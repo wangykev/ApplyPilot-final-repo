@@ -9,12 +9,5 @@
   },
   "background": {
     "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": ["*://*.myworkdayjobs.com/*", "*://*.myworkdaysite.com/*"],
-      "js": ["observe.js"],
-      "run_at": "document_idle"
-    }
-  ]
+  }
 }

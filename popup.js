@@ -80,45 +80,6 @@ document.getElementById("walk-pages").addEventListener("click", () => {
   });
 });
 
-// EXPERIMENT (throwaway): single-page fill with an OPTIONAL passive chrome.debugger
-// attach, to size whether attaching relieves background-tab timer throttling. The
-// checkbox is the USE_DEBUGGER toggle — checked = test (attach), unchecked = control —
-// so the same trigger runs both with no code change. The SW does attach/detach + a
-// page-context tick probe and GATES the fill on the tab being hidden; the fill itself
-// is the existing unmodified engine. All telemetry lands in the SERVICE-WORKER console.
-document.getElementById("fill-experiment").addEventListener("click", () => {
-  const useDebugger = document.getElementById("use-debugger").checked;
-  setStatus(`Experiment (${useDebugger ? "ATTACH/test" : "control"})… MINIMIZE the window within ~15s. See the service worker console.`);
-  chrome.runtime.sendMessage({ type: "RUN_FILL_DEBUG", useDebugger }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed (you minimized) — SW console has it all
-    if (resp.ok === false && resp.error === "no-profile") {
-      setStatus('No profile in storage — click "Load default profile" first.');
-    } else if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden in time. Rerun and minimize within ~15s.");
-    } else if (resp.ok === false) {
-      setStatus("Experiment did not complete: " + resp.error + " — see the service worker console.");
-    } else if (resp.ok) {
-      setStatus(`Experiment done (${resp.useDebugger ? "ATTACH/test" : "control"}) — ${resp.committed_count} field(s) committed. See the service worker console.`);
-    }
-  });
-});
-
-// OBSERVATION run (throwaway): inject the watch-only ticker (observe.js) into the
-// ACTIVE tab on demand, so it doesn't depend on the static content-script registration
-// or a tab reload. The SW does the injection via chrome.scripting (activeTab grants
-// access on this click — works on any Workday host). No chrome.debugger involved.
-document.getElementById("start-observe").addEventListener("click", () => {
-  setStatus("Injecting observation watcher into this tab…");
-  chrome.runtime.sendMessage({ type: "START_OBSERVE" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return;
-    if (resp.ok) {
-      setStatus("Watcher running — look for the green badge top-right of the page; ticks are in the SW console.");
-    } else {
-      setStatus("Could not inject watcher: " + resp.error + " (are you on the Workday tab?)");
-    }
-  });
-});
-
 // CDP RECON (Step 1 of the CDP actuation port): ask the SW to attach
 // chrome.debugger to THIS tab and probe hidden-tab input (text/dropdown/radio/
 // checkbox + the keyboard contingency). The SW gates on the tab going hidden,

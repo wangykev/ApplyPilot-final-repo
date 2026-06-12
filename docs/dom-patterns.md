@@ -1,4 +1,4 @@
-# Workday DOM Patterns
+﻿# Workday DOM Patterns
 
 Running log of DOM patterns observed on real Workday application pages.
 Used to drive field classification in the extension. Each entry is a
@@ -449,3 +449,56 @@ input-path `change` fires Workday's React `onChange` (delegated; not visible via
 
 ### Environment
 Top frame, `iframeCount:0` — frame-0 injection reaches the widget directly.
+
+## 2026-06-12 — Magna wd3, HIDDEN tab: CDP off-loop actuation (M24 recon + simple-widget port)
+
+Recon + live fill with the window MINIMIZED end-to-end (chrome.debugger attached, all input
+issued as CDP commands from the service worker). What hidden-tab Workday actually does:
+
+### Throttling: what freezes and what doesn't
+- Page timers throttle to ~1Hz hidden, then deep-freeze (Δperf 60–140s in the diagnosis
+  runs) — page-injected fill stalls. A PASSIVE chrome.debugger attach does NOT relieve the
+  throttle (tested: Δperf stayed ~1000ms while attached).
+- CDP `Input.*` and `Runtime.evaluate` execute PROMPTLY while hidden — they run off the page
+  loop. But Workday's debounced REACTIONS (filter/fetch/render) are page-side and stay
+  throttled → every "did it commit" wait must be generous SW-side wall-clock. Δperf ~1000ms
+  during a CDP run is EXPECTED, not failure.
+
+### Layout is LIVE while hidden
+- getBoundingClientRect returns real non-zero coords hidden — in-flow widgets (input 344×40,
+  dropdown trigger 344×40, radio label 35×20) AND the portaled option popup. Viewport keeps
+  real dimensions (1301×597 observed minimized).
+- `scrollIntoView({behavior:"instant"})` works hidden. Smooth scrolling is rAF-driven and
+  rAF IS frozen hidden — never use it.
+
+### Text input (CDP)
+- `Input.insertText` into the FOCUSED input fires trusted `beforeinput`+`input`, sets the
+  value, and the value SURVIVES blur → React registered it. This is the text method.
+- Trusted Ctrl+A + Delete clears; per-char keyDown(text)+keyUp also works (held in reserve).
+- Focus lands via a CDP coordinate click on the input.
+- ⚠ React re-renders ORPHAN held nodes/listeners (a probe's event counters read all-zero
+  after a re-render while the typed value persisted) — re-resolve every element fresh from
+  document on each read/actuation; never hold a reference across steps.
+
+### Dropdowns (CDP)
+- Mouse click on the trigger opens. Options render ATOMICALLY (country: 249 on the first
+  read, zero growth across a 3s tail) — a 2-consecutive-equal-reads settle bar suffices.
+  BUT a cold lazy list took ~5.6s to populate hidden → open budget 20s.
+- ⚠ THE URUGUAY PITFALL: a coordinate click at an out-of-view option's rect lands OUTSIDE
+  the popup's visible scroll area → outside-click DISMISSAL (listbox closes, nothing
+  commits). CDP clicks a COORDINATE, not an element — Playwright's element click
+  auto-scrolled and hid this. Do NOT type-then-click.
+- ✔ The commit that works: native type-to-jump (typed chars move `aria-activedescendant`,
+  and the highlighted option's text is readable) → verify highlight == matched target →
+  Enter (~325ms commit). Arrow keys move the highlight one enabled option per press (the
+  verified correction walk when the jump lands wrong). Commit gate = trigger display text.
+  Live: country / countryRegion / phoneType all committed this way (`enter-commit`).
+- Keyboard open also works (focused trigger + Enter; ~330ms warm).
+
+### Radio / checkbox (CDP)
+- Coordinate click on the `<label for>` commits in ~310ms (radio and checkbox).
+- Focused input + Space also commits (radio ~620ms, checkbox ~310ms) — the fallback path.
+
+### Lifecycle
+- ONE debugger client per tab: page DevTools open on the same tab kills the attach; an
+  external detach fires chrome.debugger.onDetach (clear tracked state, don't re-detach).

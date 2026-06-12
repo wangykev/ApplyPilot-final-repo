@@ -23,20 +23,6 @@
     <input id="resume-file" type="file" accept="application/pdf,.pdf">
     <div id="resume-status">Saved resume: none</div>
     <hr>
-    <!-- EXPERIMENT (throwaway): does attaching chrome.debugger relieve background-tab
-         timer throttling enough that the EXISTING fill engine finishes a page while the
-         tab is minimized? CHECK the box to ATTACH (test run); UNCHECK for the CONTROL
-         run. Click the button, then minimize the window within ~15s — the fill won't
-         start until the tab is hidden. All telemetry lands in the SERVICE-WORKER console. -->
-    <label><input id="use-debugger" type="checkbox" style="width:auto;display:inline;margin-right:6px;">Attach chrome.debugger (CDP, passive)</label>
-    <button id="fill-experiment">Run single-page fill (experiment)</button>
-    <hr>
-    <!-- OBSERVATION run (throwaway): inject the WATCH-ONLY ticker into THIS tab via
-         activeTab (no chrome.debugger, no reload needed, works on any host). Click it on
-         the Workday tab → a green badge appears top-right + ticks stream to the SW
-         console. Then tell Claude in Chrome to fill, minimize, and read the SW log. -->
-    <button id="start-observe">Start observation watcher (this tab)</button>
-    <hr>
     <!-- CDP RECON (Step 1 of the CDP actuation port): probe what chrome.debugger
          INPUT can do to a HIDDEN tab — insertText vs per-char keys, mouse vs
          keyboard commits, rect validity, commit latencies. Click, then MINIMIZE

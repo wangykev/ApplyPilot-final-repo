@@ -4,34 +4,7 @@
 // the stored resume's bytes here, then pass them as a string into the injection.
 importScripts("db.js", "lib.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
 
-// ── EXPERIMENT (throwaway) state ────────────────────────────────────────────
-// Sizing whether a passive chrome.debugger attach relieves background-tab timer
-// throttling for the EXISTING fill engine. Nothing here ships as-is.
-let debuggedTabId = null; // the tab chrome.debugger is attached to (or null)
-let onHiddenTick = null;  // resolver armed by waitForHidden, fired by the DBG_TICK listener
-
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // OBSERVATION run (throwaway): inject the watch-only ticker (observe.js) into the
-  // active tab on demand. No profile needed, no chrome.debugger — just chrome.scripting
-  // (activeTab grants access on the popup click, so it works on any Workday host without
-  // a tab reload or the static content-script registration). Handled early + standalone.
-  if (message.type === "START_OBSERVE") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, files: ["observe.js"] }, () => {
-        if (chrome.runtime.lastError) {
-          console.log("[ApplyPilot][OBSERVE] inject error:", chrome.runtime.lastError.message);
-          sendResponse({ ok: false, error: chrome.runtime.lastError.message });
-          return;
-        }
-        console.log("[ApplyPilot][OBSERVE] watch-only ticker injected into active tab", tab.id, "—", tab.url);
-        sendResponse({ ok: true, url: tab.url });
-      });
-    });
-    return true; // async sendResponse
-  }
-
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
   // chrome.debugger INPUT can do to a HIDDEN tab — insertText vs per-char keys,
   // mouse vs keyboard commits, rect validity while hidden, commit latencies —
@@ -73,10 +46,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // RUN_FILL = single page (the proven path, untouched). RUN_WALK = M15 two-page
-  // walk (fill → Next → re-inject → fill, hard cap 2). RUN_FILL_DEBUG = the throttle
-  // experiment (single page, optional passive debugger attach). All three share the
-  // same storage read + active-tab lookup; they diverge on what they do with the tab.
-  if (message.type !== "RUN_FILL" && message.type !== "RUN_WALK" && message.type !== "RUN_FILL_DEBUG") return;
+  // walk (fill → Next → re-inject → fill, hard cap 2). Both share the same storage
+  // read + active-tab lookup; they diverge on what they do with the tab.
+  if (message.type !== "RUN_FILL" && message.type !== "RUN_WALK") return;
 
   // ─── Profile handoff point ──────────────────────────────────────────────────
   // The engine ALWAYS reads the profile from chrome.storage.local — this is the
@@ -120,13 +92,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      if (message.type === "RUN_FILL_DEBUG") {
-        console.log("[ApplyPilot][DBG] ── EXPERIMENT: single-page fill, useDebugger=" + !!message.useDebugger + " on", tab.url, "──");
-        const resp = await runFillDebug(tab.id, profile, defaults, jobContext, !!message.useDebugger);
-        sendResponse(resp);
-        return;
-      }
-
       // RUN_WALK
       console.log("[ApplyPilot] Starting two-page walk on active tab:", tab.url);
       const walk = await runWalk(tab.id, profile, defaults, jobContext);
@@ -135,42 +100,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   });
 
   return true; // keep the message channel open for the async sendResponse
-});
-
-// ── EXPERIMENT: probe-tick sink (separate listener) ─────────────────────────
-// Receives ~250ms ticks from BOTH probes so they survive in the SERVICE-WORKER
-// console: (a) the experiment probe (debugProbeStart, no `mode`) — its hidden tick
-// also releases waitForHidden so the gated fill can begin; and (b) the OBSERVATION
-// content script (observe.js, mode:"observe") — watch-only, never releases the gate.
-// Fire-and-forget (no sendResponse); does NOT touch the RUN_* router above.
-chrome.runtime.onMessage.addListener((message) => {
-  if (!message || (message.type !== "DBG_TICK" && message.type !== "DBG_STOP")) return;
-  const tag = message.mode === "observe" ? "[ApplyPilot][OBSERVE]" : "[ApplyPilot][DBG]";
-  if (message.type === "DBG_TICK") {
-    console.log(`${tag} tick t=${message.t}ms  Δperf=${message.perfDelta}ms  vis=${message.visibility}  options=${message.optionCount}`);
-    // Only the experiment probe (no mode) gates the fill on hidden; an observation tick
-    // must never release a waiter (and there is none armed during an observation run).
-    if (message.mode !== "observe" && message.visibility === "hidden" && onHiddenTick) onHiddenTick();
-  } else {
-    console.log(`${tag} probe stopped — ${message.ticks} tick(s) total, last vis=${message.visibility}.`);
-  }
-});
-
-// ── EXPERIMENT: debugger lifecycle safety ───────────────────────────────────
-// If the debugged tab closes, drop our tracking (Chrome auto-detaches on close).
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === debuggedTabId) {
-    console.log("[ApplyPilot][DBG] debugged tab closed — clearing attach state.");
-    debuggedTabId = null;
-  }
-});
-// Surface external detaches (user clicked the infobar's Cancel, or DevTools opened on
-// the tab) so detachDebugger doesn't later try to detach a tab that's already gone.
-chrome.debugger.onDetach.addListener((source, reason) => {
-  if (source && source.tabId === debuggedTabId) {
-    console.log("[ApplyPilot][DBG] chrome.debugger detached externally —", reason);
-    debuggedTabId = null;
-  }
 });
 
 // ============================================================================
@@ -413,136 +342,6 @@ function injectProbe(tabId) {
         resolve((results || []).map((r) => r.result).find((r) => r) || null);
       }
     );
-  });
-}
-
-// ============================================================================
-// EXPERIMENT (throwaway): single-page fill with an OPTIONAL passive chrome.debugger
-// attach, to size whether attaching relieves background-tab timer throttling for the
-// EXISTING engine. The FILL is the unmodified injectFill — NO CDP-driven input. The
-// only new behavior is: attach/detach (passive Page+Runtime enable), a page-context
-// tick probe, and GATING the fill on the tab being hidden so the throttle-sensitive
-// typeahead actuation runs while minimized in BOTH the control and test runs.
-// ============================================================================
-async function runFillDebug(tabId, profile, defaults, jobContext, useDebugger) {
-  try {
-    if (useDebugger) {
-      const attached = await attachDebugger(tabId);
-      if (!attached.ok) {
-        console.log("[ApplyPilot][DBG] attach FAILED —", attached.error, "(is DevTools open on the tab?). Aborting; the test condition can't be set.");
-        return { ok: false, error: "attach-failed:" + attached.error };
-      }
-      console.log("[ApplyPilot][DBG] chrome.debugger attached (passive: Page + Runtime enabled, no input commands).");
-    } else {
-      console.log("[ApplyPilot][DBG] CONTROL run — no debugger attach.");
-    }
-
-    await injectProbeStart(tabId);
-    console.log("[ApplyPilot][DBG] probe started. MINIMIZE THE WINDOW NOW (within 15s). The fill waits for a hidden tick before starting.");
-
-    const becameHidden = await waitForHidden(15000);
-    if (!becameHidden) {
-      console.log("[ApplyPilot][DBG] never became hidden — INVALID run (did not minimize in time). Skipping the fill.");
-      await injectProbeStop(tabId);
-      return { ok: false, error: "never-hidden" };
-    }
-    console.log("[ApplyPilot][DBG] tab is hidden — starting the (unmodified) fill now.");
-
-    const frameResult = await injectFill(tabId, profile, defaults, jobContext);
-    await injectProbeStop(tabId); // stop ticking before we log/return
-
-    if (!frameResult) {
-      console.log("[ApplyPilot][DBG] no fill result — engine returned nothing while hidden (possible throttle stall, or injection error).");
-      return { ok: false, error: "no-result", useDebugger: !!useDebugger };
-    }
-    logFrameResult(frameResult, "experiment");
-    // Final marker: which fields actually committed (the SW already holds `results`).
-    const committed = (frameResult.results || [])
-      .filter((r) => r.status === "filled" || r.status === "filled_review")
-      .map((r) => ({ field: r.fieldName, type: r.widgetType, status: r.status, after: r.after }));
-    console.log(`[ApplyPilot][DBG] FINAL — ${committed.length} field(s) committed:`, committed);
-    await persistBundle(frameResult.bundle); // so "View last summary" works; harmless
-    return { ok: true, summary: frameResult.summary, committed_count: committed.length, useDebugger: !!useDebugger };
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    console.log("[ApplyPilot][DBG] runFillDebug error:", msg);
-    return { ok: false, error: "exception:" + msg, useDebugger: !!useDebugger };
-  } finally {
-    await detachDebugger(); // detach on completion, error, and the never-hidden path
-  }
-}
-
-// Attach chrome.debugger to `tabId` and enable the Page + Runtime domains. PASSIVE
-// only — we send NO Input.* and never Runtime.evaluate for actuation. Enabling the
-// domains is what makes the renderer treat the tab as "being debugged". Resolves
-// { ok:true } or { ok:false, error } (e.g. another client already attached).
-function attachDebugger(tabId) {
-  return new Promise((resolve) => {
-    chrome.debugger.attach({ tabId }, "1.3", () => {
-      if (chrome.runtime.lastError) {
-        resolve({ ok: false, error: chrome.runtime.lastError.message });
-        return;
-      }
-      debuggedTabId = tabId;
-      chrome.debugger.sendCommand({ tabId }, "Page.enable", {}, () => {
-        void chrome.runtime.lastError; // best-effort; ignore
-        chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}, () => {
-          void chrome.runtime.lastError; // best-effort; ignore
-          resolve({ ok: true });
-        });
-      });
-    });
-  });
-}
-
-// Detach from the tracked tab if any. Idempotent — safe in finally, on tab close, and
-// after an external detach (we swallow the "not attached" error).
-function detachDebugger() {
-  return new Promise((resolve) => {
-    if (debuggedTabId === null) { resolve(); return; }
-    const id = debuggedTabId;
-    chrome.debugger.detach({ tabId: id }, () => {
-      void chrome.runtime.lastError; // swallow "Debugger is not attached"
-      console.log("[ApplyPilot][DBG] chrome.debugger detached from tab", id);
-      debuggedTabId = null;
-      resolve();
-    });
-  });
-}
-
-// Inject the tick probe / its stop into frame 0 (mirror injectClickNext/injectProbe).
-function injectProbeStart(tabId) {
-  return new Promise((resolve) => {
-    chrome.scripting.executeScript(
-      { target: { tabId, frameIds: [0] }, func: debugProbeStart },
-      () => { void chrome.runtime.lastError; resolve(); }
-    );
-  });
-}
-function injectProbeStop(tabId) {
-  return new Promise((resolve) => {
-    chrome.scripting.executeScript(
-      { target: { tabId, frameIds: [0] }, func: debugProbeStop },
-      () => { void chrome.runtime.lastError; resolve(); }
-    );
-  });
-}
-
-// Resolve true on the first DBG_TICK reporting visibility:"hidden", false on timeout.
-// The DBG_TICK listener calls onHiddenTick when it sees a hidden tick. Single-shot:
-// clears onHiddenTick on settle so a later tick can't re-resolve a stale waiter.
-function waitForHidden(timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (v) => {
-      if (settled) return;
-      settled = true;
-      onHiddenTick = null;
-      clearTimeout(timer);
-      resolve(v);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    onHiddenTick = () => finish(true);
   });
 }
 
@@ -1348,18 +1147,6 @@ async function fillEngine(profile, defaults, jobContext) {
     const cs = window.getComputedStyle(el);
     return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
   };
-
-  // EXPERIMENT-ONLY, read-only handle (behavior-neutral). Mirrors the option-node sets
-  // the fill paths count — settlePoll's [role="option"] (visible+enabled, excl. chips)
-  // ∪ fillSource's promptOption leaves ∪ source's role=option/treeitem rows. Exposed on
-  // window so the debug probe calls the engine's OWN scrape (no drift / no false 0).
-  // Used by NOTHING in the fill path — settlePoll/fillTypeahead/fillSource keep their
-  // own scrapes — so actuation is unchanged. (Throttle experiment; not shipped.)
-  const __apOptionNodes = () =>
-    Array.from(document.querySelectorAll('[role="option"], [role="treeitem"], [data-automation-id="promptOption"]'))
-      .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true"
-        && !el.closest('[data-automation-id="selectedItemList"]'));
-  window.__apOptionNodes = __apOptionNodes;
 
   // TODO(dup): normalize / fuzzyRatio / matchCandidates have SW-side duplicates in
   // lib.js (used by the CDP fill driver + unit tests). The engine can't import
@@ -3026,56 +2813,3 @@ async function attachResume(base64, filename, mime) {
   };
 }
 
-// ============================================================================
-// debugProbeStart / debugProbeStop (EXPERIMENT, throwaway) — injected into the active
-// tab to run a ~250ms page-context tick that posts throttle telemetry to the SW. Self-
-// contained (the SW stringifies them; they close over nothing). PASSIVE: read-only DOM
-// + performance.now() + chrome.runtime.sendMessage — no actuation. Injected into the
-// SAME isolated world / renderer as fillEngine, so the tick experiences the SAME timer
-// throttling as the fill. optionCount calls window.__apOptionNodes (the engine's own
-// option scrape, exposed by fillEngine) so it counts EXACTLY what the fill paths count;
-// before fillEngine has run that handle is absent → 0 (correct: nothing is open yet).
-// ============================================================================
-function debugProbeStart() {
-  // Clear any stale probe from a prior run in this same (persistent) isolated world.
-  if (window.__apDbg && window.__apDbg.id) clearInterval(window.__apDbg.id);
-  window.__apDbg = { last: performance.now(), start: performance.now(), ticks: 0, id: null };
-  const tick = () => {
-    const now = performance.now();
-    const d = window.__apDbg;
-    if (!d) return;
-    const perfDelta = Math.round(now - d.last); // ms since last tick — the throttle tell
-    d.last = now;
-    d.ticks++;
-    let optionCount = 0;
-    try {
-      optionCount = (typeof window.__apOptionNodes === "function") ? window.__apOptionNodes().length : 0;
-    } catch (e) { optionCount = -1; } // -1 flags a scrape error (distinct from a real 0)
-    try {
-      chrome.runtime.sendMessage({
-        type: "DBG_TICK",
-        t: Math.round(now - d.start),
-        perfDelta,
-        visibility: document.visibilityState,
-        optionCount
-      });
-    } catch (e) { /* SW asleep / no receiver — ignore; next tick retries */ }
-  };
-  window.__apDbg.id = setInterval(tick, 250);
-  tick(); // immediate first reading
-  return { started: true };
-}
-
-function debugProbeStop() {
-  const d = window.__apDbg;
-  if (d && d.id) clearInterval(d.id);
-  try {
-    chrome.runtime.sendMessage({
-      type: "DBG_STOP",
-      ticks: d ? d.ticks : 0,
-      visibility: document.visibilityState
-    });
-  } catch (e) { /* ignore */ }
-  if (window.__apDbg) delete window.__apDbg;
-  return { stopped: true, ticks: d ? d.ticks : 0 };
-}
