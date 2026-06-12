@@ -1,0 +1,451 @@
+# Workday DOM Patterns
+
+Running log of DOM patterns observed on real Workday application pages.
+Used to drive field classification in the extension. Each entry is a
+dated snapshot of one page — refutations of earlier assumptions are
+tracked explicitly so the classifier stays honest about which signals
+actually fire in the wild.
+
+## Conventions
+
+- **Wrapper**: an element with `data-automation-id="formField-<name>"`.
+  Every classifiable field on a Workday form sits inside one of these.
+- **Companion input**: a hidden `<input>` Workday keeps alongside
+  custom widgets (dropdowns, multiselects) so the form still posts a
+  value. Not the user-facing control.
+- **Fieldname**: the substring after `formField-`, e.g.
+  `legalName--firstName`.
+
+## Classifier branches (current)
+
+These are the six wrapper shapes we can detect today. Order matters —
+evaluate top to bottom and take the first match.
+
+| # | Branch              | Distinguishing signal                                                                                  |
+|---|---------------------|--------------------------------------------------------------------------------------------------------|
+| 1 | Radio group         | 2+ descendant `<input type="radio">` siblings (with OR without a `role="radiogroup"` ancestor)         |
+| 2 | Multiselect         | descendant with `data-uxi-widget-type="multiselect"`                                                   |
+| 3 | Single-select       | descendant `<button aria-haspopup="listbox">` (OR `role="combobox"` — see refutation below)            |
+| 4 | Textarea            | descendant `<textarea>`                                                                                |
+| 5 | Plain text input    | exactly one descendant `<input>`, no buttons, no listbox/multiselect signals                           |
+| 6 | Unknown / fallback  | anything that doesn't match above — log and skip                                                       |
+
+---
+
+## 2026-05-27 — Comcast Workday wd5, "My Information" step
+
+- **URL pattern**: `comcast.wd5.myworkdayjobs.com/.../apply/applyManually`
+- **Page**: "My Information" (step 1 of application)
+- **Wrappers found**: 13 `formField-*`, all with required marker (`<abbr>`) consistent with the visible asterisks.
+
+> **Correction (M9 step 1.5):** Page actually has 15 `formField-*` wrappers, not 13 — `preferredCheck` (checkbox) and `regionSubdivision1` (text, likely conditional on country) were missed in initial M3 inspection. Engine classifies and skips both correctly.
+
+### Patterns observed
+
+| Count | Pattern              | Example field names                                                              | Shape                                                                       |
+|-------|----------------------|----------------------------------------------------------------------------------|-----------------------------------------------------------------------------|
+| 7     | Plain text input     | `legalName--firstName`, `legalName--lastName`, `addressLine1`, `city`, `postalCode`, `phoneNumber`, `extension` | single `<input>`, no buttons                                                |
+| 3     | Single-select dropdown | `country`, `countryRegion`, `phoneType`                                        | 1 `<button aria-haspopup="listbox">` + 1 hidden companion `<input>`         |
+| 2     | Multiselect          | `source`, `countryPhoneCode`                                                     | `data-uxi-widget-type="multiselect"` container + 1 hidden companion `<input>` |
+| 1     | Radio group          | `candidateIsPreviousWorker`                                                      | 2 naked `<input type="radio">` siblings, **no** `role="radiogroup"` wrapper |
+
+### Refutations of earlier (Python spec) assumptions
+
+- **`role="combobox"` did NOT fire** on any dropdown on this page. The
+  only reliable signal for single-selects we saw is
+  `<button aria-haspopup="listbox">`. The classifier must accept the
+  button-based signal; `role="combobox"` may still appear on other
+  tenants, so detection should treat it as a secondary OR-condition,
+  not a primary requirement.
+- **`role="radiogroup"` did NOT wrap the radio question** on this
+  page. Detection by walking up from `<input type="radio">` and
+  expecting a `radiogroup` ancestor would have missed the only radio
+  field here. Corroborated separately: other Workday forms *do* use
+  `radiogroup`, so the classifier must handle both — radios with and
+  without a `role="radiogroup"` ancestor.
+
+### Confirmed from Python spec
+
+- The hidden companion `<input>` pattern beside custom widgets
+  (single-selects and multiselects) is present exactly as the Python
+  spec described. Filling the user-facing control is what triggers
+  Workday to update the companion; do not try to set the companion
+  directly.
+
+### Radio group structure on this tenant (verified during M7)
+
+The `candidateIsPreviousWorker` wrapper contains:
+
+- A `<fieldset>` ancestor surrounding the radios — no `role="radiogroup"`.
+- Two `<input type="radio">` siblings, each with:
+  - A shared `name` attribute (group identity)
+  - A unique `id`
+  - **No** `role="radio"` (the implicit role from `type="radio"` is what screen readers use)
+  - **No** `aria-label` on the input itself
+  - CSS-hidden (visually clipped); not the visible click target
+- A `<label for="<input.id>">` for each radio, sibling-or-near-sibling
+  to the input. The label's `textContent.trim()` is the option name
+  ("Yes" / "No") and the label is what the user actually clicks.
+
+Implications for classification:
+
+- Cannot rely on `role="radiogroup"` or `role="radio"` on this tenant.
+- Cannot rely on `aria-label` on the input — the label text comes from
+  the associated `<label for>` element.
+- Grouping radios by shared `name` attribute is the reliable signal.
+
+### Dropdown structure on this tenant (verified during M6)
+
+The `phoneType` dropdown wrapper contains a `<button aria-haspopup="listbox">`
+as the trigger. When clicked, an `<ul role="listbox">` is mounted —
+**outside** the `formField-*` wrapper subtree (portaled to the body or a
+sibling container). Implications:
+
+- Don't query for the listbox inside the wrapper. Query at `document` level.
+- Same applies to `[role="option"]` elements — they live with the
+  portaled listbox, not inside the field wrapper.
+- The listbox mount is asynchronous; poll for it (the extension's
+  `waitFor` helper uses 50ms intervals, 5s ceiling).
+
+### Open questions (not answered by this page)
+
+- Do file-upload fields (resume) live inside a `formField-*` wrapper?
+  Not present on the "My Information" step — verify on the next step.
+- Do typeahead-style location pickers use the same listbox-button
+  pattern as plain dropdowns, or a different widget? Not observed here.
+- Does the `<abbr>` required marker ever appear on optional fields
+  (decorative)? All 13 wrappers were required, so we can't yet say
+  whether `requiredMarker` is a reliable required-vs-optional signal
+  or just a "this page happens to require everything" coincidence.
+
+---
+
+## 2026-05-28 — Comcast wd5 "My Information": widget interaction details (M6–M8)
+
+Same page as the 2026-05-27 baseline. This entry records how each widget
+actually *behaves when driven*, learned while building M6 (dropdown),
+M7 (radio), and M8 (typeahead).
+
+### Dropdown — `phoneType`, `country`, `countryRegion`
+
+- Trigger: `<button aria-haspopup="listbox">` inside the wrapper, plus a
+  hidden companion `<input>`.
+- Click the trigger → an `<ul role="listbox">` renders **at the document
+  root** (portaled, not inside the wrapper).
+- Options are `<li role="option">`. Skip `aria-disabled="true"` (the
+  "Select One" placeholder is disabled). Match by text, **click by index**
+  into the enabled set.
+- After selection the trigger button's text updates to the chosen value —
+  that's the verification signal.
+- `role="combobox"` does **NOT** fire on this tenant (see 2026-05-27
+  refutation). The button + `aria-haspopup="listbox"` is the only signal.
+
+### Radio — `candidateIsPreviousWorker`
+
+- Naked `<input type="radio">` siblings, **no** `role="radiogroup"` on this
+  tenant (other tenants DO use it — detection must handle both).
+- Grouped by shared `name`. Each input has a unique `id` and a
+  `<label for="<id>">` carrying the visible text ("Yes" / "No").
+- Input is CSS-hidden; **click the label**, verify via `input.checked`.
+
+### Flat typeahead — `countryPhoneCode`
+
+- Container has `data-uxi-widget-type="multiselect"`. The search box lives
+  in a `monikerSearchBox` with `data-automation-hiddensearch="true"`
+  holding `input[data-automation-id="searchBox"]`.
+- **Open-before-find:** the searchBox isn't reachable until the widget is
+  opened — click the opener first, then `waitFor` the input.
+- Filters **live** as you type (Enter not required). Options
+  `[role="option"]` render at the document root, formatted `"Name (+code)"`.
+- Selection shows as a `[data-automation-id="selectedItem"]` chip — that's
+  the read-back / verification signal.
+- This is a **single-pick** typeahead in practice (one dial code), even
+  though Workday tags the container `multiselect`. See vocabulary note below.
+
+### Hierarchical picker — `source` ("How Did You Hear About Us?") — HANDLED IN M11
+
+- The options are **expandable categories** drilling into sub-options, not flat
+  selectable leaves — picking a value means expand-the-category, then pick a leaf.
+- ⚠️ **Refuted (M11, 2026-05-30):** the earlier "same `searchBox` container as
+  `countryPhoneCode`" note above was wrong / unverified. When actually driven, the
+  `source` widget on the Cambium tenant is a **`button[aria-haspopup="listbox"]`
+  (no searchBox)** — consistent with the classifier treating it as button+listbox,
+  not a multiselect/typeahead. `fillSource` opens it, then **expand-walks**:
+  level-1 leaf check, else expand each category and scan revealed sub-options.
+- Candidate list is policy, not profile: `application_defaults.how_did_you_hear`
+  (`[...preferred, fallback "Other"]`), tried in order; `needs_review` if none match.
+- Built to **discover-and-trace** (emits `sourceTrace` with stable per-row
+  identifiers) so a failed run yields selectors, not guesses. Verified filling
+  "LinkedIn" on Cambium — see the 2026-05-30 entry.
+
+### Vocabulary reconciliation: "multiselect" vs "typeahead" vs true multi-value
+
+- `countryPhoneCode` is tagged `data-uxi-widget-type="multiselect"` in the
+  DOM but we handle it as a **single-pick typeahead**. Here "multiselect"
+  (Workday's DOM term) and "typeahead" (our handler term) refer to the
+  **same widget** — don't let the two names suggest two code paths.
+- A **true multi-value multiselect** — one that accepts several chips at
+  once — would be signalled by `role="combobox"` + `aria-multiselectable="true"`.
+  We have **not** seen one on this page. When we do, it's a separate widget
+  class needing add-each-then-confirm logic.
+
+### Sequential-cleanup principle (closing the listbox is the sequence's job)
+
+We spent significant effort trying to explicitly close the typeahead
+listbox after selection — Escape on the input, Escape on
+`document.activeElement`, and click-outside on a neutral target. None were
+reliable, and clicking the field's own `<label>` actively **reopened** the
+widget (its `for=` points at the search input, so the click refocused it).
+Resolution: **don't close per-field at all.** In a multi-field run,
+focusing the next field blurs the previous widget and dismisses its
+listbox for free. Only the last field could leave one open, and that's
+cosmetic. All the close code was removed (see commit history around M8).
+
+### `listboxClosed` detection caveat
+
+If you ever DO need to detect whether a listbox is closed: Workday leaves
+**hidden** `[role="option"]` nodes in the DOM after close, so a bare
+`document.querySelector('[role="option"]')` reports "still open" when it
+isn't. Closed-detection must filter to **visible** options (non-zero
+bounding rect, not `display:none`). This unreliable open-detection is part
+of why we abandoned explicit close in favor of the sequential-cleanup
+principle above.
+
+### Matching strategy (summary — full rationale in CLAUDE.md)
+
+Choice widgets pick from an ordered candidate list (most-specific first),
+matched with a conservative ladder: (1) exact after `normalize()`,
+(2) containment, (3) fuzzy **≥ 90 — typo tolerance only**, (4) escalate to
+`needs-review`. No low-threshold fuzzy: a loose bar silently selects a
+wrong value, the worst failure for an accuracy-focused tool. `normalize()`
+lowercases, strips a trailing `(+digits)` suffix, and collapses whitespace,
+so `"United States of America"` exact-matches the rendered
+`"United States of America (+1)"`.
+
+---
+
+## 2026-05-30 — Cambium Learning Workday, "My Information" step (M10–M11)
+
+First run on a **second tenant** (Cambium Learning, not Comcast wd5), via the
+storage-backed active-tab engine. Headline: the classifier + all four handlers
+filled **12 of 15** fields correctly with **zero code changes from the Comcast
+tenant** — the `formField-*` model generalizes.
+
+### `source` is button+listbox, not a searchBox typeahead (refutes 2026-05-28)
+Driven for the first time in M11. `fillSource` reported `opener: "BUTTON"`,
+`searchBox: false`, `sourcePath: "expand-walk"`, and filled **"LinkedIn"**
+(`matchTier: exact-normalized`, `verified: true`). So `source` is a
+`button[aria-haspopup="listbox"]` hierarchical picker with **no search input** —
+the earlier "same searchBox container as countryPhoneCode" note was wrong.
+
+### Two previously-uncatalogued fields identified (via the new `label` column)
+- `preferredCheck` → label **"I have a preferred name"** — a checkbox
+  (would map to `personal_info.has_preferred_name`). Currently `skipped (no mapping)`.
+- `regionSubdivision1` → label **"County"** — a conditional text field (not a
+  state subdivision as the name suggests). Currently `skipped (no mapping)`.
+
+### Single-bare-candidate containment ambiguity did NOT fire here
+With the profile supplying bare `"United States"` for both `country` and
+`country_phone_code` (single candidate, no curated specific-first list), the
+match ladder's containment tier correctly resolved:
+- `country` → **"United States of America"**
+- `countryPhoneCode` → **"United States of America (+1)"**
+
+No territory mis-match (e.g. "United States Minor Outlying Islands") on this
+tenant. The risk is real but unobserved; the **dial-code tiebreak** (use the
+orphaned `personal_info.dialing_code` "+1" to prefer the `(+1)` option) stays
+**parked** until it actually fires. `personal_info.dialing_code` is currently
+dormant — no FIELD_MAP entry reads it.
+
+---
+
+## 2026-06-01 — US Bank Workday wd1, "My Information" step (M13 + source/isRequired fixes)
+
+Third tenant (`usbank.wd1.myworkdayjobs.com`). Two findings changed code.
+
+### `source` — a THIRD variant: searchBox that filters on ENTER; leaves are `promptOption` divs
+Refutes both prior `source` shapes. Here `source` opens as a
+`DIV[multiselectInputContainer]` with a real `searchBox` (`searchBox: true`,
+`sourcePath: "search"`), but it does **NOT live-filter** while typing — you must press
+**Enter** to filter, after which it renders a clickable result list.
+
+The clickable result leaf (verified by manual DOM inspection) is:
+
+```html
+<div id="promptOption-…" data-automation-id="promptOption"
+     data-automation-label="LinkedIn">LinkedIn</div>
+```
+
+- It is **NOT** `role="option"`. That role sits on a *sibling* `menuItem` div
+  (`data-automation-id="menuItem"`), so a `[role="option"]` query targets the wrong node.
+- The searchBox's `aria-controls` points at a `promptAriaInstruction` node (an ARIA
+  live-region), **not** the option list — so aria-controls scoping is useless here.
+- Nesting: a `multiselectlistitem` wrapper → inner div → the `promptOption` leaf.
+
+`fillSource`'s **search** path was rebuilt against this (the **expand-walk** path for
+Cambium is untouched):
+- Scrape leaves as **`[data-automation-id="promptOption"]`** (visible-only); match the
+  candidate against **`data-automation-label`** (then `textContent`) via the shared ladder.
+- type → **full Enter sequence** (keydown/keypress/keyup) → **race-safe wait**: the
+  visible-leaf count must change from the pre-Enter baseline AND hold stable across
+  several reads + a minimum settle window. (A single row flashing in mid-render must not
+  read as the final set — that partial-render bug made it match "Other" instead of
+  "LinkedIn".)
+- **Commit-gated**: confirm the click committed via the enclosing `multiselectlistitem`'s
+  `data-uxi-multiselectlistitem-isselected` flipping `true` (backups:
+  `data-automation-selected` / `aria-selected` / a `selectedItem` chip / companion input).
+  A match that does NOT commit → `needs_review`, never a false "filled", and never a
+  fall-through to a less-preferred option. Verified filling **"LinkedIn"**.
+
+### Hidden cross-widget option contamination — visible-only scoping is necessary, not sufficient
+Workday leaves **hidden option nodes from OTHER widgets** in the DOM. A page-wide scrape
+during `source` fill captured the **countryPhoneCode typeahead's** options ("United States
+of America (+1)") — the wrong widget entirely. Filtering to **visible** elements (rect size
++ computed style; **not** `offsetParent`, which is null for `position:fixed` portaled
+popups) reduces this from "wrong widget" to "one stray phone-code row bleeds in". Harmless
+for `source` (distinct labels — the match ladder ignores the stray), but **not 100%
+isolated**: a future tenant with a `source` option whose text overlapped a phone-code value
+could see interference. Noted, not fixed.
+
+### `isRequired` — US Bank marks required with a BARE `<abbr>*</abbr>` (no title / no aria-required)
+The marker is `<abbr aria-hidden="true" class="…">*</abbr>` — the asterisk is the abbr's
+**text content**, with **no** `title="required"`, **no** `aria-label`, and **no**
+`aria-required` on the control. The M13 detector (keyed on `abbr[title*="required"]` +
+`aria-required`) therefore **missed all three dropdowns** — `country` ("Country*"),
+`countryRegion` ("State*"), `phoneType` ("Phone Device Type*") — while text inputs and the
+typeahead detected fine (they carry `aria-required`). This is the **dangerous direction**
+(a required field reading `false`). Fix: `isRequired` now also accepts an `<abbr>` whose
+text contains "*", plus a label/legend whose visible text ends with "*" (safe over-flag
+direction). Optional fields (Middle Name, Address Line 2, "I have a preferred name", Phone
+Extension) correctly stay `false`.
+
+### `candidateIsPreviousWorker` question text names the entities that count
+The "previously employed here?" question is verbose and **names the specific companies** that
+the answer covers, not just the posting's company — e.g. US Bank:
+
+> "Have you previously worked as an employee or contractor for U.S. Bank or any of its related
+> companies including any affiliates, subsidiaries, or predecessor organizations such as
+> **Elavon, U.S. Bancorp Investments, or Union Bank**? If yes, please answer the questions below."
+
+and Ken Garff: *"Are you a previous **Ken Garff** employee (not a DNQ)?"*. So `jobContext.company`
+("U.S. Bank") alone would miss a candidate who worked at a named subsidiary (Union Bank). The
+matcher (`decidePreviousWorker`) therefore also **scans the question label** (`getLabel`) for the
+user's `employment_history_companies`, via a **contiguous whole-word token-sequence** match
+(`containsSeq`) gated by a distinctiveness check — multi-word names, or a lone word ≥5 chars not
+in `GENERIC_SINGLE` — so a short/common employer entry ("Bank", "Tech") can't coincidentally hit
+question boilerplate. A hit → "Yes" + **mandatory review** (it sits beside a truthfulness cert and
+unfurls follow-up fields), with a detail naming the matched employer + signal. The scan reads the
+user's KNOWN employers out of the question; it does **not** try to extract company names from the
+prose (no LLM). Precision note: the token-sequence is exact, so "Union Bankshares" does **not**
+match an employer of "Union Bank".
+
+### Dropdown options must be scoped to the trigger's `aria-controls` listbox (M14.1)
+Making the summary dropdowns editable (M14) exposed that `fillDropdown`'s page-wide
+`[role="option"]` scrape was **contaminated by two distinct sources** — and visibility filtering
+fixed neither (two rounds), because both contaminants are genuinely `visible:true`:
+
+1. **Selection chips**, not options. A filled multiselect/source/phone-code renders its *selected
+   value* as `<ul role="listbox" data-automation-id="selectedItemList"><li role="option"
+   data-automation-id="selectedItem">…</li></ul>`. So "LinkedIn" (source) and "United States of
+   America (+1)" (countryPhoneCode) are `role="option"` nodes page-wide — and visibly shown.
+2. **A prior dropdown's listbox stays open.** Tracing with State open showed Country's listbox
+   (`ctny0`, 250 options) still present alongside State's (`ctny1`, 61) — so State's page-wide
+   scrape grabbed countries too. The previous dropdown is not dismissed when later fields fill.
+
+**Cure (verified by trace, not assumed):** each dropdown trigger's `aria-controls` resolves to its
+**own** options listbox — `country`→`ctny0` (countries), `countryRegion`→`ctny1` (states),
+`phoneType`→`ctny2` (phone types) — confirmed by option counts + samples. `fillDropdown` now polls
+for `document.getElementById(trigger.aria-controls)` (also the open-gate; a bare `ul[role="listbox"]`
+wait can match a pre-existing `selectedItemList` chip list) and scrapes `[role="option"]` **within
+that listbox only**. This excludes both the chips and the sibling dropdown's listbox. (Contrast
+`source`, whose `aria-controls` pointed at a `promptAriaInstruction` node — so aria-controls is
+verified per widget, not trusted blindly.) `settlePoll` (typeahead) additionally excludes
+`[data-automation-id="selectedItemList"]` chips for the same reason.
+
+---
+
+## 2026-06-03 — LiveRamp Workday wd5, two-page walk (M15)
+
+Fourth tenant (`liveramp.wd5.myworkdayjobs.com`). First run that crosses a **page
+transition** — the SW-driven walk (fill page 1 → click Next → wait → re-inject → fill
+page 2, hard 2-page cap). Recorded here are the *structural* findings the transition
+mechanism depends on; the walk mechanics live in CLAUDE.md → Multi-page.
+
+### Footer "Next" button
+- `<button data-automation-id="pageFooterNextButton">Save and Continue</button>`, inside
+  `data-automation-id="pageFooter"`. This is the advance control the SW clicks (via the
+  injected `clickNext`). On later pages the **review page reuses this same automation-id
+  for Submit** — hence the double-guard (`clickNext` refuses if `applyFlowReviewPage` is
+  present; the orchestrator refuses to advance once `reviewPagePresent`). Not exercised
+  here (the cap stops at page 2, well before review), but the guard is in place.
+
+### ⚠️ The page container `applyFlowPage` is SHARED across pages — `pageId` does NOT distinguish them
+The engine derives `pageId` from `[data-automation-id^="applyFlow"][data-automation-id$="Page"]`.
+On LiveRamp **both** page 1 (My Information) and page 2 (My Experience) report the **same**
+`pageId = "applyFlowPage"`. So a transition detector keyed on `pageId` alone would hang —
+it never changes. What *did* change is the **`formField-*` set** (13 wrappers → 10, different
+ids). This is exactly why `waitForNextPage` treats the page **signature** as
+`url || pageId || formFieldIds` (any one differing = advanced): the **field-set delta is the
+load-bearing signal**, with url/pageId as corroboration, not the sole basis.
+
+### Page 2 = "My Experience" — mostly widgets the engine doesn't yet fill
+The 10 page-2 wrappers (for reference — page-2 fill *quality* is a later milestone, not M15):
+- `Job Title*`, `Company*`, `Location` → classify as `text` (the first two required, unmapped → `skipped`).
+- `From*`, `To*` → classify as **`unknown`** (date-segment composites, not a single text input).
+- `Role Description` → **`unknown`** (rich-text/textarea-ish).
+- `I currently work here` → `checkbox`.
+- `Type to Add Skills` → `typeahead`.
+- `Upload a file (5MB max)*` → **`unknown`** (file upload — first file field observed; answers the
+  2026-05-27 open question "do file uploads live in a `formField-*`?" → **yes**, as `unknown`).
+- `LinkedIn` (a websites/social URL) → `text`.
+
+These are the multi-instance/Add-section, date-composite, and file-upload widgets the current
+classifier+handlers don't target — all correctly `skipped`/flagged, none mis-filled. Mapping +
+handlers for them are a future milestone.
+
+### `source` took the **search** path here
+Page 1's `source` filled "LinkedIn" via `sourcePath: "search"` (the US-Bank-style ENTER-filter
+variant), `status: filled` — consistent with the 2026-06-01 entry, no new code needed.
+
+---
+
+## 2026-06-03 — LiveRamp wd5 resume upload: programmatic ATTACH proven (M16.1)
+
+The page-2 "Upload a file (5MB max)*" widget (the `unknown` required field from M15) **can be
+filled by an injected function** — proven live. This records the widget DOM and the technique
+that works, so the round-2 real-resume handler is built on fact.
+
+### Widget DOM
+- Wrapper: `<div data-automation-id="formField-" data-fkit-id="resumeAttachments--attachments">`
+  — the automation-id's fieldName is **empty** (just `formField-`), so the classifier sees
+  `unknown`; **`data-fkit-id` is the stable identifier**, not the automation-id.
+- Hidden input: `<input data-automation-id="file-upload-input-ref" type="file" multiple>` —
+  **`accept` is null** (no client-side type filter), `disabled:false`, **`display:none` but
+  present in the DOM before any interaction** (no need to click "Select files" to reveal it).
+- Section chrome: `attachments-FileUpload` → `file-upload-drop-zone` (the dropzone; holds the
+  `select-files` button) → the hidden `file-upload-input-ref`.
+
+### The attach technique that WORKS (Playwright's `set_input_files` does NOT port)
+An injected function has no filesystem, and a `File` can't cross `chrome.runtime` message-passing
+(serializes to `{}`). So the file is **rebuilt in the page context** and attached via a synthetic
+`DataTransfer`:
+1. base64 → bytes (`atob` → `Uint8Array`) → `new File([bytes], "name.pdf", {type:"application/pdf"})`.
+2. `const dt = new DataTransfer(); dt.items.add(file); input.files = dt.files;`
+3. dispatch `new Event("change", {bubbles:true})` (and `input`).
+
+Verified on LiveRamp: `filesSetImmediately:1` (browser accepted the programmatic set) and Workday
+rendered its confirmation row with the filename. **No drop-event fallback needed** — the
+input-path `change` fires Workday's React `onChange` (delegated; not visible via `getEventListeners`).
+
+### 🔑 Success signal = the confirmation ROW, not `input.files`
+**Workday XHR-uploads then RESETS `input.files` to 0** (recon: `filesLengthAfter:0`) — so
+`input.files.length` is NOT a success check. After upload the section grows a confirmation row:
+- `file-upload-item` (the row — renders for the file) → `file-upload-item-name` (filename),
+  `file-upload-successful` (the **completion** marker), `delete-file` (the remove button).
+- ⚠️ **Round-2 note:** M16.1's poll matched `file-upload-item` *before* `file-upload-successful`
+  appeared. `file-upload-item` also renders for **in-progress / errored** uploads, so a true
+  *succeeded* confirmation should gate specifically on **`file-upload-successful`** (and treat a
+  long-lived `file-upload-item` without it as in-progress/failed).
+
+### Environment
+Top frame, `iframeCount:0` — frame-0 injection reaches the widget directly.

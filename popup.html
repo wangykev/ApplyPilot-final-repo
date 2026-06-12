@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body { font-family: system-ui, sans-serif; width: 280px; padding: 12px; }
+      button { display: block; width: 100%; margin: 0 0 8px; padding: 8px; cursor: pointer; }
+      label { display: block; font-size: 12px; margin-top: 4px; }
+      input { width: 100%; box-sizing: border-box; margin: 4px 0 6px; padding: 6px; }
+      hr { margin: 10px 0; border: none; border-top: 1px solid #ddd; }
+      #status { font-size: 12px; color: #333; white-space: pre-wrap; min-height: 1.4em; }
+    </style>
+  </head>
+  <body>
+    <button id="load-profile">Load default profile</button>
+    <button id="fill-page">Fill current page</button>
+    <button id="walk-pages">Fill 2 pages (walk)</button>
+    <button id="view-summary">View last summary</button>
+    <hr>
+    <!-- Store ONE resume (PDF) in IndexedDB. Fill (current page / walk) attaches it
+         automatically on the page that has the upload widget (M16.3). -->
+    <label for="resume-file">Resume (PDF) — stored in the extension:</label>
+    <input id="resume-file" type="file" accept="application/pdf,.pdf">
+    <div id="resume-status">Saved resume: none</div>
+    <hr>
+    <!-- EXPERIMENT (throwaway): does attaching chrome.debugger relieve background-tab
+         timer throttling enough that the EXISTING fill engine finishes a page while the
+         tab is minimized? CHECK the box to ATTACH (test run); UNCHECK for the CONTROL
+         run. Click the button, then minimize the window within ~15s — the fill won't
+         start until the tab is hidden. All telemetry lands in the SERVICE-WORKER console. -->
+    <label><input id="use-debugger" type="checkbox" style="width:auto;display:inline;margin-right:6px;">Attach chrome.debugger (CDP, passive)</label>
+    <button id="fill-experiment">Run single-page fill (experiment)</button>
+    <hr>
+    <!-- OBSERVATION run (throwaway): inject the WATCH-ONLY ticker into THIS tab via
+         activeTab (no chrome.debugger, no reload needed, works on any host). Click it on
+         the Workday tab → a green badge appears top-right + ticks stream to the SW
+         console. Then tell Claude in Chrome to fill, minimize, and read the SW log. -->
+    <button id="start-observe">Start observation watcher (this tab)</button>
+    <hr>
+    <!-- CDP RECON (Step 1 of the CDP actuation port): probe what chrome.debugger
+         INPUT can do to a HIDDEN tab — insertText vs per-char keys, mouse vs
+         keyboard commits, rect validity, commit latencies. Click, then MINIMIZE
+         within 60s; probes start on the first hidden read. Findings land in the
+         SERVICE-WORKER console ([CDP-RECON] lines + one summary JSON). Keep page
+         DevTools CLOSED on the tab — a second debugger client kills the attach. -->
+    <button id="cdp-recon">CDP recon: simple widgets (minimize!)</button>
+    <!-- CDP FILL (Step 2): fill this page's text/dropdown/radio/checkbox fields via
+         chrome.debugger input while the tab is HIDDEN. Load the profile (+ company)
+         first, click, then MINIMIZE within 60s. Typeahead/source are deferred →
+         NEEDS REVIEW; repeating sections untouched. Results in the SW console. -->
+    <button id="cdp-fill">CDP fill (hidden): simple widgets</button>
+    <hr>
+    <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
+    <label for="company">Company for this application (temporary):</label>
+    <input id="company" type="text" placeholder="e.g. Cambium Learning">
+    <button id="set-company">Set company</button>
+    <div id="status"></div>
+    <script src="db.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

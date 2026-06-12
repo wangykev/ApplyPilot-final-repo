@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "ApplyPilot Dev",
+  "version": "0.0.1",
+  "permissions": ["activeTab", "scripting", "storage", "debugger"],
+  "host_permissions": ["*://*.myworkdayjobs.com/*"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.myworkdayjobs.com/*", "*://*.myworkdaysite.com/*"],
+      "js": ["observe.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

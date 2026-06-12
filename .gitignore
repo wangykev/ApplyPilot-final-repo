@@ -1,0 +1,16 @@
+# Sensitive data — keep real credentials, profile PII, and the resume out of git.
+# Deny-by-default for data/: everything in the folder is ignored unless it is
+# explicitly allow-listed below. Drop new secrets in here freely; git won't see
+# them. Only example/template files are tracked.
+data/*
+!data/.credentials.example.json
+!data/profile.example.json
+!data/application_defaults.json
+!data/question_mapping_schema.json
+
+# Dev tooling (tests) — the extension itself ships no node_modules.
+node_modules/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

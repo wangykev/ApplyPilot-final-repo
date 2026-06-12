@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>ApplyPilot — Last fill summary</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 20px 24px; color: #1a1a1a; }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      h2 { font-size: 15px; margin: 22px 0 8px; }
+      .meta { font-size: 12px; color: #555; margin-bottom: 10px; }
+      .counts { font-size: 12px; color: #333; margin-bottom: 6px; }
+      .counts span { display: inline-block; margin-right: 14px; }
+      button { padding: 6px 14px; cursor: pointer; margin: 8px 0 4px; }
+      .review { border: 1px solid #e0b400; background: #fffbe6; border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; }
+      .review .label { font-weight: 600; }
+      .review .reason { color: #a35200; font-size: 12px; margin-top: 2px; }
+      .review .detail { font-size: 12px; color: #444; margin-top: 3px; }
+      .review .options { font-size: 11px; color: #666; margin-top: 4px; word-break: break-word; }
+      table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 4px; }
+      th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; }
+      th { background: #f5f5f5; position: sticky; top: 0; }
+      tr.flagged { background: #fffbe6; }
+      .empty { color: #777; font-size: 14px; padding: 48px 0; text-align: center; }
+      .badge { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px; background: #eee; color: #555; }
+      .badge.high { background: #d6f5d6; color: #1b6b1b; }
+      .badge.medium { background: #fff0c2; color: #8a5a00; }
+      .badge.low, .badge.none { background: #eee; color: #888; }
+      .cellval { font-weight: 500; }
+      select.editor { display: block; max-width: 340px; font-size: 12px; margin-top: 3px; }
+      .partial-note { font-size: 11px; color: #a35200; margin-top: 4px; max-width: 360px; }
+      .badge-slot { margin-top: 3px; }
+      .edit-tag { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px; background: #cfe3ff; color: #1c4d8c; }
+      .edit-tag.filled { background: #e3d6ff; color: #5a2d8c; }
+      tr.edited td { background: #f3f8ff; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="summary.js"></script>
+  </body>
+</html>

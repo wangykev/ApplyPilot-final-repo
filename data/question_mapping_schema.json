@@ -1,0 +1,988 @@
+{
+  "schema_version": "2.0",
+  "field_mappings": [
+    {
+      "canonical_field": "auth_strategy.account_email",
+      "field_type": "text",
+      "question_label_variants": [
+        "Username",
+        "Sign in email"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.country",
+      "field_type": "select",
+      "question_label_variants": [
+        "Country",
+        "Country/Region",
+        "Country of Residence"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.first_name",
+      "field_type": "text",
+      "question_label_variants": [
+        "First Name",
+        "Legal First Name",
+        "Given Name"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.last_name",
+      "field_type": "text",
+      "question_label_variants": [
+        "Last Name",
+        "Legal Last Name",
+        "Surname",
+        "Family Name"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.has_preferred_name",
+      "field_type": "checkbox",
+      "question_label_variants": [
+        "I have a preferred name"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.preferred_name",
+      "field_type": "text",
+      "question_label_variants": [
+        "Preferred Name",
+        "Chosen Name"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.address_line_1",
+      "field_type": "text",
+      "question_label_variants": [
+        "Address Line 1",
+        "Street Address",
+        "Address"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.address_line_2",
+      "field_type": "text",
+      "question_label_variants": [
+        "Address Line 2",
+        "Apartment, suite, etc.",
+        "Address 2"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.city",
+      "field_type": "text",
+      "question_label_variants": [
+        "City",
+        "Town/City"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.state_province",
+      "field_type": "select",
+      "question_label_variants": [
+        "State",
+        "State/Province",
+        "Province",
+        "Region"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.postal_code",
+      "field_type": "text",
+      "question_label_variants": [
+        "Postal Code",
+        "ZIP Code",
+        "Zip/Postal Code"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.email",
+      "field_type": "text",
+      "question_label_variants": [
+        "Email",
+        "Email Address"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.phone_device_type",
+      "field_type": "select",
+      "question_label_variants": [
+        "Phone Device Type",
+        "Phone Type"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.country_phone_code",
+      "field_type": "select",
+      "question_label_variants": [
+        "Country Phone Code",
+        "Country Code",
+        "Phone Country Code"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.phone_number",
+      "field_type": "text",
+      "question_label_variants": [
+        "Phone Number",
+        "Mobile Number",
+        "Primary Phone"
+      ]
+    },
+    {
+      "canonical_field": "personal_info.phone_extension",
+      "field_type": "text",
+      "question_label_variants": [
+        "Phone Extension",
+        "Extension",
+        "Ext"
+      ]
+    },
+    {
+      "canonical_field": "websites",
+      "field_type": "repeatable_url_list",
+      "question_label_variants": [
+        "Websites",
+        "Website",
+        "Add any relevant websites",
+        "URL"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].job_title",
+      "field_type": "text",
+      "question_label_variants": [
+        "Job Title",
+        "Title",
+        "Position Title"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].company",
+      "field_type": "text",
+      "question_label_variants": [
+        "Company",
+        "Employer",
+        "Organization"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].location",
+      "field_type": "text",
+      "question_label_variants": [
+        "Location",
+        "Work Location",
+        "City, State"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].currently_work_here",
+      "field_type": "checkbox",
+      "question_label_variants": [
+        "I currently work here",
+        "Currently employed here",
+        "Current employer"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].from",
+      "field_type": "date_month",
+      "question_label_variants": [
+        "Start Date",
+        "Employment Start Date"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].to",
+      "field_type": "date_month",
+      "question_label_variants": [
+        "To",
+        "End Date",
+        "Employment End Date"
+      ]
+    },
+    {
+      "canonical_field": "work_experience[].bullets",
+      "field_type": "textarea_bullets",
+      "question_label_variants": [
+        "Role Description",
+        "Responsibilities",
+        "Description",
+        "Job Description"
+      ]
+    },
+    {
+      "canonical_field": "projects[].name",
+      "field_type": "text",
+      "question_label_variants": [
+        "Project Name"
+      ]
+    },
+    {
+      "canonical_field": "projects[].summary",
+      "field_type": "textarea",
+      "question_label_variants": [
+        "Project Description",
+        "Summary"
+      ]
+    },
+    {
+      "canonical_field": "education[].school_or_university",
+      "field_type": "text",
+      "question_label_variants": [
+        "School or University",
+        "School",
+        "University",
+        "Institution"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.degree",
+      "field_type": "select",
+      "question_label_variants": [
+        "Degree",
+        "Degree Level",
+        "Education Level"
+      ]
+    },
+    {
+      "canonical_field": "education[].gpa",
+      "field_type": "text",
+      "question_label_variants": [
+        "Overall Result (GPA)",
+        "GPA",
+        "Overall GPA",
+        "Grade Point Average",
+        "Current GPA",
+        "Cumulative GPA"
+      ]
+    },
+    {
+      "canonical_field": "education[].from_year",
+      "field_type": "year",
+      "question_label_variants": [
+        "Start Year",
+        "Attendance From"
+      ]
+    },
+    {
+      "canonical_field": "education[].to_year",
+      "field_type": "year",
+      "question_label_variants": [
+        "To (Actual or Expected)",
+        "End Year",
+        "Graduation Year",
+        "Expected Graduation Year"
+      ]
+    },
+    {
+      "canonical_field": "education[].graduation_date",
+      "field_type": "date_month",
+      "question_label_variants": [
+        "Expected Graduation Date",
+        "Graduation Date",
+        "Degree Completion Date",
+        "When will you graduate?"
+      ]
+    },
+    {
+      "canonical_field": "education[].currently_enrolled",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you currently enrolled in school?",
+        "Currently Enrolled"
+      ]
+    },
+    {
+      "canonical_field": "education[].enrollment_status",
+      "field_type": "select",
+      "question_label_variants": [
+        "Enrollment Status",
+        "Student Status",
+        "Full-time or Part-time Student"
+      ]
+    },
+    {
+      "canonical_field": "education[].years_of_school_completed",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Years of School Completed",
+        "How many years of schooling have you completed?",
+        "Year in School"
+      ]
+    },
+    {
+      "canonical_field": "education[].returning_to_school_after_internship",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Will you be returning to school after the internship?",
+        "Returning to school after internship",
+        "Do you plan to return to your studies?"
+      ]
+    },
+    {
+      "canonical_field": "languages[].language",
+      "field_type": "text",
+      "question_label_variants": [
+        "Language",
+        "Languages"
+      ]
+    },
+    {
+      "canonical_field": "languages[].proficiency",
+      "field_type": "select",
+      "question_label_variants": [
+        "Proficiency",
+        "Language Proficiency",
+        "Fluency"
+      ]
+    },
+    {
+      "canonical_field": "skills",
+      "field_type": "tag_list",
+      "question_label_variants": [
+        "Skills",
+        "Type to Add Skills",
+        "Core Skills",
+        "Technical Skills"
+      ]
+    },
+    {
+      "canonical_field": "documents.resume_cv",
+      "field_type": "file",
+      "question_label_variants": [
+        "Resume/CV",
+        "Upload a file",
+        "Resume",
+        "CV"
+      ]
+    },
+    {
+      "canonical_field": "documents.cover_letter",
+      "field_type": "file",
+      "question_label_variants": [
+        "Cover Letter"
+      ]
+    },
+    {
+      "canonical_field": "documents.transcript",
+      "field_type": "file",
+      "question_label_variants": [
+        "Transcript",
+        "Unofficial Transcript",
+        "Academic Transcript"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.authorized_to_work_in_us",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you legally authorized to work in the United States?",
+        "Are you authorized to work in the U.S.?",
+        "Do you have the legal right to work in the United States?",
+        "Are you eligible to work for any employer in the U.S.?",
+        "I have the legal right to work in the United States without restriction or sponsorship (now or in the future)."
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.requires_sponsorship_now",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Do you currently require visa sponsorship?",
+        "Do you require sponsorship now?",
+        "Will you require sponsorship to begin employment?"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.requires_sponsorship_future",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Will you now or in the future require sponsorship?",
+        "Will you require visa sponsorship in the future?",
+        "Do you require immigration sponsorship at any point?"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.current_visa_status",
+      "field_type": "text",
+      "question_label_variants": [
+        "Current Visa Status",
+        "Immigration Status",
+        "Visa Type"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.citizenship_country",
+      "field_type": "multi_select",
+      "question_label_variants": [
+        "Country of Citizenship",
+        "Citizenship",
+        "Are you a citizen of any of the following countries?"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.permanent_resident",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you a permanent resident?",
+        "U.S. Permanent Resident",
+        "Green Card Holder"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.export_control_restrictions",
+      "field_type": "text",
+      "question_label_variants": [
+        "Export Control Restrictions",
+        "Export Compliance",
+        "Are you subject to export control restrictions?"
+      ]
+    },
+    {
+      "canonical_field": "work_authorization.restricted_country_status",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Are you a citizen of Cuba, Iran, North Korea, Syria, or another restricted country?",
+        "Restricted Country Status",
+        "Prohibited Country Citizenship"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.student_status.available_internship_term",
+      "field_type": "multi_select",
+      "question_label_variants": [
+        "Available Internship Term",
+        "Internship Term",
+        "Term Availability",
+        "Which term are you applying for?"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.student_status.can_work_full_time_during_internship",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Can you work full time during the internship?",
+        "Available full time during internship"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.previously_worked_for_company",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Have you previously worked for this company?",
+        "Previously employed here",
+        "Past employment with company"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.previously_applied_to_company",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Have you previously applied here?",
+        "Previous application with company"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.have_relatives_at_company",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Do you have any relatives working at the company?",
+        "Are you related to any current employee?",
+        "Family members employed here"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.relative_details",
+      "field_type": "textarea",
+      "question_label_variants": [
+        "Relative Details",
+        "Please provide relative information"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.know_anyone_at_company",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Do you know anyone who works here?",
+        "Do your parents know anyone working at the company?",
+        "Connections at company"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.employee_referral",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Were you referred by an employee?",
+        "Employee Referral"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.referral_name",
+      "field_type": "text",
+      "question_label_variants": [
+        "Referral Name",
+        "Employee Referrer Name"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.worked_for_competitor",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Have you worked for a competitor?",
+        "Current or prior employment with competitor",
+        "Worked at competing company"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.employment_relationships.competitor_details",
+      "field_type": "textarea",
+      "question_label_variants": [
+        "Competitor Details",
+        "Please list competitor employer"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.at_least_18_years_old",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you at least 18 years old?",
+        "18 years of age or older"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.willing_background_check",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you willing to undergo a background check?",
+        "Background Check Consent",
+        "Consent to background investigation"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.willing_drug_test",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you willing to undergo a drug test?",
+        "Drug and Alcohol Test Consent",
+        "Consent to drug screening"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.has_valid_drivers_license",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Do you have a valid driver's license?",
+        "Valid Driver License"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.willing_to_sign_confidentiality_agreement",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you willing to sign a confidentiality agreement?",
+        "Confidentiality Agreement"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.willing_to_sign_ip_assignment",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you willing to sign an invention assignment agreement?",
+        "IP Assignment Agreement",
+        "Patentable inventions assignment"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.can_provide_i9_documents",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Can you provide documentation of your legal right to work in the U.S.?",
+        "I-9 Documentation",
+        "Can provide work authorization documents"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.security_clearance",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Security Clearance",
+        "Current Security Clearance",
+        "Clearance Level"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.needs_accommodation_for_interview",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Do you need accommodation for the interview process?",
+        "Interview Accommodation",
+        "Application Accommodation Request"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.background_and_compliance.accommodation_details",
+      "field_type": "textarea",
+      "question_label_variants": [
+        "Accommodation Details",
+        "Please describe accommodation needs"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.earliest_start_date",
+      "field_type": "date",
+      "question_label_variants": [
+        "Earliest Start Date",
+        "Available Start Date",
+        "When can you start?"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.latest_start_date",
+      "field_type": "date",
+      "question_label_variants": [
+        "Latest Start Date"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.available_weeks",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Number of weeks available",
+        "Available Weeks",
+        "Internship length available"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.available_hours_per_week",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Hours per week available",
+        "Weekly availability"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.willing_to_relocate",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you willing to relocate?",
+        "Relocation",
+        "Willing to move for this role"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.preferred_locations",
+      "field_type": "multi_select",
+      "question_label_variants": [
+        "Preferred Locations",
+        "Location Preferences"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.remote_ok",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Open to remote work",
+        "Remote work acceptable"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.willing_to_travel",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Are you willing to travel?",
+        "Travel Requirement Acceptance"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.salary_expectation",
+      "field_type": "text",
+      "question_label_variants": [
+        "Salary Expectation",
+        "Expected Salary",
+        "Annual Salary Requirement"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.availability_and_preferences.hourly_expectation",
+      "field_type": "text",
+      "question_label_variants": [
+        "Hourly Rate Expectation",
+        "Expected Hourly Pay",
+        "Hourly Compensation Requirement"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.role_specific.years_of_experience_total",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Years of Experience",
+        "Total Years of Experience",
+        "Professional Experience"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.role_specific.years_of_experience_relevant",
+      "field_type": "text_or_select",
+      "question_label_variants": [
+        "Relevant Years of Experience",
+        "Experience in Related Field"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.role_specific.certifications",
+      "field_type": "tag_list",
+      "question_label_variants": [
+        "Certifications",
+        "Professional Certifications",
+        "Licenses and Certifications"
+      ]
+    },
+    {
+      "canonical_field": "application_questions.role_specific.coursework_relevant",
+      "field_type": "tag_list",
+      "question_label_variants": [
+        "Relevant Coursework",
+        "Coursework"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.gender",
+      "field_type": "select",
+      "question_label_variants": [
+        "Which most closely describes your gender?",
+        "Gender"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.hispanic_or_latino",
+      "field_type": "select",
+      "question_label_variants": [
+        "Please check if you are Hispanic or Latino.",
+        "Hispanic or Latino"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.race_ethnicity",
+      "field_type": "select",
+      "question_label_variants": [
+        "Please indicate your race/ethnicity.",
+        "Race/Ethnicity"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.veteran_status",
+      "field_type": "select",
+      "question_label_variants": [
+        "Please indicate your veteran status",
+        "Veteran Status"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.disability_status",
+      "field_type": "select",
+      "question_label_variants": [
+        "Please check one of the boxes below:",
+        "Voluntary Self-Identification of Disability",
+        "Disability Status"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.disability_form_name",
+      "field_type": "text",
+      "question_label_variants": [
+        "Name",
+        "Your Name"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.disability_form_employee_id",
+      "field_type": "text",
+      "question_label_variants": [
+        "Employee ID (if applicable)"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.disability_form_date",
+      "field_type": "date",
+      "question_label_variants": [
+        "Today's Date"
+      ]
+    },
+    {
+      "canonical_field": "self_identification.marital_status",
+      "field_type": "select",
+      "question_label_variants": [
+        "Marital Status",
+        "What is your marital status?"
+      ]
+    },
+    {
+      "canonical_field": "agreements.personal_data_statement_consent",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Personal Data Statement",
+        "Privacy Notice Consent",
+        "I consent to the terms of this Privacy Notice"
+      ]
+    },
+    {
+      "canonical_field": "agreements.terms_and_conditions_acceptance",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "I willingly accept the Terms and Conditions for submitting an application with [COMPANY].",
+        "Terms and Conditions",
+        "Conditions of Employment",
+        "Yes, I have read and consent to the terms and conditions"
+      ]
+    },
+    {
+      "canonical_field": "agreements.truthfulness_certification",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "I hereby affirm that the information provided on this application is true and complete",
+        "Certification of Truthfulness",
+        "I confirm that my answers to questions in this online interview are complete and accurate and that AssetMark may rely on my answers. I understand that in the event I am a finalist or am extended an offer of employment, AssetMark will verify the accuracy of the answers I have provided here. (Selecting \"No\" will automatically decline your application)"
+      ]
+    },
+    {
+      "canonical_field": "agreements.background_check_consent",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "I authorize investigation of all statements contained in this application",
+        "Background investigation consent"
+      ]
+    },
+    {
+      "canonical_field": "agreements.drug_alcohol_test_consent",
+      "field_type": "boolean",
+      "question_label_variants": [
+        "Drug and alcohol test",
+        "Consent to drug and alcohol testing"
+      ]
+    },
+    {
+      "canonical_field": "agreements.electronic_signature_name",
+      "field_type": "text",
+      "question_label_variants": [
+        "Electronic Signature",
+        "Type your full name"
+      ]
+    },
+    {
+      "canonical_field": "agreements.electronic_signature_date",
+      "field_type": "date",
+      "question_label_variants": [
+        "Signature Date"
+      ]
+    },
+    {
+      "canonical_field": "education[0].expected_graduation_date",
+      "field_type": "text",
+      "question_label_variants": [
+        "What is your expected graduation date?"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.how_did_you_hear",
+      "field_type": "select",
+      "question_label_variants": [
+        "How Did You Hear About Us?",
+        "How did you hear about us",
+        "How did you hear about us?",
+        "How did you find out about this position?",
+        "How did you find out about this job?",
+        "Source",
+        "Referral Source"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.field_of_study",
+      "field_type": "typeahead",
+      "question_label_variants": [
+        "Field of Study",
+        "Field of study",
+        "Major",
+        "Area of Study",
+        "Course of Study",
+        "Program",
+        "My degree is in"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.gpa_range",
+      "field_type": "dropdown",
+      "question_label_variants": [
+        "My current GPA is",
+        "GPA Range",
+        "What is your current GPA range"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.location_preference",
+      "field_type": "dropdown",
+      "question_label_variants": [
+        "With regards to this internship posting location:",
+        "With regards to this posting location",
+        "Location preference"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.degree_status",
+      "field_type": "dropdown",
+      "question_label_variants": [
+        "I am currently pursuing a Bachelor's or Master's degree in a related field to this internship:",
+        "Are you currently pursuing a degree",
+        "Current degree status"
+      ]
+    },
+    {
+      "canonical_field": "application_defaults.full_employment_availability",
+      "field_type": "dropdown",
+      "question_label_variants": [
+        "Will you graduate and be available for full employment by Spring 2027?",
+        "Will you graduate and be available for full employment",
+        "Available for full employment"
+      ]
+    },
+    {
+      "canonical_field": "websites[0].url",
+      "field_type": "text",
+      "question_label_variants": [
+        "LinkedIn (please include https://www.linkedin)",
+        "LinkedIn",
+        "LinkedIn URL",
+        "LinkedIn Profile",
+        "LinkedIn Account"
+      ]
+    }
+  ],
+  "fallback_rules": {
+    "unknown_questions_go_to": "application_questions.open_ended",
+    "locked_fields": [
+      "personal_info.first_name",
+      "personal_info.last_name",
+      "personal_info.email",
+      "personal_info.phone_number",
+      "work_authorization.authorized_to_work_in_us",
+      "work_authorization.requires_sponsorship_now",
+      "work_authorization.requires_sponsorship_future",
+      "education[0].gpa",
+      "education[0].graduation_date"
+    ],
+    "never_infer": [
+      "work_authorization.citizenship_country",
+      "work_authorization.restricted_country_status",
+      "self_identification.gender",
+      "self_identification.race_ethnicity",
+      "self_identification.veteran_status",
+      "self_identification.disability_status"
+    ],
+    "_auto_accept_doc": "Structurally-required consents: every ApplyPilot user implicitly grants these by virtue of using the tool to submit applications. NOT personal preferences and do NOT belong in profile.json. Resolver Tier 2.6 returns True for these when the profile value is empty. Setting the field to literal False in profile.json overrides to False AND flags needs_review=True so the operator sees the override in <page>_review.json. Do NOT add personal_data_statement_consent, background_check_consent, drug_alcohol_test_consent, or marketing opt-ins here — those are real user choices.",
+    "auto_accept": [
+      "agreements.terms_and_conditions_acceptance",
+      "agreements.truthfulness_certification"
+    ]
+  }
+}

@@ -1,0 +1,284 @@
+{
+  "schema_version": "2.0",
+
+  "employment_history_companies": [],
+  "_employment_history_companies_note": "INDUSTRY EMPLOYERS ONLY — companies you were formally employed by (on payroll). EXCLUDES academic/university research positions, lab affiliations, and student clubs (e.g. FSU CISCOR lab research, Carnegie Mellon Racing are NOT employment). This list's completeness is what makes the auto-'No' to 'previously employed here?' safe — keep it accurate and complete. NOT derived from work_experience; maintain it by hand. An empty list [] is treated as UNFILLED and will flag every such question for manual review. If you have genuinely never been formally employed in industry, set this to [\"none\"] to auto-answer 'No'. These names are ALSO matched against the QUESTION TEXT itself, which often names the entities that count (affiliates/subsidiaries/predecessors, e.g. \"Elavon, U.S. Bancorp Investments, or Union Bank\") — so list the specific legal-entity names you were employed by, not just a parent brand; a known employer named in the question fills 'Yes' (always flagged for review).",
+
+  "auth_strategy": {
+    "platform": "workday",
+    "login_mode": "try_login_then_create",
+    "create_account_if_login_fails": true,
+    "account_email": "",
+    "default_language": "English",
+    "credential_storage": "external_keyring"
+  },
+
+  "personal_info": {
+    "_country_fields_note": "country and country_phone_code take a TIERED candidate list (most-specific first), not a plain string, because the rendered Workday option text differs from the everyday value: the country dropdown shows \"United States of America\" and the phone-code typeahead shows \"United States of America (+1)\". Listing the exact option text first yields a high-confidence EXACT match; a bare \"United States\" only containment-matches (medium confidence). A plain string still works for both. This tiered form is NOT needed for most fields — only ones whose rendered option text differs from the natural value.",
+    "country": ["United States of America", "United States"],
+    "first_name": "",
+    "last_name": "",
+    "has_preferred_name": false,
+    "preferred_name": "",
+    "address_line_1": "",
+    "address_line_2": "",
+    "city": "",
+    "state_province": "",
+    "postal_code": "",
+    "email": "",
+    "phone_device_type": "Mobile",
+    "country_phone_code": ["United States of America (+1)", "United States of America", "United States"],
+    "phone_number": "",
+    "phone_extension": ""
+  },
+
+  "websites": [
+    {
+      "type": "linkedin",
+      "label": "LinkedIn",
+      "url": ""
+    },
+    {
+      "type": "github",
+      "label": "GitHub",
+      "url": ""
+    },
+    {
+      "type": "portfolio",
+      "label": "Portfolio",
+      "url": ""
+    },
+    {
+      "type": "other",
+      "label": "",
+      "url": ""
+    }
+  ],
+
+  "education": [
+    {
+      "_degree_field_of_study_note": "degree and field_of_study are CHOICE fields (dropdown / typeahead) whose option text varies by tenant, so give each an ORDERED, most-specific-first candidate list ending in a safe fallback — the filler tries them in order and takes the first match (same tiered model as personal_info.country). A plain string still works. Example: degree: [\"Bachelor of Science\", \"Bachelor's Degree\", \"Bachelors\"] (many Workday dropdowns only offer \"Bachelors\"); field_of_study: [\"Electrical and Computer Engineering\", \"Other\", \"computer engineering\", \"electrical engineering\"]. Keep these tiers in the PROFILE — the filler is generic.",
+      "school_or_university": "",
+      "degree": [],
+      "field_of_study": [],
+      "minor": "",
+      "gpa": "",
+      "gpa_scale": "",
+      "from_year": "",
+      "to_year": "",
+      "graduation_date": "YYYY-MM",
+      "currently_enrolled": null,
+      "enrollment_status": "",
+      "years_of_school_completed": "",
+      "returning_to_school_after_internship": null
+    }
+  ],
+
+  "work_experience": [
+    {
+      "job_title": "",
+      "company": "",
+      "location": "",
+      "currently_work_here": false,
+      "from": "YYYY-MM",
+      "to": "YYYY-MM",
+      "bullets": [],
+      "tech_stack": []
+    }
+  ],
+
+  "projects": [
+    {
+      "name": "",
+      "role": "",
+      "from": "YYYY-MM",
+      "to": "YYYY-MM",
+      "summary": "",
+      "bullets": [],
+      "tech_stack": [],
+      "link": "",
+      "github": ""
+    }
+  ],
+
+  "_languages_note": "Each language has per-skill proficiency (reading/speaking/writing) — the Workday Languages section has a separate required dropdown for each. Use the rendered option text (this tenant: Advanced/Basic/Fluent/Intermediate/None); like degree, a value MAY be a tiered most-specific-first array if a tenant's vocabulary differs. `language` must match an option in the Language dropdown (e.g. \"English\", \"Chinese\"). If a language or proficiency can't match an option, the engine deletes that (optional) entry rather than block submit.",
+  "languages": [
+    {
+      "language": "",
+      "reading": "",
+      "speaking": "",
+      "writing": ""
+    }
+  ],
+
+  "_certifications_note": "Top-level certifications fill the Workday Certifications section (separate from application_questions.role_specific.certifications). `certification` is a typeahead PICK from the tenant's list — give it the exact option text (string, or a tiered most-specific-first array like degree). Dates are FULL `YYYY-MM-DD`; a partial (`YYYY-MM`) or placeholder date is skipped (not half-filled). An entry whose `certification` can't match an option is DROPPED (delete-on-no-match) rather than blocking submit, since the section is optional.",
+  "certifications": [
+    {
+      "certification": "",
+      "certification_number": "",
+      "issued_date": "YYYY-MM-DD",
+      "expiration_date": "YYYY-MM-DD"
+    }
+  ],
+
+  "skills": [],
+
+  "documents": {
+    "resume_cv": {
+      "file_path": "",
+      "file_name": ""
+    },
+    "cover_letter": {
+      "file_path": "",
+      "file_name": ""
+    },
+    "transcript": {
+      "file_path": "",
+      "file_name": ""
+    },
+    "additional_files": [
+      {
+        "label": "",
+        "file_path": "",
+        "file_name": ""
+      }
+    ]
+  },
+
+  "work_authorization": {
+    "authorized_to_work_in_us": null,
+    "requires_sponsorship_now": null,
+    "requires_sponsorship_future": null,
+    "current_visa_status": "",
+    "citizenship_country": [],
+    "permanent_resident": null,
+    "export_control_restrictions": "",
+    "restricted_country_status": ""
+  },
+
+  "story_bank": [
+    {
+      "id": "",
+      "title": "",
+      "themes": [],
+      "context": "",
+      "challenge": "",
+      "action": "",
+      "result": "",
+      "what_i_learned": ""
+    }
+  ],
+
+  "essay_drafts": {
+    "why_this_company_general": "",
+    "why_this_role_general": "",
+    "tell_me_about_yourself": "",
+    "greatest_strength": "",
+    "greatest_weakness": "",
+    "leadership_example": "",
+    "teamwork_example": "",
+    "challenge_overcome": "",
+    "failure_lesson": "",
+    "conflict_example": "",
+    "initiative_example": "",
+    "proudest_project": "",
+    "five_year_plan": "",
+    "why_should_we_hire_you": ""
+  },
+
+  "application_questions": {
+    "student_status": {
+      "available_internship_term": [],
+      "can_work_full_time_during_internship": null
+    },
+
+    "employment_relationships": {
+      "previously_worked_for_company": null,
+      "previously_applied_to_company": null,
+      "have_relatives_at_company": null,
+      "relative_details": "",
+      "know_anyone_at_company": null,
+      "employee_referral": null,
+      "referral_name": "",
+      "worked_for_competitor": null,
+      "competitor_details": ""
+    },
+
+    "background_and_compliance": {
+      "at_least_18_years_old": null,
+      "willing_background_check": null,
+      "willing_drug_test": null,
+      "has_valid_drivers_license": null,
+      "willing_to_sign_confidentiality_agreement": null,
+      "willing_to_sign_ip_assignment": null,
+      "can_provide_i9_documents": null,
+      "security_clearance": "",
+      "needs_accommodation_for_interview": null,
+      "accommodation_details": ""
+    },
+
+    "availability_and_preferences": {
+      "earliest_start_date": "YYYY-MM-DD",
+      "latest_start_date": "YYYY-MM-DD",
+      "available_weeks": "",
+      "available_hours_per_week": "",
+      "willing_to_relocate": null,
+      "preferred_locations": [],
+      "remote_ok": null,
+      "willing_to_travel": null,
+      "salary_expectation": "",
+      "hourly_expectation": ""
+    },
+
+    "role_specific": {
+      "years_of_experience_total": "",
+      "years_of_experience_relevant": "",
+      "years_of_experience_with_skill": [
+        {
+          "skill": "",
+          "years": ""
+        }
+      ],
+      "certifications": [],
+      "coursework_relevant": []
+    },
+
+    "open_ended": [
+      {
+        "question_text": "",
+        "answer": ""
+      }
+    ],
+
+    "writing_style": ""
+  },
+
+  "self_identification": {
+    "gender": "",
+    "hispanic_or_latino": "",
+    "race_ethnicity": "",
+    "veteran_status": "",
+    "disability_status": "",
+    "marital_status": "",
+    "disability_form_name": "",
+    "disability_form_employee_id": "",
+    "disability_form_date": "MM/DD/YYYY"
+  },
+
+  "_consent_override_note": "Structural consents (terms_and_conditions_acceptance, truthfulness_certification) default to True via the schema's auto_accept rule when left null/empty here. Setting one to literal false overrides to False AND surfaces in <page>_review.json — used if you intend not to consent and not submit. Other agreements (personal_data_statement_consent, background_check_consent, drug_alcohol_test_consent) are real choices: leave null to skip, true to fill, false to refuse.",
+  "agreements": {
+    "personal_data_statement_consent": null,
+    "terms_and_conditions_acceptance": null,
+    "truthfulness_certification": null,
+    "background_check_consent": null,
+    "drug_alcohol_test_consent": null,
+    "electronic_signature_name": "",
+    "electronic_signature_date": "MM/DD/YYYY"
+  },
+
+  "autofill_rules": {
+    "generation_allowed_only_for": [
+      "application_questions.open_ended"
+    ]
+  }
+}
