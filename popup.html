@@ -35,6 +35,19 @@
          first, click, then MINIMIZE within 60s. Typeahead/source are deferred →
          NEEDS REVIEW; repeating sections untouched. Results in the SW console. -->
     <button id="cdp-fill">CDP fill (hidden): simple widgets</button>
+    <!-- TYPEAHEAD RECON (M25 Step 1): probe ONE chipless typeahead hidden — filter
+         trigger, settle timing, keyboard commit + chip signal, no-match banner,
+         option-scope (aria-controls vs page-wide). Run on My Experience (Field of
+         Study virgin → ends holding "Other", the desired value) and once on My
+         Information (pre-filled countryPhoneCode is reported read-only). Minimize
+         within 60s; results land in the SW console as [TA-RECON]. -->
+    <button id="cdp-ta-recon">CDP recon: typeahead (minimize!)</button>
+    <!-- M25 verify harness: fill ONE typeahead (matched by label regex) through the
+         CDP brain while hidden — reaches entry fields (Field of Study, Certification)
+         without the multi-entry machinery. Minimize within 60s; [CDP-TA] in SW console. -->
+    <label for="ta-label">CDP typeahead target (label regex):</label>
+    <input id="ta-label" type="text" placeholder="e.g. Field of Study">
+    <button id="cdp-fill-ta">CDP fill one typeahead (minimize!)</button>
     <hr>
     <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
     <label for="company">Company for this application (temporary):</label>

@@ -12,7 +12,9 @@ const T_BUDGETS = {
   openCeilingMs: 60, settleIntervalMs: 1, stableReads: 2,
   commitCeilingMs: 25, commitIntervalMs: 1,
   textReadDelayMs: 1, typeJumpDelayMs: 1, arrowStepMs: 1, maxArrowSteps: 60,
-  interFieldMs: 0
+  interFieldMs: 0,
+  taOpenCeilingMs: 50, taOpenIntervalMs: 1, taActionSettleMs: 1,
+  taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25
 };
 
 // ── fake actuation ───────────────────────────────────────────────────────────
@@ -24,12 +26,23 @@ const T_BUDGETS = {
 //   radio:    { options:[{id,labelText,checked}], radioClickRectDead?,
 //               radioClickNoCommit?, spaceFails? }
 //   checkbox: { inputId, checked, checkboxClickRectDead?, spaceFails? }
+//   typeahead:{ chips:[], openTexts? (rendered list at open — the stable
+//               pre-filter case), fallbackTexts? (the full list a no-match
+//               re-renders UNDER the banner), filterMap: { query →
+//               {filtered:[...]} | {banner:true} | {autoCommit:"text"} },
+//               enterCommitFails? }. Mirrors the recon-observed mechanics:
+//               the first Enter after typing applies filterMap (bumping a
+//               revision counter — the real page transitions through a
+//               cleared list, so the sig always changes on a response); a
+//               SECOND Enter commits the first filtered option as the chip;
+//               a banner and the list PERSIST across clearSearch (stale).
 function makeFakeAct(fields) {
   const log = [];
   const byLoc = (loc) => fields.find((f) => f.wrapperSel === loc.wrapperSel);
   let focusedText = null;
   let focusedInputId = null;
   let openField = null;
+  let focusedTa = null;
   const enabledIdxs = (f) => f.options.map((o, i) => ({ o, i })).filter((x) => !x.o.disabled).map((x) => x.i);
 
   return {
@@ -104,6 +117,24 @@ function makeFakeAct(fields) {
     },
     pressEnter: async () => {
       log.push(["pressEnter"]);
+      // Typeahead first (focused-searchBox semantics).
+      const ta = focusedTa;
+      if (ta && ta._open) {
+        if (!ta._filtered) {
+          const fm = (ta.filterMap || {})[ta._value];
+          if (fm) {
+            ta._rev = (ta._rev || 0) + 1; // page transitions through a cleared list — sig changes on a response
+            if (fm.banner) { ta._banner = true; ta._texts = (ta.fallbackTexts || ta._texts || []).slice(); ta._filtered = true; }
+            else if (fm.autoCommit) { ta.chips = [fm.autoCommit]; ta._open = false; ta._banner = false; }
+            else if (fm.filtered) { ta._texts = fm.filtered.slice(); ta._banner = false; ta._filtered = true; }
+          }
+          // no filterMap entry → the page never responds (the stable pre-filter case)
+        } else if (!ta.enterCommitFails && (ta._texts || []).length && !ta._banner) {
+          ta.chips = [ta._texts[0]]; // commit-Enter takes the auto-highlighted FIRST option
+          ta._open = false;
+        }
+        return;
+      }
       const f = openField;
       if (!f || !f.open) return;
       if (f.enterFails) { f.open = false; return; }
@@ -111,7 +142,63 @@ function makeFakeAct(fields) {
       if (f.activeIdx != null) f.triggerText = f.options[f.activeIdx].text;
       f.open = false;
     },
-    pressEscape: async () => { log.push(["pressEscape"]); if (openField) openField.open = false; },
+    pressEscape: async () => {
+      log.push(["pressEscape"]);
+      if (focusedTa) focusedTa._open = false;
+      if (openField) openField.open = false;
+    },
+
+    // typeahead
+    openTypeahead: async (loc) => {
+      log.push(["openTypeahead", loc.wrapperSel]);
+      const f = byLoc(loc);
+      f._open = true;
+      if (!f.focusUnconfirmable) f._focusedSb = true; // focusUnconfirmable: opens/visible but focus never confirms
+      if (f._texts === undefined) f._texts = (f.openTexts || []).slice();
+      if (f._banner === undefined) f._banner = false;
+      focusedTa = f;
+      return true;
+    },
+    focusSearchBox: async (loc) => {
+      log.push(["focusSearchBox", loc.wrapperSel]);
+      const f = byLoc(loc);
+      if (!f.focusUnconfirmable) f._focusedSb = true;
+      focusedTa = f;
+      return true;
+    },
+    readTypeahead: async (loc) => {
+      const f = byLoc(loc);
+      const texts = f._open ? (f._texts || []) : [];
+      const sig = (f._rev || 0) + "|" + texts.length + "|" + texts.slice(0, 3).join("~");
+      return {
+        searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: f._value || "" },
+        chips: (f.chips || []).slice(),
+        banner: f._open && f._banner ? { text: "No matches found", automationId: "promptTitle" } : null,
+        pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) },
+        activeText: null
+      };
+    },
+    typeInSearch: async (text) => {
+      log.push(["typeInSearch", text]);
+      if (focusedTa) { focusedTa._value = text; focusedTa._filtered = false; }
+    },
+    clearSearch: async () => {
+      log.push(["clearSearch"]);
+      if (focusedTa) { focusedTa._value = ""; focusedTa._filtered = false; }
+      // stale banner + rendered list deliberately PERSIST (recon finding)
+    },
+    // Trusted-click commit fallback. Default: commits the named option (trusted
+    // clicks work); flags: clickCommitFails (dispatched, page ignores it),
+    // clickCommitsWrongText (mis-commit — the chip gate must catch it).
+    clickTaOption: async (loc, text) => {
+      log.push(["clickTaOption", text]);
+      const f = byLoc(loc);
+      if (!f._open || !(f._texts || []).some((t) => t === text)) return false; // option not visible
+      if (f.clickCommitFails) return true; // click dispatched, nothing committed
+      f.chips = [f.clickCommitsWrongText || text];
+      f._open = false;
+      return true;
+    },
     clickOptionByIndex: async (loc, index) => {
       log.push(["clickOptionByIndex", index]);
       const f = byLoc(loc);
@@ -342,20 +429,265 @@ test("checkbox: unmapped (preferredCheck) → skipped with zero actuation", asyn
   assert.strictEqual(act.log.length, 0);
 });
 
-// ── deferred widgets: honest records, ZERO actuation ─────────────────────────
+// ── deferred / unmapped widgets: honest records, ZERO actuation ──────────────
 
-test("typeahead and source → needs_review with ZERO actuation calls", async () => {
+test("source → needs_review and unmapped typeahead → skipped, both with ZERO actuation", async () => {
   const act = makeFakeAct([
-    { wrapperSel: "[w-ta]", fieldName: "countryPhoneCode", widgetType: "typeahead", label: "Phone Code" },
-    { wrapperSel: "[w-src]", fieldName: "source", widgetType: "hierarchical", label: "How Did You Hear About Us?" }
+    { wrapperSel: "[w-src]", fieldName: "source", widgetType: "hierarchical", label: "How Did You Hear About Us?" },
+    { wrapperSel: "[w-ta2]", fieldName: "mysteryPicker", widgetType: "typeahead", label: "Mystery", chips: [], filterMap: {} }
   ]);
   const out = await drivePageFill(act, nameProfile, {}, {}, T_BUDGETS);
   assert.strictEqual(out.results[0].status, "needs_review");
-  assert.match(out.results[0].detail, /typeahead deferred/);
-  assert.strictEqual(out.results[1].status, "needs_review");
-  assert.match(out.results[1].detail, /source deferred/);
-  assert.strictEqual(act.log.length, 0, "deferred widgets must never be actuated");
-  assert.strictEqual(out.needsReview.length, 2);
+  assert.match(out.results[0].detail, /source deferred/);
+  assert.strictEqual(out.results[1].status, "skipped");
+  assert.strictEqual(out.results[1].detail, "no mapping");
+  assert.strictEqual(act.log.length, 0, "deferred/unmapped widgets must never be actuated");
+});
+
+// ── typeahead (M25 — the proven Magna brain on CDP; accuracy regression suite) ──
+// This field type silently FALSE-FILLED before; these tests pin the guards.
+
+const taField = (flags) => Object.assign({
+  wrapperSel: "[w-ta]", fieldName: "countryPhoneCode", widgetType: "typeahead",
+  label: "Country Phone Code*", chips: [], filterMap: {}
+}, flags || {});
+const taProfile = (candidates) => ({ personal_info: { country_phone_code: candidates } });
+const enters = (act) => act.log.filter(([m]) => m === "pressEnter").length;
+
+test("typeahead: banner hard-block — never commits from the fallback full list", async () => {
+  // The fallback list rendered UNDER the banner CONTAINS the candidate's value —
+  // the exact false-fill condition. The banner must block any pick.
+  const act = makeFakeAct([taField({
+    fallbackTexts: ["Afghanistan (+93)", "Albania (+355)", "United States of America (+1)"],
+    filterMap: { "United States of America (+1)": { banner: true } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, null);
+  assert.strictEqual(enters(act), 1, "only the filter-Enter — a commit-Enter must never fire on a banner");
+});
+
+test("typeahead: the stable pre-filter list is never matched (transition-aware settle)", async () => {
+  // The list rendered at open contains a plausible value and the page never
+  // responds to the filter — mere stability must NOT be treated as filtered.
+  const act = makeFakeAct([taField({
+    openTexts: ["Accounting", "United States of America (+1)", "Zoology"],
+    filterMap: {}
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, null);
+  assert.strictEqual(enters(act), 1, "no commit-Enter against a never-transitioned list");
+});
+
+test("typeahead: a stale banner does not block the next candidate", async () => {
+  // cand-0 banners; the banner + list persist through the clear (recon).
+  // cand-1's fresh filter must still settle and commit.
+  const act = makeFakeAct([taField({
+    fallbackTexts: ["Other", "Other Technology", "Electrical Engineering"],
+    filterMap: {
+      "Electrical and Computer Engineering": { banner: true },
+      "Other": { filtered: ["Other", "Other Technology"] }
+    }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");
+  assert.strictEqual(rec.verified, true);
+  assert.strictEqual(rec.settle_trace[1].staleBannerAtStart, true, "the stale banner was present when cand-1 started");
+});
+
+test("typeahead: per-candidate isolation — a later tier's value in the fallback list is never picked early", async () => {
+  // The Magna contamination shape: cand-0 banners while the visible fallback
+  // list contains cand-1's value ("Other"). It must be committed only from
+  // cand-1's OWN filtered set, never scraped during cand-0.
+  const act = makeFakeAct([taField({
+    fallbackTexts: ["Accounting", "Other", "Electrical Engineering"],
+    filterMap: {
+      "Electrical and Computer Engineering": { banner: true },
+      "Other": { filtered: ["Other", "Other Technology"] }
+    }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "Other");
+  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["Electrical and Computer Engineering", "Other"]);
+  assert.strictEqual(enters(act), 3, "cand-0: filter-Enter only (banner); cand-1: filter-Enter + commit-Enter");
+});
+
+test("typeahead: single exact match auto-commits on the filter-Enter; chip verified", async () => {
+  const act = makeFakeAct([taField({
+    filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.matchTier, "enter-auto-commit");
+  assert.strictEqual(rec.verified, true);
+  assert.strictEqual(enters(act), 1);
+});
+
+test("typeahead: an auto-commit chip that mismatches the candidate is NEVER reported filled", async () => {
+  const act = makeFakeAct([taField({
+    filterMap: { "United States of America (+1)": { autoCommit: "Canada (+1)" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, "Canada (+1)"); // surfaced, not accepted
+  assert.strictEqual(rec.verified, false);
+  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["United States of America (+1)"], "walk stops — a chip exists; more typing contaminates");
+});
+
+test("typeahead: commit-Enter fires only when the match is the FIRST filtered option", async () => {
+  // exact match at index 1 → no commit-Enter (highlight is unreadable; never blind)
+  let act = makeFakeAct([taField({ filterMap: { "Other": { filtered: ["Other Technology", "Other"] } } })]);
+  let out = await drivePageFill(act, taProfile(["Other"]), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(enters(act), 1);
+  // exact match at index 0 → commit
+  act = makeFakeAct([taField({ filterMap: { "Other": { filtered: ["Other", "Other Technology"] } } })]);
+  out = await drivePageFill(act, taProfile(["Other"]), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Other");
+  assert.strictEqual(out.results[0].verified, true);
+});
+
+test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
+  // Total commit failure: the Enter no-ops AND the click fallback is ignored.
+  const act = makeFakeAct([taField({
+    enterCommitFails: true, clickCommitFails: true,
+    filterMap: { "Other": { filtered: ["Other", "Other Technology"] } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Other"]), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(out.results[0].verified, false);
+});
+
+test("typeahead: Enter-commit fails → trusted click commits the matched option (chip verified)", async () => {
+  // The live 2026-06-12 shape: no armed highlight, the commit-Enter no-ops —
+  // the click fallback must carry tier-1 instead of losing it to a lower tier.
+  const act = makeFakeAct([taField({
+    enterCommitFails: true,
+    filterMap: { "Other": { filtered: ["Other", "Other Technology"] } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Other", "engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");
+  assert.strictEqual(rec.verified, true);
+  assert.match(rec.detail, /click-commit/);
+  assert.ok(act.log.some(([m]) => m === "clickTaOption"));
+});
+
+test("typeahead: click commits the WRONG option → chip mismatch → needs_review, walk stops", async () => {
+  const act = makeFakeAct([taField({
+    enterCommitFails: true, clickCommitsWrongText: "Other Technology",
+    filterMap: { "Other": { filtered: ["Other", "Other Technology"] } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Other", "engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, "Other Technology"); // surfaced, never accepted
+  assert.strictEqual(rec.verified, false);
+  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["Other"], "walk stops — a chip exists; more typing contaminates");
+});
+
+test("typeahead: Enter and click both fail → next candidate carries, never a silent fill", async () => {
+  const act = makeFakeAct([taField({
+    enterCommitFails: true, clickCommitFails: true,
+    filterMap: {
+      "Other": { filtered: ["Other", "Other Technology"] },
+      "engineering": { autoCommit: "Engineering" }
+    }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Other", "engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Engineering"); // tier-2 carried after tier-1's commit failed
+  assert.strictEqual(rec.matchTier, "enter-auto-commit");
+  assert.strictEqual(rec.settle_trace[0].note, "no chip from commit-Enter or click — commit did not take");
+});
+
+test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", async () => {
+  // Workday auto-derives the phone code from Country, so an already-correct
+  // chip is the common case. The failure mode is "verifying" it by re-typing —
+  // duplicating or clearing a correct chip. ZERO actuation allowed.
+  const act = makeFakeAct([taField({ chips: ["United States of America (+1)"] })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America", "United States"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.matchTier, "pre-filled");
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.strictEqual(rec.verified, true);
+  assert.strictEqual(act.log.length, 0, "pre-filled-correct must not be touched");
+});
+
+test("typeahead: pre-filled chip matching no candidate → needs_review, zero actuation", async () => {
+  const act = makeFakeAct([taField({ chips: ["Canada (+1)"] })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, "Canada (+1)");
+  assert.strictEqual(act.log.length, 0, "a mismatched pre-fill is flagged, never overwritten");
+});
+
+test("typeahead: first candidate to commit wins — later candidates never typed", async () => {
+  const act = makeFakeAct([taField({
+    filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America"]), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "filled");
+  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["United States of America (+1)"]);
+});
+
+// ── focus hygiene (M25 leak fix) — the abort guard closes the bug CLASS ──────
+// A banner drops searchBox focus; without re-asserting + verifying focus, the
+// next candidate's Ctrl+A hits the page, the query never lands, and a bare
+// Enter commits the listbox's highlighted row (the stray "Afghanistan" commit).
+
+test("typeahead: searchBox focus cannot be confirmed → ZERO actuation, needs_review", async () => {
+  const act = makeFakeAct([taField({ focusUnconfirmable: true })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /could not focus the search field/);
+  // The whole point: NO blind Ctrl+A / type / Enter when focus isn't confirmed.
+  assert.ok(!act.log.some(([m]) => m === "clearSearch"), "no Ctrl+A clear");
+  assert.ok(!act.log.some(([m]) => m === "typeInSearch"), "no typing");
+  assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
+});
+
+test("typeahead: walk-dry but a stray chip is present → record reports it, never after:null", async () => {
+  // No candidate matches (banner), but a stray chip sits on the field at
+  // walk-end (a late highlight-Enter commit our settle missed). The honesty
+  // read must surface it instead of claiming the field is empty.
+  const act = makeFakeAct([taField({
+    fallbackTexts: ["Afghanistan (+93)"],
+    filterMap: { "United States of America (+1)": { banner: true } }
+  })]);
+  // The stray exists only at walk-END (the honesty read happens after Escape):
+  // flip a flag in pressEscape, inject the chip on reads after it.
+  const origRead = act.readTypeahead, origEsc = act.pressEscape;
+  let walkEnded = false;
+  act.pressEscape = async (...a) => { walkEnded = true; return origEsc(...a); };
+  act.readTypeahead = async (loc) => {
+    const st = await origRead(loc);
+    if (walkEnded) st.chips = ["Afghanistan (+93)"];
+    return st;
+  };
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, "Afghanistan (+93)"); // surfaced, NOT null
+  assert.match(rec.detail, /uncommanded value on the field/);
 });
 
 test("unmapped text field → skipped 'no mapping'; file_upload → skipped", async () => {

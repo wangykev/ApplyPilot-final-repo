@@ -45,7 +45,15 @@ const DEFAULT_BUDGETS = {
   typeJumpDelayMs: 700,   // type-to-jump chars → highlight settles
   arrowStepMs: 110,       // per arrow step (verified walk)
   maxArrowSteps: 60,      // walk bound — type-jump should land near; farther = something's off → needs_review
-  interFieldMs: 300
+  interFieldMs: 300,
+  // Typeahead (M25 recon, Magna wd3 hidden: filter settles ~810–860ms; the
+  // ceiling tolerates colder tenants without false-negativing to needs_review).
+  taOpenCeilingMs: 5000,   // opener click → searchBox visible+focused (~260ms observed)
+  taOpenIntervalMs: 250,
+  taActionSettleMs: 400,   // after clear / after typing, before Enter
+  taSettleCeilingMs: 25000, // filter-Enter → fresh transition (banner/chip/filtered)
+  taSettleIntervalMs: 400,
+  taEnterCommitCeilingMs: 5000 // commit-Enter → chip, before the click fallback takes over
 };
 
 // ── Verbatim M22 ports (background.js fillEngine — change in lockstep) ──────
@@ -370,6 +378,190 @@ const fillCheckboxCdp = async (act, loc, want, budgets) => {
   return { status: "filled", after: String(cur), verified: cur === want, detail: pathUsed };
 };
 
+// Typeahead — the M25 CDP port of the PROVEN Magna brain (spec:
+// ~/.claude/plans/zany-shimmying-puzzle.md; recon 2026-06-12, hidden). Rules,
+// preserved exactly — this field type silently FALSE-FILLED before:
+//   • per-candidate tier walk; match ONLY the current candidate (full-list
+//     contamination was the original bug);
+//   • transition-aware settle — the pre-filter fallback list is STABLE, so
+//     mere stability is never terminal; the set must CHANGE since this
+//     candidate's filter-Enter (sawChange), and a STALE banner from the prior
+//     candidate survives clearing the input (recon), so banner is terminal
+//     only after sawChange too;
+//   • banner ("No matches found", [data-automation-id="promptTitle"]) = HARD
+//     BLOCK — the fallback full list stays rendered underneath it; never pick
+//     from it;
+//   • commit gate: a single exact match AUTO-COMMITS on the filter-Enter; a
+//     multi-match commits via a second Enter ONLY when the candidate's match
+//     is the auto-highlighted FIRST option (targetIndex===0 —
+//     aria-activedescendant is unreadable on this widget, so no highlight
+//     reads, no arrow navigation);
+//   • the ONLY commit signal is the selectedItem CHIP whose normalized text
+//     equals the matched option — no option-text fallback, ever;
+//   • first verified commit wins; anything less → needs_review with the
+//     settle trace, never a silent or false fill.
+// The listbox + searchBox self-unmount after a trusted commit (recon (f)) —
+// no close workaround needed.
+const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
+  const norm = apMatch.normalize;
+  const pre = await act.readTypeahead(loc);
+  if (!pre) return { status: "error", detail: "typeahead wrapper not found" };
+
+  // Pre-filled guard FIRST (countryPhoneCode: Workday auto-derives it from
+  // Country, so an already-correct chip is the COMMON case). Keep it with ZERO
+  // actuation — re-typing a correct value is the duplicate/clear failure mode.
+  // A same-value race with Workday's own auto-derivation is benign (we'd type
+  // the identical value); a mismatched chip is flagged, never overwritten
+  // (chip deletion is a later milestone).
+  if (pre.chips.length) {
+    const kept = pre.chips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
+    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", detail: "pre-filled chip matches a candidate — kept (no actuation)" };
+    return { status: "needs_review", after: pre.chips.join("; "), verified: false, detail: "pre-filled with a value matching no candidate — left as-is (chip overwrite is a later milestone)" };
+  }
+
+  // Ensure the searchBox is present + focused. The widget loses searchBox focus
+  // after a "No matches found" banner (recon 2026-06-12: a candidate after a
+  // banner found focus on the PAGE — a Ctrl+A selected the whole document, the
+  // typed query never landed, and the bare Enter committed the listbox's
+  // highlighted row). So focus is re-asserted BEFORE every candidate, not just
+  // at open. Returns the focused state, or null if focus can't be confirmed —
+  // in which case the caller MUST NOT actuate (no blind clear/type/Enter).
+  const ensureSearchFocused = async () => {
+    let st = await act.readTypeahead(loc);
+    if (!st || !st.searchBox.present || !st.searchBox.visible) {
+      if (!(await act.openTypeahead(loc))) return null; // re-open if it unmounted
+      const t0 = Date.now();
+      while (Date.now() - t0 < budgets.taOpenCeilingMs) {
+        await act.delay(budgets.taOpenIntervalMs);
+        st = await act.readTypeahead(loc);
+        if (st && st.searchBox.visible) break;
+      }
+    }
+    if (st && st.searchBox.visible && !st.searchBox.focused) {
+      await act.focusSearchBox(loc);
+      st = await act.readTypeahead(loc);
+    }
+    return st && st.searchBox.focused ? st : null;
+  };
+
+  const trace = [];
+  let lastFiltered = null;
+  let s = null;
+  for (const cand of candidates) {
+    const step = { candidate: cand };
+    trace.push(step);
+    // Focus hygiene: re-assert (recover) focus before touching the field. If it
+    // can't be confirmed, STOP — never blind Ctrl+A / type / Enter (that is the
+    // exact path that committed a stray "Afghanistan" via the listbox highlight).
+    const focused = await ensureSearchFocused();
+    if (!focused) {
+      step.note = "could not focus search field — not actuating blind";
+      return { status: "needs_review", after: null, verified: false, detail: "could not focus the search field — not actuating blind (no clear/type/Enter)", settle_trace: trace };
+    }
+    await act.clearSearch();
+    await act.delay(budgets.taActionSettleMs);
+    const snap = await act.readTypeahead(loc);
+    const snapSig = snap ? snap.pageWide.sig : null;
+    step.staleBannerAtStart = !!(snap && snap.banner);
+    await act.typeInSearch(cand);
+    await act.delay(budgets.taActionSettleMs);
+    await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
+
+    let sawChange = false, stable = 0, prevSig = null, outcome = "timeout";
+    const tSettle = Date.now();
+    while (Date.now() - tSettle < budgets.taSettleCeilingMs) {
+      await act.delay(budgets.taSettleIntervalMs);
+      s = await act.readTypeahead(loc);
+      const sig = s ? s.pageWide.sig : null;
+      if (sig !== snapSig) sawChange = true;
+      if (s && s.chips.length > 0) { outcome = "chip"; break; }
+      if (s && s.banner && sawChange) { outcome = "banner"; break; }
+      if (sawChange && s && s.pageWide.count > 0 && !s.banner && sig !== snapSig) {
+        stable = sig === prevSig ? stable + 1 : 0;
+        if (stable >= budgets.stableReads - 1) { outcome = "filtered"; break; }
+      }
+      prevSig = sig;
+    }
+    step.outcome = outcome;
+    step.settleMs = Date.now() - tSettle;
+
+    if (outcome === "chip") {
+      // Single exact match auto-commits on the filter-Enter (recon-proven).
+      step.chip = s.chips.join("; ");
+      if (s.chips.some((c) => norm(c) === norm(cand))) {
+        return { status: "filled", after: step.chip, verified: true, matchTier: "enter-auto-commit", detail: `auto-committed on the filter-Enter (candidate "${cand}")`, settle_trace: trace };
+      }
+      // A chip exists but is NOT this candidate — stop; more typing contaminates.
+      return { status: "needs_review", after: step.chip, verified: false, detail: `auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged, walk stopped`, settle_trace: trace };
+    }
+    if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
+    if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
+
+    const texts = s.pageWide.texts;
+    lastFiltered = texts;
+    step.filteredCount = s.pageWide.count;
+    const m = apMatch.matchCandidates([cand], texts);
+    if (m.targetIndex !== -1) step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
+    if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set"; continue; }
+    if (m.targetIndex !== 0) { step.note = `match at index ${m.targetIndex}, not the auto-highlighted first option — not committing`; continue; }
+
+    const matchedOption = texts[0];
+    step.matchedOption = matchedOption;
+
+    // Commit ladder: (1) commit-Enter — works when keystroke-driven typing
+    // armed the first-option highlight; (2) trusted CDP click on the matched
+    // option BY TEXT — the fallback for a never-armed highlight (live
+    // 2026-06-12: the Enter no-op'd and tier-1 "Other" lost to a tier-3
+    // auto-commit). Both paths end at the SAME chip gate.
+    const pollChips = async (ceilingMs) => {
+      let cs = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < ceilingMs) {
+        await act.delay(budgets.commitIntervalMs);
+        cs = await act.readTypeahead(loc);
+        if (cs && cs.chips.length > 0) break;
+      }
+      return cs ? cs.chips : [];
+    };
+    await act.pressEnter(); // the commit-Enter
+    let chips = await pollChips(budgets.taEnterCommitCeilingMs);
+    let commitPath = "enter-commit";
+    if (!chips.length) {
+      // Click fallback — only while the filtered set still shows the matched text.
+      const re = await act.readTypeahead(loc);
+      if (re && re.pageWide.texts.some((t) => norm(t) === norm(matchedOption))) {
+        if (await act.clickTaOption(loc, matchedOption)) {
+          commitPath = "click-commit";
+          chips = await pollChips(budgets.commitCeilingMs);
+        }
+      }
+    }
+    step.chip = chips.join("; ") || null;
+    step.commitPath = chips.length ? commitPath : null;
+    if (chips.length && chips.some((c) => norm(c) === norm(matchedOption))) {
+      return { status: "filled", after: step.chip, verified: true, matchTier: m.matchTier, detail: `${commitPath} on "${matchedOption}"`, captured_options: texts, settle_trace: trace };
+    }
+    if (chips.length) {
+      return { status: "needs_review", after: step.chip, verified: false, detail: `chip "${step.chip}" does not match "${matchedOption}" — flagged, walk stopped`, captured_options: texts, settle_trace: trace };
+    }
+    step.note = "no chip from commit-Enter or click — commit did not take";
+  }
+
+  // Honesty: after closing the open list, a final chip read so the record NEVER
+  // reports after:null when the page physically holds a value — catches a
+  // late/stray commit our settle missed (e.g. a highlight-Enter that landed
+  // after we moved on). Read AFTER Escape: a committed chip (selectedItem)
+  // survives Escape, so this reflects the true settled state. An uncommanded
+  // chip is flagged for review; clearing it is a later milestone.
+  await act.pressEscape();
+  let strayChip = null;
+  try { const endState = await act.readTypeahead(loc); strayChip = endState && endState.chips.length ? endState.chips.join("; ") : null; } catch (e) { /* ignore read error */ }
+  if (strayChip) {
+    return { status: "needs_review", after: strayChip, verified: false, detail: "uncommanded value on the field — review (no candidate matched; chip overwrite is a later milestone)", captured_options: lastFiltered || undefined, settle_trace: trace };
+  }
+  return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace };
+};
+
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
 async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
@@ -398,12 +590,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 
     try {
       if (f.widgetType === "hierarchical") {
-        // Deferred: the source picker needs its own (typeahead-class) CDP port.
+        // Deferred: the source picker is a different code path (tree/expand-walk
+        // variants) — its own recon + milestone.
         record.status = "needs_review";
         record.detail = "source deferred (CDP milestone scope) — fill on the form";
-      } else if (f.widgetType === "typeahead") {
-        record.status = "needs_review";
-        record.detail = "typeahead deferred (CDP milestone scope) — fill on the form";
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
         // "Yes" carries a review flag; unevaluable stays blank + review.
@@ -455,6 +645,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "typeahead") Object.assign(record, await fillTypeaheadCdp(act, loc, arg, budgets));
           else { record.status = "skipped"; record.detail = `no handler for type ${f.widgetType}`; }
         }
       }
@@ -477,5 +668,5 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker };
+  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp };
 }

@@ -502,3 +502,94 @@ issued as CDP commands from the service worker). What hidden-tab Workday actuall
 ### Lifecycle
 - ONE debugger client per tab: page DevTools open on the same tab kills the attach; an
   external detach fires chrome.debugger.onDetach (clear tracked state, don't re-detach).
+
+## 2026-06-12 — Magna wd3, HIDDEN tab: CDP typeahead port (M25)
+
+The proven typeahead brain (per-candidate tier walk, transition-aware settle, banner hard
+block, chip-only commit signal) ported to the CDP substrate, live-verified hidden
+(countryPhoneCode on page 1; Field of Study on page 2).
+
+### Option scope + filter
+- The searchBox carries NO aria-controls on Magna typeaheads (null in every read) — the
+  page-wide visible `[role="option"]` scrape EXCLUDING `selectedItemList` chips is the
+  working scope (the M22 settlePoll rules).
+- Enter-filter (typing alone does not filter); the filtered response lands ~810–860ms
+  hidden (one throttled tick + fetch).
+
+### Banner + the stale-banner rule
+- No-match banner = leaf `[data-automation-id="promptTitle"]`, text "No matches found".
+  On countryPhoneCode it CO-OCCURS with the re-rendered fallback window (17 visible of
+  ~249 — the option list is VIRTUALIZED; the window is what is painted). Matching against
+  that still-rendered list was the historic false-fill — banner = hard block.
+- A STALE banner SURVIVES clearing the search input (the list stays rendered too). The
+  settle must key terminal-banner on a FRESH change since the current candidate's own
+  Enter — otherwise candidate N+1 inherits candidate N's banner.
+
+### ⚠ A "No matches found" banner DROPS searchBox focus → focus hygiene per candidate
+- Verified hidden: after candidate-0 banners, the NEXT candidate begins with the searchBox
+  UNFOCUSED (`searchBox.focused:false`). With focus on the document, our per-candidate
+  `clearSearch` (Ctrl+A + Delete) selects the WHOLE PAGE instead of the field (operator saw
+  it), the field never clears, and the typed query never lands — so the list does NOT
+  filter to the new candidate.
+- The widget does **type-ahead-to-HIGHLIGHT** on the currently-showing list (a keystroke
+  highlights the option starting with that letter; "f"→Falkland Islands, "1"→first "+1"
+  row), and **Enter commits the highlighted row**. Blind post-focus-loss actuation =
+  Ctrl+A→page, query never lands, highlight stays on row 0, the bare filter-Enter commits
+  row 0 → a STRAY wrong value (live: "Afghanistan (+93)", row 0 of the full list). This is
+  NOT our commit code (no commit action ran) — it is the widget's highlight+Enter.
+- Fix shipped (M25): re-assert + READ-VERIFY searchBox focus BEFORE every candidate's
+  clear/type (re-open if it unmounted, then `focusSearchBox`); if focus can't be confirmed
+  → `needs_review` "could not focus the search field — not actuating blind", STOP — never
+  blind Ctrl+A / type / Enter. (`clearSearch`'s Ctrl+A is correct — it clears the FIELD; it
+  only mis-fired onto the page because focus was already lost — symptom, not cause.)
+  Honesty: a final chip read so a record never reports `after:null` when the page
+  physically holds a value; an uncommanded stray is flagged for review.
+
+### Commits — what actually works hidden
+- SINGLE exact match: AUTO-COMMITS on the filter-Enter itself (~600–850ms). ⚠ The chip can
+  carry the FULL option name, not the typed query ("CPP" → chip "Certified Payroll
+  Professional (CPP) - Multiple Recognized Providers") — an auto-commit is accepted only
+  when the chip normalize-equals the candidate; anything else → needs_review, never a
+  silent accept.
+- MULTI-match: NO highlight ever arms under CDP-injected typing — aria-activedescendant
+  read null in every recon and live read, with BOTH Input.insertText and per-char trusted
+  keystrokes — so the spec-era "second Enter commits the highlighted first option" does
+  NOT hold on this substrate (it was a human-typing observation); the commit-Enter no-ops.
+  ✔ What works: a TRUSTED CDP CLICK on the matched option (text-keyed re-resolution +
+  scrollIntoView + fresh rect) — the page-substrate isTrusted wall does not apply to CDP
+  input. ⚠ SCOPE OF THE CLAIM: click-commit is proven on SHORT filtered lists only (2
+  options, match inside the painted virtualized window). A long filtered list with the
+  match scrolled outside the rendered window is the same coordinate-into-virtualized-list
+  condition that failed in the dropdown recon ("Uruguay") — long-list / scrolled-match
+  commit is UNTESTED, an open question for the chip-overwrite milestone.
+- Pre-filled KEEP proven live: a chip that normalize-matches a candidate is KEPT with
+  ZERO actuation — and in the same run a same-value Country re-commit ran upstream and
+  the kept chip SURVIVED (a same-value re-commit does NOT reset dependent state).
+
+### The chip
+- Commit signal = `[data-automation-id="selectedItem"]` whose text == the committed
+  value; its aria-label says "…press delete to clear value"; the chip subtree contains
+  `[data-automation-id="DELETE_charm"]` — the handle for a future overwrite milestone.
+- The listbox AND the searchBox self-unmount after a commit — no close workaround needed.
+
+### ⚠ Certification on Magna is a TREE picker, not a flat typeahead (tenant-variant)
+- Its popup shows expandable parent nodes with chevrons ("Multiple Recognized Providers",
+  "Previous Place of Employment", "Workday") — the hierarchical/source family. On
+  LiveRamp the same field is a FLAT typeahead (M23a) — tenant-variant, like source's
+  three shapes.
+- The classifier keys "hierarchical" to fieldName === "source" by NAME only; tree-ness is
+  a POPUP-content property invisible on the wrapper (identical multiselect chrome), so
+  Magna's certification classifies as "typeahead" and the flat brain can reach it via the
+  targeted harness (page-2 repeating fields never reach the flat page fill). The chip
+  gate CONTAINED it: the search-driven auto-commit of a tree leaf was flagged
+  needs_review, never silently accepted.
+- A bogus query on this field timed out (25s; no fresh transition, no banner detected) —
+  cause UNDETERMINED (tree behavior vs a banner shown without a list re-render). To be
+  resolved by the tree-picker recon when source/certification get their CDP milestone; no
+  settle change was shipped on this evidence.
+
+### Page/locale notes
+- Country=Afghanistan adds `legalName--firstNameLocal`/`--lastNameLocal` fields (scanned
+  and honestly skipped as unmapped) — the page FIELD SET varies with the Country value.
+- countryPhoneCode sits inside `data-fkit-id="phoneNumber--null"` on page 1 — do not
+  generalize the repeating-section guard to all `--null` containers.

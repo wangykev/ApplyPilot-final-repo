@@ -368,6 +368,160 @@ function cdpFocusInputById(id) {
   return document.activeElement === el;
 }
 
+// ── Typeahead reads (M25 recon + port) ──────────────────────────────────────
+
+// All typeahead-classified wrappers on the page, INCLUDING inside repeating
+// entries (page-2 fieldOfStudy/certification live in entries; a document-order
+// query on the duplicated formField-* id resolves entry 1). `source` excluded —
+// hierarchical is a different code path (own recon + milestone).
+function cdpScanTypeaheads() {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const out = [];
+  for (const w of document.querySelectorAll('[data-automation-id^="formField-"]')) {
+    const id = w.getAttribute("data-automation-id");
+    const fieldName = id.slice("formField-".length);
+    if (fieldName === "source") continue;
+    if (!w.querySelector('[data-uxi-widget-type="multiselect"]')) continue;
+    const legend = w.querySelector("legend");
+    let label = legend ? legend.textContent.trim() : null;
+    if (!label) { for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) { label = t; break; } } }
+    const entry = w.closest('[data-fkit-id$="--null"]');
+    const sb = w.querySelector('input[data-automation-id="searchBox"]');
+    const opener =
+      (w.querySelector('[data-automation-id="multiselectInputContainer"]') && "multiselectInputContainer") ||
+      (w.querySelector('[data-uxi-widget-type="selectinput"]') && "selectinput") ||
+      (w.querySelector("input") && "input") || "wrapper";
+    out.push({
+      wrapperSel: '[data-automation-id="' + id + '"]',
+      fieldName,
+      label: label || null,
+      entryFkitId: entry ? entry.getAttribute("data-fkit-id") : null,
+      chips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim()),
+      searchBoxPresent: !!sb,
+      searchBoxVisible: !!(sb && isVisible(sb)),
+      opener
+    });
+  }
+  return out;
+}
+
+// Full typeahead state, fresh each call. Reports the option set through BOTH
+// candidate scopes — the searchBox's aria-controls target AND the page-wide
+// visible scrape (excluding selectedItem chips, the M22 settlePoll mirror) — so
+// the build can pick the one that resolves REAL options (the spec warns source's
+// aria-controls points at a promptAriaInstruction decoy; recon settles whether
+// plain typeaheads share that). `sig` is a cheap set signature for SW-side
+// transition detection (count + first/last texts).
+function cdpReadTaState(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  const chips = Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim());
+
+  const acId = sb ? sb.getAttribute("aria-controls") : null;
+  const acEl = acId ? document.getElementById(acId) : null;
+  const acOpts = acEl
+    ? Array.from(acEl.querySelectorAll('[role="option"]')).filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true")
+    : [];
+  const pwOpts = Array.from(document.querySelectorAll('[role="option"]'))
+    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]'));
+  const texts = (els) => els.map((el) => (el.textContent || "").trim());
+  const sig = (ts) => ts.length + "|" + ts.slice(0, 3).join("~") + "|" + ts.slice(-3).join("~");
+  const acTexts = texts(acOpts);
+  const pwTexts = texts(pwOpts);
+
+  // Banner: the leaf-most visible node whose SHORT text is "No matches found"-ish
+  // (recording its identity gives the build a precise selector).
+  let banner = null;
+  for (const el of document.querySelectorAll("[data-automation-id], [role], p, span, div")) {
+    if (!isVisible(el)) continue;
+    const t = (el.textContent || "").trim();
+    if (t.length > 60 || !/no matches found/i.test(t)) continue;
+    if (Array.from(el.children).some((c) => /no matches found/i.test((c.textContent || "").trim()))) continue;
+    banner = { text: t, tag: el.tagName, automationId: el.getAttribute("data-automation-id"), role: el.getAttribute("role") };
+    break;
+  }
+
+  const adFrom = (el) => (el && el.getAttribute && el.getAttribute("aria-activedescendant")) || null;
+  const activeId = adFrom(document.activeElement) || adFrom(sb) || (acEl ? adFrom(acEl) : null);
+  const activeEl = activeId ? document.getElementById(activeId) : null;
+
+  return {
+    searchBox: sb
+      ? { present: true, visible: isVisible(sb), focused: document.activeElement === sb, value: sb.value }
+      : { present: false, visible: false, focused: false, value: null },
+    chips,
+    banner,
+    ariaScope: acId
+      ? (acEl
+        ? { id: acId, resolved: true, tag: acEl.tagName, automationId: acEl.getAttribute("data-automation-id"), role: acEl.getAttribute("role"), count: acOpts.length, sig: sig(acTexts), sample: acTexts.slice(0, 10) }
+        : { id: acId, resolved: false })
+      : { id: null },
+    // `sample` (10) is for log series; `texts` (40) feeds candidate matching —
+    // filtered sets are small and even the virtualized fallback window is ~17.
+    pageWide: { count: pwOpts.length, sig: sig(pwTexts), sample: pwTexts.slice(0, 10), texts: pwTexts.slice(0, 40) },
+    activeText: activeEl ? (activeEl.textContent || "").trim() : null
+  };
+}
+
+// scrollIntoView + fresh rect of the VISIBLE [role="option"] whose trimmed text
+// equals `text` (chip lists excluded — same scrape rules as cdpReadTaState's
+// page-wide scope). Text-keyed, not index-keyed.
+function cdpTaOptionRectByText(text) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const el = Array.from(document.querySelectorAll('[role="option"]'))
+    .filter((o) => isVisible(o) && o.getAttribute("aria-disabled") !== "true" && !o.closest('[data-automation-id="selectedItemList"]'))
+    .find((o) => (o.textContent || "").trim() === text);
+  if (!el) return null;
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
+// READ-ONLY dump of the selected-chip subtree (tag/automation-id/role/text per
+// node, capped) — identifies the chip's delete control for a FUTURE overwrite
+// milestone. Never clicks anything.
+function cdpDumpChipSubtree(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  const root = w && (w.querySelector('[data-automation-id="selectedItemList"]') || w.querySelector('[data-automation-id="selectedItem"]'));
+  if (!root) return null;
+  const out = [];
+  const walk = (el, depth) => {
+    if (out.length >= 40 || depth > 6) return;
+    out.push({
+      depth,
+      tag: el.tagName,
+      automationId: el.getAttribute("data-automation-id"),
+      role: el.getAttribute("role"),
+      ariaLabel: el.getAttribute("aria-label"),
+      text: (el.textContent || "").trim().slice(0, 40)
+    });
+    for (const c of el.children) walk(c, depth + 1);
+  };
+  walk(root, 0);
+  return out;
+}
+
 // The actuation object. No tabId param — the substrate's single tracked
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 function makeCdpActuation() {
@@ -416,6 +570,34 @@ function makeCdpActuation() {
     // Enter-commit is primary) — scrollIntoView makes the coordinate paintable.
     clickOptionByIndex: async (loc, index) => {
       const rect = await cdpEval(cdpOptionRect, loc.wrapperSel, index);
+      if (!rect || rect.w <= 0) return false;
+      await cdpClickAt(rect.cx, rect.cy);
+      return true;
+    },
+
+    // ── typeahead (M25) ──
+    // Opener ladder: multiselectInputContainer → selectinput → first input →
+    // the wrapper itself. The searchBox is unreachable until the widget opens.
+    openTypeahead: async (loc) => {
+      for (const part of [' [data-automation-id="multiselectInputContainer"]', ' [data-uxi-widget-type="selectinput"]', " input", ""]) {
+        const rect = await cdpEval(cdpRectOf, loc.wrapperSel + part, true);
+        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); return true; }
+      }
+      return false;
+    },
+    readTypeahead: (loc) => cdpEval(cdpReadTaState, loc.wrapperSel),
+    // Per-char trusted KEYSTROKES, not insertText: the widget arms its
+    // first-option highlight only under keystroke-driven interaction — with
+    // insertText the commit-Enter had no highlight to commit and no-op'd
+    // (live 2026-06-12: tier-1 "Other" lost to a tier-3 auto-commit).
+    typeInSearch: (text) => cdpTypeChars(text, 40),
+    clearSearch: () => cdpSelectAllDelete(),         // trusted clear (focused searchBox)
+    focusSearchBox: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    // Trusted-click commit fallback (multi-match): text-keyed — immune to list
+    // shifts between the settle read and the click; a missed click dismisses
+    // (no-op) rather than mis-commits, and the chip gate verifies either way.
+    clickTaOption: async (loc, text) => {
+      const rect = await cdpEval(cdpTaOptionRectByText, text);
       if (!rect || rect.w <= 0) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;

@@ -118,6 +118,46 @@ document.getElementById("cdp-fill").addEventListener("click", () => {
   });
 });
 
+// TYPEAHEAD RECON (M25 Step 1): probe one chipless typeahead on THIS page while
+// hidden (filter/settle/commit/chip/banner + option-scope). Pre-filled typeaheads
+// are reported read-only. Minimize within 60s; output is [TA-RECON] in the SW console.
+document.getElementById("cdp-ta-recon").addEventListener("click", () => {
+  setStatus("Typeahead recon… MINIMIZE the window now (60s window). Findings land in the service worker console as [TA-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_TA_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Typeahead recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.probed === false) {
+      setStatus("No chipless typeahead on this page — pre-state captured. See [TA-RECON] in the SW console.");
+    } else {
+      setStatus(`Typeahead recon done — ${resp.errors} probe error(s). Paste the [TA-RECON] summary from the SW console.`);
+    }
+  });
+});
+
+// TARGETED TYPEAHEAD FILL (M25 verify harness): fill ONE typeahead matched by
+// label regex through the CDP brain while hidden. Minimize within 60s; the
+// result + settle trace land as [CDP-TA] in the SW console.
+document.getElementById("cdp-fill-ta").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim();
+  if (!labelRegex) { setStatus("Enter a label regex first (e.g. Field of Study)."); return; }
+  setStatus(`CDP typeahead fill ("${labelRegex}")… MINIMIZE now (60s). See [CDP-TA] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_TA", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Typeahead fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Typeahead fill: ${resp.status}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-TA].`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

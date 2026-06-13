@@ -22,6 +22,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // TYPEAHEAD RECON (M25 Step 1): empirically answer, on a live typeahead with
+  // the tab HIDDEN, the can't-guess questions the CDP typeahead port is built
+  // on — filter trigger (a), throttled settle timing (b), commit method (c),
+  // chip commit signal (d), no-match banner (e), listbox self-close (f), plus
+  // WHICH option scope resolves real options (aria-controls vs page-wide).
+  // Probes only the first CHIPLESS typeahead; pre-filled ones are reported
+  // read-only (the countryPhoneCode case). NO chip deletion — read-only dump.
+  if (message.type === "RUN_CDP_TA_RECON") {
+    // Profile is read so the probe query is FIELD-AWARE (the field's own
+    // profile-resolved candidates) — a hardcoded query banners on fields whose
+    // vocabulary doesn't contain it (the round-2 lesson). Missing profile →
+    // the driver falls back to ["Other"] with a loud log.
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpTypeaheadRecon(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
+  // TARGETED TYPEAHEAD FILL (M25 verify harness): fill ONE typeahead located by
+  // label regex — including a field inside a repeating entry (entry-1 scoped
+  // via selector composition) — through the full fillTypeaheadCdp brain while
+  // hidden. Page-2 entry fields (fieldOfStudy/certification) aren't in
+  // FIELD_MAP (that map is flat-page only), so their candidates come from a
+  // harness-side lookup. Results land as [CDP-TA] in the SW console.
+  if (message.type === "RUN_CDP_FILL_TA") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-TA] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillTypeahead(tab.id, profile, String(message.labelRegex || ""));
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL (Step 2 of the CDP actuation port): fill the active page's SIMPLE
   // widgets (text/dropdown/radio/checkbox) through chrome.debugger input while
   // the tab is HIDDEN — the M22 decision logic (fill-driver.js) over the CDP
@@ -991,6 +1037,339 @@ async function runCdpRecon(tabId) {
     const msg = String((e && e.message) || e);
     LOG("recon aborted:", msg);
     console.log("[ApplyPilot][CDP-RECON] partial summary:", JSON.stringify(R, null, 2));
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// TYPEAHEAD RECON — M25 Step 1 (port of the proven Magna typeahead brain to the
+// CDP substrate; spec: ~/.claude/plans/zany-shimmying-puzzle.md). SW-paced
+// probes on ONE chipless typeahead; pre-filled typeaheads are reported
+// read-only. The probe field ends holding "Other" — the profile's desired
+// fallback value — so the side effect IS the restore. Keyboard commit is tested
+// (the spec's primary); the trusted-click commit (c1) is reported UNTESTED:
+// testing it would require deleting the committed chip, a destructive op on the
+// live application (vetoed). Detaches in finally.
+// ============================================================================
+async function runCdpTypeaheadRecon(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][TA-RECON]", ...a);
+  const R = {
+    scan: null, probe: {},
+    c1: "untested — single virgin probe field; testing the trusted click would require deleting the committed chip (vetoed: destructive on the live application). Keyboard commit stands.",
+    sideEffects: [], errors: []
+  };
+  const guard = async (name, fn) => {
+    try { await fn(); } catch (e) {
+      const m = name + ": " + String((e && e.message) || e);
+      R.errors.push(m);
+      LOG("probe ERROR —", m);
+    }
+  };
+  const readState = (sel) => cdpEval(cdpReadTaState, sel);
+  // Type into the FOCUSED searchBox: trusted select-all+Delete, then insertText.
+  const typeQuery = async (text) => { await cdpSelectAllDelete(); await cdpDelay(150); await cdpInsertText(text); };
+
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, no probes executed.");
+      return { ok: false, error: "never-hidden" };
+    }
+    LOG("tab is hidden — typeahead recon starting.");
+
+    const scan = await cdpEval(cdpScanTypeaheads);
+    R.scan = scan;
+    LOG("typeaheads on this page (pre-state, incl. pre-filled chips):", JSON.stringify(scan, null, 2));
+    const target = (scan || []).find((t) => t.chips.length === 0);
+    if (!target) {
+      LOG("no CHIPLESS typeahead here — the pre-state above is this page's deliverable (the pre-filled-chip case). For the active probes, run on a page with a virgin typeahead (My Experience → Field of Study); if it holds a chip from an earlier fill, remove it BY HAND and re-run.");
+      console.log("[ApplyPilot][TA-RECON]", JSON.stringify(R, null, 2));
+      return { ok: true, probed: false };
+    }
+    LOG("probe target:", target.fieldName, "—", JSON.stringify(target.label), target.entryFkitId ? "(inside entry " + target.entryFkitId + ")" : "(flat)");
+    R.probe.field = { fieldName: target.fieldName, label: target.label, entryFkitId: target.entryFkitId };
+    const sel = target.wrapperSel;
+
+    // Field-aware probe candidates — the field's own profile-resolved tier list
+    // (same FIELD_MAP/getByPath/resolve chain the fill uses; globals from
+    // fill-driver.js). A committed probe thereby RESTORES the field to its
+    // correct value. No mapping/value → fallback ["Other"], loudly.
+    let candidates = ["Other"];
+    const mappedPath = FIELD_MAP[target.fieldName];
+    const raw = mappedPath && profile ? getByPath(profile, mappedPath) : undefined;
+    if (raw !== undefined) {
+      const rr = resolve(raw, "typeahead");
+      if (!rr.skip && rr.candidates && rr.candidates.length) candidates = rr.candidates;
+    }
+    if (!mappedPath || raw === undefined) {
+      LOG("⚠ no profile mapping/value for", target.fieldName, "— probing with the fallback query", JSON.stringify(candidates), "(load the profile in the popup for a field-aware probe)");
+    }
+    R.probe.candidates = candidates;
+    LOG("probe candidates (tier order):", JSON.stringify(candidates));
+
+    // ── (a) open: opener-ladder click → searchBox visible + focused ─────────
+    await guard("(a) open", async () => {
+      const openerSel =
+        target.opener === "multiselectInputContainer" ? sel + ' [data-automation-id="multiselectInputContainer"]'
+        : target.opener === "selectinput" ? sel + ' [data-uxi-widget-type="selectinput"]'
+        : target.opener === "input" ? sel + " input"
+        : sel;
+      const rect = await cdpEval(cdpRectOf, openerSel, true);
+      if (!rect || rect.w <= 0) throw new Error("opener rect dead (" + target.opener + ")");
+      await cdpClickAt(rect.cx, rect.cy);
+      let s = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await cdpDelay(250);
+        s = await readState(sel);
+        if (s && s.searchBox.present && s.searchBox.visible) break;
+      }
+      let focusedBy = s && s.searchBox.focused ? "opener-click" : null;
+      if (s && s.searchBox.visible && !s.searchBox.focused) {
+        if (await cdpEval(cdpFocusBySel, sel + ' input[data-automation-id="searchBox"]')) focusedBy = "page-focus()";
+        s = await readState(sel);
+      }
+      R.probe.open = {
+        opener: target.opener, openMs: Date.now() - t0,
+        searchBoxVisible: !!(s && s.searchBox.visible),
+        focused: !!(s && s.searchBox.focused), focusedBy
+      };
+      LOG("(a) open:", JSON.stringify(R.probe.open));
+      if (!s || !s.searchBox.visible || !s.searchBox.focused) throw new Error("searchBox not visible+focused after open — aborting active probes");
+    });
+    const opened = R.probe.open && R.probe.open.focused;
+
+    // ── (e) banner FIRST: gibberish → Enter → banner + full-list co-occurrence ──
+    await guard("(e) banner", async () => {
+      if (!opened) { R.probe.banner = { skipped: "open failed" }; return; }
+      const before = await readState(sel);
+      await typeQuery("zzqqxvw");
+      await cdpDelay(300);
+      const echoed = await readState(sel);
+      await cdpKeyTap(CDP_KEYS.enter);
+      const series = [];
+      let s = null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 25000) {
+        await cdpDelay(400);
+        s = await readState(sel);
+        series.push({ t: Date.now() - t0, banner: !!(s && s.banner), pageWideCount: s ? s.pageWide.count : -1, ariaCount: s && s.ariaScope.resolved ? s.ariaScope.count : null });
+        if (s && s.banner) break;
+      }
+      R.probe.banner = {
+        echoedValue: echoed && echoed.searchBox.value,
+        appeared: !!(s && s.banner),
+        bannerNode: s ? s.banner : null,
+        appearedAtMs: s && s.banner && series.length ? series[series.length - 1].t : null,
+        // PIN: the original false-fill condition — the banner AND the full list
+        // still rendered underneath it, co-occurring.
+        fullListStillRendered: !!(s && s.pageWide.count > 0),
+        pageWideCountWithBanner: s ? s.pageWide.count : null,
+        sampleWithBanner: s ? s.pageWide.sample : null,
+        preTypeCount: before ? before.pageWide.count : null,
+        series
+      };
+      LOG("(e) banner:", JSON.stringify(R.probe.banner));
+      await cdpSelectAllDelete();
+      await cdpDelay(800);
+      const cleared = await readState(sel);
+      R.probe.afterBannerClear = { value: cleared && cleared.searchBox.value, pageWideCount: cleared ? cleared.pageWide.count : null, bannerStill: !!(cleared && cleared.banner) };
+      LOG("(e) after clear:", JSON.stringify(R.probe.afterBannerClear));
+    });
+
+    // ── (a/b/c/d) the candidate WALK — the Step 2 brain in miniature ─────────
+    // Per candidate in tier order: clear → type → Enter → settle with the
+    // STALE-BANNER rule (round-2 finding: clearing the input does NOT clear a
+    // prior banner, so banner is terminal ONLY after a fresh change since THIS
+    // candidate's Enter). Banner ⇒ next candidate. Filtered set ⇒ the spec-B.3
+    // commit gate: the candidate's match must BE the FIRST filtered option
+    // (targetIndex===0; aria-activedescendant is unreadable on this widget —
+    // round-2 + the spec's round-3 both say so) → Enter → verify the CHIP.
+    // Never an unverified commit; first verified commit wins.
+    await guard("(a/b/c/d) candidate walk", async () => {
+      if (!opened) { R.probe.walk = { skipped: "open failed" }; return; }
+      const walk = [];
+      R.probe.walk = walk;
+      let committed = null;
+      for (const cand of candidates) {
+        const step = { candidate: cand };
+        walk.push(step);
+        await cdpSelectAllDelete();
+        await cdpDelay(400);
+        const snap = await readState(sel);
+        step.staleBannerAtStart = !!(snap && snap.banner); // documents the round-2 stale-banner behavior
+        const snapSig = snap ? snap.pageWide.sig : null;
+        await cdpInsertText(cand);
+        await cdpDelay(400);
+        await cdpKeyTap(CDP_KEYS.enter);
+
+        let s = null, sawChange = false, stable = 0, prevSig = null, outcome = "timeout";
+        const series = [];
+        const t0 = Date.now();
+        while (Date.now() - t0 < 25000) {
+          await cdpDelay(400);
+          s = await readState(sel);
+          const sig2 = s ? s.pageWide.sig : null;
+          if (sig2 !== snapSig) sawChange = true;
+          series.push({ t: Date.now() - t0, count: s ? s.pageWide.count : -1, changed: sig2 !== snapSig, banner: !!(s && s.banner), chips: s ? s.chips.length : 0 });
+          if (s && s.chips.length > 0) { outcome = "chip-auto-commit"; break; }
+          if (s && s.banner && sawChange) { outcome = "banner"; break; }
+          if (sawChange && sig2 !== snapSig && s && s.pageWide.count > 0 && !s.banner) {
+            stable = sig2 === prevSig ? stable + 1 : 0;
+            if (stable >= 1) { outcome = "filtered"; break; } // 2 consecutive equal post-transition reads
+          }
+          prevSig = sig2;
+        }
+        step.outcome = outcome;
+        step.settleMs = series.length ? series[series.length - 1].t : null;
+        step.series = series;
+        step.ariaScope = s ? s.ariaScope : null; // scope verdict continuity (round-2: did not resolve)
+
+        if (outcome === "chip-auto-commit") {
+          // Single exact match auto-commits on the filter-Enter (spec) — verify the chip.
+          step.chipTexts = s.chips;
+          step.chipMatchesCandidate = s.chips.some((c) => normalize(c) === normalize(cand));
+          if (step.chipMatchesCandidate) { committed = { candidate: cand, via: "enter-auto-commit", chips: s.chips }; }
+          else step.note = "AUTO-COMMIT chip does NOT match the candidate — walk stopped (a chip now exists; further typing would contaminate)";
+          break;
+        }
+        if (outcome === "banner") { step.note = "fresh no-match banner — hard block, next candidate"; continue; }
+        if (outcome !== "filtered") { step.note = "settle timeout (no fresh transition) — next candidate"; continue; }
+
+        step.filteredCount = s.pageWide.count;
+        step.filteredSample = s.pageWide.sample;
+        step.activeText = s.activeText; // data only — expected null on this widget
+        const m = matchCandidates([cand], s.pageWide.texts);
+        step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
+        if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set — next candidate"; continue; }
+        if (m.targetIndex !== 0) { step.note = `match is NOT the first option (targetIndex ${m.targetIndex}) — NOT pressing Enter (gate per spec B.3); next candidate`; continue; }
+
+        const matchedOption = s.pageWide.texts[0];
+        step.matchedOption = matchedOption;
+        const tEnter = Date.now();
+        await cdpKeyTap(CDP_KEYS.enter); // the commit-Enter on the auto-highlighted first option
+        let cState = null;
+        while (Date.now() - tEnter < 10000) {
+          await cdpDelay(300);
+          cState = await readState(sel);
+          if (cState && cState.chips.length > 0) break;
+        }
+        const chips = cState ? cState.chips : [];
+        step.chipTexts = chips;
+        step.chipLatencyMs = Date.now() - tEnter;
+        step.chipMatchesOption = chips.some((c) => normalize(c) === normalize(matchedOption));
+        if (chips.length && step.chipMatchesOption) {
+          committed = { candidate: cand, via: "targetIndex0-enter", matchedOption, chips, latencyMs: step.chipLatencyMs };
+          break;
+        }
+        if (chips.length) { step.note = "chip text does NOT match the matched option — NOT a verified commit; walk stopped (chip present)"; break; }
+        step.note = "no chip within budget — commit did not take; next candidate";
+      }
+
+      R.probe.committed = committed;
+      LOG("(c2/d) walk result:", JSON.stringify({ committed, steps: walk.map((w) => ({ candidate: w.candidate, outcome: w.outcome, match: w.match, chipTexts: w.chipTexts, note: w.note })) }, null, 2));
+
+      if (committed) {
+        R.sideEffects.push(`typeahead "${target.label}" committed "${committed.chips.join('", "')}" — the profile's correct value (restores the hand-cleared field)`);
+        await cdpDelay(1200);
+        const post = await readState(sel);
+        R.probe.listboxSelfClosed = !!(post && post.pageWide.count === 0); // (f)
+        R.probe.searchBoxAfterCommit = post ? post.searchBox : null;
+        LOG("(f) listbox self-closed after the trusted commit:", R.probe.listboxSelfClosed);
+        R.probe.chipSubtree = await cdpEval(cdpDumpChipSubtree, sel); // READ-ONLY
+        LOG("chip subtree (read-only — identifies the delete control for a future overwrite milestone; nothing clicked):", JSON.stringify(R.probe.chipSubtree));
+      } else {
+        await cdpKeyTap(CDP_KEYS.escape); // tidy: close the open list; nothing committed
+        LOG("walk ended with NO verified commit — field left empty (no false fill).");
+      }
+    });
+
+    LOG("TA-RECON SUMMARY (paste this whole block back):");
+    console.log("[ApplyPilot][TA-RECON]", JSON.stringify(R, null, 2));
+    if (R.sideEffects.length) LOG("side effects:", JSON.stringify(R.sideEffects));
+    return { ok: true, probed: true, errors: R.errors.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    console.log("[ApplyPilot][TA-RECON] partial summary:", JSON.stringify(R, null, 2));
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// TARGETED TYPEAHEAD FILL — the M25 verify harness. Locates ONE typeahead by
+// label regex (entry fields get an entry-1-scoped COMPOSED selector — the
+// duplicate formField-* ids make a bare wrapper selector hit entry 1 only by
+// luck; composition makes it explicit), resolves its candidates, and runs the
+// full fillTypeaheadCdp brain hidden. Detaches in finally.
+// ============================================================================
+
+// Candidates for repeating-entry typeaheads (deliberately NOT in FIELD_MAP —
+// that map is the flat-page contract; these mirror EDUCATION_MAP /
+// CERTIFICATION_MAP's profile paths for entry 0).
+const TA_ENTRY_CANDIDATES = {
+  fieldOfStudy: (p) => p && Array.isArray(p.education) && p.education[0] ? p.education[0].field_of_study : undefined,
+  certification: (p) => p && Array.isArray(p.certifications) && p.certifications[0] ? p.certifications[0].certification : undefined
+};
+
+async function runCdpFillTypeahead(tabId, profile, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-TA]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+
+    let re;
+    try { re = new RegExp(labelRegexStr || ".", "i"); } catch (e) {
+      LOG("bad label regex:", JSON.stringify(labelRegexStr));
+      return { ok: false, error: "bad-regex" };
+    }
+    const scan = await cdpEval(cdpScanTypeaheads);
+    const target = (scan || []).find((t) => re.test(t.label || "") || re.test(t.fieldName));
+    if (!target) {
+      LOG("no typeahead matching", JSON.stringify(labelRegexStr), "— typeaheads on this page:", JSON.stringify((scan || []).map((t) => ({ field: t.fieldName, label: t.label }))));
+      return { ok: false, error: "no-match" };
+    }
+    const wrapperSel = (target.entryFkitId ? '[data-fkit-id="' + target.entryFkitId + '"] ' : "") + target.wrapperSel;
+    LOG("target:", target.fieldName, "—", JSON.stringify(target.label), "| sel:", wrapperSel);
+
+    let raw;
+    const mappedPath = FIELD_MAP[target.fieldName];
+    if (mappedPath) raw = getByPath(profile, mappedPath);
+    else if (TA_ENTRY_CANDIDATES[target.fieldName]) raw = TA_ENTRY_CANDIDATES[target.fieldName](profile);
+    const rr = raw === undefined ? { skip: true } : resolve(raw, "typeahead");
+    if (rr.skip) {
+      LOG("no candidates for", target.fieldName, "— no mapping/value in the profile.");
+      return { ok: false, error: "no-candidates" };
+    }
+    LOG("candidates (tier order):", JSON.stringify(rr.candidates));
+    LOG("tab is hidden — typeahead fill starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+
+    const act = makeCdpActuation();
+    const rec = await fillTypeaheadCdp(act, { wrapperSel }, rr.candidates, DEFAULT_BUDGETS);
+    LOG("result:", JSON.stringify({ field: target.fieldName, status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, detail: rec.detail }, null, 2));
+    if (rec.settle_trace) LOG("settle trace:", JSON.stringify(rec.settle_trace, null, 2));
+    if (rec.captured_options) LOG("captured options:", JSON.stringify(rec.captured_options));
+    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("typeahead fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
