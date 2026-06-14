@@ -48,6 +48,17 @@
     <label for="ta-label">CDP typeahead target (label regex):</label>
     <input id="ta-label" type="text" placeholder="e.g. Field of Study">
     <button id="cdp-fill-ta">CDP fill one typeahead (minimize!)</button>
+    <!-- SOURCE RECON (tree picker, backlog C — Phase A, MAP ONLY, no commit): on My
+         Information, characterize the "How did you hear about us?" hierarchical picker
+         hidden — opens, maps the tree, locates LinkedIn, tests the expand mechanism,
+         reads commit-signal attributes. Never selects a leaf. Minimize within 60s;
+         [CDP-SRC-RECON] in the SW console. -->
+    <button id="cdp-source-recon">CDP recon: source map (minimize!)</button>
+    <!-- SOURCE FILL (backlog C — Phase B): fill the "How did you hear about us?" picker
+         via the typeahead-style source brain HIDDEN, candidates from
+         defaults.how_did_you_hear (preferred LinkedIn). Minimize within 60s; [CDP-SRC]
+         in the SW console. -->
+    <button id="cdp-source-fill">CDP fill source: LinkedIn (minimize!)</button>
     <hr>
     <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
     <label for="company">Company for this application (temporary):</label>

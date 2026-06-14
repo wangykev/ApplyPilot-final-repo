@@ -593,3 +593,45 @@ block, chip-only commit signal) ported to the CDP substrate, live-verified hidde
   and honestly skipped as unmapped) — the page FIELD SET varies with the Country value.
 - countryPhoneCode sits inside `data-fkit-id="phoneNumber--null"` on page 1 — do not
   generalize the repeating-section guard to all `--null` containers.
+
+## 2026-06-14 — Magna wd3, HIDDEN tab: source picker is a SEARCH typeahead (M26)
+
+The "How did you hear about us?" `source` field (the deferred "tree" class) is — on Magna —
+just a SEARCH typeahead, handled by the M25 walk with source-specific reads (fillSourceCdp).
+
+### Structure — categories on open, but typing bypasses them
+- On open the listbox shows ~13 CATEGORY rows: `<div role="option" data-automation-id="menuItem">`
+  with a chevron (Billboard/Radio, Career Fair, … Social Media, Website/Digital). These are
+  `isCategory` (chevron svg). LinkedIn is NOT a top-level row.
+- BUT typing into the searchBox + Enter FILTERS straight to the matching LEAVES — no category
+  drill needed. So source is driven exactly like the typeahead: type → filter → auto-commit /
+  click the matched leaf → next candidate on no-match.
+
+### Leaves + scope (differs from the typeahead)
+- Result leaves are `<p data-automation-id="promptOption" data-automation-label="LinkedIn">`
+  (NOT `role="option"` — that role is on the category menuItem). Match on `data-automation-label`
+  then textContent.
+- searchBox `aria-controls` is NULL (not even the promptAriaInstruction decoy) → page-wide
+  `promptOption` scrape.
+- ⚠ CHIP CONTAMINATION (cost a recon round): a committed chip ELSEWHERE on the page embeds a
+  `promptOption` P (e.g. countryPhoneCode's chip "United States of America (+1)"). A bare
+  page-wide promptOption scrape catches it → the source's "filter result" reads as the other
+  field's chip, and the settle breaks instantly on it. FIX: exclude
+  `.closest('[data-automation-id="selectedItemList"]')` from the scrape (the M14.1/M22 rule).
+
+### Commit signal + what fired live
+- The matched leaf sits in a `<… data-automation-id="promptLeafNode" data-uxi-multiselectlistitem-isselected="false">`
+  that flips to `"true"` on select; OR a `selectedItem` chip appears in the source wrapper.
+  fillSourceCdp accepts EITHER.
+- Live (LinkedIn, hidden): single-exact match → AUTO-COMMITS on the filter-Enter (chip
+  "LinkedIn", verified, ~500–1000ms) — same as countryPhoneCode. So the auto-commit/chip path
+  fired; the `promptLeafNode`-isselected verify and the multi-match TRUSTED-CLICK are
+  unit-tested but NOT yet live-proven for source (auto-commit short-circuited them — reachable
+  with a how_did_you_hear value that filters to several leaves).
+- An infobar `canceled_by_user` external-detach mid-run is handled (detach-in-finally + the
+  onDetach listener); the retry attaches clean.
+
+### Still deferred
+- The tree/EXPAND-WALK source shape (NO searchBox → chevron categories you click to reveal
+  sub-leaves) and Magna's Certification TREE — only needed when a tenant without a searchBox is
+  observed; the in-tree page-substrate fillSource still covers the expand-walk on the page path.

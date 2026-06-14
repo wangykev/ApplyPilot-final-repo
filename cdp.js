@@ -522,6 +522,193 @@ function cdpDumpChipSubtree(wrapperSel) {
   return out;
 }
 
+// ── Source / tree picker reads (backlog C recon) ────────────────────────────
+// The hierarchical "How did you hear about us?" picker. Self-contained reads
+// for the discover-and-trace recon; mirrors the node-detection of the in-tree
+// page-substrate fillSource (background.js). NOT the production fill.
+
+// Full source-field state, fresh each call. Reports: the searchBox (present/
+// visible/focused/value + its aria-controls target id and what that resolves
+// to — the DECOY check), the page-wide VISIBLE promptOption leaves (w/
+// data-automation-label — the real result leaves on the search path), the
+// [role=option]/[role=treeitem] rows classified category-vs-leaf (the
+// expand-walk shape), any selectedItem chip, and the "No matches" banner.
+function cdpReadSourceState(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+
+  // aria-controls DECOY check: what does the searchBox's aria-controls resolve to?
+  let ariaControls = null;
+  if (sb) {
+    const acId = sb.getAttribute("aria-controls");
+    const acEl = acId ? document.getElementById(acId) : null;
+    ariaControls = {
+      id: acId || null,
+      resolved: !!acEl,
+      tag: acEl ? acEl.tagName : null,
+      automationId: acEl ? acEl.getAttribute("data-automation-id") : null,
+      role: acEl ? acEl.getAttribute("role") : null,
+      optionCountUnder: acEl ? acEl.querySelectorAll('[role="option"],[data-automation-id="promptOption"]').length : null
+    };
+  }
+
+  // Category vs leaf — mirror the in-tree fillSource isCategory heuristics.
+  const isCategory = (el) =>
+    el.hasAttribute("aria-expanded") || el.hasAttribute("aria-haspopup") ||
+    !!el.querySelector('svg, [data-automation-id*="chevron" i], [class*="chevron" i]') ||
+    (el.getAttribute("role") === "treeitem" && el.hasAttribute("aria-level"));
+  const nodeInfo = (el) => ({
+    tag: el.tagName,
+    role: el.getAttribute("role"),
+    automationId: el.getAttribute("data-automation-id"),
+    label: el.getAttribute("data-automation-label") || (el.textContent || "").trim().slice(0, 50),
+    ariaExpanded: el.getAttribute("aria-expanded"),
+    ariaLevel: el.getAttribute("aria-level"),
+    ariaSelected: el.getAttribute("aria-selected"),
+    isCategory: isCategory(el),
+    hasChevron: !!el.querySelector('svg, [data-automation-id*="chevron" i], [class*="chevron" i]')
+  });
+
+  // The search-path result leaves: page-wide VISIBLE promptOption (NOT role=option),
+  // EXCLUDING selectedItemList chips — a committed chip elsewhere (e.g. countryPhoneCode
+  // "United States of America (+1)") embeds a promptOption P and otherwise contaminates
+  // this scrape (M14.1/M22 lesson; observed live in source recon Phase A).
+  const promptOptions = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true"
+      && !el.closest('[data-automation-id="selectedItemList"]'));
+  // The expand-walk rows: role=option / role=treeitem (visible, enabled).
+  const rows = Array.from(document.querySelectorAll('[role="option"],[role="treeitem"]'))
+    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true"
+      && !el.closest('[data-automation-id="selectedItemList"]'));
+
+  // Banner (same promptTitle leaf as the typeahead).
+  let banner = null;
+  for (const el of document.querySelectorAll('[data-automation-id="promptTitle"], [role], p, span, div')) {
+    if (!isVisible(el)) continue;
+    const t = (el.textContent || "").trim();
+    if (t.length > 60 || !/no matches found/i.test(t)) continue;
+    if (Array.from(el.children).some((c) => /no matches found/i.test((c.textContent || "").trim()))) continue;
+    banner = { text: t, automationId: el.getAttribute("data-automation-id") }; break;
+  }
+
+  return {
+    searchBox: sb
+      ? { present: true, visible: isVisible(sb), focused: document.activeElement === sb, value: sb.value, ariaControls }
+      : { present: false, ariaControls: null },
+    promptOptionCount: promptOptions.length,
+    promptOptions: promptOptions.slice(0, 30).map(nodeInfo),
+    rowCount: rows.length,
+    rows: rows.slice(0, 30).map(nodeInfo),
+    chips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim()),
+    banner
+  };
+}
+
+// Locate a source LEAF by label/text (promptOption preferred, then role rows),
+// scrollIntoView, return its fresh rect + selected-state markers on its
+// enclosing multiselectlistitem wrapper (the commit-signal attributes that
+// EXIST — read-only, no click). For the Phase-A "what would confirm a commit".
+function cdpSourceLeafProbe(label) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  const want = norm(label);
+  const leafLabel = (el) => el.getAttribute("data-automation-label") || (el.textContent || "").trim();
+  let el = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+    .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]')) // exclude chip contaminants
+    .find((o) => norm(leafLabel(o)) === want);
+  if (!el) el = Array.from(document.querySelectorAll('[role="option"],[role="treeitem"]'))
+    .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'))
+    .find((o) => norm(o.textContent) === want);
+  if (!el) return { found: false };
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  const wrap = el.closest('[data-uxi-multiselectlistitem-isselected],[data-automation-id*="multiselectlistitem" i],[data-automation-id*="promptLeafNode" i]');
+  return {
+    found: true,
+    matchedLabel: leafLabel(el),
+    automationId: el.getAttribute("data-automation-id"),
+    rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+            cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) },
+    rectLive: r.width > 0 && r.height > 0,
+    commitWrapper: wrap ? {
+      automationId: wrap.getAttribute("data-automation-id"),
+      hasIsSelectedAttr: wrap.hasAttribute("data-uxi-multiselectlistitem-isselected"),
+      isSelectedValue: wrap.getAttribute("data-uxi-multiselectlistitem-isselected"),
+      ariaSelected: wrap.getAttribute("aria-selected")
+    } : null
+  };
+}
+
+// LEAN source read for the fill brain (fillSourceCdp): searchBox state, the
+// chip-excluded VISIBLE promptOption leaves (label = data-automation-label||text)
+// + a set signature for transition detection, the "No matches" banner, and any
+// committed chips. (cdpReadSourceState is the verbose recon variant.)
+function cdpReadSourcePick(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  const leafLabel = (el) => el.getAttribute("data-automation-label") || (el.textContent || "").trim();
+  const leaves = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true"
+      && !el.closest('[data-automation-id="selectedItemList"]'))
+    .map(leafLabel);
+  const sig = leaves.length + "|" + leaves.slice(0, 3).join("~") + "|" + leaves.slice(-3).join("~");
+  let banner = false;
+  for (const el of document.querySelectorAll('[data-automation-id="promptTitle"]')) {
+    if (isVisible(el) && /no matches found/i.test((el.textContent || "").trim())) { banner = true; break; }
+  }
+  return {
+    searchBox: sb
+      ? { present: true, visible: isVisible(sb), focused: document.activeElement === sb, value: sb.value }
+      : { present: false, visible: false, focused: false, value: null },
+    leaves, leafCount: leaves.length, sig, banner,
+    chips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim())
+  };
+}
+
+// Expand a category node by label (trusted-click its rect) — the non-committing
+// drill probe (Q4). Returns the rect clicked, or {found:false}.
+function cdpSourceCategoryRect(label) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  const want = norm(label);
+  const el = Array.from(document.querySelectorAll('[role="option"],[role="treeitem"]'))
+    .filter((o) => isVisible(o)).find((o) => norm(o.textContent).startsWith(want) || norm(o.getAttribute("data-automation-label")) === want);
+  if (!el) return { found: false };
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  return { found: true, ariaExpandedBefore: el.getAttribute("aria-expanded"),
+           rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+                   cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) } };
+}
+
 // The actuation object. No tabId param — the substrate's single tracked
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 function makeCdpActuation() {
@@ -600,6 +787,29 @@ function makeCdpActuation() {
       const rect = await cdpEval(cdpTaOptionRectByText, text);
       if (!rect || rect.w <= 0) return false;
       await cdpClickAt(rect.cx, rect.cy);
+      return true;
+    },
+
+    // ── source / tree picker (backlog C — Magna search shape) ──
+    // Opener ladder mirrors the in-tree fillSource (button → multiselectInputContainer
+    // → selectinput → input → wrapper).
+    openSource: async (loc) => {
+      for (const part of [' button[aria-haspopup="listbox"]', ' [data-automation-id="multiselectInputContainer"]', ' [data-uxi-widget-type="selectinput"]', " input", ""]) {
+        const rect = await cdpEval(cdpRectOf, loc.wrapperSel + part, true);
+        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); return true; }
+      }
+      return false;
+    },
+    readSource: (loc) => cdpEval(cdpReadSourcePick, loc.wrapperSel),
+    focusSourceSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    typeInSourceSearch: (text) => cdpTypeChars(text, 40), // recon-proven on source; filters on Enter
+    clearSourceSearch: () => cdpSelectAllDelete(),
+    // probe a leaf by label → rect + the promptLeafNode selected-state (commit read).
+    probeSourceLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),
+    clickSourceLeaf: async (label) => {
+      const probe = await cdpEval(cdpSourceLeafProbe, label);
+      if (!probe || !probe.found || !probe.rect || probe.rect.w <= 0) return false;
+      await cdpClickAt(probe.rect.cx, probe.rect.cy);
       return true;
     },
 

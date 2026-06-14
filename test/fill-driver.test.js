@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -43,6 +43,7 @@ function makeFakeAct(fields) {
   let focusedInputId = null;
   let openField = null;
   let focusedTa = null;
+  let focusedSrc = null;
   const enabledIdxs = (f) => f.options.map((o, i) => ({ o, i })).filter((x) => !x.o.disabled).map((x) => x.i);
 
   return {
@@ -117,7 +118,19 @@ function makeFakeAct(fields) {
     },
     pressEnter: async () => {
       log.push(["pressEnter"]);
-      // Typeahead first (focused-searchBox semantics).
+      // Source filter-Enter (no commit-Enter for source — commit is clickSourceLeaf).
+      const src = focusedSrc;
+      if (src && src._open) {
+        const fm = (src.filterMap || {})[src._value];
+        if (fm) {
+          src._rev = (src._rev || 0) + 1;
+          if (fm.banner) { src._banner = true; src._leaves = (src.fallbackLeaves || src._leaves || []).slice(); }
+          else if (fm.autoCommit) { src.chips = [fm.autoCommit]; src._open = false; src._banner = false; }
+          else if (fm.filtered) { src._leaves = fm.filtered.slice(); src._banner = false; }
+        }
+        return;
+      }
+      // Typeahead next (focused-searchBox semantics).
       const ta = focusedTa;
       if (ta && ta._open) {
         if (!ta._filtered) {
@@ -145,7 +158,47 @@ function makeFakeAct(fields) {
     pressEscape: async () => {
       log.push(["pressEscape"]);
       if (focusedTa) focusedTa._open = false;
+      if (focusedSrc) focusedSrc._open = false;
       if (openField) openField.open = false;
+    },
+
+    // ── source (backlog C) — filter-Enter only (commit is clickSourceLeaf) ──
+    openSource: async (loc) => {
+      log.push(["openSource", loc.wrapperSel]);
+      const f = byLoc(loc);
+      f._open = true;
+      if (!f.focusUnconfirmable) f._focusedSb = true;
+      if (f._leaves === undefined) f._leaves = (f.openLeaves || []).slice();
+      if (f._banner === undefined) f._banner = false;
+      focusedSrc = f;
+      return true;
+    },
+    readSource: async (loc) => {
+      const f = byLoc(loc);
+      const leaves = f._open ? (f._leaves || []) : [];
+      const sig = (f._rev || 0) + "|" + leaves.length + "|" + leaves.slice(0, 3).join("~");
+      return {
+        searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: f._value || "" },
+        leaves, leafCount: leaves.length, sig,
+        banner: !!(f._open && f._banner),
+        chips: (f.chips || []).slice()
+      };
+    },
+    focusSourceSearch: async (loc) => { log.push(["focusSourceSearch"]); const f = byLoc(loc); if (!f.focusUnconfirmable) f._focusedSb = true; focusedSrc = f; return true; },
+    typeInSourceSearch: async (t) => { log.push(["typeInSourceSearch", t]); if (focusedSrc) { focusedSrc._value = t; focusedSrc._filtered = false; } },
+    clearSourceSearch: async () => { log.push(["clearSourceSearch"]); if (focusedSrc) { focusedSrc._value = ""; focusedSrc._filtered = false; } },
+    probeSourceLeaf: async (label) => {
+      const f = focusedSrc;
+      const found = !!(f && (f._leaves || []).includes(label));
+      return { found, commitWrapper: { isSelectedValue: f && f._selectedLeaf === label ? "true" : "false" }, rect: { cx: 1, cy: 1, w: 10, h: 10 } };
+    },
+    clickSourceLeaf: async (label) => {
+      log.push(["clickSourceLeaf", label]);
+      const f = focusedSrc;
+      if (!f || !(f._leaves || []).includes(label)) return false;
+      if (f.clickCommitFails) return true;
+      if (f.commitVia === "chip") f.chips = [label]; else f._selectedLeaf = label;
+      return true;
     },
 
     // typeahead
@@ -431,17 +484,30 @@ test("checkbox: unmapped (preferredCheck) → skipped with zero actuation", asyn
 
 // ── deferred / unmapped widgets: honest records, ZERO actuation ──────────────
 
-test("source → needs_review and unmapped typeahead → skipped, both with ZERO actuation", async () => {
+test("source with NO how_did_you_hear defaults → needs_review, ZERO actuation; unmapped typeahead → skipped", async () => {
   const act = makeFakeAct([
     { wrapperSel: "[w-src]", fieldName: "source", widgetType: "hierarchical", label: "How Did You Hear About Us?" },
     { wrapperSel: "[w-ta2]", fieldName: "mysteryPicker", widgetType: "typeahead", label: "Mystery", chips: [], filterMap: {} }
   ]);
-  const out = await drivePageFill(act, nameProfile, {}, {}, T_BUDGETS);
+  const out = await drivePageFill(act, nameProfile, {}, {}, T_BUDGETS); // defaults = {} → no hdyh
   assert.strictEqual(out.results[0].status, "needs_review");
-  assert.match(out.results[0].detail, /source deferred/);
+  assert.match(out.results[0].detail, /no how_did_you_hear defaults/);
   assert.strictEqual(out.results[1].status, "skipped");
   assert.strictEqual(out.results[1].detail, "no mapping");
-  assert.strictEqual(act.log.length, 0, "deferred/unmapped widgets must never be actuated");
+  assert.strictEqual(act.log.length, 0, "no-defaults source + unmapped widgets must never be actuated");
+});
+
+test("source WITH how_did_you_hear defaults → routes through fillSourceCdp and fills (drivePageFill)", async () => {
+  const act = makeFakeAct([
+    srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } })
+  ]);
+  const defaults = { how_did_you_hear: { preferred: ["LinkedIn"], fallback: "Other" } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "LinkedIn");
+  assert.strictEqual(rec.verified, true);
+  assert.deepStrictEqual(rec.resolved, ["LinkedIn", "Other"]); // candidates from defaults
 });
 
 // ── typeahead (M25 — the proven Magna brain on CDP; accuracy regression suite) ──
@@ -663,6 +729,78 @@ test("typeahead: searchBox focus cannot be confirmed → ZERO actuation, needs_r
   assert.ok(!act.log.some(([m]) => m === "clearSearch"), "no Ctrl+A clear");
   assert.ok(!act.log.some(([m]) => m === "typeInSearch"), "no typing");
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
+});
+
+// ── source picker (backlog C — the Magna SEARCH shape; mirrors the typeahead walk) ──
+
+const srcField = (flags) => Object.assign({
+  wrapperSel: "[w-src]", fieldName: "source", widgetType: "hierarchical", chips: [], filterMap: {}
+}, flags || {});
+const runSource = (field, candidates) => {
+  const act = makeFakeAct([field]);
+  return fillSourceCdp(act, { wrapperSel: field.wrapperSel }, candidates, T_BUDGETS).then((rec) => ({ rec, act }));
+};
+
+test("source: single exact match auto-commits on the filter-Enter; chip verified", async () => {
+  const { rec } = await runSource(srcField({ filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } }), ["LinkedIn", "Other"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "LinkedIn");
+  assert.strictEqual(rec.matchTier, "enter-auto-commit");
+  assert.strictEqual(rec.verified, true);
+});
+
+test("source: multi-match → trusted leaf-click, verified via promptLeafNode isselected", async () => {
+  const { rec, act } = await runSource(srcField({ commitVia: "leaf", filterMap: { LinkedIn: { filtered: ["LinkedIn", "LinkedIn Learning"] } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "LinkedIn");
+  assert.strictEqual(rec.verified, true);
+  assert.match(rec.detail, /promptLeafNode-isselected/);
+  assert.ok(act.log.some(([m]) => m === "clickSourceLeaf"));
+});
+
+test("source: commit verified via selectedItem chip", async () => {
+  const { rec } = await runSource(srcField({ commitVia: "chip", filterMap: { LinkedIn: { filtered: ["LinkedIn", "LinkedIn Learning"] } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.match(rec.detail, /selectedItem-chip/);
+  assert.strictEqual(rec.verified, true);
+});
+
+test("source: banner on tier-0 → walks to tier-1 and commits", async () => {
+  const { rec } = await runSource(srcField({
+    commitVia: "leaf", fallbackLeaves: ["Other"],
+    filterMap: { LinkedIn: { banner: true }, Other: { filtered: ["Other"] } }
+  }), ["LinkedIn", "Other"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");
+});
+
+test("source: no candidate in its filtered set → needs_review", async () => {
+  const { rec } = await runSource(srcField({ filterMap: { LinkedIn: { filtered: ["Facebook", "Twitter"] } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /no source candidate/);
+});
+
+test("source: matched leaf but commit click fails → needs_review, never false-filled", async () => {
+  const { rec } = await runSource(srcField({ clickCommitFails: true, commitVia: "leaf", filterMap: { LinkedIn: { filtered: ["LinkedIn", "LinkedIn Learning"] } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.verified, false);
+});
+
+test("source: searchBox focus cannot be confirmed → ZERO actuation, needs_review", async () => {
+  const { rec, act } = await runSource(srcField({ focusUnconfirmable: true, filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /could not focus the source search field/);
+  assert.ok(!act.log.some(([m]) => m === "clearSourceSearch"), "no clear");
+  assert.ok(!act.log.some(([m]) => m === "typeInSourceSearch"), "no typing");
+  assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
+  assert.ok(!act.log.some(([m]) => m === "clickSourceLeaf"), "no leaf click");
+});
+
+test("source: pre-filled chip matching a candidate → kept with ZERO actuation", async () => {
+  const { rec, act } = await runSource(srcField({ chips: ["LinkedIn"] }), ["LinkedIn", "Other"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.matchTier, "pre-filled");
+  assert.strictEqual(act.log.length, 0, "pre-filled-correct source must not be touched");
 });
 
 test("typeahead: walk-dry but a stray chip is present → record reports it, never after:null", async () => {

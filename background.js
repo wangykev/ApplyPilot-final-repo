@@ -68,6 +68,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // SOURCE FILL (backlog C — Phase B): fill the source picker via fillSourceCdp
+  // (typeahead-style: type → filter → auto-commit/click leaf) HIDDEN, candidates
+  // from defaults.how_did_you_hear (preferred LinkedIn). Selects LinkedIn + reads
+  // the live commit signal. [CDP-SRC] in the SW console.
+  if (message.type === "RUN_CDP_SOURCE_FILL") {
+    chrome.storage.local.get(["defaults"], ({ defaults }) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpSourceFill(tab.id, defaults);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
+  // SOURCE RECON (tree/source picker, backlog C — Phase A, map-only): characterize
+  // the live "How did you hear about us?" hierarchical picker HIDDEN — open, classify
+  // path (search vs expand-walk), map the tree, locate LinkedIn, test the EXPAND
+  // mechanism non-committingly, read the commit-signal attributes. NEVER selects a
+  // leaf (Phase B, next round). Findings: [CDP-SRC-RECON] in the SW console.
+  if (message.type === "RUN_CDP_SOURCE_RECON") {
+    chrome.storage.local.get(["defaults"], ({ defaults }) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpSourceRecon(tab.id, defaults);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL (Step 2 of the CDP actuation port): fill the active page's SIMPLE
   // widgets (text/dropdown/radio/checkbox) through chrome.debugger input while
   // the tab is HIDDEN — the M22 decision logic (fill-driver.js) over the CDP
@@ -1037,6 +1070,220 @@ async function runCdpRecon(tabId) {
     const msg = String((e && e.message) || e);
     LOG("recon aborted:", msg);
     console.log("[ApplyPilot][CDP-RECON] partial summary:", JSON.stringify(R, null, 2));
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// SOURCE FILL — backlog C, Phase B. Runs fillSourceCdp on formField-source HIDDEN
+// with candidates from defaults.how_did_you_hear (preferred LinkedIn). Selects the
+// match and logs the live commit signal (which verifier fired). Detaches in finally.
+// ============================================================================
+async function runCdpSourceFill(tabId, defaults) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-SRC]", ...a);
+  const WRAP = '[data-automation-id="formField-source"]';
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run."); return { ok: false, error: "never-hidden" }; }
+
+    const hdyh = defaults && defaults.how_did_you_hear;
+    if (!hdyh || !Array.isArray(hdyh.preferred)) { LOG("no defaults.how_did_you_hear.preferred — Load default profile (seeds defaults) first."); return { ok: false, error: "no-candidates" }; }
+    const candidates = [...hdyh.preferred];
+    if (hdyh.fallback) candidates.push(hdyh.fallback);
+    LOG("candidates (tier order):", JSON.stringify(candidates));
+    LOG("tab is hidden — source fill starting. (Δperf ~1000ms hidden is EXPECTED.)");
+
+    const act = makeCdpActuation();
+    const rec = await fillSourceCdp(act, { wrapperSel: WRAP }, candidates, DEFAULT_BUDGETS);
+    LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, detail: rec.detail }, null, 2));
+    if (rec.settle_trace) LOG("settle trace:", JSON.stringify(rec.settle_trace, null, 2));
+    if (rec.captured_options) LOG("captured leaves:", JSON.stringify(rec.captured_options));
+    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("source fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// SOURCE RECON — tree/source picker, backlog C, Phase A (map-only, NO leaf-select).
+// Characterizes the live "How did you hear about us?" hierarchical picker hidden:
+// open → classify path (search vs expand-walk) → map the tree → locate LinkedIn →
+// test the EXPAND mechanism non-committingly → read commit-signal attributes.
+// Reference: in-tree page-substrate fillSource (search path = promptOption leaves
+// filtered on Enter; expand-walk = role=option/treeitem rows, click a category to
+// reveal sub-rows; aria-controls is a promptAriaInstruction DECOY; commit signal =
+// multiselectlistitem selected-state). NEVER clicks a leaf (Phase B is next round).
+// ⚠ Search path: filtering needs type+Enter; to dodge a single-exact auto-commit,
+// Phase A types a BROAD prefix ("Link"), reads the chip after, and reports loudly
+// if anything auto-committed (never a leaf-click). Detaches in finally.
+// ============================================================================
+async function runCdpSourceRecon(tabId, defaults) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-SRC-RECON]", ...a);
+  const R = { q1_structure: {}, q2_open: {}, q3_ariaControls: {}, q4_drill: {}, q5_commitAttrs: {}, tree: {}, sideEffects: [], errors: [] };
+  const WRAP = '[data-automation-id="formField-source"]';
+  const TARGET = "LinkedIn"; // the value of interest (located, NOT selected this round)
+  const guard = async (name, fn) => {
+    try { await fn(); } catch (e) { const m = name + ": " + String((e && e.message) || e); R.errors.push(m); LOG("probe ERROR —", m); }
+  };
+  const read = () => cdpEval(cdpReadSourceState, WRAP);
+
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run."); return { ok: false, error: "never-hidden" }; }
+    LOG("tab is hidden — source recon starting (Phase A, map-only, NO leaf-select).");
+
+    // Locate the field + its opener (union ladder, mirror fillSource).
+    const found = await cdpEval((wrapperSel) => {
+      const w = document.querySelector(wrapperSel);
+      if (!w) return null;
+      const opener =
+        (w.querySelector('button[aria-haspopup="listbox"]') && "button") ||
+        (w.querySelector('[data-automation-id="multiselectInputContainer"]') && "multiselectInputContainer") ||
+        (w.querySelector('[data-uxi-widget-type="selectinput"]') && "selectinput") ||
+        (w.querySelector("input") && "input") || "wrapper";
+      const legend = w.querySelector("legend");
+      let label = legend ? legend.textContent.trim() : null;
+      if (!label) { for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) { label = t; break; } } }
+      return { opener, label, preChips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim()) };
+    }, WRAP);
+    if (!found) { LOG("no formField-source on this page — navigate to My Information and re-run."); return { ok: true, present: false }; }
+    LOG("source field:", JSON.stringify(found));
+    R.q2_open.opener = found.opener;
+    R.q2_open.label = found.label;
+    R.q2_open.preExistingChips = found.preChips;
+    if (found.preChips.length) { LOG("⚠ source already has a chip:", JSON.stringify(found.preChips), "— remove it by hand if you want a clean map."); }
+
+    // ── (Q2) open via the opener ladder ─────────────────────────────────────
+    let st = null;
+    await guard("open", async () => {
+      const openerSel =
+        found.opener === "button" ? WRAP + ' button[aria-haspopup="listbox"]'
+        : found.opener === "multiselectInputContainer" ? WRAP + ' [data-automation-id="multiselectInputContainer"]'
+        : found.opener === "selectinput" ? WRAP + ' [data-uxi-widget-type="selectinput"]'
+        : found.opener === "input" ? WRAP + " input" : WRAP;
+      const rect = await cdpEval(cdpRectOf, openerSel, true);
+      if (!rect || rect.w <= 0) throw new Error("opener rect dead (" + found.opener + ")");
+      await cdpClickAt(rect.cx, rect.cy);
+      await cdpDelay(800);
+      st = await read();
+      R.q2_open.searchBoxPresent = !!(st && st.searchBox.present);
+      R.q2_open.searchBoxVisible = !!(st && st.searchBox.present && st.searchBox.visible);
+      R.q2_open.initialRowCount = st ? st.rowCount : null;
+      R.q2_open.initialPromptOptionCount = st ? st.promptOptionCount : null;
+      R.q2_open.initialRows = st ? st.rows : null;
+      LOG("(Q2) opened:", JSON.stringify({ searchBox: R.q2_open.searchBoxVisible, rows: R.q2_open.initialRowCount, promptOptions: R.q2_open.initialPromptOptionCount }));
+      LOG("(Q2) initial rows (top-level):", JSON.stringify(st ? st.rows : null, null, 2));
+    });
+
+    const path = st && st.searchBox.present ? "search" : "expand-walk";
+    R.q1_structure.path = path;
+    LOG("PATH:", path);
+
+    // ── (Q3) aria-controls decoy ────────────────────────────────────────────
+    R.q3_ariaControls = st && st.searchBox.present ? st.searchBox.ariaControls : { note: "no searchBox (expand-walk path) — no aria-controls" };
+    LOG("(Q3) searchBox aria-controls:", JSON.stringify(R.q3_ariaControls));
+
+    if (path === "search") {
+      // ── (Q1/Q4 search): focus searchBox, type a BROAD prefix + Enter to FILTER
+      //    (NOT exact "LinkedIn" — dodge a single-exact auto-commit), read leaves. ──
+      await guard("search-filter", async () => {
+        await cdpEval(cdpFocusBySel, WRAP + ' input[data-automation-id="searchBox"]');
+        await cdpSelectAllDelete();
+        await cdpDelay(150);
+        await cdpTypeChars("Link", 40); // broad prefix
+        await cdpDelay(300);
+        await cdpKeyTap(CDP_KEYS.enter); // these filter on ENTER, not live
+        // settle: wait for promptOption leaves to render (generous, throttled)
+        let s = null;
+        const t0 = Date.now();
+        while (Date.now() - t0 < 20000) {
+          await cdpDelay(400);
+          s = await read();
+          if (s && (s.promptOptionCount > 0 || s.banner || s.chips.length)) break;
+        }
+        st = s;
+        R.q4_drill = { mechanism: "search/Enter-filter", typed: "Link", settleMs: Date.now() - t0, banner: !!(s && s.banner) };
+        R.q1_structure.leafSelector = '[data-automation-id="promptOption"]';
+        R.q1_structure.filteredLeaves = s ? s.promptOptions : null;
+        R.q1_structure.filteredLeafCount = s ? s.promptOptionCount : null;
+        const linkedinLeaf = s && s.promptOptions.find((o) => /linkedin/i.test(o.label || ""));
+        R.q1_structure.linkedInIsDirectLeaf = !!linkedinLeaf;
+        R.q1_structure.linkedInLeaf = linkedinLeaf || null;
+        LOG("(Q1) 'Link'-filtered leaves:", JSON.stringify(s ? s.promptOptions : null, null, 2));
+        LOG("(Q1) LinkedIn is a direct leaf:", R.q1_structure.linkedInIsDirectLeaf);
+        // chip-check: did the Enter-filter accidentally auto-commit?
+        if (s && s.chips.length) { R.sideEffects.push(`source auto-committed a chip during the filter: ${JSON.stringify(s.chips)} — NOT a leaf-click; review`); LOG("⚠ AUTO-COMMIT during filter:", JSON.stringify(s.chips)); }
+      });
+
+      // ── (Q5 read-only) what selected-state markers exist on the LinkedIn leaf ──
+      await guard("commit-attrs", async () => {
+        const probe = await cdpEval(cdpSourceLeafProbe, TARGET);
+        R.q5_commitAttrs = probe;
+        LOG("(Q5 read-only) LinkedIn leaf probe (rect + commit-wrapper attrs, NO click):", JSON.stringify(probe, null, 2));
+      });
+    } else {
+      // ── (Q1) expand-walk: top-level already in st.rows; locate LinkedIn or its parent ──
+      const topLeaves = (st ? st.rows : []).filter((r) => !r.isCategory);
+      const topCats = (st ? st.rows : []).filter((r) => r.isCategory);
+      R.q1_structure.topLevelLeaves = topLeaves.map((r) => r.label);
+      R.q1_structure.topLevelCategories = topCats.map((r) => r.label);
+      const liTop = topLeaves.find((r) => /linkedin/i.test(r.label || ""));
+      R.q1_structure.linkedInIsTopLevel = !!liTop;
+      LOG("(Q1) top-level leaves:", JSON.stringify(R.q1_structure.topLevelLeaves), "| categories:", JSON.stringify(R.q1_structure.topLevelCategories));
+
+      if (!liTop && topCats.length) {
+        // ── (Q4) drill: expand the FIRST category (trusted click) → did it expand? ──
+        await guard("expand-probe", async () => {
+          const cat = topCats[0];
+          const catRect = await cdpEval(cdpSourceCategoryRect, cat.label);
+          if (!catRect.found || !catRect.rect || catRect.rect.w <= 0) { R.q4_drill = { mechanism: "expand-click", category: cat.label, rectLive: false, note: "category rect dead" }; return; }
+          await cdpClickAt(catRect.rect.cx, catRect.rect.cy);
+          await cdpDelay(1000);
+          const after = await read();
+          R.q4_drill = {
+            mechanism: "expand-click", category: cat.label,
+            ariaExpandedBefore: catRect.ariaExpandedBefore,
+            rowCountBefore: st ? st.rowCount : null,
+            rowCountAfter: after ? after.rowCount : null,
+            expandedOk: !!(after && after.rowCount > (st ? st.rowCount : 0)),
+            rowsAfter: after ? after.rows : null
+          };
+          LOG("(Q4) expand '" + cat.label + "':", JSON.stringify({ before: R.q4_drill.rowCountBefore, after: R.q4_drill.rowCountAfter, expandedOk: R.q4_drill.expandedOk }));
+          // locate LinkedIn among the revealed sub-rows
+          const revealed = after ? after.rows.filter((r) => !r.isCategory) : [];
+          const liSub = revealed.find((r) => /linkedin/i.test(r.label || ""));
+          R.q1_structure.linkedInUnderCategory = liSub ? cat.label : null;
+          R.q1_structure.linkedInSubLeaf = liSub || null;
+          R.sideEffects.push(`expanded category "${cat.label}" (non-committing) — left expanded; benign`);
+        });
+      }
+      // commit-attrs read for the located LinkedIn (top or sub), no click
+      await guard("commit-attrs", async () => {
+        const probe = await cdpEval(cdpSourceLeafProbe, TARGET);
+        R.q5_commitAttrs = probe;
+        LOG("(Q5 read-only) LinkedIn leaf probe:", JSON.stringify(probe, null, 2));
+      });
+    }
+
+    R.tree = { path, finalState: st };
+    LOG("SRC-RECON SUMMARY (paste this whole block back):");
+    console.log("[ApplyPilot][CDP-SRC-RECON]", JSON.stringify(R, null, 2));
+    if (R.sideEffects.length) LOG("side effects:", JSON.stringify(R.sideEffects));
+    return { ok: true, present: true, path, errors: R.errors.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    console.log("[ApplyPilot][CDP-SRC-RECON] partial summary:", JSON.stringify(R, null, 2));
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

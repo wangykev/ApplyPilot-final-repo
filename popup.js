@@ -158,6 +158,45 @@ document.getElementById("cdp-fill-ta").addEventListener("click", () => {
   });
 });
 
+// SOURCE RECON (tree picker, backlog C — Phase A, map-only): characterize the
+// "How did you hear about us?" hierarchical picker hidden (path / tree / where
+// LinkedIn lives / expand mechanism / commit-signal attrs). Never selects a leaf.
+// Minimize within 60s; output is [CDP-SRC-RECON] in the SW console.
+document.getElementById("cdp-source-recon").addEventListener("click", () => {
+  setStatus("Source recon (map only)… MINIMIZE the window now (60s window). Findings land in the service worker console as [CDP-SRC-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_SOURCE_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Source recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.present === false) {
+      setStatus("No source field on this page — navigate to My Information and re-run.");
+    } else {
+      setStatus(`Source recon done (${resp.path} path, ${resp.errors} probe error(s)). Paste the [CDP-SRC-RECON] summary from the SW console.`);
+    }
+  });
+});
+
+// SOURCE FILL (backlog C — Phase B): fill the source picker via fillSourceCdp
+// hidden (candidates from defaults.how_did_you_hear, preferred LinkedIn). Minimize
+// within 60s; result + commit signal land as [CDP-SRC] in the SW console.
+document.getElementById("cdp-source-fill").addEventListener("click", () => {
+  setStatus("Source fill (LinkedIn)… MINIMIZE now (60s). See [CDP-SRC] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_SOURCE_FILL" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false && resp.error === "no-candidates") {
+      setStatus('No how_did_you_hear defaults — click "Load default profile" first.');
+    } else if (resp.ok === false) {
+      setStatus("Source fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Source fill: ${resp.status}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-SRC].`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

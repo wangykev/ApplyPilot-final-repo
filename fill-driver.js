@@ -562,6 +562,136 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace };
 };
 
+// Source ("How did you hear about us?") — the Magna SEARCH shape, recon 2026-06-12.
+// TODO(dup): this MIRRORS fillTypeaheadCdp's walk structure (focus hygiene,
+// per-candidate clear/type/Enter-filter, transition-aware settle + banner block,
+// candidate-only match, commit ladder, honesty read). Kept SEPARATE to leave the
+// shipped typeahead path untouched; if a third picker appears, factor the shared
+// walk into a picker-adapter and collapse both. Change in lockstep with
+// fillTypeaheadCdp. Source-specific deltas vs typeahead:
+//   • leaves = act.readSource().leaves (page-wide promptOption, data-automation-label,
+//     CHIP-EXCLUDED — a committed chip elsewhere embeds a promptOption and otherwise
+//     contaminates; recon Phase A hit exactly this);
+//   • commit-verify accepts EITHER the matched leaf's promptLeafNode
+//     `multiselectlistitem-isselected==="true"` (act.probeSourceLeaf) OR a
+//     selectedItem chip normalize-matching the candidate;
+//   • categories shown on open are bypassed — typing filters straight to leaves.
+const fillSourceCdp = async (act, loc, candidates, budgets) => {
+  const norm = apMatch.normalize;
+  const pre = await act.readSource(loc);
+  if (!pre) return { status: "error", detail: "source wrapper not found" };
+
+  // Pre-filled guard (a chip already matching a candidate → keep, zero actuation).
+  if (pre.chips.length) {
+    const kept = pre.chips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
+    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", detail: "pre-filled source chip matches a candidate — kept (no actuation)" };
+    return { status: "needs_review", after: pre.chips.join("; "), verified: false, detail: "source pre-filled with a value matching no candidate — left as-is" };
+  }
+
+  if (!(await act.openSource(loc))) return { status: "error", detail: "could not open source (opener rects dead)" };
+  // ensure searchBox focused (focus hygiene; a banner can drop focus — M25 leak).
+  const ensureFocused = async () => {
+    let s = await act.readSource(loc);
+    if (!s || !s.searchBox.present || !s.searchBox.visible) {
+      if (!(await act.openSource(loc))) return null;
+      const t0 = Date.now();
+      while (Date.now() - t0 < budgets.taOpenCeilingMs) {
+        await act.delay(budgets.taOpenIntervalMs);
+        s = await act.readSource(loc);
+        if (s && s.searchBox.visible) break;
+      }
+    }
+    if (s && s.searchBox.visible && !s.searchBox.focused) { await act.focusSourceSearch(loc); s = await act.readSource(loc); }
+    return s && s.searchBox.focused ? s : null;
+  };
+
+  const trace = [];
+  let lastLeaves = null;
+  for (const cand of candidates) {
+    const step = { candidate: cand };
+    trace.push(step);
+    const focused = await ensureFocused();
+    if (!focused) {
+      step.note = "could not focus source search field — not actuating blind";
+      return { status: "needs_review", after: null, verified: false, detail: "could not focus the source search field — not actuating blind", settle_trace: trace };
+    }
+    await act.clearSourceSearch();
+    await act.delay(budgets.taActionSettleMs);
+    const snap = await act.readSource(loc);
+    const snapSig = snap ? snap.sig : null;
+    await act.typeInSourceSearch(cand);
+    await act.delay(budgets.taActionSettleMs);
+    await act.pressEnter(); // these filter on ENTER, not live (recon)
+
+    let sawChange = false, stable = 0, prevSig = null, outcome = "timeout";
+    let s = null;
+    const tSettle = Date.now();
+    while (Date.now() - tSettle < budgets.taSettleCeilingMs) {
+      await act.delay(budgets.taSettleIntervalMs);
+      s = await act.readSource(loc);
+      const sig = s ? s.sig : null;
+      if (sig !== snapSig) sawChange = true;
+      if (s && s.chips.length > 0) { outcome = "chip"; break; }
+      if (s && s.banner && sawChange) { outcome = "banner"; break; }
+      if (sawChange && s && s.leafCount > 0 && !s.banner && sig !== snapSig) {
+        stable = sig === prevSig ? stable + 1 : 0;
+        if (stable >= budgets.stableReads - 1) { outcome = "filtered"; break; }
+      }
+      prevSig = sig;
+    }
+    step.outcome = outcome;
+    step.settleMs = Date.now() - tSettle;
+
+    if (outcome === "chip") {
+      // Single-match auto-commit on the filter-Enter — verify the chip.
+      step.chip = s.chips.join("; ");
+      if (s.chips.some((c) => norm(c) === norm(cand))) {
+        return { status: "filled", after: step.chip, verified: true, matchTier: "enter-auto-commit", detail: `source auto-committed on the filter-Enter (candidate "${cand}")`, settle_trace: trace };
+      }
+      return { status: "needs_review", after: step.chip, verified: false, detail: `source auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged, walk stopped`, settle_trace: trace };
+    }
+    if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
+    if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
+
+    const leaves = s.leaves;
+    lastLeaves = leaves;
+    step.leafCount = s.leafCount;
+    const m = apMatch.matchCandidates([cand], leaves);
+    if (m.targetIndex !== -1) step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
+    if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set"; continue; }
+
+    const matchedLeaf = leaves[m.targetIndex];
+    step.matchedLeaf = matchedLeaf;
+    // Commit ladder: trusted CLICK the matched leaf (recon: no highlight arms under
+    // CDP typing). Verify via the promptLeafNode isselected flip OR a selectedItem chip.
+    const verifyCommitted = async () => {
+      const probe = await act.probeSourceLeaf(matchedLeaf);
+      const leafSelected = !!(probe && probe.commitWrapper && probe.commitWrapper.isSelectedValue === "true");
+      const st = await act.readSource(loc);
+      const chipMatch = !!(st && st.chips.some((c) => norm(c) === norm(matchedLeaf)));
+      return { leafSelected, chipMatch, chips: st ? st.chips : [] };
+    };
+    let committed = false, via = null, vc = null;
+    if (await act.clickSourceLeaf(matchedLeaf)) {
+      const d0 = Date.now();
+      while (Date.now() - d0 < budgets.commitCeilingMs) {
+        await act.delay(budgets.commitIntervalMs);
+        vc = await verifyCommitted();
+        if (vc.leafSelected || vc.chipMatch) { committed = true; via = vc.chipMatch ? "selectedItem-chip" : "promptLeafNode-isselected"; break; }
+      }
+    }
+    step.commitVia = via;
+    step.chip = vc && vc.chips.length ? vc.chips.join("; ") : null;
+    if (committed) {
+      return { status: "filled", after: step.chip || matchedLeaf, verified: true, matchTier: m.matchTier, detail: `source click-commit on "${matchedLeaf}" (verified via ${via})`, captured_options: leaves, settle_trace: trace };
+    }
+    step.note = "matched leaf but commit did not verify (no isselected flip / chip)";
+  }
+
+  await act.pressEscape();
+  return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace };
+};
+
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
 async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
@@ -590,10 +720,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 
     try {
       if (f.widgetType === "hierarchical") {
-        // Deferred: the source picker is a different code path (tree/expand-walk
-        // variants) — its own recon + milestone.
-        record.status = "needs_review";
-        record.detail = "source deferred (CDP milestone scope) — fill on the form";
+        // Source ("How did you hear about us?") — candidates come from
+        // application_defaults.how_did_you_hear (NOT the profile), mirroring the
+        // in-tree fillEngine. The Magna SEARCH shape is handled by fillSourceCdp;
+        // the tree/expand-walk shape (no searchBox) is still deferred.
+        const hdyh = defaults && defaults.how_did_you_hear;
+        if (!hdyh || !Array.isArray(hdyh.preferred)) {
+          record.status = "needs_review";
+          record.detail = "no how_did_you_hear defaults loaded";
+        } else {
+          const candidates = [...hdyh.preferred];
+          if (hdyh.fallback) candidates.push(hdyh.fallback);
+          record.resolved = candidates;
+          Object.assign(record, await fillSourceCdp(act, loc, candidates, budgets));
+        }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
         // "Yes" carries a review flag; unevaluable stays blank + review.
@@ -668,5 +808,5 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp };
+  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp };
 }
