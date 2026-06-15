@@ -30,6 +30,92 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates };
 
+// ── M27 flag taxonomy ───────────────────────────────────────────────────────
+// The SINGLE source of the (status, confidence, flag) triple for a choice-widget
+// COMMIT, keyed by (overwrite?, commitKind, matchTier). Encoded as one table so
+// the three values can't drift apart — never assign them ad-hoc per branch.
+//   • flag = PROVENANCE (what action happened); confidence = MATCH QUALITY. They
+//     are ORTHOGONAL.
+//   • matchTier strings are apMatch.matchCandidates outputs ("exact-normalized" /
+//     "containment" / "fuzzy-NN" / null); flagTierCategory collapses them.
+//   • commitKind ∈ {"auto","directed"} (Workday auto-committed on the filter-Enter
+//     vs we directed the commit via Enter/click on a verified option).
+//   • Inside an overwrite context the flag is ALWAYS overwrite-* — NO autocommit-*/
+//     directed-* flag ever fires under overwrite (the precedence rule). The
+//     overwrite=true rows are authored here but only REACHED in Commit B; Commit A
+//     calls commitOutcome with overwrite=false exclusively.
+// The record's `matchTier` field stays the COMMIT-PATH descriptor (pre-filled /
+// enter-auto-commit / enter-commit / click-commit / source-click-commit) — the
+// match quality lives in the NEW `confidence` field, provenance in the NEW `flag`.
+function flagTierCategory(matchTier) {
+  if (matchTier === "exact-normalized") return "exact";
+  if (matchTier === "containment") return "containment";
+  if (typeof matchTier === "string" && matchTier.indexOf("fuzzy") === 0) return "fuzzy";
+  return "none";
+}
+function commitOutcome(overwrite, commitKind, matchTier) {
+  const tier = flagTierCategory(matchTier);
+  if (overwrite) {
+    // A successful overwrite is ALWAYS overwrite-success regardless of tier;
+    // confidence still tracks the tier (high iff exact, else low). A changed chip
+    // that matches no candidate is an overwrite-stray (destructive — see CLAUDE/
+    // dom-patterns; accepted).
+    if (tier === "none") return { status: "needs_review", confidence: "none", flag: "overwrite-stray" };
+    return { status: "filled_review", confidence: tier === "exact" ? "high" : "low", flag: "overwrite-success" };
+  }
+  if (commitKind === "auto") {
+    if (tier === "exact") return { status: "filled", confidence: "high", flag: "autocommit-exact" };
+    if (tier === "containment") return { status: "filled_review", confidence: "low", flag: "autocommit-containment" };
+    if (tier === "fuzzy") return { status: "filled_review", confidence: "low", flag: "autocommit-fuzzy" };
+    return { status: "needs_review", confidence: "none", flag: "autocommit-stray" };
+  }
+  // directed
+  if (tier === "exact") return { status: "filled", confidence: "high", flag: "directed-exact" };
+  if (tier === "containment") return { status: "filled_review", confidence: "low", flag: "directed-containment" };
+  if (tier === "fuzzy") return { status: "filled_review", confidence: "low", flag: "directed-fuzzy" };
+  return { status: "needs_review", confidence: "none", flag: null };
+}
+
+// ── M27 overwrite helpers (Commit B — shared by typeahead + source, lockstep) ─
+// Non-destructive overwrite: we do NOT delete the pre-fill; we search over the
+// populated field and let a commit REPLACE it (recon 2026-06-14 = REPLACE on both
+// widgets). A no-match leaves the original intact.
+//
+// chipSetChanged: did the committed chip set change from the pre-existing one?
+// NORMALIZED, order-independent. For an EMPTY field (priorChips=[]) any non-empty
+// chip set is a change, so the overwrite logic reduces to the original "a chip
+// appeared" — empty-field behavior is unchanged.
+function chipSetChanged(priorChips, chips) {
+  const norm = apMatch.normalize;
+  const a = (priorChips || []).map(norm).sort();
+  const b = (chips || []).map(norm).sort();
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return true;
+  return false;
+}
+
+// overwriteNoMatchResting: the walk-end resting state under overwrite. The
+// original chip is intact (we never deleted it). Clear any leftover filter text
+// so the field rests as {chips:[original], query:""}, and flag for review (a
+// future-AI candidate). Parametrized by read/clear/ensureFocused fns to keep
+// typeahead+source in lockstep (the ONLY differences between the two walks).
+// clear is the recon-proven chip-PRESERVING Ctrl+A+Delete (clearSearch /
+// clearSourceSearch); the best-effort focus is non-actuating beyond the clear.
+async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets) {
+  const original = priorChips.join("; ");
+  const focused = await ensureFocusedFn();
+  if (focused) { await clearFn(); await act.delay(budgets.taActionSettleMs); }
+  await act.pressEscape();
+  let endChips = priorChips;
+  try { const st = await readFn(loc); if (st && st.chips) endChips = st.chips; } catch (e) { /* keep priorChips */ }
+  return {
+    status: "needs_review", after: endChips.length ? endChips.join("; ") : original, verified: false,
+    flag: "overwrite-nomatch-original-kept", confidence: "none",
+    detail: `no candidate matched — original pre-fill "${original}" kept, filter text cleared (future-AI candidate)`,
+    captured_options: lastOptions || undefined, settle_trace: trace, overwrite: { original, refilled: false }
+  };
+}
+
 // Wait budgets — recon-informed (2026-06-12, Magna wd3 hidden): dropdown cold
 // open ~5.6s → 20s ceiling; commits 300-620ms → 10s ceilings; text read-back
 // ≤700ms → 500ms read delay. GENEROUS by design: the page's reaction runs on a
@@ -408,16 +494,21 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   if (!pre) return { status: "error", detail: "typeahead wrapper not found" };
 
   // Pre-filled guard FIRST (countryPhoneCode: Workday auto-derives it from
-  // Country, so an already-correct chip is the COMMON case). Keep it with ZERO
-  // actuation — re-typing a correct value is the duplicate/clear failure mode.
-  // A same-value race with Workday's own auto-derivation is benign (we'd type
-  // the identical value); a mismatched chip is flagged, never overwritten
-  // (chip deletion is a later milestone).
-  if (pre.chips.length) {
-    const kept = pre.chips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
-    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", detail: "pre-filled chip matches a candidate — kept (no actuation)" };
-    return { status: "needs_review", after: pre.chips.join("; "), verified: false, detail: "pre-filled with a value matching no candidate — left as-is (chip overwrite is a later milestone)" };
+  // Country, so an already-correct chip is the COMMON case). EXACT match → keep
+  // with ZERO actuation (re-typing a correct value is the duplicate/clear failure
+  // mode; a same-value race with Workday's auto-derivation is benign). A
+  // MISMATCHED pre-fill → OVERWRITE (M27 Commit B): non-destructive — recon proved
+  // search-while-populated commits REPLACE the chip, so fall through into the walk
+  // (the original stays until a new value commits; a no-match leaves it intact).
+  const priorChips = pre.chips.slice();
+  if (priorChips.length) {
+    const kept = priorChips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
+    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled chip matches a candidate — kept (no actuation)" };
+    // else: mismatched pre-fill — DON'T return; fall through to overwrite.
   }
+  const isOverwrite = priorChips.length > 0;          // a mismatched pre-fill we're replacing (KEEP already returned)
+  const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
+  const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
 
   // Ensure the searchBox is present + focused. The widget loses searchBox focus
   // after a "No matches found" banner (recon 2026-06-12: a candidate after a
@@ -474,7 +565,10 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
       s = await act.readTypeahead(loc);
       const sig = s ? s.pageWide.sig : null;
       if (sig !== snapSig) sawChange = true;
-      if (s && s.chips.length > 0) { outcome = "chip"; break; }
+      // Transition-aware: a commit is a chip set that DIFFERS from priorChips
+      // (M27). Empty field (priorChips=[]) → any chip; overwrite → only a NEW chip
+      // (the pre-existing one alone is not a commit). Sampled here in settlePoll.
+      if (s && chipSetIsNew(s.chips)) { outcome = "chip"; break; }
       if (s && s.banner && sawChange) { outcome = "banner"; break; }
       if (sawChange && s && s.pageWide.count > 0 && !s.banner && sig !== snapSig) {
         stable = sig === prevSig ? stable + 1 : 0;
@@ -486,13 +580,32 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
     step.settleMs = Date.now() - tSettle;
 
     if (outcome === "chip") {
-      // Single exact match auto-commits on the filter-Enter (recon-proven).
+      // An auto-commit fired on the filter-Enter. Classify the committed chip by
+      // its match tier vs THIS candidate (M27 taxonomy via commitOutcome): exact →
+      // filled; containment/fuzzy → filled_review + soft flag (kept, never silently
+      // trusted as plain "filled"); no match → needs_review (the stray, e.g. a
+      // "Canada" chip for a US query). Walk stops either way — a chip now exists and
+      // more typing contaminates. `matchTier` stays the commit-path; `flag`/
+      // `confidence` carry the taxonomy.
       step.chip = s.chips.join("; ");
-      if (s.chips.some((c) => norm(c) === norm(cand))) {
-        return { status: "filled", after: step.chip, verified: true, matchTier: "enter-auto-commit", detail: `auto-committed on the filter-Enter (candidate "${cand}")`, settle_trace: trace };
+      const cm = apMatch.matchCandidates([cand], s.chips);
+      const oc = commitOutcome(isOverwrite, "auto", cm.matchTier);
+      step.flag = oc.flag;
+      if (oc.status === "needs_review") {
+        // empty-field → autocommit-stray; overwrite → overwrite-stray (the accepted
+        // destructive edge: a different wrong value replaced the original).
+        const d = isOverwrite
+          ? `overwrote pre-fill "${priorChips.join("; ")}" but the auto-commit chip "${step.chip}" matches no candidate — ${oc.flag}, walk stopped`
+          : `auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged (${oc.flag}), walk stopped`;
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
       }
-      // A chip exists but is NOT this candidate — stop; more typing contaminates.
-      return { status: "needs_review", after: step.chip, verified: false, detail: `auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged, walk stopped`, settle_trace: trace };
+      // Defensive single-chip assertion (recon = REPLACE → 1 chip). A residual
+      // second chip means a tenant ADDED — never silently accept a two-value state.
+      if (isOverwrite && s.chips.length > 1) {
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
+      }
+      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}auto-committed on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
     }
     if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
     if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
@@ -519,7 +632,10 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
       while (Date.now() - t0 < ceilingMs) {
         await act.delay(budgets.commitIntervalMs);
         cs = await act.readTypeahead(loc);
-        if (cs && cs.chips.length > 0) break;
+        // Break on a NEW chip (overwrite) OR a chip == the matched option (covers
+        // the same-value overwrite where the matched target already equals the
+        // original — no needless timeout). Empty field: equivalent to "any chip".
+        if (cs && (chipSetIsNew(cs.chips) || cs.chips.some((c) => norm(c) === norm(matchedOption)))) break;
       }
       return cs ? cs.chips : [];
     };
@@ -539,20 +655,37 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
     step.chip = chips.join("; ") || null;
     step.commitPath = chips.length ? commitPath : null;
     if (chips.length && chips.some((c) => norm(c) === norm(matchedOption))) {
-      return { status: "filled", after: step.chip, verified: true, matchTier: m.matchTier, detail: `${commitPath} on "${matchedOption}"`, captured_options: texts, settle_trace: trace };
+      // Directed commit verified (chip == the matched option). Grade by the
+      // candidate→option tier `m.matchTier` (M27): exact → filled; containment/fuzzy
+      // → filled_review + flag. Under overwrite → overwrite-success + provenance.
+      // `matchTier` = the commit-path; quality → confidence.
+      const oc = commitOutcome(isOverwrite, "directed", m.matchTier);
+      step.flag = oc.flag;
+      if (isOverwrite && chips.length > 1) {
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: commitPath, flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${chips.length} chips (expected single REPLACE) — review`, captured_options: texts, settle_trace: trace }, true);
+      }
+      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: commitPath, flag: oc.flag, confidence: oc.confidence, detail: `${prov}${commitPath} on "${matchedOption}" (${m.matchTier})`, captured_options: texts, settle_trace: trace }, true);
     }
     if (chips.length) {
-      return { status: "needs_review", after: step.chip, verified: false, detail: `chip "${step.chip}" does not match "${matchedOption}" — flagged, walk stopped`, captured_options: texts, settle_trace: trace };
+      // A chip exists but isn't the matched option — overwrite → overwrite-stray
+      // (a different value replaced the original); empty field → directed-mismatch.
+      return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: commitPath, flag: isOverwrite ? "overwrite-stray" : "directed-mismatch", confidence: "none", detail: `chip "${step.chip}" does not match "${matchedOption}" — flagged, walk stopped`, captured_options: texts, settle_trace: trace }, false);
     }
     step.note = "no chip from commit-Enter or click — commit did not take";
   }
 
-  // Honesty: after closing the open list, a final chip read so the record NEVER
-  // reports after:null when the page physically holds a value — catches a
-  // late/stray commit our settle missed (e.g. a highlight-Enter that landed
-  // after we moved on). Read AFTER Escape: a committed chip (selectedItem)
-  // survives Escape, so this reflects the true settled state. An uncommanded
-  // chip is flagged for review; clearing it is a later milestone.
+  // Walk exhausted. Under OVERWRITE the original chip is intact (non-destructive —
+  // we never deleted it): rest the field clean ({chips:[original], query:""}) and
+  // flag overwrite-nomatch-original-kept (future-AI candidate).
+  if (isOverwrite) {
+    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets);
+  }
+  // Empty-field honesty read: after closing the list, a final chip read so the
+  // record NEVER reports after:null when the page physically holds a value —
+  // catches a late/stray commit our settle missed (e.g. a highlight-Enter that
+  // landed after we moved on). A committed chip (selectedItem) survives Escape, so
+  // this reflects the true settled state; an uncommanded chip is flagged for review.
   await act.pressEscape();
   let strayChip = null;
   try { const endState = await act.readTypeahead(loc); strayChip = endState && endState.chips.length ? endState.chips.join("; ") : null; } catch (e) { /* ignore read error */ }
@@ -581,12 +714,19 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   const pre = await act.readSource(loc);
   if (!pre) return { status: "error", detail: "source wrapper not found" };
 
-  // Pre-filled guard (a chip already matching a candidate → keep, zero actuation).
-  if (pre.chips.length) {
-    const kept = pre.chips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
-    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", detail: "pre-filled source chip matches a candidate — kept (no actuation)" };
-    return { status: "needs_review", after: pre.chips.join("; "), verified: false, detail: "source pre-filled with a value matching no candidate — left as-is" };
+  // Pre-filled guard (EXACT match → keep, zero actuation). A MISMATCHED pre-fill →
+  // OVERWRITE (M27 Commit B, lockstep with fillTypeaheadCdp): recon proved the
+  // source widget is symmetric (search-while-populated, clearSourceSearch preserves
+  // the chip, commit REPLACES), so fall through into the walk.
+  const priorChips = pre.chips.slice();
+  if (priorChips.length) {
+    const kept = priorChips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
+    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled source chip matches a candidate — kept (no actuation)" };
+    // else: mismatched pre-fill — DON'T return; fall through to overwrite.
   }
+  const isOverwrite = priorChips.length > 0;
+  const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
+  const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
 
   if (!(await act.openSource(loc))) return { status: "error", detail: "could not open source (opener rects dead)" };
   // ensure searchBox focused (focus hygiene; a banner can drop focus — M25 leak).
@@ -631,7 +771,8 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
       s = await act.readSource(loc);
       const sig = s ? s.sig : null;
       if (sig !== snapSig) sawChange = true;
-      if (s && s.chips.length > 0) { outcome = "chip"; break; }
+      // Transition-aware (M27): a commit is a chip set DIFFERING from priorChips.
+      if (s && chipSetIsNew(s.chips)) { outcome = "chip"; break; }
       if (s && s.banner && sawChange) { outcome = "banner"; break; }
       if (sawChange && s && s.leafCount > 0 && !s.banner && sig !== snapSig) {
         stable = sig === prevSig ? stable + 1 : 0;
@@ -643,12 +784,24 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     step.settleMs = Date.now() - tSettle;
 
     if (outcome === "chip") {
-      // Single-match auto-commit on the filter-Enter — verify the chip.
+      // Auto-commit on the filter-Enter — classify by tier (M27, lockstep with
+      // fillTypeaheadCdp): exact → filled; containment/fuzzy → filled_review + flag;
+      // no match → needs_review (stray). Walk stops either way.
       step.chip = s.chips.join("; ");
-      if (s.chips.some((c) => norm(c) === norm(cand))) {
-        return { status: "filled", after: step.chip, verified: true, matchTier: "enter-auto-commit", detail: `source auto-committed on the filter-Enter (candidate "${cand}")`, settle_trace: trace };
+      const cm = apMatch.matchCandidates([cand], s.chips);
+      const oc = commitOutcome(isOverwrite, "auto", cm.matchTier);
+      step.flag = oc.flag;
+      if (oc.status === "needs_review") {
+        const d = isOverwrite
+          ? `overwrote source pre-fill "${priorChips.join("; ")}" but the auto-commit chip "${step.chip}" matches no candidate — ${oc.flag}, walk stopped`
+          : `source auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged (${oc.flag}), walk stopped`;
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
       }
-      return { status: "needs_review", after: step.chip, verified: false, detail: `source auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged, walk stopped`, settle_trace: trace };
+      if (isOverwrite && s.chips.length > 1) {
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
+      }
+      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}source auto-committed on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
     }
     if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
     if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
@@ -683,11 +836,26 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     step.commitVia = via;
     step.chip = vc && vc.chips.length ? vc.chips.join("; ") : null;
     if (committed) {
-      return { status: "filled", after: step.chip || matchedLeaf, verified: true, matchTier: m.matchTier, detail: `source click-commit on "${matchedLeaf}" (verified via ${via})`, captured_options: leaves, settle_trace: trace };
+      // Directed leaf-click verified. Grade by candidate→leaf tier (M27); under
+      // overwrite → overwrite-success + provenance. matchTier = commit path,
+      // quality → confidence, provenance → flag.
+      const oc = commitOutcome(isOverwrite, "directed", m.matchTier);
+      step.flag = oc.flag;
+      const finalChips = vc ? vc.chips : [];
+      if (isOverwrite && finalChips.length > 1) {
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "source-click-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${finalChips.length} chips (expected single REPLACE) — review`, captured_options: leaves, settle_trace: trace }, true);
+      }
+      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
+      return withOverwrite({ status: oc.status, after: step.chip || matchedLeaf, verified: true, matchTier: "source-click-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}source click-commit on "${matchedLeaf}" (verified via ${via}, ${m.matchTier})`, captured_options: leaves, settle_trace: trace }, true);
     }
     step.note = "matched leaf but commit did not verify (no isselected flip / chip)";
   }
 
+  // Walk exhausted. Under OVERWRITE the original source chip is intact: rest the
+  // field clean ({chips:[original], query:""}) and flag for review (lockstep).
+  if (isOverwrite) {
+    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets);
+  }
   await act.pressEscape();
   return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace };
 };
@@ -712,7 +880,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
       rawValue: rawValue === undefined ? null : rawValue,
       resolved: null,
       status: null,
-      matchTier: null,
+      matchTier: null,     // COMMIT-PATH descriptor (not match quality — that's `confidence`)
+      confidence: null,    // M27: match quality (high/low/none) — set by commitOutcome
+      flag: null,          // M27: provenance (autocommit-*/directed-*/overwrite-*) — set by commitOutcome
       verified: null,
       after: null,
       detail: null
@@ -808,5 +978,5 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp };
+  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

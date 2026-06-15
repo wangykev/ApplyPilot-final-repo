@@ -48,6 +48,17 @@
     <label for="ta-label">CDP typeahead target (label regex):</label>
     <input id="ta-label" type="text" placeholder="e.g. Field of Study">
     <button id="cdp-fill-ta">CDP fill one typeahead (minimize!)</button>
+    <!-- OVERWRITE RECON (M27 Step 0): probe the populated-field model. HAND-SEED a
+         WRONG value into a typeahead (e.g. countryPhoneCode) FIRST, then click and
+         minimize within 60s. Confirms searchBox-while-populated, that clearSearch
+         keeps the chip, and whether a commit REPLACES vs ADDS a chip (the latter
+         decides if residual-chip cleanup is needed). [OVR-RECON] in the SW console. -->
+    <button id="cdp-overwrite-recon">CDP recon: overwrite model (minimize!)</button>
+    <!-- SOURCE OVERWRITE RECON (M27 Step 0, source half): prove clearSourceSearch
+         keeps a seeded source chip. HAND-SEED a value into "How did you hear about
+         us?" first, then click and minimize within 60s. [OVR-SRC-RECON] in the SW
+         console. The (a2) result gates Commit B's source no-match path. -->
+    <button id="cdp-source-overwrite-recon">CDP recon: source overwrite (minimize!)</button>
     <!-- SOURCE RECON (tree picker, backlog C — Phase A, MAP ONLY, no commit): on My
          Information, characterize the "How did you hear about us?" hierarchical picker
          hidden — opens, maps the tree, locates LinkedIn, tests the expand mechanism,

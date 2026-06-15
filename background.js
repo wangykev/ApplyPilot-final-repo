@@ -45,6 +45,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // OVERWRITE RECON (M27 Step 0): probe the POPULATED-field model on a typeahead
+  // that ALREADY holds a hand-seeded WRONG chip — searchBox-while-populated (a),
+  // clearSearch preserves the chip (a2), commit REPLACES vs ADDS (b). Field-aware
+  // (profile candidate must differ from the seeded chip). [OVR-RECON] in the SW
+  // console. Profile read so the probe restores the field's correct value.
+  if (message.type === "RUN_CDP_OVERWRITE_RECON") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpOverwriteRecon(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
+  // SOURCE OVERWRITE RECON (M27 Step 0, source half): prove clearSourceSearch
+  // preserves a SEEDED source chip before Commit B's source no-match path relies
+  // on it. Candidates from defaults.how_did_you_hear. [OVR-SRC-RECON] in the SW
+  // console.
+  if (message.type === "RUN_CDP_SOURCE_OVERWRITE_RECON") {
+    chrome.storage.local.get(["defaults"], ({ defaults }) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpSourceOverwriteRecon(tab.id, defaults);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // TARGETED TYPEAHEAD FILL (M25 verify harness): fill ONE typeahead located by
   // label regex — including a field inside a repeating entry (entry-1 scoped
   // via selector composition) — through the full fillTypeaheadCdp brain while
@@ -1099,10 +1132,10 @@ async function runCdpSourceFill(tabId, defaults) {
 
     const act = makeCdpActuation();
     const rec = await fillSourceCdp(act, { wrapperSel: WRAP }, candidates, DEFAULT_BUDGETS);
-    LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, detail: rec.detail }, null, 2));
+    LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, flag: rec.flag, confidence: rec.confidence, detail: rec.detail }, null, 2));
     if (rec.settle_trace) LOG("settle trace:", JSON.stringify(rec.settle_trace, null, 2));
     if (rec.captured_options) LOG("captured leaves:", JSON.stringify(rec.captured_options));
-    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true };
+    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true, flag: rec.flag || null };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("source fill aborted:", msg);
@@ -1553,6 +1586,315 @@ async function runCdpTypeaheadRecon(tabId, profile) {
 }
 
 // ============================================================================
+// OVERWRITE RECON (M27 Step 0) — the populated-field model probe. The existing
+// TA-RECON deliberately targets a CHIPLESS field and vetoes the populated-commit
+// probe as destructive; M27's non-destructive design needs the OPPOSITE answers,
+// on a field that ALREADY holds a (hand-seeded WRONG) chip:
+//   (a)  with a chip present, does opening expose a usable (visible+focused)
+//        searchBox? (the "search-while-populated" premise)
+//   (a2) does clearSearch (Ctrl+A+Delete) on the EMPTY searchBox PRESERVE the
+//        committed chip? (Commit B clears the filter before each candidate — it
+//        must NOT delete the chip)
+//   (b)  typing a DIFFERENT valid candidate + filter-Enter → does the commit
+//        REPLACE the chip (1 chip = new value) or ADD a second (multiselect)?
+//        REPLACE ⇒ Commit C (residual-chip cleanup) NOT needed; ADD ⇒ required.
+// Field-aware: targets a populated field whose profile candidate DIFFERS from the
+// seeded chip, so a REPLACE restores the field to its correct value. Detaches in
+// finally. Output: [OVR-RECON] in the SW console.
+// ============================================================================
+async function runCdpOverwriteRecon(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][OVR-RECON]", ...a);
+  const R = {
+    scan: null, target: null,
+    a_searchBoxWhilePopulated: null, a2_clearEffect: null, b_commit: null,
+    verdict: {}, sideEffects: [], errors: []
+  };
+  const guard = async (name, fn) => {
+    try { await fn(); } catch (e) {
+      const m = name + ": " + String((e && e.message) || e);
+      R.errors.push(m); LOG("probe ERROR —", m);
+    }
+  };
+  const readState = (sel) => cdpEval(cdpReadTaState, sel);
+  const normEq = (a, b) => normalize(a) === normalize(b);
+  // chip set unchanged from the seeded baseline (normalized, order-independent).
+  const sameAsSeeded = (chips, seeded) =>
+    chips.length === seeded.length && seeded.every((c) => chips.some((x) => normEq(x, c)));
+
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, no probes executed.");
+      return { ok: false, error: "never-hidden" };
+    }
+    LOG("tab is hidden — overwrite recon starting.");
+
+    const scan = await cdpEval(cdpScanTypeaheads);
+    R.scan = scan;
+    LOG("typeaheads on this page (pre-state, incl. chips):", JSON.stringify(scan, null, 2));
+
+    const populated = (scan || []).filter((t) => t.chips && t.chips.length > 0);
+    if (!populated.length) {
+      LOG("no POPULATED typeahead here. HAND-SEED a WRONG value into a typeahead (e.g. countryPhoneCode on My Information) first, then re-run. The pre-state above is the only deliverable otherwise.");
+      console.log("[ApplyPilot][OVR-RECON]", JSON.stringify(R, null, 2));
+      return { ok: true, probed: false };
+    }
+
+    // Prefer a populated field whose profile candidate DIFFERS from the seeded
+    // chip — a genuine mismatch, so a REPLACE restores the correct value.
+    const candsFor = (t) => {
+      const mappedPath = FIELD_MAP[t.fieldName];
+      const raw = mappedPath && profile ? getByPath(profile, mappedPath) : undefined;
+      if (raw === undefined) return null;
+      const rr = resolve(raw, "typeahead");
+      return (!rr.skip && rr.candidates && rr.candidates.length) ? rr.candidates : null;
+    };
+    let target = null, candidates = null;
+    for (const t of populated) {
+      const cands = candsFor(t);
+      if (cands && !t.chips.some((c) => cands.some((cd) => normEq(c, cd)))) { target = t; candidates = cands; break; }
+    }
+    if (!target) {
+      target = populated[0];
+      candidates = candsFor(target) || ["Other"];
+      LOG("⚠ no populated field whose profile candidate DIFFERS from its seeded chip — using", target.fieldName, "with candidate(s)", JSON.stringify(candidates), "(if the chip already matches a candidate this won't be a real overwrite — seed a genuinely WRONG value for a clean (b) verdict).");
+    }
+    const sel = target.wrapperSel;
+    const seededChips = target.chips.slice();
+    R.target = { fieldName: target.fieldName, label: target.label, entryFkitId: target.entryFkitId || null, seededChips, candidates };
+    LOG("target:", target.fieldName, JSON.stringify(target.label), "— seeded chip(s):", JSON.stringify(seededChips), "candidate(s):", JSON.stringify(candidates));
+
+    // ── (a) open populated field → searchBox usable WITH a chip present? ─────────
+    await guard("(a) searchBox-while-populated", async () => {
+      const openerSel =
+        target.opener === "multiselectInputContainer" ? sel + ' [data-automation-id="multiselectInputContainer"]'
+        : target.opener === "selectinput" ? sel + ' [data-uxi-widget-type="selectinput"]'
+        : target.opener === "input" ? sel + " input" : sel;
+      const rect = await cdpEval(cdpRectOf, openerSel, true);
+      if (!rect || rect.w <= 0) throw new Error("opener rect dead (" + target.opener + ")");
+      await cdpClickAt(rect.cx, rect.cy);
+      let s = null; const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await cdpDelay(250);
+        s = await readState(sel);
+        if (s && s.searchBox.present && s.searchBox.visible) break;
+      }
+      let focusedBy = s && s.searchBox.focused ? "opener-click" : null;
+      if (s && s.searchBox.visible && !s.searchBox.focused) {
+        if (await cdpEval(cdpFocusBySel, sel + ' input[data-automation-id="searchBox"]')) focusedBy = "page-focus()";
+        s = await readState(sel);
+      }
+      R.a_searchBoxWhilePopulated = {
+        chipsStillPresent: s ? s.chips : null,
+        searchBoxPresent: !!(s && s.searchBox.present),
+        searchBoxVisible: !!(s && s.searchBox.visible),
+        searchBoxFocused: !!(s && s.searchBox.focused),
+        focusedBy, openMs: Date.now() - t0
+      };
+      LOG("(a):", JSON.stringify(R.a_searchBoxWhilePopulated));
+    });
+    const usable = !!(R.a_searchBoxWhilePopulated && R.a_searchBoxWhilePopulated.searchBoxFocused);
+
+    // ── (a2) does an empty-searchBox Ctrl+A+Delete PRESERVE the chip? ───────────
+    await guard("(a2) clearSearch effect on chip", async () => {
+      if (!usable) { R.a2_clearEffect = { skipped: "searchBox not usable" }; return; }
+      const before = await readState(sel);
+      await cdpSelectAllDelete();
+      await cdpDelay(500);
+      const after = await readState(sel);
+      R.a2_clearEffect = {
+        chipsBefore: before ? before.chips : null,
+        chipsAfter: after ? after.chips : null,
+        chipSurvived: !!(after && sameAsSeeded(after.chips, seededChips)),
+        searchBoxValueAfter: after ? after.searchBox.value : null
+      };
+      LOG("(a2):", JSON.stringify(R.a2_clearEffect));
+    });
+
+    // ── (b) type a DIFFERENT valid candidate → commit → REPLACE vs ADD ──────────
+    await guard("(b) commit replace-vs-add", async () => {
+      if (!usable) { R.b_commit = { skipped: "searchBox not usable" }; return; }
+      let s = await readState(sel);
+      if (!s || !s.searchBox.focused) { await cdpEval(cdpFocusBySel, sel + ' input[data-automation-id="searchBox"]'); s = await readState(sel); }
+      if (!s || !s.searchBox.focused) throw new Error("could not focus searchBox for the commit probe");
+      const cand = candidates[0];
+      await cdpSelectAllDelete(); await cdpDelay(300);
+      await cdpTypeChars(cand, 40); await cdpDelay(400);  // per-char keystrokes — the real fill path
+      await cdpKeyTap(CDP_KEYS.enter);                    // filter-Enter
+      const series = []; const t0 = Date.now(); let done = false, sawBanner = false;
+      while (Date.now() - t0 < 25000) {
+        await cdpDelay(400);
+        s = await readState(sel);
+        const chipsNow = s ? s.chips : [];
+        const differs = !sameAsSeeded(chipsNow, seededChips);
+        series.push({ t: Date.now() - t0, chipCount: chipsNow.length, chips: chipsNow, banner: !!(s && s.banner), differs });
+        if (s && s.banner) { sawBanner = true; done = true; break; }  // candidate not an option here
+        if (differs && chipsNow.length > 0) { done = true; break; }   // a NEW chip committed
+      }
+      const finalChips = s ? s.chips : [];
+      const containsSeeded = seededChips.every((c) => finalChips.some((x) => normEq(x, c)));
+      const containsCand = finalChips.some((x) => normEq(x, cand));
+      let verdict = "INCONCLUSIVE";
+      if (finalChips.length === 1 && containsCand && !containsSeeded) verdict = "REPLACE";            // model holds → Commit C NOT needed
+      else if (finalChips.length >= 2 && containsCand && containsSeeded) verdict = "ADD";             // multiselect → Commit C REQUIRED
+      else if (sawBanner) verdict = "BANNER (candidate is not a selectable option here — re-seed a field whose profile candidate IS a valid option)";
+      else if (containsSeeded && !containsCand) verdict = "NO-COMMIT (chip unchanged — search-while-populated may not commit a replacement)";
+      R.b_commit = { candidate: cand, finalChips, finalChipCount: finalChips.length, containsSeeded, containsCand, sawBanner, verdict, settledInBudget: done, series };
+      R.verdict.commitBehavior = verdict;
+      LOG("(b):", JSON.stringify(R.b_commit, null, 2));
+      if (verdict === "REPLACE") R.sideEffects.push(`overwrote ${JSON.stringify(seededChips)} → "${cand}" (REPLACE; field now holds the profile-correct value)`);
+      else if (verdict === "ADD") R.sideEffects.push(`field now holds TWO chips ${JSON.stringify(finalChips)} — restore BY HAND (remove the wrong one)`);
+    });
+
+    R.verdict.searchBoxUsableWhilePopulated = usable;
+    R.verdict.clearSearchPreservesChip = !!(R.a2_clearEffect && R.a2_clearEffect.chipSurvived);
+    R.verdict.commitCNeeded = R.verdict.commitBehavior === "ADD";
+    LOG("OVR-RECON VERDICT:", JSON.stringify(R.verdict));
+    LOG("OVR-RECON SUMMARY (paste this whole block back):");
+    console.log("[ApplyPilot][OVR-RECON]", JSON.stringify(R, null, 2));
+    if (R.sideEffects.length) LOG("side effects:", JSON.stringify(R.sideEffects));
+    return { ok: true, probed: true, verdict: R.verdict, errors: R.errors.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    console.log("[ApplyPilot][OVR-RECON] partial summary:", JSON.stringify(R, null, 2));
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// SOURCE OVERWRITE RECON (M27 Step 0, source half) — prove clearSourceSearch on
+// the SOURCE widget before Commit B's source no-match resting-state relies on it.
+// The typeahead recon proved clearSearch preserves the chip; clearSourceSearch is
+// the byte-identical primitive but was never probed on the source widget. Seed a
+// WRONG value into "How did you hear about us?" by hand, then run hidden. The
+// load-bearing result is (a2): does clearSourceSearch keep the committed chip?
+// [OVR-SRC-RECON] in the SW console. Detaches in finally.
+// ============================================================================
+async function runCdpSourceOverwriteRecon(tabId, defaults) {
+  const LOG = (...a) => console.log("[ApplyPilot][OVR-SRC-RECON]", ...a);
+  const R = { target: null, a_searchBoxWhilePopulated: null, a2_clearEffect: null, b_commit: null, verdict: {}, sideEffects: [], errors: [] };
+  const guard = async (name, fn) => {
+    try { await fn(); } catch (e) { const m = name + ": " + String((e && e.message) || e); R.errors.push(m); LOG("probe ERROR —", m); }
+  };
+  const sel = '[data-automation-id="formField-source"]';
+  const readState = () => cdpEval(cdpReadSourcePick, sel);
+  const normEq = (a, b) => normalize(a) === normalize(b);
+  const sameAsSeeded = (chips, seeded) => chips.length === seeded.length && seeded.every((c) => chips.some((x) => normEq(x, c)));
+
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run."); return { ok: false, error: "never-hidden" }; }
+    LOG("tab is hidden — source overwrite recon starting.");
+
+    const pre = await readState();
+    if (!pre) { LOG("no source field here ([data-automation-id=formField-source]) — run on My Information."); return { ok: false, error: "no-source-field" }; }
+    LOG("source pre-state:", JSON.stringify(pre));
+    if (!pre.chips.length) {
+      LOG("source has NO chip. HAND-SEED a value into 'How did you hear about us?' (any leaf) first, then re-run.");
+      console.log("[ApplyPilot][OVR-SRC-RECON]", JSON.stringify(R, null, 2));
+      return { ok: true, probed: false };
+    }
+    const hdyh = defaults && defaults.how_did_you_hear;
+    const candidates = (hdyh && Array.isArray(hdyh.preferred)) ? [...hdyh.preferred] : [];
+    if (hdyh && hdyh.fallback) candidates.push(hdyh.fallback);
+    if (!candidates.length) { LOG('no how_did_you_hear defaults — click "Load default profile" first.'); return { ok: false, error: "no-candidates" }; }
+    const seededChips = pre.chips.slice();
+    const cand = candidates.find((c) => !seededChips.some((ch) => normEq(ch, c))) || candidates[0];
+    R.target = { seededChips, candidates, candidateUsed: cand };
+    LOG("source target — seeded chip(s):", JSON.stringify(seededChips), "candidate:", JSON.stringify(cand));
+
+    // (a) open the populated source → is the searchBox usable with a chip present?
+    await guard("(a) searchBox-while-populated", async () => {
+      let opened = false;
+      for (const part of [' button[aria-haspopup="listbox"]', ' [data-automation-id="multiselectInputContainer"]', ' [data-uxi-widget-type="selectinput"]', " input", ""]) {
+        const rect = await cdpEval(cdpRectOf, sel + part, true);
+        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); opened = true; break; }
+      }
+      if (!opened) throw new Error("source opener rects all dead");
+      let s = null; const t0 = Date.now();
+      while (Date.now() - t0 < 5000) { await cdpDelay(250); s = await readState(); if (s && s.searchBox.present && s.searchBox.visible) break; }
+      let focusedBy = s && s.searchBox.focused ? "opener-click" : null;
+      if (s && s.searchBox.visible && !s.searchBox.focused) { if (await cdpEval(cdpFocusBySel, sel + ' input[data-automation-id="searchBox"]')) focusedBy = "page-focus()"; s = await readState(); }
+      R.a_searchBoxWhilePopulated = { chipsStillPresent: s ? s.chips : null, searchBoxPresent: !!(s && s.searchBox.present), searchBoxVisible: !!(s && s.searchBox.visible), searchBoxFocused: !!(s && s.searchBox.focused), focusedBy, openMs: Date.now() - t0 };
+      LOG("(a):", JSON.stringify(R.a_searchBoxWhilePopulated));
+    });
+    const usable = !!(R.a_searchBoxWhilePopulated && R.a_searchBoxWhilePopulated.searchBoxFocused);
+
+    // (a2) THE load-bearing check: clearSourceSearch (= cdpSelectAllDelete) on the
+    // empty searchBox must PRESERVE the committed chip.
+    await guard("(a2) clearSourceSearch effect on chip", async () => {
+      if (!usable) { R.a2_clearEffect = { skipped: "searchBox not usable" }; return; }
+      const before = await readState();
+      await cdpSelectAllDelete();
+      await cdpDelay(500);
+      const after = await readState();
+      R.a2_clearEffect = { chipsBefore: before ? before.chips : null, chipsAfter: after ? after.chips : null, chipSurvived: !!(after && sameAsSeeded(after.chips, seededChips)), searchBoxValueAfter: after ? after.searchBox.value : null };
+      LOG("(a2):", JSON.stringify(R.a2_clearEffect));
+    });
+
+    // (b) type a DIFFERENT candidate → commit → REPLACE vs ADD (bonus; source
+    // normally commits via leaf-click, so a single-exact may auto-commit and a
+    // multi-leaf may not change the chip here — (a)/(a2) are the load-bearing results).
+    await guard("(b) commit replace-vs-add", async () => {
+      if (!usable) { R.b_commit = { skipped: "searchBox not usable" }; return; }
+      let s = await readState();
+      if (!s || !s.searchBox.focused) { await cdpEval(cdpFocusBySel, sel + ' input[data-automation-id="searchBox"]'); s = await readState(); }
+      if (!s || !s.searchBox.focused) throw new Error("could not focus source searchBox for the commit probe");
+      await cdpSelectAllDelete(); await cdpDelay(300);
+      await cdpTypeChars(cand, 40); await cdpDelay(400);
+      await cdpKeyTap(CDP_KEYS.enter);
+      const series = []; const t0 = Date.now(); let done = false, sawBanner = false;
+      while (Date.now() - t0 < 25000) {
+        await cdpDelay(400);
+        s = await readState();
+        const chipsNow = s ? s.chips : [];
+        const differs = !sameAsSeeded(chipsNow, seededChips);
+        series.push({ t: Date.now() - t0, chipCount: chipsNow.length, chips: chipsNow, banner: !!(s && s.banner), leafCount: s ? s.leafCount : -1, differs });
+        if (s && s.banner) { sawBanner = true; done = true; break; }
+        if (differs && chipsNow.length > 0) { done = true; break; }
+      }
+      const finalChips = s ? s.chips : [];
+      const containsSeeded = seededChips.every((c) => finalChips.some((x) => normEq(x, c)));
+      const containsCand = finalChips.some((x) => normEq(x, cand));
+      let verdict = "INCONCLUSIVE (no auto-commit; source commits via leaf-click — (a)/(a2) are the load-bearing results)";
+      if (finalChips.length === 1 && containsCand && !containsSeeded) verdict = "REPLACE";
+      else if (finalChips.length >= 2 && containsCand && containsSeeded) verdict = "ADD";
+      else if (sawBanner) verdict = "BANNER (candidate is not a selectable leaf — pick a how_did_you_hear value that filters to a leaf)";
+      R.b_commit = { candidate: cand, finalChips, finalChipCount: finalChips.length, containsSeeded, containsCand, sawBanner, verdict, settledInBudget: done, series };
+      R.verdict.commitBehavior = verdict;
+      LOG("(b):", JSON.stringify(R.b_commit, null, 2));
+      if (verdict === "ADD") R.sideEffects.push(`source now holds TWO chips ${JSON.stringify(finalChips)} — restore BY HAND`);
+      else if (verdict === "REPLACE") R.sideEffects.push(`source overwrote ${JSON.stringify(seededChips)} → "${cand}" (REPLACE)`);
+    });
+
+    R.verdict.searchBoxUsableWhilePopulated = usable;
+    R.verdict.clearSourceSearchPreservesChip = !!(R.a2_clearEffect && R.a2_clearEffect.chipSurvived);
+    LOG("OVR-SRC-RECON VERDICT:", JSON.stringify(R.verdict));
+    LOG("OVR-SRC-RECON SUMMARY (paste this whole block back):");
+    console.log("[ApplyPilot][OVR-SRC-RECON]", JSON.stringify(R, null, 2));
+    if (R.sideEffects.length) LOG("side effects:", JSON.stringify(R.sideEffects));
+    return { ok: true, probed: true, verdict: R.verdict, errors: R.errors.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    console.log("[ApplyPilot][OVR-SRC-RECON] partial summary:", JSON.stringify(R, null, 2));
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // TARGETED TYPEAHEAD FILL — the M25 verify harness. Locates ONE typeahead by
 // label regex (entry fields get an entry-1-scoped COMPOSED selector — the
 // duplicate formField-* ids make a bare wrapper selector hit entry 1 only by
@@ -1610,10 +1952,10 @@ async function runCdpFillTypeahead(tabId, profile, labelRegexStr) {
 
     const act = makeCdpActuation();
     const rec = await fillTypeaheadCdp(act, { wrapperSel }, rr.candidates, DEFAULT_BUDGETS);
-    LOG("result:", JSON.stringify({ field: target.fieldName, status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, detail: rec.detail }, null, 2));
+    LOG("result:", JSON.stringify({ field: target.fieldName, status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, flag: rec.flag, confidence: rec.confidence, detail: rec.detail }, null, 2));
     if (rec.settle_trace) LOG("settle trace:", JSON.stringify(rec.settle_trace, null, 2));
     if (rec.captured_options) LOG("captured options:", JSON.stringify(rec.captured_options));
-    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true };
+    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true, flag: rec.flag || null };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("typeahead fill aborted:", msg);
@@ -1658,7 +2000,7 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
     }
     console.table(out.results.map((r) => ({
       field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, tier: r.matchTier, detail: r.detail
+      verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
     })));
     LOG("counts:", JSON.stringify(out.counts));
     return { ok: true, counts: out.counts, needs_review: out.needsReview.length };

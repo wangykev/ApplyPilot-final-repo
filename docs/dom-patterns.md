@@ -635,3 +635,58 @@ just a SEARCH typeahead, handled by the M25 walk with source-specific reads (fil
 - The tree/EXPAND-WALK source shape (NO searchBox → chevron categories you click to reveal
   sub-leaves) and Magna's Certification TREE — only needed when a tenant without a searchBox is
   observed; the in-tree page-substrate fillSource still covers the expand-walk on the page path.
+
+## 2026-06-14 — Magna wd3, HIDDEN tab: populated-typeahead OVERWRITE model (M27 Step 0 recon)
+
+Probe (`runCdpOverwriteRecon` / `RUN_CDP_OVERWRITE_RECON`) on `countryPhoneCode` with a HAND-SEEDED
+WRONG chip "Åland Islands (+358)"; profile candidate "United States of America (+1)". Tab minimized.
+This is the OPPOSITE of the M25 TA-RECON (which targets a chipless field): it answers whether an
+already-committed typeahead can be overwritten NON-DESTRUCTIVELY.
+
+### (a) Search-while-populated — TRUE
+- Opening a single-pick typeahead that ALREADY holds a chip exposes a usable searchBox:
+  `present: true, visible: true, focused: true` (focusedBy `opener-click`, openMs 370). The chip
+  stays present while the searchBox is open. So you do NOT delete-first to re-fill — you search
+  over the populated field.
+
+### (a2) clearSearch preserves the chip — TRUE
+- `cdpSelectAllDelete` (Ctrl+A+Delete) on the EMPTY searchBox with a chip present LEFT the chip
+  intact ("Åland Islands (+358)" before and after; searchBox value `""`). So the per-candidate
+  clear in the walk is safe with a committed chip — no reordering needed.
+- NOTE: proven on the TYPEAHEAD widget only. `clearSourceSearch` is the byte-identical primitive
+  (`() => cdpSelectAllDelete()`) but its chip-preservation on the SOURCE widget is not yet
+  live-proven — verify when the source overwrite path is exercised.
+
+### (b) Commit REPLACES (single-pick), does NOT add — verdict REPLACE
+- Type the candidate → filter-Enter → at t=419 the chip still read "Åland Islands (+358)"
+  (`differs:false`); at **t=835 the field held ONE chip "United States of America (+1)"** — the new
+  value REPLACED the old (auto-commit on the exact single match, ~835ms hidden). `finalChipCount: 1`,
+  `containsSeeded: false`, `containsCand: true`.
+- ⇒ **No residual-chip cleanup / DELETE_charm primitive needed** (the M27 "Commit C" was dropped).
+  A defensive single-chip assertion catches a hypothetical tenant that ADDs instead.
+
+### Validates the transition-aware commit detection (M27 Commit B)
+- The series shows the chip set EQUAL to `priorChips` at t=419, then DIFFERENT at t=835. The existing
+  walk's bare `chips.length > 0` check would have falsely fired on the pre-existing chip at t=419.
+  The fix: recognize a commit only when the NORMALIZED chip set differs from `priorChips` (captured
+  once before the walk), sampled inside the existing settlePoll — confirmed correct by this series.
+
+### Accepted destructive edge (M27, by design — see overwrite-stray)
+- The non-destructive guarantee holds on clean walk-exhaustion (original chip kept). It does NOT
+  hold if, mid-overwrite, an auto-commit substitutes a DIFFERENT wrong value (overwrite-stray):
+  because commit REPLACES, the original is gone and unrecoverable on the page. Accepted: the
+  original was already wrong, no candidate exists to restore it, and the field is flagged
+  needs_review either way. The walk STOPS on the stray (contamination rule) — later candidates
+  are not tried.
+
+### Source widget — SAME model (recon, gate for Commit B's source path)
+Probe (`runCdpSourceOverwriteRecon` / `RUN_CDP_SOURCE_OVERWRITE_RECON`) on `formField-source` with a
+hand-seeded WRONG chip "Family"; candidate "LinkedIn" (from `defaults.how_did_you_hear`). Tab minimized.
+- **(a) searchBoxUsableWhilePopulated: true** — with "Family" present, opening exposed the searchBox
+  present+visible+focused (focusedBy `page-focus()`, openMs 401).
+- **(a2) clearSourceSearchPreservesChip: TRUE** — `clearSourceSearch` (= the byte-identical
+  `cdpSelectAllDelete`) left "Family" intact, searchBox value "". So Commit B's source no-match
+  resting-state stands on a proven primitive, not assumed symmetry.
+- **(b) REPLACE** — typing "LinkedIn" → filter-Enter → single chip "LinkedIn" at t=402 (auto-committed
+  on the single-exact match; `leafCount:0`). Source overwrite-success can fire via auto-commit.
+- Verdict: source is SYMMETRIC to the typeahead — the overwrite walk applies in lockstep.

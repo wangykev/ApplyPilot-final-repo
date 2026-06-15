@@ -153,7 +153,46 @@ document.getElementById("cdp-fill-ta").addEventListener("click", () => {
     } else if (resp.ok === false) {
       setStatus("Typeahead fill failed: " + resp.error + " — see the service worker console.");
     } else {
-      setStatus(`Typeahead fill: ${resp.status}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-TA].`);
+      setStatus(`Typeahead fill: ${resp.status}${resp.flag ? ` [${resp.flag}]` : ""}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-TA].`);
+    }
+  });
+});
+
+// OVERWRITE RECON (M27 Step 0): probe the populated-field model on a hand-seeded
+// WRONG chip — searchBox-while-populated, clearSearch preserves the chip, commit
+// REPLACE vs ADD. Minimize within 60s; output is [OVR-RECON] in the SW console.
+document.getElementById("cdp-overwrite-recon").addEventListener("click", () => {
+  setStatus("Overwrite recon… HAND-SEED a WRONG typeahead value first, then MINIMIZE now (60s). Findings land in the service worker console as [OVR-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_OVERWRITE_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Overwrite recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.probed === false) {
+      setStatus("No POPULATED typeahead — hand-seed a WRONG value first, then re-run. See [OVR-RECON] in the SW console.");
+    } else {
+      setStatus(`Overwrite recon: commit=${resp.verdict ? resp.verdict.commitBehavior : "?"}, Commit C needed=${resp.verdict ? resp.verdict.commitCNeeded : "?"}. Paste the [OVR-RECON] summary from the SW console.`);
+    }
+  });
+});
+
+// SOURCE OVERWRITE RECON (M27 Step 0, source half): prove clearSourceSearch keeps
+// a seeded source chip. Minimize within 60s; output is [OVR-SRC-RECON] in the SW console.
+document.getElementById("cdp-source-overwrite-recon").addEventListener("click", () => {
+  setStatus("Source overwrite recon… HAND-SEED a 'How did you hear' value first, then MINIMIZE now (60s). Findings land in the service worker console as [OVR-SRC-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_SOURCE_OVERWRITE_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false && resp.error === "no-candidates") {
+      setStatus('No how_did_you_hear defaults — click "Load default profile" first.');
+    } else if (resp.ok === false) {
+      setStatus("Source overwrite recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.probed === false) {
+      setStatus("No source chip — hand-seed a 'How did you hear' value first, then re-run. See [OVR-SRC-RECON].");
+    } else {
+      setStatus(`Source overwrite recon: clearSourceSearch keeps chip=${resp.verdict ? resp.verdict.clearSourceSearchPreservesChip : "?"}. Paste the [OVR-SRC-RECON] summary from the SW console.`);
     }
   });
 });

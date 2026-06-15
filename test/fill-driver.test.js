@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -138,7 +138,9 @@ function makeFakeAct(fields) {
           if (fm) {
             ta._rev = (ta._rev || 0) + 1; // page transitions through a cleared list — sig changes on a response
             if (fm.banner) { ta._banner = true; ta._texts = (ta.fallbackTexts || ta._texts || []).slice(); ta._filtered = true; }
-            else if (fm.autoCommit) { ta.chips = [fm.autoCommit]; ta._open = false; ta._banner = false; }
+            // residualChipAfterCommit: simulate a tenant that ADDS a chip instead of
+            // REPLACING (recon = REPLACE on Magna; this drives the defensive assertion).
+            else if (fm.autoCommit) { ta.chips = ta.residualChipAfterCommit ? (ta.chips || []).concat([fm.autoCommit]) : [fm.autoCommit]; ta._open = false; ta._banner = false; }
             else if (fm.filtered) { ta._texts = fm.filtered.slice(); ta._banner = false; ta._filtered = true; }
           }
           // no filterMap entry → the page never responds (the stable pre-filter case)
@@ -690,18 +692,62 @@ test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", a
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.matchTier, "pre-filled");
+  assert.strictEqual(rec.flag, "prefilled-kept");
   assert.strictEqual(rec.after, "United States of America (+1)");
   assert.strictEqual(rec.verified, true);
-  assert.strictEqual(act.log.length, 0, "pre-filled-correct must not be touched");
+  assert.strictEqual(act.log.length, 0, "pre-filled-correct must not be touched (no overwrite actuation)");
 });
 
-test("typeahead: pre-filled chip matching no candidate → needs_review, zero actuation", async () => {
-  const act = makeFakeAct([taField({ chips: ["Canada (+1)"] })]);
+// ── M27 Commit B: non-destructive overwrite of a mismatched pre-fill ─────────
+// (Replaces the old "left as-is, zero actuation" pinned test — a mismatched
+// pre-fill now ACTUATES: search-while-populated, commit REPLACES, no-match keeps
+// the original. The behavior change is intentional and sanctioned by M27.)
+
+test("overwrite: mismatched pre-fill + matching candidate → filled_review / overwrite-success, original recorded, single chip (REPLACE)", async () => {
+  const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } } });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "overwrite-success");
+  assert.strictEqual(rec.confidence, "high");
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.deepStrictEqual(rec.overwrite, { original: "Canada (+1)", refilled: true });
+  assert.deepStrictEqual(field.chips, ["United States of America (+1)"], "REPLACE — exactly one chip, the new value");
+});
+
+test("overwrite: no candidate matches → needs_review / overwrite-nomatch-original-kept, ORIGINAL preserved + resting {chips:[original], query:''}", async () => {
+  const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { banner: true } } });
+  const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.after, "Canada (+1)");
-  assert.strictEqual(act.log.length, 0, "a mismatched pre-fill is flagged, never overwritten");
+  assert.strictEqual(rec.flag, "overwrite-nomatch-original-kept");
+  assert.strictEqual(rec.after, "Canada (+1)");                          // the original, NOT empty
+  assert.deepStrictEqual(rec.overwrite, { original: "Canada (+1)", refilled: false });
+  assert.deepStrictEqual(field.chips, ["Canada (+1)"], "original chip NEVER destroyed on a no-match");
+  assert.strictEqual(field._value, "", "leftover filter text cleared — field rests clean");
+});
+
+test("overwrite: a different value commits (stray) → needs_review / overwrite-stray, original recorded", async () => {
+  const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { autoCommit: "Mexico (+52)" } } });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "overwrite-stray");
+  assert.strictEqual(rec.after, "Mexico (+52)");
+  assert.deepStrictEqual(rec.overwrite, { original: "Canada (+1)", refilled: false });
+});
+
+test("overwrite: a residual second chip (tenant ADDED, not REPLACED) → needs_review / overwrite-residual-flagged", async () => {
+  const field = taField({ chips: ["Canada (+1)"], residualChipAfterCommit: true, filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } } });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "overwrite-residual-flagged");
+  assert.ok(field.chips.length > 1, "two chips present — a two-value state is never silently accepted");
 });
 
 test("typeahead: first candidate to commit wins — later candidates never typed", async () => {
@@ -729,6 +775,87 @@ test("typeahead: searchBox focus cannot be confirmed → ZERO actuation, needs_r
   assert.ok(!act.log.some(([m]) => m === "clearSearch"), "no Ctrl+A clear");
   assert.ok(!act.log.some(([m]) => m === "typeInSearch"), "no typing");
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
+});
+
+// ── M27 flag taxonomy (Commit A) ────────────────────────────────────────────
+// flag = provenance, confidence = match quality (orthogonal); both from ONE table.
+
+test("M27 commitOutcome table: (overwrite?, commitKind, matchTier) → (status, confidence, flag)", () => {
+  // empty-field, auto
+  assert.deepStrictEqual(commitOutcome(false, "auto", "exact-normalized"), { status: "filled", confidence: "high", flag: "autocommit-exact" });
+  assert.deepStrictEqual(commitOutcome(false, "auto", "containment"), { status: "filled_review", confidence: "low", flag: "autocommit-containment" });
+  assert.deepStrictEqual(commitOutcome(false, "auto", "fuzzy-93"), { status: "filled_review", confidence: "low", flag: "autocommit-fuzzy" });
+  assert.deepStrictEqual(commitOutcome(false, "auto", null), { status: "needs_review", confidence: "none", flag: "autocommit-stray" });
+  // empty-field, directed
+  assert.deepStrictEqual(commitOutcome(false, "directed", "exact-normalized"), { status: "filled", confidence: "high", flag: "directed-exact" });
+  assert.deepStrictEqual(commitOutcome(false, "directed", "containment"), { status: "filled_review", confidence: "low", flag: "directed-containment" });
+  assert.deepStrictEqual(commitOutcome(false, "directed", "fuzzy-90"), { status: "filled_review", confidence: "low", flag: "directed-fuzzy" });
+  // overwrite: flag is ALWAYS overwrite-success regardless of commitKind/tier; confidence tracks tier
+  assert.deepStrictEqual(commitOutcome(true, "auto", "exact-normalized"), { status: "filled_review", confidence: "high", flag: "overwrite-success" });
+  assert.deepStrictEqual(commitOutcome(true, "directed", "containment"), { status: "filled_review", confidence: "low", flag: "overwrite-success" });
+  assert.deepStrictEqual(commitOutcome(true, "auto", "fuzzy-91"), { status: "filled_review", confidence: "low", flag: "overwrite-success" });
+  assert.deepStrictEqual(commitOutcome(true, "directed", null), { status: "needs_review", confidence: "none", flag: "overwrite-stray" });
+  // precedence invariant: NO autocommit-*/directed-* flag ever fires under overwrite
+  for (const ck of ["auto", "directed"]) for (const t of ["exact-normalized", "containment", "fuzzy-95", null]) {
+    const flag = commitOutcome(true, ck, t).flag;
+    assert.ok(flag === "overwrite-success" || flag === "overwrite-stray", `overwrite flag must be overwrite-*, got "${flag}"`);
+  }
+});
+
+test("typeahead: exact auto-commit → filled, autocommit-exact, high confidence", async () => {
+  const act = makeFakeAct([taField({ filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } } })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "autocommit-exact");
+  assert.strictEqual(rec.confidence, "high");
+  assert.strictEqual(rec.matchTier, "enter-auto-commit"); // commit-path preserved
+});
+
+test("typeahead: containment auto-commit → filled_review + autocommit-containment, low confidence", async () => {
+  // Candidate "United States"; Workday auto-commits the fuller "United States of America (+1)".
+  const act = makeFakeAct([taField({ filterMap: { "United States": { autoCommit: "United States of America (+1)" } } })]);
+  const out = await drivePageFill(act, taProfile(["United States"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "autocommit-containment");
+  assert.strictEqual(rec.confidence, "low");
+  assert.strictEqual(rec.after, "United States of America (+1)"); // value kept, not cleared
+  assert.strictEqual(rec.verified, true);
+});
+
+test("typeahead: fuzzy auto-commit → filled_review + autocommit-fuzzy, low (kept, never silently filled)", async () => {
+  // A typo'd auto-commit ("Engineerng" for "Engineering") — fuzzy >=90, not containment.
+  const act = makeFakeAct([taField({ filterMap: { "Engineering": { autoCommit: "Engineerng" } } })]);
+  const out = await drivePageFill(act, taProfile(["Engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "autocommit-fuzzy");
+  assert.strictEqual(rec.confidence, "low");
+  assert.strictEqual(rec.after, "Engineerng");
+});
+
+test("typeahead: stray auto-commit (no match) → needs_review + autocommit-stray, value recorded", async () => {
+  const act = makeFakeAct([taField({ filterMap: { "United States of America (+1)": { autoCommit: "Canada (+1)" } } })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "autocommit-stray");
+  assert.strictEqual(rec.confidence, "none");
+  assert.strictEqual(rec.after, "Canada (+1)"); // surfaced, not accepted
+  assert.strictEqual(rec.verified, false);
+});
+
+test("typeahead: directed containment commit → filled_review + directed-containment", async () => {
+  // candidate "United States" filters to the fuller option at index 0 (containment) → directed commit.
+  const act = makeFakeAct([taField({ filterMap: { "United States": { filtered: ["United States of America (+1)", "United States Minor Outlying Islands"] } } })]);
+  const out = await drivePageFill(act, taProfile(["United States"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "directed-containment");
+  assert.strictEqual(rec.confidence, "low");
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.strictEqual(rec.matchTier, "enter-commit"); // commit-path, not the match tier
 });
 
 // ── source picker (backlog C — the Magna SEARCH shape; mirrors the typeahead walk) ──
@@ -800,7 +927,45 @@ test("source: pre-filled chip matching a candidate → kept with ZERO actuation"
   const { rec, act } = await runSource(srcField({ chips: ["LinkedIn"] }), ["LinkedIn", "Other"]);
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.matchTier, "pre-filled");
+  assert.strictEqual(rec.flag, "prefilled-kept");
   assert.strictEqual(act.log.length, 0, "pre-filled-correct source must not be touched");
+});
+
+test("source overwrite: mismatched pre-fill + matching candidate → filled_review / overwrite-success (lockstep with typeahead)", async () => {
+  const field = srcField({ chips: ["Family"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } });
+  const { rec } = await runSource(field, ["LinkedIn"]);
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "overwrite-success");
+  assert.strictEqual(rec.after, "LinkedIn");
+  assert.deepStrictEqual(rec.overwrite, { original: "Family", refilled: true });
+  assert.deepStrictEqual(field.chips, ["LinkedIn"]);
+});
+
+test("source overwrite: no candidate matches → needs_review / overwrite-nomatch-original-kept, original preserved + resting", async () => {
+  const field = srcField({ chips: ["Family"], filterMap: { LinkedIn: { banner: true } } });
+  const { rec } = await runSource(field, ["LinkedIn"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "overwrite-nomatch-original-kept");
+  assert.strictEqual(rec.after, "Family");
+  assert.deepStrictEqual(field.chips, ["Family"], "original source chip never destroyed");
+  assert.strictEqual(field._value, "", "leftover source filter text cleared");
+});
+
+test("source: containment auto-commit → filled_review + autocommit-containment (lockstep with typeahead)", async () => {
+  const { rec } = await runSource(srcField({ filterMap: { "LinkedIn": { autoCommit: "LinkedIn Corporation" } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "autocommit-containment");
+  assert.strictEqual(rec.confidence, "low");
+  assert.strictEqual(rec.after, "LinkedIn Corporation");
+  assert.strictEqual(rec.matchTier, "enter-auto-commit");
+});
+
+test("source: directed exact leaf-click → filled, directed-exact (commit-path matchTier)", async () => {
+  const { rec } = await runSource(srcField({ commitVia: "leaf", filterMap: { LinkedIn: { filtered: ["LinkedIn", "LinkedIn Learning"] } } }), ["LinkedIn"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "directed-exact");
+  assert.strictEqual(rec.confidence, "high");
+  assert.strictEqual(rec.matchTier, "source-click-commit");
 });
 
 test("typeahead: walk-dry but a stray chip is present → record reports it, never after:null", async () => {
