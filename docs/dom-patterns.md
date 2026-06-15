@@ -755,3 +755,29 @@ worked. So a stale-but-plausible starting selection broke the fill.
 - ⇒ The real reliability win is **session-expiry detection** (surface "refresh + log in + reopen"),
   deferred to its own round; M29 is the smaller transient-sliver hardening + the diagnostic that
   motivates it.
+
+## 2026-06-14 — Magna wd3: session-expiry is NOT statically detectable (M30 recon) → source-liveness heuristic
+
+`RUN_CDP_SESSION_RECON` (read-only `cdpReadSessionState` snapshot) run on a VALID form and on a
+LOGGED-OUT / timed-out form. The two snapshots are **DOM-identical**:
+- `formFieldCount` 14 both; `applyFlowPagePresent` true both; `passwordInputPresent` /
+  `signInButtonPresent` false both; `authUrl` false both; `sessionBanner` / `vpsErrorPresent` false
+  both; same `url` / `title`; and the candidate **email (`wangykev@gmail.com`) still renders in BOTH**.
+- A timed-out Magna page keeps the whole form client-rendered — there is **NO static marker** to gate
+  on. The planned static `classifySession(snapshot)` is impossible here.
+
+### What IS observable — behavioral only
+- On a dead session, **server-loaded content doesn't render**: typing into `source` ("How did you hear
+  about us?") returns no leaves (`leafCount` stays 0) → "no source candidate". (Bundled content like the
+  country list still fills — so it's not uniform; `source` is the sensitive canary.)
+- **Save & Continue → many `Error Code: VPS|…` banners** — the UNAMBIGUOUS server signal, but it only
+  appears on the page-advance action (deferred to that round).
+
+### M30 ships — source-liveness early-warning (heuristic, NOT general detection)
+- `fillSourceCdp` tracks `optionsEverLoaded` (any settle read with `leafCount > 0` or a chip) and returns
+  `optionsLoaded` on the walk-end no-commit. `drivePageFill` raises ONE `sessionWarning` iff the source
+  record is `needs_review` AND `optionsLoaded === false`. NOTE, never a halt.
+- **Scope is narrow + honest:** fires ONLY on pages with a `source` field, via its options failing to
+  load. No `source` field → no warning (no false positive, no coverage). A matching miss (leaves loaded,
+  candidate absent) → no warning (false-positive guard, unit-tested). Reliable detection = the VPS
+  signal on Save & Continue, in the page-advance round.

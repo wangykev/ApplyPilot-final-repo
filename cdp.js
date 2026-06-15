@@ -271,6 +271,38 @@ function cdpPageScan() {
   };
 }
 
+// M30 session-expiry recon read: a READ-ONLY static snapshot to classify whether
+// the page is a live apply form vs a logged-out / expired / error state. No clicks.
+// Run once on a VALID form and once LOGGED-OUT/stale to find the discriminator.
+function cdpReadSessionState() {
+  const q = (sel) => document.querySelector(sel);
+  const qa = (sel) => Array.from(document.querySelectorAll(sel));
+  const bodyText = ((document.body && document.body.innerText) || "").slice(0, 20000);
+  const clickables = qa('button, a, [role="button"]');
+  const formFields = qa('[data-automation-id^="formField-"]');
+  const errMatch = bodyText.match(/error[- ]page error[\s\S]{0,200}/i);
+  return {
+    url: location.href,
+    title: document.title,
+    visibilityState: document.visibilityState,
+    // apply-form markers
+    formFieldCount: formFields.length,
+    applyFlowPagePresent: !!q('[data-automation-id="applyFlowPage"]'),
+    applyFlowReviewPresent: !!q('[data-automation-id="applyFlowReviewPage"]'),
+    saveContinuePresent: clickables.some((b) => /save and (continue|submit)|^\s*(continue|submit|next)\s*$/i.test((b.textContent || "").trim())),
+    sourcePresent: !!q('[data-automation-id="formField-source"]'),
+    // login / auth markers
+    passwordInputPresent: !!q('input[type="password"]'),
+    signInButtonPresent: clickables.some((b) => /\b(sign[- ]?in|log[- ]?in|sign[- ]?on|log[- ]?on)\b/i.test((b.textContent || "").trim())),
+    authUrl: /login|sign-?in|authn|\bsso\b|\/saml|\/idp/i.test(location.href),
+    // session / timeout / error banners (capped text scan)
+    sessionBanner: /(session (has )?(expired|timed out|ended)|sign in again|log in again|your session|been (signed|logged) out|timed out)/i.test(bodyText),
+    vpsErrorPresent: /error code:\s*vps\|/i.test(bodyText),
+    errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
+    bodyTextSample: bodyText.slice(0, 500).replace(/\s+/g, " ").trim()
+  };
+}
+
 // Fresh rect for `sel` (optionally scrollIntoView first — instant, not smooth:
 // smooth is rAF-driven and rAF is frozen hidden).
 function cdpRectOf(sel, scroll) {

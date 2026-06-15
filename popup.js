@@ -113,7 +113,7 @@ document.getElementById("cdp-fill").addEventListener("click", () => {
     } else if (resp.ok === false) {
       setStatus("CDP fill failed: " + resp.error + " — see the service worker console.");
     } else {
-      setStatus(`CDP fill done — ${JSON.stringify(resp.counts)}, ${resp.needs_review} need review. See the service worker console.`);
+      setStatus(`${resp.session_warning ? "⚠ " + resp.session_warning + "\n" : ""}CDP fill done — ${JSON.stringify(resp.counts)}, ${resp.needs_review} need review. See the service worker console.`);
     }
   });
 });
@@ -193,6 +193,21 @@ document.getElementById("cdp-source-overwrite-recon").addEventListener("click", 
       setStatus("No source chip — hand-seed a 'How did you hear' value first, then re-run. See [OVR-SRC-RECON].");
     } else {
       setStatus(`Source overwrite recon: clearSourceSearch keeps chip=${resp.verdict ? resp.verdict.clearSourceSearchPreservesChip : "?"}. Paste the [OVR-SRC-RECON] summary from the SW console.`);
+    }
+  });
+});
+
+// SESSION RECON (M30 Step 0): read-only static snapshot to classify live-form vs
+// logged-out/expired. No minimize. Run on a VALID form + a LOGGED-OUT state, diff.
+document.getElementById("cdp-session-recon").addEventListener("click", () => {
+  setStatus("Session recon (static read, no minimize). Run once on a VALID form and once LOGGED-OUT, paste both [SESSION-RECON] blocks from the SW console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_SESSION_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("Session recon failed: " + resp.error + " — see the service worker console.");
+    } else {
+      const s = resp.snapshot || {};
+      setStatus(`Session recon: fields=${s.formFieldCount}, login=${s.passwordInputPresent || s.signInButtonPresent}, vps=${s.vpsErrorPresent}, sessionBanner=${s.sessionBanner}. Paste [SESSION-RECON] from the SW console.`);
     }
   });
 });

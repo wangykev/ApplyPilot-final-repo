@@ -533,6 +533,39 @@ test("source WITH how_did_you_hear defaults → routes through fillSourceCdp and
   assert.deepStrictEqual(rec.resolved, ["LinkedIn", "Other"]); // candidates from defaults
 });
 
+// ── M30 session-expiry early-warning (heuristic, SOURCE-only) ────────────────
+// A NOTE never a halt; fires only when the source options NEVER load (dead-session
+// tell), NOT on a matching miss (the false-positive guard).
+
+test("M30 session warning: source options NEVER load → out.sessionWarning set", async () => {
+  const act = makeFakeAct([srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { banner: true }, Other: { banner: true } } })]);
+  const defaults = { how_did_you_hear: { preferred: ["LinkedIn"], fallback: "Other" } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(out.results[0].optionsLoaded, false, "leaves never rendered");
+  assert.ok(out.sessionWarning, "a likely-expired-session warning is raised");
+  assert.match(out.sessionWarning, /session expired/i);
+});
+
+test("M30 session warning: source loaded-but-no-match → NO warning (false-positive guard)", async () => {
+  // Leaves DO render; the candidate just isn't among them — a matching miss, not a
+  // dead session. The most important guard: it must NOT misfire.
+  const act = makeFakeAct([srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { filtered: ["Facebook", "Twitter"] } } })]);
+  const defaults = { how_did_you_hear: { preferred: ["LinkedIn"] } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(out.results[0].optionsLoaded, true, "leaves rendered");
+  assert.strictEqual(out.sessionWarning, null, "a matching miss is NOT a session warning");
+});
+
+test("M30 session warning: source commits normally → NO warning", async () => {
+  const act = makeFakeAct([srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } })]);
+  const defaults = { how_did_you_hear: { preferred: ["LinkedIn"] } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.sessionWarning, null);
+});
+
 // ── typeahead (M25 — the proven Magna brain on CDP; accuracy regression suite) ──
 // This field type silently FALSE-FILLED before; these tests pin the guards.
 

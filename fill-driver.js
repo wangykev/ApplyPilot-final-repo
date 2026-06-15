@@ -744,6 +744,11 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
 
   const trace = [];
   let lastLeaves = null;
+  // M30: did the source options EVER render during the walk? If they never load
+  // (leafCount stays 0, no chip) the server didn't return them — the dead-session
+  // tell (distinct from "loaded but no candidate matched"). Surfaced on the
+  // walk-end no-commit return for drivePageFill's session warning.
+  let optionsEverLoaded = false;
   for (const cand of candidates) {
     const step = { candidate: cand };
     trace.push(step);
@@ -768,6 +773,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
       s = await act.readSource(loc);
       const sig = s ? s.sig : null;
       if (sig !== snapSig) sawChange = true;
+      if (s && (s.leafCount > 0 || (s.chips && s.chips.length > 0))) optionsEverLoaded = true; // M30 liveness
       // Transition-aware (M27): a commit is a chip set DIFFERING from priorChips.
       if (s && chipSetIsNew(s.chips)) { outcome = "chip"; break; }
       if (s && s.banner && sawChange) { outcome = "banner"; break; }
@@ -854,7 +860,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets);
   }
   await act.pressEscape();
-  return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace };
+  return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded };
 };
 
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
@@ -969,7 +975,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview };
+  // M30 session-expiry EARLY-WARNING (heuristic, SOURCE-ONLY): if this page has the
+  // `source` field and its options never loaded (server fetch failed), a dead/expired
+  // session is likely. A NOTE, never a halt — and ONLY on pages WITH a source field
+  // (this is NOT general session detection; a page without source gets no warning).
+  // The UNAMBIGUOUS detector (VPS errors on Save & Continue) is the page-advance round.
+  const srcRec = results.find((r) => r.widgetType === "hierarchical");
+  const sessionWarning = (srcRec && srcRec.status === "needs_review" && srcRec.optionsLoaded === false)
+    ? "Likely session expired — the \"How did you hear about us?\" options never loaded (server fetch failed). Refresh, log in, and reopen the form, then retry."
+    : null;
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning };
 }
 
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so

@@ -78,6 +78,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // SESSION RECON (M30 Step 0): read-only snapshot to classify live-form vs
+  // logged-out/expired. No minimize needed. [SESSION-RECON] in the SW console.
+  if (message.type === "RUN_CDP_SESSION_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpSessionRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // TARGETED TYPEAHEAD FILL (M25 verify harness): fill ONE typeahead located by
   // label regex — including a field inside a repeating entry (entry-1 scoped
   // via selector composition) — through the full fillTypeaheadCdp brain while
@@ -1895,6 +1907,31 @@ async function runCdpSourceOverwriteRecon(tabId, defaults) {
 }
 
 // ============================================================================
+// SESSION RECON (M30 Step 0) — a READ-ONLY static snapshot to find the signal that
+// distinguishes a live apply form from a logged-out / expired / error state. No
+// minimize needed (a static DOM read isn't throttle-sensitive). Run once on a VALID
+// form and once on a LOGGED-OUT/stale state, paste both [SESSION-RECON] blocks.
+// Detaches in finally.
+// ============================================================================
+async function runCdpSessionRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][SESSION-RECON]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const snap = await cdpEval(cdpReadSessionState);
+    LOG("session snapshot (run once VALID + once LOGGED-OUT to diff):");
+    console.log("[ApplyPilot][SESSION-RECON]", JSON.stringify(snap, null, 2));
+    return { ok: true, snapshot: snap };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // TARGETED TYPEAHEAD FILL — the M25 verify harness. Locates ONE typeahead by
 // label regex (entry fields get an entry-1-scoped COMPOSED selector — the
 // duplicate formField-* ids make a bare wrapper selector hit entry 1 only by
@@ -1993,6 +2030,7 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
     // ── Report: NEEDS REVIEW first (typeahead/source deferrals AND employer-
     // match outcomes), then the full per-field table, then counts. ──
     LOG("page:", out.url);
+    if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
     if (out.repeatingFieldCount) LOG(`${out.repeatingFieldCount} repeating-section field(s) on this page — untouched (out of scope this milestone).`);
     LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
     for (const r of out.needsReview) {
@@ -2003,7 +2041,7 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
       verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
     })));
     LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("CDP fill aborted:", msg);
