@@ -262,6 +262,18 @@ function makeFakeAct(fields) {
       f.open = false;
       return true;
     },
+    // M28: text-keyed dropdown option click. clickDismisses = click dispatched but
+    // nothing commits (the Uruguay out-of-view shape) — trigger stays unchanged.
+    clickDropdownOptionByText: async (loc, text) => {
+      log.push(["clickDropdownOptionByText", text]);
+      const f = byLoc(loc);
+      if (f.clickDismisses) return true;
+      const o = (f.options || []).find((x) => !x.disabled && x.text === text);
+      if (!o) return false;
+      f.triggerText = o.text;
+      f.open = false;
+      return true;
+    },
 
     // radio / checkbox
     readRadioState: async (loc) => byLoc(loc).options.map((o) => ({ ...o })),
@@ -405,33 +417,28 @@ const ddField = (flags) => Object.assign({
 }, flags || {});
 const usProfile = { personal_info: { country: "United States of America" } };
 
-test("dropdown: type-jump lands on target → verified Enter commit, no arrow-walk", async () => {
+test("dropdown: commits the matched option via TEXT-keyed click (no type-jump, no arrow-walk)", async () => {
   const act = makeFakeAct([ddField()]);
   const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "United States of America");
-  assert.strictEqual(rec.detail, "enter-commit");
-  assert.ok(!act.log.some(([m]) => m === "arrowStep"), "no arrow-walk needed");
+  assert.match(rec.detail, /text-click-commit/);
+  assert.ok(act.log.some(([m]) => m === "clickDropdownOptionByText"), "committed by text-keyed click");
+  assert.ok(!act.log.some(([m]) => m === "typeJumpChars"), "no type-jump");
+  assert.ok(!act.log.some(([m]) => m === "arrowStep"), "no arrow-walk (no step counting)");
 });
 
-test("dropdown: type-jump lands WRONG → arrow-walk correction → re-verified Enter", async () => {
-  const act = makeFakeAct([ddField({ typeJumpLandsIdx: 3 /* Uruguay */ })]);
+test("dropdown: M28 — starting on a same-first-letter value still commits (no type-jump cycling)", async () => {
+  // The live bug: dropdown already on a U-item ("Uruguay" here; "United Arab Emirates"
+  // live) → native type-jump cycled to the next U, then errored. Text-keyed click is
+  // immune to the starting selection.
+  const act = makeFakeAct([ddField({ triggerText: "Uruguay" })]);
   const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "United States of America");
-  assert.ok(act.log.some(([m]) => m === "arrowStep"), "arrow-walk corrected the highlight");
-});
-
-test("dropdown: highlight never verifiable → Enter NEVER pressed → needs_review", async () => {
-  const act = makeFakeAct([ddField({ highlightStuck: true })]);
-  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
-  const rec = out.results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.match(rec.detail, /could not verify highlight/);
-  assert.ok(!act.log.some(([m]) => m === "pressEnter"), "must not commit an unverified highlight");
-  assert.ok(act.log.some(([m]) => m === "pressEscape"), "closes the listbox");
+  assert.ok(!act.log.some(([m]) => m === "typeJumpChars"), "no type-jump from a same-prefix start");
 });
 
 test("dropdown: options never render → Escape + needs_review (skipped_no_option_match)", async () => {
@@ -450,18 +457,11 @@ test("dropdown: no candidate matched → Escape + needs_review with captured opt
   assert.deepStrictEqual(rec.options, ["Canada", "United States of America", "Uruguay"]);
 });
 
-test("dropdown: Enter commits the WRONG value → never silently accepted", async () => {
-  const [rec] = await run([ddField({ enterCommitsWrongIdx: 1 /* Canada */ })], usProfile, {});
+test("dropdown: click dispatched but nothing commits → needs_review, never a silent/wrong fill", async () => {
+  const [rec] = await run([ddField({ clickDismisses: true })], usProfile, {});
   assert.strictEqual(rec.status, "needs_review");
   assert.match(rec.detail, /commit failed/);
-  assert.strictEqual(rec.after, "Canada"); // the wrong value is surfaced, not accepted
-});
-
-test("dropdown: Enter-commit fails → last-resort coordinate click, same verify gate", async () => {
-  const [rec] = await run([ddField({ enterFails: true, clickFallbackWorks: true })], usProfile, {});
-  assert.strictEqual(rec.status, "filled");
-  assert.strictEqual(rec.after, "United States of America");
-  assert.match(rec.detail, /click-fallback/);
+  assert.strictEqual(rec.after, "Select One"); // unchanged trigger surfaced, not accepted
 });
 
 test("dropdown: trigger already matches a candidate → filled / dropdown-prefilled-kept, NO re-open (M27 Commit C)", async () => {

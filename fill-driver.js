@@ -343,78 +343,62 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts };
   }
   const target = enabledTexts[m.targetIndex];
-  const onTarget = (s) => !!(s && s.activeText && norm(s.activeText) === norm(target));
+  // Verify gate TIGHTENED (M28): exact-normalize ONLY — a substring trigger can't false-pass.
+  const committedText = (t) => t != null && norm(t) === norm(target);
 
-  // Type-to-highlight: leading chars move aria-activedescendant (native listbox
-  // type-jump, recon-confirmed); throttling can split keystrokes → verify, and
-  // arrow-walk the remainder from the LIVE highlight if the jump landed wrong.
-  await act.typeJumpChars(target.slice(0, Math.min(3, target.length)));
-  await act.delay(budgets.typeJumpDelayMs);
-  let s2 = await act.readDropdownState(loc);
-  if (!onTarget(s2)) {
-    const idxOf = (txt) => (txt == null ? -1 : enabledTexts.findIndex((t) => norm(t) === norm(txt)));
-    let steps = 0;
-    let dir = 1;
-    while (!onTarget(s2) && steps < budgets.maxArrowSteps) {
-      const cur = idxOf(s2 && s2.activeText);
-      if (cur !== -1) dir = cur < m.targetIndex ? 1 : cur > m.targetIndex ? -1 : dir;
-      await act.arrowStep(dir);
-      await act.delay(budgets.arrowStepMs);
-      s2 = await act.readDropdownState(loc);
-      steps++;
+  // Commit is TEXT-KEYED (M28): scroll the matched option into view and click it by
+  // its text — deterministic regardless of the dropdown's STARTING selection, and
+  // immune to scrape-order vs live-DOM-order drift (no index, no type-jump cycling,
+  // no counted arrow-walk). The old type-jump+arrow-walk failed when the dropdown
+  // already sat on a same-first-letter value (native type-ahead cycled to the NEXT
+  // match) and on long lists (step cap), and worst it returned needs_review BEFORE
+  // any click could run. Behind the SAME verify gate: filled only if the trigger
+  // then shows the target exactly; otherwise needs_review (never a wrong commit).
+  const commitByClick = async () => {
+    if (!(await act.clickDropdownOptionByText(loc, target))) {
+      const cs = await act.readDropdownState(loc);
+      return { ok: false, after: cs ? cs.triggerText : null };
     }
-  }
-  if (!onTarget(s2)) {
+    let after = null;
+    const deadline = Date.now() + budgets.commitCeilingMs;
+    while (Date.now() < deadline) {
+      await act.delay(budgets.commitIntervalMs);
+      const cs = await act.readDropdownState(loc);
+      after = cs ? cs.triggerText : after;
+      if (committedText(after)) return { ok: true, after };
+    }
+    return { ok: false, after };
+  };
+
+  // Backstop/log: a fresh read must still show the target present + enabled before
+  // clicking (catches a vanished option / DOM drift). The index canary is non-fatal
+  // — the click is text-keyed, so a scrape-vs-DOM order mismatch can't mis-click.
+  const fresh = await act.readDropdownState(loc);
+  const freshEnabled = fresh ? fresh.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+  if (!freshEnabled.some((t) => norm(t) === norm(target))) {
     await act.pressEscape();
-    return { status: "needs_review", detail: `could not verify highlight on "${target}" — not committing`, after: before, options: enabledTexts, matchTier: m.matchTier };
+    return { status: "needs_review", detail: `target "${target}" no longer in the open list — review`, after: before, options: enabledTexts, matchTier: m.matchTier };
   }
+  const fullIdx = fresh.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
+  const idxCanary = (fresh.options[fullIdx] && norm(fresh.options[fullIdx].text) === norm(target)) ? "" : " [option-index desync vs scrape — text-keyed click used]";
 
-  // Verified highlight → Enter, then the post-commit gate: trigger text must
-  // show the target. Mismatch is NEVER silently accepted.
-  await act.pressEnter();
-  const committedText = (t) => t != null && (norm(t) === norm(target) || norm(t).includes(norm(target)));
-  let after = null;
-  const commitDeadline = Date.now() + budgets.commitCeilingMs;
-  while (Date.now() < commitDeadline) {
-    await act.delay(budgets.commitIntervalMs);
-    const cs = await act.readDropdownState(loc);
-    after = cs ? cs.triggerText : after;
-    if (committedText(after)) {
-      return { status: "filled", after, verified: true, matchTier: m.matchTier, detail: "enter-commit", options: enabledTexts };
-    }
-  }
-
-  // LAST RESORT (kept for tenants where Enter-commit might not take): reopen if
-  // the Enter closed the list, scrollIntoView + coordinate-click the matched
-  // option, SAME verify gate. Recon proved Enter works on Magna; this is
-  // belt-and-suspenders, never an unverified accept.
-  let fb = await act.readDropdownState(loc);
-  if (!fb || fb.optionCount === 0) {
-    if (await act.openDropdown(loc)) {
-      const fbDeadline = Date.now() + Math.min(budgets.openCeilingMs, 8000);
-      while (Date.now() < fbDeadline) {
-        await act.delay(budgets.settleIntervalMs);
-        fb = await act.readDropdownState(loc);
-        if (fb && fb.optionCount > 0) break;
+  let res = await commitByClick();
+  if (!res.ok) {
+    // One retry: re-open if the click closed the list without committing, then re-click.
+    let re = await act.readDropdownState(loc);
+    if (!re || re.optionCount === 0) {
+      if (await act.openDropdown(loc)) {
+        const d = Date.now() + Math.min(budgets.openCeilingMs, 8000);
+        while (Date.now() < d) { await act.delay(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; }
       }
     }
+    if (re && re.optionCount > 0) res = await commitByClick();
   }
-  if (fb && fb.options && fb.optionCount > 0) {
-    const fullIdx = fb.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
-    if (fullIdx !== -1 && (await act.clickOptionByIndex(loc, fullIdx))) {
-      const d2 = Date.now() + budgets.commitCeilingMs;
-      while (Date.now() < d2) {
-        await act.delay(budgets.commitIntervalMs);
-        const cs = await act.readDropdownState(loc);
-        after = cs ? cs.triggerText : after;
-        if (committedText(after)) {
-          return { status: "filled", after, verified: true, matchTier: m.matchTier, detail: "click-fallback (enter-commit failed)", options: enabledTexts };
-        }
-      }
-    }
-    await act.pressEscape();
+  if (res.ok) {
+    return { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };
   }
-  return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${after}")`, after, options: enabledTexts, matchTier: m.matchTier };
+  await act.pressEscape();
+  return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")`, after: res.after, options: enabledTexts, matchTier: m.matchTier };
 };
 
 // Radio: label-text exact match (case-insensitive, candidates in order — M22

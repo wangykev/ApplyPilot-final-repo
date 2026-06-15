@@ -340,6 +340,28 @@ function cdpOptionRect(wrapperSel, index) {
            cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
+// scrollIntoView + rect of the dropdown option whose trimmed text == `text`
+// (M28 — TEXT-keyed, NOT index: sidesteps any scrape-order vs live-DOM-order drift
+// from disabled/placeholder/separator rows). Scoped to the trigger's aria-controls
+// listbox (same as cdpReadDropdownState, so chips / other listboxes are excluded);
+// skips aria-disabled options (the "Select One" placeholder). `text` is itself a
+// scraped option text, so an exact trimmed match resolves the same element.
+function cdpDropdownOptionRectByText(wrapperSel, text) {
+  const w = document.querySelector(wrapperSel);
+  const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
+  if (!trigger) return null;
+  const id = trigger.getAttribute("aria-controls");
+  const lb = id ? document.getElementById(id) : null;
+  if (!lb) return null;
+  const el = Array.from(lb.querySelectorAll('[role="option"]'))
+    .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
+  if (!el) return null;
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
 function cdpReadRadioState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;
@@ -757,6 +779,16 @@ function makeCdpActuation() {
     // Enter-commit is primary) — scrollIntoView makes the coordinate paintable.
     clickOptionByIndex: async (loc, index) => {
       const rect = await cdpEval(cdpOptionRect, loc.wrapperSel, index);
+      if (!rect || rect.w <= 0) return false;
+      await cdpClickAt(rect.cx, rect.cy);
+      return true;
+    },
+    // M28: TEXT-keyed option click — scrollIntoView the matched option (by text)
+    // then coordinate-click it. The primary dropdown commit (no type-jump cycling,
+    // no scrape-order index assumption). A null/zero rect (text not resolvable) →
+    // false; a missed click dismisses harmlessly and the trigger-text gate verifies.
+    clickDropdownOptionByText: async (loc, text) => {
+      const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
       if (!rect || rect.w <= 0) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;

@@ -690,3 +690,41 @@ hand-seeded WRONG chip "Family"; candidate "LinkedIn" (from `defaults.how_did_yo
 - **(b) REPLACE** — typing "LinkedIn" → filter-Enter → single chip "LinkedIn" at t=402 (auto-committed
   on the single-exact match; `leafCount:0`). Source overwrite-success can fire via auto-commit.
 - Verdict: source is SYMMETRIC to the typeahead — the overwrite walk applies in lockstep.
+
+## 2026-06-14 — Magna wd3, HIDDEN tab: dropdown commit must be TEXT-keyed, not type-jump (M28)
+
+Bug found in a full-page CDP fill: the **country** dropdown failed to commit when it was already on a
+value sharing the target's first letter (started on "United Arab Emirates", profile "United States of
+America") → `needs_review` "could not verify highlight"; country stayed wrong; the dependent
+`countryRegion` (State) then showed Emirate vocab → "no candidate matched". Started on "Select One" it
+worked. So a stale-but-plausible starting selection broke the fill.
+
+### Why type-jump + arrow-walk failed
+- **Native listbox type-ahead cycles on a same-prefix selection:** with the active option already
+  starting with the typed letter, pressing "u" jumps to the NEXT "U" item, not the first. And hidden-tab
+  throttling breaks the multi-char buffer ("u"→"n"→"i") between keystrokes → the highlight lands far from
+  target (observed: wandered toward "N").
+- **The counted arrow-walk** (`maxArrowSteps` cap 60) can't cross a ~249-item list from a wrong landing.
+- **Worst:** on a failed highlight the code returned `needs_review` BEFORE the scroll+click fallback ran
+  (the fallback was gated behind the highlight verifying) — the one deterministic mechanism never fired.
+
+### The fix — text-keyed scroll+click (TEXT, not index)
+- `cdpDropdownOptionRectByText(wrapperSel, text)` resolves the option **within the trigger's
+  `aria-controls` listbox** (chips / other listboxes excluded; skips `aria-disabled` placeholder) whose
+  trimmed `textContent` == target, `scrollIntoView({block:"center"})`, returns the rect; `cdpClickAt`.
+- Deterministic regardless of the starting selection; **no type-jump cycling, no arrow counting, no
+  scrape-order==DOM-order index assumption** ("not virtualized" — full 249 list IS in the DOM — does NOT
+  guarantee order parity, so text-keying removes the assumption at the source).
+- Verify gate TIGHTENED to **exact-normalize** (a substring trigger can't false-pass). Backstop: a fresh
+  read confirms the target is still present pre-click; a `fullIdx` desync canary is logged (non-fatal,
+  text-keyed click can't mis-click). One retry, then `needs_review` — never a wrong/silent commit.
+- The earlier "Uruguay pitfall" (out-of-view coordinate-click dismisses) is handled by the option's own
+  `scrollIntoView` before the click; live-verified the click commits a deep same-prefix target.
+
+### Live result (country pre-set "United Arab Emirates", normal session)
+- `country` → `filled` "United States of America" (`text-click-commit`); `countryRegion` → `filled`
+  "Florida" (cascade cleared); 0 needs_review, 0 errors.
+- **Name-fields finding:** the extra/erroring local/middle-name boxes seen in the BUGGY run were revealed
+  by the WRONG country (UAE) committing — with the correct country (US) NONE appear. So those weren't an
+  engine gap; they were downstream of the dropdown bug. `legalName--firstNameLocal`/`lastNameLocal`
+  remain `skipped: no mapping` (a separate, low-priority mapping gap).
