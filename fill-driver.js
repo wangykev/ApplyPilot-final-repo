@@ -300,6 +300,19 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const pre = await act.readDropdownState(loc);
   const before = pre ? pre.triggerText : null;
 
+  // KEEP guard (M27 Commit C): if the trigger already shows a value that
+  // EXACT-matches a candidate, keep it with ZERO actuation — skip re-opening a
+  // cold 200+ option list. Symmetry with the typeahead/source pre-filled KEEP;
+  // exact-only (a containment/fuzzy trigger still goes through the verified
+  // re-select), and the "Select One" placeholder matches nothing so empty
+  // dropdowns fall through to the normal fill.
+  if (before) {
+    const k = apMatch.matchCandidates(candidates, [before]);
+    if (k.targetIndex !== -1 && k.matchTier === "exact-normalized") {
+      return { status: "filled", after: before, verified: true, matchTier: "pre-filled", flag: "dropdown-prefilled-kept", confidence: "high", detail: "dropdown already shows a matching value — kept (no actuation)" };
+    }
+  }
+
   if (!(await act.openDropdown(loc))) return { status: "error", detail: "could not open dropdown (trigger rect dead)", after: before };
 
   // Settle: 2 consecutive equal non-zero reads (recon: the list renders

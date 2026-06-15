@@ -464,6 +464,27 @@ test("dropdown: Enter-commit fails → last-resort coordinate click, same verify
   assert.match(rec.detail, /click-fallback/);
 });
 
+test("dropdown: trigger already matches a candidate → filled / dropdown-prefilled-kept, NO re-open (M27 Commit C)", async () => {
+  const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
+  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.matchTier, "pre-filled");
+  assert.strictEqual(rec.flag, "dropdown-prefilled-kept");
+  assert.strictEqual(rec.confidence, "high");
+  assert.strictEqual(rec.after, "United States of America");
+  assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a matching dropdown is not re-opened");
+});
+
+test("dropdown: 'Select One' placeholder does NOT trigger keep — falls through to the verified fill", async () => {
+  const act = makeFakeAct([ddField()]); // default triggerText "Select One"
+  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "United States of America");
+  assert.ok(act.log.some(([m]) => m === "openDropdown"), "placeholder dropdown must still open + fill");
+});
+
 // ── checkbox (reconcile-to-boolean; mapping synthetic — mechanism coverage) ──
 
 test("checkbox: reconciles false→true and true→false, verified by checked read-back", async () => {
