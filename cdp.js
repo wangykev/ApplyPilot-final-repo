@@ -282,6 +282,36 @@ function cdpRectOf(sel, scroll) {
            cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
+// M29 reliability: a rect read RETRIED SW-side until the element has a non-zero
+// layout box (or a ceiling). While hidden the page reacts on the ~1Hz-throttled
+// loop, so a one-shot getBoundingClientRect can catch a not-yet-laid-out element
+// (mid-rerender — e.g. a server-loaded dropdown, or an input the page is
+// re-rendering) → a 0-rect → the actuation errored ("trigger rect dead" / "could
+// not focus input") on a single bad tick. Polling absorbs that transient; a
+// genuinely-absent element still returns null after the ceiling (same safe
+// outcome). Happy path is the first read (no added latency). All waiting is
+// SW-side (cdpDelay), per the off-loop discipline.
+const RECT_READY_CEILING_MS = 2500;
+const RECT_READY_INTERVAL_MS = 150;
+async function cdpRectReady(sel, scroll) {
+  const start = Date.now();
+  const deadline = start + RECT_READY_CEILING_MS;
+  let rect = await cdpEval(cdpRectOf, sel, scroll);
+  let polls = 0;
+  while ((!rect || rect.w <= 0) && Date.now() < deadline) {
+    await cdpDelay(RECT_READY_INTERVAL_MS);
+    rect = await cdpEval(cdpRectOf, sel, scroll);
+    polls++;
+  }
+  // Log ONLY when the retry engaged (a clean run stays silent) — makes the M29 fix
+  // visible during live verification: "recovered" = a field that would have dropped.
+  if (polls > 0) {
+    const ok = rect && rect.w > 0;
+    console.log("[ApplyPilot][CDP] rectReady", JSON.stringify(sel), ok ? `RECOVERED after ${Date.now() - start}ms / ${polls} polls` : `gave up after ${Date.now() - start}ms / ${polls} polls`);
+  }
+  return rect && rect.w > 0 ? rect : null;
+}
+
 function cdpReadTextState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   const input = w && w.querySelector("input");
@@ -743,20 +773,31 @@ function makeCdpActuation() {
     // Focus ladder (recon: cdp-click is what works; the rest are fallbacks).
     focusText: async (loc) => {
       const inputSel = loc.wrapperSel + " input";
-      const rect = await cdpEval(cdpRectOf, inputSel, true);
-      if (rect && rect.w > 0) {
-        await cdpClickAt(rect.cx, rect.cy);
-        await cdpDelay(250);
-        const s = await cdpEval(cdpReadTextState, loc.wrapperSel);
-        if (s && s.focused) return "cdp-click";
+      // M29: retry the WHOLE focus ladder until the input is actually focused (or a
+      // ceiling). A hidden-tab frozen-layout tick can make the input transiently
+      // unfocusable (0-rect / mid-rerender) → a one-shot ladder returned null
+      // ("could not focus input"). Re-attempt; the happy path returns on pass 1.
+      const start = Date.now();
+      const deadline = start + RECT_READY_CEILING_MS;
+      let attempt = 0;
+      while (true) {
+        const rect = await cdpEval(cdpRectOf, inputSel, true);
+        if (rect && rect.w > 0) {
+          await cdpClickAt(rect.cx, rect.cy);
+          await cdpDelay(250);
+          const s = await cdpEval(cdpReadTextState, loc.wrapperSel);
+          if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (cdp-click)`); return "cdp-click"; }
+        }
+        if (await cdpEval(cdpFocusBySel, inputSel)) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (page-focus)`); return "page-focus()"; }
+        try {
+          await cdpDomFocus(inputSel);
+          const s = await cdpEval(cdpReadTextState, loc.wrapperSel);
+          if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; }
+        } catch (e) { /* fall through to retry / null */ }
+        if (Date.now() >= deadline) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `gave up after ${Date.now() - start}ms / ${attempt} retries`); return null; }
+        await cdpDelay(RECT_READY_INTERVAL_MS);
+        attempt++;
       }
-      if (await cdpEval(cdpFocusBySel, inputSel)) return "page-focus()";
-      try {
-        await cdpDomFocus(inputSel);
-        const s = await cdpEval(cdpReadTextState, loc.wrapperSel);
-        if (s && s.focused) return "DOM.focus";
-      } catch (e) { /* fall through to null */ }
-      return null;
     },
     clearText: () => cdpSelectAllDelete(),
     typeText: (text) => cdpInsertText(text), // recon (a): trusted beforeinput+input, survives blur
@@ -764,8 +805,8 @@ function makeCdpActuation() {
 
     // ── dropdown ──
     openDropdown: async (loc) => {
-      const rect = await cdpEval(cdpRectOf, loc.wrapperSel + ' button[aria-haspopup="listbox"]', true);
-      if (!rect || rect.w <= 0) return false;
+      const rect = await cdpRectReady(loc.wrapperSel + ' button[aria-haspopup="listbox"]', true); // M29: retry the trigger rect
+      if (!rect) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;
     },
@@ -848,8 +889,8 @@ function makeCdpActuation() {
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
     clickRadioLabel: async (loc, id) => {
-      const rect = await cdpEval(cdpRectOf, 'label[for="' + id + '"]', true);
-      if (!rect || rect.w <= 0) return false;
+      const rect = await cdpRectReady('label[for="' + id + '"]', true); // M29: retry the label rect
+      if (!rect) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;
     },
@@ -859,8 +900,8 @@ function makeCdpActuation() {
     clickCheckboxLabel: async (loc) => {
       const st = await cdpEval(cdpReadCheckboxState, loc.wrapperSel);
       if (!st || !st.inputId) return false;
-      let rect = await cdpEval(cdpRectOf, 'label[for="' + st.inputId + '"]', true);
-      if (!rect || rect.w <= 0) rect = await cdpEval(cdpRectOf, loc.wrapperSel + ' input[type="checkbox"]', true);
+      let rect = await cdpRectReady('label[for="' + st.inputId + '"]', true); // M29: retry the label rect
+      if (!rect) rect = await cdpEval(cdpRectOf, loc.wrapperSel + ' input[type="checkbox"]', true); // one-shot input fallback
       if (!rect || rect.w <= 0) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;

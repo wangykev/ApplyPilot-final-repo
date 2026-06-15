@@ -728,3 +728,30 @@ worked. So a stale-but-plausible starting selection broke the fill.
   by the WRONG country (UAE) committing — with the correct country (US) NONE appear. So those weren't an
   engine gap; they were downstream of the dropdown bug. `legalName--firstNameLocal`/`lastNameLocal`
   remain `skipped: no mapping` (a separate, low-priority mapping gap).
+
+## 2026-06-14 — Magna wd3: rect/focus retry (M29) + the reliability cause is SESSION LOGOUT
+
+### M29 — retry one-shot rect/focus reads (cdp.js)
+- `cdpRectReady(sel, scroll)` polls `cdpRectOf` SW-side until a non-zero layout box (≤2.5s / 150ms);
+  `focusText` retries its whole ladder until the input is focused or the ceiling; `openDropdown` /
+  `clickRadioLabel` / the checkbox label read go through it. Logs `RECOVERED` / `gave up` ONLY when the
+  retry actually polled (clean runs are silent) — a diagnostic for the intermittent field-drops.
+- Rationale: while hidden the page reacts on the ~1Hz loop, so a one-shot `getBoundingClientRect` can
+  catch a not-yet-laid-out element → 0-rect → the actuation errored on a single bad tick. Polling
+  absorbs a genuine transient; a truly-absent element still `gave up` after the ceiling (same safe
+  outcome, now logged + bounded). Happy path = first read (no added latency).
+
+### REFRAME — the field-drops are most likely SESSION LOGOUT, not throttle-transient
+- Live: after the form sat / a manual logout, **`source` ("How did you hear about us?") did not load**
+  → "no source candidate produced a verified commit". That field's options are **server-loaded**; a
+  logged-out session can't fetch them, so they never render.
+- This strongly implies the earlier scattered field-drops (`legalName--firstName` "could not focus
+  input"; `countryRegion` "trigger rect dead") were the SAME logged-out symptom — a server-rendered /
+  re-rendering element that never laid out — NOT a throttle-transient rect read. M29's retry can't fix
+  that (it can't conjure un-fetched content); it just makes the failure logged + bounded. A `gave up`
+  log on the next logout will CONFIRM "session-gone, not transient".
+- Also observed: **Save & Continue → four `Error-Page Error — Error Code: VPS|…` banners** (top of
+  page) — likely session/validation-related; for the page-advance + session round.
+- ⇒ The real reliability win is **session-expiry detection** (surface "refresh + log in + reopen"),
+  deferred to its own round; M29 is the smaller transient-sliver hardening + the diagnostic that
+  motivates it.
