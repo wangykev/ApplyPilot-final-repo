@@ -79,6 +79,14 @@
          defaults.how_did_you_hear (preferred LinkedIn). Minimize within 60s; [CDP-SRC]
          in the SW console. -->
     <button id="cdp-source-fill">CDP fill source: LinkedIn (minimize!)</button>
+    <!-- REPEATING-SECTION RECON (M32 Step 0): the FIRST step of porting page-2
+         (My Experience) repeating sections to CDP. Read-only structure dump
+         (sections present, entries, per-entry fields, Add/Delete rects) + a
+         Websites shape check + one bounded DATE-SPINBUTTON probe (the key
+         unknown — CDP has no native setter). Run on My Experience (page 2);
+         minimize within 60s (the date probe actuates one segment, restored
+         after). [REPEAT-RECON] in the SW console. -->
+    <button id="cdp-repeat-recon">CDP recon: repeating sections (minimize!)</button>
     <hr>
     <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
     <label for="company">Company for this application (temporary):</label>

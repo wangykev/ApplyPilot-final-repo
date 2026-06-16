@@ -274,6 +274,29 @@ document.getElementById("cdp-source-fill").addEventListener("click", () => {
   });
 });
 
+// REPEATING-SECTION RECON (M32 Step 0): the first step of porting page-2 (My
+// Experience) repeating sections to CDP. Read-only structure dump + Websites
+// shape check + a bounded date-spinbutton probe. Run on My Experience (page 2);
+// minimize within 60s. Output is [REPEAT-RECON] in the SW console.
+document.getElementById("cdp-repeat-recon").addEventListener("click", () => {
+  setStatus("Repeating-section recon… open My Experience (page 2), then MINIMIZE now (60s). Findings land in the service worker console as [REPEAT-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REPEAT_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false && resp.error === "no-repeating-sections") {
+      setStatus("No repeating sections on this page — navigate to My Experience (page 2) and re-run.");
+    } else if (resp.ok === false) {
+      setStatus("Repeating-section recon failed: " + resp.error + " — see the service worker console.");
+    } else {
+      const sp = (resp.scan && resp.scan.sectionsPresent) || [];
+      const dp = resp.probe || {};
+      const date = !dp.attempted ? "no date field" : (dp.anyMethodStuck ? "date OK" : "DATE BLOCKED");
+      setStatus(`Repeating recon done — sections: ${sp.join(", ") || "none"}; ${date}. Paste the [REPEAT-RECON] summary from the SW console.`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

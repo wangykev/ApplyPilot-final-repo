@@ -90,6 +90,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // REPEATING-SECTION RECON (M32 Step 0): the FIRST step of porting page-2 (My
+  // Experience) repeating sections to CDP. READ-ONLY structure dump (sections
+  // present → entries → per-entry fields with the composed entry-scoped selector,
+  // add-button + delete-button rects) PLUS one bounded, restore-where-possible
+  // DATE-SPINBUTTON probe (the key unknown — CDP has no native setter; a total
+  // probe failure is a STOP-and-surface known-blocker, not a quiet fallback).
+  // Run on My Experience (page 2); MINIMIZE within 60s (the date probe actuates).
+  // [REPEAT-RECON] in the SW console. No profile needed.
+  if (message.type === "RUN_CDP_REPEAT_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpRepeatRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // TARGETED TYPEAHEAD FILL (M25 verify harness): fill ONE typeahead located by
   // label regex — including a field inside a repeating entry (entry-1 scoped
   // via selector composition) — through the full fillTypeaheadCdp brain while
@@ -1941,6 +1959,191 @@ async function runCdpSessionRecon(tabId) {
     LOG("session snapshot (run once VALID + once LOGGED-OUT to diff):");
     console.log("[ApplyPilot][SESSION-RECON]", JSON.stringify(snap, null, 2));
     return { ok: true, snapshot: snap };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// REPEATING-SECTION RECON (M32 Step 0) — the FIRST step of the page-2 CDP port.
+// (1) READ-ONLY structure dump (cdpRepeatingScan): which sections are present,
+//     their entry containers + per-entry fields (with the composed entry-scoped
+//     selector that the existing handlers reuse), the Add/Delete button rects.
+// (2) WEBSITES shape check (sharpening 3): confirm Websites exists on Magna and
+//     is the assumed one-url-field shape BEFORE committing to it as the first
+//     (date-free) section to prove the machinery.
+// (3) DATE-SPINBUTTON probe (the key unknown — CDP has no native setter): try
+//     insertText → per-char keys → arrow keys, EACH verified by read-back. A
+//     TOTAL failure is a STOP-and-surface KNOWN-BLOCKER (dates unactuatable →
+//     defer the composite), per sharpening 1 — never a silent fallback-cascade.
+//     Bounded + restore-where-possible (one segment, throwaway app). Hidden-gated
+//     (it actuates). Detaches in finally.
+// ============================================================================
+async function runCdpRepeatRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][REPEAT-RECON]", ...a);
+  // self-contained segment read (value + focus) for the date probe read-backs
+  const readVal = (sel) => cdpEval((s) => {
+    const el = document.querySelector(s);
+    return el ? { value: el.value, focused: document.activeElement === el, role: el.getAttribute("role") } : null;
+  }, sel);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing probed.");
+      return { ok: false, error: "never-hidden" };
+    }
+    LOG("tab is hidden — repeating-section recon starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+
+    // ── (1) structure dump ──────────────────────────────────────────────────
+    const scan = await cdpEval(cdpRepeatingScan);
+    if (!scan) return { ok: false, error: "scan-failed" };
+    LOG("sections present:", JSON.stringify(scan.sectionsPresent), "| url:", scan.url);
+    if (!scan.sectionsPresent.length) {
+      LOG("⚠ NO repeating sections on this page — navigate to My Experience (page 2) and re-run.");
+      return { ok: false, error: "no-repeating-sections", scan };
+    }
+    for (const prefix of scan.sectionsPresent) {
+      const sec = scan.sections[prefix];
+      LOG("── section", prefix, "— entryCount:", sec.entryCount);
+      console.log("[ApplyPilot][REPEAT-RECON]", prefix, JSON.stringify(sec, null, 2));
+    }
+    LOG("add-buttons (rect + nearest heading — for findSectionAdd / clickSectionAdd):");
+    console.log("[ApplyPilot][REPEAT-RECON]", JSON.stringify(scan.addButtons, null, 2));
+
+    // ── (2) Websites shape check (sharpening 3) ───────────────────────────────
+    const websites = scan.sections["webAddress-"];
+    if (websites) {
+      const e0 = websites.entries[0];
+      const textFields = e0 ? e0.fields.filter((f) => f.widgetType === "text") : [];
+      const anyDate = e0 ? e0.fields.some((f) => f.dateSegments.length > 0) : false;
+      const anyHashed = e0 ? e0.fields.some((f) => f.hashedId) : false;
+      const looksSimpleOneUrl = !!(e0 && e0.fieldCount === 1 && textFields.length === 1 && !anyDate && !anyHashed);
+      LOG("WEBSITES shape check (sharpening 3):", JSON.stringify({
+        present: true, entryCount: websites.entryCount,
+        firstEntryFieldCount: e0 ? e0.fieldCount : 0,
+        firstEntryFields: e0 ? e0.fields.map((f) => ({ field: f.fieldName, widget: f.widgetType, hashed: f.hashedId, dateSegs: f.dateSegments.length, required: f.isRequired })) : [],
+        looksSimpleOneUrl
+      }, null, 2));
+      LOG(looksSimpleOneUrl
+        ? "→ Websites looks like the simple one-url shape — a good DATE-FREE first section to prove the machinery."
+        : "→ Websites shape DIFFERS from the assumed one-url field — the cleanest-section pick may need to change (sharpening 3).");
+    } else {
+      LOG("WEBSITES not present on this page — the date-free first-section pick may need to change (sharpening 3). Sections here:", JSON.stringify(scan.sectionsPresent));
+    }
+
+    // ── (3) DATE-SPINBUTTON probe (the key unknown) ───────────────────────────
+    const dateField = (() => {
+      for (const prefix of scan.sectionsPresent) {
+        for (const e of scan.sections[prefix].entries) {
+          const f = e.fields.find((x) => x.dateSegments.length > 0);
+          if (f) return { prefix, entryFkitId: e.entryFkitId, field: f };
+        }
+      }
+      return null;
+    })();
+
+    const probe = { attempted: false };
+    if (!dateField) {
+      LOG("date probe SKIPPED — no date field on this page. (The composite is only needed by date-bearing sections; if the first section is date-free, it waits regardless.)");
+    } else {
+      probe.attempted = true;
+      const seg = dateField.field.dateSegments[0];
+      const segSel = dateField.field.wrapperSel + ' [data-automation-id="' + seg + '"]';
+      probe.target = { section: dateField.prefix, entry: dateField.entryFkitId, field: dateField.field.fieldName, segment: seg, segSel };
+      LOG("date probe target:", JSON.stringify(probe.target));
+      const orig = await readVal(segSel);
+      probe.originalValue = orig ? orig.value : null;
+      const want = "12";
+
+      const rect = await cdpRectReady(segSel, true);
+      probe.rectLive = !!rect;
+      if (!rect) {
+        LOG("date probe: segment rect DEAD (0-box) even after retry — cannot actuate this segment.");
+        probe.insertText = { skipped: "no-rect" };
+      } else {
+        // method (a): cdp-click focus → trusted clear → insertText
+        await cdpClickAt(rect.cx, rect.cy);
+        await cdpDelay(250);
+        const af = await readVal(segSel);
+        probe.focusedAfterClick = !!(af && af.focused);
+        await cdpSelectAllDelete();
+        await cdpDelay(150);
+        await cdpInsertText(want);
+        await cdpDelay(300);
+        const a = await readVal(segSel);
+        probe.insertText = { read: a ? a.value : null, stuck: !!(a && a.value === want) };
+        LOG("date probe (a) insertText:", JSON.stringify(probe.insertText));
+
+        // method (b): per-char trusted keystrokes
+        if (!probe.insertText.stuck) {
+          await cdpClickAt(rect.cx, rect.cy); await cdpDelay(150);
+          await cdpSelectAllDelete(); await cdpDelay(150);
+          await cdpTypeChars(want, 80); await cdpDelay(300);
+          const b = await readVal(segSel);
+          probe.typeChars = { read: b ? b.value : null, stuck: !!(b && b.value === want) };
+          LOG("date probe (b) typeChars:", JSON.stringify(probe.typeChars));
+
+          // method (c): arrow keys (spinbutton increment) — success = value became non-empty
+          if (!probe.typeChars.stuck) {
+            await cdpClickAt(rect.cx, rect.cy); await cdpDelay(150);
+            await cdpSelectAllDelete(); await cdpDelay(150);
+            await cdpKeyTap(CDP_KEYS.arrowUp); await cdpDelay(200);
+            await cdpKeyTap(CDP_KEYS.arrowUp); await cdpDelay(200);
+            const c = await readVal(segSel);
+            probe.arrowKeys = { read: c ? c.value : null, stuck: !!(c && c.value && String(c.value).trim() !== "") };
+            LOG("date probe (c) arrowKeys:", JSON.stringify(probe.arrowKeys));
+          }
+        }
+      }
+      probe.anyMethodStuck = !!((probe.insertText && probe.insertText.stuck) || (probe.typeChars && probe.typeChars.stuck) || (probe.arrowKeys && probe.arrowKeys.stuck));
+
+      // STOP-and-surface (sharpening 1) — a total failure is a recorded known-blocker.
+      if (!probe.anyMethodStuck) {
+        LOG("⛔ DATE PROBE FAILED — NO CDP method made the segment stick (insertText / typeChars / arrows all failed read-back).");
+        LOG("⛔ KNOWN-BLOCKER: dates appear UNACTUATABLE on CDP → blocks Education / Certifications / Work-Experience / Languages date fields. The date composite must be DEFERRED (date-free section only this round), NOT papered over. Record this in dom-patterns.");
+      } else {
+        const winner = probe.insertText && probe.insertText.stuck ? "insertText"
+          : probe.typeChars && probe.typeChars.stuck ? "typeChars" : "arrowKeys";
+        LOG("✅ date probe: a working CDP method EXISTS →", winner, "(read-back verified). The CDP date composite can use it.");
+      }
+
+      // restore-where-possible (one segment, throwaway app)
+      probe.restored = false;
+      try {
+        const r2 = await cdpRectReady(segSel, true);
+        if (r2) {
+          await cdpClickAt(r2.cx, r2.cy); await cdpDelay(120);
+          await cdpSelectAllDelete(); await cdpDelay(120);
+          if (probe.originalValue) { await cdpInsertText(probe.originalValue); await cdpDelay(150); }
+          const rr = await readVal(segSel);
+          probe.restored = !!(rr && rr.value === (probe.originalValue || ""));
+        }
+      } catch (e) { /* best-effort */ }
+      LOG("date probe restore:", probe.restored ? "restored to original" : "left modified (throwaway app — re-fill or discard the entry).");
+    }
+
+    // ── summary ───────────────────────────────────────────────────────────────
+    LOG("── RECON SUMMARY ──");
+    console.log("[ApplyPilot][REPEAT-RECON]", JSON.stringify({
+      url: scan.url,
+      sectionsPresent: scan.sectionsPresent,
+      entryCounts: Object.fromEntries(scan.sectionsPresent.map((p) => [p, scan.sections[p].entryCount])),
+      addButtonCount: scan.addButtons.length,
+      websitesPresent: !!scan.sections["webAddress-"],
+      dateProbe: probe.attempted
+        ? { attempted: true, anyMethodStuck: probe.anyMethodStuck, methods: { insertText: probe.insertText, typeChars: probe.typeChars, arrowKeys: probe.arrowKeys } }
+        : { attempted: false, reason: "no date field on this page" }
+    }, null, 2));
+    return { ok: true, scan, probe };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("recon aborted:", msg);

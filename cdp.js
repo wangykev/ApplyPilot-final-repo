@@ -271,6 +271,113 @@ function cdpPageScan() {
   };
 }
 
+// M32 recon: READ-ONLY structure dump of the page's repeating sections (My
+// Experience). Enumerates the `--null` ENTRY containers grouped by section
+// prefix (NOT the `--startDate`/`--endDate` date wrappers that share the prefix
+// — the over-match trap), and per entry: each `formField-*` field with its
+// widget type, label, required flag, HASHED-id flag (→ needs labelRegex), the
+// date SEGMENT ids if any (`dateSection*-input`), and the COMPOSED entry-scoped
+// `wrapperSel` (the duplicate-formField-id rule — every field access must be
+// entry-scoped). Also every `add-button` (rect + nearest heading, for
+// findSectionAdd/clickSectionAdd) and each entry's "Delete" button rect
+// (deleteEntryButton climb). No clicks — the date-input PROBE is separate, in
+// the SW runner. Mirrors background.js fillRepeatingSection/fillMappedEntry.
+function cdpRepeatingScan() {
+  const rectOf = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+             cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  };
+  const labelOf = (w) => {
+    const legend = w.querySelector("legend");
+    if (legend && legend.textContent.trim()) return legend.textContent.trim().slice(0, 60);
+    for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); }
+    return null;
+  };
+  const classify = (w) => {
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => {
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
+    });
+    if (textLike.length === 1) return "text";
+    return "unknown";
+  };
+  const dateSegsOf = (w) => Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]'))
+    .map((s) => s.getAttribute("data-automation-id")).filter(Boolean);
+  // Hashed id = the suffix after "formField-" isn't a clean name (contains a hex
+  // run / non-word chars) → can't be targeted by automation-id, needs labelRegex.
+  const isHashed = (fieldName) => /[0-9a-f]{8}/i.test(fieldName) || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(fieldName);
+  const requiredOf = (w) => {
+    for (const a of w.querySelectorAll("abbr")) {
+      const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || "");
+      if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true;
+    }
+    if (w.querySelector('[aria-required="true"], [data-required="true"]')) return true;
+    const labelEl = w.querySelector("legend") || w.querySelector("label");
+    if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
+    return false;
+  };
+  // Nearest preceding heading (climb ancestors, scan previous siblings) — maps an
+  // add-button back to its section, the findSectionAdd anchor.
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  const PREFIXES = ["workExperience-", "education-", "webAddress-", "language-", "certification-"];
+  const sections = {};
+  for (const prefix of PREFIXES) {
+    const entries = Array.from(document.querySelectorAll('[data-fkit-id^="' + prefix + '"][data-fkit-id$="--null"]'));
+    if (!entries.length) continue;
+    sections[prefix] = {
+      entryCount: entries.length,
+      entries: entries.map((e) => {
+        const fkit = e.getAttribute("data-fkit-id");
+        // "Delete" button: climb up to 6 ancestors, find a <button> whose text is "Delete".
+        let del = null, p = e;
+        for (let i = 0; i < 6 && p; i++) {
+          p = p.parentElement;
+          if (!p) break;
+          const b = Array.from(p.querySelectorAll("button")).find((x) => /^delete$/i.test((x.textContent || "").trim()));
+          if (b) { del = b; break; }
+        }
+        const fields = Array.from(e.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
+          const id = w.getAttribute("data-automation-id");
+          const fieldName = id.slice("formField-".length);
+          return {
+            fieldName, automationId: id,
+            widgetType: classify(w),
+            label: labelOf(w),
+            isRequired: requiredOf(w),
+            hashedId: isHashed(fieldName),
+            dateSegments: dateSegsOf(w),
+            wrapperSel: '[data-fkit-id="' + fkit + '"] [data-automation-id="' + id + '"]'
+          };
+        });
+        return { entryFkitId: fkit, deletePresent: !!del, deleteRect: rectOf(del), fieldCount: fields.length, fields };
+      })
+    };
+  }
+  const addButtons = Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
+    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), rect: rectOf(b), nearestHeading: nearestHeading(b) }));
+  return { url: location.href, sectionsPresent: Object.keys(sections), sections, addButtons };
+}
+
 // M30 session-expiry recon read: a READ-ONLY static snapshot to classify whether
 // the page is a live apply form vs a logged-out / expired / error state. No clicks.
 // Run once on a VALID form and once LOGGED-OUT/stale to find the discriminator.
