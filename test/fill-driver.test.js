@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -14,7 +14,8 @@ const T_BUDGETS = {
   textReadDelayMs: 1, typeJumpDelayMs: 1, arrowStepMs: 1, maxArrowSteps: 60,
   interFieldMs: 0,
   taOpenCeilingMs: 50, taOpenIntervalMs: 1, taActionSettleMs: 1,
-  taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25
+  taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25,
+  entryReconcileCeilingMs: 40, entryReconcileIntervalMs: 1
 };
 
 // ── fake actuation ───────────────────────────────────────────────────────────
@@ -1056,4 +1057,197 @@ test("unmapped text field → skipped 'no mapping'; file_upload → skipped", as
   assert.strictEqual(out.results[0].detail, "no mapping");
   assert.strictEqual(out.results[1].status, "skipped");
   assert.match(out.results[1].detail, /file upload/);
+});
+
+// ── M32 repeating-section fill (driveRepeatingSectionCdp) ───────────────────
+// A fake actuation modeling ONE repeating section as a mutable entries[] array:
+// repeatingScan/entryCount derive from it; clickSectionAdd pushes a fresh entry,
+// clickDeleteEntry splices; the text/checkbox handlers route a COMPOSED entry-scoped
+// wrapperSel back to the right entry's field. .log keeps every call so a test can
+// assert a deferred date field is NEVER actuated. NOTE: byLoc resolves by
+// construction, so this guards ROUTING only — true entry-scope selector uniqueness
+// (the duplicate-formField-id trap) is proven by the LIVE eyeball, not this fake.
+function makeFakeRepeatAct(state) {
+  const log = [];
+  const selOf = (fkit, fieldName) => '[data-fkit-id="' + fkit + '"] [data-automation-id="formField-' + fieldName + '"]';
+  const allFields = () => state.entries.flatMap((e) => e.fields.map((f) => ({ f, sel: selOf(e.fkit, f.fieldName) })));
+  const byLoc = (loc) => { const hit = allFields().find((x) => x.sel === loc.wrapperSel); return hit ? hit.f : null; };
+  let focusedText = null;
+  let focusedInputId = null;
+  return {
+    log,
+    delay: async () => {},
+    entryCount: async () => state.entries.length,
+    repeatingScan: async () => ({
+      url: "fake://repeat",
+      sectionsPresent: [state.prefix],
+      sections: { [state.prefix]: {
+        entryCount: state.entries.length,
+        entries: state.entries.map((e) => ({
+          entryFkitId: e.fkit, deletePresent: true, deleteRect: { w: 10, h: 10, cx: 1, cy: 1 },
+          fieldCount: e.fields.length,
+          fields: e.fields.map((f) => ({
+            fieldName: f.fieldName, automationId: "formField-" + f.fieldName,
+            widgetType: f.widgetType, label: f.label || f.fieldName, isRequired: !!f.isRequired,
+            hashedId: false, dateSegments: f.widgetType === "date" ? ["dateSectionYear-input"] : [],
+            wrapperSel: selOf(e.fkit, f.fieldName)
+          }))
+        }))
+      } },
+      addButtons: []
+    }),
+    clickSectionAdd: async (re) => {
+      log.push(["clickSectionAdd", re]);
+      if (!state.addable) return { ok: false };
+      state.entries.push(state.newEntry(state.entries.length));
+      return { ok: true };
+    },
+    clickDeleteEntry: async (prefix, index) => {
+      log.push(["clickDeleteEntry", index]);
+      if (!state.deletable) return { ok: false };
+      if (state.noDrop) return { ok: true }; // clicked but the count won't change (the guard test)
+      state.entries.splice(index, 1);
+      return { ok: true };
+    },
+    // text
+    readTextValue: async (loc) => { const f = byLoc(loc); return f ? { value: f.value || "", focused: focusedText === f } : null; },
+    focusText: async (loc) => { log.push(["focusText", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.noFocus) return null; focusedText = f; return "cdp-click"; },
+    clearText: async () => { log.push(["clearText"]); if (focusedText) focusedText.value = ""; },
+    typeText: async (text) => { log.push(["typeText", text]); if (focusedText) focusedText.value = text; },
+    // checkbox
+    readCheckboxState: async (loc) => { const f = byLoc(loc); return { inputId: f.inputId, checked: f.checked }; },
+    readChecked: async (id) => { const hit = allFields().find((x) => x.f.inputId === id); return hit ? hit.f.checked : null; },
+    focusInput: async (id) => { focusedInputId = id; return true; },
+    pressSpace: async () => { log.push(["pressSpace"]); const hit = allFields().find((x) => x.f.inputId === focusedInputId); if (hit) hit.f.checked = !hit.f.checked; },
+    clickCheckboxLabel: async (loc) => { log.push(["clickCheckboxLabel", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.checkboxClickRectDead) return false; f.checked = !f.checked; return true; }
+  };
+}
+
+const webEntry = (fkit, url) => ({ fkit, fields: [{ fieldName: "url", label: "URL*", widgetType: "text", isRequired: true, value: url || "" }] });
+const webState = (overrides) => Object.assign({
+  prefix: "webAddress-", addable: true, deletable: true,
+  newEntry: (i) => webEntry("webAddress-new" + i, ""),
+  entries: []
+}, overrides || {});
+const runWeb = async (state, items, extra) => {
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, Object.assign({
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items, fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, extra || {}), T_BUDGETS);
+  return { out, act, state };
+};
+
+test("repeating UP: adds entries to reach N, then fills each url", async () => {
+  const state = webState({ entries: [webEntry("webAddress-4--null", "")] });
+  const items = [{ url: "https://a.example" }, { url: "https://b.example" }, { url: "https://c.example" }];
+  const { out, state: s } = await runWeb(state, items);
+  assert.strictEqual(s.entries.length, 3);
+  const add = out.results.find((r) => r.fieldName === "website.add");
+  assert.strictEqual(add.status, "filled");
+  assert.match(add.detail, /added 2 entry\(ies\); 3\/3/);
+  const urls = out.results.filter((r) => /\.url$/.test(r.fieldName));
+  assert.strictEqual(urls.length, 3);
+  assert.ok(urls.every((r) => r.status === "filled" && r.verified === true));
+});
+
+test("repeating DOWN: deletes trailing extras to reach N (trailing-first)", async () => {
+  const state = webState({ entries: [
+    webEntry("webAddress-1--null"), webEntry("webAddress-2--null"),
+    webEntry("webAddress-3--null"), webEntry("webAddress-4--null")
+  ] });
+  const items = [{ url: "https://a.example" }, { url: "https://b.example" }];
+  const { out, act, state: s } = await runWeb(state, items);
+  assert.strictEqual(s.entries.length, 2);
+  const del = out.results.find((r) => r.fieldName === "website.delete");
+  assert.strictEqual(del.status, "filled");
+  assert.match(del.detail, /deleted 2 extra\(s\); 2\/2/);
+  const delIdx = act.log.filter(([m]) => m === "clickDeleteEntry").map(([, i]) => i);
+  assert.deepStrictEqual(delIdx, [3, 2]); // trailing-first
+  assert.strictEqual(out.results.filter((r) => /\.url$/.test(r.fieldName)).length, 2);
+});
+
+test("repeating fill: each entry gets ITS OWN url (routing; live proves uniqueness)", async () => {
+  const state = webState({ entries: [
+    webEntry("webAddress-1--null"), webEntry("webAddress-2--null"), webEntry("webAddress-3--null")
+  ] });
+  const items = [{ url: "https://alice.example" }, { url: "https://bob.example" }, { url: "https://carol.example" }];
+  const { out } = await runWeb(state, items);
+  const urls = out.results.filter((r) => /\.url$/.test(r.fieldName));
+  assert.deepStrictEqual(urls.map((r) => r.after), ["https://alice.example", "https://bob.example", "https://carol.example"]);
+  assert.ok(urls.every((r) => r.status === "filled" && r.verified === true));
+});
+
+test("repeating N===0: deletes phantom entries, records a single skipped section", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null"), webEntry("webAddress-2--null")] });
+  const { out, state: s } = await runWeb(state, []);
+  assert.strictEqual(s.entries.length, 0);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "website.delete").status, "filled");
+  const skip = out.results.find((r) => r.fieldName === "website");
+  assert.strictEqual(skip.status, "skipped");
+  assert.match(skip.detail, /no meaningful website entries/);
+  assert.ok(!out.results.some((r) => /\.url$/.test(r.fieldName)));
+});
+
+test("repeating date field is DEFERRED (skipped+flagged) with ZERO actuation", async () => {
+  const entry = { fkit: "webAddress-1--null", fields: [
+    { fieldName: "url", label: "URL*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "startDate", label: "From", widgetType: "date", isRequired: false, value: "" }
+  ] };
+  const state = webState({ entries: [entry] });
+  const fieldMap = [
+    { field: "url", widget: "text", key: "url", path: "url" },
+    { field: "startDate", widget: "date", key: "from", path: "from" }
+  ];
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?", containerPrefix: "webAddress-",
+    items: [{ url: "https://a.example", from: "2024-01" }], fieldMap, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  const dateRec = out.results.find((r) => /startDate$/.test(r.fieldName));
+  assert.strictEqual(dateRec.status, "skipped");
+  assert.strictEqual(dateRec.flag, "cdp-date-deferred");
+  assert.match(dateRec.detail, /CDP date unactuatable/);
+  assert.strictEqual(out.results.find((r) => /\.url$/.test(r.fieldName)).status, "filled");
+  // INVARIANT (never papered over): the date field is NEVER focused, and its value never typed.
+  const dateSel = '[data-fkit-id="webAddress-1--null"] [data-automation-id="formField-startDate"]';
+  assert.ok(!act.log.some(([m, a]) => m === "focusText" && a === dateSel), "date field must never be focused");
+  assert.ok(!act.log.some(([m, a]) => m === "typeText" && a === "2024-01"), "date value must never be typed");
+});
+
+test("repeating delete-on-no-match: required no-fill entries deleted high→low", async () => {
+  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "text", isRequired: true, value: "", noFocus: true }] });
+  const state = webState({ entries: [mk("webAddress-1--null"), mk("webAddress-2--null")] });
+  const fieldMap = [{ field: "x", widget: "text", key: "x", path: "x" }];
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "lang", headingRegex: "x", containerPrefix: "webAddress-",
+    items: [{ x: "a" }, { x: "b" }], fieldMap, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  const delIdx = act.log.filter(([m]) => m === "clickDeleteEntry").map(([, i]) => i);
+  assert.deepStrictEqual(delIdx, [1, 0]); // high→low so lower indices stay valid
+  const removed = out.results.filter((r) => /removed$/.test(r.fieldName));
+  assert.strictEqual(removed.length, 2);
+  assert.ok(removed.every((r) => r.status === "skipped" && /entry deleted/.test(r.detail)));
+});
+
+test("repeating UP: add that never mounts stops bounded, flags needs_review", async () => {
+  const state = webState({ addable: false, entries: [webEntry("webAddress-1--null")] });
+  const items = [{ url: "https://a.example" }, { url: "https://b.example" }, { url: "https://c.example" }];
+  const { out, act, state: s } = await runWeb(state, items);
+  const add = out.results.find((r) => r.fieldName === "website.add");
+  assert.strictEqual(add.status, "needs_review");
+  assert.match(add.detail, /added 0 entry\(ies\); 1\/3/);
+  assert.strictEqual(act.log.filter(([m]) => m === "clickSectionAdd").length, 1); // bounded — no spin
+  assert.strictEqual(s.entries.length, 1);
+});
+
+test("repeating DOWN: delete that doesn't drop the count stops bounded", async () => {
+  const state = webState({ noDrop: true, entries: [
+    webEntry("webAddress-1--null"), webEntry("webAddress-2--null"), webEntry("webAddress-3--null")
+  ] });
+  const { out, act, state: s } = await runWeb(state, [{ url: "https://a.example" }]);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "website.delete").status, "needs_review");
+  assert.strictEqual(act.log.filter(([m]) => m === "clickDeleteEntry").length, 1); // bounded — no spin
+  assert.strictEqual(s.entries.length, 3);
 });

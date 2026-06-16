@@ -139,7 +139,11 @@ const DEFAULT_BUDGETS = {
   taActionSettleMs: 400,   // after clear / after typing, before Enter
   taSettleCeilingMs: 25000, // filter-Enter → fresh transition (banner/chip/filtered)
   taSettleIntervalMs: 400,
-  taEnterCommitCeilingMs: 5000 // commit-Enter → chip, before the click fallback takes over
+  taEnterCommitCeilingMs: 5000, // commit-Enter → chip, before the click fallback takes over
+  // M32 repeating-section reconcile poll (Add/Delete → entry count moves). In-tree
+  // budget is 4s/150ms; the page mounts the new/removed entry on its throttled loop.
+  entryReconcileCeilingMs: 4000,
+  entryReconcileIntervalMs: 150
 };
 
 // ── Verbatim M22 ports (background.js fillEngine — change in lockstep) ──────
@@ -987,8 +991,201 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
   return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning };
 }
 
+// ============================================================================
+// M32 — repeating-section fill on the CDP substrate.
+//
+// Port of background.js fillRepeatingSection (~3447) + fillMappedEntry (~3605).
+// Substrate-agnostic (talks ONLY to `act`): reconciles the live entry count to
+// items.length (Add up via clickSectionAdd / Delete trailing extras down via
+// clickDeleteEntry, count-polled off-loop), then fills each entry's mapped fields
+// through the EXISTING per-widget CDP handlers with ENTRY-SCOPED composed selectors
+// (act.repeatingScan emits fd.wrapperSel = `[data-fkit-id="…"] [data-automation-id=
+// "formField-…"]` — the duplicate-formField-id rule).
+//
+// DATE/YEAR fields are DEFERRED — recorded skipped + flag "cdp-date-deferred",
+// NEVER actuated. M32 recon (Magna wd3, hidden) proved CDP cannot drive the date
+// spinbutton segments (insertText / per-char / arrow all failed read-back). This is
+// the explicit blocker handling, not a silent skip; re-probe on future Chrome revs.
+//
+// Returns the same envelope drivePageFill returns, so the harness report code is
+// shared. Proven on Websites (date-free, one url text field/entry); the other
+// sections (Languages/Education/Certs/WE) reuse this driver in later rounds.
+//
+// TODO(dup): WEBSITE_MAP mirrors background.js WEBSITE_MAP (~3571). The other maps
+// (EDUCATION/LANGUAGE/CERTIFICATION) are NOT ported yet — they need the deferred
+// date path and, for Languages, the labelRegex resolve below (wired, unproven on
+// CDP). Change in lockstep with the in-tree maps when ported.
+// ============================================================================
+const WEBSITE_MAP = [{ field: "url", widget: "text", key: "url", path: "url" }];
+
+// Fill one entry's mapped fields. Re-reads act.repeatingScan() FRESH per field — a
+// commit can re-render the entry subtree and orphan a held descriptor (the recon's
+// core warning). Resolves the field by automation-id (`f.field`) OR by label
+// (`f.labelRegex`, for hashed ids — Languages). Records use the SAME shape as
+// drivePageFill so the report/table code is shared.
+async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets) {
+  const recs = [];
+  const base = sectionName + "[" + idx + "].";
+  for (const f of fieldMap) {
+    const scan = await act.repeatingScan();
+    const sec = scan && scan.sections ? scan.sections[prefix] : null;
+    const entry = sec && sec.entries ? sec.entries[idx] : null;
+    const recName = f.name || f.field;
+    const fd = entry ? (f.labelRegex
+      ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
+      : entry.fields.find((x) => x.fieldName === f.field)) : null;
+    const rec = {
+      fieldName: base + recName, label: fd ? fd.label : null,
+      widgetType: f.widget === "year" ? "date" : f.widget,
+      isRequired: fd ? !!fd.isRequired : false, mappedPath: base + f.path,
+      rawValue: item[f.key] === undefined ? null : item[f.key], resolved: null,
+      status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null
+    };
+    if (!fd) {
+      rec.status = "error"; rec.detail = "field wrapper not found in entry";
+      recs.push(rec); await act.delay(budgets.interFieldMs); continue;
+    }
+    const loc = { wrapperSel: fd.wrapperSel };
+    try {
+      if (f.widget === "year" || f.widget === "date") {
+        // DEFERRED — CDP can't actuate date spinbuttons (M32 recon). ZERO actuation.
+        rec.status = "skipped";
+        rec.flag = "cdp-date-deferred";
+        rec.detail = "CDP date unactuatable (spinbutton segments rejected insertText/per-char/arrow in M32 recon) — deferred";
+      } else if (f.widget === "checkbox") {
+        rec.resolved = item[f.key] === true;
+        Object.assign(rec, await fillCheckboxCdp(act, loc, item[f.key] === true, budgets));
+      } else {
+        const r = resolve(item[f.key], f.widget);
+        if (r.skip) {
+          rec.status = "skipped";
+          rec.detail = r.reason || ("empty value at " + base + f.path);
+        } else {
+          const arg = r.value !== undefined ? r.value : r.candidates;
+          rec.resolved = arg;
+          if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
+          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
+          else if (f.widget === "typeahead") Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets));
+          else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
+          else { rec.status = "skipped"; rec.detail = "no handler for widget " + f.widget; }
+        }
+      }
+    } catch (e) {
+      rec.status = "error"; rec.detail = String(e);
+    }
+    recs.push(rec);
+    await act.delay(budgets.interFieldMs);
+  }
+  return recs;
+}
+
+async function driveRepeatingSectionCdp(act, section, budgetsIn) {
+  const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
+  const { name, headingRegex, containerPrefix, items, fieldMap, deleteOnNoMatch } = section;
+  const N = Array.isArray(items) ? items.length : 0;
+  const results = [];
+
+  const sectionRec = (suffix, label, status, detail) => ({
+    fieldName: name + suffix, label, widgetType: "section", isRequired: false,
+    mappedPath: null, rawValue: null, resolved: null, status, matchTier: null,
+    confidence: null, flag: null, verified: null, after: null, detail
+  });
+
+  // Poll the entry count off-loop until it moves in the wanted direction or a
+  // ceiling (port of the in-tree 4s/150ms reconcile poll; SW-paced via act.delay).
+  const pollCount = async (before, rose) => {
+    const deadline = Date.now() + budgets.entryReconcileCeilingMs;
+    let count = await act.entryCount(containerPrefix);
+    while ((rose ? count <= before : count >= before) && Date.now() < deadline) {
+      await act.delay(budgets.entryReconcileIntervalMs);
+      count = await act.entryCount(containerPrefix);
+    }
+    return count;
+  };
+
+  const finalize = (url) => {
+    const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
+    const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
+    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section").length;
+    return { url, repeatingFieldCount, results, counts, needsReview };
+  };
+
+  const initial = await act.repeatingScan();
+  const url = initial ? initial.url : null;
+  let count = await act.entryCount(containerPrefix);
+
+  // reconcile UP — Add to reach N (create-first OR "Add Another").
+  if (count < N) {
+    let adds = 0;
+    while (count < N && adds < N) {
+      const before = count;
+      const clicked = await act.clickSectionAdd(headingRegex);
+      if (!clicked || !clicked.ok) break;
+      count = await pollCount(before, true);
+      if (count <= before) break; // mount didn't register — don't spin
+      adds++;
+      await act.delay(budgets.interFieldMs);
+    }
+    results.push(sectionRec(".add", name + " — Add entries",
+      count >= N ? "filled" : "needs_review",
+      "added " + adds + " entry(ies); " + count + "/" + N + " present"));
+  }
+
+  // reconcile DOWN — delete trailing extras beyond N (also cleans up when N===0).
+  if (count > N) {
+    let deleted = 0;
+    while (count > N && deleted < 10) {
+      const before = count;
+      const clicked = await act.clickDeleteEntry(containerPrefix, count - 1);
+      if (!clicked || !clicked.ok) break;
+      count = await pollCount(before, false);
+      if (count >= before) break; // didn't drop — don't spin
+      deleted++;
+      await act.delay(budgets.interFieldMs);
+    }
+    results.push(sectionRec(".delete", name + " — delete extras",
+      count <= N ? "filled" : "needs_review",
+      "deleted " + deleted + " extra(s); " + count + "/" + N + " entries"));
+  }
+
+  if (N === 0) {
+    results.push(sectionRec("", name, "skipped", "no meaningful " + name + " entries to fill"));
+    return finalize(url);
+  }
+
+  // Fill each entry; track whether all its REQUIRED fields filled (delete-on-no-match).
+  const fillCount = Math.min(N, await act.entryCount(containerPrefix));
+  const perEntry = [];
+  for (let i = 0; i < fillCount; i++) {
+    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets);
+    const ok = entryRecs.every((r) => !r.isRequired || r.status === "filled");
+    perEntry.push({ idx: i, recs: entryRecs, ok });
+  }
+
+  // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose
+  // REQUIRED pick didn't match would block Next, so delete it. Sweep high→low so
+  // lower indices stay valid. OFF for Websites (text always fills if present).
+  if (deleteOnNoMatch) {
+    for (let k = perEntry.length - 1; k >= 0; k--) {
+      if (perEntry[k].ok) continue;
+      const before = await act.entryCount(containerPrefix);
+      const clicked = await act.clickDeleteEntry(containerPrefix, perEntry[k].idx);
+      if (!clicked || !clicked.ok) continue; // can't delete — leave it (surfaces in review)
+      const after = await pollCount(before, false);
+      if (after < before) {
+        perEntry[k].recs = [sectionRec("[" + perEntry[k].idx + "].removed", name + " entry removed",
+          "skipped", "a required pick didn't match an option → entry deleted (optional section)")];
+      }
+      await act.delay(budgets.interFieldMs);
+    }
+  }
+
+  for (const e of perEntry) results.push(...e.recs);
+  return finalize(url);
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

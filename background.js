@@ -131,6 +131,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP FILL WEBSITES (M32b): the FIRST repeating-section fill on the CDP path —
+  // reconcile the Websites section to N + fill each entry's url (date-free) while
+  // HIDDEN. Proves driveRepeatingSectionCdp; dates are deferred (Websites has none).
+  // Run on My Experience (page 2). Results land as [CDP-WEB] in the SW console.
+  if (message.type === "RUN_CDP_FILL_WEBSITES") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-WEB] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillWebsites(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // SOURCE FILL (backlog C — Phase B): fill the source picker via fillSourceCdp
   // (typeahead-style: type → filter → auto-commit/click leaf) HIDDEN, candidates
   // from defaults.how_did_you_hear (preferred LinkedIn). Selects LinkedIn + reads
@@ -2267,6 +2288,57 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("CDP fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP FILL WEBSITES (M32b) — the FIRST repeating-section fill on the CDP path.
+// Prove driveRepeatingSectionCdp on the date-free Websites section (one url text
+// field per entry): attach → hidden-gate → reconcile to N + fill each entry's url →
+// NEEDS-REVIEW-first report → detach in finally. Dates are deferred (recon: CDP
+// can't actuate spinbuttons); Websites has none. Other sections follow in later
+// rounds reusing the same driver. Standalone — RUN_FILL/RUN_CDP_FILL untouched.
+// ============================================================================
+async function runCdpFillWebsites(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-WEB]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    const prepared = prepareProfile(profile);
+    const items = Array.isArray(prepared.websites) ? prepared.websites : [];
+    LOG(`tab is hidden — websites fill starting. ${items.length} meaningful website(s). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+
+    const act = makeCdpActuation();
+    const out = await driveRepeatingSectionCdp(act, {
+      name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+      items, fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+    }, DEFAULT_BUDGETS);
+
+    LOG("page:", out.url);
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
+      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+    }
+    console.table(out.results.map((r) => ({
+      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+      verified: r.verified, flag: r.flag, detail: r.detail
+    })));
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("websites fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

@@ -828,3 +828,43 @@ For future-AI page-debugging: the nav-timeout and session-expired stops now log 
 left EMPTY because the profile/JSON has no value (`results` with `status:"skipped"` + their detail — e.g.
 "empty value at personal_info.first_name") — the likely cause of a "required" validation error. Returned
 as `page_errors` / `error_page_text` / `empty_fields` on the walk result too.
+
+## 2026-06-16 — Magna wd3, HIDDEN tab: repeating-section fill on CDP (M32 — Websites proven, dates BLOCKED)
+
+Page 2 ("My Experience") repeating-section recon (`RUN_CDP_REPEAT_RECON` → `cdpRepeatingScan`) + the
+Websites fill port (`driveRepeatingSectionCdp`). Sections seen live: workExperience- (3), education- (2),
+webAddress- (3), language- (3), certification- (2).
+
+### ⛔ Date spinbuttons are UNACTUATABLE on CDP — HARD BLOCKER
+The recon probed the first date segment (`dateSection*-input`, `role="spinbutton"`) with all THREE CDP input
+channels — `Input.insertText`, per-char `cdpTypeChars` (keyDown-with-text), and arrow-key increment
+(`cdpKeyTap` ArrowUp) — and **all three failed read-back**: the segment never held the value (`anyMethodStuck:
+false`). ⇒ Work Experience From/To, Education first/last-year, and Certification Issued/Expiration dates
+**cannot be filled via CDP**. The CDP brain DEFERS them (`status:"skipped"`, `flag:"cdp-date-deferred"`,
+detail "CDP date unactuatable …") — NEVER a silent or false fill. Re-probe if a future Chrome/CDP rev changes
+spinbutton handling. (The page-injected `fillDateComposite` still works on the page substrate; this is a
+CDP-substrate limit only.)
+
+### Websites = the date-free machinery proof
+One `formField-url` text field per entry, no dates, no hashed ids, no dropdowns — the clean first section to
+prove the reconcile-to-N + per-entry-fill machinery. Other sections reuse `driveRepeatingSectionCdp` later.
+
+### Load-bearing mechanics (ported into the CDP substrate)
+- **Entry enumeration = the `--null` containers ONLY:** `[data-fkit-id^="<prefix>"][data-fkit-id$="--null"]`.
+  The bare prefix over-matches the date sub-wrappers (`workExperience-N--startDate`/`--endDate`) — the trap.
+- **Duplicate `formField-*` ids across entries** → every field access MUST be entry-scoped via the composed
+  selector `[data-fkit-id="<fkit>"] [data-automation-id="formField-<name>"]` (emitted by `cdpRepeatingScan`).
+  The CDP handlers are selector-agnostic (`loc={wrapperSel}`), so they work per-entry unchanged.
+- **Add/Delete are COORDINATE clicks** (`clickSectionAdd`/`clickDeleteEntry`): the scan's `addButtons[].rect` /
+  `deleteRect` are PAGE coords (huge) — unusable for `cdpClickAt`. The substrate page-fn does
+  `scrollIntoView({behavior:"instant"})` **inside the eval** (rAF/"smooth" is frozen hidden) + a fresh
+  `getBoundingClientRect` viewport rect + M29-style 0-rect retry (`cdpEvalRectReady`), THEN `cdpClickAt`.
+- **Add disambiguation by nearest-heading regex** (no `adds.length===1` fallback — 5 Add buttons coexist):
+  `/websites?|web ?address/i` matches EXACTLY one of the recon's `nearestHeading`s ("Work Experience 3",
+  "Education 2", "Specialties"×2, "Certifications 2", "Languages 3", "Websites 3") → only "Websites 3".
+- **Count-poll reconcile:** after each Add/Delete, poll `entryCount(prefix)` SW-side (4000ms/150ms) until the
+  count rises/drops; if it doesn't move → STOP (don't spin). Re-scan fresh per field (held descriptors orphan
+  on re-render).
+- **Languages labelRegex gap (later):** hashed proficiency-dropdown ids resolve by `label` (`cdpRepeatingScan`
+  emits it), not automation-id — the labelRegex resolve path is wired in `fillEntryCdp` but UNPROVEN on CDP
+  until the Languages round.

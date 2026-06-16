@@ -297,6 +297,25 @@ document.getElementById("cdp-repeat-recon").addEventListener("click", () => {
   });
 });
 
+// WEBSITES FILL (M32b): the first repeating-section fill on the CDP path —
+// reconcile to N + fill each entry's url (date-free Websites). Run on My
+// Experience (page 2); minimize within 60s. Results land as [CDP-WEB] in the SW console.
+document.getElementById("cdp-fill-websites").addEventListener("click", () => {
+  setStatus("CDP websites fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-WEB] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_WEBSITES" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Websites fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Websites fill done — counts: ${JSON.stringify(resp.counts)}, needs review: ${resp.needs_review}. See [CDP-WEB].`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

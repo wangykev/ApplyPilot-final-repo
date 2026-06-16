@@ -378,6 +378,65 @@ function cdpRepeatingScan() {
   return { url: location.href, sectionsPresent: Object.keys(sections), sections, addButtons };
 }
 
+// ── M32 repeating-section actuation page fns (self-contained, cdpEval'd) ──────
+// Count a section's entries — the `--null` containers ONLY (the bare prefix
+// over-matches the date sub-wrappers, e.g. workExperience-N--startDate). The
+// cheap reconcile-poll primitive (lighter than a full cdpRepeatingScan).
+function cdpEntryCount(prefix) {
+  return document.querySelectorAll('[data-fkit-id^="' + prefix + '"][data-fkit-id$="--null"]').length;
+}
+
+// Find a section's Add/"Add Another" button by its nearest-heading regex, scroll it
+// into view (instant — rAF/"smooth" is frozen hidden), return a fresh VIEWPORT rect
+// for cdpClickAt. Port of background.js findSectionAdd, matched against the SAME
+// nearestHeading the recon's addButtons[] used (verified 2026-06-16:
+// /websites?|web ?address/i hits ONLY "Websites 3" among the 5 page-2 sections).
+// NO adds.length===1 fallback — REQUIRE a heading match (5 Add buttons coexist).
+function cdpSectionAddRect(regexSource) {
+  const re = new RegExp(regexSource, "i");
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  const btn = Array.from(document.querySelectorAll('[data-automation-id="add-button"]')).find((b) => re.test(nearestHeading(b) || ""));
+  if (!btn) return null;
+  if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = btn.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
+// Find the index-th `--null` entry's Delete button (climb ≤6 ancestors to a
+// <button>Delete</button> — port of background.js deleteEntryButton), scroll into
+// view, return a fresh VIEWPORT rect.
+function cdpDeleteEntryRect(prefix, index) {
+  const entries = Array.from(document.querySelectorAll('[data-fkit-id^="' + prefix + '"][data-fkit-id$="--null"]'));
+  const e = entries[index];
+  if (!e) return null;
+  let p = e, btn = null;
+  for (let i = 0; i < 6 && p; i++) {
+    p = p.parentElement;
+    if (!p) break;
+    const b = Array.from(p.querySelectorAll("button")).find((x) => /^delete$/i.test((x.textContent || "").trim()));
+    if (b) { btn = b; break; }
+  }
+  if (!btn) return null;
+  if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = btn.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
 // M30 session-expiry recon read: a READ-ONLY static snapshot to classify whether
 // the page is a live apply form vs a logged-out / expired / error state. No clicks.
 // Run once on a VALID form and once LOGGED-OUT/stale to find the discriminator.
@@ -456,6 +515,19 @@ async function cdpRectReady(sel, scroll) {
   if (polls > 0) {
     const ok = rect && rect.w > 0;
     console.log("[ApplyPilot][CDP] rectReady", JSON.stringify(sel), ok ? `RECOVERED after ${Date.now() - start}ms / ${polls} polls` : `gave up after ${Date.now() - start}ms / ${polls} polls`);
+  }
+  return rect && rect.w > 0 ? rect : null;
+}
+
+// M29-style retry for a rect produced by an EVAL FN that scrolls-then-measures
+// (Add/Delete buttons have no stable selector, so cdpRectReady's selector form
+// can't be reused). Re-evals until a non-zero viewport box or the same ceiling.
+async function cdpEvalRectReady(fn, ...args) {
+  const deadline = Date.now() + RECT_READY_CEILING_MS;
+  let rect = await cdpEval(fn, ...args);
+  while ((!rect || rect.w <= 0) && Date.now() < deadline) {
+    await cdpDelay(RECT_READY_INTERVAL_MS);
+    rect = await cdpEval(fn, ...args);
   }
   return rect && rect.w > 0 ? rect : null;
 }
@@ -1065,6 +1137,28 @@ function makeCdpActuation() {
       if (!rect) return { clicked: false, refused: "no-button" };
       await cdpClickAt(rect.cx, rect.cy);
       return { clicked: true };
+    },
+
+    // ── repeating sections (M32) ──
+    // Substrate for driveRepeatingSectionCdp. The brain stays substrate-agnostic:
+    // these return data / {ok}, never rects, so the test fake just flips counts.
+    repeatingScan: () => cdpEval(cdpRepeatingScan),
+    entryCount: (prefix) => cdpEval(cdpEntryCount, prefix),
+    // Click a section's Add button (headingRegexSource is a STRING — RegExp can't
+    // cross the eval boundary). scrollIntoView + viewport rect + M29 retry, then click.
+    clickSectionAdd: async (headingRegexSource) => {
+      const rect = await cdpEvalRectReady(cdpSectionAddRect, headingRegexSource);
+      if (!rect) return { ok: false };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { ok: true };
+    },
+    // Click the index-th entry's Delete button (trailing entry for reconcile-down;
+    // any index for delete-on-no-match). Same scroll + viewport-rect + retry mechanics.
+    clickDeleteEntry: async (prefix, index) => {
+      const rect = await cdpEvalRectReady(cdpDeleteEntryRect, prefix, index);
+      if (!rect) return { ok: false };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { ok: true };
     }
   };
 }
