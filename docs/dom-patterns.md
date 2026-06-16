@@ -835,15 +835,29 @@ Page 2 ("My Experience") repeating-section recon (`RUN_CDP_REPEAT_RECON` → `cd
 Websites fill port (`driveRepeatingSectionCdp`). Sections seen live: workExperience- (3), education- (2),
 webAddress- (3), language- (3), certification- (2).
 
-### ⛔ Date spinbuttons are UNACTUATABLE on CDP — HARD BLOCKER
-The recon probed the first date segment (`dateSection*-input`, `role="spinbutton"`) with all THREE CDP input
-channels — `Input.insertText`, per-char `cdpTypeChars` (keyDown-with-text), and arrow-key increment
-(`cdpKeyTap` ArrowUp) — and **all three failed read-back**: the segment never held the value (`anyMethodStuck:
-false`). ⇒ Work Experience From/To, Education first/last-year, and Certification Issued/Expiration dates
-**cannot be filled via CDP**. The CDP brain DEFERS them (`status:"skipped"`, `flag:"cdp-date-deferred"`,
-detail "CDP date unactuatable …") — NEVER a silent or false fill. Re-probe if a future Chrome/CDP rev changes
-spinbutton handling. (The page-injected `fillDateComposite` still works on the page substrate; this is a
-CDP-substrate limit only.)
+### Date spinbuttons ARE actuatable on CDP — the M32 "blocker" was a PROBE ARTIFACT (M33, 2026-06-16)
+The first M32 probe reported dates "unactuatable" — but it (1) targeted `dateSection*-**display**`
+(`dateSegments[0]` — a read-only span with no `.value`) and (2) read `el.value` off that span (always
+`undefined`), so the read-back compared `undefined === "12"` → false for every method REGARDLESS of whether
+keystrokes landed. **Two compounding artifacts, not a real limit.**
+
+The M33 corrected probe (Magna wd3 page 2, hidden) settled it:
+- The date `-input` (`role="spinbutton"`) is **0-box** (zero-width masked input — the visible UI is the
+  sibling `dateSection*-display` span). So `cdpClickAt` CANNOT coordinate-click it (`cdpRectReady` gives up —
+  the iter-1 `no-rect` result). That, plus the wrong read-back element, was the whole "blocker."
+- **The working recipe (proven by read-back):** **TRIPLE-CLICK the visible `-display` rect to focus the
+  0-box `-input`** (`focusMethod:"triple-click-display"`), then type the digits. Once focused, **BOTH
+  per-char `cdpTypeChars` AND `Input.insertText` make `-input.value` stick** (read-back "12"). The month
+  spinbutton **auto-advances to year** after 2 digits (typed "2024" → stuck). Restore clean.
+- Rect-free focus fallbacks (`cdpFocusBySel` = page `el.focus()`, `cdpDomFocus` = CDP DOM.focus) exist for
+  segments where triple-click-display doesn't land (e.g. a standalone year — UNVERIFIED until M34).
+⇒ Work Experience From/To, Education years, and Certification dates ARE fillable on CDP. M34 builds
+`fillDateCompositeCdp` (focus EACH segment explicitly — robust vs auto-advance timing; per-char primary +
+insertText fallback, each read-back-verified). The M32b `cdp-date-deferred` skip stays until M34's handler is
+proven + M35 wires it into the date-bearing sections.
+
+**Recon-tool lesson (carried forward):** target the EDITABLE `-input` for read-back and never gate actuation
+on a masked input's own rect — focus via the visible sibling (triple-click) or a rect-free `focus()`.
 
 ### Websites = the date-free machinery proof
 One `formField-url` text field per entry, no dates, no hashed ids, no dropdowns — the clean first section to

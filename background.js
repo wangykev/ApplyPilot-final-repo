@@ -2077,77 +2077,113 @@ async function runCdpRepeatRecon(tabId) {
       LOG("date probe SKIPPED — no date field on this page. (The composite is only needed by date-bearing sections; if the first section is date-free, it waits regardless.)");
     } else {
       probe.attempted = true;
-      const seg = dateField.field.dateSegments[0];
+      // M33: target the EDITABLE spinbutton input, NOT the read-only -display span.
+      // The original probe used dateSegments[0] = "dateSection*-display" (a span with
+      // no .value), so readVal compared undefined==="12" and false-negatived EVERY
+      // method regardless of whether the keystrokes actually landed. fillDateComposite
+      // fills the -input; a human can type it — so re-probe the real input.
+      const seg = dateField.field.dateSegments.find((s) => /-input$/.test(s)) || dateField.field.dateSegments[0];
       const segSel = dateField.field.wrapperSel + ' [data-automation-id="' + seg + '"]';
       probe.target = { section: dateField.prefix, entry: dateField.entryFkitId, field: dateField.field.fieldName, segment: seg, segSel };
       LOG("date probe target:", JSON.stringify(probe.target));
       const orig = await readVal(segSel);
       probe.originalValue = orig ? orig.value : null;
+      probe.segmentRole = orig ? orig.role : null; // expect "spinbutton" — confirms we hit the -input, not a -display span
+      LOG("date probe segment element:", JSON.stringify({ segment: seg, role: probe.segmentRole, originalValue: probe.originalValue }));
       const want = "12";
-
-      const rect = await cdpRectReady(segSel, true);
-      probe.rectLive = !!rect;
-      if (!rect) {
-        LOG("date probe: segment rect DEAD (0-box) even after retry — cannot actuate this segment.");
-        probe.insertText = { skipped: "no-rect" };
-      } else {
-        // method (a): cdp-click focus → trusted clear → insertText
-        await cdpClickAt(rect.cx, rect.cy);
-        await cdpDelay(250);
-        const af = await readVal(segSel);
-        probe.focusedAfterClick = !!(af && af.focused);
-        await cdpSelectAllDelete();
+      // M33 iter-2: the masked -input is 0-box (coordinate-click impossible — iter-1 proved
+      // its rect is dead). Per Claude-in-Chrome's live recipe: focus the VISIBLE -display via
+      // a TRIPLE-CLICK, then PER-CHAR type the digits (insertText/value-set no-ops on these
+      // spinbuttons). Read-back stays the -input.value (parseInt). Decouple focus from input.
+      const displaySel = dateField.field.wrapperSel + ' [data-automation-id="' + seg.replace("-input", "-display") + '"]';
+      const yearInputSel = dateField.field.wrapperSel + ' [data-automation-id="dateSectionYear-input"]';
+      const tripleClickAt = async (x, y) => {
+        const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
+        await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" });
+        for (let i = 1; i <= 3; i++) {
+          await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i });
+          await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i });
+        }
+      };
+      const refocus = async (method, dispRect) => {
+        if (method === "triple-click-display" && dispRect) await tripleClickAt(dispRect.cx, dispRect.cy);
+        else if (method === "el.focus()") await cdpEval(cdpFocusBySel, segSel);
+        else { try { await cdpDomFocus(segSel); } catch (e) { /* not found */ } }
         await cdpDelay(150);
-        await cdpInsertText(want);
-        await cdpDelay(300);
+      };
+
+      // ── focus ladder: visible-display triple-click → rect-free fallbacks ──
+      let focusMethod = null;
+      const dispRect = await cdpRectReady(displaySel, true); // the VISIBLE element has a rect
+      probe.displayRectLive = !!dispRect;
+      if (dispRect) {
+        await tripleClickAt(dispRect.cx, dispRect.cy);
+        await cdpDelay(250);
+        const f = await readVal(segSel);
+        if (f && f.focused) focusMethod = "triple-click-display";
+      }
+      if (!focusMethod) { // rect-free: page el.focus() on the -input
+        if (await cdpEval(cdpFocusBySel, segSel)) { await cdpDelay(150); const f = await readVal(segSel); if (f && f.focused) focusMethod = "el.focus()"; }
+      }
+      if (!focusMethod) { // rect-free: CDP DOM.focus on the -input
+        try { await cdpDomFocus(segSel); await cdpDelay(150); const f = await readVal(segSel); if (f && f.focused) focusMethod = "DOM.focus"; } catch (e) { /* not found */ }
+      }
+      probe.focusMethod = focusMethod;
+      LOG("date probe focus:", JSON.stringify({ focusMethod: focusMethod || "NONE", displayRectLive: probe.displayRectLive }));
+
+      if (!focusMethod) {
+        probe.insertText = { skipped: "no-focus" };
+        probe.typeChars = { skipped: "no-focus" };
+        LOG("date probe: could NOT focus the segment input by any method (triple-click-display / el.focus / DOM.focus).");
+      } else {
+        // (a) CONTRAST: insertText / value-set — expected NOT to stick on these spinbuttons.
+        await cdpSelectAllDelete(); await cdpDelay(150);
+        await cdpInsertText(want); await cdpDelay(300);
         const a = await readVal(segSel);
-        probe.insertText = { read: a ? a.value : null, stuck: !!(a && a.value === want) };
-        LOG("date probe (a) insertText:", JSON.stringify(probe.insertText));
+        probe.insertText = { read: a ? a.value : null, stuck: !!(a && parseInt(a.value, 10) === parseInt(want, 10)) };
+        LOG("date probe (a) insertText [expected: does NOT stick]:", JSON.stringify(probe.insertText));
 
-        // method (b): per-char trusted keystrokes
-        if (!probe.insertText.stuck) {
-          await cdpClickAt(rect.cx, rect.cy); await cdpDelay(150);
-          await cdpSelectAllDelete(); await cdpDelay(150);
-          await cdpTypeChars(want, 80); await cdpDelay(300);
-          const b = await readVal(segSel);
-          probe.typeChars = { read: b ? b.value : null, stuck: !!(b && b.value === want) };
-          LOG("date probe (b) typeChars:", JSON.stringify(probe.typeChars));
+        // (b) THE recipe — per-char trusted keystrokes (re-assert focus first; (a) may have shifted it).
+        await refocus(focusMethod, dispRect);
+        await cdpSelectAllDelete(); await cdpDelay(150);
+        await cdpTypeChars(want, 80); await cdpDelay(300);
+        const b = await readVal(segSel);
+        probe.typeChars = { read: b ? b.value : null, stuck: !!(b && parseInt(b.value, 10) === parseInt(want, 10)) };
+        LOG("date probe (b) typeChars [THE recipe]:", JSON.stringify(probe.typeChars));
 
-          // method (c): arrow keys (spinbutton increment) — success = value became non-empty
-          if (!probe.typeChars.stuck) {
-            await cdpClickAt(rect.cx, rect.cy); await cdpDelay(150);
-            await cdpSelectAllDelete(); await cdpDelay(150);
-            await cdpKeyTap(CDP_KEYS.arrowUp); await cdpDelay(200);
-            await cdpKeyTap(CDP_KEYS.arrowUp); await cdpDelay(200);
-            const c = await readVal(segSel);
-            probe.arrowKeys = { read: c ? c.value : null, stuck: !!(c && c.value && String(c.value).trim() !== "") };
-            LOG("date probe (c) arrowKeys:", JSON.stringify(probe.arrowKeys));
-          }
+        // auto-advance GATE (not just a logged field): after the 2 month digits, is the YEAR
+        // -input focused? Auto-advance is a page reaction on the throttled loop — may lag/no-op
+        // hidden. If it fired, type the year too (exercise the full M/Y path). If not, M34 must
+        // focus the year segment EXPLICITLY between digits rather than rely on advance.
+        const yf = await readVal(yearInputSel);
+        probe.autoAdvancedToYear = !!(yf && yf.focused);
+        LOG("date probe auto-advance:", JSON.stringify({ autoAdvancedToYear: probe.autoAdvancedToYear }));
+        if (probe.autoAdvancedToYear) {
+          await cdpTypeChars("2024", 80); await cdpDelay(300);
+          const yr = await readVal(yearInputSel);
+          probe.year = { read: yr ? yr.value : null, stuck: !!(yr && parseInt(yr.value, 10) === 2024) };
+          LOG("date probe year (auto-advanced):", JSON.stringify(probe.year));
         }
       }
-      probe.anyMethodStuck = !!((probe.insertText && probe.insertText.stuck) || (probe.typeChars && probe.typeChars.stuck) || (probe.arrowKeys && probe.arrowKeys.stuck));
 
-      // STOP-and-surface (sharpening 1) — a total failure is a recorded known-blocker.
+      probe.anyMethodStuck = !!((probe.insertText && probe.insertText.stuck) || (probe.typeChars && probe.typeChars.stuck));
+
+      // STOP-and-surface — a total failure stays a recorded known-blocker; a per-char success lifts it.
       if (!probe.anyMethodStuck) {
-        LOG("⛔ DATE PROBE FAILED — NO CDP method made the segment stick (insertText / typeChars / arrows all failed read-back).");
-        LOG("⛔ KNOWN-BLOCKER: dates appear UNACTUATABLE on CDP → blocks Education / Certifications / Work-Experience / Languages date fields. The date composite must be DEFERRED (date-free section only this round), NOT papered over. Record this in dom-patterns.");
+        LOG("⛔ DATE PROBE FAILED — focus", JSON.stringify(probe.focusMethod || "NONE"), "but NO input method made -input.value stick (insertText + per-char both failed read-back). Dates stay DEFERRED on CDP — record the focus/input trace in dom-patterns.");
       } else {
-        const winner = probe.insertText && probe.insertText.stuck ? "insertText"
-          : probe.typeChars && probe.typeChars.stuck ? "typeChars" : "arrowKeys";
-        LOG("✅ date probe: a working CDP method EXISTS →", winner, "(read-back verified). The CDP date composite can use it.");
+        const winner = probe.typeChars && probe.typeChars.stuck ? "typeChars (per-char)" : "insertText";
+        LOG("✅ date probe: CDP CAN fill the segment — focus via", JSON.stringify(probe.focusMethod), "+ input via", winner, "(read-back verified). M34 can build the composite.");
       }
 
-      // restore-where-possible (one segment, throwaway app)
+      // restore-where-possible (re-type the original month, best-effort — per-char, since insertText no-ops)
       probe.restored = false;
       try {
-        const r2 = await cdpRectReady(segSel, true);
-        if (r2) {
-          await cdpClickAt(r2.cx, r2.cy); await cdpDelay(120);
-          await cdpSelectAllDelete(); await cdpDelay(120);
-          if (probe.originalValue) { await cdpInsertText(probe.originalValue); await cdpDelay(150); }
-          const rr = await readVal(segSel);
-          probe.restored = !!(rr && rr.value === (probe.originalValue || ""));
-        }
+        await refocus(focusMethod, dispRect);
+        await cdpSelectAllDelete(); await cdpDelay(120);
+        if (probe.originalValue) { await cdpTypeChars(String(probe.originalValue), 80); await cdpDelay(150); }
+        const rr = await readVal(segSel);
+        probe.restored = !!(rr && parseInt(rr.value, 10) === parseInt(probe.originalValue || "", 10));
       } catch (e) { /* best-effort */ }
       LOG("date probe restore:", probe.restored ? "restored to original" : "left modified (throwaway app — re-fill or discard the entry).");
     }
@@ -2161,7 +2197,7 @@ async function runCdpRepeatRecon(tabId) {
       addButtonCount: scan.addButtons.length,
       websitesPresent: !!scan.sections["webAddress-"],
       dateProbe: probe.attempted
-        ? { attempted: true, anyMethodStuck: probe.anyMethodStuck, methods: { insertText: probe.insertText, typeChars: probe.typeChars, arrowKeys: probe.arrowKeys } }
+        ? { attempted: true, focusMethod: probe.focusMethod || null, anyMethodStuck: probe.anyMethodStuck, autoAdvancedToYear: probe.autoAdvancedToYear || false, methods: { insertText: probe.insertText, typeChars: probe.typeChars }, year: probe.year || null }
         : { attempted: false, reason: "no date field on this page" }
     }, null, 2));
     return { ok: true, scan, probe };
