@@ -145,8 +145,25 @@ function matchCandidates(candidates, optionTexts) {
   return { targetIndex: -1, matchTier: null, matchedCandidate: null };
 }
 
+// M31: classify a cdpReadSessionState snapshot as a likely-DEAD/expired Workday
+// session. CONSERVATIVE — a valid form (INCLUDING one showing ordinary VALIDATION
+// errors) is NEVER dead; a false positive would send a fine user to re-auth and lose
+// page state. Recon (Magna, 2026-06-15) proved `vpsErrorPresent` (the "Error Code:
+// VPS|" banner that appears on Save & Continue) is FALSE on a live validation error
+// and TRUE on a dead session — the clean discriminator. Deliberately does NOT key off
+// errorPageText / errorMarkers (a validation error sets those). One-tenant/one-pair
+// proof — re-check if another tenant's validation ever carries a VPS-like code.
+function sessionLooksDead(state) {
+  if (!state) return false;
+  if (state.vpsErrorPresent) return true;                                              // VPS| code (post-Save&Continue)
+  if (state.sessionBanner) return true;                                                // explicit "session expired" text
+  if (state.passwordInputPresent || state.signInButtonPresent || state.authUrl) return true; // login/redirect
+  if ((state.formFieldCount || 0) === 0 && !state.applyFlowPagePresent) return true;   // no form at all (hard redirect/blank)
+  return false;
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates };
+  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead };
 }

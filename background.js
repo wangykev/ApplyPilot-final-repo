@@ -169,6 +169,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP WALK (M31): fill page 1 → guarded Save & Continue → detect VPS/session-death
+  // (halt) or a clean transition (report "advanced", stop — page-2 fill deferred).
+  if (message.type === "RUN_CDP_WALK") {
+    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-WALK] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpWalk(tab.id, profile, defaults || {}, jobContext || {});
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // RUN_FILL = single page (the proven path, untouched). RUN_WALK = M15 two-page
   // walk (fill → Next → re-inject → fill, hard cap 2). Both share the same storage
   // read + active-tab lookup; they diverge on what they do with the tab.
@@ -2045,6 +2064,117 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("CDP fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP WALK (M31) — fill page 1 → GUARDED Save & Continue → detect session-death
+// (VPS/login) OR a clean transition. ONE transition; page-2 fill is deferred
+// (repeating sections aren't on the CDP path). The CDP attach SURVIVES the
+// navigation (only Runtime+DOM enabled, no Page domain) — so no re-injection; we
+// just re-read the page via cdpEval on the same attach. Detaches in finally.
+// ============================================================================
+
+// Page signature for transition detection: url + the sorted formField name set
+// (the field-set delta is the load-bearing signal — pageId alone is shared across
+// pages on some tenants; dom-patterns).
+function cdpPageSig(scan) {
+  return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
+}
+
+// Poll SW-side after Save & Continue: a fresh dead-session read FIRST (a dead session
+// shows VPS banners on the SAME page — no transition — so sessionLooksDead is what
+// fires), else a hydrated page-signature change (steady across two reads). Mid-nav
+// read errors are "not ready, keep polling".
+async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
+  const start = Date.now();
+  let steady = -1;
+  while (Date.now() - start < timeoutMs) {
+    await cdpDelay(intervalMs);
+    let state = null;
+    try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
+    if (state && sessionLooksDead(state)) return { advanced: false, sessionDead: true, state };
+    let scan = null;
+    try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
+    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; continue; } // not hydrated
+    const sig = cdpPageSig(scan);
+    if (sig === prevSig) { steady = -1; continue; } // still page 1
+    if (scan.fields.length === steady) return { advanced: true, sig };
+    steady = scan.fields.length;
+  }
+  return { advanced: false, timeout: true };
+}
+
+async function runCdpWalk(tabId, profile, defaults, jobContext) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-WALK]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the walk starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run, nothing done."); return { ok: false, error: "never-hidden" }; }
+    LOG("tab hidden — walk starting. ONE transition; page-2 fill is deferred (repeating sections).");
+
+    const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+
+    // ── Fill page 1 ──
+    const act = makeCdpActuation();
+    const out = await drivePageFill(act, profile, defaults, jobContext);
+    LOG("page 1:", out.url);
+    if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning (source-liveness)
+    LOG(`page 1 filled — ${JSON.stringify(out.counts)}, ${out.needsReview.length} need review.`);
+    for (const r of out.needsReview) LOG(`  ⚠ [${r.status}] ${r.fieldName} — ${r.detail}`);
+    const base = { counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null };
+
+    // M31.1: on a stop-with-errors, surface the EXACT page error text (future AI will
+    // use these to debug/fix the page) + which fields the walk left EMPTY because the
+    // profile/JSON has no value (the likely cause of a "required" validation error).
+    // Reads the error state FRESH (errors render after Save & Continue).
+    const reportPageErrors = async () => {
+      let st = null;
+      try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
+      const samples = (st && st.errorMarkers && st.errorMarkers.samples) || [];
+      if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
+      if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
+      if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
+      const empties = out.results.filter((r) => r.status === "skipped");
+      if (empties.length) {
+        LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
+        empties.forEach((r) => LOG(`    • ${r.fieldName} — ${r.detail}`));
+      }
+      return { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+    };
+
+    // ── Nav decision (double Submit-guard + pre-click dead check) ──
+    const nav = await cdpEval(cdpReadSessionState);
+    if (nav && nav.applyFlowReviewPresent) { LOG("on the REVIEW page — NEVER advancing (would submit). Stop."); return { ok: true, advanced: false, stopped: "review-page", ...base }; }
+    if (nav && sessionLooksDead(nav)) { LOG("⚠⚠ SESSION EXPIRED before advance (login/VPS/no-form) — refresh, log in, reopen the form, then retry."); const diag = await reportPageErrors(); return { ok: true, advanced: false, stopped: "session-expired", session_expired: true, ...diag, ...base }; }
+    if (!nav || !nav.nextButtonPresent) { LOG("no Save & Continue button — terminal page. Stop (no advance)."); return { ok: true, advanced: false, stopped: "no-next-button", ...base }; }
+
+    // ── Guarded advance ──
+    const click = await act.clickPageNext();
+    LOG("Save & Continue:", JSON.stringify(click));
+    if (!click.clicked) { return { ok: true, advanced: false, stopped: "click-refused:" + (click.refused || "?"), ...base }; }
+
+    // ── Wait for transition OR session-death ──
+    const res = await cdpWaitNextPage(prevSig);
+    if (res.sessionDead) {
+      LOG("⚠⚠ SESSION EXPIRED / page errors after Save & Continue — refresh, log in, and reopen the form, then retry.");
+      const diag = await reportPageErrors();
+      return { ok: true, advanced: false, stopped: "session-expired", session_expired: true, ...diag, ...base };
+    }
+    if (res.advanced) {
+      LOG("✓ advanced to page 2 — page-2 fill (repeating sections) is a future round. Stopping (1-transition cap).");
+      return { ok: true, advanced: true, stopped: "advanced-page2-deferred", ...base };
+    }
+    LOG("⚠ nav-timeout — clicked Save & Continue but the page neither advanced nor showed a session error. PAGE 1 MAY NOW BE DIRTY — EYEBALL it before any re-run; do NOT re-run on this page as if fresh. Errors + empty fields below:");
+    const diag = await reportPageErrors();
+    return { ok: true, advanced: false, stopped: "nav-timeout-dirty", ...diag, ...base };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("walk aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

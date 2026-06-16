@@ -118,6 +118,29 @@ document.getElementById("cdp-fill").addEventListener("click", () => {
   });
 });
 
+// CDP WALK (M31): fill page 1 + a GUARDED Save & Continue with VPS/session detection.
+// Halts "session expired" on a dead session; "advanced" on a clean transition (page-2
+// fill deferred). On a LIVE session this DOES advance the application. Minimize within 60s.
+document.getElementById("cdp-walk").addEventListener("click", () => {
+  setStatus("CDP walk: fill page 1 + Save & Continue + session check… MINIMIZE now (60s). See [CDP-WALK] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_WALK" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("CDP walk failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.session_expired) {
+      setStatus("⚠ SESSION EXPIRED — refresh, log in, and reopen the form, then retry. See [CDP-WALK].");
+    } else if (resp.advanced) {
+      setStatus("CDP walk: page 1 filled, ADVANCED to page 2 (page-2 fill deferred). See [CDP-WALK].");
+    } else {
+      setStatus(`CDP walk: page 1 filled, stopped — ${resp.stopped}. See [CDP-WALK].`);
+    }
+  });
+});
+
 // TYPEAHEAD RECON (M25 Step 1): probe one chipless typeahead on THIS page while
 // hidden (filter/settle/commit/chip/banner + option-scope). Pre-filled typeaheads
 // are reported read-only. Minimize within 60s; output is [TA-RECON] in the SW console.

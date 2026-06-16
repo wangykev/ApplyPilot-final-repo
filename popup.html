@@ -35,6 +35,11 @@
          first, click, then MINIMIZE within 60s. Typeahead/source are deferred →
          NEEDS REVIEW; repeating sections untouched. Results in the SW console. -->
     <button id="cdp-fill">CDP fill (hidden): simple widgets</button>
+    <!-- CDP WALK (M31): fill page 1, then a GUARDED Save & Continue with VPS/session
+         detection — halts "session expired" on a dead session, reports "advanced" on a
+         clean transition (page-2 fill deferred). NOTE: on a LIVE session this advances
+         the application to page 2. Minimize within 60s; [CDP-WALK] in the SW console. -->
+    <button id="cdp-walk">CDP fill + advance / session check (minimize!)</button>
     <!-- TYPEAHEAD RECON (M25 Step 1): probe ONE chipless typeahead hidden — filter
          trigger, settle timing, keyboard commit + chip signal, no-match banner,
          option-scope (aria-controls vs page-wide). Run on My Experience (Field of

@@ -781,3 +781,50 @@ LOGGED-OUT / timed-out form. The two snapshots are **DOM-identical**:
   load. No `source` field → no warning (no false positive, no coverage). A matching miss (leaves loaded,
   candidate absent) → no warning (false-positive guard, unit-tested). Reliable detection = the VPS
   signal on Save & Continue, in the page-advance round.
+- **M30 is LIVE-VERIFIED** (2026-06-15): on a dead session the `⚠⚠ Likely session expired …` warning fired
+  (source `needs_review`, all other fields filled).
+
+## 2026-06-15 — Magna wd3: VPS ≠ validation error (M31 gate) + CDP guarded page-advance
+
+### The session detector is separable from ordinary validation (recon GATE — passed)
+Both snapshots captured POST-Save&Continue:
+- **LIVE session + a required field empty** (validation error): `vpsErrorPresent: false`, `errorPageText: null`,
+  `sessionBanner: false`; `errorMarkers` = the field-level "The field … is required …" only. Workday shows
+  a top "Errors Found" banner + a field-level error — NO `VPS|` code.
+- **DEAD session + Save & Continue:** `vpsErrorPresent: true` (multiple `Error Code: VPS|<uuid>` in
+  `errorPageText`), `sessionBanner: false`.
+- ⇒ **`vpsErrorPresent` (the `Error Code: VPS|` banner) is the CLEAN discriminator** — present only on a
+  dead session, absent on a live validation error. `sessionLooksDead` keys off it (+ `sessionBanner` +
+  login markers + no-form), and DELIBERATELY NOT off `errorPageText`/`errorMarkers` (a validation error
+  sets those). ⚠ **One-tenant / one-pair proof (Magna):** if another tenant's validation errors ever carry
+  a VPS-like code, this guard needs re-checking — don't generalize "separable on Magna" to "everywhere".
+
+### CDP guarded page-advance (M31)
+- `clickPageNext` (cdp.js): refuse if `applyFlowReviewPage` present (footer `pageFooterNextButton` is
+  Submit on review — the double-guard), else `cdpRectReady` the button + `cdpClickAt`.
+- **The CDP attach SURVIVES the Save & Continue navigation** (only Runtime+DOM enabled, no Page domain) —
+  no re-injection; `cdpWaitNextPage` just re-reads via `cdpEval` on the same attach: a dead-session check
+  FIRST (`sessionLooksDead` — a dead session shows VPS on the SAME page, no transition), else a hydrated
+  page-signature change (`url` + sorted formField-name set; field-set delta is load-bearing, steady across
+  2 reads). `runCdpWalk` = fill page 1 → guarded advance → halt-on-dead / "advanced (page-2 deferred)" /
+  nav-timeout DIRTY-STATE (clicked, no advance, no error → page 1 may be dirty; eyeball, don't re-scan fresh).
+- **Page-2 fill is OUT** (My Experience = repeating sections, deferred on CDP) — the walk is one transition:
+  the session detector + the guarded-advance foundation, not a useful page-2 fill.
+
+### Live results (2026-06-15) — all confirmed
+- **Advance:** live session → page 1 filled, `clickPageNext {clicked:true}`, transition detected → "advanced
+  to page 2 (page-2 fill deferred)". Browser **Back restores page 1 with state intact** (the advance is
+  safely reversible).
+- **Dead-session detector:** logged-out session → page 1 filled (cached), Save & Continue → `sessionLooksDead`
+  caught the VPS → "⚠⚠ SESSION EXPIRED" halt, no advance.
+- **Validation false-positive guard:** live session with a required field empty (blanked
+  `personal_info.first_name` so the walk SKIPS it + hand-cleared the field — needed because the walk
+  re-fills and most page-1 fields are account-pre-filled) → Save & Continue → validation error, no advance,
+  no VPS → **`nav-timeout` DIRTY-STATE, NOT "session expired"** → `sessionLooksDead` stayed alive end-to-end.
+
+### M31.1 — dirty-state / session-expired reports print the EXACT errors + profile gaps
+For future-AI page-debugging: the nav-timeout and session-expired stops now log `errorMarkers.samples`
+(the field-level "…is required…" texts) + `errorPageText` (VPS/Error-Page text), AND the fields the walk
+left EMPTY because the profile/JSON has no value (`results` with `status:"skipped"` + their detail — e.g.
+"empty value at personal_info.first_name") — the likely cause of a "required" validation error. Returned
+as `page_errors` / `error_page_text` / `empty_fields` on the walk result too.

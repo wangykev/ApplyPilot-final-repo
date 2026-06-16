@@ -281,6 +281,12 @@ function cdpReadSessionState() {
   const clickables = qa('button, a, [role="button"]');
   const formFields = qa('[data-automation-id^="formField-"]');
   const errMatch = bodyText.match(/error[- ]page error[\s\S]{0,200}/i);
+  // M31 recon: visible Workday error elements (count + sample text) — lets the recon
+  // PROVE an ordinary page-1 validation error is separable from a VPS/session error
+  // before sessionLooksDead keys off vpsErrorPresent/sessionBanner. nextButtonPresent
+  // is the PRECISE footer-button read (vs the saveContinuePresent text heuristic).
+  const errorEls = qa('[data-automation-id="errorMessage"], [role="alert"], [data-automation-id*="rror"]')
+    .filter((el) => { const r = el.getBoundingClientRect && el.getBoundingClientRect(); return r && r.width > 0 && r.height > 0; });
   return {
     url: location.href,
     title: document.title,
@@ -289,6 +295,7 @@ function cdpReadSessionState() {
     formFieldCount: formFields.length,
     applyFlowPagePresent: !!q('[data-automation-id="applyFlowPage"]'),
     applyFlowReviewPresent: !!q('[data-automation-id="applyFlowReviewPage"]'),
+    nextButtonPresent: !!q('[data-automation-id="pageFooterNextButton"]'),
     saveContinuePresent: clickables.some((b) => /save and (continue|submit)|^\s*(continue|submit|next)\s*$/i.test((b.textContent || "").trim())),
     sourcePresent: !!q('[data-automation-id="formField-source"]'),
     // login / auth markers
@@ -299,6 +306,8 @@ function cdpReadSessionState() {
     sessionBanner: /(session (has )?(expired|timed out|ended)|sign in again|log in again|your session|been (signed|logged) out|timed out)/i.test(bodyText),
     vpsErrorPresent: /error code:\s*vps\|/i.test(bodyText),
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
+    // M31: error-element detail for the validation-vs-VPS recon diff
+    errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 120)).filter(Boolean) },
     bodyTextSample: bodyText.slice(0, 500).replace(/\s+/g, " ").trim()
   };
 }
@@ -937,6 +946,18 @@ function makeCdpActuation() {
       if (!rect || rect.w <= 0) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;
+    },
+
+    // ── page advance (M31) ──
+    // Guarded Save & Continue. REFUSE on the review page (the footer button is
+    // Submit there — the double-guard). cdpRectReady (M29) absorbs a transient 0-rect.
+    clickPageNext: async () => {
+      const reviewPresent = await cdpEval(() => !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'));
+      if (reviewPresent) return { clicked: false, refused: "review-page" };
+      const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
+      if (!rect) return { clicked: false, refused: "no-button" };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { clicked: true };
     }
   };
 }
