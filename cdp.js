@@ -117,6 +117,18 @@ async function cdpClickAt(x, y) {
   await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
 }
 
+// Canonical triple-click (clickCount 1→2→3) — focuses a date spinbutton's 0-box
+// `-input` by clicking its VISIBLE `-display` sibling (M33 proven recipe; the
+// masked input can't be coordinate-clicked directly).
+async function cdpTripleClickAt(x, y) {
+  const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
+  await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" });
+  for (let i = 1; i <= 3; i++) {
+    await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i });
+    await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i });
+  }
+}
+
 // Insert text into the FOCUSED editable as one IME-style commit — fires trusted
 // beforeinput/input (no per-key events). Recon (a) decides if this is enough
 // for Workday's React or whether per-char key events are needed.
@@ -537,6 +549,15 @@ function cdpReadTextState(wrapperSel) {
   const input = w && w.querySelector("input");
   if (!input) return null;
   return { value: input.value, focused: document.activeElement === input };
+}
+
+// Read a specific input by a FULL composed selector (e.g. a date segment's
+// dateSection*-input) — value + focused. Direct (not "first input in wrapper"),
+// since a date wrapper holds several segment inputs (M34).
+function cdpReadInputBySel(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return null;
+  return { value: el.value, focused: document.activeElement === el };
 }
 
 function cdpFocusBySel(sel) {
@@ -1159,6 +1180,25 @@ function makeCdpActuation() {
       if (!rect) return { ok: false };
       await cdpClickAt(rect.cx, rect.cy);
       return { ok: true };
-    }
+    },
+
+    // ── date composite segments (M34) ──
+    // A date `-input` (role=spinbutton) is 0-box — can't be coordinate-clicked. Focus
+    // ladder: TRIPLE-CLICK the visible `-display` sibling (M33 recipe) → rect-free
+    // el.focus() → CDP DOM.focus, each verified via the input's focused flag. Returns
+    // the winning rung ("triple-click-display" / "el.focus()" / "DOM.focus") or null.
+    // `segment` ∈ {"Month","Day","Year"} → dateSection<segment>-input / -display.
+    focusDateSegment: async (loc, segment) => {
+      const inputSel = loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-input"]';
+      const displaySel = loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-display"]';
+      const focused = async () => { const s = await cdpEval(cdpReadInputBySel, inputSel); return !!(s && s.focused); };
+      const r = await cdpRectReady(displaySel, true);
+      if (r) { await cdpTripleClickAt(r.cx, r.cy); await cdpDelay(200); if (await focused()) return "triple-click-display"; }
+      if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpDelay(120); if (await focused()) return "el.focus()"; }
+      try { await cdpDomFocus(inputSel); await cdpDelay(120); if (await focused()) return "DOM.focus"; } catch (e) { /* not found */ }
+      return null;
+    },
+    readDateSegment: (loc, segment) => cdpEval(cdpReadInputBySel, loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-input"]'),
+    typeDigits: (text) => cdpTypeChars(String(text), 80) // per-char primary; act.typeText (insertText) is the brain's verified fallback
   };
 }

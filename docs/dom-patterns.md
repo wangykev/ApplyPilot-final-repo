@@ -859,6 +859,28 @@ proven + M35 wires it into the date-bearing sections.
 **Recon-tool lesson (carried forward):** target the EDITABLE `-input` for read-back and never gate actuation
 on a masked input's own rect — focus via the visible sibling (triple-click) or a rect-free `focus()`.
 
+### M34 — the CDP multi-segment date recipe (and the Ctrl+A bug that broke it)
+`fillDateCompositeCdp` fills a date by, **per segment**: triple-click the visible `dateSection<seg>-display`
+(which SELECTS the segment) → READ `.focused` (the `focusDateSegment` gate — never type into an unfocused
+segment) → per-char type (insertText fallback) → parseInt read-back-verify. Live-verified hidden on Magna
+wd3 page 2: WE M/Y "5/2025", Education year-only "2024", **Certs M/D/Y "6/15/2024"** — all verified, every
+segment via `triple-click-display/typeChars`.
+- **⛔ NO Ctrl+A anywhere in the date path.** The first M34 build cleared each segment with Ctrl+A+Delete
+  (`cdpSelectAllDelete`) before typing — and **Ctrl+A spans the WHOLE date composite, clears all segments,
+  and resets the active segment to Month**, so the per-char Day/Year digits piled into Month (15→clamps to
+  12 → the live "12/20/2024" bug). It looked intermittent ("sometimes") because it depended on prior
+  field/focus state. The `RUN_CDP_DATE_MECH` mechanics probe (since pruned; this is the record) proved it
+  the SOLE culprit: with NO clear, both the sequential-one-focus and per-segment-triple-click recipes filled
+  M/D/Y **3/3 deterministically, no auto-advance race** (immediate == settled focus reads).
+- **No clear is needed** — triple-click SELECTS the segment, so typing REPLACES it (proven: mech-probe runs
+  with residual segment values read back correctly). A future replace-on-type-hostile tenant would need a
+  **segment-scoped Backspace** clear — NEVER Ctrl+A. A `node --test` guard asserts the composite never calls
+  a whole-field clear.
+- M/Y is NOT a Month-first false pass: `focusDateSegment` returns `triple-click-display` only after a
+  `.focused` read, so Year is genuinely focus-verified before typing (confirmed live via the fill trace).
+- The date branch in `fillEntryCdp` stays DEFERRED (`cdp-date-deferred`) until M35+ wires the composite
+  into the date-bearing section fills.
+
 ### Websites = the date-free machinery proof
 One `formField-url` text field per entry, no dates, no hashed ids, no dropdowns — the clean first section to
 prove the reconcile-to-N + per-entry-fill machinery. Other sections reuse `driveRepeatingSectionCdp` later.

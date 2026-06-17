@@ -316,6 +316,27 @@ document.getElementById("cdp-fill-websites").addEventListener("click", () => {
   });
 });
 
+// DATE FILL (M34 verify): fill ONE date composite matched by the label regex (reuses
+// the ta-label input) via fillDateCompositeCdp. Run on My Experience (page 2); minimize
+// within 60s. Result + per-segment focus/input trace land as [CDP-DATE] in the SW console.
+document.getElementById("cdp-fill-date").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim();
+  if (!labelRegex) { setStatus("Enter a label regex first (e.g. From, To, Issued Date)."); return; }
+  setStatus(`CDP date fill ("${labelRegex}")… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-DATE] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_DATE", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Date fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Date fill: ${resp.status}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-DATE].`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

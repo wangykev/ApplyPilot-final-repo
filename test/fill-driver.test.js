@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, fillDateCompositeCdp } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1250,4 +1250,114 @@ test("repeating DOWN: delete that doesn't drop the count stops bounded", async (
   assert.strictEqual(out.results.find((r) => r.fieldName === "website.delete").status, "needs_review");
   assert.strictEqual(act.log.filter(([m]) => m === "clickDeleteEntry").length, 1); // bounded — no spin
   assert.strictEqual(s.entries.length, 3);
+});
+
+// ── M34 CDP date composite (fillDateCompositeCdp) ───────────────────────────
+// A fake actuation modeling ONE date field's segments. focusDateSegment sets the
+// focused segment + returns the winning rung; typeDigits (per-char) / typeText
+// (insertText fallback) write the focused segment's value; readDateSegment reads it
+// back. Flags simulate focus failure, per-char no-op (→ insertText fallback), and
+// both-methods failure (→ needs_review). .log asserts a segment that can't focus is
+// NEVER typed into (the "never type blind" invariant).
+function makeFakeDateAct(segs, opts) {
+  opts = opts || {};
+  const log = [];
+  let focused = null;
+  const focusFails = new Set(opts.focusFailsFor || []);
+  const perCharFails = new Set(opts.perCharFailsFor || []);
+  const bothFail = new Set(opts.bothFailFor || []);
+  const rung = (s) => (opts.focusRungFor && opts.focusRungFor[s]) || "triple-click-display";
+  return {
+    log,
+    delay: async () => {},
+    focusDateSegment: async (loc, seg) => {
+      log.push(["focusDateSegment", seg]);
+      if (focusFails.has(seg) || !(seg in segs)) { focused = null; return null; }
+      focused = seg;
+      return rung(seg);
+    },
+    readDateSegment: async (loc, seg) => (seg in segs ? { value: segs[seg].value, focused: focused === seg } : null),
+    clearText: async () => { log.push(["clearText", focused]); if (focused && segs[focused]) segs[focused].value = ""; },
+    typeDigits: async (text) => {
+      log.push(["typeDigits", focused, text]);
+      if (!focused) return;
+      if (perCharFails.has(focused) || bothFail.has(focused)) return; // per-char no-op → insertText fallback
+      segs[focused].value = String(text);
+    },
+    typeText: async (text) => {
+      log.push(["typeText", focused, text]);
+      if (!focused) return;
+      if (bothFail.has(focused)) return; // insertText also no-op → needs_review
+      segs[focused].value = String(text);
+    }
+  };
+}
+const seg0 = () => ({ value: "" });
+const runDate = (segs, parsed, opts) => {
+  const act = makeFakeDateAct(segs, opts);
+  return fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, parsed, T_BUDGETS).then((rec) => ({ rec, act }));
+};
+
+test("date composite: M/Y fills + verifies each segment", async () => {
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "12", year: "2024" });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "12/2024");
+  assert.strictEqual(rec.verified, true);
+  assert.deepStrictEqual([segs.Month.value, segs.Year.value], ["12", "2024"]);
+});
+
+test("date composite: year-only (string parsed) fills the Year segment", async () => {
+  const segs = { Year: seg0() };
+  const { rec } = await runDate(segs, "2028");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "2028");
+  assert.strictEqual(segs.Year.value, "2028");
+});
+
+test("date composite: M/D/Y fills all three segments in order", async () => {
+  const segs = { Month: seg0(), Day: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "6", day: "15", year: "2027" });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "6/15/2027");
+  assert.deepStrictEqual([segs.Month.value, segs.Day.value, segs.Year.value], ["6", "15", "2027"]);
+});
+
+test("date composite: a segment that can't focus → needs_review with ZERO typing on it", async () => {
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec, act } = await runDate(segs, { month: "12", year: "2024" }, { focusFailsFor: ["Year"] });
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.verified, false);
+  assert.strictEqual(segs.Month.value, "12"); // month still filled
+  // the load-bearing "never type blind": a segment that failed to focus is NEVER typed into.
+  assert.ok(!act.log.some(([m, s]) => (m === "typeDigits" || m === "typeText") && s === "Year"),
+    "must not type into a segment that failed to focus");
+});
+
+test("date composite: per-char no-op → insertText fallback verifies → filled", async () => {
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "12", year: "2024" }, { perCharFailsFor: ["Month"] });
+  assert.strictEqual(rec.status, "filled");
+  assert.match(rec.detail, /"Month":"triple-click-display\/insertText"/);
+  assert.strictEqual(segs.Month.value, "12");
+});
+
+test("date composite: both per-char AND insertText fail → needs_review (never 'filled')", async () => {
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "12", year: "2024" }, { bothFailFor: ["Month"] });
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.verified, false);
+  assert.match(rec.detail, /Month.*FAILED/);
+});
+
+// REGRESSION GUARD (M34 M/D/Y bug): the composite must NEVER Ctrl+A-clear the whole date
+// composite — that resets the active segment to Month, so per-char Day/Year digits pile
+// into Month (the "12/20/2024" bug). triple-click-select + type-replace needs no clear.
+test("date composite: NEVER calls a whole-field clearText (no Ctrl+A in the date path)", async () => {
+  const segs = { Month: seg0(), Day: seg0(), Year: seg0() };
+  const { rec, act } = await runDate(segs, { month: "6", day: "15", year: "2024" });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "6/15/2024");
+  assert.ok(!act.log.some(([m]) => m === "clearText"),
+    "composite must not Ctrl+A-clear the whole date composite (resets focus to Month → digit-piling)");
 });

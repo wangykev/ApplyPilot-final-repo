@@ -1184,8 +1184,66 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   return finalize(url);
 }
 
+// ============================================================================
+// M34 — CDP date composite. Port of fillDateComposite (background.js ~3270) onto
+// the CDP substrate. The date `-input`s are 0-box masked spinbuttons (the M33
+// finding) — focus EACH segment EXPLICITLY by triple-clicking its visible
+// `-display` (rect-free el.focus()/DOM.focus fallbacks), then type the digits.
+// Per-segment explicit focus is robust vs auto-advance timing (a throttled page
+// reaction). Input ladder per segment: per-char (typeDigits) primary → insertText
+// (typeText) fallback, EACH read-back-verified (parseInt). A read-back mismatch is
+// NEVER reported "filled". `parsed` = a "YYYY" string (year-only) OR { month, year,
+// day } (month/day optional). `detail` carries the per-segment focusRung/inputMethod
+// trace so the live run shows HOW each focused (esp. the standalone year-only).
+// Proven standalone via RUN_CDP_FILL_DATE; wired into fillEntryCdp in M35.
+// ============================================================================
+const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
+  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
+  const norm = (typeof parsed === "string" || typeof parsed === "number") ? { year: String(parsed) } : (parsed || {});
+  const present = (v) => v !== null && v !== undefined && String(v).trim() !== "";
+  const segs = [];
+  if (present(norm.month)) segs.push(["Month", String(norm.month)]);
+  if (present(norm.day)) segs.push(["Day", String(norm.day)]);
+  if (present(norm.year)) segs.push(["Year", String(norm.year)]);
+  if (!segs.length) return { status: "skipped", detail: "no date value to fill" };
+
+  const after = {};
+  const trace = {};
+  let allVerified = true;
+  for (const [seg, val] of segs) {
+    const focusRung = await act.focusDateSegment(loc, seg);
+    if (!focusRung) { trace[seg] = "focus-failed"; after[seg] = null; allVerified = false; continue; }
+    const attempt = async (how) => {
+      // NO clearText (Ctrl+A+Delete) — it spans the WHOLE date composite and resets the
+      // active segment to Month, so per-char Day/Year digits pile into Month (the M34
+      // M/D/Y bug; mechanics probe proved it the sole culprit). focusDateSegment
+      // triple-click-SELECTS the segment, so typing REPLACES it — no clear needed.
+      // (Any future per-tenant clear must be segment-scoped Backspace, NEVER Ctrl+A.)
+      if (how === "insertText") await act.typeText(val); else await act.typeDigits(val);
+      await act.delay(b.textReadDelayMs);
+      const read = await act.readDateSegment(loc, seg);
+      return { read: read ? read.value : null, ok: !!(read && parseInt(read.value, 10) === parseInt(val, 10)) };
+    };
+    let inputMethod = "typeChars";
+    let res = await attempt("typeChars");
+    if (!res.ok) { // insertText fallback — re-focus first (typing may have shifted focus/auto-advanced)
+      await act.focusDateSegment(loc, seg);
+      inputMethod = "insertText";
+      res = await attempt("insertText");
+    }
+    after[seg] = res.read;
+    trace[seg] = focusRung + "/" + (res.ok ? inputMethod : inputMethod + "-FAILED");
+    if (!res.ok) allVerified = false;
+  }
+
+  const afterStr = ["Month", "Day", "Year"].filter((s) => after[s] != null).map((s) => after[s]).join("/");
+  const detail = "segments " + JSON.stringify(trace);
+  if (!allVerified) return { status: "needs_review", after: afterStr, verified: false, detail: "date read-back mismatch — " + detail };
+  return { status: "filled", after: afterStr, verified: true, detail };
+};
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

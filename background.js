@@ -152,6 +152,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // TARGETED DATE FILL (M34 verify harness): fill ONE date composite located by
+  // label regex via fillDateCompositeCdp HIDDEN — proves the date handler on the
+  // three shapes (WE M/Y, Education year-only, Certs M/D/Y). Run on My Experience
+  // (page 2). Results land as [CDP-DATE] in the SW console.
+  if (message.type === "RUN_CDP_FILL_DATE") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-DATE] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillDate(tab.id, profile, String(message.labelRegex || ""));
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // SOURCE FILL (backlog C — Phase B): fill the source picker via fillSourceCdp
   // (typeahead-style: type → filter → auto-commit/click leaf) HIDDEN, candidates
   // from defaults.how_did_you_hear (preferred LinkedIn). Selects LinkedIn + reads
@@ -2375,6 +2396,79 @@ async function runCdpFillWebsites(tabId, profile) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("websites fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// TARGETED DATE FILL (M34 verify harness) — fill ONE date composite located by
+// label regex (entry-scoped) via fillDateCompositeCdp HIDDEN, to prove the date
+// handler on all three shapes (WE M/Y, Education year-only, Certs M/D/Y) BEFORE
+// wiring dates into the section fill (M35). Values come from prepareProfile's
+// parsed annotations (NOT FIELD_MAP — that's the flat-page contract). The result's
+// `detail` shows the per-segment focusRung/inputMethod (esp. the standalone year).
+// [CDP-DATE] in the SW console. Detaches in finally.
+// ============================================================================
+const DATE_ENTRY_VALUES = {
+  startDate: (p) => p && p.work_experience && p.work_experience[0] ? p.work_experience[0].fromParsed : undefined,
+  endDate: (p) => p && p.work_experience && p.work_experience[0] ? p.work_experience[0].toParsed : undefined,
+  firstYearAttended: (p) => p && p.education && p.education[0] ? p.education[0].fromYearParsed : undefined,
+  lastYearAttended: (p) => p && p.education && p.education[0] ? p.education[0].toYearParsed : undefined,
+  issuedDate: (p) => p && p.certifications && p.certifications[0] ? p.certifications[0].issuedDateParsed : undefined,
+  expirationDate: (p) => p && p.certifications && p.certifications[0] ? p.certifications[0].expirationDateParsed : undefined
+};
+
+async function runCdpFillDate(tabId, profile, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-DATE]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    let re;
+    try { re = new RegExp(labelRegexStr || ".", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+
+    const scan = await cdpEval(cdpRepeatingScan);
+    let target = null;
+    for (const prefix of (scan ? scan.sectionsPresent : [])) {
+      for (const e of scan.sections[prefix].entries) {
+        const f = e.fields.find((x) => x.dateSegments.length > 0 && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { target = { prefix, field: f }; break; }
+      }
+      if (target) break;
+    }
+    if (!target) {
+      LOG("no date field matching", JSON.stringify(labelRegexStr), "— date fields on this page:",
+        JSON.stringify((scan ? scan.sectionsPresent : []).flatMap((p) => scan.sections[p].entries.flatMap((e) => e.fields.filter((f) => f.dateSegments.length > 0).map((f) => ({ field: f.fieldName, label: f.label }))))));
+      return { ok: false, error: "no-match" };
+    }
+    LOG("target:", target.field.fieldName, "—", JSON.stringify(target.field.label), "| sel:", target.field.wrapperSel);
+
+    const prepared = prepareProfile(profile);
+    const getter = DATE_ENTRY_VALUES[target.field.fieldName];
+    const parsed = getter ? getter(prepared) : undefined;
+    if (!parsed) {
+      LOG("no parsed date value for", target.field.fieldName, "— check the profile (work_experience/education/certifications entry 0).");
+      return { ok: false, error: "no-value" };
+    }
+    LOG("value (parsed):", JSON.stringify(parsed));
+    LOG("tab is hidden — date fill starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+
+    const act = makeCdpActuation();
+    const rec = await fillDateCompositeCdp(act, { wrapperSel: target.field.wrapperSel }, parsed, DEFAULT_BUDGETS);
+    LOG("result:", JSON.stringify({ field: target.field.fieldName, status: rec.status, after: rec.after, verified: rec.verified, detail: rec.detail }, null, 2));
+    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("date fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
