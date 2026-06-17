@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, fillDateCompositeCdp } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, fillDateCompositeCdp } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1119,7 +1119,24 @@ function makeFakeRepeatAct(state) {
     readChecked: async (id) => { const hit = allFields().find((x) => x.f.inputId === id); return hit ? hit.f.checked : null; },
     focusInput: async (id) => { focusedInputId = id; return true; },
     pressSpace: async () => { log.push(["pressSpace"]); const hit = allFields().find((x) => x.f.inputId === focusedInputId); if (hit) hit.f.checked = !hit.f.checked; },
-    clickCheckboxLabel: async (loc) => { log.push(["clickCheckboxLabel", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.checkboxClickRectDead) return false; f.checked = !f.checked; return true; }
+    clickCheckboxLabel: async (loc) => { log.push(["clickCheckboxLabel", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.checkboxClickRectDead) return false; f.checked = !f.checked; return true; },
+    // dropdown (M28 flow: open → settle → matchCandidates → clickDropdownOptionByText → commit-verify)
+    openDropdown: async (loc) => { log.push(["openDropdown", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.openFails) return false; f._open = true; return true; },
+    readDropdownState: async (loc) => {
+      const f = byLoc(loc); const open = !!(f && f._open);
+      const options = open ? (f.options || []) : [];
+      return { triggerText: f ? (f.triggerText || null) : null, listboxPresent: open,
+        optionCount: options.filter((o) => !o.disabled).length,
+        options: options.map((o) => ({ text: o.text, disabled: !!o.disabled, selected: false })), activeText: null };
+    },
+    clickDropdownOptionByText: async (loc, text) => {
+      log.push(["clickDropdownOptionByText", loc.wrapperSel, text]);
+      const f = byLoc(loc); if (!f) return false;
+      const o = (f.options || []).find((x) => !x.disabled && x.text === text);
+      if (!o) return false;
+      f.triggerText = text; f._open = false; return true; // commit: trigger now shows the picked option
+    },
+    pressEscape: async () => { log.push(["pressEscape"]); state.entries.forEach((e) => e.fields.forEach((f) => { f._open = false; })); }
   };
 }
 
@@ -1360,4 +1377,90 @@ test("date composite: NEVER calls a whole-field clearText (no Ctrl+A in the date
   assert.strictEqual(rec.after, "6/15/2024");
   assert.ok(!act.log.some(([m]) => m === "clearText"),
     "composite must not Ctrl+A-clear the whole date composite (resets focus to Month → digit-piling)");
+});
+
+// ── M35 Languages (driveRepeatingSectionCdp + LANGUAGE_MAP) ─────────────────
+// Exercises the dropdown + checkbox + labelRegex routing in fillEntryCdp. The
+// proficiency fields use IDENTICAL hashed fieldNames across entries (the live
+// duplicate-id trap) — resolution must stay entry-scoped (find within the entry's
+// fields + fkit-prefixed wrapperSel). Reuses makeFakeRepeatAct (now with dropdowns).
+const LANG_OPTS = [{ text: "Select One", disabled: true }, { text: "English" }, { text: "Chinese" }, { text: "Spanish" }];
+const PROF_OPTS = [{ text: "Select One", disabled: true }, { text: "Novice" }, { text: "Intermediate" }, { text: "Advanced" }, { text: "Fluent" }];
+const langEntry = (fkit, o) => ({ fkit, fields: [
+  { fieldName: "language", label: "Language*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: LANG_OPTS },
+  { fieldName: "5aaaedREAD", label: (o && o.readingLabel) || "Reading Proficiency*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: PROF_OPTS },
+  { fieldName: "5aaaedSPEAK", label: "Speaking Proficiency*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: PROF_OPTS },
+  { fieldName: "5aaaedWRITE", label: "Writing Proficiency*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: PROF_OPTS },
+  { fieldName: "native", label: "I am fluent in this language.", widgetType: "checkbox", isRequired: false, inputId: fkit + "-native", checked: false }
+] });
+const runLang = async (entries, items) => {
+  const state = { prefix: "language-", addable: true, deletable: true, newEntry: (i) => langEntry("language-new" + i), entries };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "language", headingRegex: "languages?", containerPrefix: "language-",
+    items, fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  return { out, act, state };
+};
+const EN = { language: "English", reading: "Fluent", speaking: "Fluent", writing: "Fluent", _allFluent: true };
+const ZH = { language: "Chinese", reading: "Intermediate", speaking: "Advanced", writing: "Intermediate", _allFluent: false };
+const nativeOf = (e) => e.fields.find((f) => f.fieldName === "native").checked;
+
+test("languages: English all-Fluent → dropdowns filled (incl. by-LABEL proficiencies) + 'I am fluent' checked", async () => {
+  const { out, state } = await runLang([langEntry("language-6--null")], [EN]);
+  const rec = (n) => out.results.find((r) => r.fieldName === n);
+  assert.strictEqual(rec("language[0].language").after, "English");
+  for (const p of ["readingProficiency", "speakingProficiency", "writingProficiency"]) {
+    assert.strictEqual(rec("language[0]." + p).status, "filled", p);
+    assert.strictEqual(rec("language[0]." + p).after, "Fluent", p);
+  }
+  assert.strictEqual(rec("language[0].native").status, "filled");
+  assert.strictEqual(nativeOf(state.entries[0]), true);
+  assert.strictEqual(out.needsReview.length, 0);
+});
+
+test("languages: Chinese per-skill → distinct proficiencies + 'I am fluent' left unchecked", async () => {
+  const { out, state } = await runLang([langEntry("language-6--null")], [ZH]);
+  const rec = (n) => out.results.find((r) => r.fieldName === n);
+  assert.strictEqual(rec("language[0].language").after, "Chinese");
+  assert.strictEqual(rec("language[0].readingProficiency").after, "Intermediate");
+  assert.strictEqual(rec("language[0].speakingProficiency").after, "Advanced");
+  assert.strictEqual(rec("language[0].writingProficiency").after, "Intermediate");
+  assert.strictEqual(nativeOf(state.entries[0]), false); // _allFluent:false → reconciled to unchecked
+});
+
+test("languages: ENTRY-SCOPED resolve with DUPLICATE hashed ids — entries get their OWN values (not crossed)", async () => {
+  const e6 = langEntry("language-6--null"); // both share fieldName "5aaaedREAD" etc. — fkit differs
+  const e7 = langEntry("language-7--null");
+  await runLang([e6, e7], [EN, ZH]);
+  const v = (e, fn) => e.fields.find((f) => f.fieldName === fn).triggerText;
+  assert.strictEqual(v(e6, "language"), "English");
+  assert.strictEqual(v(e6, "5aaaedREAD"), "Fluent");      // entry-6 reading = English's Fluent
+  assert.strictEqual(v(e7, "language"), "Chinese");
+  assert.strictEqual(v(e7, "5aaaedREAD"), "Intermediate"); // entry-7 reading = Chinese's — NOT crossed
+  assert.strictEqual(v(e7, "5aaaedSPEAK"), "Advanced");
+});
+
+test("languages: deleteOnNoMatch — an unmatchable language deletes the RIGHT entry (high→low)", async () => {
+  const bogus = { language: "Klingon", reading: "Fluent", speaking: "Fluent", writing: "Fluent", _allFluent: true };
+  const { act, state } = await runLang([langEntry("language-6--null"), langEntry("language-7--null")], [EN, bogus]);
+  assert.strictEqual(state.entries.length, 1);
+  assert.strictEqual(state.entries[0].fkit, "language-6--null"); // the bogus entry-7 deleted, the real one kept
+  const delIdx = act.log.filter(([m]) => m === "clickDeleteEntry").map(([, i]) => i);
+  assert.deepStrictEqual(delIdx, [1]); // deleted index 1 (bogus), not 0
+});
+
+test("languages: labelRegex NO-match → 'field wrapper not found' (resolve-failure path)", async () => {
+  const e = langEntry("language-6--null", { readingLabel: "Comprehension Level" }); // won't match /reading proficiency/i
+  const { out } = await runLang([e], [EN]);
+  const r = out.results.find((x) => x.fieldName === "language[0].readingProficiency");
+  assert.strictEqual(r.status, "error");
+  assert.match(r.detail, /field wrapper not found/);
+});
+
+test("languages: 'I am fluent' checkbox is processed LAST (after the proficiencies)", async () => {
+  const { out } = await runLang([langEntry("language-6--null")], [EN]);
+  const order = out.results.filter((r) => /^language\[0\]\./.test(r.fieldName)).map((r) => r.fieldName);
+  assert.ok(order.indexOf("language[0].native") > order.indexOf("language[0].writingProficiency"),
+    "native must be filled after the proficiencies");
 });

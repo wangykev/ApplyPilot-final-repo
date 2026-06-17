@@ -316,6 +316,24 @@ document.getElementById("cdp-fill-websites").addEventListener("click", () => {
   });
 });
 
+// LANGUAGES FILL (M35): reuse the repeating-section driver for the date-free Languages section.
+// Run on My Experience (page 2); minimize within 60s. Results land as [CDP-LANG] in the SW console.
+document.getElementById("cdp-fill-languages").addEventListener("click", () => {
+  setStatus("CDP languages fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-LANG] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_LANGUAGES" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Languages fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Languages fill done — counts: ${JSON.stringify(resp.counts)}, needs review: ${resp.needs_review}. See [CDP-LANG].`);
+    }
+  });
+});
+
 // DATE FILL (M34 verify): fill ONE date composite matched by the label regex (reuses
 // the ta-label input) via fillDateCompositeCdp. Run on My Experience (page 2); minimize
 // within 60s. Result + per-segment focus/input trace land as [CDP-DATE] in the SW console.

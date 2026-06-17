@@ -903,4 +903,30 @@ prove the reconcile-to-N + per-entry-fill machinery. Other sections reuse `drive
   on re-render).
 - **Languages labelRegex gap (later):** hashed proficiency-dropdown ids resolve by `label` (`cdpRepeatingScan`
   emits it), not automation-id — the labelRegex resolve path is wired in `fillEntryCdp` but UNPROVEN on CDP
-  until the Languages round.
+  until the Languages round. **(RESOLVED in M35 — see 2026-06-17 below.)**
+
+## 2026-06-17 — Magna wd3, HIDDEN: Languages on CDP (labelRegex/hashed-id + deleteOnNoMatch PROVEN LIVE) (M35)
+
+`driveRepeatingSectionCdp` + `LANGUAGE_MAP` (language dropdown + 3 proficiency dropdowns + "I am fluent"
+checkbox), date-free — the first LIVE exercise of the two paths wired-but-unproven since M32b. All passed
+hidden on Magna page 2; the machinery (M32b) needed NO change — only `LANGUAGE_MAP` + a harness.
+
+- **labelRegex resolves the HASHED-id proficiency dropdowns BY LABEL — PROVEN LIVE.** The three proficiency
+  dropdowns have hashed `formField-5aaaed…` ids; `/reading|speaking|writing proficiency/i` matched the live
+  labels ("Reading/Speaking/Writing Proficiency*") and they filled (`text-click-commit` where actuated,
+  `dropdown-prefilled-kept` where already right).
+- **Entry-scope holds despite IDENTICAL hashed ids across entries (the duplicate-id trap, confirmed live).**
+  `formField-5aaaed…` (reading) is shared by `language-6` AND `language-7`; resolution stayed entry-scoped
+  (labelRegex match WITHIN the entry's fields + the fkit-prefixed composed `wrapperSel`), so `language[0]`
+  (English, all-Fluent) and `language[1]` (Chinese, per-skill) got their OWN values — NOT crossed.
+- **"I am fluent" checkbox** reconciled to `_allFluent` (English → checked; Chinese → unchecked, "already in
+  desired state"). Processed LAST in the map (proficiencies fill first; recon MutationObserver: the
+  proficiency dropdowns STAY visible when fluent is checked — the old "checking it hides them" comment was
+  false and is corrected).
+- **deleteOnNoMatch — PROVEN LIVE via the no-match trigger.** A bogus `"Zxqwbogus"` language (unmatchable by
+  the ~65-option dropdown) → its required `language` pick didn't match → that entry deleted as
+  `language[2].removed` ("a required pick didn't match an option → entry deleted"), the **right** entry (the
+  good English/Chinese survived filled). This is the no-match path, distinct from reconcile-down
+  ("deleted N extra(s)"). (Verified with a TEMPORARY profile entry, reverted after — profile.json is
+  untracked, never committed.)
+- **Heading disambiguation:** `/languages?/i` matches only "Languages 3" among the page-2 section headings.

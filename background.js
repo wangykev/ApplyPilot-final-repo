@@ -152,6 +152,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP FILL LANGUAGES (M35): reuse driveRepeatingSectionCdp for the date-free Languages
+  // section (language + 3 by-label proficiency dropdowns + "I am fluent" checkbox; deleteOnNoMatch).
+  // First live exercise of the labelRegex/hashed-id resolve. Run on My Experience (page 2). [CDP-LANG].
+  if (message.type === "RUN_CDP_FILL_LANGUAGES") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-LANG] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillLanguages(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // TARGETED DATE FILL (M34 verify harness): fill ONE date composite located by
   // label regex via fillDateCompositeCdp HIDDEN — proves the date handler on the
   // three shapes (WE M/Y, Education year-only, Certs M/D/Y). Run on My Experience
@@ -2403,6 +2423,56 @@ async function runCdpFillWebsites(tabId, profile) {
 }
 
 // ============================================================================
+// CDP FILL LANGUAGES (M35) — reuse driveRepeatingSectionCdp for the date-free Languages
+// section: language dropdown + 3 proficiency dropdowns resolved BY LABEL (hashed ids,
+// IDENTICAL across entries → resolution stays entry-scoped) + the "I am fluent" checkbox.
+// deleteOnNoMatch:true (a required pick that can't match blocks Next → delete the entry).
+// FIRST live exercise of the labelRegex/hashed-id resolve path. [CDP-LANG] in the SW console.
+// ============================================================================
+async function runCdpFillLanguages(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-LANG]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    const prepared = prepareProfile(profile);
+    const items = Array.isArray(prepared.languages) ? prepared.languages : [];
+    LOG(`tab is hidden — languages fill starting. ${items.length} meaningful language(s). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+
+    const act = makeCdpActuation();
+    const out = await driveRepeatingSectionCdp(act, {
+      name: "language", headingRegex: "languages?", containerPrefix: "language-",
+      items, fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true
+    }, DEFAULT_BUDGETS);
+
+    LOG("page:", out.url);
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
+      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+    }
+    console.table(out.results.map((r) => ({
+      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+      verified: r.verified, flag: r.flag, detail: r.detail
+    })));
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("languages fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // TARGETED DATE FILL (M34 verify harness) — fill ONE date composite located by
 // label regex (entry-scoped) via fillDateCompositeCdp HIDDEN, to prove the date
 // handler on all three shapes (WE M/Y, Education year-only, Certs M/D/Y) BEFORE
@@ -3782,9 +3852,10 @@ async function fillEngine(profile, defaults, jobContext) {
     { labelRegex: /reading proficiency/i, name: "readingProficiency", widget: "dropdown", key: "reading", path: "reading" },
     { labelRegex: /speaking proficiency/i, name: "speakingProficiency", widget: "dropdown", key: "speaking", path: "speaking" },
     { labelRegex: /writing proficiency/i, name: "writingProficiency", widget: "dropdown", key: "writing", path: "writing" },
-    // LAST: check "I am fluent in this language" when all three are fluent (_allFluent,
-    // computed SW-side). After the proficiencies are filled+recorded, so even if checking it
-    // hides them, delete-on-no-match won't fire.
+    // LAST for safety-in-principle: check "I am fluent" when all three are fluent (_allFluent,
+    // computed SW-side) AFTER the proficiencies are filled+recorded. (Recon MutationObserver:
+    // on Magna the proficiency dropdowns STAY visible + interactive when fluent is checked — no
+    // hide — so the order is harmless either way; NOT because checking it hides them.)
     { field: "native", widget: "checkbox", key: "_allFluent", path: "_allFluent" }
   ];
   // Certifications (M23): certification typeahead (REQUIRED pick) + optional number + two

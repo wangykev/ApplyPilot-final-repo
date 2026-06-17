@@ -1011,12 +1011,27 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 // shared. Proven on Websites (date-free, one url text field/entry); the other
 // sections (Languages/Education/Certs/WE) reuse this driver in later rounds.
 //
-// TODO(dup): WEBSITE_MAP mirrors background.js WEBSITE_MAP (~3571). The other maps
-// (EDUCATION/LANGUAGE/CERTIFICATION) are NOT ported yet — they need the deferred
-// date path and, for Languages, the labelRegex resolve below (wired, unproven on
-// CDP). Change in lockstep with the in-tree maps when ported.
+// TODO(dup): WEBSITE_MAP + LANGUAGE_MAP mirror background.js (~3571 / ~3780). EDUCATION/
+// CERTIFICATION are NOT ported yet — they need the deferred date path. Change in lockstep
+// with the in-tree maps.
 // ============================================================================
 const WEBSITE_MAP = [{ field: "url", widget: "text", key: "url", path: "url" }];
+
+// M35 — Languages (date-free). language dropdown + 3 proficiency dropdowns resolved BY LABEL
+// (hashed `formField-5aaaed…` ids that are IDENTICAL across entries — resolution MUST stay
+// entry-scoped: fillEntryCdp finds the labelRegex match within THIS entry's fields and fills
+// through the fkit-prefixed composed wrapperSel) + the "I am fluent" checkbox. deleteOnNoMatch.
+const LANGUAGE_MAP = [
+  { field: "language", widget: "dropdown", key: "language", path: "language" },
+  { labelRegex: /reading proficiency/i, name: "readingProficiency", widget: "dropdown", key: "reading", path: "reading" },
+  { labelRegex: /speaking proficiency/i, name: "speakingProficiency", widget: "dropdown", key: "speaking", path: "speaking" },
+  { labelRegex: /writing proficiency/i, name: "writingProficiency", widget: "dropdown", key: "writing", path: "writing" },
+  // LAST for safety-in-principle: fill + record the proficiencies BEFORE touching the checkbox.
+  // (Recon MutationObserver: on Magna the proficiency dropdowns STAY visible + interactive when
+  // "I am fluent" is checked — no hide — so the order is harmless either way; NOT because checking
+  // it hides them.) `_allFluent` is SW-computed by prepareProfile (isFluent × 3).
+  { field: "native", widget: "checkbox", key: "_allFluent", path: "_allFluent" }
+];
 
 // Fill one entry's mapped fields. Re-reads act.repeatingScan() FRESH per field — a
 // commit can re-render the entry subtree and orphan a held descriptor (the recon's
@@ -1245,5 +1260,5 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }
