@@ -663,47 +663,6 @@ function cdpFocusInputById(id) {
 
 // ── Typeahead reads (M25 recon + port) ──────────────────────────────────────
 
-// All typeahead-classified wrappers on the page, INCLUDING inside repeating
-// entries (page-2 fieldOfStudy/certification live in entries; a document-order
-// query on the duplicated formField-* id resolves entry 1). `source` excluded —
-// hierarchical is a different code path (own recon + milestone).
-function cdpScanTypeaheads() {
-  const isVisible = (el) => {
-    if (!el || !el.getBoundingClientRect) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return false;
-    const cs = window.getComputedStyle(el);
-    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
-  };
-  const out = [];
-  for (const w of document.querySelectorAll('[data-automation-id^="formField-"]')) {
-    const id = w.getAttribute("data-automation-id");
-    const fieldName = id.slice("formField-".length);
-    if (fieldName === "source") continue;
-    if (!w.querySelector('[data-uxi-widget-type="multiselect"]')) continue;
-    const legend = w.querySelector("legend");
-    let label = legend ? legend.textContent.trim() : null;
-    if (!label) { for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) { label = t; break; } } }
-    const entry = w.closest('[data-fkit-id$="--null"]');
-    const sb = w.querySelector('input[data-automation-id="searchBox"]');
-    const opener =
-      (w.querySelector('[data-automation-id="multiselectInputContainer"]') && "multiselectInputContainer") ||
-      (w.querySelector('[data-uxi-widget-type="selectinput"]') && "selectinput") ||
-      (w.querySelector("input") && "input") || "wrapper";
-    out.push({
-      wrapperSel: '[data-automation-id="' + id + '"]',
-      fieldName,
-      label: label || null,
-      entryFkitId: entry ? entry.getAttribute("data-fkit-id") : null,
-      chips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim()),
-      searchBoxPresent: !!sb,
-      searchBoxVisible: !!(sb && isVisible(sb)),
-      opener
-    });
-  }
-  return out;
-}
-
 // Full typeahead state, fresh each call. Reports the option set through BOTH
 // candidate scopes — the searchBox's aria-controls target AND the page-wide
 // visible scrape (excluding selectedItem chips, the M22 settlePoll mirror) — so

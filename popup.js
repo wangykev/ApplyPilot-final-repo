@@ -141,85 +141,6 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
   });
 });
 
-// TYPEAHEAD RECON (M25 Step 1): probe one chipless typeahead on THIS page while
-// hidden (filter/settle/commit/chip/banner + option-scope). Pre-filled typeaheads
-// are reported read-only. Minimize within 60s; output is [TA-RECON] in the SW console.
-document.getElementById("cdp-ta-recon").addEventListener("click", () => {
-  setStatus("Typeahead recon… MINIMIZE the window now (60s window). Findings land in the service worker console as [TA-RECON].");
-  chrome.runtime.sendMessage({ type: "RUN_CDP_TA_RECON" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
-    if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
-    } else if (resp.ok === false) {
-      setStatus("Typeahead recon failed: " + resp.error + " — see the service worker console.");
-    } else if (resp.probed === false) {
-      setStatus("No chipless typeahead on this page — pre-state captured. See [TA-RECON] in the SW console.");
-    } else {
-      setStatus(`Typeahead recon done — ${resp.errors} probe error(s). Paste the [TA-RECON] summary from the SW console.`);
-    }
-  });
-});
-
-// TARGETED TYPEAHEAD FILL (M25 verify harness): fill ONE typeahead matched by
-// label regex through the CDP brain while hidden. Minimize within 60s; the
-// result + settle trace land as [CDP-TA] in the SW console.
-document.getElementById("cdp-fill-ta").addEventListener("click", () => {
-  const labelRegex = document.getElementById("ta-label").value.trim();
-  if (!labelRegex) { setStatus("Enter a label regex first (e.g. Field of Study)."); return; }
-  setStatus(`CDP typeahead fill ("${labelRegex}")… MINIMIZE now (60s). See [CDP-TA] in the service worker console.`);
-  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_TA", labelRegex }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
-    if (resp.ok === false && resp.error === "no-profile") {
-      setStatus('No profile in storage — click "Load default profile" first.');
-    } else if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
-    } else if (resp.ok === false) {
-      setStatus("Typeahead fill failed: " + resp.error + " — see the service worker console.");
-    } else {
-      setStatus(`Typeahead fill: ${resp.status}${resp.flag ? ` [${resp.flag}]` : ""}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-TA].`);
-    }
-  });
-});
-
-// OVERWRITE RECON (M27 Step 0): probe the populated-field model on a hand-seeded
-// WRONG chip — searchBox-while-populated, clearSearch preserves the chip, commit
-// REPLACE vs ADD. Minimize within 60s; output is [OVR-RECON] in the SW console.
-document.getElementById("cdp-overwrite-recon").addEventListener("click", () => {
-  setStatus("Overwrite recon… HAND-SEED a WRONG typeahead value first, then MINIMIZE now (60s). Findings land in the service worker console as [OVR-RECON].");
-  chrome.runtime.sendMessage({ type: "RUN_CDP_OVERWRITE_RECON" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
-    if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
-    } else if (resp.ok === false) {
-      setStatus("Overwrite recon failed: " + resp.error + " — see the service worker console.");
-    } else if (resp.probed === false) {
-      setStatus("No POPULATED typeahead — hand-seed a WRONG value first, then re-run. See [OVR-RECON] in the SW console.");
-    } else {
-      setStatus(`Overwrite recon: commit=${resp.verdict ? resp.verdict.commitBehavior : "?"}, Commit C needed=${resp.verdict ? resp.verdict.commitCNeeded : "?"}. Paste the [OVR-RECON] summary from the SW console.`);
-    }
-  });
-});
-
-// SOURCE OVERWRITE RECON (M27 Step 0, source half): prove clearSourceSearch keeps
-// a seeded source chip. Minimize within 60s; output is [OVR-SRC-RECON] in the SW console.
-document.getElementById("cdp-source-overwrite-recon").addEventListener("click", () => {
-  setStatus("Source overwrite recon… HAND-SEED a 'How did you hear' value first, then MINIMIZE now (60s). Findings land in the service worker console as [OVR-SRC-RECON].");
-  chrome.runtime.sendMessage({ type: "RUN_CDP_SOURCE_OVERWRITE_RECON" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
-    if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
-    } else if (resp.ok === false && resp.error === "no-candidates") {
-      setStatus('No how_did_you_hear defaults — click "Load default profile" first.');
-    } else if (resp.ok === false) {
-      setStatus("Source overwrite recon failed: " + resp.error + " — see the service worker console.");
-    } else if (resp.probed === false) {
-      setStatus("No source chip — hand-seed a 'How did you hear' value first, then re-run. See [OVR-SRC-RECON].");
-    } else {
-      setStatus(`Source overwrite recon: clearSourceSearch keeps chip=${resp.verdict ? resp.verdict.clearSourceSearchPreservesChip : "?"}. Paste the [OVR-SRC-RECON] summary from the SW console.`);
-    }
-  });
-});
-
 // SESSION RECON (M30 Step 0): read-only static snapshot to classify live-form vs
 // logged-out/expired. No minimize. Run on a VALID form + a LOGGED-OUT state, diff.
 document.getElementById("cdp-session-recon").addEventListener("click", () => {
@@ -231,26 +152,6 @@ document.getElementById("cdp-session-recon").addEventListener("click", () => {
     } else {
       const s = resp.snapshot || {};
       setStatus(`Session recon: fields=${s.formFieldCount}, login=${s.passwordInputPresent || s.signInButtonPresent}, vps=${s.vpsErrorPresent}, sessionBanner=${s.sessionBanner}. Paste [SESSION-RECON] from the SW console.`);
-    }
-  });
-});
-
-// SOURCE RECON (tree picker, backlog C — Phase A, map-only): characterize the
-// "How did you hear about us?" hierarchical picker hidden (path / tree / where
-// LinkedIn lives / expand mechanism / commit-signal attrs). Never selects a leaf.
-// Minimize within 60s; output is [CDP-SRC-RECON] in the SW console.
-document.getElementById("cdp-source-recon").addEventListener("click", () => {
-  setStatus("Source recon (map only)… MINIMIZE the window now (60s window). Findings land in the service worker console as [CDP-SRC-RECON].");
-  chrome.runtime.sendMessage({ type: "RUN_CDP_SOURCE_RECON" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
-    if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
-    } else if (resp.ok === false) {
-      setStatus("Source recon failed: " + resp.error + " — see the service worker console.");
-    } else if (resp.present === false) {
-      setStatus("No source field on this page — navigate to My Information and re-run.");
-    } else {
-      setStatus(`Source recon done (${resp.path} path, ${resp.errors} probe error(s)). Paste the [CDP-SRC-RECON] summary from the SW console.`);
     }
   });
 });

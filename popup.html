@@ -40,40 +40,13 @@
          clean transition (page-2 fill deferred). NOTE: on a LIVE session this advances
          the application to page 2. Minimize within 60s; [CDP-WALK] in the SW console. -->
     <button id="cdp-walk">CDP fill + advance / session check (minimize!)</button>
-    <!-- TYPEAHEAD RECON (M25 Step 1): probe ONE chipless typeahead hidden — filter
-         trigger, settle timing, keyboard commit + chip signal, no-match banner,
-         option-scope (aria-controls vs page-wide). Run on My Experience (Field of
-         Study virgin → ends holding "Other", the desired value) and once on My
-         Information (pre-filled countryPhoneCode is reported read-only). Minimize
-         within 60s; results land in the SW console as [TA-RECON]. -->
-    <button id="cdp-ta-recon">CDP recon: typeahead (minimize!)</button>
-    <!-- M25 verify harness: fill ONE typeahead (matched by label regex) through the
-         CDP brain while hidden — reaches entry fields (Field of Study, Certification)
-         without the multi-entry machinery. Minimize within 60s; [CDP-TA] in SW console. -->
-    <label for="ta-label">CDP typeahead target (label regex):</label>
-    <input id="ta-label" type="text" placeholder="e.g. Field of Study">
-    <button id="cdp-fill-ta">CDP fill one typeahead (minimize!)</button>
-    <!-- OVERWRITE RECON (M27 Step 0): probe the populated-field model. HAND-SEED a
-         WRONG value into a typeahead (e.g. countryPhoneCode) FIRST, then click and
-         minimize within 60s. Confirms searchBox-while-populated, that clearSearch
-         keeps the chip, and whether a commit REPLACES vs ADDS a chip (the latter
-         decides if residual-chip cleanup is needed). [OVR-RECON] in the SW console. -->
-    <button id="cdp-overwrite-recon">CDP recon: overwrite model (minimize!)</button>
-    <!-- SOURCE OVERWRITE RECON (M27 Step 0, source half): prove clearSourceSearch
-         keeps a seeded source chip. HAND-SEED a value into "How did you hear about
-         us?" first, then click and minimize within 60s. [OVR-SRC-RECON] in the SW
-         console. The (a2) result gates Commit B's source no-match path. -->
-    <button id="cdp-source-overwrite-recon">CDP recon: source overwrite (minimize!)</button>
+    <!-- Label/field regex for "CDP fill one date" below (the remaining fill-one harness). -->
+    <label for="ta-label">CDP fill-one target (label/field regex):</label>
+    <input id="ta-label" type="text" placeholder="e.g. issuedDate">
     <!-- SESSION RECON (M30 Step 0): read-only snapshot to find the signal that tells a
          live apply form from a logged-out/expired state. NO minimize needed. Run once
          on a VALID form and once LOGGED-OUT/stale; paste both [SESSION-RECON] blocks. -->
     <button id="cdp-session-recon">CDP recon: session state (no minimize)</button>
-    <!-- SOURCE RECON (tree picker, backlog C — Phase A, MAP ONLY, no commit): on My
-         Information, characterize the "How did you hear about us?" hierarchical picker
-         hidden — opens, maps the tree, locates LinkedIn, tests the expand mechanism,
-         reads commit-signal attributes. Never selects a leaf. Minimize within 60s;
-         [CDP-SRC-RECON] in the SW console. -->
-    <button id="cdp-source-recon">CDP recon: source map (minimize!)</button>
     <!-- SOURCE FILL (backlog C — Phase B): fill the "How did you hear about us?" picker
          via the typeahead-style source brain HIDDEN, candidates from
          defaults.how_did_you_hear (preferred LinkedIn). Minimize within 60s; [CDP-SRC]
