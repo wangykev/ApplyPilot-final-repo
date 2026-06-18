@@ -815,6 +815,89 @@ test("typeahead: first candidate to commit wins — later candidates never typed
   assert.deepStrictEqual(typed, ["United States of America (+1)"]);
 });
 
+// ── M36.1 tier-aware pre-filled guard ────────────────────────────────────────
+// A pre-fill matching a LOWER tier was kept priority-blind (the live fieldOfStudy
+// bug: a stale tier-3 "electrical engineering" kept over the reordered tier-1
+// "Other"). Now: tier 0 → keep, ZERO actuation (countryPhoneCode auto-derive);
+// tier k>0 → walk only the HIGHER tiers and overwrite to the BEST offered, keeping
+// the pre-fill if none is offered; tier -1 → full overwrite walk (unchanged).
+const taTypedQueries = (act) => act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+
+test('INVARIANT (M36.1): a tier-0 pre-fill is KEPT with ZERO actuation — countryPhoneCode auto-derive is never re-typed', async () => {
+  // The chip carries the (+1) suffix; normalize() strips it, so it is tier 0 vs the
+  // tiered candidate list — keep, no open/clear/type/Enter.
+  const act = makeFakeAct([taField({ chips: ["United States of America (+1)"] })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America", "United States"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "prefilled-kept");
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.strictEqual(act.log.length, 0, "a tier-0 (top) pre-fill must never be actuated");
+});
+
+test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available, not first-that-lands)", async () => {
+  // The live fieldOfStudy reorder: pre-fill = tier-3 "electrical engineering"; tier-1
+  // "Other" AND tier-2 "computer engineering" are BOTH offered; tier-0 is NOT. Must
+  // upgrade to tier-1 "Other" (the highest offered) — NOT tier-2.
+  const field = taField({
+    chips: ["electrical engineering"],
+    filterMap: {
+      "Electrical and Computer Engineering": { banner: true },   // tier 0 — not offered
+      "Other": { autoCommit: "Other" },                          // tier 1 — offered
+      "computer engineering": { autoCommit: "computer engineering" } // tier 2 — also offered
+    }
+  });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering", "electrical engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "overwrite-success");
+  assert.strictEqual(rec.after, "Other", "the HIGHEST offered tier, NOT tier-2 'computer engineering'");
+  assert.deepStrictEqual(rec.overwrite, { original: "electrical engineering", refilled: true });
+  // priority order proven: tried tier-0 then tier-1, STOPPED (tier-2 never typed); the
+  // pre-fill's own tier-3 is NEVER re-searched.
+  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "Other"]);
+});
+
+test("M36.1 typeahead k>0: nothing higher offered → KEEP the pre-fill (prefilled-better-tier-unavailable) — NOT zero-actuation", async () => {
+  // Pre-fill = tier-1 "Other"; the only higher tier (tier-0) is NOT offered → "Other"
+  // is the best available → kept, flagged. It DID actuate (searched tier-0).
+  const field = taField({
+    chips: ["Other"],
+    filterMap: { "Electrical and Computer Engineering": { banner: true } } // tier 0 not offered
+  });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
+  assert.strictEqual(rec.after, "Other", "the pre-fill (best available tier) is kept");
+  assert.deepStrictEqual(field.chips, ["Other"], "chip unchanged — never re-committed");
+  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering"], "DID search the higher tier (not zero-actuation); never re-searched its own tier");
+});
+
+test("M36.1 typeahead k===-1: a mismatched pre-fill walks the FULL list (down to the last tier) — unchanged from M27", async () => {
+  // Pre-fill matches NO candidate → genuine mismatch → full overwrite walk; only the
+  // LAST tier is offered, and it commits — proving the full list is in scope (unlike
+  // k>0, which excludes the pre-fill's tier and below).
+  const field = taField({
+    chips: ["Mechanical Engineering"], // not in the candidate list
+    filterMap: {
+      "Electrical and Computer Engineering": { banner: true }, // tier 0
+      "computer engineering": { banner: true },                // tier 1
+      "Other": { autoCommit: "Other" }                         // tier 2 (last) — offered
+    }
+  });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "computer engineering", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "overwrite-success");
+  assert.strictEqual(rec.after, "Other");
+  assert.deepStrictEqual(rec.overwrite, { original: "Mechanical Engineering", refilled: true });
+  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "computer engineering", "Other"], "full list walked incl. the last tier");
+});
+
 // ── focus hygiene (M25 leak fix) — the abort guard closes the bug CLASS ──────
 // A banner drops searchBox focus; without re-asserting + verifying focus, the
 // next candidate's Ctrl+A hits the page, the query never lands, and a bare
@@ -1004,6 +1087,31 @@ test("source overwrite: no candidate matches → needs_review / overwrite-nomatc
   assert.strictEqual(rec.after, "Family");
   assert.deepStrictEqual(field.chips, ["Family"], "original source chip never destroyed");
   assert.strictEqual(field._value, "", "leftover source filter text cleared");
+});
+
+// M36.1 tier-aware pre-filled guard — source, in LOCKSTEP with the typeahead tests above.
+const srcTypedQueries = (act) => act.log.filter(([m]) => m === "typeInSourceSearch").map(([, t]) => t);
+
+test("M36.1 source k>0: upgrades to the HIGHEST offered tier (lockstep)", async () => {
+  // Pre-fill = tier-2 "Friend"; tier-0 "LinkedIn" AND tier-1 "Other" both offered →
+  // upgrade to tier-0 "LinkedIn" (the highest), STOP (tier-1 never tried).
+  const field = srcField({ chips: ["Friend"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" }, Other: { autoCommit: "Other" } } });
+  const { rec, act } = await runSource(field, ["LinkedIn", "Other", "Friend"]);
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "overwrite-success");
+  assert.strictEqual(rec.after, "LinkedIn", "the HIGHEST offered tier, NOT tier-1 'Other'");
+  assert.deepStrictEqual(rec.overwrite, { original: "Friend", refilled: true });
+  assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn"], "stopped at the highest offered; tier-1/own tier never searched");
+});
+
+test("M36.1 source k>0: nothing higher offered → KEEP the pre-fill (prefilled-better-tier-unavailable), DID actuate (lockstep)", async () => {
+  const field = srcField({ chips: ["Other"], filterMap: { LinkedIn: { banner: true } } }); // tier-0 not offered
+  const { rec, act } = await runSource(field, ["LinkedIn", "Other"]);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
+  assert.strictEqual(rec.after, "Other", "the pre-fill (best available tier) is kept");
+  assert.deepStrictEqual(field.chips, ["Other"], "chip unchanged — never re-committed");
+  assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn"], "DID search the higher tier (not zero-actuation)");
 });
 
 test("source: containment auto-commit → filled_review + autocommit-containment (lockstep with typeahead)", async () => {

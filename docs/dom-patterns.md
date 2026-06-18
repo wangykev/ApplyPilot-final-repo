@@ -964,3 +964,38 @@ M34 `fillDateCompositeCdp` UNCHANGED, then ported `EDUCATION_MAP` (year-only fro
 - 121 tests (the M32b "date field DEFERRED — zero actuation" test replaced by 3 segment-WRITE tests:
   M/Y, M/D/Y-Certs-shape, Education-year-coexists — asserting the segments were ACTUALLY typed, not just
   `status:"filled"`).
+
+## 2026-06-17 — Magna wd3, HIDDEN: tier-aware pre-filled guard (M36.1) — a reordered profile takes effect
+
+The CDP typeahead/source pre-filled guard kept a chip if it matched ANY candidate (`candidates.some`),
+**priority-blind**. Live bug: a `field_of_study` reorder (operator moved "electrical engineering" to
+tier 3, put "Other" at tier 1) had NO effect — the form's stale tier-3 "Electrical Engineering" chip was
+`prefilled-kept`. Fix is tier-aware (typeahead + source in lockstep).
+
+- **Tier index drives the decision.** `k` = first candidate the pre-fill exact-normalize-matches.
+  - **k===0** → already the top choice → KEEP, zero actuation (`prefilled-kept`). countryPhoneCode is the
+    canonical case: Workday auto-derives "United States of America (+1)" from Country and `normalize()`
+    strips the `(+1)`, so the chip is tier 0 vs the tiered profile list. **Only k===0 is zero-actuation.**
+  - **k>0** → walk ONLY `candidates.slice(0,k)` (the higher tiers, in priority order) and commit the
+    FIRST that the form offers = the **highest-available** upgrade (`overwrite-success`). The walk's
+    transition-aware commit detection (`chipSetChanged` vs the pre-fill) cleanly sees the new chip. If NO
+    higher tier is offered, the walk-end keeps the pre-fill via `overwriteNoMatchResting(keptLowerTier)`
+    → `filled` / **`prefilled-better-tier-unavailable`** (honest: the value IS a real tier hit, NOT a
+    no-match). This path SEARCHED the higher tiers → it is NOT free; a lower-tier-but-best field
+    re-searches on every re-run (bounded by tier count).
+  - **k===-1** (pre-fill matches no candidate) → unchanged full overwrite walk (M27).
+- **LIVE-VERIFIED (Magna page 2, hidden), the exact fieldOfStudy repro across two runs:**
+  - Run 1: chip "Electrical Engineering" (tier 3) → **overwrote to "Other"** (tier 1; tier-0 "Electrical
+    and Computer Engineering" is NOT a Magna option) — `filled_review` / `overwrite-success`,
+    `overwrite.original: "Electrical Engineering"`, `enter-commit on "Other"`.
+  - Run 2 (idempotent): chip now "Other" (tier 1), tier-0 still not offered → **kept** `filled` /
+    `prefilled-better-tier-unavailable` ("no higher-priority tier is offered by the form").
+  - countryPhoneCode "United States of America (+1)" + source "LinkedIn" → `prefilled-kept`, ZERO
+    actuation (the tier-0 path is byte-identical to before — regression intact).
+- **Dropdown deliberately left priority-blind** (`dropdown-prefilled-kept` unchanged): a tier-aware
+  dropdown keep would re-open the cold 200+-item list on every non-tier-0 re-run — exactly the cost
+  M27.C's keep-guard avoids, and tiered dropdowns normally have non-option top tiers (live: `degree`
+  correctly kept "Bachelors", tiers 0/1 not options). Revisit only on an observed live dropdown mis-keep.
+- 127 tests (6 new): a named tier-0 zero-actuation INVARIANT; k>0 highest-offered (tier-1 over tier-2,
+  proving priority order + never re-searching its own tier) for typeahead AND source; k>0 nothing-higher
+  → keep; k===-1 mismatch walks the full list. The pre-fill values mirror the live fieldOfStudy reorder.

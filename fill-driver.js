@@ -101,13 +101,27 @@ function chipSetChanged(priorChips, chips) {
 // typeahead+source in lockstep (the ONLY differences between the two walks).
 // clear is the recon-proven chip-PRESERVING Ctrl+A+Delete (clearSearch /
 // clearSourceSearch); the best-effort focus is non-actuating beyond the clear.
-async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets) {
+// keptLowerTier (M36.1): the pre-fill EXACT-matched a LOWER candidate tier and the
+// walk over the HIGHER tiers committed nothing (no higher tier is offered by the
+// form) → the pre-fill IS the best available answer. KEEP it `filled` (the value is
+// a real tier hit, NOT a no-match), flagged `prefilled-better-tier-unavailable` so
+// review sees it isn't the top tier — honest taxonomy. (This path DID actuate: it
+// searched every higher tier; only the tier-0 keep skips actuation entirely.)
+async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier) {
   const original = priorChips.join("; ");
   const focused = await ensureFocusedFn();
   if (focused) { await clearFn(); await act.delay(budgets.taActionSettleMs); }
   await act.pressEscape();
   let endChips = priorChips;
   try { const st = await readFn(loc); if (st && st.chips) endChips = st.chips; } catch (e) { /* keep priorChips */ }
+  if (keptLowerTier) {
+    return {
+      status: "filled", after: endChips.length ? endChips.join("; ") : original, verified: true,
+      matchTier: "pre-filled", flag: "prefilled-better-tier-unavailable", confidence: "high",
+      detail: `kept pre-fill "${original}" — matches a candidate tier, but no higher-priority tier is offered by the form`,
+      captured_options: lastOptions || undefined, settle_trace: trace
+    };
+  }
   return {
     status: "needs_review", after: endChips.length ? endChips.join("; ") : original, verified: false,
     flag: "overwrite-nomatch-original-kept", confidence: "none",
@@ -494,20 +508,30 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   const pre = await act.readTypeahead(loc);
   if (!pre) return { status: "error", detail: "typeahead wrapper not found" };
 
-  // Pre-filled guard FIRST (countryPhoneCode: Workday auto-derives it from
-  // Country, so an already-correct chip is the COMMON case). EXACT match → keep
-  // with ZERO actuation (re-typing a correct value is the duplicate/clear failure
-  // mode; a same-value race with Workday's auto-derivation is benign). A
-  // MISMATCHED pre-fill → OVERWRITE (M27 Commit B): non-destructive — recon proved
-  // search-while-populated commits REPLACE the chip, so fall through into the walk
-  // (the original stays until a new value commits; a no-match leaves it intact).
+  // Pre-filled guard — TIER-AWARE (M36.1). countryPhoneCode is auto-derived by
+  // Workday from Country, so an already-correct chip is the COMMON case. Find the
+  // pre-fill's matched TIER (the first candidate it exact-normalize-matches):
+  //   • tier 0  → the pre-fill is already the most-specific choice → KEEP, ZERO
+  //     actuation (countryPhoneCode: its chip normalize-equals candidates[0] —
+  //     `normalize()` strips the (+1) suffix, so it's tier 0 even when the rendered
+  //     chip carries it). Re-typing a correct value is the duplicate/clear failure mode.
+  //   • tier k>0 → a LOWER tier is showing but the profile prioritizes higher ones →
+  //     try to UPGRADE: walk ONLY the higher tiers (candidates.slice(0,k), priority
+  //     order) and overwrite to the BEST the form offers; if none is offered, the
+  //     walk-end keeps the pre-fill (prefilled-better-tier-unavailable). NOT
+  //     zero-actuation — it searches every higher tier.
+  //   • tier -1 (no candidate matches the pre-fill) → genuine mismatch → full
+  //     overwrite walk (M27 Commit B): non-destructive, REPLACE-on-commit, a no-match
+  //     leaves the original intact.
   const priorChips = pre.chips.slice();
-  if (priorChips.length) {
-    const kept = priorChips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
-    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled chip matches a candidate — kept (no actuation)" };
-    // else: mismatched pre-fill — DON'T return; fall through to overwrite.
+  const preTierIndex = priorChips.length
+    ? candidates.findIndex((cand) => priorChips.some((c) => norm(c) === norm(cand)))
+    : -1;
+  if (preTierIndex === 0) {
+    return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled chip is already the top candidate — kept (no actuation)" };
   }
-  const isOverwrite = priorChips.length > 0;          // a mismatched pre-fill we're replacing (KEEP already returned)
+  const overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
+  const isOverwrite = priorChips.length > 0;          // a pre-fill we're trying to replace/upgrade (tier-0 KEEP already returned)
   const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
   const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
 
@@ -539,7 +563,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   const trace = [];
   let lastFiltered = null;
   let s = null;
-  for (const cand of candidates) {
+  for (const cand of overwriteCandidates) {
     const step = { candidate: cand };
     trace.push(step);
     // Focus hygiene: re-assert (recover) focus before touching the field. If it
@@ -680,7 +704,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   // we never deleted it): rest the field clean ({chips:[original], query:""}) and
   // flag overwrite-nomatch-original-kept (future-AI candidate).
   if (isOverwrite) {
-    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets);
+    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0);
   }
   // Empty-field honesty read: after closing the list, a final chip read so the
   // record NEVER reports after:null when the page physically holds a value —
@@ -715,16 +739,20 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   const pre = await act.readSource(loc);
   if (!pre) return { status: "error", detail: "source wrapper not found" };
 
-  // Pre-filled guard (EXACT match → keep, zero actuation). A MISMATCHED pre-fill →
-  // OVERWRITE (M27 Commit B, lockstep with fillTypeaheadCdp): recon proved the
-  // source widget is symmetric (search-while-populated, clearSourceSearch preserves
-  // the chip, commit REPLACES), so fall through into the walk.
+  // Pre-filled guard — TIER-AWARE (M36.1, lockstep with fillTypeaheadCdp). tier 0 →
+  // keep, ZERO actuation; tier k>0 → walk only the higher tiers (slice(0,k), priority
+  // order) and overwrite to the best the form offers, else keep (walk-end
+  // prefilled-better-tier-unavailable); tier -1 → genuine mismatch → full overwrite
+  // walk (recon proved source is symmetric: search-while-populated, clearSourceSearch
+  // preserves the chip, commit REPLACES).
   const priorChips = pre.chips.slice();
-  if (priorChips.length) {
-    const kept = priorChips.find((c) => candidates.some((cand) => norm(c) === norm(cand)));
-    if (kept) return { status: "filled", after: kept, verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled source chip matches a candidate — kept (no actuation)" };
-    // else: mismatched pre-fill — DON'T return; fall through to overwrite.
+  const preTierIndex = priorChips.length
+    ? candidates.findIndex((cand) => priorChips.some((c) => norm(c) === norm(cand)))
+    : -1;
+  if (preTierIndex === 0) {
+    return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled source chip is already the top candidate — kept (no actuation)" };
   }
+  const overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
   const isOverwrite = priorChips.length > 0;
   const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
   const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
@@ -753,7 +781,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   // tell (distinct from "loaded but no candidate matched"). Surfaced on the
   // walk-end no-commit return for drivePageFill's session warning.
   let optionsEverLoaded = false;
-  for (const cand of candidates) {
+  for (const cand of overwriteCandidates) {
     const step = { candidate: cand };
     trace.push(step);
     const focused = await ensureFocused();
@@ -861,7 +889,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   // Walk exhausted. Under OVERWRITE the original source chip is intact: rest the
   // field clean ({chips:[original], query:""}) and flag for review (lockstep).
   if (isOverwrite) {
-    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets);
+    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0);
   }
   await act.pressEscape();
   return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded };
