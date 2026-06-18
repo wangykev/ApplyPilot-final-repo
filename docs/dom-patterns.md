@@ -1034,3 +1034,24 @@ upload — a repeating section nested inside a repeating entry (the first such o
   operator clears them manually. Honest LEFTOVER log added.
 - **Decision:** the nested specialty FILL is **DEFERRED** (niche — most applicants have none). The
   structure above is the complete input for that build whenever it's picked up.
+
+## 2026-06-18 — Magna wd3, HIDDEN: CDP DOES drive a <textarea> (M37 Part 0 — WE gate RESOLVED)
+
+The WE `roleDescription` is a `<textarea>`; `fillTextCdp` is `<input>`-only (`focusText` targets
+`wrapperSel + " input"`, `cdpReadTextState` does `querySelector("input")`), and CDP `Input.insertText`
+on a textarea — especially with NEWLINES — was unproven. Probed both write paths with a MULTI-LINE value
+(2 lines, one `\n`: `"Recon line one — alpha\nRecon line two — bravo"`) on the live WE textarea.
+
+- **BOTH paths PASS** — full value landed WITH the newline intact (`lines===2`) AND survived a React
+  re-read (re-read after 600ms still `lines===2`):
+  - **(a) coordinate-click focus + `Input.insertText`** → PASS. (The textarea has a REAL rect — unlike the
+    masked date `-input` — so a coordinate click focuses it.)
+  - **(b) native setter via `cdpEval`** (the exact page-engine `HTMLTextAreaElement.prototype` value
+    setter + `input`+`change`) → PASS.
+- **DECISION: (a) `Input.insertText` is PREFERRED** (trusted input, consistent with `fillTextCdp`'s
+  `typeText`). **`insertText` does NOT mishandle the newline on a textarea** (the worry that drove the
+  multi-line probe is refuted). (b) stays the guaranteed fallback.
+- **Build implication:** the WE roleDescription needs only a textarea-TARGETING focus + read-back
+  (`querySelector("textarea")`, not `"input"`) reusing the SAME `typeText` (insertText); the `<input>`
+  path stays untouched (regression-safe). So WE is unblocked: focus the textarea (coordinate-click) →
+  `Input.insertText` the newline-joined `bulletsText` → read-back-verify.

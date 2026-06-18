@@ -67,6 +67,12 @@
          then restores. Run on My Experience (page 2); minimize within 60s.
          [CERT-SPECIALTY-RECON] in the SW console. -->
     <button id="cdp-cert-specialty-recon">CDP recon: cert specialties (page 2; minimize!)</button>
+    <!-- TEXTAREA RECON (M37 Part 0 — the WE gate): does CDP actuation drive a Workday
+         <textarea>? Probes the Work Experience roleDescription textarea with a MULTI-LINE
+         value (insertText vs native-setter), confirming the newline survives + React
+         survival. Run on My Experience (page 2) with ≥1 WE entry; minimize within 60s.
+         [TEXTAREA-RECON] in the SW console. -->
+    <button id="cdp-textarea-recon">CDP recon: WE textarea (page 2; minimize!)</button>
     <!-- WEBSITES FILL (M32b): the FIRST repeating-section fill on the CDP path —
          reconcile the Websites section to N + fill each entry's url (date-free; the
          section the M32 recon flagged as the clean machinery proof). Run on My

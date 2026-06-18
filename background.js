@@ -65,6 +65,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP TEXTAREA RECON (M37 Part 0 — the WE gate): does CDP actuation drive a Workday
+  // <textarea>? Probes the WE roleDescription textarea with a multi-line value via
+  // insertText vs the native-setter cdpEval. [TEXTAREA-RECON] in the SW console.
+  if (message.type === "RUN_CDP_TEXTAREA_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpTextAreaRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL WEBSITES (M32b): the FIRST repeating-section fill on the CDP path —
   // reconcile the Websites section to N + fill each entry's url (date-free) while
   // HIDDEN. Proves driveRepeatingSectionCdp; dates are deferred (Websites has none).
@@ -1588,6 +1601,94 @@ async function runCdpCertSpecialtyRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP TEXTAREA RECON (M37 Part 0 — the GATE before WE) — does CDP actuation drive
+// a Workday <textarea> (roleDescription)? fillTextCdp is <input>-only (focusText
+// targets " input", cdpReadTextState querySelector("input")), and CDP Input.insertText
+// on a textarea is UNPROVEN. Probe the first WE entry's roleDescription textarea with
+// a MULTI-LINE value (≥2 lines + \n — the real fill writes newline-joined bulletsText;
+// insertText can mishandle newlines, so single-line success is weak evidence):
+//   (a) coordinate-click focus + Input.insertText (trusted, consistent with the text path)
+//   (b) native setter via cdpEval/Runtime.evaluate (the EXACT page-engine technique —
+//       off-loop + proven page-side + handles \n trivially → the guaranteed fallback)
+// Verify the FULL value lands WITH the newline intact AND survives React (re-read after
+// a tick); restore (clear) after. Read-mostly. [TEXTAREA-RECON] in the SW console.
+// ============================================================================
+async function runCdpTextAreaRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][TEXTAREA-RECON]", ...a);
+  const TA = '[data-fkit-id^="workExperience-"][data-fkit-id$="--null"] [data-automation-id="formField-roleDescription"] textarea';
+  const MULTILINE = "Recon line one — alpha\nRecon line two — bravo"; // 2 lines, exactly one \n
+  const readTA = () => cdpEval((sel) => {
+    const t = document.querySelector(sel);
+    return t ? { value: t.value, lines: t.value.split("\n").length, focused: document.activeElement === t } : null;
+  }, TA);
+  const nativeWrite = (val) => cdpEval((sel, v) => {
+    const t = document.querySelector(sel); if (!t) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    if (t.focus) t.focus(); setter.call(t, v);
+    t.dispatchEvent(new Event("input", { bubbles: true })); t.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }, TA, val);
+  const clearTA = () => nativeWrite("");
+  // A path "passes" only if the FULL multi-line value lands (newline kept) AND survives
+  // a React re-read — not just that some text appeared.
+  const verify = async (label) => {
+    const r1 = await readTA();
+    await cdpDelay(600); // React-survival re-read (did onChange revert it?)
+    const r2 = await readTA();
+    const stuck = !!(r1 && r1.value === MULTILINE);
+    const newlineKept = !!(r1 && r1.lines === 2);
+    const survived = !!(r2 && r2.value === MULTILINE);
+    LOG(label + ":", JSON.stringify({ stuck, newlineKept, survivedReact: survived, read1: r1 && r1.value, read1Lines: r1 && r1.lines, read2Lines: r2 && r2.lines }));
+    return stuck && newlineKept && survived;
+  };
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window). Run on My Experience (page 2) with ≥1 Work Experience entry.");
+    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run, nothing probed."); return { ok: false, error: "never-hidden" }; }
+    LOG("tab is hidden — textarea recon starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+
+    const pre = await readTA();
+    if (!pre) { LOG("⚠ no Work Experience roleDescription textarea found — add a WE entry on My Experience (page 2) and re-run."); return { ok: false, error: "no-textarea" }; }
+    LOG("roleDescription textarea found (original value length " + (pre.value || "").length + "). Probing the MULTI-LINE value:", JSON.stringify(MULTILINE));
+
+    // ── (a) Input.insertText after a coordinate-click focus ──────────────────
+    await clearTA(); await cdpDelay(300);
+    let aResult = "no-rect";
+    const rect = await cdpRectReady(TA, true); // textarea is visible → real rect (unlike the masked date -input)
+    if (rect) {
+      await cdpClickAt(rect.cx, rect.cy); await cdpDelay(250);
+      const f = await readTA();
+      LOG("(a) coordinate-click focus →", (f && f.focused) ? "focused" : "NOT focused");
+      await cdpInsertText(MULTILINE); await cdpDelay(500);
+      aResult = (await verify("(a) Input.insertText (multi-line)")) ? "PASS" : "FAIL";
+    } else { LOG("(a) textarea rect not live — skipping the trusted-input path."); }
+
+    // ── (b) native setter via cdpEval (the proven page-engine technique) ──────
+    await clearTA(); await cdpDelay(300);
+    await nativeWrite(MULTILINE); await cdpDelay(500);
+    const bResult = (await verify("(b) native-setter via cdpEval (multi-line)")) ? "PASS" : "FAIL";
+
+    // ── restore + decision ───────────────────────────────────────────────────
+    await clearTA();
+    const decision = aResult === "PASS" ? "(a) Input.insertText — PREFERRED (trusted input, consistent with fillTextCdp)"
+      : bResult === "PASS" ? "(b) native-setter via cdpEval — fallback (insertText didn't keep the full multi-line value)"
+      : "NEITHER landed the full multi-line value — investigate before building WE";
+    LOG("════ TEXTAREA RECON RESULT ════");
+    LOG("(a) Input.insertText:", aResult, "| (b) native-setter via cdpEval:", bResult);
+    LOG("→ DECISION for the WE build:", decision);
+    LOG("textarea cleared (restored).");
+    return { ok: true, insertText: aResult, nativeSetter: bResult, decision };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("textarea recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

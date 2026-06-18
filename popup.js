@@ -217,6 +217,24 @@ document.getElementById("cdp-cert-specialty-recon").addEventListener("click", ()
   });
 });
 
+// TEXTAREA RECON (M37 Part 0 — WE gate): does CDP actuation drive a Workday <textarea>?
+// Run on My Experience (page 2) with ≥1 WE entry; minimize within 60s. [TEXTAREA-RECON].
+document.getElementById("cdp-textarea-recon").addEventListener("click", () => {
+  setStatus("WE textarea recon… open My Experience (page 2) with ≥1 Work Experience entry, then MINIMIZE now (60s). Findings land as [TEXTAREA-RECON] in the SW console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_TEXTAREA_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false && resp.error === "no-textarea") {
+      setStatus("No WE roleDescription textarea found — add a Work Experience entry (page 2) and re-run.");
+    } else if (resp.ok === false) {
+      setStatus("Textarea recon failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Textarea recon done — insertText: ${resp.insertText}, native-setter: ${resp.nativeSetter}. Decision: ${resp.decision}. See [TEXTAREA-RECON].`);
+    }
+  });
+});
+
 // WEBSITES FILL (M32b): the first repeating-section fill on the CDP path —
 // reconcile to N + fill each entry's url (date-free Websites). Run on My
 // Experience (page 2); minimize within 60s. Results land as [CDP-WEB] in the SW console.
