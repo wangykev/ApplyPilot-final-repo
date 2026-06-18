@@ -1074,6 +1074,7 @@ function makeFakeRepeatAct(state) {
   const byLoc = (loc) => { const hit = allFields().find((x) => x.sel === loc.wrapperSel); return hit ? hit.f : null; };
   let focusedText = null;
   let focusedInputId = null;
+  let focusedSeg = null; // { f, seg } — a focused date segment (M36)
   return {
     log,
     delay: async () => {},
@@ -1111,9 +1112,9 @@ function makeFakeRepeatAct(state) {
     },
     // text
     readTextValue: async (loc) => { const f = byLoc(loc); return f ? { value: f.value || "", focused: focusedText === f } : null; },
-    focusText: async (loc) => { log.push(["focusText", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.noFocus) return null; focusedText = f; return "cdp-click"; },
+    focusText: async (loc) => { log.push(["focusText", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.noFocus) return null; focusedText = f; focusedSeg = null; return "cdp-click"; },
     clearText: async () => { log.push(["clearText"]); if (focusedText) focusedText.value = ""; },
-    typeText: async (text) => { log.push(["typeText", text]); if (focusedText) focusedText.value = text; },
+    typeText: async (text) => { log.push(["typeText", text]); if (focusedSeg) focusedSeg.f.segments[focusedSeg.seg].value = String(text); else if (focusedText) focusedText.value = text; },
     // checkbox
     readCheckboxState: async (loc) => { const f = byLoc(loc); return { inputId: f.inputId, checked: f.checked }; },
     readChecked: async (id) => { const hit = allFields().find((x) => x.f.inputId === id); return hit ? hit.f.checked : null; },
@@ -1136,7 +1137,26 @@ function makeFakeRepeatAct(state) {
       if (!o) return false;
       f.triggerText = text; f._open = false; return true; // commit: trigger now shows the picked option
     },
-    pressEscape: async () => { log.push(["pressEscape"]); state.entries.forEach((e) => e.fields.forEach((f) => { f._open = false; })); }
+    pressEscape: async () => { log.push(["pressEscape"]); state.entries.forEach((e) => e.fields.forEach((f) => { f._open = false; })); },
+    // date segments (M36): a date field carries `segments: { Month/Day/Year: { value } }`.
+    // focusDateSegment returns the triple-click-display rung; typeDigits/typeText WRITE the
+    // focused segment's value (so a test can prove the write actually happened).
+    focusDateSegment: async (loc, seg) => {
+      log.push(["focusDateSegment", seg]);
+      const f = byLoc(loc);
+      if (!f || !f.segments || !f.segments[seg] || f.dateFocusFails) { focusedSeg = null; return null; }
+      focusedSeg = { f, seg }; focusedText = null;
+      return f.dateFocusRung || "triple-click-display";
+    },
+    readDateSegment: async (loc, seg) => {
+      const f = byLoc(loc);
+      if (!f || !f.segments || !f.segments[seg]) return null;
+      return { value: f.segments[seg].value, focused: !!(focusedSeg && focusedSeg.f === f && focusedSeg.seg === seg) };
+    },
+    typeDigits: async (text) => {
+      log.push(["typeDigits", String(text)]);
+      if (focusedSeg && !focusedSeg.f.dateTypeFails) focusedSeg.f.segments[focusedSeg.seg].value = String(text);
+    }
   };
 }
 
@@ -1206,10 +1226,14 @@ test("repeating N===0: deletes phantom entries, records a single skipped section
   assert.ok(!out.results.some((r) => /\.url$/.test(r.fieldName)));
 });
 
-test("repeating date field is DEFERRED (skipped+flagged) with ZERO actuation", async () => {
+// M36 — the M32b "date is DEFERRED / zero-actuation" invariant is INVERTED: the date branch
+// now FILLS via fillDateCompositeCdp. The flip asserts the segments were ACTUALLY WRITTEN
+// (per-segment typeDigits happened + the fake's segment values changed) — not merely
+// status:"filled" (which a fake could pass without modeling the write).
+test("repeating M/Y date now FILLS via the composite — segments ACTUALLY written (M36 un-defer)", async () => {
   const entry = { fkit: "webAddress-1--null", fields: [
     { fieldName: "url", label: "URL*", widgetType: "text", isRequired: true, value: "" },
-    { fieldName: "startDate", label: "From", widgetType: "date", isRequired: false, value: "" }
+    { fieldName: "startDate", label: "From", widgetType: "date", isRequired: false, segments: { Month: { value: "" }, Year: { value: "" } } }
   ] };
   const state = webState({ entries: [entry] });
   const fieldMap = [
@@ -1219,17 +1243,54 @@ test("repeating date field is DEFERRED (skipped+flagged) with ZERO actuation", a
   const act = makeFakeRepeatAct(state);
   const out = await driveRepeatingSectionCdp(act, {
     name: "website", headingRegex: "websites?", containerPrefix: "webAddress-",
-    items: [{ url: "https://a.example", from: "2024-01" }], fieldMap, deleteOnNoMatch: false
+    items: [{ url: "https://a.example", from: { month: "12", year: "2024" } }], fieldMap, deleteOnNoMatch: false
   }, T_BUDGETS);
   const dateRec = out.results.find((r) => /startDate$/.test(r.fieldName));
-  assert.strictEqual(dateRec.status, "skipped");
-  assert.strictEqual(dateRec.flag, "cdp-date-deferred");
-  assert.match(dateRec.detail, /CDP date unactuatable/);
-  assert.strictEqual(out.results.find((r) => /\.url$/.test(r.fieldName)).status, "filled");
-  // INVARIANT (never papered over): the date field is NEVER focused, and its value never typed.
-  const dateSel = '[data-fkit-id="webAddress-1--null"] [data-automation-id="formField-startDate"]';
-  assert.ok(!act.log.some(([m, a]) => m === "focusText" && a === dateSel), "date field must never be focused");
-  assert.ok(!act.log.some(([m, a]) => m === "typeText" && a === "2024-01"), "date value must never be typed");
+  assert.strictEqual(dateRec.status, "filled");
+  assert.strictEqual(dateRec.flag, null); // no cdp-date-deferred anymore
+  assert.strictEqual(entry.fields[1].segments.Month.value, "12"); // WRITTEN, provably
+  assert.strictEqual(entry.fields[1].segments.Year.value, "2024");
+  assert.ok(act.log.some(([m, a]) => m === "typeDigits" && a === "12"), "Month digits actually typed");
+  assert.ok(act.log.some(([m, a]) => m === "typeDigits" && a === "2024"), "Year digits actually typed");
+});
+
+test("repeating M/D/Y date fills all THREE segments in-section (the Certs shape)", async () => {
+  const entry = { fkit: "certification-1--null", fields: [
+    { fieldName: "issuedDate", label: "Issued Date", widgetType: "date", isRequired: false, segments: { Month: { value: "" }, Day: { value: "" }, Year: { value: "" } } }
+  ] };
+  const state = { prefix: "certification-", addable: true, deletable: true, newEntry: () => entry, entries: [entry] };
+  const fieldMap = [{ field: "issuedDate", widget: "date", key: "issuedDateParsed", path: "issued_date" }];
+  const out = await driveRepeatingSectionCdp(makeFakeRepeatAct(state), {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ issuedDateParsed: { month: "6", day: "15", year: "2024" } }], fieldMap, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  assert.strictEqual(out.results.find((r) => /issuedDate$/.test(r.fieldName)).status, "filled");
+  assert.deepStrictEqual(
+    [entry.fields[0].segments.Month.value, entry.fields[0].segments.Day.value, entry.fields[0].segments.Year.value],
+    ["6", "15", "2024"]);
+});
+
+test("repeating Education-shape entry: text + dropdown + YEAR date all fill (date coexists)", async () => {
+  const entry = { fkit: "education-1--null", fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Bachelors" }] },
+    { fieldName: "firstYearAttended", label: "From", widgetType: "date", isRequired: false, segments: { Year: { value: "" } } }
+  ] };
+  const state = { prefix: "education-", addable: true, deletable: true, newEntry: () => entry, entries: [entry] };
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school" },
+    { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
+    { field: "firstYearAttended", widget: "year", key: "fromYearParsed", path: "from_year" }
+  ];
+  const out = await driveRepeatingSectionCdp(makeFakeRepeatAct(state), {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU", degree: ["Bachelor of Science", "Bachelors"], fromYearParsed: "2024" }], fieldMap, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  const rec = (n) => out.results.find((r) => r.fieldName === n);
+  assert.strictEqual(rec("education[0].schoolName").after, "CMU");
+  assert.strictEqual(rec("education[0].degree").after, "Bachelors"); // tiered array → matched
+  assert.strictEqual(rec("education[0].firstYearAttended").status, "filled");
+  assert.strictEqual(entry.fields[2].segments.Year.value, "2024"); // year date WRITTEN
 });
 
 test("repeating delete-on-no-match: required no-fill entries deleted high→low", async () => {

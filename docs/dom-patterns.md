@@ -930,3 +930,37 @@ hidden on Magna page 2; the machinery (M32b) needed NO change — only `LANGUAGE
   ("deleted N extra(s)"). (Verified with a TEMPORARY profile entry, reverted after — profile.json is
   untracked, never committed.)
 - **Heading disambiguation:** `/languages?/i` matches only "Languages 3" among the page-2 section headings.
+
+## 2026-06-17 — Magna wd3, HIDDEN: dates wired into Education + Certs (M36) + nested cert Specialties surfaced
+
+Un-deferred `fillEntryCdp`'s date branch (the M32b `cdp-date-deferred` zero-actuation skip) to call the
+M34 `fillDateCompositeCdp` UNCHANGED, then ported `EDUCATION_MAP` (year-only from/to) + `CERTIFICATION_MAP`
+(M/D/Y issued/expiration). Both sections live-verified hidden on page 2.
+
+- **Year-only AND M/D/Y dates fill IN-SECTION (not just standalone, M34).** Education `firstYearAttended`
+  "2024" / `lastYearAttended` "2028" (year-only, single segment); Certs `issuedDate` 6/15/2024 /
+  `expirationDate` 6/15/2027 (M/D/Y — the 3-segment auto-advance shape that had the M34 Ctrl+A pile-up
+  bug). Every segment landed via `triple-click-display/typeChars`, parseInt read-back verified, with
+  **distinct** Month/Day/Year values (not a Month-first false pass). The M34 composite needed no change in
+  the repeating context — `fillEntryCdp` re-resolves the wrapper per entry, so the entry-scoped composed
+  selector reaches the right date wrapper.
+- **`deleteOnNoMatch` keep-fix — an abbreviated required pick that auto-commits as `filled_review` is
+  KEPT, not deleted.** The cert typeahead candidate "CPP" containment-matched the chip the form
+  auto-filled ("Certified Payroll Professional (CPP) - Multiple Recognized Providers") → `filled_review`
+  / `autocommit-containment`. The old reconcile `ok`-check (`status === "filled"` only) would have
+  `deleteOnNoMatch`-DELETED the entry, discarding a committed value. Fixed: `ok = …|| r.status ===
+  "filled_review"` — a required pick that committed ANY value (filled or filled_review) won't block Next,
+  so the entry is kept + flagged for review. `deleteOnNoMatch` still fires on `needs_review`/`error`/
+  `skipped` (the genuine no-match). Live-proven: the "CPP" entry stayed, dates filled.
+- **NEW structure surfaced — each Certification entry nests a repeating Specialties sub-section +
+  Attachments (NOT handled; recon deferred).** Beyond the top-level cert fields, a cert entry offers
+  "Add" for **Specialties** (each = a typeahead + start/end **date**) and an **Attachments** file upload.
+  This is a **repeating section nested inside a repeating entry** — a new structural pattern
+  (`driveRepeatingSectionCdp` handles one level; `cdpRepeatingScan` `PREFIXES` has no specialty prefix;
+  the profile cert schema has no `specialties`). Decided: **Specialties → recon-first round AFTER M36.1**
+  (read-only dump of the nested Add / specialty `data-fkit-id` prefix / per-specialty typeahead + the two
+  M34 date composites); **Attachments → DEFERRED** (the profile stores no per-cert document files, unlike
+  the single resume in IndexedDB — nothing to attach).
+- 121 tests (the M32b "date field DEFERRED — zero actuation" test replaced by 3 segment-WRITE tests:
+  M/Y, M/D/Y-Certs-shape, Education-year-coexists — asserting the segments were ACTUALLY typed, not just
+  `status:"filled"`).

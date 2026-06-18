@@ -235,6 +235,42 @@ document.getElementById("cdp-fill-languages").addEventListener("click", () => {
   });
 });
 
+// EDUCATION FILL (M36): reuse the repeating-section driver for Education (incl. from/to YEAR dates).
+// Run on My Experience (page 2); minimize within 60s. Results land as [CDP-EDU] in the SW console.
+document.getElementById("cdp-fill-education").addEventListener("click", () => {
+  setStatus("CDP education fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-EDU] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_EDUCATION" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Education fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Education fill done — counts: ${JSON.stringify(resp.counts)}, needs review: ${resp.needs_review}. See [CDP-EDU].`);
+    }
+  });
+});
+
+// CERTIFICATIONS FILL (M36): reuse the repeating-section driver for Certifications (incl. issued/
+// expiration M/D/Y dates). Run on My Experience (page 2); minimize within 60s. [CDP-CERT] in SW console.
+document.getElementById("cdp-fill-certifications").addEventListener("click", () => {
+  setStatus("CDP certifications fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-CERT] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_CERTIFICATIONS" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Certifications fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Certifications fill done — counts: ${JSON.stringify(resp.counts)}, needs review: ${resp.needs_review}. See [CDP-CERT].`);
+    }
+  });
+});
+
 // DATE FILL (M34 verify): fill ONE date composite matched by the label regex (reuses
 // the ta-label input) via fillDateCompositeCdp. Run on My Experience (page 2); minimize
 // within 60s. Result + per-segment focus/input trace land as [CDP-DATE] in the SW console.

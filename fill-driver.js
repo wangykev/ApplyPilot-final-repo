@@ -1002,10 +1002,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
 // (act.repeatingScan emits fd.wrapperSel = `[data-fkit-id="…"] [data-automation-id=
 // "formField-…"]` — the duplicate-formField-id rule).
 //
-// DATE/YEAR fields are DEFERRED — recorded skipped + flag "cdp-date-deferred",
-// NEVER actuated. M32 recon (Magna wd3, hidden) proved CDP cannot drive the date
-// spinbutton segments (insertText / per-char / arrow all failed read-back). This is
-// the explicit blocker handling, not a silent skip; re-probe on future Chrome revs.
+// DATE/YEAR fields fill via fillDateCompositeCdp (M34 composite, wired in M36): a
+// "YYYY" string (year-only) or { month, year, day } (M/D/Y). (The M32-era
+// cdp-date-deferred skip was removed once M33/M34 proved the date segments ARE
+// actuatable — triple-click the visible -display + per-char type, NO Ctrl+A.)
 //
 // Returns the same envelope drivePageFill returns, so the harness report code is
 // shared. Proven on Websites (date-free, one url text field/entry); the other
@@ -1031,6 +1031,26 @@ const LANGUAGE_MAP = [
   // "I am fluent" is checked — no hide — so the order is harmless either way; NOT because checking
   // it hides them.) `_allFluent` is SW-computed by prepareProfile (isFluent × 3).
   { field: "native", widget: "checkbox", key: "_allFluent", path: "_allFluent" }
+];
+
+// M36 — Education (year-only dates) + Certifications (M/D/Y dates). TODO(dup) ↔ background.js
+// EDUCATION_MAP (~2919) / CERTIFICATION_MAP (~2949). `degree`/`field_of_study` are PROFILE-side
+// tiered arrays (resolve→candidates); the year/date keys are SW-parsed by prepareProfile
+// (fromYearParsed/toYearParsed = parseYear; issuedDateParsed/expirationDateParsed = parseYearMonthDay)
+// and filled by the now-un-deferred date branch via fillDateCompositeCdp.
+const EDUCATION_MAP = [
+  { field: "schoolName", widget: "text", key: "school_or_university", path: "school_or_university" },
+  { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
+  { field: "fieldOfStudy", widget: "typeahead", key: "field_of_study", path: "field_of_study" },
+  { field: "gradeAverage", widget: "text", key: "gpa", path: "gpa" },
+  { field: "firstYearAttended", widget: "year", key: "fromYearParsed", path: "from_year" },
+  { field: "lastYearAttended", widget: "year", key: "toYearParsed", path: "to_year" }
+];
+const CERTIFICATION_MAP = [
+  { field: "certification", widget: "typeahead", key: "certification", path: "certification" },
+  { field: "certificationNumber", widget: "text", key: "certification_number", path: "certification_number" },
+  { field: "issuedDate", widget: "date", key: "issuedDateParsed", path: "issued_date" },
+  { field: "expirationDate", widget: "date", key: "expirationDateParsed", path: "expiration_date" }
 ];
 
 // Fill one entry's mapped fields. Re-reads act.repeatingScan() FRESH per field — a
@@ -1063,10 +1083,12 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     const loc = { wrapperSel: fd.wrapperSel };
     try {
       if (f.widget === "year" || f.widget === "date") {
-        // DEFERRED — CDP can't actuate date spinbuttons (M32 recon). ZERO actuation.
-        rec.status = "skipped";
-        rec.flag = "cdp-date-deferred";
-        rec.detail = "CDP date unactuatable (spinbutton segments rejected insertText/per-char/arrow in M32 recon) — deferred";
+        // M36: fill via the M34 date composite. item[f.key] is SW-parsed — a "YYYY"
+        // string (year-only) or { month, year, day } (M/D/Y); fillDateCompositeCdp
+        // accepts both. Skip cleanly when there's no value (matches the page engine).
+        const parsed = item[f.key];
+        if (!parsed) { rec.status = "skipped"; rec.detail = "no valid date at " + base + f.path; }
+        else { rec.resolved = parsed; Object.assign(rec, await fillDateCompositeCdp(act, loc, parsed, budgets)); }
       } else if (f.widget === "checkbox") {
         rec.resolved = item[f.key] === true;
         Object.assign(rec, await fillCheckboxCdp(act, loc, item[f.key] === true, budgets));
@@ -1173,7 +1195,11 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const perEntry = [];
   for (let i = 0; i < fillCount; i++) {
     const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets);
-    const ok = entryRecs.every((r) => !r.isRequired || r.status === "filled");
+    // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
+    // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
+    // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.
+    // deleteOnNoMatch fires only when a required pick has NO committed value (needs_review/error/skipped).
+    const ok = entryRecs.every((r) => !r.isRequired || r.status === "filled" || r.status === "filled_review");
     perEntry.push({ idx: i, recs: entryRecs, ok });
   }
 
@@ -1260,5 +1286,5 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

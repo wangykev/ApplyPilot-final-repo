@@ -93,6 +93,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP FILL EDUCATION (M36): reuse driveRepeatingSectionCdp; un-deferred date branch fills the
+  // from/to YEAR dates via the M34 composite. Run on My Experience (page 2). [CDP-EDU] in SW console.
+  if (message.type === "RUN_CDP_FILL_EDUCATION") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-EDU] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillEducation(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
+  // CDP FILL CERTIFICATIONS (M36): reuse driveRepeatingSectionCdp; un-deferred date branch fills the
+  // issued/expiration M/D/Y dates. deleteOnNoMatch (a non-matching cert deletes its entry). Run on My
+  // Experience (page 2). [CDP-CERT] in the SW console.
+  if (message.type === "RUN_CDP_FILL_CERTIFICATIONS") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-CERT] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillCertifications(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // TARGETED DATE FILL (M34 verify harness): fill ONE date composite located by
   // label regex via fillDateCompositeCdp HIDDEN — proves the date handler on the
   // three shapes (WE M/Y, Education year-only, Certs M/D/Y). Run on My Experience
@@ -1550,6 +1589,106 @@ async function runCdpFillLanguages(tabId, profile) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("languages fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP FILL EDUCATION (M36) — reuse driveRepeatingSectionCdp for the Education section:
+// schoolName text / degree dropdown (tiered) / fieldOfStudy typeahead / gradeAverage→gpa text /
+// from+to YEAR dates (the M34 composite, now un-deferred via fillEntryCdp). NOT deleteOnNoMatch
+// (flag for review, never delete). The clean dates-in-section proof (year dates, entry survives).
+// [CDP-EDU] in the SW console. Detaches in finally.
+// ============================================================================
+async function runCdpFillEducation(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-EDU]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    const prepared = prepareProfile(profile);
+    const items = Array.isArray(prepared.education) ? prepared.education : [];
+    LOG(`tab is hidden — education fill starting. ${items.length} meaningful entr(y/ies). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+
+    const act = makeCdpActuation();
+    const out = await driveRepeatingSectionCdp(act, {
+      name: "education", headingRegex: "education", containerPrefix: "education-",
+      items, fieldMap: EDUCATION_MAP, deleteOnNoMatch: false
+    }, DEFAULT_BUDGETS);
+
+    LOG("page:", out.url);
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
+      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+    }
+    console.table(out.results.map((r) => ({
+      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+      verified: r.verified, flag: r.flag, detail: r.detail
+    })));
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("education fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP FILL CERTIFICATIONS (M36) — reuse driveRepeatingSectionCdp for the Certifications
+// section: certification typeahead (required) / certificationNumber text / issued+expiration
+// M/D/Y dates (the M34 composite, un-deferred). deleteOnNoMatch:true (optional pick section).
+// The M/D/Y-in-section proof (3-segment auto-advance) — needs a MATCHING cert name to render.
+// [CDP-CERT] in the SW console. Detaches in finally.
+// ============================================================================
+async function runCdpFillCertifications(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-CERT]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    const prepared = prepareProfile(profile);
+    const items = Array.isArray(prepared.certifications) ? prepared.certifications : [];
+    LOG(`tab is hidden — certifications fill starting. ${items.length} meaningful cert(s). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+
+    const act = makeCdpActuation();
+    const out = await driveRepeatingSectionCdp(act, {
+      name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+      items, fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true
+    }, DEFAULT_BUDGETS);
+
+    LOG("page:", out.url);
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
+      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+    }
+    console.table(out.results.map((r) => ({
+      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+      verified: r.verified, flag: r.flag, detail: r.detail
+    })));
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("certifications fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

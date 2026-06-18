@@ -70,6 +70,14 @@
          First live exercise of the labelRegex/hashed-id resolve. Run on My Experience (page 2);
          minimize within 60s. [CDP-LANG] in the SW console. -->
     <button id="cdp-fill-languages">CDP fill languages (page 2; minimize!)</button>
+    <!-- EDUCATION FILL (M36): reuse the repeating-section driver for Education — school/degree/
+         fieldOfStudy/GPA + from/to YEAR dates (un-deferred date branch). Run on My Experience
+         (page 2); minimize within 60s. [CDP-EDU] in the SW console. -->
+    <button id="cdp-fill-education">CDP fill education (page 2; minimize!)</button>
+    <!-- CERTIFICATIONS FILL (M36): cert typeahead + number + issued/expiration M/D/Y dates
+         (un-deferred date branch). deleteOnNoMatch. Set a REAL cert name to see the M/D/Y dates
+         render in-section. Run on My Experience (page 2); minimize within 60s. [CDP-CERT]. -->
+    <button id="cdp-fill-certifications">CDP fill certifications (page 2; minimize!)</button>
     <!-- DATE FILL (M34 verify): fill ONE date composite located by the label regex
          above (reuses the "CDP typeahead target" input) via fillDateCompositeCdp —
          proves the date handler on WE M/Y, Education year-only, Certs M/D/Y. Run on
