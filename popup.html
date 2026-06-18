@@ -60,6 +60,13 @@
          minimize within 60s (the date probe actuates one segment, restored
          after). [REPEAT-RECON] in the SW console. -->
     <button id="cdp-repeat-recon">CDP recon: repeating sections (minimize!)</button>
+    <!-- CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the NESTED Specialties
+         sub-section inside a Certification entry (a repeating section within a repeating
+         entry). Mounts ONE specialty, dumps the data-fkit-id + field diff (the specialty
+         container prefix + per-specialty typeahead/start-end dates + Attachments presence),
+         then restores. Run on My Experience (page 2); minimize within 60s.
+         [CERT-SPECIALTY-RECON] in the SW console. -->
+    <button id="cdp-cert-specialty-recon">CDP recon: cert specialties (page 2; minimize!)</button>
     <!-- WEBSITES FILL (M32b): the FIRST repeating-section fill on the CDP path —
          reconcile the Websites section to N + fill each entry's url (date-free; the
          section the M32 recon flagged as the clean machinery proof). Run on My

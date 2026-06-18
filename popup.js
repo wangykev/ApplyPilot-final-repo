@@ -198,6 +198,25 @@ document.getElementById("cdp-repeat-recon").addEventListener("click", () => {
   });
 });
 
+// CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the nested Specialties
+// sub-section inside a Certification entry. Run on My Experience (page 2); minimize
+// within 60s. Findings land as [CERT-SPECIALTY-RECON] in the SW console.
+document.getElementById("cdp-cert-specialty-recon").addEventListener("click", () => {
+  setStatus("Cert-specialty recon… open My Experience (page 2), then MINIMIZE now (60s). Findings land in the SW console as [CERT-SPECIALTY-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_CERT_SPECIALTY_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Cert-specialty recon failed: " + resp.error + " — see the service worker console.");
+    } else if (!resp.mounted) {
+      setStatus("Recon ran but no specialty mounted — see [CERT-SPECIALTY-RECON]: check the cert entry's inside Add heading, fill the cert / re-run.");
+    } else {
+      setStatus(`Cert-specialty recon done (specialty entry M=${resp.specialtyIndex || "?"}). ⚠ Remove the leftover empty specialty manually on the form. Paste the [CERT-SPECIALTY-RECON] dump from the SW console.`);
+    }
+  });
+});
+
 // WEBSITES FILL (M32b): the first repeating-section fill on the CDP path —
 // reconcile to N + fill each entry's url (date-free Websites). Run on My
 // Experience (page 2); minimize within 60s. Results land as [CDP-WEB] in the SW console.

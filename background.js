@@ -52,6 +52,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the NESTED Specialties
+  // sub-section inside a Certification entry (mounts ONE specialty, dumps the diff,
+  // restores). [CERT-SPECIALTY-RECON] in the SW console. No profile needed.
+  if (message.type === "RUN_CDP_CERT_SPECIALTY_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpCertSpecialtyRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL WEBSITES (M32b): the FIRST repeating-section fill on the CDP path —
   // reconcile the Websites section to N + fill each entry's url (date-free) while
   // HIDDEN. Proves driveRepeatingSectionCdp; dates are deferred (Websites has none).
@@ -1436,6 +1449,142 @@ async function runCdpRepeatRecon(tabId) {
         : { attempted: false, reason: "no date field on this page" }
     }, null, 2));
     return { ok: true, scan, probe };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP CERT-SPECIALTY RECON (M36.2) — read-MOSTLY structure discovery of the
+// NESTED Specialties sub-section inside a Certification entry (a repeating
+// section nested inside a repeating entry — never recon'd). Attach → hidden-gate
+// → dump the cert entry → OBSERVE its inside Add buttons → mount ONE specialty
+// (bounded) → dump the before/after data-fkit-id + field DIFF (the specialty
+// container prefix + its per-specialty typeahead/start-end-date fields + entry-
+// scoping + Attachments presence) → RESTORE (delete the mounted specialty, and any
+// cert entry we added) → detach. RECON ONLY — no fill, no profile schema (those are
+// a later build milestone). Attachments are recorded, never filled (deferred — no
+// per-cert files stored). [CERT-SPECIALTY-RECON] in the SW console.
+// ============================================================================
+async function runCdpCertSpecialtyRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", ...a);
+  const act = makeCdpActuation();
+  // Poll the cert-entry scan until `pred` holds (or the ceiling) — the page mounts
+  // on its throttled hidden loop, so all waits are generous SW wall-clock.
+  const scanUntil = async (pred, ceilingMs) => {
+    const t0 = Date.now();
+    let last = await cdpEval(cdpCertSpecialtyScan);
+    while (!pred(last) && Date.now() - t0 < ceilingMs) { await cdpDelay(250); last = await cdpEval(cdpCertSpecialtyScan); }
+    return last;
+  };
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing probed.");
+      return { ok: false, error: "never-hidden" };
+    }
+    LOG("tab is hidden — cert-specialty recon starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+
+    // ── (1) ensure a cert entry exists (host for the specialty) ───────────────
+    let scan = await cdpEval(cdpCertSpecialtyScan);
+    if (!scan) return { ok: false, error: "scan-failed" };
+    let addedCert = false;
+    if (scan.certEntryCount === 0) {
+      LOG("no Certification entry present — adding one to host the specialty…");
+      const a = await act.clickSectionAdd("certifications?");
+      if (!a.ok) { LOG("could not click the Certifications Add — abort (navigate to My Experience page 2)."); return { ok: false, error: "cert-add-failed" }; }
+      scan = await scanUntil((s) => s && s.certEntryCount >= 1, 6000);
+      addedCert = !!(scan && scan.certEntryCount >= 1);
+      if (!addedCert) { LOG("Certification entry never mounted after Add — abort."); return { ok: false, error: "no-cert-entry" }; }
+    }
+    const before = scan.certEntries[0];
+    LOG("cert entry:", before.fkit, "| own field count:", before.fieldCount, "| Attachments file inputs:", before.fileInputs);
+    LOG("cert entry BEFORE — nested fkit ids:", JSON.stringify(before.nestedFkitIds));
+    LOG("cert entry BEFORE — full structure:");
+    console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(before, null, 2));
+    LOG("Add buttons INSIDE the cert entry (observe the specialty Add's heading BEFORE clicking):");
+    console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(before.addButtonsInside, null, 2));
+
+    if (!before.addButtonsInside.length) {
+      LOG("⚠ NO Add button inside the cert entry — the Specialties Add may require the cert typeahead filled first, or the structure differs. Recon stops at the BEFORE dump (read-only); fill the cert + re-run, or inspect the dump above.");
+      if (addedCert) { LOG("removing the cert entry we added…"); await act.clickDeleteEntry("certification-", 0); }
+      return { ok: true, mounted: false, note: "no-inside-add" };
+    }
+
+    // ── (2) mount ONE specialty (bounded) — by the observed heading regex ─────
+    const baseline = new Set(before.nestedFkitIds);
+    LOG('mounting one specialty via clickSectionAdd("specialt") …');
+    const m = await act.clickSectionAdd("specialt");
+    let after = before, newFkit = [];
+    if (!m.ok) {
+      LOG('⚠ clickSectionAdd("specialt") found no Add with a "Special…" heading. Check addButtonsInside above for the real heading, then re-run with that regex. (Recon read-only; nothing mounted.)');
+    } else {
+      const post = await scanUntil((s) => {
+        const c0 = s && s.certEntries[0];
+        return c0 && c0.nestedFkitIds.some((id) => !baseline.has(id));
+      }, 6000);
+      const c0 = post && post.certEntries[0];
+      if (c0) { after = c0; newFkit = c0.nestedFkitIds.filter((id) => !baseline.has(id)); }
+    }
+
+    // ── (3) dump the DIFF — the specialty structure ───────────────────────────
+    let specialtyIndex = null;
+    if (!newFkit.length) {
+      LOG("⚠ no NEW nested data-fkit-id appeared after the Add — the specialty may mount in a modal / different DOM, or the heading regex missed. AFTER dump for inspection:");
+      console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(after, null, 2));
+    } else {
+      LOG("✅ specialty mounted — NEW nested data-fkit-id(s):", JSON.stringify(newFkit));
+      // Pattern (recon finding): certification-<N>--specialties-<M>--<field>. NO `--null`
+      // container — the specialty ENTRY is the SET of --specialties-<M>--{specialtyParent,
+      // startDate,endDate} field-fkit nodes (M = the entry index).
+      const sm = newFkit[0].match(/--specialties-(\d+)--/);
+      specialtyIndex = sm ? sm[1] : null;
+      LOG("→ specialty entry fkit pattern: certification-<N>--specialties-<M>--<field> (this entry M=" + (specialtyIndex || "?") + "); NO --null container — the entry is the --specialties-" + (specialtyIndex || "M") + "--{specialtyParent,startDate,endDate} field-fkit set.");
+      const beforeIds = new Set(before.fields.map((f) => f.automationId));
+      const newFields = after.fields.filter((f) => !beforeIds.has(f.automationId));
+      LOG("NEW specialty fields (the diff — expect a typeahead + start/end date composites):");
+      console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(newFields, null, 2));
+      // entry-scoping: are the specialty formField ids duplicated vs the cert's own
+      // (the WE/Languages duplicate-id trap → the future nested fill must scope)?
+      const dupVsCert = newFields.filter((f) => beforeIds.has(f.automationId)).map((f) => f.automationId);
+      const dateFields = newFields.filter((f) => f.dateSegments.length > 0);
+      const typeaheads = newFields.filter((f) => f.widgetType === "typeahead");
+      LOG("specialty shape summary:", JSON.stringify({
+        newFieldCount: newFields.length,
+        typeaheadFields: typeaheads.map((f) => f.fieldName),
+        dateFields: dateFields.map((f) => ({ field: f.fieldName, segments: f.dateSegments })),
+        hashedIds: newFields.filter((f) => f.hashedId).map((f) => f.fieldName),
+        duplicateAutomationIdsVsCertOwn: dupVsCert,
+        attachmentsFileInputsInCertEntry: after.fileInputs
+      }, null, 2));
+    }
+
+    // ── (4) RESTORE — HONEST (auto-restore NOT wired for the nested shape) ─────
+    // The specialty entry is NOT a `--null` container (it's the --specialties-<M>--
+    // field-fkit set), so clickDeleteEntry (which keys on --null entries) can't remove
+    // it — and a proper per-cert-entry nested Delete belongs to the DEFERRED fill
+    // milestone, not a half-built one here. So we do NOT auto-delete the mounted
+    // specialty; we log it loudly. ⚠ The operator removes the leftover manually before
+    // the WE / full-page work (a stale empty specialty would confuse a full-page rescan).
+    if (newFkit.length) {
+      LOG("⚠ LEFTOVER — this recon MOUNTED an empty specialty (" + newFkit.join(", ") + ") and does NOT auto-remove it (the nested Delete is part of the deferred fill milestone). REMOVE IT MANUALLY: on the form, click Delete on the empty specialty under the cert's 'Specialties' — before running WE / a full-page fill.");
+    }
+    if (addedCert) {
+      LOG("removing the cert entry we added for the recon (a --null entry, deletable)…");
+      const d = await act.clickDeleteEntry("certification-", 0);
+      LOG(d.ok ? "✅ cert entry removed." : "⚠ could not delete the added cert entry — remove it manually.");
+    }
+    LOG("recon complete — see the BEFORE/diff dumps above. Build (schema + nested fill) is a DEFERRED milestone; Attachments deferred.");
+    return { ok: true, mounted: !!newFkit.length, specialtyIndex };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("recon aborted:", msg);

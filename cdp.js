@@ -390,6 +390,88 @@ function cdpRepeatingScan() {
   return { url: location.href, sectionsPresent: Object.keys(sections), sections, addButtons };
 }
 
+// M36.2 — read-only structure dump of the Certifications entries, for the NESTED
+// Specialties sub-section recon. Per cert entry (`certification-N--null`): ALL
+// descendant `data-fkit-id`s (raw — a mounted specialty's container surfaces here,
+// its prefix being the recon's unknown), ALL `formField-*` fields (widget/label/
+// dates/hashed/required — flat; the runner diffs before/after a mount to isolate the
+// specialty's own), the Add/Delete buttons INSIDE the entry (text + nearestHeading +
+// rect — to click the nested specialty Add/Delete directly, no page-wide heading
+// match), and the Attachments `input[type=file]` count (recorded, not filled). Self-
+// contained (cdpEval stringifies it — helpers can't be shared with cdpRepeatingScan).
+function cdpCertSpecialtyScan() {
+  const rectOf = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+             cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  };
+  const labelOf = (w) => {
+    const lg = w.querySelector("legend");
+    if (lg && lg.textContent.trim()) return lg.textContent.trim().slice(0, 60);
+    for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); }
+    return null;
+  };
+  const classify = (w) => {
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
+    if (w.querySelector('input[type="file"]')) return "file";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => {
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
+    });
+    if (textLike.length === 1) return "text";
+    return "unknown";
+  };
+  const dateSegsOf = (w) => Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]'))
+    .map((s) => s.getAttribute("data-automation-id")).filter(Boolean);
+  const isHashed = (fn) => /[0-9a-f]{8}/i.test(fn) || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(fn);
+  const requiredOf = (w) => {
+    for (const a of w.querySelectorAll("abbr")) {
+      const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || "");
+      if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true;
+    }
+    if (w.querySelector('[aria-required="true"], [data-required="true"]')) return true;
+    const le = w.querySelector("legend") || w.querySelector("label");
+    if (le && /\*\s*$/.test((le.textContent || "").trim())) return true;
+    return false;
+  };
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  const certEntries = Array.from(document.querySelectorAll('[data-fkit-id^="certification-"][data-fkit-id$="--null"]')).map((e) => {
+    const fkit = e.getAttribute("data-fkit-id");
+    const nestedFkitIds = Array.from(e.querySelectorAll("[data-fkit-id]")).map((n) => n.getAttribute("data-fkit-id"));
+    const fields = Array.from(e.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
+      const id = w.getAttribute("data-automation-id");
+      const fn = id.slice("formField-".length);
+      return { fieldName: fn, automationId: id, widgetType: classify(w), label: labelOf(w), isRequired: requiredOf(w), hashedId: isHashed(fn), dateSegments: dateSegsOf(w) };
+    });
+    const addButtonsInside = Array.from(e.querySelectorAll('[data-automation-id="add-button"]'))
+      .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), nearestHeading: nearestHeading(b), rect: rectOf(b) }));
+    const deleteButtonsInside = Array.from(e.querySelectorAll("button"))
+      .filter((b) => /^delete$/i.test((b.textContent || "").trim()))
+      .map((b) => ({ nearestHeading: nearestHeading(b), rect: rectOf(b) }));
+    const fileInputs = e.querySelectorAll('input[type="file"]').length;
+    return { fkit, nestedFkitIds, fieldCount: fields.length, fields, addButtonsInside, deleteButtonsInside, fileInputs };
+  });
+  return { url: location.href, certEntryCount: certEntries.length, certEntries };
+}
+
 // ── M32 repeating-section actuation page fns (self-contained, cdpEval'd) ──────
 // Count a section's entries — the `--null` containers ONLY (the bare prefix
 // over-matches the date sub-wrappers, e.g. workExperience-N--startDate). The

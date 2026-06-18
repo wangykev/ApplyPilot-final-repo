@@ -999,3 +999,38 @@ tier 3, put "Other" at tier 1) had NO effect — the form's stale tier-3 "Electr
 - 127 tests (6 new): a named tier-0 zero-actuation INVARIANT; k>0 highest-offered (tier-1 over tier-2,
   proving priority order + never re-searching its own tier) for typeahead AND source; k>0 nothing-higher
   → keep; k===-1 mismatch walks the full list. The pre-fill values mirror the live fieldOfStudy reorder.
+
+## 2026-06-18 — Magna wd3, HIDDEN: nested cert Specialties structure (M36.2 recon — DISCOVERED LIVE)
+
+`runCdpCertSpecialtyRecon` / `cdpCertSpecialtyScan` (read-mostly: dump cert entry → mount ONE specialty →
+dump the before/after `data-fkit-id` + field DIFF → log). Run hidden on Magna page 2; the structure is
+now fully known. **Each Certification entry hosts a REPEATING Specialties sub-section + an Attachments
+upload — a repeating section nested inside a repeating entry (the first such on any observed tenant).**
+
+- **Specialty entry fkit pattern: `certification-<N>--specialties-<M>--<field>`** (e.g.
+  `certification-54--specialties-5--specialtyParent`). **CRITICAL: NO `--null` container** — unlike every
+  top-level section entry (`education-N--null`, `certification-N--null`, …), a specialty "entry" is NOT a
+  single `--null` node; it is the SET of field-fkit nodes sharing the `--specialties-<M>--` infix (M = the
+  specialty entry index, a Workday internal counter). The Specialties SECTION parent is
+  `certification-<N>--specialties`. ⇒ the existing `cdpEntryCount`/`cdpDeleteEntryRect` (which key on
+  `[data-fkit-id$="--null"]`) DON'T apply to specialties; nested enumerate/Add/Delete need the
+  `--specialties-<M>--` infix.
+- **Per-specialty fields (3):** `specialtyParent` (typeahead, **required**, label "Specialty*", NOT
+  hashed); `startDate` + `endDate` (both `date`, full **M/D/Y** — Month/Day/Year display+input segments,
+  identical to the M34 composite). `formField-*` ids are `specialtyParent`/`startDate`/`endDate`.
+- **Add is INSIDE the cert entry** — `nearestHeading` "Specialties" (text "Add" with 0, "Add Another"
+  with ≥1; heading becomes "Specialties 1" once one exists). `clickSectionAdd("specialt")` mounted it
+  live. **But it is page-wide by heading → with multiple cert entries it hits the FIRST cert's Specialties
+  Add; the nested fill needs per-cert-entry-scoped Add/Delete.**
+- **Entry-scoping:** specialty `formField-*` ids do NOT collide with the cert's OWN fields
+  (`duplicateAutomationIdsVsCertOwn: []`) and are not hashed — BUT across MULTIPLE specialties they
+  duplicate (`formField-specialtyParent` ×N), so the future nested fill MUST scope per specialty via the
+  `--specialties-<M>--<field>` fkit (the WE/Languages composed-selector pattern).
+- **Attachments:** one `input[type=file]` (`formField-` empty fieldName, hashed, label "Attachments") —
+  DEFERRED (no per-cert files stored).
+- **Recon hygiene note:** the recon MOUNTS a specialty to reveal the structure and does **NOT auto-remove
+  it** (the specialty isn't a `--null` entry, so `clickDeleteEntry` can't; a proper per-cert nested Delete
+  is the deferred fill milestone's job — not half-built here). Each run leaves one empty specialty → the
+  operator clears them manually. Honest LEFTOVER log added.
+- **Decision:** the nested specialty FILL is **DEFERRED** (niche — most applicants have none). The
+  structure above is the complete input for that build whenever it's picked up.
