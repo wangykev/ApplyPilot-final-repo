@@ -626,11 +626,11 @@ async function cdpEvalRectReady(fn, ...args) {
   return rect && rect.w > 0 ? rect : null;
 }
 
-function cdpReadTextState(wrapperSel) {
+function cdpReadTextState(wrapperSel, tag) {
   const w = document.querySelector(wrapperSel);
-  const input = w && w.querySelector("input");
-  if (!input) return null;
-  return { value: input.value, focused: document.activeElement === input };
+  const el = w && w.querySelector(tag || "input"); // M37: "textarea" for roleDescription; default "input"
+  if (!el) return null;
+  return { value: el.value, focused: document.activeElement === el };
 }
 
 // Read a specific input by a FULL composed selector (e.g. a date segment's
@@ -1053,9 +1053,9 @@ function makeCdpActuation() {
 
     // ── text ──
     // Focus ladder (recon: cdp-click is what works; the rest are fallbacks).
-    focusText: async (loc) => {
-      const inputSel = loc.wrapperSel + " input";
-      // M29: retry the WHOLE focus ladder until the input is actually focused (or a
+    focusText: async (loc, tag) => {
+      const sel = loc.wrapperSel + " " + (tag || "input"); // M37: "textarea" for roleDescription; default "input"
+      // M29: retry the WHOLE focus ladder until the element is actually focused (or a
       // ceiling). A hidden-tab frozen-layout tick can make the input transiently
       // unfocusable (0-rect / mid-rerender) → a one-shot ladder returned null
       // ("could not focus input"). Re-attempt; the happy path returns on pass 1.
@@ -1063,27 +1063,27 @@ function makeCdpActuation() {
       const deadline = start + RECT_READY_CEILING_MS;
       let attempt = 0;
       while (true) {
-        const rect = await cdpEval(cdpRectOf, inputSel, true);
+        const rect = await cdpEval(cdpRectOf, sel, true);
         if (rect && rect.w > 0) {
           await cdpClickAt(rect.cx, rect.cy);
           await cdpDelay(250);
-          const s = await cdpEval(cdpReadTextState, loc.wrapperSel);
-          if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (cdp-click)`); return "cdp-click"; }
+          const s = await cdpEval(cdpReadTextState, loc.wrapperSel, tag);
+          if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(sel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (cdp-click)`); return "cdp-click"; }
         }
-        if (await cdpEval(cdpFocusBySel, inputSel)) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (page-focus)`); return "page-focus()"; }
+        if (await cdpEval(cdpFocusBySel, sel)) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(sel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (page-focus)`); return "page-focus()"; }
         try {
-          await cdpDomFocus(inputSel);
-          const s = await cdpEval(cdpReadTextState, loc.wrapperSel);
-          if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; }
+          await cdpDomFocus(sel);
+          const s = await cdpEval(cdpReadTextState, loc.wrapperSel, tag);
+          if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(sel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; }
         } catch (e) { /* fall through to retry / null */ }
-        if (Date.now() >= deadline) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(inputSel), `gave up after ${Date.now() - start}ms / ${attempt} retries`); return null; }
+        if (Date.now() >= deadline) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(sel), `gave up after ${Date.now() - start}ms / ${attempt} retries`); return null; }
         await cdpDelay(RECT_READY_INTERVAL_MS);
         attempt++;
       }
     },
     clearText: () => cdpSelectAllDelete(),
     typeText: (text) => cdpInsertText(text), // recon (a): trusted beforeinput+input, survives blur
-    readTextValue: (loc) => cdpEval(cdpReadTextState, loc.wrapperSel),
+    readTextValue: (loc, tag) => cdpEval(cdpReadTextState, loc.wrapperSel, tag),
 
     // ── dropdown ──
     openDropdown: async (loc) => {

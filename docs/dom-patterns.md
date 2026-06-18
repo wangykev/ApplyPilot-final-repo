@@ -1055,3 +1055,31 @@ on a textarea — especially with NEWLINES — was unproven. Probed both write p
   (`querySelector("textarea")`, not `"input"`) reusing the SAME `typeText` (insertText); the `<input>`
   path stays untouched (regression-safe). So WE is unblocked: focus the textarea (coordinate-click) →
   `Input.insertText` the newline-joined `bulletsText` → read-back-verify.
+
+## 2026-06-18 — Magna wd3, HIDDEN: Work Experience on CDP (M37 Part 1 — PROVEN LIVE, incl. dirty-state)
+
+WE filled via the SAME `driveRepeatingSectionCdp`/`fillEntryCdp` + `WORK_EXPERIENCE_MAP` (the bespoke
+section folded onto the config path). New deltas, all live-verified on Magna page 2 (3 entries × 2 runs,
+0 needs_review):
+
+- **`fillTextCdp` `tag` param** (default `"input"` → existing callers byte-identical): `focusText`/
+  `readTextValue`/`cdpReadTextState` target `tag`; `tag:"textarea"` drives `roleDescription` (the
+  recon-proven coordinate-click focus + `Input.insertText`, newline-intact). The `roleDescription`
+  textarea filled + `verified` multi-line on EVERY entry.
+- **`currentlyWorkHere` reconciled FIRST** (checkbox, label-click), all three states seen live:
+  false→false ("already in desired state"), false→**true** ("label-click"), true→true ("already").
+- **Conditional `endDate` via `skipWhen(item)`**: `currently_work_here:true` → endDate `skipped`
+  ("currently_work_here = true → no end date (To box removed)"), ZERO actuation; otherwise the M/Y date
+  fills. (entry[1] true → skipped; entries [0]/[2] false → 8/2025, 8/2023.)
+- **`waitForPresence` poll-until-present** for the endDate remount (uncheck case) — bounded re-scan, NEVER
+  a fixed wait (M29). Unit-pinned with a with-poll(fills)-vs-without-poll(errors) test; the live runs
+  here didn't need it (no checked→unchecked transition), but it's the safety net for that path.
+- **M/Y dates** (startDate + endDate) fill via the M34 composite (triple-click-display/typeChars), distinct
+  per entry; **entry-scoping** held across 3 entries (own jobTitle/company/location/dates/description).
+- **Dirty-state robustness (run 2 — the strongest proof):** the operator added WRONG values + checked
+  random boxes, then re-ran → **reconcile-DOWN deleted the extra entry** ("deleted 1 extra(s); 3/3"),
+  **every field overwrote the wrong value back to correct**, and checkboxes reconciled idempotently. So
+  the fill reconciles from an ARBITRARY starting state, not just a clean page (re-exercising the M36.1/M27
+  overwrite path in anger).
+- 132 tests (5 new WE). `WORK_EXPERIENCE_MAP` is the fill-driver config shape (TODO(dup): the page
+  engine's `fillWorkExperienceEntry` is bespoke — INTENT-lockstep, not 1:1).

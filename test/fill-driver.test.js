@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, fillDateCompositeCdp } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1183,28 +1183,37 @@ function makeFakeRepeatAct(state) {
   let focusedText = null;
   let focusedInputId = null;
   let focusedSeg = null; // { f, seg } — a focused date segment (M36)
+  let scanCount = 0;     // M37: a field with `appearsAtScan: N` is OMITTED until the Nth
+                         // repeatingScan — models a field that REMOUNTS (WE endDate after
+                         // unchecking currentlyWorkHere) so the waitForPresence poll is testable.
   return {
     log,
     delay: async () => {},
     entryCount: async () => state.entries.length,
-    repeatingScan: async () => ({
-      url: "fake://repeat",
-      sectionsPresent: [state.prefix],
-      sections: { [state.prefix]: {
-        entryCount: state.entries.length,
-        entries: state.entries.map((e) => ({
-          entryFkitId: e.fkit, deletePresent: true, deleteRect: { w: 10, h: 10, cx: 1, cy: 1 },
-          fieldCount: e.fields.length,
-          fields: e.fields.map((f) => ({
-            fieldName: f.fieldName, automationId: "formField-" + f.fieldName,
-            widgetType: f.widgetType, label: f.label || f.fieldName, isRequired: !!f.isRequired,
-            hashedId: false, dateSegments: f.widgetType === "date" ? ["dateSectionYear-input"] : [],
-            wrapperSel: selOf(e.fkit, f.fieldName)
-          }))
-        }))
-      } },
-      addButtons: []
-    }),
+    repeatingScan: async () => {
+      scanCount++;
+      return {
+        url: "fake://repeat",
+        sectionsPresent: [state.prefix],
+        sections: { [state.prefix]: {
+          entryCount: state.entries.length,
+          entries: state.entries.map((e) => {
+            const visible = e.fields.filter((f) => !f.appearsAtScan || scanCount >= f.appearsAtScan);
+            return {
+              entryFkitId: e.fkit, deletePresent: true, deleteRect: { w: 10, h: 10, cx: 1, cy: 1 },
+              fieldCount: visible.length,
+              fields: visible.map((f) => ({
+                fieldName: f.fieldName, automationId: "formField-" + f.fieldName,
+                widgetType: f.widgetType, label: f.label || f.fieldName, isRequired: !!f.isRequired,
+                hashedId: false, dateSegments: f.widgetType === "date" ? ["dateSectionYear-input"] : [],
+                wrapperSel: selOf(e.fkit, f.fieldName)
+              }))
+            };
+          })
+        } },
+        addButtons: []
+      };
+    },
     clickSectionAdd: async (re) => {
       log.push(["clickSectionAdd", re]);
       if (!state.addable) return { ok: false };
@@ -1222,7 +1231,7 @@ function makeFakeRepeatAct(state) {
     readTextValue: async (loc) => { const f = byLoc(loc); return f ? { value: f.value || "", focused: focusedText === f } : null; },
     focusText: async (loc) => { log.push(["focusText", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.noFocus) return null; focusedText = f; focusedSeg = null; return "cdp-click"; },
     clearText: async () => { log.push(["clearText"]); if (focusedText) focusedText.value = ""; },
-    typeText: async (text) => { log.push(["typeText", text]); if (focusedSeg) focusedSeg.f.segments[focusedSeg.seg].value = String(text); else if (focusedText) focusedText.value = text; },
+    typeText: async (text) => { log.push(["typeText", text]); if (focusedSeg) focusedSeg.f.segments[focusedSeg.seg].value = String(text); else if (focusedText && !focusedText.writeFails) focusedText.value = text; }, // writeFails (M37): the write no-ops → read-back mismatch → needs_review
     // checkbox
     readCheckboxState: async (loc) => { const f = byLoc(loc); return { inputId: f.inputId, checked: f.checked }; },
     readChecked: async (id) => { const hit = allFields().find((x) => x.f.inputId === id); return hit ? hit.f.checked : null; },
@@ -1632,4 +1641,99 @@ test("languages: 'I am fluent' checkbox is processed LAST (after the proficienci
   const order = out.results.filter((r) => /^language\[0\]\./.test(r.fieldName)).map((r) => r.fieldName);
   assert.ok(order.indexOf("language[0].native") > order.indexOf("language[0].writingProficiency"),
     "native must be filled after the proficiencies");
+});
+
+// ── M37 Work Experience (textarea + currentlyWorkHere-first + conditional endDate) ──
+// WE via the SAME driveRepeatingSectionCdp/fillEntryCdp + WORK_EXPERIENCE_MAP. New deltas:
+// the `textarea` widget (roleDescription, via fillTextCdp tag="textarea"), `skipWhen`
+// (endDate when currently_work_here), and `waitForPresence` (endDate remount poll).
+const weEntry = (fkit, o) => {
+  o = o || {};
+  const fields = [
+    { fieldName: "currentlyWorkHere", label: "I currently work here", widgetType: "checkbox", inputId: fkit + "-cwh", checked: !!o.cwhChecked },
+    { fieldName: "jobTitle", label: "Job Title*", widgetType: "text", value: "" },
+    { fieldName: "companyName", label: "Company*", widgetType: "text", value: "" },
+    { fieldName: "location", label: "Location", widgetType: "text", value: "" },
+    { fieldName: "startDate", label: "From*", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } } }
+  ];
+  if (o.endDate !== "absent") fields.push({ fieldName: "endDate", label: "To", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } } });
+  fields.push({ fieldName: "roleDescription", label: "Role Description", widgetType: "textarea", value: "", writeFails: !!o.roleDescWriteFails });
+  return { fkit, fields };
+};
+const weState = (entries) => ({ prefix: "workExperience-", addable: true, deletable: true, newEntry: (i) => weEntry("workExperience-new" + i, {}), entries });
+const weItem = (o) => Object.assign({ job_title: "Engineer", company: "Acme", location: "NYC", currently_work_here: false, fromParsed: { year: "2020", month: "01" }, toParsed: { year: "2022", month: "06" }, bulletsText: "Did X\nDid Y" }, o || {});
+const runWE = async (entries, items) => {
+  const state = weState(entries);
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
+    items, fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  return { out, act, state };
+};
+const weRec = (out, i, n) => out.results.find((r) => r.fieldName === "workExperience[" + i + "]." + n);
+
+test("M37 WE: an entry fills text + currentlyWorkHere + M/Y dates + the roleDescription textarea (multi-line)", async () => {
+  const { out } = await runWE([weEntry("workExperience-0--null", { cwhChecked: false })], [weItem({ bulletsText: "Led the team\nShipped v2" })]);
+  assert.strictEqual(weRec(out, 0, "jobTitle").after, "Engineer");
+  assert.strictEqual(weRec(out, 0, "companyName").after, "Acme");
+  assert.strictEqual(weRec(out, 0, "location").after, "NYC");
+  assert.strictEqual(weRec(out, 0, "currentlyWorkHere").status, "filled"); // false → false: already in desired state
+  assert.strictEqual(weRec(out, 0, "startDate").status, "filled");
+  assert.strictEqual(weRec(out, 0, "startDate").verified, true);
+  assert.strictEqual(weRec(out, 0, "endDate").status, "filled"); // currently_work_here false → endDate fills
+  const td = weRec(out, 0, "roleDescription");
+  assert.strictEqual(td.status, "filled");
+  assert.strictEqual(td.verified, true);
+  assert.strictEqual(td.after, "Led the team\nShipped v2"); // the multi-line value — newline preserved
+});
+
+test("M37 WE: currently_work_here=true → endDate SKIPPED (skipWhen), checkbox checked, startDate still fills", async () => {
+  const { out } = await runWE([weEntry("workExperience-0--null", { cwhChecked: false })], [weItem({ currently_work_here: true })]);
+  const ed = weRec(out, 0, "endDate");
+  assert.strictEqual(ed.status, "skipped");
+  assert.match(ed.detail, /currently_work_here/);
+  assert.strictEqual(weRec(out, 0, "currentlyWorkHere").after, "true"); // reconciled to checked
+  assert.strictEqual(weRec(out, 0, "startDate").status, "filled");
+});
+
+test("M37 WE: endDate REMOUNTS (absent then present) — waitForPresence POLLS until present (vs error without it)", async () => {
+  const mk = () => weState([{ fkit: "workExperience-0--null", fields: [
+    { fieldName: "endDate", label: "To", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } }, appearsAtScan: 3 }
+  ] }]);
+  const item = { toParsed: { year: "2022", month: "06" } };
+  // WITHOUT waitForPresence: the first scanFd (scan 2) misses the not-yet-remounted endDate → error.
+  const noWait = await driveRepeatingSectionCdp(makeFakeRepeatAct(mk()), {
+    name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
+    items: [item], fieldMap: [{ field: "endDate", widget: "date", key: "toParsed", path: "to" }], deleteOnNoMatch: false
+  }, T_BUDGETS);
+  assert.strictEqual(noWait.results.find((r) => /endDate/.test(r.fieldName)).status, "error",
+    "without the poll, the not-yet-remounted endDate errors (field wrapper not found)");
+  // WITH waitForPresence: the bounded poll re-scans until endDate remounts (scan 3), then fills.
+  const withWait = await driveRepeatingSectionCdp(makeFakeRepeatAct(mk()), {
+    name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
+    items: [item], fieldMap: [{ field: "endDate", widget: "date", key: "toParsed", path: "to", waitForPresence: true }], deleteOnNoMatch: false
+  }, T_BUDGETS);
+  const ed = withWait.results.find((r) => /endDate/.test(r.fieldName));
+  assert.strictEqual(ed.status, "filled", "the bounded poll found the remounted endDate");
+  assert.strictEqual(ed.verified, true);
+});
+
+test("M37 WE: a roleDescription textarea write that doesn't stick → needs_review, NEVER silent filled", async () => {
+  const { out } = await runWE([weEntry("workExperience-0--null", { roleDescWriteFails: true })], [weItem()]);
+  const td = weRec(out, 0, "roleDescription");
+  assert.strictEqual(td.status, "needs_review");
+  assert.strictEqual(td.verified, false);
+  assert.match(td.detail, /read-back mismatch/);
+});
+
+test("M37 WE: two entries get their OWN values (entry-scoped, no bleed)", async () => {
+  const { out } = await runWE(
+    [weEntry("workExperience-0--null", {}), weEntry("workExperience-1--null", {})],
+    [weItem({ company: "Acme", bulletsText: "A1\nA2" }), weItem({ company: "Globex", bulletsText: "B1\nB2" })]
+  );
+  assert.strictEqual(weRec(out, 0, "companyName").after, "Acme");
+  assert.strictEqual(weRec(out, 1, "companyName").after, "Globex");
+  assert.strictEqual(weRec(out, 0, "roleDescription").after, "A1\nA2");
+  assert.strictEqual(weRec(out, 1, "roleDescription").after, "B1\nB2");
 });

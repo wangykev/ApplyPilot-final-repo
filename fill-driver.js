@@ -291,17 +291,21 @@ const pollCheckedIs = async (act, id, want, budgets) => {
 
 // Text: focus → trusted clear → insertText → read-back. Read-back mismatch is
 // NEVER reported as filled (the commit-verification contract of this port).
-const fillTextCdp = async (act, loc, value, budgets) => {
-  const pre = await act.readTextValue(loc);
-  if (!pre) return { status: "error", detail: "no input in wrapper" };
+// `tag` (M37) selects the element kind within the wrapper — default "input"; pass
+// "textarea" for the WE roleDescription (recon 2026-06-18: coordinate-click focus +
+// Input.insertText drives a Workday <textarea> with the newline intact + React-
+// surviving). The default keeps every existing <input> caller byte-identical.
+const fillTextCdp = async (act, loc, value, budgets, tag) => {
+  const pre = await act.readTextValue(loc, tag);
+  if (!pre) return { status: "error", detail: "no " + (tag || "input") + " in wrapper" };
   const before = pre.value;
-  const focusMethod = await act.focusText(loc);
-  if (!focusMethod) return { status: "error", detail: "could not focus input", after: before };
+  const focusMethod = await act.focusText(loc, tag);
+  if (!focusMethod) return { status: "error", detail: "could not focus " + (tag || "input"), after: before };
   await act.clearText();
   await act.delay(budgets.textReadDelayMs);
   await act.typeText(value);
   await act.delay(budgets.textReadDelayMs);
-  const read = await act.readTextValue(loc);
+  const read = await act.readTextValue(loc, tag);
   const after = read ? read.value : null;
   if (after !== value) return { status: "needs_review", after, verified: false, detail: `read-back mismatch (typed via ${focusMethod}, field shows "${after}")` };
   return { status: "filled", after, verified: true, detail: before ? `overwrote "${before}"` : null };
@@ -1081,6 +1085,28 @@ const CERTIFICATION_MAP = [
   { field: "expirationDate", widget: "date", key: "expirationDateParsed", path: "expiration_date" }
 ];
 
+// M37 — Work Experience (the bespoke section, via the same config-driven fillEntryCdp).
+// `currentlyWorkHere` is FIRST — it controls whether the endDate "To" box exists; the
+// checkbox reconcile settles the subtree before the dates. `endDate` carries skipWhen
+// (currently_work_here → Workday removes the To box, no actuation) AND waitForPresence
+// (when UNchecking, the To box REMOUNTS → POLL until present, never a fixed wait — M29).
+// `roleDescription` is a <textarea> (recon 2026-06-18: coordinate-click focus +
+// Input.insertText drives it, newline-intact + React-surviving). from/to are M/Y dates
+// (parseYearMonth → {year,month}, no day). TODO(dup): the page engine's
+// fillWorkExperienceEntry is bespoke (not this config shape) — keep INTENT in lockstep,
+// not 1:1. prepareProfile (background.js) provides fromParsed/toParsed + bulletsText.
+const WORK_EXPERIENCE_MAP = [
+  { field: "currentlyWorkHere", widget: "checkbox", key: "currently_work_here", path: "currently_work_here" },
+  { field: "jobTitle", widget: "text", key: "job_title", path: "job_title" },
+  { field: "companyName", widget: "text", key: "company", path: "company" },
+  { field: "location", widget: "text", key: "location", path: "location" },
+  { field: "startDate", widget: "date", key: "fromParsed", path: "from" },
+  { field: "endDate", widget: "date", key: "toParsed", path: "to",
+    skipWhen: (i) => i.currently_work_here === true,
+    skipDetail: "currently_work_here = true → no end date (To box removed)", waitForPresence: true },
+  { field: "roleDescription", widget: "textarea", key: "bulletsText", path: "role_description" }
+];
+
 // Fill one entry's mapped fields. Re-reads act.repeatingScan() FRESH per field — a
 // commit can re-render the entry subtree and orphan a held descriptor (the recon's
 // core warning). Resolves the field by automation-id (`f.field`) OR by label
@@ -1090,13 +1116,34 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
   const recs = [];
   const base = sectionName + "[" + idx + "].";
   for (const f of fieldMap) {
-    const scan = await act.repeatingScan();
-    const sec = scan && scan.sections ? scan.sections[prefix] : null;
-    const entry = sec && sec.entries ? sec.entries[idx] : null;
     const recName = f.name || f.field;
-    const fd = entry ? (f.labelRegex
+    // M37 skipWhen: a conditional field (WE endDate when currentlyWorkHere is checked →
+    // Workday removes the "To" box) — record skipped, ZERO actuation, no wrapper lookup.
+    if (f.skipWhen && f.skipWhen(item)) {
+      recs.push({
+        fieldName: base + recName, label: null, widgetType: f.widget === "year" ? "date" : f.widget,
+        isRequired: false, mappedPath: base + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
+        resolved: null, status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null,
+        detail: f.skipDetail || "skipped (skipWhen)"
+      });
+      await act.delay(budgets.interFieldMs); continue;
+    }
+    const findFd = (entry) => entry ? (f.labelRegex
       ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
       : entry.fields.find((x) => x.fieldName === f.field)) : null;
+    const scanFd = async () => {
+      const scan = await act.repeatingScan();
+      const sec = scan && scan.sections ? scan.sections[prefix] : null;
+      return findFd(sec && sec.entries ? sec.entries[idx] : null);
+    };
+    let fd = await scanFd();
+    // M37 waitForPresence: a field that REMOUNTS (WE endDate after UNchecking
+    // currentlyWorkHere) — POLL until present (bounded), NEVER a fixed wait (the M29
+    // poll-until-ready lesson: a sleep races the remount on the throttled hidden loop).
+    if (!fd && f.waitForPresence) {
+      const t0 = Date.now();
+      while (!fd && Date.now() - t0 < budgets.entryReconcileCeilingMs) { await act.delay(budgets.entryReconcileIntervalMs); fd = await scanFd(); }
+    }
     const rec = {
       fieldName: base + recName, label: fd ? fd.label : null,
       widgetType: f.widget === "year" ? "date" : f.widget,
@@ -1121,7 +1168,8 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
         rec.resolved = item[f.key] === true;
         Object.assign(rec, await fillCheckboxCdp(act, loc, item[f.key] === true, budgets));
       } else {
-        const r = resolve(item[f.key], f.widget);
+        // textarea (WE roleDescription) resolves like text — a plain string (bulletsText).
+        const r = resolve(item[f.key], f.widget === "textarea" ? "text" : f.widget);
         if (r.skip) {
           rec.status = "skipped";
           rec.detail = r.reason || ("empty value at " + base + f.path);
@@ -1129,6 +1177,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           const arg = r.value !== undefined ? r.value : r.candidates;
           rec.resolved = arg;
           if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
+          else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
           else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widget === "typeahead") Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets));
           else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
@@ -1314,5 +1363,5 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

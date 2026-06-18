@@ -272,6 +272,25 @@ document.getElementById("cdp-fill-languages").addEventListener("click", () => {
   });
 });
 
+// WORK EXPERIENCE FILL (M37): reuse the repeating-section driver for WE — text + currentlyWorkHere
+// checkbox + M/Y dates + the roleDescription <textarea>. Run on My Experience (page 2); minimize within
+// 60s. Results land as [CDP-WE] in the SW console.
+document.getElementById("cdp-fill-work-experience").addEventListener("click", () => {
+  setStatus("CDP work-experience fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-WE] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_WORK_EXPERIENCE" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "never-hidden") {
+      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
+    } else if (resp.ok === false) {
+      setStatus("Work-experience fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Work-experience fill done — counts: ${JSON.stringify(resp.counts)}, needs review: ${resp.needs_review}. See [CDP-WE].`);
+    }
+  });
+});
+
 // EDUCATION FILL (M36): reuse the repeating-section driver for Education (incl. from/to YEAR dates).
 // Run on My Experience (page 2); minimize within 60s. Results land as [CDP-EDU] in the SW console.
 document.getElementById("cdp-fill-education").addEventListener("click", () => {

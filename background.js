@@ -119,6 +119,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP FILL WORK EXPERIENCE (M37): reuse driveRepeatingSectionCdp; WORK_EXPERIENCE_MAP
+  // (text + currentlyWorkHere checkbox + M/Y dates + roleDescription textarea). Run on
+  // My Experience (page 2). [CDP-WE] in the SW console.
+  if (message.type === "RUN_CDP_FILL_WORK_EXPERIENCE") {
+    chrome.storage.local.get(["profile"], ({ profile }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-WE] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillWorkExperience(tab.id, profile);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL EDUCATION (M36): reuse driveRepeatingSectionCdp; un-deferred date branch fills the
   // from/to YEAR dates via the M34 composite. Run on My Experience (page 2). [CDP-EDU] in SW console.
   if (message.type === "RUN_CDP_FILL_EDUCATION") {
@@ -1839,6 +1859,57 @@ async function runCdpFillLanguages(tabId, profile) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("languages fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP FILL WORK EXPERIENCE (M37 Part 1) — the bespoke section via the SAME
+// driveRepeatingSectionCdp. WORK_EXPERIENCE_MAP fills jobTitle/companyName/location
+// (text), currentlyWorkHere FIRST (checkbox — controls the To box), from/to M/Y dates,
+// and roleDescription (<textarea> ← bulletsText, recon 2026-06-18). endDate is skipWhen
+// currently_work_here + waitForPresence (remount poll, never a fixed wait). deleteOnNoMatch
+// OFF (WE flags, never deletes). Run on My Experience (page 2). [CDP-WE] in the SW console.
+// ============================================================================
+async function runCdpFillWorkExperience(tabId, profile) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-WE]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    const prepared = prepareProfile(profile);
+    const items = Array.isArray(prepared.work_experience) ? prepared.work_experience : [];
+    LOG(`tab is hidden — work-experience fill starting. ${items.length} meaningful entr(y/ies). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+
+    const act = makeCdpActuation();
+    const out = await driveRepeatingSectionCdp(act, {
+      name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
+      items, fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false
+    }, DEFAULT_BUDGETS);
+
+    LOG("page:", out.url);
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
+      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+    }
+    console.table(out.results.map((r) => ({
+      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+      verified: r.verified, flag: r.flag, detail: r.detail
+    })));
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("work-experience fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
