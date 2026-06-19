@@ -1178,7 +1178,10 @@ test("unmapped text field → skipped 'no mapping'; file_upload → skipped", as
 function makeFakeRepeatAct(state) {
   const log = [];
   const selOf = (fkit, fieldName) => '[data-fkit-id="' + fkit + '"] [data-automation-id="formField-' + fieldName + '"]';
-  const allFields = () => state.entries.flatMap((e) => e.fields.map((f) => ({ f, sel: selOf(e.fkit, f.fieldName) })));
+  const allFields = () => [
+    ...state.entries.flatMap((e) => e.fields.map((f) => ({ f, sel: selOf(e.fkit, f.fieldName) }))),
+    ...(state.flatFields || []).map((f) => ({ f, sel: f.wrapperSel })) // M38 fold: flat (page-level) fields
+  ];
   const byLoc = (loc) => { const hit = allFields().find((x) => x.sel === loc.wrapperSel); return hit ? hit.f : null; };
   let focusedText = null;
   let focusedInputId = null;
@@ -1190,29 +1193,34 @@ function makeFakeRepeatAct(state) {
     log,
     delay: async () => {},
     entryCount: async () => state.entries.length,
+    // M38: scanPage = the FLAT (page-level) fields the fold's flat loop fills (default none).
+    scanPage: async () => ({
+      url: "fake://page", repeatingFieldCount: 0,
+      fields: (state.flatFields || []).map((f) => ({
+        fieldName: f.fieldName, label: f.label || f.fieldName, widgetType: f.widgetType,
+        isRequired: !!f.isRequired, wrapperSel: f.wrapperSel
+      }))
+    }),
     repeatingScan: async () => {
       scanCount++;
-      return {
-        url: "fake://repeat",
-        sectionsPresent: [state.prefix],
-        sections: { [state.prefix]: {
-          entryCount: state.entries.length,
-          entries: state.entries.map((e) => {
-            const visible = e.fields.filter((f) => !f.appearsAtScan || scanCount >= f.appearsAtScan);
-            return {
-              entryFkitId: e.fkit, deletePresent: true, deleteRect: { w: 10, h: 10, cx: 1, cy: 1 },
-              fieldCount: visible.length,
-              fields: visible.map((f) => ({
-                fieldName: f.fieldName, automationId: "formField-" + f.fieldName,
-                widgetType: f.widgetType, label: f.label || f.fieldName, isRequired: !!f.isRequired,
-                hashedId: false, dateSegments: f.widgetType === "date" ? ["dateSectionYear-input"] : [],
-                wrapperSel: selOf(e.fkit, f.fieldName)
-              }))
-            };
-          })
-        } },
-        addButtons: []
+      const mkEntry = (e) => {
+        const visible = e.fields.filter((f) => !f.appearsAtScan || scanCount >= f.appearsAtScan);
+        return {
+          entryFkitId: e.fkit, deletePresent: true, deleteRect: { w: 10, h: 10, cx: 1, cy: 1 },
+          fieldCount: visible.length,
+          fields: visible.map((f) => ({
+            fieldName: f.fieldName, automationId: "formField-" + f.fieldName,
+            widgetType: f.widgetType, label: f.label || f.fieldName, isRequired: !!f.isRequired,
+            hashedId: false, dateSegments: f.widgetType === "date" ? ["dateSectionYear-input"] : [],
+            wrapperSel: selOf(e.fkit, f.fieldName)
+          }))
+        };
       };
+      // Mirror REAL cdpRepeatingScan: a prefix appears in `sections` ONLY if it has ≥1
+      // entry container (empty sections omitted → drives the fold's presence-gate).
+      const sections = {};
+      if (state.entries.length > 0) sections[state.prefix] = { entryCount: state.entries.length, entries: state.entries.map(mkEntry) };
+      return { url: "fake://repeat", sectionsPresent: Object.keys(sections), sections, addButtons: state.addButtons || [] };
     },
     clickSectionAdd: async (re) => {
       log.push(["clickSectionAdd", re]);
@@ -1410,20 +1418,40 @@ test("repeating Education-shape entry: text + dropdown + YEAR date all fill (dat
   assert.strictEqual(entry.fields[2].segments.Year.value, "2024"); // year date WRITTEN
 });
 
-test("repeating delete-on-no-match: required no-fill entries deleted high→low", async () => {
-  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "text", isRequired: true, value: "", noFocus: true }] });
+test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candidate absent) deletes high→low", async () => {
+  // M38 Bug B1: deleteOnNoMatch fires on a GENUINE no-match — the required dropdown's
+  // options RENDERED but the candidate isn't among them (this value isn't offered).
+  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Alpha" }, { text: "Beta" }] }] });
   const state = webState({ entries: [mk("webAddress-1--null"), mk("webAddress-2--null")] });
-  const fieldMap = [{ field: "x", widget: "text", key: "x", path: "x" }];
+  const fieldMap = [{ field: "x", widget: "dropdown", key: "x", path: "x" }];
   const act = makeFakeRepeatAct(state);
   const out = await driveRepeatingSectionCdp(act, {
     name: "lang", headingRegex: "x", containerPrefix: "webAddress-",
-    items: [{ x: "a" }, { x: "b" }], fieldMap, deleteOnNoMatch: true
+    items: [{ x: "Zzz-nomatch" }, { x: "Qqq-nomatch" }], fieldMap, deleteOnNoMatch: true
   }, T_BUDGETS);
   const delIdx = act.log.filter(([m]) => m === "clickDeleteEntry").map(([, i]) => i);
   assert.deepStrictEqual(delIdx, [1, 0]); // high→low so lower indices stay valid
   const removed = out.results.filter((r) => /removed$/.test(r.fieldName));
   assert.strictEqual(removed.length, 2);
   assert.ok(removed.every((r) => r.status === "skipped" && /entry deleted/.test(r.detail)));
+});
+
+test("M38 Bug B1: a required pick failing TRANSIENTLY (options didn't render) is KEPT + needs_review, NOT deleted", async () => {
+  // The live English/Chinese loss: the language dropdown didn't render deep in a long fold
+  // → deleteOnNoMatch deleted VALID data. Now a transient/infra failure (NOT a genuine
+  // no-match) keeps the entry + surfaces it for review — never silently destroyed.
+  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [] }] }); // options never render
+  const state = webState({ entries: [mk("webAddress-1--null")] });
+  const fieldMap = [{ field: "x", widget: "dropdown", key: "x", path: "x" }];
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "lang", headingRegex: "x", containerPrefix: "webAddress-",
+    items: [{ x: "English" }], fieldMap, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "a transient failure must NOT delete the entry (no data loss)");
+  assert.ok(!out.results.some((r) => /removed$/.test(r.fieldName)), "no removal rec");
+  const xRec = out.results.find((r) => r.fieldName === "lang[0].x");
+  assert.strictEqual(xRec.status, "needs_review", "kept + surfaced for review");
 });
 
 test("repeating UP: add that never mounts stops bounded, flags needs_review", async () => {
@@ -1736,4 +1764,46 @@ test("M37 WE: two entries get their OWN values (entry-scoped, no bleed)", async 
   assert.strictEqual(weRec(out, 1, "companyName").after, "Globex");
   assert.strictEqual(weRec(out, 0, "roleDescription").after, "A1\nA2");
   assert.strictEqual(weRec(out, 1, "roleDescription").after, "B1\nB2");
+});
+
+// ── M38 Part 1: the FOLD — drivePageFill = flat fields + every PRESENT repeating section ──
+// The combined fake exposes scanPage (flat fields) AND repeatingScan (sections/addButtons).
+const flatFirstName = { fieldName: "legalName--firstName", widgetType: "text", value: "", wrapperSel: "[flat-firstName]" };
+
+test("M38 fold: drivePageFill fills flat fields THEN drives each PRESENT section (items from profile[itemsKey])", async () => {
+  const state = {
+    prefix: "webAddress-", addable: true, deletable: true, newEntry: (i) => webEntry("webAddress-new" + i, ""),
+    entries: [webEntry("webAddress-0--null", "")], flatFields: [flatFirstName]
+  };
+  const act = makeFakeRepeatAct(state);
+  const profile = { personal_info: { first_name: "Kevin" }, websites: [{ url: "https://k.example" }] };
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "legalName--firstName").after, "Kevin", "flat field filled");
+  const url = out.results.find((r) => r.fieldName === "website[0].url");
+  assert.ok(url, "the website section was driven by the fold");
+  assert.strictEqual(url.after, "https://k.example", "section item came from profile[itemsKey]");
+});
+
+test("M38 fold: a page with NO recognized repeating sections drives ZERO sections (page-1 unchanged)", async () => {
+  // entries=[] → repeatingScan omits the section; addButtons=[] → no heading match → nothing driven,
+  // EVEN THOUGH the profile has websites (the section just isn't on this page).
+  const state = { prefix: "webAddress-", entries: [], addButtons: [], flatFields: [flatFirstName] };
+  const act = makeFakeRepeatAct(state);
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" }, websites: [{ url: "x" }] }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "legalName--firstName").after, "Kevin");
+  assert.ok(!out.results.some((r) => /^\w+\[\d+\]\./.test(r.fieldName)), "no repeating-section results");
+  assert.ok(!act.log.some(([m]) => m === "clickSectionAdd"), "no Add attempts on a section-less page");
+});
+
+test("M38 fold: a section present ONLY via an Add-button heading (create-first) IS driven", async () => {
+  // 0 entry containers, but the section's Add (heading 'Websites') is on the page → drive it (create-first Add).
+  const state = {
+    prefix: "webAddress-", addable: true, deletable: true, newEntry: (i) => webEntry("webAddress-new" + i, ""),
+    entries: [], addButtons: [{ text: "Add", nearestHeading: "Websites", rect: { cx: 1, cy: 1 } }], flatFields: []
+  };
+  const act = makeFakeRepeatAct(state);
+  const out = await drivePageFill(act, { websites: [{ url: "https://k.example" }] }, {}, {}, T_BUDGETS);
+  assert.ok(act.log.some(([m]) => m === "clickSectionAdd"), "create-first Add fired (presence via heading)");
+  const url = out.results.find((r) => r.fieldName === "website[0].url");
+  assert.ok(url && url.after === "https://k.example", "create-first section filled");
 });

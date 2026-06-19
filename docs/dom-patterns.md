@@ -1083,3 +1083,40 @@ section folded onto the config path). New deltas, all live-verified on Magna pag
   overwrite path in anger).
 - 132 tests (5 new WE). `WORK_EXPERIENCE_MAP` is the fill-driver config shape (TODO(dup): the page
   engine's `fillWorkExperienceEntry` is bespoke — INTENT-lockstep, not 1:1).
+
+## 2026-06-19 — Magna wd3, HIDDEN: the FOLD (full page-2 in one drivePageFill) + two integration bugs (M38 Part 1)
+
+`drivePageFill` now drives the flat fields THEN every PRESENT repeating section (a `PAGE_SECTIONS`
+registry → `driveRepeatingSectionCdp` per section; presence = a `containerPrefix` in `repeatingScan.sections`
+OR an `addButtons` nearestHeading matching the section's `headingRegex`). One "CDP fill FULL PAGE" click
+fills the whole of page 2. **A LITERAL oracle comparison** (folded run vs the five standalone per-section
+harnesses) caught two integration bugs that "0 needs_review" would NOT have — the load-bearing reason to
+compare against the oracle, not just check for errors:
+
+- **Bug A — date-segment focus is flaky (one-shot).** `workExperience[0].endDate` Year `focus-failed` →
+  half-filled `"8"` (standalone filled `"8/2025"`). `focusDateSegment`'s triple-click→`el.focus`→`DOM.focus`
+  ladder was one-shot-per-rung; a transient hidden-tab layout glitch failed all rungs in one pass. **Fix:**
+  wrap the ladder in an M29-style retry (poll until `.focused` or `RECT_READY_CEILING_MS`); a true ceiling
+  still returns null → the existing read-back-mismatch `needs_review` (never a silent wrong fill). Re-run:
+  `endDate` filled `8/2025`.
+- **Bug B — `deleteOnNoMatch` SILENTLY destroyed valid data.** Both Languages entries (English/Chinese)
+  were DELETED ("required pick didn't match") and recorded only as `skipped` — the language dropdown had
+  failed to render deep in the long fold (4th section). `fillDropdownCdp` returns `needs_review` for THREE
+  reasons — "options did not render" (transient), "no candidate matched" (genuine — value not offered),
+  "could not open" (transient) — and the OLD gate deleted on ALL of them. **Fix (B1, the win):** the pick
+  handlers tag ONLY a genuine no-match with `genuineNoMatch:true` (dropdown: options rendered + candidate
+  absent; typeahead/source: every candidate banner'd or filtered-but-absent — NOT a timeout, NOT
+  present-but-uncommitted); `deleteOnNoMatch` deletes ONLY when every failed required pick is a genuine
+  no-match. A transient/infra failure → KEEP + `needs_review` (never silent data loss). **M35 preserved**
+  (a real bogus value → genuine no-match → still deletes). Re-run: English/Chinese FILLED cleanly (the
+  intermittent render failure didn't recur).
+- **Bug B2 (root cause) — UNDIAGNOSED + intermittent.** WHY the language dropdown intermittently fails to
+  render deep in a long throttled fold (throttle accumulation? cross-section state-bleed?) — it didn't
+  reproduce on the re-run, so no surfaced detail. Fix B1 makes it NON-DESTRUCTIVE (kept+surfaced on
+  recurrence); the targeted fix (settle budget / between-section settle) waits for a reproduction WITH the
+  detail (recon-first). **Known risk: a long fold can intermittently fail to render ANY section's cold
+  widget** — watch for it; the safety net prevents data loss.
+- **Re-run = clean oracle pass:** every section matches the standalone oracle; filled 46, filled_review 1
+  (CPP), skipped 2 (file_upload + WE[1].endDate currently-work-here), 0 needs_review. 136 tests (3 fold +
+  the genuine-vs-transient deleteOnNoMatch pair). Console-report only — the CDP review-summary bundle +
+  accumulation is M38 Part 2.

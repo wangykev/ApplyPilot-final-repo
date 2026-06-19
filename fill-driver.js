@@ -362,7 +362,12 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const m = apMatch.matchCandidates(candidates, enabledTexts);
   if (m.targetIndex === -1) {
     await act.pressEscape();
-    return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts };
+    // GENUINE no-match: the option list RENDERED but no candidate is among it — i.e. this
+    // value isn't offered (the only delete-worthy case for deleteOnNoMatch, M38 Bug B1).
+    // The other needs_review/error returns (options-didn't-render / couldn't-open /
+    // target-vanished / commit-didn't-take) are transient/infra failures, NOT invalid
+    // data — they are NOT tagged, so deleteOnNoMatch keeps + surfaces them.
+    return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts, genuineNoMatch: true };
   }
   const target = enabledTexts[m.targetIndex];
   // Verify gate TIGHTENED (M28): exact-normalize ONLY — a substring trigger can't false-pass.
@@ -721,7 +726,13 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   if (strayChip) {
     return { status: "needs_review", after: strayChip, verified: false, detail: "uncommanded value on the field — review (no candidate matched; chip overwrite is a later milestone)", captured_options: lastFiltered || undefined, settle_trace: trace };
   }
-  return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace };
+  // M38 Bug B1 — GENUINE no-match (for deleteOnNoMatch) ONLY if EVERY candidate gave a
+  // definitive negative: a "No matches" banner, or filtered-but-absent (no match object).
+  // A timeout (no fresh transition — transient) or a present-but-uncommitted candidate
+  // (commit-ladder limitation, the data IS valid) is NOT genuine → keep + surface, never
+  // delete. (Mirrors fillDropdownCdp's genuineNoMatch — the data-loss safety, lockstep.)
+  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "banner" || (s.outcome === "filtered" && !s.match));
+  return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace, genuineNoMatch };
 };
 
 // Source ("How did you hear about us?") — the Magna SEARCH shape, recon 2026-06-12.
@@ -896,7 +907,11 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0);
   }
   await act.pressEscape();
-  return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded };
+  // M38 Bug B1 — GENUINE no-match (deleteOnNoMatch) ONLY if every candidate gave a
+  // definitive negative (banner / filtered-but-absent); a timeout or present-but-
+  // uncommitted leaf is NOT genuine → keep + surface (lockstep with typeahead/dropdown).
+  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "banner" || (s.outcome === "filtered" && !s.match));
+  return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded, genuineNoMatch };
 };
 
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
@@ -1009,6 +1024,33 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
     await act.delay(budgets.interFieldMs);
   }
 
+  // M38 FOLD — after the flat fields, drive each repeating section PRESENT on this page
+  // (so ONE drivePageFill = a full page fill). One repeatingScan determines presence: a
+  // container with the section's prefix OR an Add button whose nearestHeading matches the
+  // headingRegex (the create-first case — Education can start 0 entries but its Add +
+  // heading are present). Absent sections are SKIPPED → a page with no repeating sections
+  // (page 1) behaves exactly as before (no spurious Add attempts). Section results concat
+  // into `results` (the counts/needsReview below cover them too); driveRepeatingSectionCdp
+  // handles reconcile-to-N (create-first / delete-extras / 0-items) per section. `profile`
+  // is the PREPARED profile (the SW prepareProfile's it), so profile[itemsKey] carries the
+  // annotated arrays. Driven in registry order.
+  let rscan = null;
+  try { rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
+  if (rscan && (rscan.sections || rscan.addButtons)) {
+    for (const sec of PAGE_SECTIONS) {
+      const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
+      const re = new RegExp(sec.headingRegex, "i");
+      const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((b) => re.test((b && b.nearestHeading) || ""));
+      if (!hasContainer && !hasAdd) continue; // section not on this page
+      const items = Array.isArray(profile[sec.itemsKey]) ? profile[sec.itemsKey] : [];
+      const out = await driveRepeatingSectionCdp(act, {
+        name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
+        items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch
+      }, budgets);
+      if (out && Array.isArray(out.results)) results.push(...out.results);
+    }
+  }
+
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
   // M30 session-expiry EARLY-WARNING (heuristic, SOURCE-ONLY): if this page has the
@@ -1105,6 +1147,21 @@ const WORK_EXPERIENCE_MAP = [
     skipWhen: (i) => i.currently_work_here === true,
     skipDetail: "currently_work_here = true → no end date (To box removed)", waitForPresence: true },
   { field: "roleDescription", widget: "textarea", key: "bulletsText", path: "role_description" }
+];
+
+// M38 — section registry for the FOLD. `drivePageFill` drives each PRESENT repeating
+// section after the flat fields → ONE call = a full page fill. One entry per page-2
+// section; values mirror the five per-section runners (Languages/Certs
+// deleteOnNoMatch:true, the rest false). `itemsKey` reads the PREPARED profile array
+// (work_experience/education/languages/certifications/websites). Registry order = fill
+// order; sections are independent + entry-scoped (any cross-section effect is caught by
+// the oracle comparison, not relied upon).
+const PAGE_SECTIONS = [
+  { name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-", itemsKey: "work_experience", fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false },
+  { name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education", fieldMap: EDUCATION_MAP, deleteOnNoMatch: false },
+  { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true },
+  { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
+  { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
 ];
 
 // Fill one entry's mapped fields. Re-reads act.repeatingScan() FRESH per field — a
@@ -1275,17 +1332,25 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.
-    // deleteOnNoMatch fires only when a required pick has NO committed value (needs_review/error/skipped).
-    const ok = entryRecs.every((r) => !r.isRequired || r.status === "filled" || r.status === "filled_review");
-    perEntry.push({ idx: i, recs: entryRecs, ok });
+    const failedRequired = entryRecs.filter((r) => r.isRequired && r.status !== "filled" && r.status !== "filled_review");
+    const ok = failedRequired.length === 0;
+    // M38 Bug B1 — an entry is DELETABLE (deleteOnNoMatch) ONLY if EVERY failed required pick
+    // is a GENUINE no-match (options/leaves RENDERED, candidate genuinely absent → this value
+    // isn't offered). A transient/infra failure (dropdown didn't render / couldn't open / commit
+    // didn't take / typeahead focus-unconfirmable) is NOT invalid data → KEEP + surface
+    // (needs_review), NEVER silently destroy valid data (the live English/Chinese loss when the
+    // language dropdown failed to render deep in a long fold).
+    const deletable = failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true);
+    perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
   }
 
-  // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose
-  // REQUIRED pick didn't match would block Next, so delete it. Sweep high→low so
-  // lower indices stay valid. OFF for Websites (text always fills if present).
+  // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose REQUIRED
+  // pick GENUINELY didn't match (the value isn't offered) would block Next, so delete it.
+  // Sweep high→low so lower indices stay valid. OFF for Websites (text always fills if present).
+  // A transient/infra pick failure is NOT deletable (kept + surfaced — Bug B1).
   if (deleteOnNoMatch) {
     for (let k = perEntry.length - 1; k >= 0; k--) {
-      if (perEntry[k].ok) continue;
+      if (!perEntry[k].deletable) continue; // ok entries AND transient-fail entries are KEPT
       const before = await act.entryCount(containerPrefix);
       const clicked = await act.clickDeleteEntry(containerPrefix, perEntry[k].idx);
       if (!clicked || !clicked.ok) continue; // can't delete — leave it (surfaces in review)
@@ -1363,5 +1428,5 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

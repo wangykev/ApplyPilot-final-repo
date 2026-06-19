@@ -238,6 +238,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP FILL FULL PAGE (M38 Part 1): the FOLD — one drivePageFill fills flat fields +
+  // every present repeating section. [CDP-PAGE] in the SW console.
+  if (message.type === "RUN_CDP_FILL_PAGE") {
+    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-PAGE] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpFillPage(tab.id, profile, defaults, jobContext);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // CDP WALK (M31): fill page 1 → guarded Save & Continue → detect VPS/session-death
   // (halt) or a clean transition (report "advanced", stop — page-2 fill deferred).
   if (message.type === "RUN_CDP_WALK") {
@@ -1758,6 +1777,55 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("CDP fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP FILL FULL PAGE (M38 Part 1) — the FOLD: ONE drivePageFill fills the flat
+// fields AND every repeating section PRESENT on the page (the fold in fill-driver
+// drives each present section via driveRepeatingSectionCdp + PAGE_SECTIONS). Passes
+// the PREPARED profile (sections need the annotated arrays). Console-report only
+// (the CDP review-summary bundle is M38 Part 2). On page 1 (no repeating sections)
+// this is identical to runCdpFill; on page 2 it fills the whole page in one click.
+// [CDP-PAGE] in the SW console.
+// ============================================================================
+async function runCdpFillPage(tabId, profile, defaults, jobContext) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached. MINIMIZE THE WINDOW NOW — the full-page fill starts on the first hidden read (60s window).");
+    if (!(await cdpWaitHidden(60000, 500))) {
+      LOG("tab never went hidden — INVALID run, nothing filled.");
+      return { ok: false, error: "never-hidden" };
+    }
+    LOG("tab is hidden — FULL-PAGE fill starting (flat fields + every repeating section present). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+
+    const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
+    const act = makeCdpActuation();
+    const out = await drivePageFill(act, prepared, defaults, jobContext);
+
+    LOG("page:", out.url);
+    if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
+      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+    }
+    console.table(out.results.map((r) => ({
+      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+      verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
+    })));
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("full-page fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

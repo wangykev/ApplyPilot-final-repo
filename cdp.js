@@ -1233,11 +1233,23 @@ function makeCdpActuation() {
       const inputSel = loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-input"]';
       const displaySel = loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-display"]';
       const focused = async () => { const s = await cdpEval(cdpReadInputBySel, inputSel); return !!(s && s.focused); };
-      const r = await cdpRectReady(displaySel, true);
-      if (r) { await cdpTripleClickAt(r.cx, r.cy); await cdpDelay(200); if (await focused()) return "triple-click-display"; }
-      if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpDelay(120); if (await focused()) return "el.focus()"; }
-      try { await cdpDomFocus(inputSel); await cdpDelay(120); if (await focused()) return "DOM.focus"; } catch (e) { /* not found */ }
-      return null;
+      // M38 Bug A: RETRY the whole ladder until the segment reads .focused (or a ceiling).
+      // The ladder is one-shot-per-rung; a transient hidden-tab layout glitch (frozen
+      // layout tick / mid-rerender) can fail all three rungs in one pass → "focus-failed"
+      // → a half-filled date (the live WE[0].endDate Year). Re-attempt; the happy path
+      // returns on pass 1 (no added latency). Mirrors focusText's M29 hardening (single
+      // cdpRectOf per attempt — the outer loop owns the retry). Logs only when it engages.
+      const start = Date.now();
+      let attempt = 0;
+      while (true) {
+        const r = await cdpEval(cdpRectOf, displaySel, true);
+        if (r && r.w > 0) { await cdpTripleClickAt(r.cx, r.cy); await cdpDelay(200); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(displaySel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (triple-click-display)`); return "triple-click-display"; } }
+        if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (el.focus)`); return "el.focus()"; } }
+        try { await cdpDomFocus(inputSel); await cdpDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; } } catch (e) { /* not found */ }
+        if (Date.now() - start >= RECT_READY_CEILING_MS) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `gave up after ${Date.now() - start}ms / ${attempt} retries`); return null; }
+        await cdpDelay(RECT_READY_INTERVAL_MS);
+        attempt++;
+      }
     },
     readDateSegment: (loc, segment) => cdpEval(cdpReadInputBySel, loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-input"]'),
     typeDigits: (text) => cdpTypeChars(String(text), 80) // per-char primary; act.typeText (insertText) is the brain's verified fallback
