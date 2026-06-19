@@ -1425,8 +1425,129 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
   return { status: "filled", after: afterStr, verified: true, detail };
 };
 
+// ============================================================================
+// M38 Part 2 — CDP review-summary bundle (the persisted review UI for the CDP path).
+// Reproduces the page-engine fillEngine's buildEntry + mapFillStatus/deriveConfidence/
+// deriveReview (background.js ~3716) — they are PURE and read ONLY the rec fields a CDP
+// result carries, so they apply verbatim. TODO(dup): keep in LOCKSTEP with fillEngine —
+// summary.html (the viewer) reads BOTH paths' bundles, so a schema change must update
+// both copies + the viewer. Section recs (.add/.delete/.removed) are filtered (not
+// review fields). `field_id` is PAGE-QUALIFIED for global uniqueness across the
+// accumulated multi-page bundle (the viewer keys reviewValueNodes on field_id).
+// ============================================================================
+const REVIEW_SCHEMA_VERSION = "1.0";
+
+function summarizeEntries(entries) {
+  return {
+    total: entries.length,
+    counts: entries.reduce((a, e) => { a[e.fill_status] = (a[e.fill_status] || 0) + 1; return a; }, {}),
+    by_type: entries.reduce((a, e) => { a[e.widget_type] = (a[e.widget_type] || 0) + 1; return a; }, {}),
+    needs_review_count: entries.filter((e) => e.needs_review).length
+  };
+}
+
+// Build a SINGLE-page review bundle from drivePageFill's results. `meta = { page, url,
+// tenant, capturedAt }` — the SW stamps capturedAt + the PRE-fill cdpPageSig as `page`.
+function buildReviewBundle(results, meta) {
+  const m = meta || {};
+  const mapFillStatus = (status) => {
+    if (status === "filled" || status === "filled_review") return "filled";
+    if (status === "skipped") return "skipped";
+    if (status === "error") return "error";
+    return "not_filled"; // needs_review / null
+  };
+  const deriveConfidence = (rec) => {
+    const flagged = rec.status === "needs_review" || rec.status === "filled_review" || rec.status === "error";
+    let source;
+    if (rec.fieldName === "candidateIsPreviousWorker") source = "employer_match";
+    else if ((rec.widgetType === "text" || rec.widgetType === "date" || rec.widgetType === "textarea") && rec.status === "filled") source = "profile_direct";
+    else if (rec.matchTier === "exact-normalized" || rec.matchTier === "label-exact") source = "exact";
+    else if (rec.matchTier === "containment") source = "containment";
+    else if (typeof rec.matchTier === "string" && rec.matchTier.startsWith("fuzzy")) source = "fuzzy";
+    else source = "reason";
+    let band;
+    if (flagged || rec.status === "skipped") band = "none";
+    else if (source === "profile_direct" || source === "exact" || source === "employer_match") band = "high";
+    else band = "medium";
+    return { confidence: band, confidence_source: source };
+  };
+  const deriveReview = (rec) => {
+    const required = !!rec.isRequired;
+    const flaggedBase = rec.status === "needs_review" || rec.status === "filled_review" || rec.status === "error";
+    const escalated = rec.status === "skipped" && required;
+    if (!flaggedBase && !escalated) return { needs_review: false, needs_review_reason: null };
+    const detail = (rec.detail || "").toLowerCase();
+    let reason;
+    if (rec.fieldName === "candidateIsPreviousWorker") reason = "employer_match_uncertain";
+    else if (rec.status === "error") reason = "fill_error";
+    else if (rec.status === "skipped" && required && !rec.mappedPath) reason = "unmapped_required_field";
+    else if (rec.status === "skipped" && required) reason = "required_field_empty";
+    else if (detail.includes("no options appeared")) reason = "typeahead_empty_listbox";
+    else if (detail.includes("unsupported widget") || detail.includes("no handler")) reason = "unsupported_widget";
+    else if (detail.includes("defaults")) reason = "config_missing";
+    else reason = "low_confidence";
+    return { needs_review: true, needs_review_reason: reason };
+  };
+  const fieldRecs = (results || []).filter((r) => r.widgetType !== "section"); // .add/.delete/.removed are ops
+  const entries = fieldRecs.map((rec, index) => {
+    const fill_status = mapFillStatus(rec.status);
+    const { confidence, confidence_source } = deriveConfidence(rec);
+    const { needs_review, needs_review_reason } = deriveReview(rec);
+    const current_value = fill_status === "filled" && rec.after != null ? rec.after : null;
+    return {
+      field_id: (m.page ? m.page + "::" : "") + "formField-" + rec.fieldName, // PAGE-QUALIFIED → unique in the accumulated bundle
+      page: m.page != null ? m.page : null,
+      field_index: index,
+      question_label: rec.label != null ? rec.label : null,
+      widget_type: rec.widgetType,
+      canonical_field: rec.mappedPath != null ? rec.mappedPath : null,
+      is_required: !!rec.isRequired,
+      current_value,
+      original_ai_value: current_value, // the bot's pick at write time — never changed by edits
+      is_edited: false,
+      edit_kind: null,
+      confidence,
+      confidence_source,
+      needs_review,
+      needs_review_reason,
+      fill_status,
+      fill_error: rec.status === "error" ? (rec.detail || null) : null,
+      detail: rec.detail != null ? rec.detail : null,
+      match_tier: rec.matchTier != null ? rec.matchTier : null,
+      options: Array.isArray(rec.options) ? rec.options : null,
+      captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
+      character_count: null
+    };
+  });
+  return Object.assign({
+    schema_version: REVIEW_SCHEMA_VERSION,
+    page: m.page != null ? m.page : null,
+    url: m.url != null ? m.url : null,
+    tenant: m.tenant != null ? m.tenant : null,
+    captured_at: m.capturedAt != null ? m.capturedAt : null
+  }, summarizeEntries(entries), { entries });
+}
+
+// Accumulate a page bundle into the prior entries — WRITE-PER-PAGE (the M15 decision).
+// Drop the prior entries for THIS page (by `entry.page`), KEEP all OTHER pages' entries
+// VERBATIM (a viewer EDIT on a prior page survives the next page's persist — NOT a
+// rebuild), append this page's, recompute the envelope. PURE — the SW does the I/O.
+function accumulateBundle(priorEntries, pageBundle) {
+  const pageKey = pageBundle.page;
+  const kept = (priorEntries || []).filter((e) => e.page !== pageKey); // other pages, verbatim (edits intact)
+  const entries = kept.concat(pageBundle.entries || []);
+  const pages = Array.from(new Set(entries.map((e) => e.page).filter((p) => p != null))).sort();
+  return Object.assign({
+    schema_version: pageBundle.schema_version,
+    page: pages.length > 1 ? "accumulated (" + pages.length + " pages)" : pageBundle.page,
+    url: pageBundle.url,
+    tenant: pageBundle.tenant,
+    captured_at: pageBundle.captured_at
+  }, summarizeEntries(entries), { entries });
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
 }

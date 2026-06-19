@@ -425,6 +425,26 @@ function persistBundle(bundle) {
   });
 }
 
+// M38 Part 2 — accumulate the CDP review-summary across pages, WRITE-PER-PAGE. Thin I/O
+// wrapper: read the stored reviewSummary, merge this page's bundle via the PURE
+// accumulateBundle (drops THIS page's prior entries, keeps OTHER pages VERBATIM so a
+// viewer edit survives, recomputes the envelope), write. Eviction-robust (each page
+// writes immediately). The page key is the PRE-fill cdpPageSig (stable per page, distinct
+// across pages even on a same-URL SPA).
+function persistAccumulated(pageBundle) {
+  return new Promise((resolve) => {
+    if (!pageBundle) { resolve(); return; }
+    chrome.storage.local.get("reviewSummary", ({ reviewSummary }) => {
+      const prior = (reviewSummary && Array.isArray(reviewSummary.entries)) ? reviewSummary.entries : [];
+      const bundle = accumulateBundle(prior, pageBundle);
+      chrome.storage.local.set({ reviewSummary: bundle }, () => {
+        console.log(`[ApplyPilot] Summary saved (accumulated) — page "${pageBundle.page}": +${pageBundle.total} field(s); total ${bundle.total} across ${bundle.entries.length ? new Set(bundle.entries.map((e) => e.page)).size : 0} page(s), ${bundle.needs_review_count} need review. "View last summary".`);
+        resolve();
+      });
+    });
+  });
+}
+
 // Render a page's fill result to the SW console (table + review queue + source
 // diagnostics). `pageLabel` annotates which page in a walk (null for single-page).
 function logFrameResult(frameResult, pageLabel) {
@@ -1787,10 +1807,11 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
 // CDP FILL FULL PAGE (M38 Part 1) — the FOLD: ONE drivePageFill fills the flat
 // fields AND every repeating section PRESENT on the page (the fold in fill-driver
 // drives each present section via driveRepeatingSectionCdp + PAGE_SECTIONS). Passes
-// the PREPARED profile (sections need the annotated arrays). Console-report only
-// (the CDP review-summary bundle is M38 Part 2). On page 1 (no repeating sections)
-// this is identical to runCdpFill; on page 2 it fills the whole page in one click.
-// [CDP-PAGE] in the SW console.
+// the PREPARED profile (sections need the annotated arrays). M38 Part 2: builds the
+// review-summary bundle from the results + persists it (accumulating write-per-page,
+// keyed by the pre-fill cdpPageSig) — "View last summary" in the popup. On page 1 (no
+// repeating sections) this is identical to runCdpFill + a summary; on page 2 it fills
+// the whole page in one click. [CDP-PAGE] in the SW console.
 // ============================================================================
 async function runCdpFillPage(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
@@ -1807,6 +1828,11 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     }
     LOG("tab is hidden — FULL-PAGE fill starting (flat fields + every repeating section present). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
 
+    // M38 Part 2: page identity for the accumulation merge key — the PRE-fill cdpPageKey
+    // (url PATHNAME [drops the volatile query] + sorted field-set: STABLE per page across
+    // re-runs, DISTINCT across pages even on a same-pathname SPA). Computed BEFORE the fill
+    // (a field-revealing fill could change the field-set). NOT cdpPageSig (full url incl. query).
+    const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
     const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
     const act = makeCdpActuation();
     const out = await drivePageFill(act, prepared, defaults, jobContext);
@@ -1822,7 +1848,12 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
       verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
     })));
     LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null };
+
+    // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
+    const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
+    const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+    await persistAccumulated(bundle);
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("full-page fill aborted:", msg);

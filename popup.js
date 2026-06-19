@@ -420,6 +420,14 @@ document.getElementById("view-summary").addEventListener("click", () => {
   chrome.tabs.create({ url: chrome.runtime.getURL("summary.html") });
 });
 
+// Clear the accumulated review summary — the reset for a fresh application. The CDP
+// full-page fill / walk accumulates write-per-page (so the walk builds ONE whole-
+// application summary), which means prior/stale pages persist across runs; this is the
+// manual reset. The popup can write chrome.storage directly (no SW round-trip).
+document.getElementById("clear-summary").addEventListener("click", () => {
+  chrome.storage.local.remove("reviewSummary", () => setStatus("Review summary cleared — the next fill starts a fresh summary."));
+});
+
 // Job-context (per-posting company) — TEMPORARY manual entry. This is a SEPARATE
 // storage key from `profile`/`defaults` (those are stable across applications);
 // later the JD-page extraction will write `jobContext` automatically. Restore the

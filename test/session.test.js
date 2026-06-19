@@ -4,7 +4,7 @@
 // validation error has vpsErrorPresent=false).
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { sessionLooksDead } = require("../lib.js");
+const { sessionLooksDead, cdpPageKey } = require("../lib.js");
 
 // The recon-captured valid-form baseline (Magna My Information).
 const validForm = {
@@ -52,4 +52,30 @@ test("sessionLooksDead: 0 fields BUT the applyFlow page shell is present → ali
 test("sessionLooksDead: null / undefined → alive (never dead on missing data)", () => {
   assert.strictEqual(sessionLooksDead(null), false);
   assert.strictEqual(sessionLooksDead(undefined), false);
+});
+
+// M38 Part 2 — cdpPageKey: the STABLE per-page accumulation merge key.
+test("cdpPageKey: STABLE across a volatile query change (same pathname + field-set → same key)", () => {
+  const fields = [{ fieldName: "jobTitle" }, { fieldName: "companyName" }];
+  const a = cdpPageKey({ url: "https://x.myworkdaysite.com/apply?utm_source=Simplify&t=111", fields });
+  const b = cdpPageKey({ url: "https://x.myworkdaysite.com/apply?utm_source=Other&t=999", fields }); // query changed
+  assert.strictEqual(a, b, "query/token changes must NOT change the key (no duplicate accumulation)");
+  assert.ok(!a.includes("utm_source") && !a.includes("t="), "query dropped");
+});
+
+test("cdpPageKey: DISTINCT across pages on the SAME pathname (SPA — the field-set discriminates)", () => {
+  const url = "https://x.myworkdaysite.com/apply"; // same pathname (SPA reuses the URL)
+  const page1 = cdpPageKey({ url, fields: [{ fieldName: "legalName--firstName" }, { fieldName: "country" }] });
+  const page2 = cdpPageKey({ url, fields: [{ fieldName: "jobTitle" }, { fieldName: "companyName" }] });
+  assert.notStrictEqual(page1, page2, "different field-sets on the same URL must NOT overwrite each other");
+});
+
+test("cdpPageKey: field ORDER doesn't matter (sorted) + null on missing data", () => {
+  const url = "https://x/apply";
+  assert.strictEqual(
+    cdpPageKey({ url, fields: [{ fieldName: "b" }, { fieldName: "a" }] }),
+    cdpPageKey({ url, fields: [{ fieldName: "a" }, { fieldName: "b" }] })
+  );
+  assert.strictEqual(cdpPageKey(null), null);
+  assert.strictEqual(cdpPageKey({ url }), null); // no fields
 });

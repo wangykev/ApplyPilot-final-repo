@@ -1120,3 +1120,38 @@ compare against the oracle, not just check for errors:
   (CPP), skipped 2 (file_upload + WE[1].endDate currently-work-here), 0 needs_review. 136 tests (3 fold +
   the genuine-vs-transient deleteOnNoMatch pair). Console-report only — the CDP review-summary bundle +
   accumulation is M38 Part 2.
+
+## 2026-06-19 — CDP review-summary bundle + write-per-page accumulation (M38 Part 2, viewer-verified)
+
+The CDP path had no persisted reviewSummary (console-only). M38 Part 2 builds it + accumulates across
+pages, rendering in the existing `summary.html` viewer. Schema-drift check FIRST: `summary.js` reads a
+SUBSET of the page-engine `buildEntry` schema (background.js ~3761) — no breaking drift, so reproduce
+that schema.
+
+- **`buildReviewBundle(results, meta)`** (fill-driver.js, PURE): reproduces the page-engine
+  `mapFillStatus`/`deriveConfidence`/`deriveReview`/`buildEntry` (they read only the rec fields a CDP
+  result carries — TODO(dup), lockstep with `fillEngine`; the viewer reads BOTH paths' bundles). **Filters
+  `widgetType==="section"`** (the `.add`/`.delete`/`.removed` ops aren't review fields). **`field_id` is
+  PAGE-QUALIFIED** (`<pageKey>::formField-<name>`) — globally unique across the accumulated multi-page
+  bundle, because the viewer keys `reviewValueNodes[field_id]` for its in-place card refresh (a collision
+  would refresh the wrong card; the edit DATA is closure-safe regardless).
+- **`cdpPageKey(scan)`** (lib.js, tested): the STABLE accumulation merge key = url PATHNAME (drops the
+  volatile query/token) + sorted field-set. Stable per page across re-runs; distinct across pages even on
+  a same-pathname SPA (the field-set discriminates — the M31 lesson). NOT the full-url `cdpPageSig`.
+- **`accumulateBundle`** (pure) + **`persistAccumulated`** (background.js I/O): WRITE-PER-PAGE — merge by
+  `entry.page`, dropping only THIS page's prior entries and keeping every OTHER page VERBATIM (a viewer
+  EDIT on a prior page survives the next page's persist — NOT a rebuild), recompute the envelope. Eviction-
+  robust. Per-entry `page` provenance fixes the M15 "overwrite-per-page shows oddly" note.
+- **Stale-data finding + the RESET:** write-per-page accumulates MONOTONICALLY — the same merge that
+  protects edits also RETAINS a prior run's pages (a first live run showed stale "Add entries" section
+  recs from an old reviewSummary). So a fresh application needs a reset: a **"Clear summary" popup button**
+  (`chrome.storage.local.remove("reviewSummary")`). The walk (Part 3) must clear ONCE at start, OUTSIDE
+  the page loop (a mid-walk clear would wipe accumulated pages).
+- **LIVE-VERIFIED:** "CDP fill FULL PAGE" → "View last summary" renders the accumulated bundle (first run
+  showed "accumulated (2 pages)", 63 fields, all correct). After Clear → re-fill → CLEAN: single page, 44
+  fields, ZERO stale section recs, NEEDS REVIEW = the 2 real items (file_upload unmapped + CPP
+  filled_review). 143 tests (4 bundle/accumulate + 3 cdpPageKey). **Edit-persistence is unit-proven
+  (`accumulateBundle` retains current_value/edit_kind/is_edited) + inferred (the unchanged page-engine
+  editor on a schema-matching bundle) — NOT live-exercised on a CDP bundle this round; first seam to check
+  if a Part-3 edit doesn't survive.** field_id-page-qualification, cdpPageKey-stability, and edit-survival
+  each traced to actual `summary.js` behavior.

@@ -162,8 +162,22 @@ function sessionLooksDead(state) {
   return false;
 }
 
+// M38 Part 2 — STABLE per-page key for the review-summary accumulation merge (write-
+// per-page). Unlike cdpPageSig (which keys the M31 transition detector off the FULL url
+// incl. query — fine for "did anything change", but VOLATILE: a session token in the
+// query would make the same page get a new key → duplicate accumulation), this drops the
+// query/hash (url PATHNAME only) and combines it with the sorted field-name SET — stable
+// across re-runs AND distinct across pages even on a same-pathname SPA (the field-set is
+// the discriminator, the M31 lesson). `scan` = a cdpPageScan result ({ url, fields:[{fieldName}] }).
+function cdpPageKey(scan) {
+  if (!scan || !Array.isArray(scan.fields)) return null;
+  let path = scan.url || "";
+  try { path = new URL(scan.url).pathname; } catch (e) { /* non-URL → keep raw (still stable) */ }
+  return path + "|" + scan.fields.map((f) => f.fieldName).sort().join(",");
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead };
+  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, cdpPageKey };
 }

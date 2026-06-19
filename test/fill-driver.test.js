@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1806,4 +1806,78 @@ test("M38 fold: a section present ONLY via an Add-button heading (create-first) 
   assert.ok(act.log.some(([m]) => m === "clickSectionAdd"), "create-first Add fired (presence via heading)");
   const url = out.results.find((r) => r.fieldName === "website[0].url");
   assert.ok(url && url.after === "https://k.example", "create-first section filled");
+});
+
+// ── M38 Part 2: the CDP review-summary bundle + write-per-page accumulation ──────────
+test("M38 Part 2 buildReviewBundle: CDP results → viewer-schema entries (section recs filtered, statuses mapped)", () => {
+  const results = [
+    { fieldName: "workExperience.add", widgetType: "section", status: "filled", detail: "added 1" }, // op, NOT a field
+    { fieldName: "legalName--firstName", widgetType: "text", status: "filled", after: "Kevin", isRequired: true, mappedPath: "personal_info.first_name", label: "First Name" },
+    { fieldName: "education[0].degree", widgetType: "dropdown", status: "filled", after: "Bachelors", matchTier: "exact-normalized", isRequired: true, label: "Degree", options: ["Bachelors", "Masters"] },
+    { fieldName: "certification[0].certification", widgetType: "typeahead", status: "filled_review", after: "CPP - full", matchTier: "enter-auto-commit", isRequired: true, label: "Certification", detail: "autocommit-containment" },
+    { fieldName: "language[0].language", widgetType: "dropdown", status: "needs_review", isRequired: true, label: "Language", detail: "options did not render" },
+    { fieldName: "extension", widgetType: "text", status: "skipped", isRequired: false, label: "Ext", detail: "empty" }
+  ];
+  const b = buildReviewBundle(results, { page: "P2", url: "https://x.wd3.myworkdaysite.com/apply", tenant: "x.wd3.myworkdaysite.com", capturedAt: "2026-06-19T00:00:00Z" });
+  assert.ok(!b.entries.some((e) => e.widget_type === "section"), "section recs filtered out");
+  assert.strictEqual(b.entries.length, 5);
+  assert.strictEqual(b.schema_version, "1.0");
+  assert.strictEqual(b.page, "P2");
+  assert.strictEqual(b.tenant, "x.wd3.myworkdaysite.com");
+  assert.strictEqual(b.captured_at, "2026-06-19T00:00:00Z");
+  const cert = b.entries.find((e) => /certification/.test(e.field_id));
+  assert.strictEqual(cert.fill_status, "filled"); // filled_review → filled
+  assert.strictEqual(cert.needs_review, true);
+  assert.strictEqual(cert.current_value, "CPP - full");
+  assert.strictEqual(cert.original_ai_value, "CPP - full");
+  const lang = b.entries.find((e) => /language/.test(e.field_id));
+  assert.strictEqual(lang.fill_status, "not_filled"); // needs_review → not_filled
+  assert.strictEqual(lang.needs_review, true);
+  const ext = b.entries.find((e) => /extension/.test(e.field_id));
+  assert.strictEqual(ext.fill_status, "skipped");
+  assert.strictEqual(ext.needs_review, false); // skipped + not required → not flagged
+  const fn = b.entries.find((e) => /firstName/.test(e.field_id));
+  assert.strictEqual(fn.field_id, "P2::formField-legalName--firstName"); // page-qualified
+  assert.strictEqual(fn.question_label, "First Name");
+  assert.strictEqual(fn.is_required, true);
+  assert.strictEqual(fn.canonical_field, "personal_info.first_name");
+  assert.strictEqual(fn.confidence, "high"); // text + filled → profile_direct → high
+  assert.strictEqual(fn.field_index, 0);
+  assert.strictEqual(b.needs_review_count, 2); // cert + lang
+  assert.strictEqual(b.counts.filled, 3);      // firstName + degree + cert(filled_review→filled)
+});
+
+test("M38 Part 2 buildReviewBundle: field_id is PAGE-QUALIFIED (globally unique across pages)", () => {
+  const rec = [{ fieldName: "source", widgetType: "dropdown", status: "filled", after: "LinkedIn", label: "Source" }];
+  const p1 = buildReviewBundle(rec, { page: "P1" });
+  const p2 = buildReviewBundle(rec, { page: "P2" });
+  assert.strictEqual(p1.entries[0].field_id, "P1::formField-source");
+  assert.strictEqual(p2.entries[0].field_id, "P2::formField-source");
+  assert.notStrictEqual(p1.entries[0].field_id, p2.entries[0].field_id); // no cross-page collision
+});
+
+test("M38 Part 2 accumulateBundle: merges pages; re-writing a page replaces ONLY its entries", () => {
+  const mk = (page, fields) => buildReviewBundle(fields.map((f) => ({ fieldName: f, widgetType: "text", status: "filled", after: f, label: f })), { page });
+  let acc = accumulateBundle([], mk("P1", ["a", "b"]));
+  assert.strictEqual(acc.total, 2);
+  acc = accumulateBundle(acc.entries, mk("P2", ["c"]));
+  assert.strictEqual(acc.total, 3); // both pages accumulated
+  assert.ok(acc.entries.some((e) => e.page === "P1") && acc.entries.some((e) => e.page === "P2"));
+  assert.match(acc.page, /accumulated \(2 pages\)/);
+  acc = accumulateBundle(acc.entries, mk("P1", ["a"])); // re-write P1 (was 2 fields → now 1)
+  assert.strictEqual(acc.entries.filter((e) => e.page === "P1").length, 1, "P1 replaced");
+  assert.strictEqual(acc.entries.filter((e) => e.page === "P2").length, 1, "P2 untouched");
+});
+
+test("M38 Part 2 accumulateBundle: a viewer EDIT on a prior page SURVIVES the next page's persist", () => {
+  let acc = accumulateBundle([], buildReviewBundle([{ fieldName: "degree", widgetType: "dropdown", status: "filled", after: "Bachelors", label: "Degree" }], { page: "P1" }));
+  // simulate a viewer edit on the P1 entry (current_value/edit_kind/is_edited)
+  const edited = acc.entries.find((e) => e.page === "P1");
+  edited.current_value = "Masters"; edited.edit_kind = "override"; edited.is_edited = true;
+  // persist page 2 → the merge must RETAIN P1 verbatim (not rebuild)
+  acc = accumulateBundle(acc.entries, buildReviewBundle([{ fieldName: "language[0].language", widgetType: "dropdown", status: "filled", after: "English", label: "Language" }], { page: "P2" }));
+  const survived = acc.entries.find((e) => e.page === "P1");
+  assert.strictEqual(survived.current_value, "Masters");
+  assert.strictEqual(survived.edit_kind, "override");
+  assert.strictEqual(survived.is_edited, true);
 });

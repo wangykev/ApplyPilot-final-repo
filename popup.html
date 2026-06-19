@@ -16,6 +16,9 @@
     <button id="fill-page">Fill current page</button>
     <button id="walk-pages">Fill 2 pages (walk)</button>
     <button id="view-summary">View last summary</button>
+    <!-- Reset the accumulated review summary (the CDP full-page fill / walk accumulates
+         write-per-page, so prior pages persist across runs) — click before a NEW application. -->
+    <button id="clear-summary">Clear summary (reset for a new application)</button>
     <hr>
     <!-- Store ONE resume (PDF) in IndexedDB. Fill (current page / walk) attaches it
          automatically on the page that has the upload widget (M16.3). -->
