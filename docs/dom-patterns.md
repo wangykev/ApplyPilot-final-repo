@@ -1207,3 +1207,29 @@ speedup is for OUR pacing BETWEEN actions — it must NEVER shorten THE PAGE's o
   make text/date read-backs + typeahead pre-Enter settles reactive (poll-until-complete-state, ceilings =
   give-up only); then the post-fill page AUDIT (re-read the real DOM per field + reconcile) as the
   permanent backstop for this class, BEFORE the N-page walk.
+
+## 2026-06-20 — Magna wd3: reactive read-backs (M39.1) — poll until the COMPLETE value, no fixed sleep
+
+Generalizing M39's lesson (poll-until-the-page-state-holds, never fixed-time-then-assume) so the fill works
+on ANY machine / laggy wifi — "if it doesn't load, don't proceed until it does." Part 1 = the read-backs.
+
+- **`fillTextCdp`** — was: type → fixed `delay(textReadDelayMs)` → read ONCE → compare. Now: type → **POLL
+  `readTextValue` until `value === target`** (the COMPLETE typed value — `===`, not "non-empty"), ceiling
+  `textReadCeilingMs` = give-up only. Dropped the fixed clear-settle (the CDP clear→type input events apply
+  in DOM order; no settle needed between).
+- **`fillDateCompositeCdp`** — per segment: type → **POLL `readDateSegment` until `parseInt === val`** (the
+  COMPLETE value — a half-typed "1" of "15" must NOT satisfy the poll; this is the dropdown false-verify
+  lesson applied: poll the complete correct state, never a partial), ceiling = give-up. Keeps the insertText
+  fallback (re-focus + per-char → poll, then insertText → poll).
+- **Why this is correct, not just slower-safe:** `typeText`/`typeDigits` set the value via trusted input
+  whose read-back is essentially synchronous — on a good connection the poll matches on the FIRST read (no
+  added latency vs the old fixed 500ms; usually FASTER). The ceiling only engages under genuine lag, where
+  the old fixed delay would have read too early → a false `needs_review` (missed fill) or worse. Ceilings
+  are GIVE-UP bounds, not "assume-ready-after-N" waits.
+- **Pure-pacing delays kept** (`interFieldMs` prior-field blur, `reopenSettleMs` re-render-before-reopen):
+  they gate no correctness read — the next handler opens/reads reactively anyway — so they can't false-fill.
+- **LIVE-VERIFIED (Magna page 2, visible):** page matches the report, text + all dates (M/Y, year-only,
+  M/D/Y) correct + fast, no regression. 152 tests (+4: text lag→fills / never→needs_review; date partial→
+  rejected-then-fills-on-complete / stuck-partial→needs_review — real lag can't be injected live, so the
+  lag-model fakes are the proof). The DELICATE typeahead/source pre-Enter settle is M39.2 (separate, verified
+  in isolation — its commit gate is unchanged; only the pre-Enter echo wait becomes reactive).

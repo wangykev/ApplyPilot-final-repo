@@ -12,7 +12,7 @@ const T_BUDGETS = {
   openCeilingMs: 60, settleIntervalMs: 1, stableReads: 2,
   openRetries: 3, openExpandWindowMs: 20, reopenSettleMs: 1, taOpenRetries: 3,
   commitCeilingMs: 25, commitIntervalMs: 1,
-  textReadDelayMs: 1, typeJumpDelayMs: 1, arrowStepMs: 1, maxArrowSteps: 60,
+  textReadDelayMs: 1, textReadCeilingMs: 30, textReadIntervalMs: 1, typeJumpDelayMs: 1, arrowStepMs: 1, maxArrowSteps: 60,
   interFieldMs: 0,
   taOpenCeilingMs: 50, taOpenIntervalMs: 1, taActionSettleMs: 1,
   taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25,
@@ -64,7 +64,14 @@ function makeFakeAct(fields) {
     // text
     readTextValue: async (loc) => {
       const f = byLoc(loc);
-      return f.noInput ? null : { value: f.value || "", focused: focusedText === f };
+      if (f.noInput) return null;
+      // lag model: typeText stashed a pending value that REGISTERS only after N reads (laggy
+      // read-back) — the reactive poll must keep reading until it appears.
+      if (f._readsLeft !== undefined) {
+        if (f._readsLeft > 0) f._readsLeft -= 1;
+        else f.value = f._pending;
+      }
+      return { value: f.value || "", focused: focusedText === f };
     },
     focusText: async (loc) => {
       log.push(["focusText", loc.wrapperSel]);
@@ -76,7 +83,10 @@ function makeFakeAct(fields) {
     clearText: async () => { log.push(["clearText"]); if (focusedText) focusedText.value = ""; },
     typeText: async (text) => {
       log.push(["typeText", text]);
-      if (focusedText) focusedText.value = focusedText.mangle ? focusedText.mangle(text) : text;
+      if (!focusedText) return;
+      const v = focusedText.mangle ? focusedText.mangle(text) : text;
+      if (focusedText.valueAfterReads !== undefined) { focusedText._pending = v; focusedText._readsLeft = focusedText.valueAfterReads; } // lag model
+      else focusedText.value = v;
     },
 
     // dropdown
@@ -553,6 +563,30 @@ test("dropdown: commit shows the target then REVERTS (pick before render-complet
   assert.strictEqual(rec.status, "needs_review", "a pick that doesn't persist is NEVER reported filled");
   assert.match(rec.detail, /commit failed/);
   assert.strictEqual(rec.after, "Associates", "surfaces the reverted (actual) value, not the momentary target");
+});
+
+// ── text reactive read-back (laggy wifi: poll until the COMPLETE value reads back) ──
+
+const cityField = (flags) => Object.assign({ wrapperSel: "[w-city]", fieldName: "city", widgetType: "text", label: "City", value: "" }, flags || {});
+const cityProfile = { personal_info: { city: "Pittsburgh" } };
+
+test("text: read-back LAGS (value registers only after several reads) → reactive poll WAITS, then fills", async () => {
+  const act = makeFakeAct([cityField({ valueAfterReads: 5 })]);
+  const out = await drivePageFill(act, cityProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Pittsburgh");
+});
+
+test("text: value NEVER registers within the ceiling → needs_review, never a false fill", async () => {
+  // Infinity (not a big finite count): act.delay is instant in tests, so the poll spins many
+  // iterations within the ceiling — a finite valueAfterReads would eventually register and
+  // flip the result to filled (flaky). Infinity → _readsLeft never decrements to the swap.
+  const act = makeFakeAct([cityField({ valueAfterReads: Infinity })]);
+  const out = await drivePageFill(act, cityProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /read-back mismatch/);
 });
 
 // ── checkbox (reconcile-to-boolean; mapping synthetic — mechanism coverage) ──
@@ -1574,6 +1608,7 @@ function makeFakeDateAct(segs, opts) {
   const focusFails = new Set(opts.focusFailsFor || []);
   const perCharFails = new Set(opts.perCharFailsFor || []);
   const bothFail = new Set(opts.bothFailFor || []);
+  const readSeq = opts.readSequenceFor || {}; // { seg: [read1, read2, ...] } — dequeue per read, last sticks (laggy/partial read-back)
   const rung = (s) => (opts.focusRungFor && opts.focusRungFor[s]) || "triple-click-display";
   return {
     log,
@@ -1585,7 +1620,13 @@ function makeFakeDateAct(segs, opts) {
       focused = seg;
       return rung(seg);
     },
-    readDateSegment: async (loc, seg) => (seg in segs ? { value: segs[seg].value, focused: focused === seg } : null),
+    readDateSegment: async (loc, seg) => {
+      if (!(seg in segs)) return null;
+      // lag/partial model: return the next queued read (a partial value must NOT satisfy the
+      // poll — only the complete value does); the last element repeats.
+      if (readSeq[seg]) { const q = readSeq[seg]; const v = q.length > 1 ? q.shift() : q[0]; return { value: v, focused: focused === seg }; }
+      return { value: segs[seg].value, focused: focused === seg };
+    },
     clearText: async () => { log.push(["clearText", focused]); if (focused && segs[focused]) segs[focused].value = ""; },
     typeDigits: async (text) => {
       log.push(["typeDigits", focused, text]);
@@ -1630,6 +1671,22 @@ test("date composite: M/D/Y fills all three segments in order", async () => {
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "6/15/2027");
   assert.deepStrictEqual([segs.Month.value, segs.Day.value, segs.Year.value], ["6", "15", "2027"]);
+});
+
+test("date composite: a segment reads PARTIAL then complete → poll rejects the partial, fills only on the COMPLETE value", async () => {
+  // Year reads "" → "202" (parseInt 202 ≠ 2024, a partial) → "2024" (complete). The poll's
+  // parseInt===val must reject "202" and wait for "2024" — the complete-state lesson.
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "12", year: "2024" }, { readSequenceFor: { Year: ["", "202", "2024"] } });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "12/2024");
+});
+
+test("date composite: a segment never reads back the COMPLETE value (stuck partial) → needs_review, never accepted", async () => {
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "12", year: "2024" }, { readSequenceFor: { Year: ["202"] } });
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.verified, false);
 });
 
 test("date composite: a segment that can't focus → needs_review with ZERO typing on it", async () => {

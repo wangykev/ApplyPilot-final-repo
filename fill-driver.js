@@ -150,7 +150,11 @@ const DEFAULT_BUDGETS = {
   taOpenRetries: 3,       // same race on the typeahead searchBox open/focus
   commitCeilingMs: 10000, // click/Enter → observable state change
   commitIntervalMs: 300,
-  textReadDelayMs: 500,   // insertText → read-back
+  textReadDelayMs: 500,   // insertText → read-back (legacy; reactive poll below)
+  // Reactive read-back (text + date): POLL readback until it equals the COMPLETE target,
+  // ceiling = give-up only (survives laggy wifi — the page registers the value when it does).
+  textReadCeilingMs: 6000,
+  textReadIntervalMs: 60,
   typeJumpDelayMs: 700,   // type-to-jump chars → highlight settles
   arrowStepMs: 110,       // per arrow step (verified walk)
   maxArrowSteps: 60,      // walk bound — type-jump should land near; farther = something's off → needs_review
@@ -310,12 +314,20 @@ const fillTextCdp = async (act, loc, value, budgets, tag) => {
   const before = pre.value;
   const focusMethod = await act.focusText(loc, tag);
   if (!focusMethod) return { status: "error", detail: "could not focus " + (tag || "input"), after: before };
-  await act.clearText();
-  await act.delay(budgets.textReadDelayMs);
+  await act.clearText(); // local DOM op; CDP clear→type events apply in order — no fixed settle needed
   await act.typeText(value);
-  await act.delay(budgets.textReadDelayMs);
-  const read = await act.readTextValue(loc, tag);
-  const after = read ? read.value : null;
+  // Reactive read-back: POLL until the field reads back the COMPLETE typed value (survives any
+  // lag — laggy wifi, a throttled tick), NEVER a fixed sleep then a single read. `after === value`
+  // is the COMPLETE-state condition (not "something appeared") — the same lesson as the dropdown
+  // false-verify: a partial/momentary read must not satisfy it. Ceiling = give-up bound only.
+  let after = before;
+  const deadline = Date.now() + budgets.textReadCeilingMs;
+  do {
+    const read = await act.readTextValue(loc, tag);
+    after = read ? read.value : null;
+    if (after === value) break;
+    await act.delay(budgets.textReadIntervalMs);
+  } while (Date.now() < deadline);
   if (after !== value) return { status: "needs_review", after, verified: false, detail: `read-back mismatch (typed via ${focusMethod}, field shows "${after}")` };
   return { status: "filled", after, verified: true, detail: before ? `overwrote "${before}"` : null };
 };
@@ -1460,9 +1472,17 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
       // triple-click-SELECTS the segment, so typing REPLACES it — no clear needed.
       // (Any future per-tenant clear must be segment-scoped Backspace, NEVER Ctrl+A.)
       if (how === "insertText") await act.typeText(val); else await act.typeDigits(val);
-      await act.delay(b.textReadDelayMs);
-      const read = await act.readDateSegment(loc, seg);
-      return { read: read ? read.value : null, ok: !!(read && parseInt(read.value, 10) === parseInt(val, 10)) };
+      // Reactive read-back: POLL the segment until it equals the COMPLETE value (parseInt
+      // exact — a half-typed "1" of "15" must NOT satisfy it), ceiling = give-up only. Never
+      // a fixed sleep then a single read (survives laggy wifi).
+      let read = null;
+      const deadline = Date.now() + b.textReadCeilingMs;
+      do {
+        read = await act.readDateSegment(loc, seg);
+        if (read && parseInt(read.value, 10) === parseInt(val, 10)) return { read: read.value, ok: true };
+        await act.delay(b.textReadIntervalMs);
+      } while (Date.now() < deadline);
+      return { read: read ? read.value : null, ok: false };
     };
     let inputMethod = "typeChars";
     let res = await attempt("typeChars");
