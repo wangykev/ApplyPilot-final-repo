@@ -38,11 +38,12 @@
          first, click, then MINIMIZE within 60s. Typeahead/source are deferred →
          NEEDS REVIEW; repeating sections untouched. Results in the SW console. -->
     <button id="cdp-fill">CDP fill (hidden): simple widgets</button>
-    <!-- CDP FILL FULL PAGE (M38 Part 1 — the FOLD): ONE click fills the flat fields AND
-         every repeating section present on the page (drivePageFill drives the sections via
-         driveRepeatingSectionCdp). On page 1 == simple-widgets; on page 2 (My Experience)
-         fills the whole page. Load profile first, click, MINIMIZE within 60s. [CDP-PAGE]. -->
-    <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; minimize!)</button>
+    <!-- CDP FILL FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
+         flat fields AND every repeating section present (drivePageFill drives the sections via
+         driveRepeatingSectionCdp). On page 1 == simple-widgets; on page 2 (My Experience) fills
+         the whole page. NO minimize gate: keep the tab VISIBLE for a FAST fill (watch it) or
+         MINIMIZE for slow/background — it adapts live. Load profile first, click. [CDP-PAGE]. -->
+    <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; visible=fast)</button>
     <!-- CDP WALK (M31): fill page 1, then a GUARDED Save & Continue with VPS/session
          detection — halts "session expired" on a dead session, reports "advanced" on a
          clean transition (page-2 fill deferred). NOTE: on a LIVE session this advances

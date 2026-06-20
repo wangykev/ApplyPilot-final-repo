@@ -53,6 +53,7 @@ function cdpAttach(tabId) {
         return;
       }
       cdpTabId = tabId;
+      _visCache = { visible: false, at: 0 }; // fresh foreground sampling per run (adaptive pacing)
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
@@ -104,6 +105,44 @@ async function cdpEval(fn, ...args) {
     throw new Error("cdpEval: " + ((d.exception && d.exception.description) || d.text || "page exception"));
   }
   return res && res.result ? res.result.value : undefined;
+}
+
+// ── Foreground-adaptive pacing ───────────────────────────────────────────────
+// The fill's budgets are GENEROUS — tuned for the hidden-tab ~1Hz throttle (the
+// page's debounced REACTION runs page-side + throttled). When the tab is VISIBLE
+// the page runs full-speed, so those waits are wasteful. act.delay (wired to
+// cdpAdaptiveDelay) scales DOWN when foreground and stays FULL when hidden —
+// re-sampled (TTL) so a mid-fill minimize/restore adapts live ("fall back to slow
+// if hidden"). This scales the inter-action delays AND the settle-poll INTERVALS
+// (both flow through act.delay); the deadlines/ceilings are computed from raw
+// budget values and are NOT routed through act.delay, so they stay full — a
+// transient slow moment breaks early on success and never times out. Visible =
+// fast happy path; safe failure ceiling either way.
+// NOTE: pacing only. Visible CDP ACTUATION itself (coordinate-clicks, scrollIntoView,
+// focus) is a separate, newly-exercised surface — see runCdpFillPage / docs.
+const FAST_FACTOR = 0.2;    // visible delays = 1/5 the hidden delays (conservative; tunable — raise if a visible fill races)
+const FAST_FLOOR_MS = 25;   // …but never below this (a too-short wait races even full-speed)
+const VIS_TTL_MS = 500;     // re-sample document.visibilityState at most this often (amortize the cdpEval round-trip)
+
+let _visCache = { visible: false, at: 0 };
+
+// Cached, off-loop foreground read. cdpEval runs promptly even when hidden, so
+// this is reliable in both states; the TTL keeps act.delay from round-tripping
+// every call. Reset at attach (fresh per run). On read failure (tab closing)
+// default to NOT-visible → full (safe) delays.
+async function cdpVisible() {
+  if (Date.now() - _visCache.at <= VIS_TTL_MS) return _visCache.visible;
+  let vis = false;
+  try { vis = (await cdpEval(() => document.visibilityState)) === "visible"; } catch (e) { vis = false; }
+  _visCache = { visible: vis, at: Date.now() };
+  return vis;
+}
+
+// The adaptive pacing primitive wired into act.delay. Visible → scaled-down wait;
+// hidden → the full caller-requested wait (byte-identical to the proven path).
+async function cdpAdaptiveDelay(ms) {
+  const fast = await cdpVisible();
+  await cdpDelay(fast ? Math.max(FAST_FLOOR_MS, Math.round(ms * FAST_FACTOR)) : ms);
 }
 
 // ── Input primitives (trusted, off-loop) ────────────────────────────────────
@@ -669,6 +708,10 @@ function cdpReadDropdownState(wrapperSel) {
   const activeEl = activeId ? document.getElementById(activeId) : null;
   return {
     triggerText: trigger.textContent.trim(),
+    // The TRIGGER's expanded state — the cheap "did the open-click actually open it?"
+    // signal (independent of whether the option list has rendered yet). The driver's
+    // open-retry gates on this: a raced no-op click never flips it to "true".
+    ariaExpanded: trigger.getAttribute("aria-expanded"),
     listboxPresent: !!lb,
     optionCount: options.filter((o) => !o.disabled).length,
     options,
@@ -1047,7 +1090,8 @@ function cdpSourceCategoryRect(label) {
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 function makeCdpActuation() {
   return {
-    delay: cdpDelay, // ALL driver pacing goes through this (SW wall-clock)
+    delay: cdpAdaptiveDelay, // ALL driver pacing goes through this — visibility-adaptive: fast foreground, full hidden (SW wall-clock)
+    delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility (dropdown option-list render + commit-verify). The 5x speedup is for OUR pacing between actions, NEVER the page's render.
 
     scanPage: () => cdpEval(cdpPageScan),
 

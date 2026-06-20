@@ -1821,12 +1821,12 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the full-page fill starts on the first hidden read (60s window).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
-    LOG("tab is hidden — FULL-PAGE fill starting (flat fields + every repeating section present). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+    // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
+    // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
+    // throttle-immune), adapting LIVE as the operator minimizes/restores. This is the
+    // FIRST path that exercises visible-viewport CDP actuation (coordinate-clicks /
+    // scrollIntoView / focus on a real, watched viewport) — watch for mis-targets.
+    LOG("attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).");
 
     // M38 Part 2: page identity for the accumulation merge key — the PRE-fill cdpPageKey
     // (url PATHNAME [drops the volatile query] + sorted field-set: STABLE per page across

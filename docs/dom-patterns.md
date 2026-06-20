@@ -1155,3 +1155,55 @@ that schema.
   editor on a schema-matching bundle) — NOT live-exercised on a CDP bundle this round; first seam to check
   if a Part-3 edit doesn't survive.** field_id-page-qualification, cdpPageKey-stability, and edit-survival
   each traced to actual `summary.js` behavior.
+
+## 2026-06-19 — Magna wd3: foreground fast-fill, the open-race, and a FALSE verified:true (M39)
+
+The operator wanted the CDP fill MUCH faster when watching it (a visible tab isn't throttled, unlike the
+hidden tab the off-loop path was built for). Making it fast exposed a class of latent bugs whose root is
+ONE principle violation: **fixed-time-then-assume instead of poll-until-the-page-state-holds.** The 5×
+speedup is for OUR pacing BETWEEN actions — it must NEVER shorten THE PAGE's own render time.
+
+- **Foreground fast-fill** = visibility-adaptive `act.delay`. `cdpVisible()` reads
+  `document.visibilityState` off-loop (works hidden too) behind a ~500ms TTL cache; `act.delay(ms)` returns
+  `max(floor, ms×0.2)` when visible, full `ms` when hidden, re-sampled so a mid-fill minimize/restore
+  adapts live. `runCdpFillPage` dropped the `cdpWaitHidden` "minimize-first" gate — it fills immediately,
+  visible=fast (watch) or minimize=slow/background. Other runners keep the gate (run hidden → adaptive
+  delay = full → byte-identical).
+- **The open-race (also M38's undiagnosed Bug B2).** A fast open-click fires DURING the prior field's
+  post-commit React re-render and NO-OPs — the trigger never sets `aria-expanded="true"`, so no list ever
+  renders; the old single open then burned the full option ceiling and false-failed "options did not
+  render." The tell was an ALTERNATING dropdown pattern per language entry (1st/3rd opened, 2nd/4th didn't
+  — each successful commit's re-render broke the immediately-following open, whose long give-up gave the
+  next one time). **Fix:** `fillDropdownCdp` bounded-retries the open on an **aria-expanded GATE** —
+  re-open ONLY while not expanded; once expanded, poll options to the full ceiling. **TOGGLE-SHUT
+  INVARIANT (named test):** never re-click a trigger already reading `aria-expanded="true"` — a 2nd click
+  on an OPEN dropdown CLOSES it (the inverse bug a naive retry would introduce). Same bounded open/focus
+  retry for the typeahead searchBox ("could not focus" was the same race).
+- **THE SEVERE ONE — a false `verified:true`.** At fast pacing the dropdown PICKED an option before the
+  option list finished rendering. The selection made against an INCOMPLETE list is DISCARDED on
+  render-complete — but the inline commit-verify (poll trigger-text until == target, return on FIRST
+  match) caught the MOMENTARY pick and reported `filled`/`verified:true` with the target while the PAGE
+  reverted to its default. Live: degree Bachelors→**Associates**; English/Chinese reading+speaking
+  →**Basic** (writing + the language field, picked after their lists had settled, stuck). This is the ONE
+  failure mode the whole accuracy-first contract exists to prevent — a silent wrong fill that REPORTS
+  success. The operator caught it by reading the actual page; the report claimed all-correct.
+- **Fix = `act.delayFull` (NON-adaptive) where the wait depends on THE PAGE's render, two exposures:**
+  (1) **GATE 2 option-settle** — the "2 stable non-zero reads" must span REAL wall-clock time so the list
+  is COMPLETELY rendered before we match/click (at fast-scaled intervals they spanned ~140ms and concluded
+  on a partial render). (2) **Commit-verify PERSISTENCE** — after the trigger first shows the target,
+  re-read after another real beat and require it STILL shows the target; a value that doesn't stick keeps
+  polling → honest `needs_review`, NEVER accepted. Both waits real-time; the open-detection / text / date /
+  checkbox / inter-field pacing stays fast.
+- **Class audit (the principle, every widget):** a verify must read AFTER the page-render it depends on.
+  Only the dropdown was exposed — its correctness depends on an ASYNC option-list render AND the pick is
+  discardable. The rest are already render-aware under fast pacing: text/date read back values set
+  SYNCHRONOUSLY by `insertText`/`typeDigits` (no async render between action and value); radio/checkbox
+  `pollCheckedIs` waits for `checked===want`; typeahead/source poll the chip/transition. **Poll the
+  COMPLETE CORRECT state, never the presence of any state** — the false-verify came from reading a
+  momentary/partial value.
+- **LIVE-VERIFIED (visible):** the page MATCHES the report — degree Bachelors, English all Fluent, Chinese
+  reading Intermediate/speaking Advanced/writing Intermediate, correct FIRST TRY, only the expected CPP
+  `filled_review`; text/dates fast. 148 tests. **Follow-ups (committed plan):** generalize the principle —
+  make text/date read-backs + typeahead pre-Enter settles reactive (poll-until-complete-state, ceilings =
+  give-up only); then the post-fill page AUDIT (re-read the real DOM per field + reconcile) as the
+  permanent backstop for this class, BEFORE the N-page walk.

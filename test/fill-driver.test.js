@@ -10,6 +10,7 @@ const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, W
 // spin only for a few ms of wall clock.
 const T_BUDGETS = {
   openCeilingMs: 60, settleIntervalMs: 1, stableReads: 2,
+  openRetries: 3, openExpandWindowMs: 20, reopenSettleMs: 1, taOpenRetries: 3,
   commitCeilingMs: 25, commitIntervalMs: 1,
   textReadDelayMs: 1, typeJumpDelayMs: 1, arrowStepMs: 1, maxArrowSteps: 60,
   interFieldMs: 0,
@@ -50,6 +51,7 @@ function makeFakeAct(fields) {
   return {
     log,
     delay: async () => {},
+    delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     scanPage: async () => ({
       url: "fake://page",
       repeatingFieldCount: 0,
@@ -82,21 +84,34 @@ function makeFakeAct(fields) {
       log.push(["openDropdown", loc.wrapperSel]);
       const f = byLoc(loc);
       if (f.openFails) return false;
-      f.open = true;
+      // Open-race model: the click "succeeds" (returns true) but the trigger only
+      // actually EXPANDS once it has been opened expandsOnAttempt times (default 1 =
+      // expands immediately). expandsOnAttempt:99 → never expands (genuine failure).
+      f._openCount = (f._openCount || 0) + 1;
+      f.open = f._openCount >= (f.expandsOnAttempt || 1);
       if (f.activeIdx === undefined) f.activeIdx = null;
       openField = f;
       return true;
     },
     readDropdownState: async (loc) => {
       const f = byLoc(loc);
-      const open = f.open && !f.neverRenders;
-      const options = open ? f.options : [];
+      const expanded = !!f.open;                    // trigger aria-expanded (open-click took)
+      const rendered = expanded && !f.neverRenders; // option list actually present
+      const options = rendered ? f.options : [];
+      // false-verify model (see clickDropdownOptionByText): show the target for a few reads
+      // post-commit, then revert — the persistence/commit-stability guard must catch this.
+      let triggerText = f.triggerText;
+      if (f._revertCountdown !== undefined) {
+        if (f._revertCountdown > 0) f._revertCountdown -= 1;
+        else triggerText = f.revertValue || "Select One";
+      }
       return {
-        triggerText: f.triggerText,
-        listboxPresent: !!open,
+        triggerText,
+        ariaExpanded: expanded ? "true" : "false",
+        listboxPresent: rendered,
         optionCount: options.filter((o) => !o.disabled).length,
         options: options.map((o) => ({ text: o.text, disabled: !!o.disabled, selected: !!o.selected })),
-        activeText: open && f.activeIdx != null ? f.options[f.activeIdx].text : null
+        activeText: rendered && f.activeIdx != null ? f.options[f.activeIdx].text : null
       };
     },
     typeJumpChars: async (chars) => {
@@ -209,7 +224,10 @@ function makeFakeAct(fields) {
       log.push(["openTypeahead", loc.wrapperSel]);
       const f = byLoc(loc);
       f._open = true;
-      if (!f.focusUnconfirmable) f._focusedSb = true; // focusUnconfirmable: opens/visible but focus never confirms
+      // focusUnconfirmable: opens/visible but focus NEVER confirms (the abort invariant).
+      // focusRaces: open doesn't confirm focus; focusSearchBox confirms only on its 2nd
+      // call (the fast-pacing open/focus race that the open-retry must recover from).
+      if (!f.focusUnconfirmable && !f.focusRaces) f._focusedSb = true;
       if (f._texts === undefined) f._texts = (f.openTexts || []).slice();
       if (f._banner === undefined) f._banner = false;
       focusedTa = f;
@@ -218,7 +236,7 @@ function makeFakeAct(fields) {
     focusSearchBox: async (loc) => {
       log.push(["focusSearchBox", loc.wrapperSel]);
       const f = byLoc(loc);
-      if (!f.focusUnconfirmable) f._focusedSb = true;
+      if (!f.focusUnconfirmable) f._focusedSb = f.focusRaces ? ((f._fsbTries = (f._fsbTries || 0) + 1) >= 2) : true;
       focusedTa = f;
       return true;
     },
@@ -273,6 +291,9 @@ function makeFakeAct(fields) {
       if (!o) return false;
       f.triggerText = o.text;
       f.open = false;
+      // false-verify model: the pick shows for `showTargetReads` reads (default 1) then
+      // the page DISCARDS it (reverts to revertValue) — a pick made before render-complete.
+      if (f.revertsAfterCommit) f._revertCountdown = f.showTargetReads !== undefined ? f.showTargetReads : 1;
       return true;
     },
 
@@ -484,6 +505,54 @@ test("dropdown: 'Select One' placeholder does NOT trigger keep — falls through
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "United States of America");
   assert.ok(act.log.some(([m]) => m === "openDropdown"), "placeholder dropdown must still open + fill");
+});
+
+// ── dropdown open-retry (foreground fast-fill: the open races the prior re-render) ──
+
+test("dropdown: open RACES the prior re-render (expands on attempt 2) → re-open RECOVERS, filled", async () => {
+  // The foreground-fast-fill bug: a fast open-click no-ops during the prior field's
+  // post-commit re-render (the trigger never expands), so the old single open burned
+  // the full option ceiling and false-failed. The aria-expanded-gated retry must
+  // re-open and commit.
+  const act = makeFakeAct([ddField({ expandsOnAttempt: 2 })]);
+  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "United States of America");
+  assert.strictEqual(act.log.filter(([m]) => m === "openDropdown").length, 2, "re-opened exactly once after the raced attempt");
+});
+
+test("dropdown: an already-EXPANDED dropdown is NOT re-clicked (toggle-shut invariant)", async () => {
+  // The inverse bug the retry must NOT introduce: a 2nd click on an OPEN dropdown
+  // TOGGLES IT SHUT. attempt-1 expands immediately → straight to options-settle, a
+  // single open-click, never a second. NAMED invariant.
+  const act = makeFakeAct([ddField()]); // expands on attempt 1 (default)
+  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(act.log.filter(([m]) => m === "openDropdown").length, 1, "expanded dropdown opened exactly once (no toggle-shut re-click)");
+});
+
+test("dropdown: trigger NEVER expands across all retries → needs_review (options did not render), no false fill", async () => {
+  const act = makeFakeAct([ddField({ expandsOnAttempt: 99 })]);
+  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /options did not render/);
+  assert.strictEqual(act.log.filter(([m]) => m === "openDropdown").length, T_BUDGETS.openRetries, "re-opened up to the retry bound, then gave up — never a false filled");
+});
+
+test("dropdown: commit shows the target then REVERTS (pick before render-complete) → needs_review, never a false verified:true", async () => {
+  // The live silent wrong-fill: the trigger flashed the target (the inline verify caught that
+  // instant) then the page DISCARDED the pick (degree Bachelors→Associates; proficiencies →Basic).
+  // The commit PERSISTENCE guard must re-read after a real-time beat and reject a value that
+  // didn't stick — the one failure mode the whole safety contract exists to prevent.
+  const act = makeFakeAct([ddField({ revertsAfterCommit: true, revertValue: "Associates" })]);
+  const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review", "a pick that doesn't persist is NEVER reported filled");
+  assert.match(rec.detail, /commit failed/);
+  assert.strictEqual(rec.after, "Associates", "surfaces the reverted (actual) value, not the momentary target");
 });
 
 // ── checkbox (reconcile-to-boolean; mapping synthetic — mechanism coverage) ──
@@ -915,6 +984,21 @@ test("typeahead: searchBox focus cannot be confirmed → ZERO actuation, needs_r
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
 });
 
+test("typeahead: searchBox focus RACES on the first try → open/focus retry RECOVERS, commits", async () => {
+  // The live fast-fill "could not focus the search field" (it WORKED slow/hidden) — a
+  // fast open/focus raced the prior re-render. The bounded open+focus retry must recover
+  // and commit, not abort. focusRaces = focus confirms on the 2nd focusSearchBox call.
+  const act = makeFakeAct([taField({
+    focusRaces: true,
+    openTexts: ["United States of America (+1)"],
+    filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "United States of America (+1)");
+});
+
 // ── M27 flag taxonomy (Commit A) ────────────────────────────────────────────
 // flag = provenance, confidence = match quality (orthogonal); both from ONE table.
 
@@ -1192,6 +1276,7 @@ function makeFakeRepeatAct(state) {
   return {
     log,
     delay: async () => {},
+    delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     entryCount: async () => state.entries.length,
     // M38: scanPage = the FLAT (page-level) fields the fold's flat loop fills (default none).
     scanPage: async () => ({
@@ -1493,6 +1578,7 @@ function makeFakeDateAct(segs, opts) {
   return {
     log,
     delay: async () => {},
+    delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     focusDateSegment: async (loc, seg) => {
       log.push(["focusDateSegment", seg]);
       if (focusFails.has(seg) || !(seg in segs)) { focused = null; return null; }

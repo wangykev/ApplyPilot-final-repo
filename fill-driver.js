@@ -139,6 +139,15 @@ const DEFAULT_BUDGETS = {
   openCeilingMs: 20000,   // dropdown click → options rendered (cold lazy lists)
   settleIntervalMs: 350,  // option-list poll interval
   stableReads: 2,         // consecutive equal non-zero reads (atomic render confirmed)
+  // Open-retry (foreground fast-fill): a fast-paced open-click can fire during the
+  // PRIOR field's post-commit React re-render and no-op (the trigger never expands).
+  // openExpandWindowMs is the CHEAP aria-expanded gate (give up + re-open if the
+  // trigger doesn't expand within it — does NOT burn the option ceiling); openRetries
+  // bounds the re-opens; reopenSettleMs lets the re-render finish before re-opening.
+  openRetries: 3,
+  openExpandWindowMs: 2000,
+  reopenSettleMs: 400,
+  taOpenRetries: 3,       // same race on the typeahead searchBox open/focus
   commitCeilingMs: 10000, // click/Enter → observable state change
   commitIntervalMs: 300,
   textReadDelayMs: 500,   // insertText → read-back
@@ -335,23 +344,49 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     }
   }
 
-  if (!(await act.openDropdown(loc))) return { status: "error", detail: "could not open dropdown (trigger rect dead)", after: before };
-
-  // Settle: 2 consecutive equal non-zero reads (recon: the list renders
-  // ATOMICALLY — 249 options on first read, stable through a 3s tail).
-  let state = null, prevCount = -1, stable = 0;
-  const openDeadline = Date.now() + budgets.openCeilingMs;
-  while (Date.now() < openDeadline) {
-    await act.delay(budgets.settleIntervalMs);
-    state = await act.readDropdownState(loc);
-    const n = state ? state.optionCount : 0;
-    if (n > 0 && n === prevCount) {
-      stable++;
-      if (stable >= budgets.stableReads - 1) break;
-    } else {
-      stable = 0;
+  // Open with a bounded, aria-expanded-GATED retry (M29 "retry the actuation until
+  // it takes"). A fast-paced open-click can fire DURING the prior field's post-commit
+  // React re-render and no-op — the trigger never expands, so no list ever appears;
+  // the old single open then burned the full option ceiling and false-failed ("options
+  // did not render"). STRICT TWO-GATE sequencing, with the INVARIANT that guards the
+  // inverse bug: NEVER re-click a trigger already reading aria-expanded="true" — a
+  // second click TOGGLES the open dropdown SHUT. So openDropdown is called ONLY while
+  // not yet expanded (the for-loop's `!expanded` guard); once expanded we only poll.
+  let state = null, expanded = false;
+  for (let attempt = 1; attempt <= budgets.openRetries && !expanded; attempt++) {
+    if (attempt > 1) { await act.pressEscape(); await act.delay(budgets.reopenSettleMs); } // close the half-state + let the re-render finish
+    if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
+    // GATE 1 (cheap): poll aria-expanded for a SHORT window. A real open expands
+    // promptly; a raced no-op never does. Don't burn the option ceiling on a race.
+    const expandDeadline = Date.now() + budgets.openExpandWindowMs;
+    while (Date.now() < expandDeadline) {
+      await act.delay(budgets.settleIntervalMs);
+      state = await act.readDropdownState(loc);
+      if (state && state.ariaExpanded === "true") { expanded = true; break; }
     }
-    prevCount = n;
+  }
+  // GATE 2: the trigger IS expanded — NEVER re-click it. Poll optionCount to the FULL
+  // ceiling (a cold lazy list renders after the expand). Settle = 2 equal non-zero reads.
+  // delayFull (NON-adaptive): the option list renders at the PAGE's pace, which the
+  // foreground speedup must NOT shorten — at fast-scaled intervals the "2 stable reads"
+  // span only ~140ms and conclude on an INCOMPLETE render, so a pick lands on a partial
+  // list and is discarded on render-complete (the false verified:true). Real-time stability
+  // ⇒ the list is fully rendered before we match/click.
+  if (expanded) {
+    let prevCount = -1, stable = 0;
+    const openDeadline = Date.now() + budgets.openCeilingMs;
+    while (Date.now() < openDeadline) {
+      const n = state ? state.optionCount : 0;
+      if (n > 0 && n === prevCount) {
+        stable++;
+        if (stable >= budgets.stableReads - 1) break;
+      } else {
+        stable = 0;
+      }
+      prevCount = n;
+      await act.delayFull(budgets.settleIntervalMs);
+      state = await act.readDropdownState(loc);
+    }
   }
   if (!state || state.optionCount === 0) {
     await act.pressEscape();
@@ -389,10 +424,21 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     let after = null;
     const deadline = Date.now() + budgets.commitCeilingMs;
     while (Date.now() < deadline) {
-      await act.delay(budgets.commitIntervalMs);
+      await act.delayFull(budgets.commitIntervalMs); // real time — the page commits the pick at its own pace
       const cs = await act.readDropdownState(loc);
       after = cs ? cs.triggerText : after;
-      if (committedText(after)) return { ok: true, after };
+      if (committedText(after)) {
+        // PERSISTENCE (the false-verify guard): a pick made before the option list finished
+        // rendering shows for an instant, then is DISCARDED on render-complete — that momentary
+        // value is exactly what produced the false verified:true. Confirm the trigger STILL
+        // shows the target after another real-time beat before accepting; a revert keeps polling
+        // (→ honest needs_review), never a silent wrong fill.
+        await act.delayFull(budgets.commitIntervalMs);
+        const cs2 = await act.readDropdownState(loc);
+        const after2 = cs2 ? cs2.triggerText : null;
+        if (committedText(after2)) return { ok: true, after: after2 };
+        after = after2; // reverted — not committed; keep polling until the deadline
+      }
     }
     return { ok: false, after };
   };
@@ -416,7 +462,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     if (!re || re.optionCount === 0) {
       if (await act.openDropdown(loc)) {
         const d = Date.now() + Math.min(budgets.openCeilingMs, 8000);
-        while (Date.now() < d) { await act.delay(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; }
+        while (Date.now() < d) { await act.delayFull(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; }
       }
     }
     if (re && re.optionCount > 0) res = await commitByClick();
@@ -552,21 +598,32 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   // at open. Returns the focused state, or null if focus can't be confirmed —
   // in which case the caller MUST NOT actuate (no blind clear/type/Enter).
   const ensureSearchFocused = async () => {
-    let st = await act.readTypeahead(loc);
-    if (!st || !st.searchBox.present || !st.searchBox.visible) {
-      if (!(await act.openTypeahead(loc))) return null; // re-open if it unmounted
-      const t0 = Date.now();
-      while (Date.now() - t0 < budgets.taOpenCeilingMs) {
-        await act.delay(budgets.taOpenIntervalMs);
-        st = await act.readTypeahead(loc);
-        if (st && st.searchBox.visible) break;
+    // Bounded open+focus retry (M29). A fast-paced open can race the prior field's
+    // post-commit re-render so the searchBox isn't focusable on the first try (the
+    // live "could not focus" — it worked on the slow/hidden path). Re-attempt.
+    // INVARIANT (the toggle-shut analog): openTypeahead is called ONLY when the
+    // searchBox is NOT present/visible — never re-open an already-open search.
+    // Returns the focused state, or null after exhausting attempts → the caller
+    // MUST NOT actuate (no blind clear/type/Enter).
+    for (let attempt = 1; attempt <= budgets.taOpenRetries; attempt++) {
+      let st = await act.readTypeahead(loc);
+      if (!st || !st.searchBox.present || !st.searchBox.visible) {
+        if (!(await act.openTypeahead(loc))) { await act.delay(budgets.reopenSettleMs); continue; } // unmounted — re-open
+        const t0 = Date.now();
+        while (Date.now() - t0 < budgets.taOpenCeilingMs) {
+          await act.delay(budgets.taOpenIntervalMs);
+          st = await act.readTypeahead(loc);
+          if (st && st.searchBox.visible) break;
+        }
       }
+      if (st && st.searchBox.visible && !st.searchBox.focused) {
+        await act.focusSearchBox(loc); // already-visible search → focus only, never re-open
+        st = await act.readTypeahead(loc);
+      }
+      if (st && st.searchBox.focused) return st;
+      await act.delay(budgets.reopenSettleMs); // let a racing re-render settle, then retry
     }
-    if (st && st.searchBox.visible && !st.searchBox.focused) {
-      await act.focusSearchBox(loc);
-      st = await act.readTypeahead(loc);
-    }
-    return st && st.searchBox.focused ? st : null;
+    return null;
   };
 
   const trace = [];
