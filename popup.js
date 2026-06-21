@@ -121,17 +121,29 @@ document.getElementById("cdp-fill").addEventListener("click", () => {
 // CDP FILL FULL PAGE (M38 Part 1 — the fold): flat fields + every present repeating
 // section in one click. Run on My Experience (page 2); minimize within 60s. [CDP-PAGE].
 document.getElementById("cdp-fill-page").addEventListener("click", () => {
-  setStatus("CDP full-page fill… MINIMIZE the window now (60s window). Results land in the service worker console as [CDP-PAGE].");
+  setStatus("CDP full-page fill starting… keep the tab VISIBLE for a fast fill (watch it) or minimize for slow/background. Results land in the service worker console as [CDP-PAGE].");
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_PAGE" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
       setStatus('No profile in storage — click "Load default profile" first.');
-    } else if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
     } else if (resp.ok === false) {
       setStatus("Full-page fill failed: " + resp.error + " — see the service worker console.");
     } else {
-      setStatus(`${resp.session_warning ? "⚠ " + resp.session_warning + "\n" : ""}Full-page fill done — ${JSON.stringify(resp.counts)}, ${resp.needs_review} need review. See [CDP-PAGE].`);
+      setStatus(`${resp.session_warning ? "⚠ " + resp.session_warning + "\n" : ""}Full-page fill done — ${JSON.stringify(resp.counts)}, ${resp.needs_review} need review${resp.audit_flagged ? `, ${resp.audit_flagged} AUDIT-flagged` : ""}. See [CDP-PAGE].`);
+    }
+  });
+});
+
+document.getElementById("cdp-audit").addEventListener("click", () => {
+  setStatus("CDP re-audit… re-reading the live page vs the last fill. See [CDP-AUDIT] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_AUDIT" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false && resp.error === "no-audit-data") {
+      setStatus("No audit data — run a full-page CDP fill first (it records the expectations).");
+    } else if (resp.ok === false) {
+      setStatus("Re-audit failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Re-audit done — ${resp.checked} checked, ${resp.flagged} flagged${resp.flagged ? " (MISMATCH — see [CDP-AUDIT])" : " (page matches the last fill)"}.`);
     }
   });
 });

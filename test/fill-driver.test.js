@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2068,4 +2068,102 @@ test("M38 Part 2 accumulateBundle: a viewer EDIT on a prior page SURVIVES the ne
   assert.strictEqual(survived.current_value, "Masters");
   assert.strictEqual(survived.edit_kind, "override");
   assert.strictEqual(survived.is_edited, true);
+});
+
+// ── M40 post-fill page AUDIT — re-read the live DOM + reconcile vs recorded ──
+// A self-contained fake exposing only the reads reconcileAudit uses; `live` maps a
+// wrapperSel → the value the LIVE page now shows (the perturbation). missing:true →
+// the loc no longer resolves (read returns null → audit-unverifiable).
+function makeAuditAct(live) {
+  const g = (loc) => live[loc.wrapperSel] || {};
+  return {
+    delayFull: async () => {},
+    readTextValue: async (loc) => { const f = g(loc); return f.missing ? null : { value: f.text || "" }; },
+    readDropdownState: async (loc) => { const f = g(loc); return f.missing ? null : { triggerText: f.trigger }; },
+    readCheckboxState: async (loc) => { const f = g(loc); return f.missing ? null : { inputId: "i", checked: f.checked }; },
+    readRadioState: async (loc) => { const f = g(loc); return f.missing ? null : [{ labelText: f.radioLabel, checked: true }]; },
+    readTypeahead: async (loc) => { const f = g(loc); return f.missing ? null : { chips: f.chips || [] }; },
+    readSource: async (loc) => { const f = g(loc); return f.missing ? null : { chips: f.chips || [] }; },
+    readDateSegment: async (loc, seg) => { const f = g(loc); if (f.missing || !f.segments || f.segments[seg] == null) return null; return { value: String(f.segments[seg]) }; }
+  };
+}
+const auditVerdict = async (entry, liveForKey) => {
+  const v = await reconcileAudit(makeAuditAct({ "[w]": liveForKey }), [Object.assign({ key: "k", auditLoc: "[w]" }, entry)], T_BUDGETS);
+  return v[0].verdict;
+};
+
+// (1) Date round-trip (the user's hard point): auditDateSegments is the EXACT inverse of
+// fillDateCompositeCdp's afterStr — confirm the split-count→shape mapping round-trips for
+// all three (year-only, M/Y, M/D/Y), else a correct date false-flags or a real one is missed.
+test("M40 audit: auditDateSegments round-trips all three date shapes (inverse of the fill formatting)", () => {
+  assert.deepStrictEqual(auditDateSegments("2024"), [["Year", "2024"]]);                                  // year-only
+  assert.deepStrictEqual(auditDateSegments("5/2025"), [["Month", "5"], ["Year", "2025"]]);                 // M/Y
+  assert.deepStrictEqual(auditDateSegments("6/15/2024"), [["Month", "6"], ["Day", "15"], ["Year", "2024"]]); // M/D/Y
+});
+
+test("M40 audit: a date whose live segments still equal the recorded value → match (round-trip, all shapes)", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "date", expected: "2024" }, { segments: { Year: "2024" } }), "match");
+  assert.strictEqual(await auditVerdict({ widgetType: "date", expected: "5/2025" }, { segments: { Month: "5", Year: "2025" } }), "match");
+  assert.strictEqual(await auditVerdict({ widgetType: "date", expected: "6/15/2024" }, { segments: { Month: "6", Day: "15", Year: "2024" } }), "match");
+});
+
+test("M40 audit: a date segment reverted on the live page → MISMATCH", async () => {
+  // expected 6/15/2024 but the page now shows month 1 → caught.
+  assert.strictEqual(await auditVerdict({ widgetType: "date", expected: "6/15/2024" }, { segments: { Month: "1", Day: "15", Year: "2024" } }), "mismatch");
+});
+
+// (2) Per-widget mismatch — the perturbation gate's unit analog (the live page differs from recorded).
+test("M40 audit: dropdown reverted (degree Bachelors→Associates) → MISMATCH", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "dropdown", expected: "Bachelors" }, { trigger: "Associates" }), "mismatch");
+});
+test("M40 audit: text overwritten on the page → MISMATCH; unchanged → match", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "text", expected: "Tallahassee, FL" }, { text: "Pittsburgh, PA" }), "mismatch");
+  assert.strictEqual(await auditVerdict({ widgetType: "text", expected: "Tallahassee, FL" }, { text: "Tallahassee, FL" }), "match");
+});
+test("M40 audit: dropdown still matches (normalize-aware) → match, no false flip", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "dropdown", expected: "United States of America" }, { trigger: "United States of America" }), "match");
+});
+test("M40 audit: checkbox state changed → MISMATCH; same → match", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "checkbox", expected: "true" }, { checked: false }), "mismatch");
+  assert.strictEqual(await auditVerdict({ widgetType: "checkbox", expected: "true" }, { checked: true }), "match");
+});
+test("M40 audit: typeahead chip reverted → MISMATCH", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "typeahead", expected: "Other" }, { chips: ["Electrical Engineering"] }), "mismatch");
+});
+
+// (3) Unre-readable → audit-unverifiable, NEVER a silent pass (the honest branch).
+test("M40 audit: a field whose locator no longer resolves → UNVERIFIABLE (never silently 'match')", async () => {
+  assert.strictEqual(await auditVerdict({ widgetType: "dropdown", expected: "Bachelors" }, { missing: true }), "unverifiable");
+  assert.strictEqual(await auditVerdict({ widgetType: "date", expected: "2024" }, { missing: true }), "unverifiable");
+});
+
+// (4) applyAuditVerdicts mutates the result in place: mismatch → needs_review/audit-mismatch,
+// after = the live truth; unverifiable → audit-unverifiable; match → untouched.
+test("M40 audit: applyAuditVerdicts downgrades a mismatch (after = live truth) + flags unverifiable + leaves matches", () => {
+  const results = [
+    { fieldName: "a", status: "filled", verified: true, flag: null, after: "Bachelors", detail: "x" },
+    { fieldName: "b", status: "filled_review", verified: true, flag: "autocommit-containment", after: "CPP …", detail: "y" },
+    { fieldName: "c", status: "filled", verified: true, flag: null, after: "Tallahassee, FL", detail: null }
+  ];
+  applyAuditVerdicts(results, [
+    { key: "a", verdict: "mismatch", expected: "Bachelors", actual: "Associates" },
+    { key: "b", verdict: "unverifiable", expected: "CPP …", actual: null },
+    { key: "c", verdict: "match", expected: "Tallahassee, FL", actual: "Tallahassee, FL" }
+  ]);
+  assert.strictEqual(results[0].status, "needs_review");
+  assert.strictEqual(results[0].flag, "audit-mismatch");
+  assert.strictEqual(results[0].after, "Associates");        // the bundle shows the live truth
+  assert.match(results[0].detail, /AUDIT: page shows "Associates" not "Bachelors"/);
+  assert.strictEqual(results[1].status, "needs_review");
+  assert.strictEqual(results[1].flag, "audit-unverifiable");
+  assert.strictEqual(results[2].status, "filled");           // a match is left untouched
+  assert.strictEqual(results[2].flag, null);
+});
+
+// (5) Integration: a CLEAN flat fill → the inline audit re-reads, everything matches, ZERO audit flags
+// (proves the audit doesn't FALSE-flag a correct page — the complement of the mismatch tests above).
+test("M40 audit: a clean drivePageFill run gets NO audit-* flags (no false flags on a correct page)", async () => {
+  const out = await drivePageFill(makeFakeAct([ddField()]), usProfile, {}, {}, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable"), "a correct fill must not be audit-flagged");
+  assert.strictEqual(out.results[0].status, "filled");
 });

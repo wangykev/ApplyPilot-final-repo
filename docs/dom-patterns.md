@@ -1265,3 +1265,36 @@ ISOLATION, never riding the text/date pass.
   to Enter, no hang — the underlying value landed, so it still commits, proving proceed-not-hang). The
   reactive sweep (M39 → M39.1 → M39.2) is complete. Next: the post-fill page AUDIT (M40) as the permanent
   backstop for the false-verify class, before the N-page walk.
+
+## 2026-06-21 — Magna wd3: post-fill page AUDIT (M40) — the false-verify-class backstop
+
+A field's own in-fill verify reads right after it acts — so it CANNOT see a value clobbered AFTER its fill
+completes (a later field's actuation disturbing an earlier one, or a delayed server reset). M39 fixed the
+IN-fill race; M40 is the independent POST-SETTLE pass: re-read the whole page once it's done + reconcile vs
+what each field recorded. The automated form of the operator's manual page-check. FLAG-ONLY (reconcile +
+flag, never auto-refill — the chosen scope).
+
+- **`reconcileAudit(act, entries, budgets)`** (fill-driver.js, exported): one `delayFull` settle (the
+  page's render is real wall-clock — the foreground speedup must not shorten it), then per entry re-read the
+  LIVE value by widget type (reusing the existing `act` reads — text/textarea `readTextValue`, dropdown
+  `readDropdownState.triggerText`, checkbox `readCheckboxState.checked`, radio `readRadioState`, typeahead
+  `readTypeahead.chips`, source `readSource.chips`, date per-segment `readDateSegment` — all keyed by
+  `auditLoc`, a SELECTOR STRING re-resolved fresh, never a held node) → classify **match / mismatch /
+  unverifiable**.
+- **Date re-read = the one with format ambiguity** (text/dropdown/checkbox are direct). `auditDateSegments`
+  is the EXACT inverse of `fillDateCompositeCdp`'s `afterStr` (`["Month","Day","Year"].filter(present)
+  .join("/")`): split count → shape (1=Year-only, 2=M/Y, 3=M/D/Y), compared parseInt-per-segment. A
+  round-trip unit test pins all three so a correct date can't false-flag and a real change can't be missed.
+- **Verdicts:** mismatch → `needs_review`/`audit-mismatch`, `after` = the LIVE TRUTH (the bundle must show
+  what's actually on the page), detail = claimed-vs-actual. Unre-readable (loc gone) → `audit-unverifiable`
+  — NEVER a silent pass (the honest branch). A match is left untouched (no false flip).
+- **Two triggers:** INLINE (auto, end of `drivePageFill`, mutating results → the bundle — the real backstop,
+  the walk gets it free) + STANDALONE (`runCdpAudit` + "CDP re-audit last fill" button, re-reading the
+  persisted `reviewAudit` side-list `[{key,widgetType,auditLoc,auditTag,expected}]`, overwrite-per-fill).
+  The standalone is what makes the perturbation test stageable (no operator intervention mid-run).
+- **LIVE perturbation-gate-verified (the gate = it must CATCH, not just stay quiet):** clean page-1 + page-2
+  runs added ZERO audit flags (no false flags on a correct page). Then staged changes were ALL caught —
+  countryPhoneCode→"Algeria (+213)" (typeahead mismatch), schoolName→"…Universityyyy" (text) + issuedDate→
+  6/15/2023 (DATE — the round-trip reconstruction proven LIVE), and a DELETED workExperience[2] entry → all
+  7 of its fields `unverifiable` ("page shows null", the structural-loss proof: catches a removed entry, not
+  just a changed value). 165 tests (+11). Next: M38 Part 3 (the N-page walk) reuses this inline per page.

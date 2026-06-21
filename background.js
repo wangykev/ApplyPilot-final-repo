@@ -257,6 +257,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP RE-AUDIT (M40 standalone): re-read the live page vs the persisted reviewAudit
+  // expectations + report mismatches. No profile needed (reads stored expectations).
+  if (message.type === "RUN_CDP_AUDIT") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpAudit(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP WALK (M31): fill page 1 → guarded Save & Continue → detect VPS/session-death
   // (halt) or a clean transition (report "advanced", stop — page-2 fill deferred).
   if (message.type === "RUN_CDP_WALK") {
@@ -1849,14 +1861,62 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     })));
     LOG("counts:", JSON.stringify(out.counts));
 
+    // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
+    // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations
+    // (out.audit) so the standalone "re-audit" can re-read the live page later (the perturbation
+    // re-check). Overwrite-per-fill — the audit is about the CURRENT live page, not accumulated.
+    const auditFlags = out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable");
+    LOG(`audit: re-read ${(out.audit || []).length} filled field(s) post-settle —`, auditFlags.length ? `${auditFlags.length} FLAGGED (${auditFlags.map((r) => r.fieldName + ":" + r.flag).join(", ")})` : "all matched the report");
+    await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
+
     // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
     const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
     const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
     await persistAccumulated(bundle);
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total };
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total, audit_flagged: auditFlags.length };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("full-page fill aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP RE-AUDIT (M40 standalone) — re-read the LIVE page against the persisted
+// expectations (`reviewAudit`, written by the last full-page fill) + report any
+// mismatch. The independent backstop, runnable any time: the operator can fill,
+// then MANUALLY change a committed field, then re-audit → it MUST flag that field
+// (the perturbation gate — proves the audit CATCHES, not just stays quiet). Read-
+// only re-reads; never actuates. Attach → reconcileAudit → report → detach.
+// ============================================================================
+async function runCdpAudit(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-AUDIT]", ...a);
+  try {
+    const stored = await new Promise((resolve) => chrome.storage.local.get("reviewAudit", (r) => resolve(r && r.reviewAudit)));
+    if (!stored || !Array.isArray(stored.entries) || !stored.entries.length) {
+      LOG("no reviewAudit found — run a full-page CDP fill first (it records the expectations).");
+      return { ok: false, error: "no-audit-data" };
+    }
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG(`re-auditing ${stored.entries.length} field(s) against the live page (recorded ${stored.savedAt}).`);
+    const act = makeCdpActuation();
+    const verdicts = await reconcileAudit(act, stored.entries, DEFAULT_BUDGETS);
+    const bad = verdicts.filter((v) => v.verdict !== "match");
+    LOG(`════ AUDIT (${verdicts.length} checked, ${bad.length} flagged) ════`);
+    for (const v of bad) {
+      LOG(`  ⚠ [${v.verdict}] ${v.key} (${v.widgetType}) — page shows "${v.actual}" ; expected "${v.expected}"`);
+    }
+    if (!bad.length) LOG("  ✓ every field still shows its filled value — page matches the last fill.");
+    return { ok: true, checked: verdicts.length, flagged: bad.length, mismatches: bad };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("re-audit aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

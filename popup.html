@@ -44,6 +44,11 @@
          the whole page. NO minimize gate: keep the tab VISIBLE for a FAST fill (watch it) or
          MINIMIZE for slow/background — it adapts live. Load profile first, click. [CDP-PAGE]. -->
     <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; visible=fast)</button>
+    <!-- RE-AUDIT (M40): re-read the live page vs the last full-page fill's recorded values
+         + report any field that no longer matches. The independent backstop for the
+         false-verify class. To TEST it: fill, then manually change a committed field on the
+         page, then click this — it must flag that field. [CDP-AUDIT] in the SW console. -->
+    <button id="cdp-audit">CDP re-audit last fill (flag mismatches)</button>
     <!-- CDP WALK (M31): fill page 1, then a GUARDED Save & Continue with VPS/session
          detection — halts "session expired" on a dead session, reports "advanced" on a
          clean transition (page-2 fill deferred). NOTE: on a LIVE session this advances

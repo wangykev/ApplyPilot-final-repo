@@ -198,7 +198,10 @@ const DEFAULT_BUDGETS = {
   // M32 repeating-section reconcile poll (Add/Delete → entry count moves). In-tree
   // budget is 4s/150ms; the page mounts the new/removed entry on its throttled loop.
   entryReconcileCeilingMs: 4000,
-  entryReconcileIntervalMs: 150
+  entryReconcileIntervalMs: 150,
+  // M40 post-fill audit: one settle (NON-adaptive — the page's render is real wall-clock)
+  // before the independent re-read pass, so a still-settling last field isn't false-flagged.
+  auditSettleMs: 600
 };
 
 // ── Verbatim M22 ports (background.js fillEngine — change in lockstep) ──────
@@ -1114,6 +1117,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
       record.status = "error";
       record.detail = String(e);
     }
+    record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
     results.push(record);
 
     // Let one field's transient UI settle before the next opens (also the
@@ -1148,6 +1152,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
     }
   }
 
+  // M40 post-fill page AUDIT (inline backstop): after the WHOLE page has settled, re-read
+  // every field that claims a value + reconcile vs what it recorded. Catches a value clobbered
+  // AFTER its own fill (cross-field / delayed reset) that per-field verify can't see. A mismatch
+  // → needs_review/audit-mismatch (after = the live truth); unre-readable → audit-unverifiable.
+  // `auditEntries` (expected = the value just filled, BEFORE any mutation) is returned for the SW
+  // to persist (the standalone re-audit). Flag-only — never auto-refills.
+  const auditEntries = auditEntriesFromResults(results);
+  const auditVerdicts = await reconcileAudit(act, auditEntries, budgets);
+  applyAuditVerdicts(results, auditVerdicts);
+
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
   // M30 session-expiry EARLY-WARNING (heuristic, SOURCE-ONLY): if this page has the
@@ -1159,7 +1173,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
   const sessionWarning = (srcRec && srcRec.status === "needs_review" && srcRec.optionsLoaded === false)
     ? "Likely session expired — the \"How did you hear about us?\" options never loaded (server fetch failed). Refresh, log in, and reopen the form, then retry."
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning };
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries };
 }
 
 // ============================================================================
@@ -1310,6 +1324,8 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       recs.push(rec); await act.delay(budgets.interFieldMs); continue;
     }
     const loc = { wrapperSel: fd.wrapperSel };
+    rec.auditLoc = fd.wrapperSel; // M40: retain the entry-scoped locator for the post-fill audit re-read
+    rec.auditTag = f.widget === "textarea" ? "textarea" : undefined;
     try {
       if (f.widget === "year" || f.widget === "date") {
         // M36: fill via the M34 date composite. item[f.key] is SW-parsed — a "YYYY"
@@ -1531,6 +1547,103 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
 };
 
 // ============================================================================
+// M40 — post-fill page AUDIT. A SECOND, INDEPENDENT read of the live DOM AFTER the
+// whole page has settled, reconciled against what each field RECORDED. It catches the
+// false-verify CLASS that a field's own in-fill verify structurally CANNOT see: a value
+// clobbered AFTER its own fill completed (a later field's actuation disturbed an earlier
+// one, or a delayed server reset — M39 was an IN-fill race; this is the post-settle one).
+// FLAG-ONLY (the chosen scope): reconcile + flag, never auto-refill. Runs inline at the
+// end of drivePageFill (the real backstop, mutating results → the bundle) AND standalone
+// via the SW (re-read the persisted expectations — the perturbation re-check).
+// ============================================================================
+
+// auditDateSegments: the EXACT inverse of fillDateCompositeCdp's afterStr formatting
+// (["Month","Day","Year"].filter(present).join("/")). Split count → segment shape:
+// 1 part = Year-only, 2 = Month/Year, 3 = Month/Day/Year. A round-trip unit test pins this.
+function auditDateSegments(expected) {
+  const parts = String(expected == null ? "" : expected).split("/");
+  if (parts.length === 1) return [["Year", parts[0]]];
+  if (parts.length === 2) return [["Month", parts[0]], ["Year", parts[1]]];
+  return [["Month", parts[0]], ["Day", parts[1]], ["Year", parts[2]]];
+}
+function auditDateMatches(actual, expected) {
+  const a = String(actual).split("/"), b = String(expected).split("/");
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (parseInt(a[i], 10) !== parseInt(b[i], 10)) return false;
+  return true;
+}
+
+// Re-read ONE field's live value by widget type (reusing the existing act reads, all keyed
+// by wrapperSel — a SELECTOR STRING, re-resolved fresh from document, never a held node).
+// Returns { actual, readable }: readable=false ⇒ the loc no longer resolves / read failed
+// (→ audit-unverifiable, NEVER a silent pass).
+async function auditReReadActual(act, e) {
+  const loc = { wrapperSel: e.auditLoc };
+  try {
+    switch (e.widgetType) {
+      case "text": case "textarea": { const r = await act.readTextValue(loc, e.auditTag); return { actual: r ? r.value : null, readable: !!r }; }
+      case "dropdown": { const r = await act.readDropdownState(loc); return { actual: r ? r.triggerText : null, readable: !!r }; }
+      case "checkbox": { const r = await act.readCheckboxState(loc); return { actual: r ? String(r.checked) : null, readable: !!(r && r.inputId != null) }; }
+      case "radio": { const r = await act.readRadioState(loc); const ok = Array.isArray(r) && r.length > 0; const c = ok && r.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
+      case "typeahead": { const r = await act.readTypeahead(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
+      case "hierarchical": { const r = await act.readSource(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
+      case "date": {
+        const segs = auditDateSegments(e.expected);
+        const parts = [];
+        for (const [seg] of segs) { const r = await act.readDateSegment(loc, seg); if (!r || r.value == null) return { actual: null, readable: false }; parts.push(r.value); }
+        return { actual: parts.join("/"), readable: true };
+      }
+      default: return { actual: null, readable: false }; // unauditable type → unverifiable, never a pass
+    }
+  } catch (err) { return { actual: null, readable: false }; }
+}
+
+// reconcileAudit: re-read each entry's live value + classify match / mismatch / unverifiable.
+// One settle first (delayFull — the page's render takes real wall-clock; the foreground
+// speedup must not shorten it). Pure verdict list; the caller (inline or SW) acts on it.
+async function reconcileAudit(act, entries, budgets) {
+  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
+  const norm = apMatch.normalize;
+  await act.delayFull(b.auditSettleMs);
+  const verdicts = [];
+  for (const e of entries) {
+    const { actual, readable } = await auditReReadActual(act, e);
+    let verdict;
+    if (!readable || actual === null) verdict = "unverifiable";
+    else if (e.widgetType === "text" || e.widgetType === "textarea" || e.widgetType === "checkbox") verdict = actual === e.expected ? "match" : "mismatch";
+    else if (e.widgetType === "date") verdict = auditDateMatches(actual, e.expected) ? "match" : "mismatch";
+    else verdict = norm(actual) === norm(e.expected) ? "match" : "mismatch"; // dropdown / radio / typeahead / source
+    verdicts.push({ key: e.key, widgetType: e.widgetType, expected: e.expected, actual, verdict });
+  }
+  return verdicts;
+}
+
+// Build the audit entry list from drivePageFill results (the fields claiming a value) +
+// apply the verdicts back to the results in place (a mismatch downgrades to needs_review).
+function auditEntriesFromResults(results) {
+  return (results || [])
+    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc)
+    .map((r) => ({ key: r.fieldName, widgetType: r.widgetType, auditLoc: r.auditLoc, auditTag: r.auditTag || null, expected: r.after }));
+}
+function applyAuditVerdicts(results, verdicts) {
+  for (const v of verdicts) {
+    if (v.verdict === "match") continue;
+    const rec = (results || []).find((r) => r.fieldName === v.key);
+    if (!rec) continue;
+    rec.verified = false;
+    rec.status = "needs_review";
+    if (v.verdict === "mismatch") {
+      rec.flag = "audit-mismatch";
+      rec.after = v.actual; // the bundle must show the TRUTH (the live page), not the claimed value
+      rec.detail = (rec.detail ? rec.detail + " | " : "") + `AUDIT: page shows "${v.actual}" not "${v.expected}"`;
+    } else {
+      rec.flag = "audit-unverifiable";
+      rec.detail = (rec.detail ? rec.detail + " | " : "") + "AUDIT: could not re-read to verify";
+    }
+  }
+}
+
+// ============================================================================
 // M38 Part 2 — CDP review-summary bundle (the persisted review UI for the CDP path).
 // Reproduces the page-engine fillEngine's buildEntry + mapFillStatus/deriveConfidence/
 // deriveReview (background.js ~3716) — they are PURE and read ONLY the rec fields a CDP
@@ -1654,5 +1767,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
 }
