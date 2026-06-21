@@ -1298,3 +1298,33 @@ flag, never auto-refill — the chosen scope).
   6/15/2023 (DATE — the round-trip reconstruction proven LIVE), and a DELETED workExperience[2] entry → all
   7 of its fields `unverifiable` ("page shows null", the structural-loss proof: catches a removed entry, not
   just a changed value). 165 tests (+11). Next: M38 Part 3 (the N-page walk) reuses this inline per page.
+
+## 2026-06-21 — M38 Part 3: the N-page walk loop (BUILT; live-verify-to-review DEFERRED)
+
+Generalized M31's ONE-transition `runCdpWalk` into an N-page LOOP. The M31 guards (`clickPageNext`
+review-refusal, `cdpWaitNextPage` dead-check-then-field-set-delta, `sessionLooksDead`, `reportPageErrors`)
+are reused verbatim; Part 3 just loops them.
+
+- **Extracted `fillAndPersistPage(act, prepared, defaults, jobContext, LOG)`** — the per-page work shared by
+  `runCdpFillPage` (single page → thin wrapper) and the walk: `cdpPageKey` → `drivePageFill` (the fold +
+  inline M40 audit) → report → persist `reviewAudit` + `buildReviewBundle` + `persistAccumulated`
+  (write-per-page). Keeps the attach/clear concerns in the callers.
+- **The loop** (`for page=1..WALK_MAX_PAGES=8`): (a) `sessionLooksDead` → halt; (b) `applyFlowReviewPresent`
+  → STOP `reached-review` (SUCCESS — the whole app filled, never submit); (c) `fillAndPersistPage` (NO
+  advance click); (d) `!nextButtonPresent` → `no-next-button`; (e) `clickPageNext` (refuses on review →
+  `click-refused`); (f) `cdpWaitNextPage` → `sessionDead` halt / `timeout` `nav-timeout-dirty`+diagnostics /
+  `advanced` → next iteration. Dropped the hidden-gate (M39 foreground fast-fill). Clears `reviewSummary`+
+  `reviewAudit` ONCE at START, OUTSIDE the loop (mid-walk clear would wipe accumulated pages).
+- **SUBMIT-NEVER (the load-bearing safety):** double guard reused VERBATIM from M31 — the review-terminal
+  check is at the TOP of each iteration BEFORE any fill/click, AND `clickPageNext` independently refuses on
+  the `applyFlowReviewPage` marker. Confirmed the `fillAndPersistPage` extraction has NO advance click and
+  did NOT move the review check after a click. Submit is unreachable by construction.
+- **HONEST STATUS:** unit-green (165 — the walk is SW glue, not fill-driver) + the guards unit-pinned/reused,
+  BUT the LOOP reaching the ACTUAL review page has NEVER run live: no page advances until the prereqs land
+  (the required page-2 resume upload blocks Save & Continue; not-in-JSON required questions block too), so
+  the to-review path is currently UNREACHABLE by construction. **Committed as-built (operator-sanctioned)
+  BUT the first to-review walk is a HARD eyes-on gate on a DISPOSABLE application before any unattended run.**
+- **Blocked on two prereqs (next):** (1) resume attach on CDP — REUSE `attachResume` via `cdpEval` (self-
+  contained), wired into `fillAndPersistPage`, no-resume → `needs_review` that HALTS at that page; (2) the
+  multi-provider AI feature (Anthropic/Gemini/OpenAI) for free-text / unmapped-choice / yes-no screening
+  (guess+fill+flag), with EEO/demographics as a review-NOTE, not AI.

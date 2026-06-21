@@ -152,21 +152,21 @@ document.getElementById("cdp-audit").addEventListener("click", () => {
 // Halts "session expired" on a dead session; "advanced" on a clean transition (page-2
 // fill deferred). On a LIVE session this DOES advance the application. Minimize within 60s.
 document.getElementById("cdp-walk").addEventListener("click", () => {
-  setStatus("CDP walk: fill page 1 + Save & Continue + session check… MINIMIZE now (60s). See [CDP-WALK] in the service worker console.");
+  setStatus("CDP walk: filling each page → Save & Continue → to the REVIEW page (NEVER submits). Keep the tab VISIBLE to watch. Clear orphan cert specialties first. See [CDP-WALK].");
   chrome.runtime.sendMessage({ type: "RUN_CDP_WALK" }, (resp) => {
-    if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
       setStatus('No profile in storage — click "Load default profile" first.');
-    } else if (resp.ok === false && resp.error === "never-hidden") {
-      setStatus("INVALID run — tab never went hidden. Rerun and minimize within 60s.");
     } else if (resp.ok === false) {
       setStatus("CDP walk failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.reached_review) {
+      setStatus(`✓ CDP walk reached the REVIEW page — ${resp.pages_filled} page(s) filled, NOT submitted. "View last summary". See [CDP-WALK].`);
     } else if (resp.session_expired) {
-      setStatus("⚠ SESSION EXPIRED — refresh, log in, and reopen the form, then retry. See [CDP-WALK].");
-    } else if (resp.advanced) {
-      setStatus("CDP walk: page 1 filled, ADVANCED to page 2 (page-2 fill deferred). See [CDP-WALK].");
+      setStatus(`⚠ SESSION EXPIRED after ${resp.pages_filled} page(s) — refresh, log in, reopen the form, retry. See [CDP-WALK].`);
+    } else if (resp.stopped && resp.stopped.indexOf("nav-timeout") === 0) {
+      setStatus(`⚠ CDP walk halted at page ${resp.nav_timeout_page} (nav-timeout — page may be dirty, eyeball it). ${resp.pages_filled} page(s) filled. See [CDP-WALK].`);
     } else {
-      setStatus(`CDP walk: page 1 filled, stopped — ${resp.stopped}. See [CDP-WALK].`);
+      setStatus(`CDP walk stopped — ${resp.stopped} (${resp.pages_filled} page(s) filled). See [CDP-WALK].`);
     }
   });
 });

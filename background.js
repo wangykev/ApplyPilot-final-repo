@@ -1816,14 +1816,59 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
 }
 
 // ============================================================================
+// fillAndPersistPage (M38 Part 3 extraction) — the per-page work shared by the
+// single-page fill (runCdpFillPage) AND the N-page walk (runCdpWalk). On an ALREADY-
+// ATTACHED tab: compute the accumulation key → fold-fill (drivePageFill: flat + every
+// present repeating section + the inline M40 audit) → report → persist the audit
+// expectations + build & ACCUMULATE the review bundle (write-per-page). Takes the
+// PREPARED profile + a made `act` (the caller owns attach/detach + prepareProfile, so
+// the walk prepares once + attaches once across pages). Returns { out, bundle, auditFlags }.
+// ============================================================================
+async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG) {
+  // Accumulation merge key — the PRE-fill cdpPageKey (url PATHNAME [drops the volatile
+  // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
+  // on a same-pathname SPA). Computed BEFORE the fill (a field-revealing fill could change
+  // the field-set). NOT cdpPageSig (full url incl. query).
+  const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
+  const out = await drivePageFill(act, prepared, defaults, jobContext);
+
+  LOG("page:", out.url);
+  if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
+  LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+  for (const r of out.needsReview) {
+    LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
+  }
+  console.table(out.results.map((r) => ({
+    field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
+    verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
+  })));
+  LOG("counts:", JSON.stringify(out.counts));
+
+  // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
+  // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations
+  // (out.audit) so the standalone "re-audit" can re-read the live page later. Overwrite-per-
+  // fill — the audit is about the CURRENT live page, not accumulated.
+  const auditFlags = out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable");
+  LOG(`audit: re-read ${(out.audit || []).length} filled field(s) post-settle —`, auditFlags.length ? `${auditFlags.length} FLAGGED (${auditFlags.map((r) => r.fieldName + ":" + r.flag).join(", ")})` : "all matched the report");
+  await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
+
+  // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
+  const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
+  const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  await persistAccumulated(bundle);
+  return { out, bundle, auditFlags };
+}
+
+// ============================================================================
 // CDP FILL FULL PAGE (M38 Part 1) — the FOLD: ONE drivePageFill fills the flat
 // fields AND every repeating section PRESENT on the page (the fold in fill-driver
 // drives each present section via driveRepeatingSectionCdp + PAGE_SECTIONS). Passes
 // the PREPARED profile (sections need the annotated arrays). M38 Part 2: builds the
 // review-summary bundle from the results + persists it (accumulating write-per-page,
-// keyed by the pre-fill cdpPageSig) — "View last summary" in the popup. On page 1 (no
+// keyed by the pre-fill cdpPageKey) — "View last summary" in the popup. On page 1 (no
 // repeating sections) this is identical to runCdpFill + a summary; on page 2 it fills
-// the whole page in one click. [CDP-PAGE] in the SW console.
+// the whole page in one click. SINGLE page (no advance) — accumulates, reset via the
+// "Clear summary" button. [CDP-PAGE] in the SW console.
 // ============================================================================
 async function runCdpFillPage(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
@@ -1835,44 +1880,12 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     }
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
-    // throttle-immune), adapting LIVE as the operator minimizes/restores. This is the
-    // FIRST path that exercises visible-viewport CDP actuation (coordinate-clicks /
-    // scrollIntoView / focus on a real, watched viewport) — watch for mis-targets.
+    // throttle-immune), adapting LIVE as the operator minimizes/restores.
     LOG("attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).");
 
-    // M38 Part 2: page identity for the accumulation merge key — the PRE-fill cdpPageKey
-    // (url PATHNAME [drops the volatile query] + sorted field-set: STABLE per page across
-    // re-runs, DISTINCT across pages even on a same-pathname SPA). Computed BEFORE the fill
-    // (a field-revealing fill could change the field-set). NOT cdpPageSig (full url incl. query).
-    const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
     const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
     const act = makeCdpActuation();
-    const out = await drivePageFill(act, prepared, defaults, jobContext);
-
-    LOG("page:", out.url);
-    if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-
-    // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
-    // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations
-    // (out.audit) so the standalone "re-audit" can re-read the live page later (the perturbation
-    // re-check). Overwrite-per-fill — the audit is about the CURRENT live page, not accumulated.
-    const auditFlags = out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable");
-    LOG(`audit: re-read ${(out.audit || []).length} filled field(s) post-settle —`, auditFlags.length ? `${auditFlags.length} FLAGGED (${auditFlags.map((r) => r.fieldName + ":" + r.flag).join(", ")})` : "all matched the report");
-    await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
-
-    // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
-    const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-    const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
-    await persistAccumulated(bundle);
+    const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
     return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total, audit_flagged: auditFlags.length };
   } catch (e) {
     const msg = String((e && e.message) || e);
@@ -2249,11 +2262,15 @@ async function runCdpFillDate(tabId, profile, labelRegexStr) {
 }
 
 // ============================================================================
-// CDP WALK (M31) — fill page 1 → GUARDED Save & Continue → detect session-death
-// (VPS/login) OR a clean transition. ONE transition; page-2 fill is deferred
-// (repeating sections aren't on the CDP path). The CDP attach SURVIVES the
-// navigation (only Runtime+DOM enabled, no Page domain) — so no re-injection; we
-// just re-read the page via cdpEval on the same attach. Detaches in finally.
+// CDP WALK (M38 Part 3) — the N-PAGE LOOP. Generalizes the M31 ONE-transition walk:
+// for each page, fold-fill + audit + accumulate (fillAndPersistPage) → GUARDED Save &
+// Continue → wait for the transition (or session-death) → repeat, until the REVIEW
+// page (STOP — never submit), a terminal page, session death, a nav-timeout, or the
+// MAX_PAGES cap. The CDP attach SURVIVES navigation (only Runtime+DOM enabled, no Page
+// domain) — no re-injection; we re-read via cdpEval on the same attach. Detaches in
+// finally. SUBMIT-NEVER (double guard, reused verbatim from M31): the review terminal
+// is checked at the TOP of each iteration BEFORE any fill/click, AND clickPageNext
+// refuses on the review marker. Review-page reached = SUCCESS (walked the whole app).
 // ============================================================================
 
 // Page signature for transition detection: url + the sorted formField name set
@@ -2286,70 +2303,101 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
   return { advanced: false, timeout: true };
 }
 
+const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks are the REAL stops — this only bounds a detection bug from looping forever.
+
 async function runCdpWalk(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-WALK]", ...a);
+
+  // M31.1: surface the EXACT page error text + the fields left EMPTY (no profile value —
+  // the likely "required" validation cause) on a stop-with-errors. Takes the CURRENT page's
+  // results (per-page in the loop). Reads error state FRESH (errors render post Save & Continue).
+  const reportPageErrors = async (pageOut) => {
+    let st = null;
+    try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
+    const samples = (st && st.errorMarkers && st.errorMarkers.samples) || [];
+    if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
+    if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
+    if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
+    const empties = (pageOut && pageOut.results || []).filter((r) => r.status === "skipped");
+    if (empties.length) {
+      LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
+      empties.forEach((r) => LOG(`    • ${r.fieldName} — ${r.detail}`));
+    }
+    return { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+  };
+
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the walk starts on the first hidden read (60s window).");
-    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run, nothing done."); return { ok: false, error: "never-hidden" }; }
-    LOG("tab hidden — walk starting. ONE transition; page-2 fill is deferred (repeating sections).");
+    // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
+    // whole walk) or minimize=slow/background, adapting live.
+    LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
+    LOG("PREREQ: clear any recon-mounted orphan cert Specialties first — an empty REQUIRED specialty blocks Save & Continue (a false nav-timeout halt at the cert page).");
 
-    const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+    // CLEAR the accumulated summary ONCE at walk START, OUTSIDE the loop (its own guard):
+    // a fresh application starts clean. The loop only calls the ACCUMULATING persist — a
+    // mid-walk clear (from re-entry) would wipe the pages already filled.
+    await new Promise((resolve) => chrome.storage.local.remove(["reviewSummary", "reviewAudit"], resolve));
+    LOG("cleared the prior review summary + audit (fresh application).");
 
-    // ── Fill page 1 ──
+    const prepared = prepareProfile(profile); // once — each page fills what its own scan presents
     const act = makeCdpActuation();
-    const out = await drivePageFill(act, profile, defaults, jobContext);
-    LOG("page 1:", out.url);
-    if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning (source-liveness)
-    LOG(`page 1 filled — ${JSON.stringify(out.counts)}, ${out.needsReview.length} need review.`);
-    for (const r of out.needsReview) LOG(`  ⚠ [${r.status}] ${r.fieldName} — ${r.detail}`);
-    const base = { counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null };
+    const pagesFilled = [];
 
-    // M31.1: on a stop-with-errors, surface the EXACT page error text (future AI will
-    // use these to debug/fix the page) + which fields the walk left EMPTY because the
-    // profile/JSON has no value (the likely cause of a "required" validation error).
-    // Reads the error state FRESH (errors render after Save & Continue).
-    const reportPageErrors = async () => {
-      let st = null;
-      try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-      const samples = (st && st.errorMarkers && st.errorMarkers.samples) || [];
-      if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
-      if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
-      if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
-      const empties = out.results.filter((r) => r.status === "skipped");
-      if (empties.length) {
-        LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
-        empties.forEach((r) => LOG(`    • ${r.fieldName} — ${r.detail}`));
+    for (let page = 1; page <= WALK_MAX_PAGES; page++) {
+      // ── (a/b) TOP-OF-ITERATION guards: session-death + the REVIEW terminal (SUBMIT-NEVER —
+      // checked BEFORE any fill/click, so we never fill or advance the review page). ──
+      let nav = null;
+      try { nav = await cdpEval(cdpReadSessionState); } catch (e) { /* treat as not-ready below */ }
+      if (nav && sessionLooksDead(nav)) {
+        LOG(`⚠⚠ SESSION EXPIRED at page ${page} (login/VPS/no-form) — refresh, log in, reopen the form, retry.`);
+        const diag = await reportPageErrors(null);
+        return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
-      return { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
-    };
+      if (nav && nav.applyFlowReviewPresent) {
+        LOG(`✓✓ reached the REVIEW page after ${pagesFilled.length} page(s) — the whole application is filled. NOT submitting (terminal). "View last summary" for the accumulated bundle.`);
+        return { ok: true, stopped: "reached-review", reached_review: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
 
-    // ── Nav decision (double Submit-guard + pre-click dead check) ──
-    const nav = await cdpEval(cdpReadSessionState);
-    if (nav && nav.applyFlowReviewPresent) { LOG("on the REVIEW page — NEVER advancing (would submit). Stop."); return { ok: true, advanced: false, stopped: "review-page", ...base }; }
-    if (nav && sessionLooksDead(nav)) { LOG("⚠⚠ SESSION EXPIRED before advance (login/VPS/no-form) — refresh, log in, reopen the form, then retry."); const diag = await reportPageErrors(); return { ok: true, advanced: false, stopped: "session-expired", session_expired: true, ...diag, ...base }; }
-    if (!nav || !nav.nextButtonPresent) { LOG("no Save & Continue button — terminal page. Stop (no advance)."); return { ok: true, advanced: false, stopped: "no-next-button", ...base }; }
+      // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
+      LOG(`──── PAGE ${page} ────`);
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+      const { out } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
+      pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length });
 
-    // ── Guarded advance ──
-    const click = await act.clickPageNext();
-    LOG("Save & Continue:", JSON.stringify(click));
-    if (!click.clicked) { return { ok: true, advanced: false, stopped: "click-refused:" + (click.refused || "?"), ...base }; }
+      // ── (d) Terminal page with no Save & Continue (not the review marker — unusual). ──
+      const navAfter = await cdpEval(cdpReadSessionState);
+      if (!navAfter || !navAfter.nextButtonPresent) {
+        LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
+        return { ok: true, stopped: "no-next-button", pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
 
-    // ── Wait for transition OR session-death ──
-    const res = await cdpWaitNextPage(prevSig);
-    if (res.sessionDead) {
-      LOG("⚠⚠ SESSION EXPIRED / page errors after Save & Continue — refresh, log in, and reopen the form, then retry.");
-      const diag = await reportPageErrors();
-      return { ok: true, advanced: false, stopped: "session-expired", session_expired: true, ...diag, ...base };
+      // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──
+      const click = await act.clickPageNext();
+      LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
+      if (!click.clicked) {
+        LOG(`advance refused on page ${page} (${click.refused}) — stop.`);
+        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
+
+      // ── (f) Wait for the transition OR session-death OR a nav-timeout (dirty halt). ──
+      const res = await cdpWaitNextPage(prevSig);
+      if (res.sessionDead) {
+        LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`);
+        const diag = await reportPageErrors(out);
+        return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+      }
+      if (res.timeout) {
+        LOG(`⚠ nav-timeout on page ${page} — clicked Save & Continue but the page neither advanced nor showed a session error. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        const diag = await reportPageErrors(out);
+        return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+      }
+      LOG(`✓ page ${page} → advanced.`);
+      // res.advanced → next iteration (top-of-loop re-checks review/session on the new page).
     }
-    if (res.advanced) {
-      LOG("✓ advanced to page 2 — page-2 fill (repeating sections) is a future round. Stopping (1-transition cap).");
-      return { ok: true, advanced: true, stopped: "advanced-page2-deferred", ...base };
-    }
-    LOG("⚠ nav-timeout — clicked Save & Continue but the page neither advanced nor showed a session error. PAGE 1 MAY NOW BE DIRTY — EYEBALL it before any re-run; do NOT re-run on this page as if fresh. Errors + empty fields below:");
-    const diag = await reportPageErrors();
-    return { ok: true, advanced: false, stopped: "nav-timeout-dirty", ...diag, ...base };
+
+    LOG(`⚠ hit the ${WALK_MAX_PAGES}-page cap without reaching review — stopping (a detection-bug backstop). Eyeball the application.`);
+    return { ok: true, stopped: "max-pages-cap", pages_filled: pagesFilled.length, pages: pagesFilled };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("walk aborted:", msg);
