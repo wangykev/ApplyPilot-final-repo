@@ -94,6 +94,28 @@ function chipSetChanged(priorChips, chips) {
   return false;
 }
 
+// pollSearchValue (M39.2): reactive PRE-Enter settle for the typeahead/source search
+// box. POLL the searchBox VALUE (the input REFLECTION — `searchBox.value`) until it
+// equals `want` (`""` after a clear / the full candidate after typing), ceiling = give-up
+// ONLY. This is an ECHO wait, NOT a render wait: it confirms our typed/cleared text has
+// LANDED in the input before we snapshot/press the filter-Enter — it does NOT touch the
+// filter-render (the option list), which the UNCHANGED post-Enter transition-settle still
+// gates. `typeInSearch` types char-by-char and awaits every keystroke dispatch, so the
+// happy path matches on the FIRST read (no added latency); the poll only absorbs reflection
+// lag on a slow connection. Read-only (never changes focus). On give-up returns false and
+// the caller PROCEEDS to Enter anyway (today's fixed-delay behavior — the post-Enter settle
+// is the real commit gate) → strictly-better-than-today, never a hang. `read` is a thunk
+// (() => act.readTypeahead(loc) | act.readSource(loc)).
+async function pollSearchValue(act, read, want, budgets) {
+  const deadline = Date.now() + budgets.taActionSettleCeilingMs;
+  do {
+    const st = await read();
+    if (st && st.searchBox && st.searchBox.value === want) return true;
+    await act.delay(budgets.taActionSettleIntervalMs);
+  } while (Date.now() < deadline);
+  return false;
+}
+
 // overwriteNoMatchResting: the walk-end resting state under overwrite. The
 // original chip is intact (we never deleted it). Clear any leftover filter text
 // so the field rests as {chips:[original], query:""}, and flag for review (a
@@ -110,7 +132,9 @@ function chipSetChanged(priorChips, chips) {
 async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier) {
   const original = priorChips.join("; ");
   const focused = await ensureFocusedFn();
-  if (focused) { await clearFn(); await act.delay(budgets.taActionSettleMs); }
+  // Resting cleanup (gates nothing verified — the result comes from endChips below, never the
+  // searchBox value): clear the leftover filter text, reactively confirm it landed, then escape.
+  if (focused) { await clearFn(); await pollSearchValue(act, () => readFn(loc), "", budgets); }
   await act.pressEscape();
   let endChips = priorChips;
   try { const st = await readFn(loc); if (st && st.chips) endChips = st.chips; } catch (e) { /* keep priorChips */ }
@@ -163,7 +187,11 @@ const DEFAULT_BUDGETS = {
   // ceiling tolerates colder tenants without false-negativing to needs_review).
   taOpenCeilingMs: 5000,   // opener click → searchBox visible+focused (~260ms observed)
   taOpenIntervalMs: 250,
-  taActionSettleMs: 400,   // after clear / after typing, before Enter
+  taActionSettleMs: 400,   // after clear / after typing, before Enter (legacy; reactive pollSearchValue below)
+  // Reactive PRE-Enter settle (M39.2): poll the searchBox VALUE (input echo) until it reflects
+  // the clear/typed candidate. Ceiling generous — a ~40-char candidate types ~1.6s char-by-char.
+  taActionSettleCeilingMs: 6000,
+  taActionSettleIntervalMs: 60,
   taSettleCeilingMs: 25000, // filter-Enter → fresh transition (banner/chip/filtered)
   taSettleIntervalMs: 400,
   taEnterCommitCeilingMs: 5000, // commit-Enter → chip, before the click fallback takes over
@@ -653,12 +681,12 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the search field — not actuating blind (no clear/type/Enter)", settle_trace: trace };
     }
     await act.clearSearch();
-    await act.delay(budgets.taActionSettleMs);
+    await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets); // reactive: the clear has LANDED in the input before snapshot
     const snap = await act.readTypeahead(loc);
     const snapSig = snap ? snap.pageWide.sig : null;
     step.staleBannerAtStart = !!(snap && snap.banner);
     await act.typeInSearch(cand);
-    await act.delay(budgets.taActionSettleMs);
+    await pollSearchValue(act, () => act.readTypeahead(loc), cand, budgets); // reactive: the full candidate has LANDED before the filter-Enter
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
 
     let sawChange = false, stable = 0, prevSig = null, outcome = "timeout";
@@ -874,11 +902,11 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the source search field — not actuating blind", settle_trace: trace };
     }
     await act.clearSourceSearch();
-    await act.delay(budgets.taActionSettleMs);
+    await pollSearchValue(act, () => act.readSource(loc), "", budgets); // reactive: the clear has LANDED before snapshot
     const snap = await act.readSource(loc);
     const snapSig = snap ? snap.sig : null;
     await act.typeInSourceSearch(cand);
-    await act.delay(budgets.taActionSettleMs);
+    await pollSearchValue(act, () => act.readSource(loc), cand, budgets); // reactive: the full candidate has LANDED before the filter-Enter
     await act.pressEnter(); // these filter on ENTER, not live (recon)
 
     let sawChange = false, stable = 0, prevSig = null, outcome = "timeout";

@@ -1233,3 +1233,35 @@ on ANY machine / laggy wifi — "if it doesn't load, don't proceed until it does
   rejected-then-fills-on-complete / stuck-partial→needs_review — real lag can't be injected live, so the
   lag-model fakes are the proof). The DELICATE typeahead/source pre-Enter settle is M39.2 (separate, verified
   in isolation — its commit gate is unchanged; only the pre-Enter echo wait becomes reactive).
+
+## 2026-06-20 — Magna wd3: reactive typeahead/source pre-Enter settle (M39.2) — echo, not render
+
+The last fixed-then-assume waits. `fillTypeaheadCdp`/`fillSourceCdp` did `clear → delay(taActionSettleMs)
+→ snapshot`, then `type → delay(taActionSettleMs) → pressEnter`. The fixed 400ms can be too short on lag →
+Enter filters on PARTIAL text → wrong filter (safe needs_review, but a missed fill). DELICATE because this
+is the M25-tuned path (focus-hygiene, stray-commit guard, banner-block) — so it was built + verified IN
+ISOLATION, never riding the text/date pass.
+
+- **`pollSearchValue(act, read, want, budgets)`** — poll the searchBox VALUE (`searchBox.value`, exposed at
+  cdp.js:841/980/1060) until `=== want` (`""` after clear / the full candidate after type), ceiling =
+  give-up only. The KEY distinction from the dropdown fix: this is an **ECHO wait, not a render wait** — it
+  confirms our typed/cleared text LANDED in the input before we snapshot/press the filter-Enter; it does
+  NOT (and must not) wait on the filter-render (the option list). So it correctly does NOT over-apply the
+  dropdown's `delayFull` lesson: it uses adaptive `act.delay` (the echo is near-synchronous — `typeInSearch`
+  is char-by-char `cdpTypeChars` and AWAITS every keystroke dispatch, so the happy path matches on the
+  FIRST read). Read-only (never changes focus).
+- **The commit gate is UNTOUCHED.** The post-Enter transition-settle (sawChange / chip / banner / filtered)
+  stays exactly as M25/M27 built it — so focus-hygiene, the stray-commit chip gate, and the banner
+  hard-block all run unchanged. pollSearchValue only makes the PRE-Enter wait condition-driven.
+- **Ceiling-fallback = strictly-better-than-today:** value never echoes within the ceiling → PROCEED to
+  Enter anyway (today's behavior; the post-Enter settle is the real gate). No hang, no new abort path.
+- Also converted the `overwriteNoMatchResting` resting-clear (clear → poll `""` → escape) — gates nothing
+  verified (the result comes from the post-escape chip read, never the searchBox value).
+- **LIVE-VERIFIED IN ISOLATION (the pass condition = the M25 SHAPE: right value, NO stray chip, commit on
+  the COMPLETE candidate — not mere "shows a value"):** `cdp-source-fill` → LinkedIn `autocommit-exact`,
+  single chip, settle 459ms; full-page typeaheads → fieldOfStudy "Other" (`overwrite-success` over the
+  stale "Electrical Engineering") + cert CPP `autocommit-containment`, both `filled_review`, no stray. 154
+  tests (+2: typed value reflects late → poll waits then Enter fires + commits; echo never lands → proceeds
+  to Enter, no hang — the underlying value landed, so it still commits, proving proceed-not-hang). The
+  reactive sweep (M39 → M39.1 → M39.2) is complete. Next: the post-fill page AUDIT (M40) as the permanent
+  backstop for the false-verify class, before the N-page walk.

@@ -15,6 +15,7 @@ const T_BUDGETS = {
   textReadDelayMs: 1, textReadCeilingMs: 30, textReadIntervalMs: 1, typeJumpDelayMs: 1, arrowStepMs: 1, maxArrowSteps: 60,
   interFieldMs: 0,
   taOpenCeilingMs: 50, taOpenIntervalMs: 1, taActionSettleMs: 1,
+  taActionSettleCeilingMs: 30, taActionSettleIntervalMs: 1,
   taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25,
   entryReconcileCeilingMs: 40, entryReconcileIntervalMs: 1
 };
@@ -254,8 +255,16 @@ function makeFakeAct(fields) {
       const f = byLoc(loc);
       const texts = f._open ? (f._texts || []) : [];
       const sig = (f._rev || 0) + "|" + texts.length + "|" + texts.slice(0, 3).join("~");
+      // M39.2 lag model: the searchBox VALUE reflects the typed text only after N reads
+      // (the underlying _value is set immediately, so the filter-Enter still works — only the
+      // READ-back of the input echoes late). Default: value === _value (immediate, unchanged).
+      let sbValue = f._value || "";
+      if (f._lagLeft !== undefined) {
+        if (f._lagLeft > 0) f._lagLeft -= 1; else f._lagReflected = f._lagPending;
+        sbValue = f._lagReflected;
+      }
       return {
-        searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: f._value || "" },
+        searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: sbValue },
         chips: (f.chips || []).slice(),
         banner: f._open && f._banner ? { text: "No matches found", automationId: "promptTitle" } : null,
         pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) },
@@ -264,7 +273,9 @@ function makeFakeAct(fields) {
     },
     typeInSearch: async (text) => {
       log.push(["typeInSearch", text]);
-      if (focusedTa) { focusedTa._value = text; focusedTa._filtered = false; }
+      if (!focusedTa) return;
+      focusedTa._value = text; focusedTa._filtered = false; // _value (used by filter-Enter) lands immediately
+      if (focusedTa.searchValueLagReads !== undefined) { focusedTa._lagPending = text; focusedTa._lagReflected = ""; focusedTa._lagLeft = focusedTa.searchValueLagReads; } // but the READ echoes late
     },
     clearSearch: async () => {
       log.push(["clearSearch"]);
@@ -1031,6 +1042,40 @@ test("typeahead: searchBox focus RACES on the first try → open/focus retry REC
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "United States of America (+1)");
+});
+
+// ── M39.2 reactive PRE-Enter settle (poll the searchBox echo, not the filter-render) ──
+
+test("typeahead M39.2: typed value reflects LATE → poll WAITS for the echo, THEN the filter-Enter fires + commits", async () => {
+  // Laggy wifi: the searchBox value echoes the typed candidate only after several reads. The
+  // pre-Enter poll must WAIT for the COMPLETE candidate to land before pressing Enter (else the
+  // filter runs on partial text). The filter-Enter must fire exactly once, after the echo.
+  const act = makeFakeAct([taField({
+    searchValueLagReads: 6,
+    openTexts: ["United States of America (+1)"],
+    filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.strictEqual(enters(act), 1, "exactly one filter-Enter, fired AFTER the echo landed");
+});
+
+test("typeahead M39.2: echo NEVER lands within the ceiling → PROCEEDS to Enter anyway (no hang; ceiling = give-up)", async () => {
+  // Strictly-better-than-today: if the searchBox value never reflects, the poll gives up at the
+  // ceiling and proceeds to Enter (today's behavior — the post-Enter transition-settle is the real
+  // commit gate). Here the underlying value DID land (the type happened), so it still commits —
+  // proving the fallback PROCEEDS rather than hangs.
+  const act = makeFakeAct([taField({
+    searchValueLagReads: Infinity,
+    openTexts: ["United States of America (+1)"],
+    filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(enters(act), 1, "Enter still fired after the ceiling — proceeds, never hangs");
+  assert.strictEqual(rec.status, "filled");
 });
 
 // ── M27 flag taxonomy (Commit A) ────────────────────────────────────────────
