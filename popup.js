@@ -148,6 +148,22 @@ document.getElementById("cdp-audit").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-resume-recon").addEventListener("click", () => {
+  setStatus("CDP resume-attach recon… probing attachResume via cdpEval. Run on the page WITH the upload (page 2). See [CDP-RESUME-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_RESUME_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false && resp.error === "no-resume") {
+      setStatus("No resume stored — upload a PDF above first, then re-run.");
+    } else if (resp.ok === false) {
+      setStatus("Resume recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.widget_present === false) {
+      setStatus("No upload widget on this page — run on the page that HAS the required upload (page 2).");
+    } else {
+      setStatus(`Resume recon: ${resp.attached ? "✓ attached" : "✗ not confirmed"} in ${resp.elapsed_ms}ms (${resp.visibility}). See [CDP-RESUME-RECON]. ⚠ a real file is now on the form.`);
+    }
+  });
+});
+
 // CDP WALK (M31): fill page 1 + a GUARDED Save & Continue with VPS/session detection.
 // Halts "session expired" on a dead session; "advanced" on a clean transition (page-2
 // fill deferred). On a LIVE session this DOES advance the application. Minimize within 60s.
@@ -163,6 +179,8 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
       setStatus(`✓ CDP walk reached the REVIEW page — ${resp.pages_filled} page(s) filled, NOT submitted. "View last summary". See [CDP-WALK].`);
     } else if (resp.session_expired) {
       setStatus(`⚠ SESSION EXPIRED after ${resp.pages_filled} page(s) — refresh, log in, reopen the form, retry. See [CDP-WALK].`);
+    } else if (resp.stopped === "resume-not-attached") {
+      setStatus(`⚠ Walk halted: resume not attached (required upload blocks advance). Upload a resume in the popup + clear any bad attachment, then re-run. ${resp.pages_filled} page(s) filled. See [CDP-WALK].`);
     } else if (resp.stopped && resp.stopped.indexOf("nav-timeout") === 0) {
       setStatus(`⚠ CDP walk halted at page ${resp.nav_timeout_page} (nav-timeout — page may be dirty, eyeball it). ${resp.pages_filled} page(s) filled. See [CDP-WALK].`);
     } else {

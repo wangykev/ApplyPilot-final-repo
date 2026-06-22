@@ -1328,3 +1328,37 @@ are reused verbatim; Part 3 just loops them.
   contained), wired into `fillAndPersistPage`, no-resume → `needs_review` that HALTS at that page; (2) the
   multi-provider AI feature (Anthropic/Gemini/OpenAI) for free-text / unmapped-choice / yes-no screening
   (guess+fill+flag), with EEO/demographics as a review-NOTE, not AI.
+
+## 2026-06-21 — Resume attach on the CDP path (walk prereq 1) — cdpEval-native, proven live in the walk
+
+The required page-2 "Application Documents → Upload a file*" blocks Save & Continue until a file attaches;
+the CDP fold recorded `file_upload` as `skipped`. M16's `attachResume` (rebuild File from base64 →
+DataTransfer → input.files → change → gate on `file-upload-successful`) was proven on the page-INJECTION
+path; it is SELF-CONTAINED (closes over nothing — built for injection), so it runs verbatim via `cdpEval`.
+
+- **Recon (`RUN_CDP_RESUME_RECON`, live Magna page 2):** `cdpEval(attachResume, base64, filename, mime)`
+  WORKS on the SAME debugger attach — `attached:true`, `confirmationVia:"file-upload-successful"`,
+  `filesSetImmediately:1`, ~1–2.2s VISIBLE; re-runs show `deletedCount:1` (clear-then-attach is idempotent
+  via CDP too). No chrome.scripting, no second debugger client. The internal page-side confirmation poll
+  completed VISIBLE (the walk's operative case via M39 fast-fill); HIDDEN untested (walk is visible-by-
+  design → SW-pace only if a hidden walk ever misses it). `attachResume` is scoped to
+  `[data-fkit-id="resumeAttachments--attachments"]` so it targets the resume upload, NOT the deferred
+  per-cert Attachments (recon-confirmed: fileName = the resume).
+- **Wired** into `fillAndPersistPage` (after `drivePageFill`, before `buildReviewBundle`): detect the
+  `file_upload` record → `getResume` (IndexedDB) → `cdpEval(attachResume,…)` → patch the record to `filled`
+  (after=fileName) so the bundle/summary reflect it; **no-resume/attach-failed → `needs_review`** (self-
+  explaining). `runCdpWalk` adds a pre-advance guard: a `file_upload` not `filled` → HALT
+  `resume-not-attached` BEFORE `clickPageNext` (the required upload empty WOULD block Save & Continue → a
+  self-explaining stop, not a bare nav-timeout).
+- **LIVE in the walk:** page 1 filled → `✓ advanced` → page 2 filled → `resume: attached "Kevin's Resume
+  2.pdf"`. ⚠ **The isolated "Save & Continue ADVANCES past the upload" proof is PENDING — confounded (NOT
+  disproven) by an unrelated `Duplicate language entries are not allowed` validation blocker** (state
+  residue: the fill report + M40 audit both show distinct English/Chinese, so the fill was clean — the dup
+  is leftover from re-running the same app + manual perturbations, and the M31.1 halt correctly NAMED it,
+  which is how we know it's residue not a fill bug). Confirm advance-past-upload on a clean page-2 state.
+  165 tests green (SW/CDP glue; `drivePageFill`'s `file_upload`-skipped recording is unchanged → brain +
+  fakes untouched).
+- **Resume-confirmed ≠ advanced-past** (the M40-style distinction): `attachResume`'s `attached:true` is the
+  ENGINE's claim (the file-upload-successful row rendered); the FORM accepting it (Save & Continue proceeds)
+  is the form's TRUTH, and they can differ (a file that "attaches" but fails Workday's own doc validation
+  would report attached yet still block). The walk's ADVANCE is the decisive proof — still open.

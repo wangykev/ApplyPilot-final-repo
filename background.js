@@ -269,6 +269,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP RESUME-ATTACH RECON (walk prereq 1): probe whether attachResume runs via cdpEval
+  // on the debugger attach + how the confirmation gate behaves. Needs a stored resume,
+  // not a profile. Run on the page WITH the upload widget (Magna page 2).
+  if (message.type === "RUN_CDP_RESUME_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpResumeRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP WALK (M31): fill page 1 → guarded Save & Continue → detect VPS/session-death
   // (halt) or a clean transition (report "advanced", stop — page-2 fill deferred).
   if (message.type === "RUN_CDP_WALK") {
@@ -1844,6 +1857,39 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG) {
   })));
   LOG("counts:", JSON.stringify(out.counts));
 
+  // Walk prereq 1 (resume attach): the CDP fold records file_upload as `skipped` (it can't
+  // attach). Here the SW reads the stored resume (IndexedDB) + runs the PROVEN attachResume
+  // via cdpEval on the SAME debugger attach (recon 2026-06-21: works VISIBLE, idempotent —
+  // clears existing then attaches; gate = file-upload-successful). Patch the file_upload
+  // record BEFORE buildReviewBundle so the bundle reflects it. No resume / failed →
+  // needs_review (self-explaining); the walk's pre-advance check HALTS on it (a required
+  // upload empty blocks Save & Continue). NOTE: attachResume's attached:true is the engine's
+  // claim; the FORM accepting it (Save & Continue advances) is the form's truth — the walk's
+  // advance is the decisive proof, not this record.
+  const uploadRec = out.results.find((r) => r.widgetType === "file_upload");
+  if (uploadRec) {
+    let resumeRec = null;
+    try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
+    if (!resumeRec || !resumeRec.base64) {
+      uploadRec.status = "needs_review"; uploadRec.verified = false;
+      uploadRec.detail = "no resume stored — upload a PDF in the popup first (the required upload blocks Save & Continue)";
+      LOG("resume: NOT attached — no resume stored (upload one in the popup).");
+    } else {
+      let ar = null, arErr = null;
+      try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
+      catch (e) { arErr = String((e && e.message) || e); }
+      if (ar && ar.attached) {
+        uploadRec.status = "filled"; uploadRec.verified = true; uploadRec.after = ar.fileName || resumeRec.filename || null;
+        uploadRec.detail = `resume attached (file-upload-successful, cleared ${ar.deletedCount || 0} existing)`;
+        LOG(`resume: attached "${uploadRec.after}".`);
+      } else {
+        uploadRec.status = "needs_review"; uploadRec.verified = false;
+        uploadRec.detail = "resume attach failed — " + (arErr || (ar && ar.detail) || "no confirmation");
+        LOG("resume: NOT attached —", uploadRec.detail);
+      }
+    }
+  }
+
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
   // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations
   // (out.audit) so the standalone "re-audit" can re-read the live page later. Overwrite-per-
@@ -1930,6 +1976,61 @@ async function runCdpAudit(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("re-audit aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP RESUME-ATTACH RECON (walk prereq 1, recon-first) — the KEY unknowns before
+// wiring the resume into the CDP fill: (1) does the PROVEN page-injection attachResume
+// (rebuild File from base64 → DataTransfer → input.files → change → gate on
+// file-upload-successful) run via cdpEval/Runtime.evaluate on the SAME debugger attach
+// (no chrome.scripting, no second client)? (2) attachResume's clear-loop + confirmation
+// gate use PAGE-SIDE setTimeout — does the confirmation complete under the debugger
+// channel, and how does the throttle bite HIDDEN vs VISIBLE (→ keep its internal poll, or
+// SW-PACE the gate like every other CDP wait)? Run on a page WITH the upload widget
+// (Magna page 2 "Application Documents"); a resume must be stored (popup). Reports the
+// attach result + ELAPSED wall-clock. NOTE: this ATTACHES A REAL FILE to the live form —
+// recon debris (leave it / clear it in the form per the orphan-specialties discipline).
+// Run it VISIBLE and (separately) MINIMIZED and compare the elapsed times.
+// ============================================================================
+async function runCdpResumeRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-RESUME-RECON]", ...a);
+  try {
+    let rec = null;
+    try { rec = await getResume(); } catch (e) { LOG("IndexedDB read failed:", String(e)); return { ok: false, error: "idb-read-failed" }; }
+    if (!rec || !rec.base64) { LOG("no resume stored — upload a PDF in the popup first, then re-run."); return { ok: false, error: "no-resume" }; }
+
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+
+    // Is the upload widget on this page at all?
+    const hasWidget = await cdpEval(() => !!document.querySelector('[data-automation-id="file-upload-input-ref"]'));
+    const vis = await cdpEval(() => document.visibilityState);
+    LOG(`upload widget present: ${hasWidget}; tab visibilityState: ${vis}. Resume: ${rec.filename} (${rec.size} bytes).`);
+    if (!hasWidget) { LOG("no file-upload-input-ref on this page — run on the page that HAS the required upload (Magna page 2 'Application Documents')."); return { ok: true, widget_present: false }; }
+
+    // PROBE: run the existing self-contained attachResume via cdpEval (awaitPromise) — the
+    // candidate reuse path. Time the whole thing (its internal page-side confirmation poll
+    // is what the throttle would bite). NOTE: cdpEval uses Date.now()-free SW timing here.
+    const t0 = Date.now();
+    let result = null, evalError = null;
+    try { result = await cdpEval(attachResume, rec.base64, rec.filename || "resume.pdf", rec.mime || "application/pdf"); }
+    catch (e) { evalError = String((e && e.message) || e); }
+    const elapsedMs = Date.now() - t0;
+
+    if (evalError) { LOG(`cdpEval(attachResume) THREW after ${elapsedMs}ms: ${evalError} (Runtime.evaluate may not run this fn — fall back to chrome.scripting, or SW-pace a custom probe).`); return { ok: true, widget_present: true, eval_error: evalError, elapsed_ms: elapsedMs }; }
+    LOG(`cdpEval(attachResume) returned after ${elapsedMs}ms:`, JSON.stringify(result, null, 2));
+    LOG(result && result.attached
+      ? `✓ ATTACHED via the debugger channel (confirmation: ${result.confirmationVia}). ⇒ cdpEval-native attach WORKS${vis === "visible" ? " (visible)" : " (HIDDEN — the internal page poll survived the throttle)"}.`
+      : `✗ NOT confirmed (${result && result.detail}). If the File set (filesSetImmediately) but no confirmation row ${vis === "visible" ? "even visible → page didn't process the change" : "while hidden → the throttle bit the page-side poll/XHR → SW-PACE the gate"}.`);
+    LOG("NOTE: a real file is now attached on the live form — clear it in the form if you don't want it, before any walk.");
+    return { ok: true, widget_present: true, attached: !!(result && result.attached), confirmation_via: result && result.confirmationVia, files_set: result && result.filesSetImmediately, elapsed_ms: elapsedMs, visibility: vis, detail: result && result.detail };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("resume recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
@@ -2364,6 +2465,15 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const { out } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
       pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length });
+
+      // ── (c.1) Required-upload guard (walk prereq 1, hold #1): a file_upload that didn't
+      // attach (no resume / failed) WILL block Save & Continue → HALT here, self-explaining,
+      // BEFORE clickPageNext (not a bare nav-timeout). ──
+      const upRec = out.results.find((r) => r.widgetType === "file_upload");
+      if (upRec && upRec.status !== "filled") {
+        LOG(`⚠ resume NOT attached on page ${page} (${upRec.detail}) — the required upload blocks Save & Continue. Halting. Fix: upload a resume in the popup, clear any bad attachment on the form, re-run.`);
+        return { ok: true, stopped: "resume-not-attached", resume_detail: upRec.detail, pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
 
       // ── (d) Terminal page with no Save & Continue (not the review marker — unusual). ──
       const navAfter = await cdpEval(cdpReadSessionState);

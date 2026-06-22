@@ -49,6 +49,12 @@
          false-verify class. To TEST it: fill, then manually change a committed field on the
          page, then click this — it must flag that field. [CDP-AUDIT] in the SW console. -->
     <button id="cdp-audit">CDP re-audit last fill (flag mismatches)</button>
+    <!-- RESUME-ATTACH RECON (walk prereq 1): probe whether the proven attachResume runs
+         via cdpEval on the debugger attach + whether its confirmation gate survives (run
+         VISIBLE and MINIMIZED, compare elapsed). Needs a resume stored (upload above).
+         Run on the page WITH the upload (Magna page 2 "Application Documents"). ⚠ attaches
+         a REAL file to the live form. [CDP-RESUME-RECON] in the SW console. -->
+    <button id="cdp-resume-recon">CDP recon: resume attach (page 2; attaches a file!)</button>
     <!-- CDP WALK (M38 Part 3): the N-PAGE WALK. Fills each page (the full fold + audit +
          accumulating review summary) → guarded Save & Continue → repeats to the REVIEW
          page, where it STOPS and NEVER submits (double guard). Clears the prior summary
