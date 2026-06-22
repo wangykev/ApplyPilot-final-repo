@@ -1428,3 +1428,59 @@ because the bot's CDP input is `isTrusted` through the SAME pipeline as the oper
   `clickPageNext` + nav to the next page, the old overlay is wiped and the next isn't installed until the
   next `fillAndPersistPage` → the operator could interfere during the transition. Confirm + close (re-install
   right after `cdpWaitNextPage`) when the first LOCKED walk runs.
+
+## 2026-06-22 — AI-0/AI-1: the LLM adapter + screening-question dropdown fill (Magna page 3)
+
+The page AFTER My Experience is a screening QUESTIONS page. Magna page 3 (live recon + fill):
+
+- **Structure:** 4 fields, ALL standard `aria-haspopup="listbox"` dropdowns, ALL required, 2 enabled
+  options each (plus the "Select One" placeholder). Verbatim labels (the basis for the regexes):
+  "Are you currently employed with Magna? (…please select \"No\".)**" → `["Yes, I'm currently employed
+  with Magna","No, I'm NOT currently employed with Magna"]`; "Are you eligible to work in Canada?*" →
+  Yes/No; "Are you over the age of 18?*" → Yes/No; "Have you been convicted of a criminal offence for
+  which a pardon has not been granted?*" → Yes/No. No radio/typeahead/source on this page. So the
+  existing `fillDropdownCdp`/`readDropdownState` machinery applies verbatim.
+
+- **Recon false-clean → the LOAD-BEARING dropdown lesson.** `reconDropdownDump` (open→read→Escape→re-read)
+  reported "4/4 clean" but the page actually ENDED with 3 dropdowns committed to "No". Mechanism: a
+  click-opened dropdown arms NO highlight (safe to read), BUT **Escape does NOT reliably DISMISS a Magna
+  dropdown**, and the portaled option list overlays the next field — so opening field N+1 (or the slow
+  close) left values committed. The per-field before/after read happened too early (each field still
+  showed "Select One" at its own close) so it missed the delayed/cross-field stray. ⇒ **a dropdown's
+  "clean/blank" property is the VALUE (`triggerText` stayed on the placeholder), NOT `ariaExpanded` —
+  a STRAY commits a value which ALSO closes the list.** `closeAndVerifyBlank` decides blank by value;
+  do NOT reopen-to-toggle to force-close (it ping-pongs a slow-closing list → a FALSE stray on a blank
+  field, the live Q2/Q3/Q4 "Select One STRAYED"). Best-effort Escape + the inter-field delay close it.
+
+- **ALWAYS-GUESS, not UNKNOWN-gate (the contract shift for REQUIRED choice fields).** First fill returned
+  Q2/Q3/Q4 as UNKNOWN→blank — but a blank REQUIRED field HALTS the walk (Save & Continue won't proceed),
+  so "leave blank" is not a safe rest state here. The operator web-verified (same model, full profile)
+  that all four are profile-DERIVABLE and inferred correctly. So the AI ALWAYS chooses + reports a
+  confidence (High/Medium/Low) + a short justification; safety = the human review gate + the confidence,
+  NOT a refusal. The choice still clears the match ladder (never blind-commit); UNKNOWN/paraphrase →
+  rare `ai-nomatch` (the human answers). LIVE: currently-Magna→No (High), eligible-Canada→No (High,
+  citizenship+address), over-18→Yes (High, education dates), criminal→No (**Medium**, the model itself
+  rating its reasoning-from-ABSENCE less certain — the intended behavior). M40 re-read all 4 + matched.
+
+- **Confidence is NOT a substitute for the sensitive flag (the inverse failure).** "Reasoning from absence"
+  (profile silent ≠ profile asserts No) is exactly what the model marks HIGH and is the criminal/eligibility
+  case where a wrong answer matters most — so confidence-driven prominence would BURY the most dangerous
+  answers. ⇒ the viewer renders `ai-choice-sensitive` (legally-loaded) answers FIRST with a loud red badge,
+  prominence keyed off the FLAG, never confidence; and the prompt makes the justification NAME its basis
+  (positive fact vs absence) so absence-reasoning is reviewable for what it is.
+
+- **`legallyLoaded` regex gap caught by the verbatim labels.** The first regex missed "over the age of **18**"
+  (it required "18 years"/"18 or older"). Widened to include `\bage\b|over (the age of )?\d+|\b18\b` etc. —
+  the recon's verbatim-label dump is exactly where to catch a regex gap before relying on it (over-flagging
+  to sensitive is the safe direction).
+
+- **Model facts.** `gemini-2.0-flash-lite` was SHUT DOWN 2026-06-01 (the original default's 429 — a stale
+  hardcoded model). The flash-LITE models answer at low `maxTokens`; the THINKING models (`gemini-3.5-flash`,
+  `gemini-2.5-flash`) returned `finishReason:MAX_TOKENS` with EMPTY text at `maxTokens:16` (they spend the
+  budget on `thoughtsTokenCount` first) → `aiFillField` uses `maxTokens:512`. Default = `gemini-3.1-flash-lite`
+  (operator-verified inference quality; ~15 RPM is ample for a ~4-call screening page). A model dropdown
+  (curated `LLM_MODELS`, default=first) replaces a free-text field so a stale typed id can't 429.
+
+- **Justification BREVITY.** "one-sentence justification" produced verbose detail that bloats the summary a
+  future AI reads; "a SHORT phrase (~12 words, no preamble) that names its basis" produces tight, reviewable
+  detail (e.g. "Inferred from the absence of any criminal record in the applicant profile.").
