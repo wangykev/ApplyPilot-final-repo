@@ -3,7 +3,12 @@
   "name": "ApplyPilot Dev",
   "version": "0.0.1",
   "permissions": ["activeTab", "scripting", "storage", "debugger"],
-  "host_permissions": ["*://*.myworkdayjobs.com/*"],
+  "host_permissions": [
+    "*://*.myworkdayjobs.com/*",
+    "https://api.anthropic.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.openai.com/*"
+  ],
   "action": {
     "default_popup": "popup.html"
   },

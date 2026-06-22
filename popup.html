@@ -141,12 +141,32 @@
          My Experience (page 2); minimize within 60s. [CDP-DATE] in the SW console. -->
     <button id="cdp-fill-date">CDP fill one date (page 2; minimize!)</button>
     <hr>
+    <!-- AI config (AI-0): the multi-provider LLM adapter. Provider + model + API key are
+         stored in chrome.storage.local.llmConfig; "AI fill ON" is the opt-in toggle (OFF =
+         the fill never calls the LLM = no API spend). "Test connection" round-trips a trivial
+         prompt to prove the call path. [LLM-TEST] in the SW console. Key stays local to the
+         extension on this machine. -->
+    <label><input id="llm-enabled" type="checkbox"> AI fill ON (opt-in — uses your API key)</label>
+    <label for="llm-provider">AI provider:</label>
+    <select id="llm-provider">
+      <option value="gemini">Gemini (Google)</option>
+      <option value="anthropic">Anthropic (Claude)</option>
+      <option value="openai">OpenAI</option>
+    </select>
+    <label for="llm-model">Model:</label>
+    <select id="llm-model"></select>
+    <label for="llm-key">API key (stored locally):</label>
+    <input id="llm-key" type="password" placeholder="paste your provider API key">
+    <button id="llm-save">Save AI config</button>
+    <button id="llm-test">Test connection</button>
+    <hr>
     <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
     <label for="company">Company for this application (temporary):</label>
     <input id="company" type="text" placeholder="e.g. Cambium Learning">
     <button id="set-company">Set company</button>
     <div id="status"></div>
     <script src="db.js"></script>
+    <script src="llm.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

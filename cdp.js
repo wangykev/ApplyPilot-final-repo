@@ -1151,7 +1151,9 @@ function cdpSourceCategoryRect(label) {
 
 // The actuation object. No tabId param — the substrate's single tracked
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
-function makeCdpActuation() {
+// `llmConfig` (AI-0 seam): the operator's {provider,model,apiKey,enabled} from storage,
+// captured for act.llm. Omitted by recon/section harnesses (act.llm then short-circuits OFF).
+function makeCdpActuation(llmConfig) {
   return {
     delay: cdpAdaptiveDelay, // ALL driver pacing goes through this — visibility-adaptive: fast foreground, full hidden (SW wall-clock)
     delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility (dropdown option-list render + commit-verify). The 5x speedup is for OUR pacing between actions, NEVER the page's render.
@@ -1359,6 +1361,17 @@ function makeCdpActuation() {
       }
     },
     readDateSegment: (loc, segment) => cdpEval(cdpReadInputBySel, loc.wrapperSel + ' [data-automation-id="dateSection' + segment + '-input"]'),
-    typeDigits: (text) => cdpTypeChars(String(text), 80) // per-char primary; act.typeText (insertText) is the brain's verified fallback
+    typeDigits: (text) => cdpTypeChars(String(text), 80), // per-char primary; act.typeText (insertText) is the brain's verified fallback
+
+    // ── AI fill (AI-0 seam) ── the ONLY I/O method on act: round-trips the configured
+    // provider via the llm.js adapter (callLLM is a global — llm.js is imported before cdp.js
+    // in background.js importScripts). Enforces the opt-in toggle HERE: enabled===false (or no
+    // config) ⇒ no provider call, no spend. NEVER throws — returns the normalized
+    // {ok,text}|{ok:false,error}; the brain flags the field for review on !ok. The brain stays
+    // Node-testable: tests pass a FAKE act.llm with canned replies (the real one isn't loaded).
+    llm: async ({ system, user, maxTokens }) => {
+      if (!llmConfig || !llmConfig.enabled) return { ok: false, error: "AI fill OFF (enable it in the popup)" };
+      return await callLLM({ provider: llmConfig.provider, model: llmConfig.model, apiKey: llmConfig.apiKey, system, user, maxTokens });
+    }
   };
 }

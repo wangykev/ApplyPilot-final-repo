@@ -515,3 +515,51 @@ document.getElementById("set-company").addEventListener("click", async () => {
   setStatus(company ? `Company set for this application: "${company}".` : "Company cleared.");
   console.log("[ApplyPilot] jobContext set:", { company });
 });
+
+// ── AI config (AI-0): multi-provider LLM adapter ────────────────────────────
+// chrome.storage.local.llmConfig = { provider, model, apiKey, enabled }. Restore on open;
+// "Save" persists; "Test connection" round-trips a trivial prompt (RUN_LLM_TEST → callLLM in
+// the SW). The toggle (enabled) is the opt-in: OFF = the fill never calls the LLM (no spend).
+const llmProviderEl = document.getElementById("llm-provider");
+const llmModelEl = document.getElementById("llm-model");
+const llmKeyEl = document.getElementById("llm-key");
+const llmEnabledEl = document.getElementById("llm-enabled");
+// Fill the model <select> from this provider's CURATED list (llm.js LLM_MODELS), marking the
+// default. The list is exactly LLM_MODELS — a stale/retired SAVED model (e.g. gemini-2.0-flash
+// from an older config) is NOT shown; selection falls back to the default, and a Save replaces it.
+function populateModelOptions(provider, selected) {
+  const def = LLM_DEFAULT_MODELS[provider] || "";
+  const models = LLM_MODELS[provider] || [];
+  llmModelEl.innerHTML = "";
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m === def ? `${m} (default)` : m;
+    llmModelEl.appendChild(opt);
+  }
+  llmModelEl.value = (selected && models.includes(selected)) ? selected : def;
+}
+chrome.storage.local.get("llmConfig", ({ llmConfig }) => {
+  const c = llmConfig || {};
+  if (c.provider) llmProviderEl.value = c.provider;
+  populateModelOptions(llmProviderEl.value, c.model);
+  if (c.apiKey) llmKeyEl.value = c.apiKey;
+  llmEnabledEl.checked = !!c.enabled;
+});
+// On provider change, repopulate the model list + select that provider's default.
+llmProviderEl.addEventListener("change", () => populateModelOptions(llmProviderEl.value));
+const readLlmConfig = () => ({ provider: llmProviderEl.value, model: llmModelEl.value, apiKey: llmKeyEl.value.trim(), enabled: llmEnabledEl.checked });
+document.getElementById("llm-save").addEventListener("click", async () => {
+  const cfg = readLlmConfig();
+  await chrome.storage.local.set({ llmConfig: cfg });
+  setStatus(`AI config saved — ${cfg.provider}/${cfg.model || "(no model)"}, AI fill ${cfg.enabled ? "ON" : "OFF"}${cfg.apiKey ? "" : " (no key!)"}.`);
+});
+document.getElementById("llm-test").addEventListener("click", () => {
+  const cfg = readLlmConfig();
+  if (!cfg.apiKey) { setStatus("Enter an API key first."); return; }
+  setStatus(`Testing ${cfg.provider}/${cfg.model}… see [LLM-TEST] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_LLM_TEST", config: cfg }, (resp) => {
+    if (chrome.runtime.lastError || !resp) { setStatus("Test failed (no response) — see the service worker console."); return; }
+    setStatus(resp.ok ? `✓ AI connected — reply: "${resp.text}". Save the config to use it.` : `✗ AI test failed: ${resp.error}`);
+  });
+});

@@ -2,7 +2,7 @@
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
+importScripts("db.js", "lib.js", "llm.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); llm.js = multi-provider LLM adapter (callLLM); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
@@ -292,6 +292,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const out = await runCdpTaStrayRecon(tab.id, String(message.labelRegex || ""));
       sendResponse(out);
     });
+    return true; // async sendResponse
+  }
+
+  // LLM TEST-CONNECTION (AI-0): round-trip a trivial prompt through the configured provider
+  // to prove the call path + key + host_permissions BEFORE wiring the AI into the fill. The
+  // popup sends the current config (test-before-save). No tab/attach needed (direct SW fetch).
+  if (message.type === "RUN_LLM_TEST") {
+    (async () => {
+      const cfg = message.config || {};
+      console.log("[ApplyPilot][LLM-TEST] testing", cfg.provider, "/", cfg.model, "…");
+      const res = await callLLM({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, system: "You are a connectivity probe. Reply with exactly: OK", user: "Reply with exactly: OK", maxTokens: 16 });
+      if (res.ok) console.log("[ApplyPilot][LLM-TEST] ✓ reply:", JSON.stringify(res.text));
+      else console.log("[ApplyPilot][LLM-TEST] ✗", res.error);
+      sendResponse(res);
+    })();
     return true; // async sendResponse
   }
 
@@ -1946,6 +1961,13 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 // the whole page in one click. SINGLE page (no advance) — accumulates, reset via the
 // "Clear summary" button. [CDP-PAGE] in the SW console.
 // ============================================================================
+// AI-0 seam: read the operator's LLM config for act.llm. act.llm enforces the opt-in
+// (enabled===false ⇒ no provider call). Only the FILL paths (full-page + walk) thread it in;
+// recon/section harnesses build a config-less act (act.llm short-circuits OFF). Returns {} if unset.
+async function getLlmConfig() {
+  return await new Promise((resolve) => chrome.storage.local.get("llmConfig", (r) => resolve((r && r.llmConfig) || {})));
+}
+
 async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
   try {
@@ -1960,7 +1982,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
     LOG(`attached. Filling NOW${opts && opts.skipLock ? " (NO input-lock — oracle baseline)" : " (input-lock ON)"} — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).`);
 
     const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
-    const act = makeCdpActuation();
+    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
     const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts);
     return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total, audit_flagged: auditFlags.length };
   } catch (e) {
@@ -2740,7 +2762,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     LOG("cleared the prior review summary + audit (fresh application).");
 
     const prepared = prepareProfile(profile); // once — each page fills what its own scan presents
-    const act = makeCdpActuation();
+    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
     const pagesFilled = [];
 
     for (let page = 1; page <= WALK_MAX_PAGES; page++) {
