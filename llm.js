@@ -126,11 +126,12 @@ async function callLLM(req, fetchImpl) {
 // so a stale typed id can't 429). FIRST entry of each list is the provider default. This is the
 // ONLY place model IDs live — UPDATE here when a provider's lineup changes. Gemini IDs verified
 // against Google's live list 2026-06-22 (gemini-2.0-flash-lite was SHUT DOWN 2026-06-01 — the
-// stale-model 429), so 2.5-flash-lite leads (highest free RPD — best for many-call fills);
-// 3.5-flash = quality, 3.1-flash-lite = ~15 RPM.
+// stale-model 429). gemini-3.1-flash-lite LEADS — operator-verified to infer the screening
+// answers correctly, and ~15 RPM is ample for the small screening page; 2.5-flash-lite (highest
+// free RPD) is the high-volume alternative; 3.5-flash = quality.
 const LLM_MODELS = {
   anthropic: ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
-  gemini: ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  gemini: ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"]
 };
 // Default = the first listed model per provider (single source of truth — can't drift from the list).

@@ -516,6 +516,19 @@ document.getElementById("set-company").addEventListener("click", async () => {
   console.log("[ApplyPilot] jobContext set:", { company });
 });
 
+// QUESTIONS RECON (AI-1 Step 1): read-only dump of the screening-questions page — verbatim
+// labels + each dropdown's options + a clean-close proof (open→read→dismiss, NEVER commits).
+// Output is [Q-RECON] in the service worker console.
+document.getElementById("cdp-questions-recon").addEventListener("click", () => {
+  setStatus("Screening-questions recon… open the QUESTIONS page (page 3+) and keep it VISIBLE. Findings land in the service worker console as [Q-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_QUESTIONS_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // SW console has it all
+    if (resp.ok === false) { setStatus("Questions recon failed: " + resp.error + " — see the service worker console."); return; }
+    const dirty = resp.strayed ? ` ⚠ ${resp.strayed} STRAYED` : "";
+    setStatus(`Recon done — ${resp.dropdowns.length} dropdown(s), ${resp.dropdowns.length - resp.strayed} clean${dirty}. See [Q-RECON] in the SW console.`);
+  });
+});
+
 // ── AI config (AI-0): multi-provider LLM adapter ────────────────────────────
 // chrome.storage.local.llmConfig = { provider, model, apiKey, enabled }. Restore on open;
 // "Save" persists; "Test connection" round-trips a trivial prompt (RUN_LLM_TEST → callLLM in

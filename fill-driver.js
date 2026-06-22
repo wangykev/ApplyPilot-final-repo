@@ -403,6 +403,195 @@ const fillTextCdp = async (act, loc, value, budgets, tag) => {
   return { status: "filled", after, verified: true, detail: before ? `overwrote "${before}"` : null };
 };
 
+// ── AI-1 dropdown helpers (shared open/settle + verified-blank close) ─────────
+// Open a dropdown with the proven retry + settle and return its FULL option list. Mirrors
+// fillDropdownCdp's open-retry (GATE 1 aria-expanded) + option settle (GATE 2, delayFull —
+// the option list renders at the PAGE's pace, never sped up). Reads `before` (the pre-open
+// trigger text = the placeholder) so a later closeAndVerifyBlank can prove the field stayed
+// blank. READ-ONLY — no match/commit. (fillDropdownCdp keeps its own inline copy; this serves
+// reconDropdownDump + aiFillField, the no-commit readers.)
+const openAndReadDropdown = async (act, loc, budgets) => {
+  const pre = await act.readDropdownState(loc);
+  const before = pre ? pre.triggerText : null;
+  let state = null, expanded = false;
+  for (let attempt = 1; attempt <= budgets.openRetries && !expanded; attempt++) {
+    if (attempt > 1) { await act.pressEscape(); await act.delay(budgets.reopenSettleMs); }
+    if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
+    const expandDeadline = Date.now() + budgets.openExpandWindowMs;
+    while (Date.now() < expandDeadline) {
+      await act.delay(budgets.settleIntervalMs);
+      state = await act.readDropdownState(loc);
+      if (state && state.ariaExpanded === "true") { expanded = true; break; }
+    }
+  }
+  if (expanded) { // GATE 2: real-time settle to the COMPLETE list (2 equal non-zero reads)
+    let prevCount = -1, stable = 0;
+    const openDeadline = Date.now() + budgets.openCeilingMs;
+    while (Date.now() < openDeadline) {
+      const n = state ? state.optionCount : 0;
+      if (n > 0 && n === prevCount) { stable++; if (stable >= budgets.stableReads - 1) break; }
+      else stable = 0;
+      prevCount = n;
+      await act.delayFull(budgets.settleIntervalMs);
+      state = await act.readDropdownState(loc);
+    }
+  }
+  return { before, state, expanded };
+};
+
+// The no-commit dismissal for the UNKNOWN / no-match paths (AI-1) and the recon. **BLANK is a
+// VALUE property:** the trigger stayed on its opening placeholder (`norm(triggerText)===norm(before)`).
+// Hold 1's actual property is "staying-blank" — a STRAY commits a real option, which CHANGES
+// triggerText, so the value check fully captures it (incl. the commit-that-also-closes-the-list
+// case Hold 1 named). We deliberately do NOT gate on `ariaExpanded` and do NOT reopen-to-toggle:
+// the live run proved both manufacture a false stray — on a slow-closing Magna dropdown the read
+// catches the list still open, the toggle REOPENS the closing list (ping-pong), retries exhaust,
+// and a genuinely blank field got mislabeled `ai-unknown-stray` ("Select One STRAYED"). pressEscape
+// is BEST-EFFORT close (never reopen); the inter-field delay + the next field's open-settle let it
+// finish closing before the next field (empirically no cross-field stray live — and a cross-field
+// stray WOULD surface as the NEXT field's value changing → still flagged, just attributed to the
+// field it landed on). Returns {blank, after}: !blank ⇒ the caller surfaces `after` (the real
+// strayed value) — Hold 2. The SOLE guard on the no-commit path (M40 never re-reads a blank field).
+const closeAndVerifyBlank = async (act, loc, before, budgets) => {
+  const norm = apMatch.normalize;
+  const blankNow = (s) => !!s && before != null && norm(s.triggerText) === norm(before);
+  let s = null;
+  for (let attempt = 1; attempt <= budgets.openRetries; attempt++) {
+    await act.pressEscape();
+    await act.delayFull(budgets.reopenSettleMs);
+    s = await act.readDropdownState(loc);
+    if (s && s.ariaExpanded === "false") break; // closed — done (blank decided by the value)
+    // still open (or unreadable) → Escape again, NEVER reopen; give the close real time
+  }
+  return { blank: blankNow(s), after: s ? s.triggerText : null };
+};
+
+// AI-1 recon (READ-ONLY): open a dropdown, capture its FULL option list, then dismiss it via
+// the VERIFIED-BLANK close (NOT a bare Escape) and report whether it stayed blank. NEVER
+// types/arrows/clicks an option. `clean` is the real property (closed AND still on the
+// placeholder) — a stray is reported clean:false with the strayed value (the recon's earlier
+// false-clean is fixed: closeAndVerifyBlank catches the closed-but-committed case).
+const reconDropdownDump = async (act, loc, budgets) => {
+  const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+  const options = state ? state.options.map((o) => ({ text: o.text, disabled: o.disabled, selected: o.selected })) : [];
+  const optionCount = state ? state.optionCount : 0;
+  const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+  return { opened: expanded, before, after: cz.after, clean: cz.blank, optionCount, options };
+};
+
+// ── AI-1 eligibility + the AI dropdown fill ──────────────────────────────────
+// Legally-loaded screening questions get a STRONGER review reason. Widened per the Magna recon
+// (the verbatim labels): the old /18 (years|or older)/ MISSED "over the age of 18". Over-flag
+// to "sensitive" is the safe direction (worst case a benign Q gets a stronger flag).
+const AI_LEGALLY_LOADED_RE = /criminal|convict|pardon|eligib|authoriz|work permit|right to work|currently employed|sponsor|\bage\b|over (the age of )?\d+|under \d+|\b18\b/i;
+const legallyLoaded = (label) => AI_LEGALLY_LOADED_RE.test(String(label || ""));
+
+// Protected EEO/demographic attributes are NEVER AI-guessed (review-NOTE instead — AI-3). The
+// EXCLUSION ships now: an EEO-labelled choice field is not AI-eligible. Over-exclude = safe.
+const AI_EEO_RE = /gender|\brace\b|ethnic|veteran|disab|sexual orientation|\bsex\b|hispanic|latino|pronoun/i;
+
+// AI-fill is allowed ONLY for an unmapped/unmatched CHOICE field (AI-1: dropdown). NEVER the
+// employer-match radio (its own logic), file_upload, an EEO field, or free-text (= AI-2). Hard
+// gate — unit-pinned (act.llm must never be called for an excluded field).
+const aiEligible = (f) => {
+  if (!f || f.widgetType !== "dropdown") return false;            // AI-1 core = dropdowns
+  if (f.fieldName === "candidateIsPreviousWorker") return false;  // employer-match path
+  if (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || ""))) return false;
+  return true;
+};
+
+// Did the deterministic pass produce NOTHING usable? (the AI-fallback trigger) — either
+// unmapped (skipped "no mapping") or a GENUINE no-match (options rendered, none matched).
+// NEVER a transient/infra failure (those aren't tagged genuineNoMatch).
+const producedNothing = (record) =>
+  (record.status === "skipped" && record.detail === "no mapping") ||
+  (record.status === "needs_review" && record.genuineNoMatch === true);
+
+// Parse the LLM's structured screening answer. The prompt asks for JSON {choice, justification,
+// confidence}; be tolerant — strip ```-fences, fall back to the first {…} block, and if it's not
+// JSON at all treat the whole reply as the choice (low confidence). confidence normalizes to the
+// existing band vocabulary (high/medium/low) so the summary badge CSS + deriveConfidence reuse it.
+const _aiConf = (c) => { const v = String(c == null ? "" : c).trim().toLowerCase(); return (v === "high" || v === "medium" || v === "low") ? v : "low"; };
+const parseAiReply = (text) => {
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const mm = t.match(/\{[\s\S]*\}/);
+    if (mm) { try { obj = JSON.parse(mm[0]); } catch (e2) { /* fall through to best-effort */ } }
+  }
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    const pick = (a, b) => String(obj[a] != null ? obj[a] : (obj[b] != null ? obj[b] : "")).trim();
+    return { choice: pick("choice", "answer"), justification: pick("justification", "reason"), confidence: _aiConf(obj.confidence) };
+  }
+  return { choice: t, justification: "", confidence: "low" }; // unparseable → best-effort: whole reply is the choice
+};
+
+// AI dropdown fill (AI-1, ALWAYS-GUESS): open + read the LIVE options → the LLM gets the profile +
+// question + exact options and CHOOSES one (these are REQUIRED fields — never UNKNOWN/blank, a blank
+// HALTS the walk) + a one-sentence justification (that NAMES its basis: a positive profile fact vs
+// reasoning from ABSENCE) + a confidence. The choice is a CANDIDATE that must clear the match ladder
+// vs the LIVE options (never blind-commit) → commit + read-back + M39 persistence re-read. ALWAYS
+// filled_review (never silent). Safety = the human review gate + per-answer confidence + the
+// sensitive flag — the legally-loaded "reasoning-from-absence" answers (criminal→No, eligibility→No)
+// are surfaced ai-choice-sensitive and the viewer keys PROMINENCE off that flag, NOT off confidence
+// (a High-confidence sensitive answer must not be the easiest to scroll past). Provider-agnostic.
+const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
+  const norm = apMatch.normalize;
+  const sensitive = legallyLoaded(f.label);
+  const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+  if (!expanded || !state || state.optionCount === 0) { // couldn't open / no render — infra, not invalid data
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: cz.blank ? "ai-no-options" : "ai-no-options-stray",
+      detail: "AI fallback: dropdown options did not render (not actuated)", options: enabledTextsSafe(state), auditLoc: loc.wrapperSel };
+  }
+  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low.";
+  const user = "Question: " + String(f.label || "")
+    + "\nAnswer options (choose exactly one; reply with its EXACT text): " + JSON.stringify(enabledTexts)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\"}";
+  const res = await act.llm({ system, user, maxTokens: 512 });
+  if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
+      detail: "AI call failed — " + ((res && res.error) || "no reply"), options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  const ai = parseAiReply(res.text);
+  const conf = ai.confidence; // the AI's self-reported inference confidence (high/medium/low)
+  // The choice is a CANDIDATE — clear the match ladder vs the LIVE options. A paraphrase / refusal /
+  // literal "UNKNOWN" won't match → a RARE needs_review fallback (never blind-commit arbitrary text).
+  const m = ai.choice ? apMatch.matchCandidates([ai.choice], enabledTexts) : { targetIndex: -1, matchTier: null };
+  if (m.targetIndex === -1) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    const base = "AI chose \"" + ai.choice + "\" — not one of the options" + (ai.justification ? " (" + ai.justification + ")" : "");
+    if (cz.blank) return { status: "needs_review", after: null, flag: "ai-nomatch", confidence: conf,
+      detail: base, options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: cz.after, flag: "ai-nomatch-stray", confidence: conf,
+      detail: base + "; \"" + cz.after + "\" STRAYED onto this field — review/correct it", options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+
+  const target = enabledTexts[m.targetIndex];
+  await act.clickDropdownOptionByText(loc, target);
+  await act.delayFull(budgets.reopenSettleMs);
+  let post = await act.readDropdownState(loc);
+  let committed = post && norm(post.triggerText) === norm(target);
+  if (committed) { // M39 persistence: re-read after a real beat — a momentary pick that reverts is NOT a commit
+    await act.delayFull(budgets.reopenSettleMs);
+    post = await act.readDropdownState(loc);
+    committed = post && norm(post.triggerText) === norm(target);
+  }
+  if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-commit-failed", confidence: conf,
+    detail: "AI chose \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
+  // ALWAYS filled_review — an AI guess is never silently trusted.
+  return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier,
+    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf,
+    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + target + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
+    options: enabledTexts, auditLoc: loc.wrapperSel };
+};
+// options for the no-render branch (state may be null) — keep the report honest without throwing.
+function enabledTextsSafe(state) { return state && Array.isArray(state.options) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : null; }
+
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
 // VERIFIED Enter (recon: a coordinate click on an out-of-view option dismisses
 // the popup — the Uruguay failure; Enter on a verified highlight commits).
@@ -1187,6 +1376,17 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
       record.status = "error";
       record.detail = String(e);
     }
+
+    // ── AI-1 FALLBACK ── if AI is ON, the field is AI-eligible (a dropdown; NEVER the
+    // employer-match radio / file_upload / EEO / free-text), and the deterministic pass
+    // produced NOTHING usable (unmapped or genuine no-match), ask the LLM: guess + fill +
+    // FLAG (filled_review), never silent. Additive + gated — the deterministic record above
+    // is untouched unless this fires (so the existing tests/paths are unchanged when AI is OFF).
+    if (act.aiEnabled && aiEligible(f) && producedNothing(record)) {
+      try { Object.assign(record, await aiFillField(act, loc, f, profile, jobContext, budgets)); }
+      catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
+    }
+
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
     results.push(record);
 
@@ -1745,6 +1945,12 @@ function buildReviewBundle(results, meta) {
     return "not_filled"; // needs_review / null
   };
   const deriveConfidence = (rec) => {
+    // AI fills carry the MODEL's self-reported inference confidence (high/medium/low) — surface
+    // it (not the flagged-"none" band) so the review shows how sure the AI was. NOT prominence:
+    // the viewer keys sensitive-prominence off the ai-choice-sensitive FLAG, never this.
+    if (rec.flag && rec.flag.indexOf("ai-") === 0 && (rec.confidence === "high" || rec.confidence === "medium" || rec.confidence === "low")) {
+      return { confidence: rec.confidence, confidence_source: "ai_inference" };
+    }
     const flagged = rec.status === "needs_review" || rec.status === "filled_review" || rec.status === "error";
     let source;
     if (rec.fieldName === "candidateIsPreviousWorker") source = "employer_match";
@@ -1766,7 +1972,15 @@ function buildReviewBundle(results, meta) {
     if (!flaggedBase && !escalated) return { needs_review: false, needs_review_reason: null };
     const detail = (rec.detail || "").toLowerCase();
     let reason;
-    if (rec.fieldName === "candidateIsPreviousWorker") reason = "employer_match_uncertain";
+    if (rec.flag && rec.flag.indexOf("ai-") === 0) {
+      // AI-inferred fields get a DISTINCT, scannable reason (so the human doesn't scroll-past
+      // an unremarkable "low_confidence"). stray = a value landed that the AI didn't intend.
+      if (/stray/.test(rec.flag)) reason = "ai_strayed_value";
+      else if (rec.flag === "ai-choice-sensitive") reason = "ai_inferred_sensitive";
+      else if (rec.flag === "ai-choice") reason = "ai_inferred";
+      else reason = "ai_no_answer"; // ai-unknown(-sensitive) / ai-nomatch / ai-no-options / ai-commit-failed / ai-error
+    }
+    else if (rec.fieldName === "candidateIsPreviousWorker") reason = "employer_match_uncertain";
     else if (rec.status === "error") reason = "fill_error";
     else if (rec.status === "skipped" && required && !rec.mappedPath) reason = "unmapped_required_field";
     else if (rec.status === "skipped" && required) reason = "required_field_empty";
@@ -1802,6 +2016,7 @@ function buildReviewBundle(results, meta) {
       fill_error: rec.status === "error" ? (rec.detail || null) : null,
       detail: rec.detail != null ? rec.detail : null,
       match_tier: rec.matchTier != null ? rec.matchTier : null,
+      flag: rec.flag != null ? rec.flag : null, // PROVENANCE (was dropped) — the viewer badges "AI-INFERRED" off flag.startsWith("ai-")
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       character_count: null
@@ -1837,5 +2052,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
 }

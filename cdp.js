@@ -1155,6 +1155,9 @@ function cdpSourceCategoryRect(label) {
 // captured for act.llm. Omitted by recon/section harnesses (act.llm then short-circuits OFF).
 function makeCdpActuation(llmConfig) {
   return {
+    // AI-1: the brain gates the AI-fallback on this BEFORE opening a field (so a disabled
+    // toggle never opens/actuates). Mirrors act.llm's own enabled check (both read llmConfig).
+    aiEnabled: !!(llmConfig && llmConfig.enabled),
     delay: cdpAdaptiveDelay, // ALL driver pacing goes through this — visibility-adaptive: fast foreground, full hidden (SW wall-clock)
     delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility (dropdown option-list render + commit-verify). The 5x speedup is for OUR pacing between actions, NEVER the page's render.
 

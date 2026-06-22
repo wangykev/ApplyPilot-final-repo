@@ -164,21 +164,37 @@ const render = () => {
   root.appendChild(refreshButton());
 
   // ── NEEDS REVIEW first (informational; editors live in the ALL FIELDS table) ──
-  const flagged = bundle.entries.filter((e) => e.needs_review);
+  // LEGALLY-LOADED (ai-choice-sensitive) answers render FIRST and loud, REGARDLESS of confidence —
+  // prominence keys off the FLAG, never confidence. A "reasoning-from-absence" answer (criminal→No,
+  // eligibility→No) is exactly the one the model marks HIGH, so confidence must NOT be allowed to
+  // bury it; the human must see it first. Confidence prioritizes scrutiny only AMONG the rest.
+  const isSensitive = (e) => e.flag && /sensitive/.test(e.flag);
+  const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
+  const flaggedAll = bundle.entries.filter((e) => e.needs_review);
+  const flagged = [...flaggedAll.filter(isSensitive), ...flaggedAll.filter((e) => !isSensitive(e))]; // sensitive FIRST (flag-driven)
   root.appendChild(el("h2", { text: `Needs review (${flagged.length})` }));
   if (!flagged.length) {
     root.appendChild(el("div", { class: "meta", text: "Nothing flagged." }));
   } else {
     for (const e of flagged) {
-      const card = el("div", { class: "review" });
-      card.appendChild(el("div", { class: "label", text: `${fmt(e.question_label)}  (${fmt(e.widget_type)})` }));
+      const sensitive = isSensitive(e);
+      const isAi = isAiFlag(e);
+      const card = el("div", { class: sensitive ? "review sensitive" : "review" });
+      const label = el("div", { class: "label" });
+      label.appendChild(document.createTextNode(`${fmt(e.question_label)}  (${fmt(e.widget_type)})  `));
+      // The loud marker is flag-driven: a legally-loaded answer is conspicuous at ANY confidence.
+      if (sensitive) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ LEGALLY-LOADED — VERIFY" }));
+      if (isAi) label.appendChild(el("span", { class: "badge ai-inferred", text: "AI-INFERRED" }));
+      card.appendChild(label);
       const reason = el("div", { class: "reason" });
       reason.appendChild(document.createTextNode(`reason: ${fmt(e.needs_review_reason)}  ·  status: ${fmt(e.fill_status)}  ·  value: `));
       const rv = el("span", { text: fmt(e.current_value) });
       reviewValueNodes[e.field_id] = rv; // kept fresh when the field is edited below
       reason.appendChild(rv);
       card.appendChild(reason);
-      if (e.detail) card.appendChild(el("div", { class: "detail", text: e.detail }));
+      // AI provenance — the flag (which AI path) + confidence, so the human sanity-checks HOW it answered.
+      if (isAi) card.appendChild(el("div", { class: "reason", text: `AI provenance: ${fmt(e.flag)}  ·  confidence: ${fmt(e.confidence)}` }));
+      if (e.detail) card.appendChild(el("div", { class: "detail", text: e.detail })); // the AI's RATIONALE (names its basis)
       const opts = e.options || e.captured_options;
       if (opts && opts.length) {
         // Cap the flat-text dump (options can now be ~250 for plain dropdowns).

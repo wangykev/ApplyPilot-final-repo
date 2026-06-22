@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -39,7 +39,8 @@ const T_BUDGETS = {
 //               cleared list, so the sig always changes on a response); a
 //               SECOND Enter commits the first filtered option as the chip;
 //               a banner and the list PERSIST across clearSearch (stale).
-function makeFakeAct(fields) {
+function makeFakeAct(fields, opts) {
+  const o = opts || {};
   const log = [];
   const byLoc = (loc) => fields.find((f) => f.wrapperSel === loc.wrapperSel);
   let focusedText = null;
@@ -51,6 +52,16 @@ function makeFakeAct(fields) {
 
   return {
     log,
+    // AI-1: the toggle gate + the LLM seam. aiEnabled defaults OFF (existing tests unchanged —
+    // the AI hook never fires). `o.ai` is the canned reply: a string → {ok:true,text}; an object
+    // → returned verbatim ({ok:false,error} models a failure); undefined → {ok:false} (no reply).
+    aiEnabled: o.aiEnabled === true,
+    llm: async (req) => {
+      log.push(["llm", req && req.user]);
+      const a = o.ai;
+      if (a === undefined || a === null) return { ok: false, error: "no canned reply" };
+      return typeof a === "string" ? { ok: true, text: a } : a;
+    },
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     scanPage: async () => ({
@@ -191,7 +202,11 @@ function makeFakeAct(fields) {
       // never report a false "kept original".
       if (focusedTa) { if (focusedTa.strayChipOnEscape) focusedTa.chips = [focusedTa.strayChipOnEscape]; focusedTa._open = false; }
       if (focusedSrc) { if (focusedSrc.strayChipOnEscape) focusedSrc.chips = [focusedSrc.strayChipOnEscape]; focusedSrc._open = false; }
-      if (openField) openField.open = false;
+      // strayValueOnEscape: model the recon's closed-but-COMMITTED dropdown — Escape collapses
+      // the list AND a value lands (triggerText changes) → blank:false + the strayed value.
+      // escapeWontClose: model the LIVE false-stray cause — a slow-closing list that stays OPEN
+      // across the Escape while the VALUE stays the placeholder → must still read blank:true.
+      if (openField) { if (openField.strayValueOnEscape) openField.triggerText = openField.strayValueOnEscape; if (!openField.escapeWontClose) openField.open = false; }
     },
 
     // ── source (backlog C) — filter-Enter only (commit is clickSourceLeaf) ──
@@ -564,6 +579,156 @@ test("dropdown: trigger NEVER expands across all retries → needs_review (optio
   assert.strictEqual(rec.status, "needs_review");
   assert.match(rec.detail, /options did not render/);
   assert.strictEqual(act.log.filter(([m]) => m === "openDropdown").length, T_BUDGETS.openRetries, "re-opened up to the retry bound, then gave up — never a false filled");
+});
+
+test("reconDropdownDump (AI-1 recon): reads options + dismisses CLEAN, NEVER arms/commits an option", async () => {
+  // Concern 1 — the recon runs on a REAL app's page 3 the operator then fills, so each
+  // dropdown must end exactly where it started ("Select One"), never a stray row-0 commit.
+  const act = makeFakeAct([ddField()]); // default triggerText "Select One"
+  const dump = await reconDropdownDump(act, { wrapperSel: "[w-country]" }, T_BUDGETS);
+  assert.strictEqual(dump.before, "Select One");
+  assert.strictEqual(dump.after, "Select One");
+  assert.strictEqual(dump.clean, true, "trigger text unchanged before vs after — left clean");
+  assert.ok(dump.optionCount > 0 && dump.options.length, "captured the option list");
+  // NEVER arms or commits: no type-jump / arrow / Enter / option-click in the actuation log.
+  const armedOrCommitted = act.log.some(([m]) => ["typeJumpChars", "arrowStep", "pressEnter", "clickDropdownOptionByText", "clickOptionByIndex"].includes(m));
+  assert.ok(!armedOrCommitted, "recon must never type/arrow/Enter/click an option (no armed row to stray)");
+  assert.ok(act.log.some(([m]) => m === "pressEscape"), "dismissed via Escape (the clean close)");
+});
+
+// ── AI-1: AI dropdown fallback (fake act.llm) ────────────────────────────────
+const aiDd = (flags) => Object.assign({
+  wrapperSel: "[w-ai]", fieldName: "screen_q", widgetType: "dropdown", isRequired: true,
+  label: "Are you over the age of 18?*",
+  triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }]
+}, flags || {});
+
+test("AI fallback: a matched JSON answer → filled_review + ai-choice-sensitive + the AI's confidence + justification (NEVER silent)", async () => {
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","justification":"the applicant is an enrolled student, so under 18 is implausible","confidence":"High"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review", "an AI guess is never silently 'filled'");
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.flag, "ai-choice-sensitive", "'over the age of 18' is legally-loaded → the sensitive flag");
+  assert.strictEqual(rec.confidence, "high", "the AI's self-reported confidence is carried");
+  assert.match(rec.detail, /enrolled student/, "the justification (its basis) is in the detail");
+  assert.ok(act.log.some(([m]) => m === "llm") && act.log.some(([m]) => m === "clickDropdownOptionByText"));
+  const e = buildReviewBundle(out.results, {}).entries[0];
+  assert.strictEqual(e.needs_review, true, "filled_review surfaces in NEEDS REVIEW (top of the viewer)");
+  assert.strictEqual(e.flag, "ai-choice-sensitive", "flag PERSISTED → the viewer keys sensitive-prominence off it");
+  assert.strictEqual(e.needs_review_reason, "ai_inferred_sensitive");
+  assert.strictEqual(e.confidence, "high", "AI confidence surfaced in the bundle");
+  assert.strictEqual(e.confidence_source, "ai_inference");
+  assert.strictEqual(e.current_value, "No");
+});
+
+test("AI fallback: a literal UNKNOWN reply is just a non-option → needs_review (ai-nomatch), blank, no commit (the gate is dropped — guess, don't refuse)", async () => {
+  const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, null, "blank — UNKNOWN matched no option");
+  assert.strictEqual(rec.flag, "ai-nomatch");
+  assert.strictEqual(rec.confidence, "low", "carries the AI's confidence even on a non-match");
+  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "never committed");
+});
+
+test("AI fallback: LLM choice not among the options → needs_review (ai-nomatch), never blind-commit", async () => {
+  const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"Maybe","justification":"unsure","confidence":"Medium"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-nomatch");
+  assert.strictEqual(rec.after, null);
+  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "a non-option reply is never committed");
+});
+
+test("AI fallback HOLD 2: a non-option choice + a value STRAYS on close → ai-nomatch-stray surfaces the STRAYED value (never a false blank)", async () => {
+  const act = makeFakeAct([aiDd({ label: "Favorite color?", strayValueOnEscape: "No" })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-nomatch-stray");
+  assert.strictEqual(rec.after, "No", "reports the TRUE page state (the strayed value), NOT a clean 'blank, please answer'");
+  assert.match(rec.detail, /STRAYED/);
+});
+
+test("AI: sensitive-vs-not prominence DATA — both flags + distinct reasons persist (the viewer partitions on the flag, not confidence)", async () => {
+  const act = makeFakeAct([
+    aiDd({ wrapperSel: "[w-crim]", fieldName: "crim_q", label: "Have you been convicted of a criminal offence?", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] }),
+    aiDd({ wrapperSel: "[w-pref]", fieldName: "pref_q", label: "Preferred shift?", options: [{ text: "Select One", disabled: true }, { text: "Day" }, { text: "Night" }] })
+  ], { aiEnabled: true, ai: '{"choice":"No","justification":"x","confidence":"High"}' });
+  // both AI fields get the same canned reply; only the criminal one matches "No". Assert the flags.
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const crim = out.results.find((r) => r.fieldName === "crim_q");
+  assert.strictEqual(crim.flag, "ai-choice-sensitive", "criminal question → sensitive, even at High confidence");
+  const e = buildReviewBundle(out.results, {}).entries.find((x) => x.question_label.includes("criminal"));
+  assert.strictEqual(e.needs_review_reason, "ai_inferred_sensitive");
+  assert.strictEqual(e.confidence, "high", "High confidence must NOT demote it — prominence is flag-driven in the viewer");
+});
+
+test("parseAiReply: plain JSON, ```-fenced, embedded, bad-confidence, and a non-JSON fallback", () => {
+  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high" });
+  assert.strictEqual(parseAiReply('```json\n{"choice":"No","confidence":"Low"}\n```').choice, "No");
+  assert.strictEqual(parseAiReply('Here is my answer: {"choice":"Maybe","confidence":"Medium"}').confidence, "medium");
+  assert.strictEqual(parseAiReply('{"choice":"X","confidence":"bogus"}').confidence, "low", "unknown confidence → low");
+  const fb = parseAiReply("just No"); assert.strictEqual(fb.choice, "just No"); assert.strictEqual(fb.confidence, "low");
+});
+
+test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays deterministic)", async () => {
+  const act = makeFakeAct([aiDd()], { aiEnabled: false, ai: "No" });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "llm"), "AI OFF → the LLM is never consulted");
+  assert.strictEqual(out.results[0].status, "skipped", "stays the deterministic skipped (no mapping)");
+});
+
+test("AI INVARIANT: an EEO-labelled dropdown ⇒ aiEligible false ⇒ act.llm NEVER called", async () => {
+  const act = makeFakeAct([aiDd({ label: "What is your gender?" })], { aiEnabled: true, ai: "Male" });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "llm"), "a protected EEO field is NEVER AI-guessed");
+  assert.strictEqual(out.results[0].status, "skipped");
+});
+
+test("AI INVARIANT: previous-worker / file_upload / free-text are never AI-eligible; an unmapped screening dropdown is", () => {
+  assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "candidateIsPreviousWorker", label: "Have you worked here?" }), false);
+  assert.strictEqual(aiEligible({ widgetType: "file_upload", fieldName: "resume", label: "Resume" }), false);
+  assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "essay", label: "Why us?" }), false); // free-text = AI-2
+  assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "screen_q", label: "Eligible to work in Canada?" }), true);
+});
+
+test("legallyLoaded matches all 4 Magna labels incl. 'over the age of 18'; benign label does not", () => {
+  assert.ok(legallyLoaded("Are you currently employed with Magna?"));
+  assert.ok(legallyLoaded("Are you eligible to work in Canada?"));
+  assert.ok(legallyLoaded("Are you over the age of 18?"), "the recon-caught gap");
+  assert.ok(legallyLoaded("Have you been convicted of a criminal offence for which a pardon has not been granted?"));
+  assert.ok(!legallyLoaded("What is your favorite color?"));
+});
+
+test("closeAndVerifyBlank: stayed-blank → {blank:true}; strayed-on-close → {blank:false, after:<strayed value>}", async () => {
+  const clean = makeFakeAct([aiDd()]);
+  await clean.openDropdown({ wrapperSel: "[w-ai]" });
+  assert.deepStrictEqual(await closeAndVerifyBlank(clean, { wrapperSel: "[w-ai]" }, "Select One", T_BUDGETS), { blank: true, after: "Select One" });
+  const dirty = makeFakeAct([aiDd({ strayValueOnEscape: "No" })]);
+  await dirty.openDropdown({ wrapperSel: "[w-ai]" });
+  const r = await closeAndVerifyBlank(dirty, { wrapperSel: "[w-ai]" }, "Select One", T_BUDGETS);
+  assert.strictEqual(r.blank, false);
+  assert.strictEqual(r.after, "No", "the verified-blank close reports the strayed truth, never a false blank");
+});
+
+test("closeAndVerifyBlank REGRESSION (the live false-stray): list slow / won't close but value stays the placeholder → {blank:true}, NOT a stray", async () => {
+  // The live Q2/Q3/Q4 bug: a blank field whose list was slow to dismiss got mislabeled a stray.
+  // Value-based blank is the fix — list-open does NOT mean a value strayed (Confirm #1 + the
+  // ariaExpanded gate / reopen-toggle that ping-ponged are gone).
+  const stuck = makeFakeAct([aiDd({ escapeWontClose: true })]);
+  await stuck.openDropdown({ wrapperSel: "[w-ai]" });
+  const r = await closeAndVerifyBlank(stuck, { wrapperSel: "[w-ai]" }, "Select One", T_BUDGETS);
+  assert.strictEqual(r.blank, true, "value === placeholder ⇒ blank, regardless of the list still being open");
+  assert.strictEqual(r.after, "Select One");
+});
+
+test("AI fallback REGRESSION: a non-option choice with a slow-to-close list (value stays placeholder) → ai-nomatch BLANK, not a false ai-nomatch-stray", async () => {
+  const act = makeFakeAct([aiDd({ label: "Favorite color?", escapeWontClose: true })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-nomatch", "a blank field whose list was slow to close is reported clean, not STRAYED");
+  assert.strictEqual(rec.after, null);
 });
 
 test("dropdown: commit shows the target then REVERTS (pick before render-complete) → needs_review, never a false verified:true", async () => {

@@ -52,6 +52,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP QUESTIONS RECON (AI-1 Step 1): READ-ONLY dump of the screening-questions page —
+  // verbatim field labels + each dropdown's options + a per-dropdown clean-close PROOF
+  // (open→read→dismiss, NEVER commits). [Q-RECON] in the SW console. No profile/LLM.
+  if (message.type === "RUN_CDP_QUESTIONS_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpQuestionsRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the NESTED Specialties
   // sub-section inside a Certification entry (mounts ONE specialty, dumps the diff,
   // restores). [CERT-SPECIALTY-RECON] in the SW console. No profile needed.
@@ -1389,6 +1402,69 @@ async function runCdpSessionRecon(tabId) {
 //     Bounded + restore-where-possible (one segment, throwaway app). Hidden-gated
 //     (it actuates). Detaches in finally.
 // ============================================================================
+// CDP QUESTIONS RECON (AI-1 Step 1, READ-ONLY) — the screening-questions page (page 3+).
+// Dumps EVERY field's VERBATIM label + type + required (for tuning the legallyLoaded /
+// EEO-exclusion regexes against the REAL text), and OPENS each dropdown to capture its
+// option list + PROVE it dismisses CLEAN (before==after trigger text — never leaves a
+// committed/strayed answer on a real app's page). Radios are read in place (no open).
+// Typeaheads/source are NOTED only (not opened — recon-safe vs the typeahead stray bug).
+// NO LLM, NO commit. Foreground (watch it). Output is [Q-RECON] in the SW console.
+async function runCdpQuestionsRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][Q-RECON]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. READ-ONLY: opens each dropdown, reads its options, and dismisses it CLEAN (never commits). Keep the tab VISIBLE. Run on the screening QUESTIONS page (page 3+).");
+    const act = makeCdpActuation(); // no llmConfig — recon never calls act.llm
+    const scan = await act.scanPage();
+    if (!scan || !Array.isArray(scan.fields)) { LOG("scan failed."); return { ok: false, error: "scan-failed" }; }
+    LOG(`url: ${scan.url} — ${scan.fields.length} field(s).`);
+
+    // (1) VERBATIM label dump — ALL fields (regex tuning needs the EXACT strings, incl. *).
+    LOG("── ALL FIELDS (verbatim labels — JSON so exact chars / asterisks / casing show) ──");
+    for (const f of scan.fields) {
+      console.log("[ApplyPilot][Q-RECON]", JSON.stringify({ fieldName: f.fieldName, widgetType: f.widgetType, isRequired: f.isRequired, label: f.label }));
+    }
+
+    // (2) DROPDOWNS — open → settle → read options → dismiss CLEAN (before==after proof).
+    const dropdowns = scan.fields.filter((f) => f.widgetType === "dropdown");
+    LOG(`── ${dropdowns.length} DROPDOWN(s) — open / read / clean-close ──`);
+    const results = [];
+    let strayed = 0, notOpened = 0;
+    for (const f of dropdowns) {
+      const dump = await reconDropdownDump(act, { wrapperSel: f.wrapperSel }, DEFAULT_BUDGETS);
+      if (!dump.opened) notOpened++;
+      if (!dump.clean) strayed++;
+      const optTexts = dump.options.filter((o) => !o.disabled).map((o) => o.text);
+      LOG(`• ${JSON.stringify(f.label)} ${f.isRequired ? "[required]" : ""}`);
+      LOG(`    clean: ${dump.clean ? "✓ before==after " + JSON.stringify(dump.before) : "✗✗ STRAYED — before " + JSON.stringify(dump.before) + " → after " + JSON.stringify(dump.after)}`);
+      LOG(`    opened: ${dump.opened} · enabled options (${optTexts.length}): ${JSON.stringify(optTexts)}`);
+      results.push({ fieldName: f.fieldName, label: f.label, required: f.isRequired, clean: dump.clean, opened: dump.opened, optionCount: optTexts.length, options: optTexts });
+    }
+
+    // (3) RADIOS — read in place (no open; screening Qs are sometimes radios).
+    for (const f of scan.fields.filter((f) => f.widgetType === "radio")) {
+      const opts = await act.readRadioState({ wrapperSel: f.wrapperSel });
+      LOG(`• RADIO ${JSON.stringify(f.label)} ${f.isRequired ? "[required]" : ""} — options: ${JSON.stringify((opts || []).map((o) => o.labelText))}`);
+    }
+
+    // (4) TYPEAHEAD/SOURCE — NOTED only (NOT opened — recon-safe vs the typeahead stray bug).
+    for (const f of scan.fields.filter((f) => f.widgetType === "typeahead" || f.widgetType === "hierarchical")) {
+      LOG(`• ${f.widgetType.toUpperCase()} ${JSON.stringify(f.label)} — present (NOT opened; fold into aiFillField if the screening page uses these).`);
+    }
+
+    if (!dropdowns.length) LOG("⚠ NO dropdowns found — are you on the screening/questions page? (page 3+)");
+    LOG(`SUMMARY: ${dropdowns.length} dropdown(s) — clean ${dropdowns.length - strayed}/${dropdowns.length}${strayed ? " ⚠⚠ " + strayed + " STRAYED (recon left a value — DO NOT proceed; investigate)" : (dropdowns.length ? " ✓ all left clean" : "")}${notOpened ? " · " + notOpened + " did not open" : ""}.`);
+    return { ok: true, url: scan.url, field_count: scan.fields.length, dropdowns: results, strayed, not_opened: notOpened };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("questions recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
 async function runCdpRepeatRecon(tabId) {
   const LOG = (...a) => console.log("[ApplyPilot][REPEAT-RECON]", ...a);
   // self-contained segment read (value + focus) for the date probe read-backs
