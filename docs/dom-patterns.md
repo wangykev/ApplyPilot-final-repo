@@ -1389,3 +1389,42 @@ keptLowerTier path reported KEPT "Other" but the page held "Accounting" (the aud
   tests (2 M36.1 updated to the re-commit contract + a strayed-check backstop test). The recon harness
   (slow `delayFull`) pinned the disarm + the slow-safe/fast-strays split; the full-page fill (fast) is the
   authoritative reproduction + validation.
+
+## 2026-06-22 — operator input-lock during a CDP fill (block accidental interference)
+
+The foreground fast-fill runs VISIBLE so the operator watches it — and can absentmindedly click/type and
+corrupt the in-progress fill. Goal: block the OPERATOR's pointer/keyboard while the bot actuates. Hard
+because the bot's CDP input is `isTrusted` through the SAME pipeline as the operator's.
+
+- **Recon (`RUN_CDP_INPUTLOCK_RECON`, 3 probes; a first run was an off-screen-target ARTIFACT — the finder
+  must `scrollIntoView` + pick an in-viewport field, mirroring `cdpRectOf(sel,true)`):**
+  - **(1) a pointer-events:auto overlay BLOCKS the bot's own `cdpClickAt`** (hit-testing) → a static
+    blocking overlay is out; must flag-gate.
+  - **(2) `cdpInsertText` BYPASSES a capture keydown-blocker (fires beforeinput/input, not keydown); per-
+    char keys (`cdpTypeChars`/`cdpKeyTap`) are BLOCKED by it** → block keydown+paste for the operator's
+    typing; the bot's key path needs gating, insertText is independently safe.
+  - **(3) the `__apActing` toggle-timing self-block is NOT real here** — with a CONTROL (flag true
+    throughout → click lands, proving the probe fired) both clear-after-dispatch AND clear-after-settle
+    LANDED ⇒ the flag may CLEAR-AFTER-DISPATCH (CDP's awaited `Input.*` resolves after page propagation).
+    cdpEval ≈ 1.4ms.
+- **Build:** `installInputLock`/`removeInputLock` (cdp.js): a VISUAL-only overlay (pointer-events:none) +
+  banner + **capture-phase listeners** (mousedown/click/keydown/keypress/paste/contextmenu) that swallow
+  the operator's events when a `window.__apActing` COUNTER ≤ 0. The 4 input primitives
+  (`cdpClickAt`/`cdpTripleClickAt`/`cdpKeyTap`/`cdpInsertText` — the choke; `cdpTypeChars`/`cdpSelectAllDelete`
+  /Enter route through `cdpKeyTap`) bump the counter ±1 around their sends (clear-after-dispatch). A COUNTER
+  (not a bool) keeps the nested `cdpTypeChars→cdpKeyTap` correct. `inputLockActive` ⇒ non-lock runs pay
+  zero toggle cost. Installed in `fillAndPersistPage` (per page); removed in the `runCdpFillPage`/`runCdpWalk`
+  finally (before `cdpDetach` — no stuck lock).
+- **HONEST framing — a strong DETERRENT + MITIGATION, NOT an absolute block.** Live (Magna page 2): NO
+  self-block across all 3 input modes (clicks, insertText, AND the nested cdpTypeChars→cdpKeyTap path —
+  dates + typeahead filled identically under the lock); the lock blocked operator interference except ONE
+  same-instant keystroke slip (`fFirmware…`), while the NO-LOCK baseline (same interference) let 4 changes
+  through. **The ~ms same-instant window is REAL + unavoidable** — it's exactly the window where input MUST
+  be allowed for the bot's own keystroke. Safety holds by **defense-in-depth**: the lock blocks accidental
+  interference; the read-back/M40-audit catches the rare slip → `needs_review`, NEVER silent corruption.
+- **FORWARD NOTE (the WALK, not this single-page commit):** install is per-page (re-installs after each nav,
+  idempotent — `cdpInstallInputLock` early-returns if `__apLock` exists; nav wipes it with the page so each
+  page gets exactly one, no stacking). BUT there's a between-pages WINDOW — after a page's fill, during
+  `clickPageNext` + nav to the next page, the old overlay is wiped and the next isn't installed until the
+  next `fillAndPersistPage` → the operator could interfere during the transition. Confirm + close (re-install
+  right after `cdpWaitNextPage`) when the first LOCKED walk runs.

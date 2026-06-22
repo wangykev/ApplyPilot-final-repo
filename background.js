@@ -250,7 +250,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
         const tab = tabs[0];
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillPage(tab.id, profile, defaults, jobContext);
+        const out = await runCdpFillPage(tab.id, profile, defaults, jobContext, { skipLock: !!message.noLock });
         sendResponse(out);
       });
     });
@@ -290,6 +290,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
       const out = await runCdpTaStrayRecon(tab.id, String(message.labelRegex || ""));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
+  // INPUT-LOCK RECON: probe overlay-vs-CDP-click, keydown-vs-insertText, and the __apActing
+  // flag-gate cost + toggle-timing self-block. No profile needed. Run on any form page.
+  if (message.type === "RUN_CDP_INPUTLOCK_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpInputlockRecon(tab.id);
       sendResponse(out);
     });
     return true; // async sendResponse
@@ -1850,12 +1862,17 @@ async function runCdpFill(tabId, profile, defaults, jobContext) {
 // PREPARED profile + a made `act` (the caller owns attach/detach + prepareProfile, so
 // the walk prepares once + attaches once across pages). Returns { out, bundle, auditFlags }.
 // ============================================================================
-async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG) {
+async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts) {
   // Accumulation merge key — the PRE-fill cdpPageKey (url PATHNAME [drops the volatile
   // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
   // on a same-pathname SPA). Computed BEFORE the fill (a field-revealing fill could change
   // the field-set). NOT cdpPageSig (full url incl. query).
   const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
+  // Operator input-lock: install BEFORE any actuation (idempotent — re-creates the overlay on a
+  // fresh page after a nav, so the walk re-protects each page). The 4 CDP input primitives gate
+  // on the counter it sets; the caller removes it in its finally (alongside cdpDetach).
+  // opts.skipLock = the NO-LOCK baseline for the oracle-equal verification (lock-off vs lock-on).
+  if (!(opts && opts.skipLock)) await installInputLock();
   const out = await drivePageFill(act, prepared, defaults, jobContext);
 
   LOG("page:", out.url);
@@ -1929,7 +1946,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG) {
 // the whole page in one click. SINGLE page (no advance) — accumulates, reset via the
 // "Clear summary" button. [CDP-PAGE] in the SW console.
 // ============================================================================
-async function runCdpFillPage(tabId, profile, defaults, jobContext) {
+async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
   try {
     const attached = await cdpAttach(tabId);
@@ -1940,17 +1957,18 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
-    LOG("attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).");
+    LOG(`attached. Filling NOW${opts && opts.skipLock ? " (NO input-lock — oracle baseline)" : " (input-lock ON)"} — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).`);
 
     const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
     const act = makeCdpActuation();
-    const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
+    const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts);
     return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total, audit_flagged: auditFlags.length };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("full-page fill aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
+    await removeInputLock(); // BEFORE detach (needs the attach) — stuck-lock is the worst operator failure
     await cdpDetach();
   }
 }
@@ -2182,6 +2200,135 @@ async function runCdpTaStrayRecon(tabId, labelRegexStr) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("typeahead-stray recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// INPUT-LOCK RECON — resolve the 3 unknowns before building the operator input-lock
+// (block the operator's pointer/keyboard while the bot's CDP input proceeds). The bot's
+// CDP input is isTrusted through the SAME pipeline as the operator's, so "block user,
+// allow bot" is non-trivial. Probes (each restored after):
+//   (1) does a pointer-events:auto overlay INTERCEPT the bot's cdpClickAt? (static
+//       overlay viable, or must flag-gate?)
+//   (2) does a capture keydown-blocker eat cdpInsertText vs cdpTypeChars/cdpKeyTap?
+//   (3) the __apActing flag-gate: cost + the TOGGLE-TIMING self-block — clearing the
+//       flag right after the dispatch CALL returns may self-block the bot's still-
+//       propagating event (clear-after-dispatch vs clear-after-confirm). [INPUTLOCK-RECON]
+// ============================================================================
+async function runCdpInputlockRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][INPUTLOCK-RECON]", ...a);
+  const TSEL = '[data-ap-recon-target="1"]';
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+
+    // Tag a text input as the probe target — PREFER one already in the viewport (RECON 1 picked an
+    // off-screen field at y=-4807 → clicks hit nothing → artifacts). freshTargetRect() scrollIntoViews
+    // + returns the POST-scroll center rect + an in-viewport check (mirrors the bot's cdpRectOf(sel,true));
+    // re-fresh before EVERY click so coords are always valid.
+    const tagged = await cdpEval(() => {
+      const cands = Array.from(document.querySelectorAll("input")).filter((i) => {
+        const t = (i.getAttribute("type") || "").toLowerCase();
+        const ok = t === "" || t === "text" || t === "tel" || t === "email";
+        const r = i.getBoundingClientRect();
+        return ok && r.width > 0 && r.height > 0;
+      });
+      if (!cands.length) return null;
+      const inView = cands.find((i) => { const r = i.getBoundingClientRect(); return r.top >= 0 && r.bottom <= window.innerHeight; });
+      const el = inView || cands[0];
+      el.setAttribute("data-ap-recon-target", "1");
+      return { id: el.getAttribute("data-automation-id") || el.name || "(input)" };
+    });
+    if (!tagged) { LOG("no visible text input on this page to probe — run on a form page."); return { ok: true, no_target: true }; }
+    const freshTargetRect = async () => cdpEval((sel) => {
+      const el = document.querySelector(sel); if (!el) return null;
+      if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+      const r = el.getBoundingClientRect();
+      const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
+      return { cx, cy, inViewport: cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight };
+    }, TSEL);
+    const tr0 = await freshTargetRect();
+    LOG(`probe target: ${tagged.id} @ (${tr0 && tr0.cx},${tr0 && tr0.cy}) inViewport=${tr0 && tr0.inViewport}.`);
+
+    // ── (1) Overlay vs CDP coordinate click ──
+    const r1 = await freshTargetRect();
+    if (r1 && r1.inViewport) {
+      await cdpEval(() => {
+        const o = document.createElement("div");
+        o.id = "__ap_ovl"; o.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.02);pointer-events:auto;";
+        window.__ap_ovl_hit = false;
+        o.addEventListener("mousedown", () => { window.__ap_ovl_hit = true; }, true);
+        o.addEventListener("click", () => { window.__ap_ovl_hit = true; }, true);
+        document.body.appendChild(o);
+        const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) t.blur();
+      });
+      await cdpClickAt(r1.cx, r1.cy); await cdpDelay(200);
+      const p1 = await cdpEval((sel) => ({ overlayHit: !!window.__ap_ovl_hit, targetFocused: document.activeElement === document.querySelector(sel) }), TSEL);
+      await cdpEval(() => { const o = document.getElementById("__ap_ovl"); if (o) o.remove(); });
+      var overlayBlocks = p1.overlayHit;
+      LOG(`(1) pointer-events:auto overlay + cdpClickAt @ (${r1.cx},${r1.cy}) → overlayHit=${p1.overlayHit}, targetFocused=${p1.targetFocused} ⇒ ${p1.overlayHit ? "a STATIC overlay BLOCKS the bot's own click → must FLAG-GATE/toggle." : (p1.targetFocused ? "overlay did NOT intercept the CDP click (target focused THROUGH it) → a static overlay may suffice." : "neither hit — re-run (click may not have landed).")}`);
+    } else { LOG(`(1) SKIPPED — target not in viewport after scroll (${r1 && r1.cx},${r1 && r1.cy}).`); }
+
+    // ── (2) Capture keydown-blocker vs insertText / per-char keys (no coords — focus()+keys) ──
+    await cdpEval(() => {
+      window.__ap_kd = 0;
+      window.__ap_kdh = (e) => { window.__ap_kd++; e.preventDefault(); e.stopPropagation(); };
+      document.addEventListener("keydown", window.__ap_kdh, true);
+      const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) { t.focus(); t.value = ""; }
+    });
+    await cdpInsertText("AP"); await cdpDelay(120);
+    await cdpTypeChars("XY", 40); await cdpDelay(120);
+    const p2 = await cdpEval((sel) => { const t = document.querySelector(sel); const v = t ? t.value : null; document.removeEventListener("keydown", window.__ap_kdh, true); if (t) t.value = ""; return { value: v, kd: window.__ap_kd }; }, TSEL);
+    LOG(`(2) capture keydown-blocker ON → cdpInsertText "AP" + cdpTypeChars "XY" → field="${p2.value}" (keydowns blocked: ${p2.kd}) ⇒ insertText ${(p2.value || "").includes("AP") ? "BYPASSES keydown (lands)" : "BLOCKED"}; per-char keys ${(p2.value || "").includes("X") ? "land" : "BLOCKED by the keydown handler"}.`);
+
+    // ── (3) __apActing flag-gate: COST + TOGGLE-TIMING self-block, with a CONTROL ──
+    const t0 = Date.now(); for (let i = 0; i < 10; i++) await cdpEval(() => 1);
+    const perEval = (Date.now() - t0) / 10;
+    LOG(`(3a) cdpEval round-trip ≈ ${perEval.toFixed(1)}ms each (a per-primitive toggle = ~2 of these).`);
+    await cdpEval(() => {
+      window.__apActing = false; window.__ap_gblk = 0;
+      window.__ap_g = (e) => { if (!window.__apActing) { window.__ap_gblk++; e.preventDefault(); e.stopPropagation(); } };
+      ["mousedown", "click", "keydown"].forEach((t) => document.addEventListener(t, window.__ap_g, true));
+    });
+    // gatedClick: re-fresh the rect (re-scroll) → flag true → click → clear per `mode` → read.
+    // mode "control": NEVER clear (flag true throughout) → the click MUST land if the mechanism works
+    // (so a "self-blocked" in A/B is REAL, not a click-that-never-landed artifact — the hold).
+    const gatedClick = async (mode) => {
+      const r = await freshTargetRect();
+      if (!r || !r.inViewport) return { skipped: true };
+      await cdpEval(() => { window.__apActing = true; window.__ap_gblk = 0; const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) t.blur(); });
+      await cdpClickAt(r.cx, r.cy);
+      if (mode === "dispatch") { await cdpEval(() => { window.__apActing = false; }); await cdpDelay(250); }
+      else if (mode === "settle") { await cdpDelay(250); await cdpEval(() => { window.__apActing = false; }); }
+      else { await cdpDelay(250); } // control: leave the flag true
+      const s = await cdpEval((sel) => ({ focused: document.activeElement === document.querySelector(sel), blocked: window.__ap_gblk }), TSEL);
+      await cdpEval(() => { window.__apActing = false; }); // reset for the next sub-probe
+      return s;
+    };
+    const ctl = await gatedClick("control");
+    const vA = await gatedClick("dispatch");
+    const vB = await gatedClick("settle");
+    await cdpEval(() => { ["mousedown", "click", "keydown"].forEach((t) => document.removeEventListener(t, window.__ap_g, true)); });
+    const controlLanded = !ctl.skipped && ctl.focused;
+    if (!controlLanded) {
+      LOG(`(3b) CONTROL (flag true throughout) → ${ctl.skipped ? "SKIPPED (target not in viewport)" : "click did NOT land (blocked=" + ctl.blocked + ")"} ⇒ the click mechanism isn't landing → probe 3 INCONCLUSIVE (artifact). Re-run on a page where the target stays in view.`);
+    } else {
+      LOG(`(3b) CONTROL landed (the blocker genuinely has a bot event to gate). TOGGLE-TIMING: clear-after-dispatch → ${vA.focused ? "LANDED" : "SELF-BLOCKED (blocked=" + vA.blocked + ")"}; clear-after-settle → ${vB.focused ? "LANDED" : "SELF-BLOCKED (blocked=" + vB.blocked + ")"}. ⇒ ` +
+        ((!vA.focused && vB.focused) ? "MUST clear-after-CONFIRM — clear-after-dispatch SELF-BLOCKS (the inverse race is REAL)."
+          : (vA.focused && vB.focused) ? "clear-after-dispatch is SAFE (dispatch resolves after propagation)."
+            : (!vA.focused && !vB.focused) ? "BOTH self-block despite the control landing → the flag clears too early both ways; clear only on a read-back CONFIRMATION (focus/value changed)."
+              : "A landed but B didn't — unexpected; re-run."));
+    }
+
+    await cdpEval(() => { const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) t.removeAttribute("data-ap-recon-target"); });
+    LOG("done. (No overlay/listener left; the probe typed into + cleared the target.)");
+    return { ok: true, overlay_blocks_bot: typeof overlayBlocks === "undefined" ? null : overlayBlocks, insertText_value: p2.value, keydowns_blocked: p2.kd, ms_per_eval: perEval, control_landed: controlLanded, clear_after_dispatch_lands: vA.focused, clear_after_settle_lands: vB.focused };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("input-lock recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
@@ -2664,6 +2811,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     LOG("walk aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
+    await removeInputLock(); // BEFORE detach (needs the attach) — never strand the operator behind the lock
     await cdpDetach();
   }
 }

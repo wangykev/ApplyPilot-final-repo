@@ -134,6 +134,20 @@ document.getElementById("cdp-fill-page").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-fill-page-nolock").addEventListener("click", () => {
+  setStatus("CDP full-page fill (NO input-lock — oracle baseline)… compare its result table to a lock run. See [CDP-PAGE].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_PAGE", noLock: true }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false) {
+      setStatus("Baseline fill failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Baseline (no-lock) fill done — ${JSON.stringify(resp.counts)}, ${resp.needs_review} need review${resp.audit_flagged ? `, ${resp.audit_flagged} AUDIT-flagged` : ""}. Now run WITH the lock + compare. See [CDP-PAGE].`);
+    }
+  });
+});
+
 document.getElementById("cdp-audit").addEventListener("click", () => {
   setStatus("CDP re-audit… re-reading the live page vs the last fill. See [CDP-AUDIT] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_AUDIT" }, (resp) => {
@@ -392,6 +406,20 @@ document.getElementById("cdp-fill-date").addEventListener("click", () => {
       setStatus("Date fill failed: " + resp.error + " — see the service worker console.");
     } else {
       setStatus(`Date fill: ${resp.status}${resp.after ? ` — "${resp.after}"` : ""} (verified: ${resp.verified}). See [CDP-DATE].`);
+    }
+  });
+});
+
+document.getElementById("cdp-inputlock-recon").addEventListener("click", () => {
+  setStatus("Input-lock recon… probing overlay/keydown/flag-gate. Run on a form page. See [INPUTLOCK-RECON] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_INPUTLOCK_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("Input-lock recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.no_target) {
+      setStatus("No text input on this page to probe — run on a form page.");
+    } else {
+      setStatus(`Input-lock recon done — overlay-blocks-bot: ${resp.overlay_blocks_bot}; probe3 ${resp.control_landed ? `conclusive (clear-after-dispatch lands: ${resp.clear_after_dispatch_lands})` : "INCONCLUSIVE (control didn't land — re-run)"}. See [INPUTLOCK-RECON].`);
     }
   });
 });

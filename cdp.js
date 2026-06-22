@@ -145,51 +145,114 @@ async function cdpAdaptiveDelay(ms) {
   await cdpDelay(fast ? Math.max(FAST_FLOOR_MS, Math.round(ms * FAST_FACTOR)) : ms);
 }
 
+// ── Operator input-lock (recon 2026-06-22) ──────────────────────────────────
+// While the bot actuates a VISIBLE tab the operator could accidentally click/type and
+// corrupt the fill. The bot's CDP input is isTrusted through the SAME pipeline as the
+// operator's (a pointer-events:auto overlay would block the BOT's own clicks — recon
+// probe 1), so we use a VISUAL-only overlay + capture-phase listeners gated by a
+// `window.__apActing` COUNTER: the bot raises the counter around each input primitive
+// (every Input.* originates in cdpClickAt/cdpTripleClickAt/cdpKeyTap/cdpInsertText →
+// gating those = no primitive un-gated), so the listeners block ONLY the operator's
+// events (counter<=0). Clear-AFTER-dispatch is safe (recon probe 3: the awaited Input.*
+// resolves after page propagation — no self-block). The counter (not a bool) keeps the
+// nested cdpTypeChars→cdpKeyTap path correct.
+let inputLockActive = false; // module flag: when false, the primitives skip the toggle (zero cost for non-lock runs)
+
+function cdpInstallInputLock() {
+  if (window.__apLock) return true; // idempotent (re-install after a nav re-creates it on the fresh page)
+  window.__apActing = 0;
+  const overlay = document.createElement("div");
+  overlay.id = "__ap_lock_overlay";
+  overlay.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none;background:rgba(20,20,30,0.16);";
+  const banner = document.createElement("div");
+  banner.textContent = "⏳ ApplyPilot is filling this form — please don't click or type.";
+  banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:2147483647;pointer-events:none;background:#1a73e8;color:#fff;font:600 14px system-ui,sans-serif;text-align:center;padding:10px;box-shadow:0 2px 10px rgba(0,0,0,0.35);";
+  (document.body || document.documentElement).appendChild(overlay);
+  (document.body || document.documentElement).appendChild(banner);
+  // Block the OPERATOR's input when the bot is NOT mid-primitive (counter<=0). keydown+
+  // keypress+paste cover typing (the bot's insertText bypasses keydown — recon probe 2);
+  // mousedown/click/etc cover clicks + focus-via-click; Tab→keydown blocked = no focus-steal.
+  // NOT wheel — let the operator scroll to watch.
+  const block = (e) => { if ((window.__apActing || 0) <= 0) { e.preventDefault(); e.stopImmediatePropagation(); } };
+  const types = ["mousedown", "mouseup", "click", "dblclick", "keydown", "keypress", "paste", "contextmenu"];
+  types.forEach((t) => document.addEventListener(t, block, true));
+  window.__apLock = { overlay, banner, block, types };
+  return true;
+}
+
+function cdpRemoveInputLock() {
+  const L = window.__apLock;
+  if (!L) return true;
+  try { L.types.forEach((t) => document.removeEventListener(t, L.block, true)); } catch (e) { /* ignore */ }
+  try { if (L.overlay) L.overlay.remove(); if (L.banner) L.banner.remove(); } catch (e) { /* ignore */ }
+  try { delete window.__apLock; delete window.__apActing; } catch (e) { /* ignore */ }
+  return true;
+}
+
+// SW-side lifecycle + the per-primitive counter toggle (no-op unless inputLockActive).
+async function installInputLock() { try { await cdpEval(cdpInstallInputLock); inputLockActive = true; } catch (e) { inputLockActive = false; } }
+async function removeInputLock() { inputLockActive = false; try { await cdpEval(cdpRemoveInputLock); } catch (e) { /* tab gone / detached — nothing to remove */ } }
+async function actingDelta(d) { try { await cdpEval((dd) => { window.__apActing = (window.__apActing || 0) + dd; }, d); } catch (e) { /* ignore */ } }
+
 // ── Input primitives (trusted, off-loop) ────────────────────────────────────
 
 // Full mouse click at viewport CSS-pixel coords: move → press → release — the
 // closest CDP analog to a real click; the resulting page events are isTrusted.
 async function cdpClickAt(x, y) {
-  const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
-  await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 });
-  await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 });
-  await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
+  if (inputLockActive) await actingDelta(+1);
+  try {
+    const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
+    await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 });
+    await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 });
+    await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
+  } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
 // Canonical triple-click (clickCount 1→2→3) — focuses a date spinbutton's 0-box
 // `-input` by clicking its VISIBLE `-display` sibling (M33 proven recipe; the
 // masked input can't be coordinate-clicked directly).
 async function cdpTripleClickAt(x, y) {
-  const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
-  await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" });
-  for (let i = 1; i <= 3; i++) {
-    await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i });
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i });
-  }
+  if (inputLockActive) await actingDelta(+1);
+  try {
+    const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
+    await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" });
+    for (let i = 1; i <= 3; i++) {
+      await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i });
+      await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i });
+    }
+  } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
 // Insert text into the FOCUSED editable as one IME-style commit — fires trusted
 // beforeinput/input (no per-key events). Recon (a) decides if this is enough
 // for Workday's React or whether per-char key events are needed.
-function cdpInsertText(text) {
-  return cdpSend("Input.insertText", { text: String(text) });
+async function cdpInsertText(text) {
+  if (inputLockActive) await actingDelta(+1);
+  try { return await cdpSend("Input.insertText", { text: String(text) }); }
+  finally { if (inputLockActive) await actingDelta(-1); }
 }
 
 // Named-key tap (keyDown + keyUp). def = { key, code, vk, text?, modifiers? }.
+// The keyboard choke: cdpTypeChars / cdpSelectAllDelete / pressEnter/Escape/arrows ALL
+// route through here, so gating cdpKeyTap covers the bot's entire key path (counter-based,
+// so the nested cdpTypeChars→cdpKeyTap stays "acting" throughout — no per-char gap).
 async function cdpKeyTap(def) {
-  const down = {
-    type: "keyDown",
-    key: def.key, code: def.code,
-    windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
-    modifiers: def.modifiers || 0
-  };
-  if (def.text) { down.text = def.text; down.unmodifiedText = def.text; }
-  await cdpSend("Input.dispatchKeyEvent", down);
-  await cdpSend("Input.dispatchKeyEvent", {
-    type: "keyUp", key: def.key, code: def.code,
-    windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
-    modifiers: def.modifiers || 0
-  });
+  if (inputLockActive) await actingDelta(+1);
+  try {
+    const down = {
+      type: "keyDown",
+      key: def.key, code: def.code,
+      windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
+      modifiers: def.modifiers || 0
+    };
+    if (def.text) { down.text = def.text; down.unmodifiedText = def.text; }
+    await cdpSend("Input.dispatchKeyEvent", down);
+    await cdpSend("Input.dispatchKeyEvent", {
+      type: "keyUp", key: def.key, code: def.code,
+      windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
+      modifiers: def.modifiers || 0
+    });
+  } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
 const CDP_KEYS = {

@@ -44,6 +44,10 @@
          the whole page. NO minimize gate: keep the tab VISIBLE for a FAST fill (watch it) or
          MINIMIZE for slow/background — it adapts live. Load profile first, click. [CDP-PAGE]. -->
     <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; visible=fast)</button>
+    <!-- Oracle baseline for the input-lock verification: same full-page fill but with the
+         operator input-lock OFF, so a lock run can be compared field-by-field to confirm the
+         lock's gating drops/corrupts nothing (no self-block). [CDP-PAGE]. -->
+    <button id="cdp-fill-page-nolock">CDP fill FULL PAGE — NO input-lock (baseline)</button>
     <!-- RE-AUDIT (M40): re-read the live page vs the last full-page fill's recorded values
          + report any field that no longer matches. The independent backstop for the
          false-verify class. To TEST it: fill, then manually change a committed field on the
@@ -61,6 +65,12 @@
          Reads chip/activeText/firstOption between each resting step. Run on page 2.
          [CDP-TA-STRAY] in the SW console. -->
     <button id="cdp-ta-stray-recon">CDP recon: typeahead stray (page 2; uses label below)</button>
+    <!-- INPUT-LOCK RECON: probe whether an operator input-lock is feasible — does a
+         pointer-events overlay block the bot's OWN cdpClickAt; does a keydown-blocker eat
+         insertText vs per-char keys; the __apActing flag-gate cost + the toggle-timing
+         self-block (clear-after-dispatch vs clear-after-confirm). Run on any form page.
+         [INPUTLOCK-RECON] in the SW console. -->
+    <button id="cdp-inputlock-recon">CDP recon: input-lock feasibility (any form page)</button>
     <!-- CDP WALK (M38 Part 3): the N-PAGE WALK. Fills each page (the full fold + audit +
          accumulating review summary) → guarded Save & Continue → repeats to the REVIEW
          page, where it STOPS and NEVER submits (double guard). Clears the prior summary
