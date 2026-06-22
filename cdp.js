@@ -341,6 +341,7 @@ function cdpPageScan() {
       return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
     });
     if (textLike.length === 1) return "text";
+    if (wrapper.querySelector("textarea")) return "textarea"; // AI-2: a flat <textarea> (essay) — was "unknown"
     return "unknown";
   };
   const labelOf = (wrapper) => {

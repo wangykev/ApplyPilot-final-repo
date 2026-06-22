@@ -490,14 +490,16 @@ const legallyLoaded = (label) => AI_LEGALLY_LOADED_RE.test(String(label || ""));
 // EXCLUSION ships now: an EEO-labelled choice field is not AI-eligible. Over-exclude = safe.
 const AI_EEO_RE = /gender|\brace\b|ethnic|veteran|disab|sexual orientation|\bsex\b|hispanic|latino|pronoun/i;
 
-// AI-fill is allowed ONLY for an unmapped/unmatched CHOICE field (AI-1: dropdown). NEVER the
-// employer-match radio (its own logic), file_upload, an EEO field, or free-text (= AI-2). Hard
-// gate — unit-pinned (act.llm must never be called for an excluded field).
+// AI-fill is allowed for an unmapped/unmatched CHOICE field (AI-1: dropdown) or free-text
+// (AI-2: text/textarea). NEVER the employer-match radio (its own logic), file_upload, an EEO
+// field, radio, or checkbox. Hard gate — unit-pinned (act.llm must never be called for an
+// excluded field). MAPPED text fields (phone/postal/…) never reach the AI hook anyway —
+// they fill deterministically so producedNothing(record) is false; only UNMAPPED text reaches AI-2.
 const aiEligible = (f) => {
-  if (!f || f.widgetType !== "dropdown") return false;            // AI-1 core = dropdowns
+  if (!f) return false;
   if (f.fieldName === "candidateIsPreviousWorker") return false;  // employer-match path
-  if (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || ""))) return false;
-  return true;
+  if (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || ""))) return false; // EEO never AI (any widget)
+  return f.widgetType === "dropdown" || f.widgetType === "text" || f.widgetType === "textarea";
 };
 
 // Did the deterministic pass produce NOTHING usable? (the AI-fallback trigger) — either
@@ -591,6 +593,72 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
 };
 // options for the no-render branch (state may be null) — keep the report honest without throwing.
 function enabledTextsSafe(state) { return state && Array.isArray(state.options) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : null; }
+
+// Parse the LLM's free-text reply (AI-2). The prompt asks for {answer} OR {skip,reason}; tolerate
+// ```-fences / embedded JSON / a bare "SKIP" / a non-JSON answer (best-effort: the whole reply IS
+// the answer). Returns {skip, answer, reason}.
+const parseAiText = (text) => {
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const mm = t.match(/\{[\s\S]*\}/);
+    if (mm) { try { obj = JSON.parse(mm[0]); } catch (e2) { /* fall through */ } }
+  }
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    if (obj.skip === true || /^skip\b/i.test(String(obj.answer == null ? "" : obj.answer).trim())) return { skip: true, answer: "", reason: String(obj.reason == null ? "declined" : obj.reason).trim() || "declined" };
+    return { skip: false, answer: String(obj.answer == null ? "" : obj.answer).trim(), reason: "" };
+  }
+  if (/^skip\b/i.test(t)) return { skip: true, answer: "", reason: "declined" };
+  return { skip: false, answer: t, reason: "" }; // non-JSON → best-effort: the whole reply is the answer
+};
+
+// AI_NEEDS_ANSWER_MARK is the load-bearing placeholder sentinel — defined canonically in lib.js
+// (apMatch); duplicated here ONLY for the SW path where apMatch is the inline {normalize,
+// matchCandidates} fallback (no constant). LOCKSTEP with lib.js AI_NEEDS_ANSWER_MARK.
+const AI_NEEDS_ANSWER_MARK_FD = "[NEEDS YOUR ANSWER";
+const aiPlaceholderText = (reason) => AI_NEEDS_ANSWER_MARK_FD + " — AI declined: " + (reason || "no basis in profile") + "]";
+
+// AI-2 free-text / essay fill (LLM). ALWAYS-GUESS adapted to text: GENERATE an answer from the
+// profile, or SKIP for factual data it shouldn't fabricate — but **NEVER leave a REQUIRED field
+// blank** (a blank halts the walk short of review). OPTIONAL skip → blank needs_review; REQUIRED
+// skip → a CONSPICUOUS placeholder (non-blank → walk advances; the review banners it + the deferred
+// SUBMIT hard-blocks on the marker). ALWAYS filled_review. Provider-agnostic (act.llm).
+const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
+  const required = !!f.isRequired;
+  const tag = f.widgetType === "textarea" ? "textarea" : "input";
+  // OPTIONAL decline → blank+flag; REQUIRED decline → placeholder so the walk reaches review.
+  const declineOrPlaceholder = async (reason) => {
+    if (!required) return { status: "needs_review", after: null, flag: "ai-text-skip", detail: "AI declined: " + reason, auditLoc: loc.wrapperSel };
+    const ph = aiPlaceholderText(reason);
+    const r = await fillTextCdp(act, loc, ph, budgets, tag);
+    return { status: "filled_review", after: (r && r.after != null) ? r.after : ph, verified: r && r.verified === true, flag: "ai-text-needs-answer",
+      detail: "REQUIRED — AI declined (" + reason + "); placeholder filled so the walk advances — REPLACE before submit", auditLoc: loc.wrapperSel };
+  };
+  // Generation master-switch: the operator's autofill_rules allowlist (empty ⇒ generation OFF).
+  const genAllowed = !!(profile && profile.autofill_rules && Array.isArray(profile.autofill_rules.generation_allowed_only_for)
+    && profile.autofill_rules.generation_allowed_only_for.indexOf("application_questions.open_ended") !== -1);
+  if (!genAllowed) return await declineOrPlaceholder("AI text generation is off (autofill_rules)");
+
+  const style = (profile && profile.application_questions && profile.application_questions.writing_style) || "";
+  const system = "You write a brief, human, professional answer to ONE job-application question for the applicant, using ONLY the applicant's profile (experience, projects, skills, essay_drafts, story_bank, open_ended). "
+    + (style ? "Writing style: " + style + " " : "")
+    + "If the field asks for specific FACTUAL data not in the profile (a name, ID, code, date, number, URL, address) or you cannot answer from the profile, reply SKIP — NEVER fabricate facts about the applicant.";
+  const user = "Question / field label: " + String(f.label || "")
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"answer\":\"<your answer>\"}  OR  {\"skip\":true,\"reason\":\"<short reason>\"}";
+  const res = await act.llm({ system, user, maxTokens: 1024 });
+  if (!res || !res.ok) return await declineOrPlaceholder("AI call failed — " + ((res && res.error) || "no reply"));
+  const parsed = parseAiText(res.text);
+  if (parsed.skip || !parsed.answer) return await declineOrPlaceholder(parsed.reason || "AI returned no answer");
+
+  const r = await fillTextCdp(act, loc, parsed.answer, budgets, tag);
+  if (!r || r.status !== "filled") return { status: "needs_review", after: r ? r.after : null, flag: "ai-text-commit-failed",
+    detail: "AI generated an answer but the text fill did not verify: " + ((r && r.detail) || "no read-back"), auditLoc: loc.wrapperSel };
+  // ALWAYS filled_review — an AI-generated answer is never silently trusted.
+  return { status: "filled_review", after: parsed.answer, verified: true, flag: "ai-text", confidence: "medium",
+    detail: "AI-generated answer from the profile", auditLoc: loc.wrapperSel };
+};
 
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
 // VERIFIED Enter (recon: a coordinate click on an out-of-view option dismisses
@@ -1366,6 +1434,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
           const arg = r.value !== undefined ? r.value : r.candidates;
           record.resolved = arg;
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
           else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
           else if (f.widgetType === "typeahead") Object.assign(record, await fillTypeaheadCdp(act, loc, arg, budgets));
@@ -1377,14 +1446,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
       record.detail = String(e);
     }
 
-    // ── AI-1 FALLBACK ── if AI is ON, the field is AI-eligible (a dropdown; NEVER the
-    // employer-match radio / file_upload / EEO / free-text), and the deterministic pass
-    // produced NOTHING usable (unmapped or genuine no-match), ask the LLM: guess + fill +
-    // FLAG (filled_review), never silent. Additive + gated — the deterministic record above
-    // is untouched unless this fires (so the existing tests/paths are unchanged when AI is OFF).
+    // ── AI FALLBACK ── if AI is ON, the field is AI-eligible (NEVER the employer-match radio /
+    // file_upload / EEO), and the deterministic pass produced NOTHING usable (unmapped or genuine
+    // no-match), ask the LLM: guess + fill + FLAG (filled_review), never silent. Additive + gated —
+    // the deterministic record above is untouched unless this fires (existing paths unchanged when
+    // AI is OFF). DROPDOWN → aiFillField (AI-1); TEXT/TEXTAREA → aiFillText (AI-2, generate-or-skip,
+    // never leaving a REQUIRED field blank — a placeholder so the walk reaches review).
     if (act.aiEnabled && aiEligible(f) && producedNothing(record)) {
-      try { Object.assign(record, await aiFillField(act, loc, f, profile, jobContext, budgets)); }
-      catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
+      try {
+        const aiRes = (f.widgetType === "dropdown")
+          ? await aiFillField(act, loc, f, profile, jobContext, budgets)
+          : await aiFillText(act, loc, f, profile, jobContext, budgets);
+        Object.assign(record, aiRes);
+      } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
     }
 
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
@@ -1976,9 +2050,12 @@ function buildReviewBundle(results, meta) {
       // AI-inferred fields get a DISTINCT, scannable reason (so the human doesn't scroll-past
       // an unremarkable "low_confidence"). stray = a value landed that the AI didn't intend.
       if (/stray/.test(rec.flag)) reason = "ai_strayed_value";
+      else if (rec.flag === "ai-text-needs-answer") reason = "ai_needs_answer"; // AI-2: REQUIRED placeholder — MUST replace before submit
+      else if (rec.flag === "ai-text") reason = "ai_generated";               // AI-2: generated free-text answer
+      else if (rec.flag === "ai-text-skip") reason = "ai_skipped";             // AI-2: optional field the AI declined (blank)
       else if (rec.flag === "ai-choice-sensitive") reason = "ai_inferred_sensitive";
       else if (rec.flag === "ai-choice") reason = "ai_inferred";
-      else reason = "ai_no_answer"; // ai-unknown(-sensitive) / ai-nomatch / ai-no-options / ai-commit-failed / ai-error
+      else reason = "ai_no_answer"; // ai-nomatch / ai-no-options / ai-commit-failed / ai-text-commit-failed / ai-error
     }
     else if (rec.fieldName === "candidateIsPreviousWorker") reason = "employer_match_uncertain";
     else if (rec.status === "error") reason = "fill_error";
@@ -2052,5 +2129,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
 }

@@ -163,15 +163,25 @@ const render = () => {
 
   root.appendChild(refreshButton());
 
+  // ── SUBMIT-BLOCKED banner (AI-2) — a REQUIRED field the AI declined holds a placeholder that
+  // MUST NOT ship. Removal is a CHECKED precondition of submit, not just conspicuous: this banner
+  // is the visible gate now (the deferred strict-replay SUBMIT must live-re-read + refuse too). ──
+  const needsAnswer = (e) => e.flag === "ai-text-needs-answer";
+  const blocked = bundle.entries.filter((e) => needsAnswer(e));
+  if (blocked.length) {
+    root.appendChild(el("div", { class: "submit-blocked", text: `⛔ SUBMIT BLOCKED — ${blocked.length} required field(s) still hold an AI placeholder. Replace each on the form before submitting.` }));
+  }
+
   // ── NEEDS REVIEW first (informational; editors live in the ALL FIELDS table) ──
-  // LEGALLY-LOADED (ai-choice-sensitive) answers render FIRST and loud, REGARDLESS of confidence —
-  // prominence keys off the FLAG, never confidence. A "reasoning-from-absence" answer (criminal→No,
-  // eligibility→No) is exactly the one the model marks HIGH, so confidence must NOT be allowed to
-  // bury it; the human must see it first. Confidence prioritizes scrutiny only AMONG the rest.
+  // LEGALLY-LOADED (ai-choice-sensitive) + NEEDS-YOUR-ANSWER (ai-text-needs-answer) render FIRST and
+  // loud, REGARDLESS of confidence — prominence keys off the FLAG, never confidence. A "reasoning-
+  // from-absence" answer (criminal→No) is exactly the one the model marks HIGH, so confidence must
+  // NOT bury it; ditto a must-replace placeholder. Confidence prioritizes scrutiny only AMONG the rest.
   const isSensitive = (e) => e.flag && /sensitive/.test(e.flag);
   const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
+  const mustReplace = (e) => isSensitive(e) || needsAnswer(e);
   const flaggedAll = bundle.entries.filter((e) => e.needs_review);
-  const flagged = [...flaggedAll.filter(isSensitive), ...flaggedAll.filter((e) => !isSensitive(e))]; // sensitive FIRST (flag-driven)
+  const flagged = [...flaggedAll.filter(mustReplace), ...flaggedAll.filter((e) => !mustReplace(e))]; // must-replace FIRST (flag-driven)
   root.appendChild(el("h2", { text: `Needs review (${flagged.length})` }));
   if (!flagged.length) {
     root.appendChild(el("div", { class: "meta", text: "Nothing flagged." }));
@@ -179,11 +189,12 @@ const render = () => {
     for (const e of flagged) {
       const sensitive = isSensitive(e);
       const isAi = isAiFlag(e);
-      const card = el("div", { class: sensitive ? "review sensitive" : "review" });
+      const card = el("div", { class: mustReplace(e) ? "review sensitive" : "review" });
       const label = el("div", { class: "label" });
       label.appendChild(document.createTextNode(`${fmt(e.question_label)}  (${fmt(e.widget_type)})  `));
-      // The loud marker is flag-driven: a legally-loaded answer is conspicuous at ANY confidence.
+      // The loud marker is flag-driven: conspicuous at ANY confidence.
       if (sensitive) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ LEGALLY-LOADED — VERIFY" }));
+      if (needsAnswer(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ NEEDS YOUR ANSWER — REPLACE BEFORE SUBMIT" }));
       if (isAi) label.appendChild(el("span", { class: "badge ai-inferred", text: "AI-INFERRED" }));
       card.appendChild(label);
       const reason = el("div", { class: "reason" });

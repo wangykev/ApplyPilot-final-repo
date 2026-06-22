@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -672,6 +672,90 @@ test("parseAiReply: plain JSON, ```-fenced, embedded, bad-confidence, and a non-
   const fb = parseAiReply("just No"); assert.strictEqual(fb.choice, "just No"); assert.strictEqual(fb.confidence, "low");
 });
 
+// ── AI-2: free-text / essay fill (fake act.llm) ──────────────────────────────
+const GEN_ON = { autofill_rules: { generation_allowed_only_for: ["application_questions.open_ended"] }, application_questions: { writing_style: "plain professional first person" } };
+const aiText = (flags) => Object.assign({
+  wrapperSel: "[w-essay]", fieldName: "whyUs", widgetType: "text", isRequired: true, label: "Why do you want to work here?", value: ""
+}, flags || {});
+
+test("parseAiText: {answer}, {skip,reason}, bare SKIP, ```-fenced, and non-JSON → whole reply is the answer", () => {
+  assert.deepStrictEqual(parseAiText('{"answer":"I admire the mission."}'), { skip: false, answer: "I admire the mission.", reason: "" });
+  assert.deepStrictEqual(parseAiText('{"skip":true,"reason":"asks for an ID"}'), { skip: true, answer: "", reason: "asks for an ID" });
+  assert.strictEqual(parseAiText('```json\n{"answer":"Hello"}\n```').answer, "Hello");
+  assert.strictEqual(parseAiText("SKIP").skip, true);
+  assert.deepStrictEqual(parseAiText("a plain prose answer"), { skip: false, answer: "a plain prose answer", reason: "" });
+});
+
+test("AI-2: generated answer → filled_review + ai-text + the prose typed (NEVER silent)", async () => {
+  const act = makeFakeAct([aiText()], { aiEnabled: true, ai: '{"answer":"I am drawn to your robotics work, which matches my CAN-bus and ROS 2 experience."}' });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-text");
+  assert.match(rec.after, /robotics work/);
+  assert.ok(act.log.some(([m]) => m === "typeText"), "the answer was typed into the field");
+});
+
+test("AI-2: OPTIONAL field the AI SKIPs → needs_review BLANK (ai-text-skip), no fill", async () => {
+  const act = makeFakeAct([aiText({ isRequired: false })], { aiEnabled: true, ai: '{"skip":true,"reason":"asks for a specific ID not in the profile"}' });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-text-skip");
+  assert.strictEqual(rec.after, null, "optional → blank is safe (doesn't halt the walk)");
+});
+
+test("AI-2 PRINCIPLE: a REQUIRED field the AI SKIPs → conspicuous placeholder, never blank (walk reaches review; submit hard-blocks)", async () => {
+  const act = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: '{"skip":true,"reason":"asks for a specific employee ID"}' });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", "non-blank so the walk advances");
+  assert.strictEqual(rec.flag, "ai-text-needs-answer");
+  assert.match(rec.after, /^\[NEEDS YOUR ANSWER/, "a detectable, conspicuous placeholder is filled");
+  // the placeholder is detectable by the submit-precondition seam
+  const { unreplacedPlaceholders } = require("../lib.js");
+  const entries = buildReviewBundle((await drivePageFill(makeFakeAct([aiText()], { aiEnabled: true, ai: '{"skip":true,"reason":"x"}' }), GEN_ON, {}, {}, T_BUDGETS)).results, {}).entries;
+  assert.strictEqual(unreplacedPlaceholders(entries).length, 1, "the bundle entry is detected as an unreplaced placeholder (submit-blocked)");
+});
+
+test("AI-2: generation OFF (empty autofill_rules) ⇒ act.llm NEVER called; required → placeholder, optional → skip", async () => {
+  const GEN_OFF = { autofill_rules: { generation_allowed_only_for: [] } };
+  const reqAct = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: '{"answer":"should not be used"}' });
+  const reqRec = (await drivePageFill(reqAct, GEN_OFF, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!reqAct.log.some(([m]) => m === "llm"), "generation off → the LLM is never consulted");
+  assert.strictEqual(reqRec.flag, "ai-text-needs-answer", "required still gets a placeholder (walk advances)");
+  const optAct = makeFakeAct([aiText({ isRequired: false })], { aiEnabled: true, ai: '{"answer":"x"}' });
+  const optRec = (await drivePageFill(optAct, GEN_OFF, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(optRec.flag, "ai-text-skip");
+  assert.strictEqual(optRec.after, null);
+});
+
+test("AI-2: a MAPPED text field fills deterministically and NEVER reaches the AI hook", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-city]", fieldName: "city", widgetType: "text", isRequired: true, label: "City", value: "" }], { aiEnabled: true, ai: '{"answer":"nope"}' });
+  const rec = (await drivePageFill(act, Object.assign({ personal_info: { city: "Tallahassee" } }, GEN_ON), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Tallahassee");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "a mapped text field never reaches AI-2 (producedNothing is false)");
+});
+
+test("AI-2: an unmapped flat TEXTAREA routes to aiFillText and fills", async () => {
+  const act = makeFakeAct([aiText({ wrapperSel: "[w-ta]", fieldName: "coverLetter", widgetType: "textarea", label: "Cover letter" })], { aiEnabled: true, ai: '{"answer":"Dear team, I would love to join."}' });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-text");
+  assert.match(rec.after, /Dear team/);
+});
+
+test("AI-2 submit-belt: isAiPlaceholder + unreplacedPlaceholders (the CHECKED submit precondition)", () => {
+  const { isAiPlaceholder, unreplacedPlaceholders } = require("../lib.js");
+  assert.ok(isAiPlaceholder("[NEEDS YOUR ANSWER — AI declined: x]"));
+  assert.ok(!isAiPlaceholder("a real answer"));
+  assert.ok(!isAiPlaceholder(null));
+  const entries = [
+    { flag: "ai-text-needs-answer", current_value: "[NEEDS YOUR ANSWER — AI declined: x]" }, // still a placeholder → blocks
+    { flag: "ai-text-needs-answer", current_value: "the human replaced it" },                 // replaced → no longer blocks
+    { flag: "ai-text", current_value: "a generated answer" }                                  // not a placeholder field
+  ];
+  assert.strictEqual(unreplacedPlaceholders(entries).length, 1, "only the still-unreplaced placeholder blocks submit");
+});
+
 test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays deterministic)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: false, ai: "No" });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
@@ -686,11 +770,15 @@ test("AI INVARIANT: an EEO-labelled dropdown ⇒ aiEligible false ⇒ act.llm NE
   assert.strictEqual(out.results[0].status, "skipped");
 });
 
-test("AI INVARIANT: previous-worker / file_upload / free-text are never AI-eligible; an unmapped screening dropdown is", () => {
+test("AI INVARIANT: prev-worker / file_upload / radio / EEO never AI-eligible; dropdown + text/textarea ARE (AI-2 extends to free-text)", () => {
   assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "candidateIsPreviousWorker", label: "Have you worked here?" }), false);
   assert.strictEqual(aiEligible({ widgetType: "file_upload", fieldName: "resume", label: "Resume" }), false);
-  assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "essay", label: "Why us?" }), false); // free-text = AI-2
+  assert.strictEqual(aiEligible({ widgetType: "radio", fieldName: "x", label: "Pick one" }), false);
+  assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "gender", label: "What is your gender?" }), false, "EEO never AI (any widget)");
+  assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "disabilityStatus", label: "Disability status" }), false, "EEO label blocks even text");
   assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "screen_q", label: "Eligible to work in Canada?" }), true);
+  assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "whyUs", label: "Why us?" }), true, "free-text now eligible (AI-2)");
+  assert.strictEqual(aiEligible({ widgetType: "textarea", fieldName: "coverLetter", label: "Cover letter" }), true);
 });
 
 test("legallyLoaded matches all 4 Magna labels incl. 'over the age of 18'; benign label does not", () => {

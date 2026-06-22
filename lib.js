@@ -176,8 +176,22 @@ function cdpPageKey(scan) {
   return path + "|" + scan.fields.map((f) => f.fieldName).sort().join(",");
 }
 
+// AI-2: a REQUIRED free-text field the AI declined is filled with a CONSPICUOUS placeholder so
+// the walk reaches review (a blank required field would halt it) — but that placeholder is text
+// that MUST NOT ship. AI_NEEDS_ANSWER_MARK is the detectable sentinel; removal is a CHECKED
+// precondition of submit (not just "loud"): the review viewer banners while any remains, and the
+// deferred strict-replay SUBMIT MUST live-re-read the field + REFUSE while the marker is present.
+// LOCKSTEP with fill-driver.js AI_NEEDS_ANSWER_MARK_FD (the SW path can't import this).
+const AI_NEEDS_ANSWER_MARK = "[NEEDS YOUR ANSWER";
+function isAiPlaceholder(text) { return typeof text === "string" && text.indexOf(AI_NEEDS_ANSWER_MARK) !== -1; }
+// The submit-precondition seam: bundle entries flagged ai-text-needs-answer whose value STILL
+// carries the marker (the bundle is a snapshot; the authoritative submit gate re-reads the LIVE field).
+function unreplacedPlaceholders(entries) {
+  return (entries || []).filter((e) => e && e.flag === "ai-text-needs-answer" && isAiPlaceholder(e.current_value));
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, cdpPageKey };
+  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders };
 }
