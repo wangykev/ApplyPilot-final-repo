@@ -186,8 +186,11 @@ function makeFakeAct(fields) {
     },
     pressEscape: async () => {
       log.push(["pressEscape"]);
-      if (focusedTa) focusedTa._open = false;
-      if (focusedSrc) focusedSrc._open = false;
+      // strayChipOnEscape: model the live bug — an armed row-0 ("Accounting") that COMMITS on
+      // the exit/dismiss despite the resting path. The strayed-check must flag it (overwrite-stray),
+      // never report a false "kept original".
+      if (focusedTa) { if (focusedTa.strayChipOnEscape) focusedTa.chips = [focusedTa.strayChipOnEscape]; focusedTa._open = false; }
+      if (focusedSrc) { if (focusedSrc.strayChipOnEscape) focusedSrc.chips = [focusedSrc.strayChipOnEscape]; focusedSrc._open = false; }
       if (openField) openField.open = false;
     },
 
@@ -898,6 +901,19 @@ test("overwrite: no candidate matches → needs_review / overwrite-nomatch-origi
   assert.strictEqual(field._value, "", "leftover filter text cleared — field rests clean");
 });
 
+test("overwrite no-match: the resting dismissal STRAYS the chip (armed row-0 race) → needs_review/overwrite-stray, NEVER a false keep", async () => {
+  // The fieldOfStudy "Accounting" class: the no-match search arms row-0; if the exit/dismiss
+  // commits it despite the disarm-verify, the strayed-check must FLAG the live value (not report
+  // a false "kept original"). Models the stray via strayChipOnEscape.
+  const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { banner: true } }, strayChipOnEscape: "Accounting" });
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "overwrite-stray", "a strayed dismissal is flagged, not a false keep");
+  assert.strictEqual(rec.after, "Accounting", "surfaces the LIVE strayed value, not the original");
+});
+
 test("overwrite: a different value commits (stray) → needs_review / overwrite-stray, original recorded", async () => {
   const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { autoCommit: "Mexico (+52)" } } });
   const act = makeFakeAct([field]);
@@ -973,21 +989,23 @@ test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available,
   assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "Other"]);
 });
 
-test("M36.1 typeahead k>0: nothing higher offered → KEEP the pre-fill (prefilled-better-tier-unavailable) — NOT zero-actuation", async () => {
-  // Pre-fill = tier-1 "Other"; the only higher tier (tier-0) is NOT offered → "Other"
-  // is the best available → kept, flagged. It DID actuate (searched tier-0).
+test("M36.1 typeahead k>0: nothing higher offered → RE-COMMIT the kept pre-fill (prefilled-better-tier-unavailable)", async () => {
+  // Pre-fill = tier-1 "Other"; tier-0 NOT offered → "Other" is the best available. The fix
+  // AFFIRMATIVELY RE-COMMITS it (race-proof vs the armed-row-0 stray that the old dismiss-and-
+  // hope left): searches tier-0 (miss) THEN re-commits its own tier, ending filled/
+  // prefilled-better-tier-unavailable on a DELIBERATE commit (the fieldOfStudy "Accounting" fix).
   const field = taField({
     chips: ["Other"],
-    filterMap: { "Electrical and Computer Engineering": { banner: true } } // tier 0 not offered
+    filterMap: { "Electrical and Computer Engineering": { banner: true }, "Other": { autoCommit: "Other" } } // tier-0 not offered; the kept tier re-commits
   });
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.strictEqual(rec.after, "Other", "the pre-fill (best available tier) is kept");
-  assert.deepStrictEqual(field.chips, ["Other"], "chip unchanged — never re-committed");
-  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering"], "DID search the higher tier (not zero-actuation); never re-searched its own tier");
+  assert.strictEqual(rec.after, "Other", "the kept tier — re-committed");
+  assert.deepStrictEqual(field.chips, ["Other"], "ends on a DELIBERATE commit of Other (the affirmative re-commit)");
+  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "Other"], "searched the higher tier (miss) THEN re-committed its own tier (the fix)");
 });
 
 test("M36.1 typeahead k===-1: a mismatched pre-fill walks the FULL list (down to the last tier) — unchanged from M27", async () => {
@@ -1267,14 +1285,14 @@ test("M36.1 source k>0: upgrades to the HIGHEST offered tier (lockstep)", async 
   assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn"], "stopped at the highest offered; tier-1/own tier never searched");
 });
 
-test("M36.1 source k>0: nothing higher offered → KEEP the pre-fill (prefilled-better-tier-unavailable), DID actuate (lockstep)", async () => {
-  const field = srcField({ chips: ["Other"], filterMap: { LinkedIn: { banner: true } } }); // tier-0 not offered
+test("M36.1 source k>0: nothing higher offered → RE-COMMIT the kept pre-fill (prefilled-better-tier-unavailable, lockstep)", async () => {
+  const field = srcField({ chips: ["Other"], filterMap: { LinkedIn: { banner: true }, "Other": { autoCommit: "Other" } } }); // tier-0 not offered; kept tier re-commits
   const { rec, act } = await runSource(field, ["LinkedIn", "Other"]);
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.strictEqual(rec.after, "Other", "the pre-fill (best available tier) is kept");
-  assert.deepStrictEqual(field.chips, ["Other"], "chip unchanged — never re-committed");
-  assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn"], "DID search the higher tier (not zero-actuation)");
+  assert.strictEqual(rec.after, "Other", "the kept tier — re-committed");
+  assert.deepStrictEqual(field.chips, ["Other"], "ends on a DELIBERATE commit of Other (the affirmative re-commit)");
+  assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn", "Other"], "searched the higher tier (miss) THEN re-committed its own tier (the fix)");
 });
 
 test("source: containment auto-commit → filled_review + autocommit-containment (lockstep with typeahead)", async () => {

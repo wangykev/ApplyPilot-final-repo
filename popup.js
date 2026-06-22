@@ -396,6 +396,21 @@ document.getElementById("cdp-fill-date").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-ta-stray-recon").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
+  setStatus(`Typeahead-stray recon ("${labelRegex}")… pre-set the field to a LOWER tier ("Other") first. See [CDP-TA-STRAY] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_TA_STRAY_RECON", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("Stray recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.found === false) {
+      setStatus("No matching typeahead on this page — run on the page with the field (page 2 for Field of Study).");
+    } else {
+      setStatus(`Stray recon done — ${resp.strayed ? `⚠ STRAYED "${resp.chip_initial}"→"${resp.chip_after_blur}"` : "no stray this run (race — re-run)"}. See [CDP-TA-STRAY].`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

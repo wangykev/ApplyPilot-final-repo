@@ -1362,3 +1362,30 @@ path; it is SELF-CONTAINED (closes over nothing — built for injection), so it 
   ENGINE's claim (the file-upload-successful row rendered); the FORM accepting it (Save & Continue proceeds)
   is the form's TRUTH, and they can differ (a file that "attaches" but fails Workday's own doc validation
   would report attached yet still block). The walk's ADVANCE is the decisive proof — still open.
+
+## 2026-06-22 — typeahead keptLowerTier STRAY ("Other"→"Accounting") — a fast-pacing disarm race
+
+M40 surfaced a silent corruption: `fieldOfStudy` pre-filled "Other" (a tier-1 candidate) → the M36.1
+keptLowerTier path reported KEPT "Other" but the page held "Accounting" (the audit caught it). Recon
+(`RUN_CDP_TA_STRAY_RECON`, per-action chip+activeText reads) + the full-page fill pinned the mechanism:
+
+- A no-match higher-tier search (typed an absent value + filter-Enter) **ARMS listbox row-0** (the first
+  option "Accounting" — `activeText="Accounting"`), even with the "No matches" banner showing.
+- `overwriteNoMatchResting` RE-FOCUSES the searchBox, which **DISARMS** the highlight (`activeText→null`) —
+  BUT the disarm is async/page-side. **At SLOW (recon `delayFull`) pacing the disarm completes → NO stray;
+  at FAST (M39 foreground) pacing the field is EXITED before it completes, and the NEXT field's focus then
+  COMMITS the still-armed "Accounting"** (the M39 family — a fast-pacing race). Every operator fact fit:
+  Escape does NOT blur/clear the box; a MANUAL (human-slow) neutral click is safe (disarm had time); only
+  the automated FAST path raced it. NOT blur-in-general — it's the armed-row surviving to the blur.
+- **Fix (prevention, not just the M40 catch):** (1) **keptLowerTier → AFFIRMATIVELY re-commit the kept
+  value** (`recommitFn`: re-select "Other" via the proven commit machinery) — the field ends on a
+  DELIBERATE commit; the armed row BECOMES the correct value → race-proof (doesn't depend on the disarm
+  winning). (2) **plain overwrite-no-match + the empty-field-walk sibling** (original not a re-typeable
+  candidate) → `disarmHighlight`: re-focus then POLL `delayFull` (REAL time — the disarm takes wall-clock
+  the tab speedup must not shorten) until `activeText` is null BEFORE dismissing. (3) **strayed-check**: if
+  the chip still strayed → `overwrite-stray` with the live value, never a false "kept". TA + source
+  lockstep (`overwriteNoMatchResting` shared). **LIVE-VERIFIED:** fieldOfStudy stays "Other" (re-committed),
+  M40 adds no mismatch; cert "CPP" `overwrite-nomatch-original-kept` (disarm-verify path, no stray). 166
+  tests (2 M36.1 updated to the re-commit contract + a strayed-check backstop test). The recon harness
+  (slow `delayFull`) pinned the disarm + the slow-safe/fast-strays split; the full-page fill (fast) is the
+  authoritative reproduction + validation.

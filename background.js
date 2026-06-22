@@ -282,6 +282,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // TYPEAHEAD STRAY-COMMIT RECON: pin when a stray commits in the overwrite/keptLowerTier
+  // resting path (the fieldOfStudy "Other"→"Accounting" bug). No profile needed; label
+  // regex from the ta-label input. Run on the page with the field (page 2 for FoS).
+  if (message.type === "RUN_CDP_TA_STRAY_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpTaStrayRecon(tab.id, String(message.labelRegex || ""));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP WALK (M31): fill page 1 → guarded Save & Continue → detect VPS/session-death
   // (halt) or a clean transition (report "advanced", stop — page-2 fill deferred).
   if (message.type === "RUN_CDP_WALK") {
@@ -2031,6 +2044,144 @@ async function runCdpResumeRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("resume recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// TYPEAHEAD STRAY-COMMIT RECON — pin WHEN a stray ("Accounting") commits in the
+// overwrite/keptLowerTier RESTING path. Live bug: fieldOfStudy pre-filled "Other",
+// the M36.1 keptLowerTier path reported KEPT "Other" but the M40 audit found
+// "Accounting" → a stray landed AFTER the brain read the chip. HYPOTHESIS (M25 ghost):
+// clearing the searchBox to EMPTY while the listbox is open ARMS the row-0 highlight
+// (first option "Accounting"); Escape doesn't disarm it; the next field's BLUR commits
+// it. This harness drives the discrete resting steps + reads chip / activeText
+// (aria-activedescendant = the armed highlight) / firstOption between each, so the step
+// where the chip flips "Other"→firstOption IS the trigger. Read-mostly (restore the
+// field after if it strays). Locate the typeahead by label (default "field of study").
+// Pre-set the field to a LOWER tier ("Other") first to match the live keptLowerTier case.
+// ============================================================================
+async function runCdpTaStrayRecon(tabId, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-TA-STRAY]", ...a);
+  let re;
+  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+
+    // Locate the typeahead by label — across repeating-section entries, then flat.
+    let loc = null, where = null;
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
+        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+      }
+      if (loc) break;
+    }
+    if (!loc) {
+      const ps = await cdpEval(cdpPageScan);
+      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
+    }
+    if (!loc) { LOG(`no typeahead matching /${re.source}/ on this page — run on the page with the field (page 2 for Field of Study).`); return { ok: true, found: false }; }
+    LOG(`probing ${where} (${loc.wrapperSel}). Pre-set this field to a LOWER tier (e.g. "Other") first for the keptLowerTier case.`);
+
+    // Read after EACH action — distinguish ARMING (activeText→"Accounting", chip stays "Other")
+    // from COMMIT (the CHIP flips). The fix targets the COMMIT step, not arming.
+    const snap = async (tag) => {
+      const s = await act.readTypeahead(loc);
+      const chip = ((s && s.chips) || []).join("; ");
+      const active = (s && s.activeText) || null;
+      LOG(`  [${tag}] chip="${chip}" | armed(activeText)="${active}" | firstOption="${((s && s.pageWide.texts) || [])[0]}" | sbValue="${s && s.searchBox.value}" | sbVisible=${s && s.searchBox.visible} | banner=${!!(s && s.banner)}`);
+      return { chip, active };
+    };
+
+    // Locate the NEXT field's input rect (a text field in the SAME entry — the faithful
+    // "move to next field" production does) + a NEUTRAL empty coordinate (the operator's
+    // safe manual click-outside).
+    let nextRect = null;
+    try {
+      const rs2 = await cdpEval(cdpRepeatingScan);
+      for (const prefix of (rs2 ? rs2.sectionsPresent : [])) {
+        for (const e of rs2.sections[prefix].entries) {
+          const nf = e.fields.find((x) => x.widgetType === "text" && x.wrapperSel !== loc.wrapperSel);
+          if (nf) { const r = await cdpEval(cdpRectOf, nf.wrapperSel + ' input', true); if (r && r.w > 0) { nextRect = r; LOG(`next-field for the faithful blur: "${nf.label}" @ (${r.cx},${r.cy}).`); break; } }
+        }
+        if (nextRect) break;
+      }
+    } catch (e) { /* fall through — skip the next-field click */ }
+    const neutral = await cdpEval((wrapperSel) => {
+      const w = document.querySelector(wrapperSel);
+      const bad = (el) => !el || el === document.documentElement || el === document.body
+        || /^(input|button|a|select|textarea)$/i.test(el.tagName)
+        || el.closest('[role="option"], button, a, input, [data-automation-id="searchBox"]') || (w && w.contains(el));
+      const W = window.innerWidth, H = window.innerHeight;
+      for (const [x, y] of [[W * 0.5, 8], [8, H * 0.5], [W - 8, H * 0.5], [W * 0.5, H - 8], [20, 20]]) {
+        const el = document.elementFromPoint(Math.round(x), Math.round(y));
+        if (!bad(el)) return { cx: Math.round(x), cy: Math.round(y) };
+      }
+      return null;
+    }, loc.wrapperSel);
+
+    const probeQuery = "Electrical and Computer Engineering"; // a known-ABSENT higher-tier value
+    const ensureFocused = async () => { let st = await act.readTypeahead(loc); if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); } if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); } };
+    const reproduceArmed = async () => { await ensureFocused(); await act.clearSearch(); await act.delayFull(500); await act.typeInSearch(probeQuery); await act.delayFull(600); await act.pressEnter(); await act.delayFull(1800); };
+    const recommitOther = async () => { // the LIKELY FIX: affirmative re-select, overwrites whatever's armed
+      await ensureFocused(); await act.clearSearch(); await act.delayFull(500); await act.typeInSearch("Other"); await act.delayFull(600); await act.pressEnter(); await act.delayFull(1500);
+      const r = await act.readTypeahead(loc); if (!(r && (r.chips || []).some((c) => /^other$/i.test(c)))) { try { await act.clickTaOption(loc, "Other"); await act.delayFull(900); } catch (e) { /* ignore */ } }
+    };
+
+    LOG("════ PHASE A — faithful production reproduction → CLICK NEXT FIELD ════");
+    const a0 = await snap("A0 initial");
+    await reproduceArmed();
+    const a1 = await snap("A1 after no-match search   [ARMING expected here: armed→Accounting, chip stays Other]");
+    await ensureFocused();
+    const a2 = await snap("A2 after RESTING re-focus");
+    await act.clearSearch(); await act.delayFull(900);
+    const a3 = await snap("A3 after RESTING clearSearch→EMPTY   [candidate 2: does the CHIP flip here?]");
+    await act.pressEscape(); await act.delayFull(700);
+    const a4 = await snap("A4 after pressEscape");
+    if (nextRect) { await cdpClickAt(nextRect.cx, nextRect.cy); await act.delayFull(1200); } else LOG("  (no next-field rect — skipped the faithful blur)");
+    const a5 = await snap("A5 after CLICK NEXT FIELD   [candidate 1: does the CHIP flip here? — the faithful exit]");
+
+    LOG("════ RESET — re-commit \"Other\" (also tests the re-commit FIX: recovers a strayed field?) ════");
+    await recommitOther();
+    const rr = await snap("R after re-commit Other   [fix check: chip back to Other?]");
+
+    LOG("════ PHASE B — CONTROL: same reproduction, but CLICK NEUTRAL SPACE (the operator's safe manual blur) ════");
+    await reproduceArmed();
+    await snap("B1 after no-match search");
+    await ensureFocused();
+    await act.clearSearch(); await act.delayFull(900);
+    await act.pressEscape(); await act.delayFull(700);
+    await snap("B2 after resting dismiss");
+    if (neutral) { await cdpClickAt(neutral.cx, neutral.cy); await act.delayFull(1200); LOG(`  (clicked NEUTRAL @ (${neutral.cx},${neutral.cy}))`); } else LOG("  (no neutral coordinate found — skipped the control)");
+    const b3 = await snap("B3 after CLICK NEUTRAL SPACE   [operator says a neutral blur is SAFE — does it stray?]");
+
+    // ── Conclusion: ARMING vs COMMIT; next-field vs neutral ──
+    const flip = (prev, now) => !!(now.chip && prev.chip && now.chip !== prev.chip); // CHIP changed = COMMIT
+    const aSeq = [["A1", a0, a1], ["A2", a1, a2], ["A3 (resting clear→empty)", a2, a3], ["A4 (escape)", a3, a4], ["A5 (click next field)", a4, a5]];
+    let commitStep = null; for (const [tag, prev, now] of aSeq) { if (flip(prev, now)) { commitStep = tag; break; } }
+    const strayedA = !!(a5.chip && a0.chip && a5.chip !== a0.chip);
+    const strayedB = !!(b3.chip && rr.chip && b3.chip !== rr.chip);
+    LOG("════ CONCLUSION ════");
+    LOG(`ARMING: activeText became "${a1.active}" at the no-match search (A1) while chip stayed "${a1.chip}" — EXPECTED arming, not the bug.`);
+    LOG(commitStep ? `COMMIT (the trigger): the CHIP flipped "${a0.chip}"→"${a5.chip}" at step ${commitStep}. The FIX targets THAT action.`
+                   : `Phase A did NOT commit a stray this run (chip "${a5.chip}") — RACE; re-run. (Watch which step flips the CHIP, not activeText.)`);
+    LOG(`CONTROL: next-field click ${strayedA ? "STRAYED" : "clean"} vs neutral-space click ${strayedB ? "STRAYED" : "clean"}. ` +
+      (strayedA && !strayedB ? "⇒ focus-to-NEXT-FIELD is the trigger; a neutral blur is safe (candidate 1) → fix = re-commit Other, or do a safe neutral blur before exiting."
+        : strayedA && strayedB ? "⇒ BOTH stray ⇒ the resting clear-to-empty/dismiss is the trigger (candidate 2), not the click target → fix = don't-clear / re-commit Other."
+          : "⇒ inconclusive this run — re-run."));
+    LOG(`FIX CHECK: re-commit "Other" left chip "${rr.chip}" ${/^other$/i.test(rr.chip) ? "✓ (re-commit recovers — strong fix candidate)" : "✗ (re-commit did NOT land Other — investigate)"}.`);
+    LOG("NOTE: restore Field of Study manually if it isn't \"Other\" now.");
+    return { ok: true, found: true, commit_step: commitStep, strayed_next_field: strayedA, strayed_neutral: strayedB, recommit_chip: rr.chip };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("typeahead-stray recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

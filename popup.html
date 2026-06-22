@@ -55,6 +55,12 @@
          Run on the page WITH the upload (Magna page 2 "Application Documents"). ⚠ attaches
          a REAL file to the live form. [CDP-RESUME-RECON] in the SW console. -->
     <button id="cdp-resume-recon">CDP recon: resume attach (page 2; attaches a file!)</button>
+    <!-- TYPEAHEAD STRAY RECON: pin when the overwrite/keptLowerTier resting path commits a
+         stray (the fieldOfStudy "Other"→"Accounting" bug). Uses the label regex below
+         (default "field of study"). Pre-set the field to a LOWER tier ("Other") first.
+         Reads chip/activeText/firstOption between each resting step. Run on page 2.
+         [CDP-TA-STRAY] in the SW console. -->
+    <button id="cdp-ta-stray-recon">CDP recon: typeahead stray (page 2; uses label below)</button>
     <!-- CDP WALK (M38 Part 3): the N-PAGE WALK. Fills each page (the full fold + audit +
          accumulating review summary) → guarded Save & Continue → repeats to the REVIEW
          page, where it STOPS and NEVER submits (double guard). Clears the prior summary

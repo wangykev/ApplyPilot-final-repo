@@ -116,38 +116,78 @@ async function pollSearchValue(act, read, want, budgets) {
   return false;
 }
 
-// overwriteNoMatchResting: the walk-end resting state under overwrite. The
-// original chip is intact (we never deleted it). Clear any leftover filter text
-// so the field rests as {chips:[original], query:""}, and flag for review (a
-// future-AI candidate). Parametrized by read/clear/ensureFocused fns to keep
-// typeahead+source in lockstep (the ONLY differences between the two walks).
-// clear is the recon-proven chip-PRESERVING Ctrl+A+Delete (clearSearch /
-// clearSourceSearch); the best-effort focus is non-actuating beyond the clear.
-// keptLowerTier (M36.1): the pre-fill EXACT-matched a LOWER candidate tier and the
-// walk over the HIGHER tiers committed nothing (no higher tier is offered by the
-// form) → the pre-fill IS the best available answer. KEEP it `filled` (the value is
-// a real tier hit, NOT a no-match), flagged `prefilled-better-tier-unavailable` so
-// review sees it isn't the top tier — honest taxonomy. (This path DID actuate: it
-// searched every higher tier; only the tier-0 keep skips actuation entirely.)
-async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier) {
-  const original = priorChips.join("; ");
+// disarmHighlight: after a no-match search the listbox row-0 stays ARMED (activeText, e.g.
+// "Accounting" — the first option). RE-FOCUSING the searchBox DISARMS it (recon 2026-06-22:
+// activeText→null right after focus) — BUT the disarm is async/page-side: at fast (foreground)
+// pacing the field can be EXITED before it completes, and the NEXT field's focus then COMMITS
+// the still-armed stray (the live fieldOfStudy "Other"→"Accounting" bug; recon: slow=safe,
+// fast=strays). So: re-focus to TRIGGER the disarm, then POLL with `delayFull` (REAL time, NOT
+// the adaptive speedup — the page's disarm takes wall-clock the tab speedup must not shorten)
+// until activeText is null. Returns { focused, armed } (armed=null ⇒ disarmed/clean). If focus
+// can't be confirmed → { focused:false } (caller must NOT actuate blind — the M25 rule).
+async function disarmHighlight(act, ensureFocusedFn, readFn, loc, budgets) {
   const focused = await ensureFocusedFn();
-  // Resting cleanup (gates nothing verified — the result comes from endChips below, never the
-  // searchBox value): clear the leftover filter text, reactively confirm it landed, then escape.
+  if (!focused) return { focused: false, armed: null };
+  const deadline = Date.now() + budgets.taSettleCeilingMs;
+  let st = await readFn(loc);
+  while (st && st.activeText != null && Date.now() < deadline) { await act.delayFull(budgets.commitIntervalMs); st = await readFn(loc); }
+  return { focused: true, armed: st ? st.activeText : null };
+}
+
+// overwriteNoMatchResting: the walk-end resting state under overwrite. Two paths:
+//   • keptLowerTier (M36.1) — the pre-fill EXACT-matched a LOWER candidate tier and no higher
+//     tier is offered → the pre-fill IS the best answer. RE-COMMIT it AFFIRMATIVELY (recommitFn:
+//     re-select the kept value via the caller's commit machinery) so the field ends on a
+//     DELIBERATE commit — the armed row becomes the correct value, RACE-PROOF (it does NOT
+//     depend on the disarm winning vs the next field's focus). Returns filled/
+//     `prefilled-better-tier-unavailable`; a re-commit that strays/fails → needs_review with the
+//     LIVE value (never a false "kept").
+//   • plain overwrite no-match (original NOT a candidate — can't re-type it) — the original chip
+//     is intact (never deleted). DISARM-VERIFY the armed highlight (real-time) before dismissing
+//     so no armed stray survives the exit, then rest clean. A chip that strayed despite the
+//     disarm → flagged (overwrite-stray), never a false keep.
+// Parametrized (readFn/clearFn/ensureFocusedFn/recommitFn) to keep typeahead+source LOCKSTEP.
+async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier, recommitFn) {
+  const norm = apMatch.normalize;
+  const original = priorChips.join("; ");
+
+  if (keptLowerTier && recommitFn) {
+    await ensureFocusedFn(); // recover focus (the no-match banner dropped it) before re-committing
+    let chips = priorChips;
+    try { chips = await recommitFn(original); } catch (e) { /* keep priorChips */ }
+    if (chips.length && chips.some((c) => norm(c) === norm(original))) {
+      return {
+        status: "filled", after: original, verified: true, matchTier: "pre-filled",
+        flag: "prefilled-better-tier-unavailable", confidence: "high",
+        detail: `kept pre-fill "${original}" — re-committed (no higher-priority tier offered by the form)`,
+        captured_options: lastOptions || undefined, settle_trace: trace
+      };
+    }
+    const after = chips.length ? chips.join("; ") : original;
+    return {
+      status: "needs_review", after, verified: false, matchTier: "pre-filled",
+      flag: "overwrite-stray", confidence: "none",
+      detail: `keptLowerTier re-commit did not land "${original}" (field shows "${after}") — review`,
+      captured_options: lastOptions || undefined, settle_trace: trace
+    };
+  }
+
+  // Plain overwrite no-match: disarm the armed highlight (real-time) BEFORE dismissing.
+  const { focused } = await disarmHighlight(act, ensureFocusedFn, readFn, loc, budgets);
   if (focused) { await clearFn(); await pollSearchValue(act, () => readFn(loc), "", budgets); }
   await act.pressEscape();
   let endChips = priorChips;
   try { const st = await readFn(loc); if (st && st.chips) endChips = st.chips; } catch (e) { /* keep priorChips */ }
-  if (keptLowerTier) {
+  const after = endChips.length ? endChips.join("; ") : original;
+  if (endChips.length && norm(endChips.join("; ")) !== norm(original)) {
     return {
-      status: "filled", after: endChips.length ? endChips.join("; ") : original, verified: true,
-      matchTier: "pre-filled", flag: "prefilled-better-tier-unavailable", confidence: "high",
-      detail: `kept pre-fill "${original}" — matches a candidate tier, but no higher-priority tier is offered by the form`,
-      captured_options: lastOptions || undefined, settle_trace: trace
+      status: "needs_review", after, verified: false, flag: "overwrite-stray", confidence: "none",
+      detail: `resting dismissal strayed to "${after}" (expected original "${original}") — review`,
+      captured_options: lastOptions || undefined, settle_trace: trace, overwrite: { original, refilled: false }
     };
   }
   return {
-    status: "needs_review", after: endChips.length ? endChips.join("; ") : original, verified: false,
+    status: "needs_review", after, verified: false,
     flag: "overwrite-nomatch-original-kept", confidence: "none",
     detail: `no candidate matched — original pre-fill "${original}" kept, filter text cleared (future-AI candidate)`,
     captured_options: lastOptions || undefined, settle_trace: trace, overwrite: { original, refilled: false }
@@ -813,13 +853,29 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   // we never deleted it): rest the field clean ({chips:[original], query:""}) and
   // flag overwrite-nomatch-original-kept (future-AI candidate).
   if (isOverwrite) {
-    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0);
+    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
+      // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
+      async (value) => {
+        await act.clearSearch(); await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets);
+        await act.typeInSearch(value); await pollSearchValue(act, () => act.readTypeahead(loc), value, budgets);
+        await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
+        let r = await act.readTypeahead(loc);
+        if (!(r && (r.chips || []).some((c) => norm(c) === norm(value)))) {
+          try { await act.clickTaOption(loc, value); } catch (e) { /* commit-Enter only */ }
+          await act.delayFull(budgets.commitIntervalMs); r = await act.readTypeahead(loc);
+        }
+        return r ? (r.chips || []) : [];
+      });
   }
   // Empty-field honesty read: after closing the list, a final chip read so the
   // record NEVER reports after:null when the page physically holds a value —
   // catches a late/stray commit our settle missed (e.g. a highlight-Enter that
   // landed after we moved on). A committed chip (selectedItem) survives Escape, so
   // this reflects the true settled state; an uncommanded chip is flagged for review.
+  // DISARM-VERIFY first (same fast-pacing armed-row-0 race as the overwrite rest): re-focus
+  // to trigger the disarm + poll real-time until activeText is null, so no armed stray
+  // survives to the next field's focus. (The honesty read below still backstops it.)
+  await disarmHighlight(act, ensureSearchFocused, (l) => act.readTypeahead(l), loc, budgets);
   await act.pressEscape();
   let strayChip = null;
   try { const endState = await act.readTypeahead(loc); strayChip = endState && endState.chips.length ? endState.chips.join("; ") : null; } catch (e) { /* ignore read error */ }
@@ -1004,8 +1060,22 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   // Walk exhausted. Under OVERWRITE the original source chip is intact: rest the
   // field clean ({chips:[original], query:""}) and flag for review (lockstep).
   if (isOverwrite) {
-    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0);
+    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0,
+      // recommitFn (source): re-select `value` via the source commit machinery (clickSourceLeaf).
+      async (value) => {
+        await act.clearSourceSearch(); await pollSearchValue(act, () => act.readSource(loc), "", budgets);
+        await act.typeInSourceSearch(value); await pollSearchValue(act, () => act.readSource(loc), value, budgets);
+        await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
+        let r = await act.readSource(loc);
+        if (!(r && (r.chips || []).some((c) => norm(c) === norm(value)))) {
+          try { await act.clickSourceLeaf(value); } catch (e) { /* filter-Enter only */ }
+          await act.delayFull(budgets.commitIntervalMs); r = await act.readSource(loc);
+        }
+        return r ? (r.chips || []) : [];
+      });
   }
+  // DISARM-VERIFY before exit (same armed-row-0 fast-pacing race as typeahead — lockstep).
+  await disarmHighlight(act, ensureFocused, (l) => act.readSource(l), loc, budgets);
   await act.pressEscape();
   // M38 Bug B1 — GENUINE no-match (deleteOnNoMatch) ONLY if every candidate gave a
   // definitive negative (banner / filtered-but-absent); a timeout or present-but-
