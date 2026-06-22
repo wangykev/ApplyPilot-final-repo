@@ -179,7 +179,8 @@ const render = () => {
   // NOT bury it; ditto a must-replace placeholder. Confidence prioritizes scrutiny only AMONG the rest.
   const isSensitive = (e) => e.flag && /sensitive/.test(e.flag);
   const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
-  const mustReplace = (e) => isSensitive(e) || needsAnswer(e);
+  const isEeoGuess = (e) => e.flag === "ai-eeo-guess"; // AI-3: a GUESSED demographic — must be verified
+  const mustReplace = (e) => isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
   const flaggedAll = bundle.entries.filter((e) => e.needs_review);
   const flagged = [...flaggedAll.filter(mustReplace), ...flaggedAll.filter((e) => !mustReplace(e))]; // must-replace FIRST (flag-driven)
   root.appendChild(el("h2", { text: `Needs review (${flagged.length})` }));
@@ -195,6 +196,7 @@ const render = () => {
       // The loud marker is flag-driven: conspicuous at ANY confidence.
       if (sensitive) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ LEGALLY-LOADED — VERIFY" }));
       if (needsAnswer(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ NEEDS YOUR ANSWER — REPLACE BEFORE SUBMIT" }));
+      if (isEeoGuess(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ AI-GUESSED DEMOGRAPHIC — VERIFY" }));
       if (isAi) label.appendChild(el("span", { class: "badge ai-inferred", text: "AI-INFERRED" }));
       card.appendChild(label);
       const reason = el("div", { class: "reason" });

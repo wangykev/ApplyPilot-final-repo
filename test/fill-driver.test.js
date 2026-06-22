@@ -756,6 +756,87 @@ test("AI-2 submit-belt: isAiPlaceholder + unreplacedPlaceholders (the CHECKED su
   assert.strictEqual(unreplacedPlaceholders(entries).length, 1, "only the still-unreplaced placeholder blocks submit");
 });
 
+// ── AI-3: self-identification (EEO) + agreements (deterministic) + canonicalization ──────────
+const genderField = (flags) => Object.assign({
+  wrapperSel: "[w-gender]", fieldName: "gender", widgetType: "dropdown", isRequired: false,
+  label: "What is your gender?",
+  triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Female" }, { text: "Male" }, { text: "Other" }, { text: "Undeclared" }]
+}, flags || {});
+const consentField = (flags) => Object.assign({
+  wrapperSel: "[w-consent]", fieldName: "acceptTermsAndAgreements", widgetType: "checkbox", isRequired: true,
+  label: "Yes, I have read and consent to the above terms and condition.", inputId: "c-1", checked: false
+}, flags || {});
+
+test("AI-3: gender fills DETERMINISTICALLY from self_identification (exact-match, NO AI even with AI ON)", async () => {
+  const act = makeFakeAct([genderField()], { aiEnabled: true, ai: '{"choice":"should not be used"}' });
+  const rec = (await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Male");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "an EEO field that matches deterministically NEVER calls the LLM");
+});
+
+test("AI-3: a REQUIRED consent AUTO-CHECKS silently (filled, NOT flagged) even when the profile is null; an explicit profile `false` is respected", async () => {
+  const f1 = consentField();
+  const a1 = makeFakeAct([f1], { aiEnabled: true });
+  const r1 = (await drivePageFill(a1, { agreements: { terms_and_conditions_acceptance: null } }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(r1.status, "filled", "required consent auto-checks even when the profile is null");
+  assert.notStrictEqual(r1.status, "filled_review", "NOT flagged for review (silent)");
+  assert.strictEqual(f1.checked, true, "the box is actually checked");
+  const f2 = consentField();
+  const a2 = makeFakeAct([f2], { aiEnabled: true });
+  await drivePageFill(a2, { agreements: { terms_and_conditions_acceptance: false } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(f2.checked, false, "an explicit profile `false` is respected — the consent is NOT auto-checked");
+  assert.ok(!a1.log.concat(a2.log).some(([m]) => m === "llm"), "consents never involve the LLM");
+});
+
+test("AI-3 CANONICALIZATION: stated 'Male' vs a form's odd vocab → AI maps the KNOWN value (filled_review/ai-canonicalized)", async () => {
+  const act = makeFakeAct([genderField({ options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }, { text: "Nonbinary" }] })], { aiEnabled: true, ai: '{"choice":"Man","confidence":"High"}' });
+  const rec = (await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-canonicalized");
+  assert.strictEqual(rec.after, "Man");
+  assert.match(rec.detail, /canonicalized/);
+  assert.ok(act.log.some(([m]) => m === "llm"), "canonicalization consulted the LLM with the KNOWN value");
+});
+
+test("AI-3 CANONICALIZATION: AI can't map the stated value to any option → needs_review (ai-canon-nomatch), never blind-commit", async () => {
+  const act = makeFakeAct([genderField({ options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }] })], { aiEnabled: true, ai: '{"choice":"UNKNOWN"}' });
+  const rec = (await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-canon-nomatch");
+  assert.strictEqual(rec.after, null);
+});
+
+test("AI-3 EEO: an OPTIONAL unmapped EEO field → blank, act.llm NEVER called; a MANDATORY one → the EEO inference runs", async () => {
+  // OPTIONAL EEO, no value → blank, no LLM (a blank optional doesn't block the walk).
+  const opt = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: false })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
+  const optRec = (await drivePageFill(opt, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(optRec.status, "skipped");
+  assert.ok(!opt.log.some(([m]) => m === "llm"), "optional EEO with no value → never calls the LLM");
+  // MANDATORY EEO, no value → the EEO inference runs (would block otherwise).
+  const req = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: true })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
+  const reqRec = (await drivePageFill(req, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(req.log.some(([m]) => m === "llm"), "a MANDATORY unmapped EEO field → the AI EEO inference runs");
+  assert.strictEqual(reqRec.flag, "ai-eeo-guess");
+  assert.strictEqual(reqRec.after, "Male");
+  assert.strictEqual(reqRec.status, "filled_review");
+});
+
+test("AI-3 EEO inference: high-confidence guess commits (ai-eeo-guess); low-confidence or a chosen decline → neutral (eeo_declined)", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Female" }, { text: "Male" }, { text: "Undeclared" }];
+  // low confidence → NOT committed as a guess; falls back to the neutral decline ("Undeclared")
+  const lo = makeFakeAct([genderField({ fieldName: "g2", label: "Gender", isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"Low"}' });
+  const loRec = (await drivePageFill(lo, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(loRec.flag, "eeo_declined", "a low-confidence demographic guess is NOT committed");
+  assert.strictEqual(loRec.after, "Undeclared");
+  assert.strictEqual(loRec.status, "filled_review");
+  // the AI choosing to decline → eeo_declined
+  const dec = makeFakeAct([genderField({ fieldName: "g3", label: "Gender", isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Undeclared","confidence":"High"}' });
+  const decRec = (await drivePageFill(dec, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(decRec.flag, "eeo_declined");
+  assert.strictEqual(decRec.after, "Undeclared");
+});
+
 test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays deterministic)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: false, ai: "No" });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
@@ -763,10 +844,13 @@ test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays determi
   assert.strictEqual(out.results[0].status, "skipped", "stays the deterministic skipped (no mapping)");
 });
 
-test("AI INVARIANT: an EEO-labelled dropdown ⇒ aiEligible false ⇒ act.llm NEVER called", async () => {
-  const act = makeFakeAct([aiDd({ label: "What is your gender?" })], { aiEnabled: true, ai: "Male" });
+test("AI INVARIANT: the screening-question INFERENCE never touches an EEO field — an OPTIONAL EEO dropdown ⇒ act.llm NEVER called", async () => {
+  // aiEligible excludes EEO from the screening inference; an OPTIONAL EEO field also doesn't hit the
+  // AI-3 mandatory-EEO inference (which requires isRequired) → no LLM at all. (A MANDATORY EEO field
+  // DOES call the eeo-infer path — covered by the AI-3 EEO tests.)
+  const act = makeFakeAct([aiDd({ label: "What is your gender?", isRequired: false })], { aiEnabled: true, ai: "Male" });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
-  assert.ok(!act.log.some(([m]) => m === "llm"), "a protected EEO field is NEVER AI-guessed");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "an optional protected EEO field is never AI-touched");
   assert.strictEqual(out.results[0].status, "skipped");
 });
 

@@ -257,7 +257,15 @@ const FIELD_MAP = {
   "country": "personal_info.country",
   "countryRegion": "personal_info.state_province",
   "phoneType": "personal_info.phone_device_type",
-  "countryPhoneCode": "personal_info.country_phone_code"
+  "countryPhoneCode": "personal_info.country_phone_code",
+  // AI-3: self-identification (EEO) — DETERMINISTIC fill from the user's stated data (NEVER
+  //   AI-inferred). `gender` live-recon'd on Magna (options Female/Male/Other/Undeclared);
+  //   race/veteran/disability map the same way once their automation-ids are observed.
+  "gender": "self_identification.gender",
+  // AI-3: agreements — legal consent checkbox; checked ONLY if the operator pre-set the
+  //   boolean to true (fillCheckboxCdp reconciles to it). null/false → skipped → if REQUIRED
+  //   the walk halts with a clean `consent-not-granted` message (never fabricates consent).
+  "acceptTermsAndAgreements": "agreements.terms_and_conditions_acceptance"
   // "candidateIsPreviousWorker" — NOT mapped here; answered by the safety-first
   //   employer-match special case in the driver (jobContext.company vs
   //   profile.employment_history_companies).
@@ -658,6 +666,113 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
   // ALWAYS filled_review — an AI-generated answer is never silently trusted.
   return { status: "filled_review", after: parsed.answer, verified: true, flag: "ai-text", confidence: "medium",
     detail: "AI-generated answer from the profile", auditLoc: loc.wrapperSel };
+};
+
+// AI-3 CANONICALIZATION (dropdown) — the deferred "LLM vocabulary canonicalization" job, now
+// driven by the EEO gender case. The field is MAPPED and the user has a STATED value, but it
+// didn't match the form's option vocab (genuineNoMatch). The AI is TOLD the value and only
+// TRANSLATES it to the closest option — it NEVER infers/decides (so it is SAFE + allowed even for
+// EEO: the demographic comes from the profile, the AI just maps "Male"→"Man"). The pick must clear
+// the match ladder vs the LIVE options (never blind-commit); always filled_review; UNKNOWN/no-match
+// → needs_review. `stated` = the profile candidate(s) that failed to match.
+const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
+  const norm = apMatch.normalize;
+  const statedStr = Array.isArray(stated) ? stated.join(" / ") : String(stated);
+  const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+  if (!expanded || !state || state.optionCount === 0) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-canon-no-options",
+      detail: "AI canonicalize: options did not render (not actuated)", auditLoc: loc.wrapperSel };
+  }
+  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  const system = "The applicant has ALREADY STATED a value for this field. Your ONLY job is to pick the option from the provided list that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything about the applicant. If NO option means the same, reply UNKNOWN. Never pick an option that differs in meaning.";
+  const user = "Field: " + String(f.label || "")
+    + "\nThe applicant's STATED value: " + JSON.stringify(statedStr)
+    + "\nOptions (reply with the EXACT text of the matching one): " + JSON.stringify(enabledTexts)
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
+  const res = await act.llm({ system, user, maxTokens: 128 });
+  if (!res || !res.ok) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-canon-failed",
+      detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply"), options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  const ai = parseAiReply(res.text);
+  const conf = ai.confidence;
+  const m = ai.choice ? apMatch.matchCandidates([ai.choice], enabledTexts) : { targetIndex: -1, matchTier: null };
+  if (m.targetIndex === -1) { // UNKNOWN / not a real option — never blind-commit a demographic
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    const base = "AI could not map stated \"" + statedStr + "\" to an option" + (ai.choice ? " (replied \"" + ai.choice + "\")" : "");
+    if (cz.blank) return { status: "needs_review", after: null, flag: "ai-canon-nomatch", confidence: conf, detail: base, options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: cz.after, flag: "ai-canon-nomatch-stray", confidence: conf, detail: base + "; \"" + cz.after + "\" STRAYED — review", options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  const target = enabledTexts[m.targetIndex];
+  await act.clickDropdownOptionByText(loc, target);
+  await act.delayFull(budgets.reopenSettleMs);
+  let post = await act.readDropdownState(loc);
+  let committed = post && norm(post.triggerText) === norm(target);
+  if (committed) { await act.delayFull(budgets.reopenSettleMs); post = await act.readDropdownState(loc); committed = post && norm(post.triggerText) === norm(target); }
+  if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-canon-commit-failed",
+    detail: "AI mapped \"" + statedStr + "\" → \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
+  // ALWAYS filled_review — a canonicalized demographic still gets a human glance.
+  return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier, flag: "ai-canonicalized", confidence: conf,
+    detail: "AI canonicalized stated \"" + statedStr + "\" → \"" + target + "\" (vocab map, not inferred)", options: enabledTexts, auditLoc: loc.wrapperSel };
+};
+
+// AI-3 MANDATORY-EEO inference (dropdown) — operator-decided (REVERSES "never AI-guess a demographic").
+// A REQUIRED EEO field with NO profile value (a blank would HALT the walk). The LLM may INFER the
+// demographic ONLY as a CONFIDENT guess (e.g. from the name); otherwise it MUST decline (the neutral
+// option). Confidence-gated: a high-confidence non-decline guess commits (`ai-eeo-guess`); a decline,
+// or a low-confidence guess (overridden to the decline), commits the neutral (`eeo_declined`). Both
+// `filled_review` (a guessed/declined demographic always gets a human glance). The pick clears the
+// match ladder. No decline option + no confident guess → `needs_review`. ⚠ name→demographic inference
+// is culturally unreliable — the flag + the model's confidence are the only guard. Optional EEO never
+// reaches here (the dispatch gate requires isRequired).
+const AI_EEO_DECLINE_RE = /prefer not|decline|undeclared|do not wish|not.*(disclose|answer)|choose not|rather not/i;
+const aiInferEeoField = async (act, loc, f, profile, budgets) => {
+  const norm = apMatch.normalize;
+  const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+  if (!expanded || !state || state.optionCount === 0) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-no-options", detail: "AI EEO: options did not render", auditLoc: loc.wrapperSel };
+  }
+  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  const declineOpt = enabledTexts.find((o) => AI_EEO_DECLINE_RE.test(o)) || null;
+  const system = "The applicant did NOT provide this demographic, and it is REQUIRED. Infer it from their profile (e.g. name) ONLY if you can make a CONFIDENT, well-supported guess; otherwise you MUST decline. Choose the matching option text if confident, or the option that declines to answer if not. Never guess at low confidence.";
+  const user = "Field: " + String(f.label || "")
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nOptions: " + JSON.stringify(enabledTexts)
+    + (declineOpt ? "\nThe decline option is: " + JSON.stringify(declineOpt) : "\n(no explicit decline option exists)")
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
+  const res = await act.llm({ system, user, maxTokens: 128 });
+  if (!res || !res.ok) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-failed", detail: "AI EEO call failed — " + ((res && res.error) || "no reply"), options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  const ai = parseAiReply(res.text);
+  const choseDecline = !!ai.choice && AI_EEO_DECLINE_RE.test(ai.choice);
+  // Confidence gate: commit a demographic guess ONLY at high confidence; else fall back to the decline.
+  let target = null, declined = false;
+  if (choseDecline) { target = ai.choice; declined = true; }
+  else if (ai.confidence === "high" && ai.choice) { target = ai.choice; }
+  else if (declineOpt) { target = declineOpt; declined = true; } // low-confidence guess → override to decline
+  if (!target) { // no confident guess + no decline option → can't safely fill
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-undecided", detail: "AI could not confidently infer + no decline option" + (ai.choice ? " (low-confidence \"" + ai.choice + "\")" : ""), options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  const m = apMatch.matchCandidates([target], enabledTexts);
+  if (m.targetIndex === -1) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-nomatch", detail: "AI EEO pick \"" + target + "\" not an option", options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  const opt = enabledTexts[m.targetIndex];
+  await act.clickDropdownOptionByText(loc, opt);
+  await act.delayFull(budgets.reopenSettleMs);
+  let post = await act.readDropdownState(loc);
+  let committed = post && norm(post.triggerText) === norm(opt);
+  if (committed) { await act.delayFull(budgets.reopenSettleMs); post = await act.readDropdownState(loc); committed = post && norm(post.triggerText) === norm(opt); }
+  if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-eeo-commit-failed", detail: "AI EEO chose \"" + opt + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
+  if (declined) return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "eeo_declined", detail: "AI declined to guess a required demographic → neutral \"" + opt + "\"", options: enabledTexts, auditLoc: loc.wrapperSel };
+  return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "ai-eeo-guess", confidence: ai.confidence, detail: "AI inferred a required demographic → \"" + opt + "\" (confident guess — VERIFY)", options: enabledTexts, auditLoc: loc.wrapperSel };
 };
 
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
@@ -1408,10 +1523,17 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
         record.status = "skipped";
         record.detail = "file upload — not attached by this harness (CDP milestone scope)";
       } else if (f.widgetType === "checkbox") {
-        // Reconcile-to-boolean. NOTE: no flat checkbox is mapped in FIELD_MAP
-        // today (preferredCheck deliberately unmapped) — the mechanism is
-        // exercised by tests; a future mapping just works.
-        if (!mappedPath) {
+        // AI-3 (operator-decided): a REQUIRED checkbox is a consent / acknowledgment → AUTO-CHECK it
+        // (status `filled`, SILENT, NOT flagged) so the walk advances — UNLESS the profile EXPLICITLY
+        // refuses it (mapped + false), which is respected as a deliberate refusal. Optional checkboxes
+        // keep the profile-mapped reconcile (true→check / false→uncheck / empty→skip).
+        // ⚠ This silently accepts Terms / certifies truthfulness / consents to background+drug checks
+        //   with NO human review (operator-accepted; an explicit profile `false` is the only opt-out).
+        const refused = !!mappedPath && (rawValue === false || /^(false|no)$/i.test(String(rawValue == null ? "" : rawValue)));
+        if (f.isRequired && !refused) {
+          record.resolved = true;
+          Object.assign(record, await fillCheckboxCdp(act, loc, true, budgets)); // auto-consent
+        } else if (!mappedPath) {
           record.status = "skipped";
           record.detail = "no mapping";
         } else if (rawValue === null || rawValue === undefined || (typeof rawValue === "string" && rawValue.trim() === "")) {
@@ -1446,19 +1568,34 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
       record.detail = String(e);
     }
 
-    // ── AI FALLBACK ── if AI is ON, the field is AI-eligible (NEVER the employer-match radio /
-    // file_upload / EEO), and the deterministic pass produced NOTHING usable (unmapped or genuine
-    // no-match), ask the LLM: guess + fill + FLAG (filled_review), never silent. Additive + gated —
-    // the deterministic record above is untouched unless this fires (existing paths unchanged when
-    // AI is OFF). DROPDOWN → aiFillField (AI-1); TEXT/TEXTAREA → aiFillText (AI-2, generate-or-skip,
-    // never leaving a REQUIRED field blank — a placeholder so the walk reaches review).
-    if (act.aiEnabled && aiEligible(f) && producedNothing(record)) {
+    // ── AI FALLBACK ── if AI is ON and the deterministic pass produced NOTHING usable. Additive +
+    // gated — the deterministic record above is untouched unless this fires (existing paths
+    // unchanged when AI is OFF). TWO distinct paths, never confused:
+    //  • CANONICALIZE (AI-3): a MAPPED dropdown whose STATED profile value didn't match the option
+    //    vocab → map the KNOWN value to an option. NEVER infers → ALLOWED for EEO (not aiEligible-gated).
+    //  • INFER (AI-1/AI-2): an unmapped/unanswerable field with NO known value → the AI decides.
+    //    aiEligible-gated (NEVER the employer-match radio / file_upload / EEO). dropdown→aiFillField,
+    //    text/textarea→aiFillText. ALWAYS filled_review, never silent.
+    if (act.aiEnabled && producedNothing(record)) {
+      const canonicalize = !!mappedPath && record.resolved != null && record.genuineNoMatch === true && f.widgetType === "dropdown";
       try {
-        const aiRes = (f.widgetType === "dropdown")
+        let aiRes = null;
+        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers; EEO-allowed)
+        else if (aiEligible(f)) aiRes = (f.widgetType === "dropdown")
           ? await aiFillField(act, loc, f, profile, jobContext, budgets)
           : await aiFillText(act, loc, f, profile, jobContext, budgets);
-        Object.assign(record, aiRes);
+        if (aiRes) Object.assign(record, aiRes);
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
+    }
+
+    // ── AI-3 MANDATORY-EEO inference ── a REQUIRED EEO dropdown left blank (status `skipped` —
+    // unmapped, or mapped-but-empty) would HALT the walk → the AI confident-guesses-or-declines
+    // (operator-decided; the canon/infer hook above is a no-op here — EEO inference is aiEligible-
+    // blocked and canon needs a value). OPTIONAL EEO never reaches here (a blank optional doesn't block).
+    if (act.aiEnabled && f.isRequired && record.status === "skipped" && f.widgetType === "dropdown"
+        && (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || "")))) {
+      try { Object.assign(record, await aiInferEeoField(act, loc, f, profile, budgets)); }
+      catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI EEO infer error: " + String((e && e.message) || e); }
     }
 
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
@@ -2053,10 +2190,13 @@ function buildReviewBundle(results, meta) {
       else if (rec.flag === "ai-text-needs-answer") reason = "ai_needs_answer"; // AI-2: REQUIRED placeholder — MUST replace before submit
       else if (rec.flag === "ai-text") reason = "ai_generated";               // AI-2: generated free-text answer
       else if (rec.flag === "ai-text-skip") reason = "ai_skipped";             // AI-2: optional field the AI declined (blank)
+      else if (rec.flag === "ai-canonicalized") reason = "ai_canonicalized";   // AI-3: a STATED value mapped to the form's vocab (not inferred)
+      else if (rec.flag === "ai-eeo-guess") reason = "ai_eeo_inferred";        // AI-3: a confident DEMOGRAPHIC guess on a required EEO field — VERIFY
       else if (rec.flag === "ai-choice-sensitive") reason = "ai_inferred_sensitive";
       else if (rec.flag === "ai-choice") reason = "ai_inferred";
-      else reason = "ai_no_answer"; // ai-nomatch / ai-no-options / ai-commit-failed / ai-text-commit-failed / ai-error
+      else reason = "ai_no_answer"; // ai-nomatch / ai-no-options / ai-commit-failed / ai-text-commit-failed / ai-canon-* / ai-eeo-* / ai-error
     }
+    else if (rec.flag === "eeo_declined") reason = "eeo_declined";             // AI-3: the AI declined to guess a required demographic → neutral decline
     else if (rec.fieldName === "candidateIsPreviousWorker") reason = "employer_match_uncertain";
     else if (rec.status === "error") reason = "fill_error";
     else if (rec.status === "skipped" && required && !rec.mappedPath) reason = "unmapped_required_field";
@@ -2129,5 +2269,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
 }

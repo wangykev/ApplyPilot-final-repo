@@ -2871,6 +2871,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         return { ok: true, stopped: "resume-not-attached", resume_detail: upRec.detail, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
 
+      // (AI-3, operator-decided: required consent checkboxes AUTO-CHECK in the fill — no consent
+      //  halt; the bot silently accepts them. An explicit profile `false` stays unchecked = a refusal.)
+
       // ── (d) Terminal page with no Save & Continue (not the review marker — unusual). ──
       const navAfter = await cdpEval(cdpReadSessionState);
       if (!navAfter || !navAfter.nextButtonPresent) {

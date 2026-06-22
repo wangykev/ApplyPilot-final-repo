@@ -190,6 +190,9 @@ function unreplacedPlaceholders(entries) {
   return (entries || []).filter((e) => e && e.flag === "ai-text-needs-answer" && isAiPlaceholder(e.current_value));
 }
 
+// (AI-3 NOTE: the earlier `ungrantedRequiredConsents` consent-halt was REMOVED — operator decided
+//  required consent checkboxes AUTO-CHECK silently in the fill, so a consent never strands the walk.)
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
