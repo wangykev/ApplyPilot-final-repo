@@ -16,7 +16,7 @@ const T_BUDGETS = {
   interFieldMs: 0,
   taOpenCeilingMs: 50, taOpenIntervalMs: 1, taActionSettleMs: 1,
   taActionSettleCeilingMs: 30, taActionSettleIntervalMs: 1,
-  taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25,
+  taSettleCeilingMs: 60, taSettleIntervalMs: 1, taEnterCommitCeilingMs: 25, taEmptyNoMatchMs: 10,
   entryReconcileCeilingMs: 40, entryReconcileIntervalMs: 1
 };
 
@@ -2695,4 +2695,44 @@ test("self-heal: M40 standalone re-audit (no opts) stays FLAG-ONLY — never re-
   const verdicts = await reconcileAudit(act, [entry], T_BUDGETS); // no refillOnMismatch → diagnostic mode
   assert.strictEqual(verdicts[0].verdict, "mismatch");
   assert.strictEqual(field.value, "DRIFTED");          // untouched — no re-fill happened
+});
+
+// ── CPP delay (Round 2): empty filtered list (0 options, no banner) → fast 'empty' no-match ──
+// The settle had no exit for empty-no-banner → it burned the full 25s ceiling. The 'empty' outcome
+// is a fast no-match treated EXACTLY like timeout downstream (kept, not delete-on-no-match).
+test("typeahead: a candidate filtering to 0 options + no banner → fast 'empty' no-match (not a ceiling burn)", async () => {
+  const act = makeFakeAct([taField({ filterMap: { "Nonexistent Cert (CPP)": { filtered: [] } } })]);
+  const out = await drivePageFill(act, taProfile(["Nonexistent Cert (CPP)"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");        // no-match (kept, never a false commit)
+  assert.strictEqual(rec.after, null);
+  assert.strictEqual(rec.settle_trace[0].outcome, "empty", "the empty-list fast exit fired, not a 'timeout' ceiling burn");
+  assert.strictEqual(rec.settle_trace[0].count, 0);
+  assert.strictEqual(rec.genuineNoMatch, false, "empty behaves like timeout for genuineNoMatch — kept, not delete-on-no-match");
+});
+test("source: a candidate filtering to 0 leaves + no banner → fast 'empty' no-match (lockstep)", async () => {
+  const act = makeFakeAct([srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { filtered: [] } } })]);
+  const out = await drivePageFill(act, nameProfile, { how_did_you_hear: { preferred: ["LinkedIn"] } }, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.settle_trace[0].outcome, "empty", "source empty-leaf fast exit fired (lockstep with typeahead)");
+  assert.strictEqual(rec.settle_trace[0].count, 0);
+});
+
+// ── CPP delay Round 3: AUTOCOMMIT-CLOSE — the dropdown closes holding a chip == the pre-fill ──
+// Recon-confirmed: typing "CPP" autocommits "…(CPP)…" + closes; the chip equals the pre-fill so
+// chipSetIsNew is false → the chip-path missed it → it burned the backstop + mislabeled a CORRECT
+// value needs_review. The closed-commit outcome recognizes it: kept (containment) → filled_review, fast.
+test("typeahead: a candidate that AUTOCOMMITS the pre-fill + closes → closed-commit, filled_review, value kept (CPP)", async () => {
+  const CPP = "Certified Payroll Professional (CPP) - Multiple Recognized Providers";
+  const act = makeFakeAct([taField({ chips: [CPP], filterMap: { "CPP": { autoCommit: CPP } } })]);
+  const out = await drivePageFill(act, taProfile(["CPP"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.settle_trace[0].outcome, "closed-commit", "the autocommit-close was detected (not an empty/timeout burn)");
+  assert.strictEqual(rec.status, "filled_review");        // kept + flagged (containment), NOT needs_review "no match"
+  assert.strictEqual(rec.after, CPP);                     // value intact (kept, not moved)
+  assert.strictEqual(rec.verified, true);
+  assert.strictEqual(rec.matchTier, "closed-commit");
+  assert.strictEqual(rec.flag, "autocommit-containment"); // HONEST flag — NOT "overwrite-success" (nothing was overwritten)
+  assert.match(rec.detail, /kept pre-fill/);              // provenance: kept, never "overwrote" (Hold 1)
 });

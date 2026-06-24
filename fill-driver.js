@@ -235,6 +235,7 @@ const DEFAULT_BUDGETS = {
   taActionSettleIntervalMs: 60,
   taSettleCeilingMs: 25000, // filter-Enter → fresh transition (banner/chip/filtered)
   taSettleIntervalMs: 400,
+  taEmptyNoMatchMs: 8000,   // a filtered list that stays EMPTY (0 options, no banner) this long = no-match (CPP: avoids the 25s burn; above the ~5.6s cold-list latency). FAST path (sawChange+stable) usually fires sooner.
   taEnterCommitCeilingMs: 5000, // commit-Enter → chip, before the click fallback takes over
   // M32 repeating-section reconcile poll (Add/Delete → entry count moves). In-tree
   // budget is 4s/150ms; the page mounts the new/removed entry on its throttled loop.
@@ -1166,7 +1167,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
     await pollSearchValue(act, () => act.readTypeahead(loc), cand, budgets); // reactive: the full candidate has LANDED before the filter-Enter
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
 
-    let sawChange = false, stable = 0, prevSig = null, outcome = "timeout";
+    let sawChange = false, stable = 0, emptyStable = 0, emptySince = null, prevSig = null, outcome = "timeout";
     const tSettle = Date.now();
     while (Date.now() - tSettle < budgets.taSettleCeilingMs) {
       await act.delay(budgets.taSettleIntervalMs);
@@ -1182,40 +1183,75 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
         stable = sig === prevSig ? stable + 1 : 0;
         if (stable >= budgets.stableReads - 1) { outcome = "filtered"; break; }
       }
+      // AUTOCOMMIT-CLOSE (recon 2026-06-23): the dropdown CLOSED (searchBox gone) holding a chip — the
+      // filter-Enter autocommitted a value. The CPP case: typing "CPP" autocommits "…(CPP)…" + closes,
+      // but the chip EQUALS the pre-fill so chipSetIsNew was false → the chip-path above missed it → the
+      // settle burned the backstop + mislabeled a correct value. A closed dropdown is a SETTLED state →
+      // stop now + classify the chip below. Checked AFTER chip/banner/filtered (a NEW-chip autocommit
+      // stays on the chip-path) and BEFORE empty (a closed-with-value is classified, never read as empty).
+      if (s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length) { outcome = "closed-commit"; break; }
+      // Empty filtered list (0 options, no banner) — a no-match the settle had no exit for (the CPP
+      // 25s ceiling-burn; some tenants render 0 options instead of a "No matches" banner). FAST: the
+      // list demonstrably responded-empty (sawChange) + stable across reads → conclude now (~2 reads).
+      // sawChange can't fire on a still-loading cold list (sig stays the post-clear snapshot until it
+      // responds), so this never pre-empts a slow real match. BACKSTOP: 0 options + no banner for
+      // taEmptyNoMatchMs (the no-observable-change edge). Treated downstream EXACTLY like timeout (NOT
+      // added to genuineNoMatch) — identical no-match outcome, just not a 25s stall.
+      if (s && s.pageWide.count === 0 && !s.banner) {
+        if (emptySince == null) emptySince = Date.now();
+        if (sawChange) { emptyStable = sig === prevSig ? emptyStable + 1 : 0; if (emptyStable >= budgets.stableReads - 1) { outcome = "empty"; break; } }
+        if (Date.now() - emptySince >= budgets.taEmptyNoMatchMs) { outcome = "empty"; break; }
+      } else { emptySince = null; emptyStable = 0; }
       prevSig = sig;
     }
     step.outcome = outcome;
     step.settleMs = Date.now() - tSettle;
+    step.count = s ? s.pageWide.count : null;  // instrumentation (additive): filtered option count at settle end
+    step.banner = !!(s && s.banner);           //   + whether a "No matches" banner showed (Round-1 recon, no logic change)
+    step.open = !!(s && s.searchBox && s.searchBox.visible); // RE-RECON: dropdown OPEN (empty list) vs CLOSED (autocommitted)?
+    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null; //   + the committed chip value (distinguishes the two)
 
-    if (outcome === "chip") {
-      // An auto-commit fired on the filter-Enter. Classify the committed chip by
-      // its match tier vs THIS candidate (M27 taxonomy via commitOutcome): exact →
-      // filled; containment/fuzzy → filled_review + soft flag (kept, never silently
-      // trusted as plain "filled"); no match → needs_review (the stray, e.g. a
-      // "Canada" chip for a US query). Walk stops either way — a chip now exists and
-      // more typing contaminates. `matchTier` stays the commit-path; `flag`/
-      // `confidence` carry the taxonomy.
+    if (outcome === "chip" || outcome === "closed-commit") {
+      // An auto-commit fired on the filter-Enter (chip = a NEW chip vs priorChips; closed-commit =
+      // the dropdown CLOSED holding a chip that EQUALS the pre-fill — the CPP case). Classify the chip
+      // by its match tier vs THIS candidate (M27 taxonomy via commitOutcome): exact → filled;
+      // containment/fuzzy → filled_review + soft flag (kept, never silently trusted as plain "filled");
+      // no match → needs_review (the stray, e.g. a "Canada" chip for a US query). Walk stops either way.
+      // `unchanged` = closed-commit whose chip equals the prior value (the overwrite produced NO new
+      // value, but the EXISTING value still satisfies the candidate) → KEPT provenance, NOT "overwrote".
+      // No disarm needed before stopping: the dropdown is ALREADY CLOSED with a committed value, so
+      // there is no armed listbox highlight for the overwrite-resting path to disarm.
       step.chip = s.chips.join("; ");
       const cm = apMatch.matchCandidates([cand], s.chips);
-      const oc = commitOutcome(isOverwrite, "auto", cm.matchTier);
+      const unchanged = outcome === "closed-commit" && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
+      // An unchanged closed-commit = NO overwrite happened (the chip IS the pre-fill) → classify via the
+      // AUTOCOMMIT taxonomy (honest flags: autocommit-exact/containment/fuzzy), never overwrite-success/
+      // -stray (Hold 1 — don't claim an overwrite that didn't happen).
+      const oc = commitOutcome(unchanged ? false : isOverwrite, "auto", cm.matchTier);
+      const mt = outcome === "closed-commit" ? "closed-commit" : "enter-auto-commit";
       step.flag = oc.flag;
       if (oc.status === "needs_review") {
-        // empty-field → autocommit-stray; overwrite → overwrite-stray (the accepted
-        // destructive edge: a different wrong value replaced the original).
-        const d = isOverwrite
+        // kept original (unchanged) → overwrite-nomatch-original-kept (NOT a "stray" — nothing strayed, the
+        // field holds its original value); changed overwrite → overwrite-stray; empty-field → autocommit-stray.
+        const flag = unchanged ? "overwrite-nomatch-original-kept" : oc.flag;
+        step.flag = flag;
+        const d = unchanged
+          ? `kept pre-fill "${priorChips.join("; ")}" (autocommitted + closed) but it matches no candidate — review`
+          : isOverwrite
           ? `overwrote pre-fill "${priorChips.join("; ")}" but the auto-commit chip "${step.chip}" matches no candidate — ${oc.flag}, walk stopped`
           : `auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged (${oc.flag}), walk stopped`;
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
       }
       // Defensive single-chip assertion (recon = REPLACE → 1 chip). A residual
       // second chip means a tenant ADDED — never silently accept a two-value state.
       if (isOverwrite && s.chips.length > 1) {
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
       }
-      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}auto-committed on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
+      const prov = unchanged ? `kept pre-fill "${priorChips.join("; ")}" (matches candidate "${cand}" via ${cm.matchTier}) → ` : isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}${outcome === "closed-commit" ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
     }
     if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
+    if (outcome === "empty") { step.note = "filtered to 0 options (no banner) — no match (fast, like banner)"; continue; }
     if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
 
     const texts = s.pageWide.texts;
@@ -1402,7 +1438,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     await pollSearchValue(act, () => act.readSource(loc), cand, budgets); // reactive: the full candidate has LANDED before the filter-Enter
     await act.pressEnter(); // these filter on ENTER, not live (recon)
 
-    let sawChange = false, stable = 0, prevSig = null, outcome = "timeout";
+    let sawChange = false, stable = 0, emptyStable = 0, emptySince = null, prevSig = null, outcome = "timeout";
     let s = null;
     const tSettle = Date.now();
     while (Date.now() - tSettle < budgets.taSettleCeilingMs) {
@@ -1418,32 +1454,59 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
         stable = sig === prevSig ? stable + 1 : 0;
         if (stable >= budgets.stableReads - 1) { outcome = "filtered"; break; }
       }
+      // AUTOCOMMIT-CLOSE (lockstep with fillTypeaheadCdp): the picker CLOSED holding a chip — stop now
+      // + classify the chip below. AFTER chip/banner/filtered (a NEW-chip autocommit stays on the chip-
+      // path) and BEFORE empty (a closed-with-value is classified, never read as an empty leaf list).
+      if (s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length) { outcome = "closed-commit"; break; }
+      // Empty filtered leaf list (0 leaves, no banner) = no-match (lockstep with fillTypeaheadCdp —
+      // some tenants show 0 instead of a banner). FAST: responded-empty (sawChange) + stable; BACKSTOP:
+      // taEmptyNoMatchMs. Treated downstream EXACTLY like timeout (not added to genuineNoMatch).
+      if (s && s.leafCount === 0 && !s.banner) {
+        if (emptySince == null) emptySince = Date.now();
+        if (sawChange) { emptyStable = sig === prevSig ? emptyStable + 1 : 0; if (emptyStable >= budgets.stableReads - 1) { outcome = "empty"; break; } }
+        if (Date.now() - emptySince >= budgets.taEmptyNoMatchMs) { outcome = "empty"; break; }
+      } else { emptySince = null; emptyStable = 0; }
       prevSig = sig;
     }
     step.outcome = outcome;
     step.settleMs = Date.now() - tSettle;
+    step.count = s ? s.leafCount : null;       // instrumentation (additive): filtered leaf count at settle end
+    step.banner = !!(s && s.banner);           //   + whether a "No matches" banner showed (Round-1 recon, no logic change)
+    step.open = !!(s && s.searchBox && s.searchBox.visible); // RE-RECON: source picker OPEN (empty) vs CLOSED (autocommitted)?
+    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null; //   + the committed chip value (distinguishes the two)
 
-    if (outcome === "chip") {
-      // Auto-commit on the filter-Enter — classify by tier (M27, lockstep with
-      // fillTypeaheadCdp): exact → filled; containment/fuzzy → filled_review + flag;
-      // no match → needs_review (stray). Walk stops either way.
+    if (outcome === "chip" || outcome === "closed-commit") {
+      // Auto-commit on the filter-Enter (chip = NEW chip; closed-commit = picker CLOSED holding a chip
+      // that equals the pre-fill) — classify by tier (M27, lockstep with fillTypeaheadCdp): exact →
+      // filled; containment/fuzzy → filled_review + flag; no match → needs_review (stray). `unchanged` =
+      // closed-commit whose chip equals the prior value → KEPT provenance, not "overwrote". No disarm
+      // needed: the picker is ALREADY CLOSED with a committed value (no armed highlight to disarm).
       step.chip = s.chips.join("; ");
       const cm = apMatch.matchCandidates([cand], s.chips);
-      const oc = commitOutcome(isOverwrite, "auto", cm.matchTier);
+      const unchanged = outcome === "closed-commit" && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
+      // Unchanged closed-commit = NO overwrite (chip IS the pre-fill) → AUTOCOMMIT taxonomy (honest
+      // flags), never overwrite-success/-stray (Hold 1, lockstep with fillTypeaheadCdp).
+      const oc = commitOutcome(unchanged ? false : isOverwrite, "auto", cm.matchTier);
+      const mt = outcome === "closed-commit" ? "closed-commit" : "enter-auto-commit";
       step.flag = oc.flag;
       if (oc.status === "needs_review") {
-        const d = isOverwrite
+        const flag = unchanged ? "overwrite-nomatch-original-kept" : oc.flag;
+        step.flag = flag;
+        const d = unchanged
+          ? `kept source pre-fill "${priorChips.join("; ")}" (autocommitted + closed) but it matches no candidate — review`
+          : isOverwrite
           ? `overwrote source pre-fill "${priorChips.join("; ")}" but the auto-commit chip "${step.chip}" matches no candidate — ${oc.flag}, walk stopped`
           : `source auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged (${oc.flag}), walk stopped`;
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
       }
       if (isOverwrite && s.chips.length > 1) {
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "enter-auto-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
       }
-      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: "enter-auto-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}source auto-committed on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
+      const prov = unchanged ? `kept source pre-fill "${priorChips.join("; ")}" (matches candidate "${cand}" via ${cm.matchTier}) → ` : isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}source ${outcome === "closed-commit" ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
     }
     if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
+    if (outcome === "empty") { step.note = "filtered to 0 options (no banner) — no match (fast, like banner)"; continue; }
     if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
 
     const leaves = s.leaves;

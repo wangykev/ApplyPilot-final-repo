@@ -1995,6 +1995,16 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
   })));
   LOG("counts:", JSON.stringify(out.counts));
+  // Delay-1 recon (instrumentation): per-candidate typeahead/source settle trace — reveals WHERE a
+  // slow overwrite-walk (e.g. CPP) spends its time (outcome + ms + filtered option count per candidate).
+  for (const r of out.results) {
+    if (!Array.isArray(r.settle_trace) || !r.settle_trace.length) continue;
+    LOG(`settle trace — ${r.fieldName} (${r.widgetType}):`);
+    for (const s of r.settle_trace) {
+      LOG(`    cand "${s.candidate}" → ${s.outcome || "?"} (${s.settleMs != null ? s.settleMs + "ms" : "?"}, ${s.count != null ? s.count + " options" : "? options"}, banner:${!!s.banner}, open:${!!s.open}, chip:${s.chips ? `"${s.chips}"` : "none"})${s.note ? " — " + s.note : ""}`);
+    }
+    LOG(`    → final ${r.fieldName} value: ${r.after ? `"${r.after}"` : "(none)"} [${r.status}] — cross-check vs the settle-end chip (labeling vs wrong-value)`);
+  }
 
   // Walk prereq 1 (resume attach): the CDP fold records file_upload as `skipped` (it can't
   // attach). Here the SW reads the stored resume (IndexedDB) + runs the PROVEN attachResume
@@ -3045,7 +3055,7 @@ function cdpPageSig(scan) {
 // read errors are "not ready, keep polling".
 async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
   const start = Date.now();
-  let steady = -1;
+  let steady = -1, errSteady = 0;
   while (Date.now() - start < timeoutMs) {
     await cdpDelay(intervalMs);
     let state = null;
@@ -3053,9 +3063,21 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
     if (state && sessionLooksDead(state)) return { advanced: false, sessionDead: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
-    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; continue; } // not hydrated
+    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSteady = 0; continue; } // not hydrated
     const sig = cdpPageSig(scan);
-    if (sig === prevSig) { steady = -1; continue; } // still page 1
+    if (sig === prevSig) {
+      steady = -1; // still page 1
+      // FAST validation-error exit: the page did NOT advance AND shows error markers → it errored
+      // (Workday never advances past a validation error). errors-present ⟺ won't-advance, so this
+      // can't skip a real advance (a successful re-fill clears the errors AND changes sig → the
+      // advanced path below fires instead). Two consecutive reads guard a transient flicker during a
+      // real transition → ~1s instead of burning the full ceiling. sessionLooksDead is checked first.
+      const errCount = (state && state.errorMarkers && state.errorMarkers.count) || 0;
+      errSteady = errCount > 0 ? errSteady + 1 : 0;
+      if (errSteady >= 2) return { advanced: false, timeout: true, errorDetected: true, errors: (state.errorMarkers.samples || []) };
+      continue;
+    }
+    errSteady = 0;
     if (scan.fields.length === steady) return { advanced: true, sig };
     steady = scan.fields.length;
   }
