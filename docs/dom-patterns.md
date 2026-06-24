@@ -1484,3 +1484,38 @@ The page AFTER My Experience is a screening QUESTIONS page. Magna page 3 (live r
 - **Justification BREVITY.** "one-sentence justification" produced verbose detail that bloats the summary a
   future AI reads; "a SHORT phrase (~12 words, no preamble) that names its basis" produces tight, reviewable
   detail (e.g. "Inferred from the absence of any criminal record in the applicant profile.").
+
+## 2026-06-23 — AI-4 remediation, resume-under-lock, self-heal, fill-latency (Magna wd3)
+
+- **AI-4 error→field association: the error TEXT parse is reliable; the error-anchor CLICK is NOT (on Magna).**
+  Recon hoped each validation error is a HYPERLINK that jump-focuses the offending field — but live, clicking
+  the error elements focused NO `formField-*` (`focusedFieldName` returned null for all). The error TEXT, however,
+  NAMES the field ("The field <First Name> is required"), so Tier-1 parses the name (`parseErrorFieldName`),
+  label-matches it to a scanned field (`mappedFieldsFromErrors`, normalize + bidirectional-containment), and
+  re-fills MAPPED fields from the profile DETERMINISTICALLY (no AI). The anchor-focus path was dropped.
+- **The Workday "Duplicate language entries are not allowed" PHANTOM.** Distinct entries (English + Chinese)
+  still trip it; deleting ONE doesn't clear it (the AI tried, then correctly declined). The only fix is delete
+  ALL language entries. `languageDeletionPlan` reads the FILLED values from the audited results: two entries
+  sharing a normalized language value = a REAL dupe (delete the later) vs all-distinct = the PHANTOM (delete all).
+  Scoped to LANGUAGES (other sections' dup errors may be real). Not reproducible on demand → live-PENDING.
+- **Resume attach under the input-lock — the lock SWALLOWS self-contained synthetic clicks.** `attachResume`
+  clears existing attachments with `dispatchEvent`-based clicks (NOT the gated `cdpClickAt`); the input-lock's
+  capture-phase blocker drops any `click`/`mousedown` while `window.__apActing` is 0 → "removed 0, N remain"
+  (fails ONLY when an attachment must be cleared — a clean page works because the attach's `change` isn't blocked).
+  Fix: bump `window.__apActing` around the `cdpEval(attachResume,…)` call. Any FUTURE self-contained page fn that
+  does its own synthetic input under the lock needs the same bump.
+- **CPP cert typeahead: the "0 options" was a CLOSED autocommitted dropdown, not an open empty list.** Typing
+  "CPP" AUTOCOMMITS "Certified Payroll Professional (CPP) - Multiple Recognized Providers" and CLOSES; the chip
+  EQUALS the pre-fill so `chipSetIsNew` is false → the chip-path missed it → the settle waited out its budget
+  AND mislabeled a correct value `needs_review`. The discriminator was `searchBox.visible` (open) + `chips`
+  (committed value) — read per-candidate in the settle trace; `open:false` + a chip = closed-committed. The new
+  `closed-commit` settle outcome classifies the kept chip via the match ladder (containment → `filled_review`,
+  honest flag, kept provenance). No disarm needed (already closed — no armed highlight). Recon-first
+  instrument-then-fix earned this: the first "empty filtered list" hypothesis was a category error the trace refuted.
+- **Validation-error detection: poll `errorMarkers`, don't burn the nav-ceiling.** A page that errors on
+  Save & Continue keeps the same URL+field-set (sig unchanged) and isn't a dead session, so `cdpWaitNextPage`
+  waited the full 15s. `errorMarkers` populate immediately, so: sig unchanged + errors present for 2 consecutive
+  reads → conclude errored (~1s). Safe: errors-present ⟺ won't-advance (a clean advance changes the sig first).
+- **Settle latency is page-side, not pacing.** The CPP close took ~1.8s of the FORM's own autocommit latency
+  (irreducible); the bug was the 8s/15s WAIT on top, not the interaction. The `closed-commit` early-exit removed
+  the wait without touching the M25/M27 commit/stray/disarm logic (additive settle exits only).
