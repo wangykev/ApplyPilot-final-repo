@@ -1519,3 +1519,38 @@ The page AFTER My Experience is a screening QUESTIONS page. Magna page 3 (live r
 - **Settle latency is page-side, not pacing.** The CPP close took ~1.8s of the FORM's own autocommit latency
   (irreducible); the bug was the 8s/15s WAIT on top, not the interaction. The `closed-commit` early-exit removed
   the wait without touching the M25/M27 commit/stray/disarm logic (additive settle exits only).
+
+## 2026-06-24 — Summary editability: capture the FULL option list for choice fields (FoS + dropdowns)
+The review summary lets a human edit choice fields, but a choice field is only editable if its bundle entry
+carries `options`. Two gaps left some empty: (1) a **typeahead** (Field of Study) only ever recorded
+`captured_options` = the bot's partial search matches; (2) a **`dropdown-prefilled-kept`** dropdown (M27.C
+zero-actuation short-circuit) never opened, so it scraped no options. On a re-run (everything pre-filled) the
+summary `<select>` for degree/language/proficiency showed only the current value, and FoS showed a partial note.
+- **FoS option list is BOUNDED + ENUMERABLE but VIRTUALIZED.** `cdpReadTaState` visibility-filters `[role=option]`
+  and ~16 render at a time; the full curated list (65, Accounting→Visual Arts, alphabetical) is revealed by
+  SCROLLING. Capture = a **scroll-accumulate scrape** (`cdpScrapeTaOptions`, cdp.js): runs ENTIRELY in-page in one
+  `cdpEval` (awaitPromise), frame-paced via double-rAF, finds the option-list scroll container (option's nearest
+  scrollable ancestor / the searchBox `aria-controls` el), loops `read visible [role=option] → de-dupe in order →
+  scrollTop += clientHeight → 2 frames` until bottom / no-new×2 / a 60-step cap. **READ-ONLY** (only sets scrollTop
+  + reads text → no type/Enter/arrow → no listbox highlight ever arms). LIVE: 65 options in **220ms**, bottom
+  reached, field left unchanged.
+- **Capture runs at END OF PAGE, never inline.** Two inline attempts failed: scraping BEFORE the fill scrolled the
+  list to the bottom and the immediately-following keptLowerTier re-commit committed a bottom-region row (FoS
+  "Other"→"Religion" stray); scraping immediately AFTER the commit raced the post-commit residual state (banner /
+  mid-unmount searchBox) and scraped empty. The PROVEN arrangement: capture in `drivePageFill` after all fields are
+  filled + settled/closed (a fresh re-open shows the empty-filter full list), BEFORE the M40 audit (which re-reads
+  each VALUE and backstops any capture-induced stray). `captureChoiceOptions` (fill-driver.js) dispatches per widget
+  for `filled`/`filled_review` records that LACK options, cached per option-set key so same-vocabulary fields
+  (FoS across education entries; `language`/`readingProficiency` across entries) re-open ONCE.
+- **Dropdowns: capture REPEATING-section only, reusing the read-only readers.** `captureDropdownOptions` =
+  `openAndReadDropdown` (open-retry + GATE-2 option settle) → enabled option texts → `closeAndVerifyBlank` on the
+  KEPT value (Escape-close, no commit; value preserved). Scoped to repeating-section dropdowns (fieldName matches
+  `/\[\d+\]\./`, e.g. `education[0].degree`) — **flat page-1 dropdowns (country/state/phone) are SKIPPED**: those are
+  large cold lists (re-opening them is exactly the M27.C cost the keep-short-circuit avoids) and they fill fresh WITH
+  options on a first run anyway. Committed dropdowns already carry `enabledTexts` → skipped (the `rec.options` check).
+- **Summary editor (summary.js):** a typeahead with a full `options` list → a type-to-filter combobox (`<input>` +
+  scrollable clickable list, shows ALL matches — the list box scrolls); focus / clear → the WHOLE list; type →
+  narrows; "— clear —" row → null. Same M14 write-back as the `<select>` (`current_value`/`edit_kind`/`is_edited` +
+  persist). Dropdowns keep the `<select>` (now populated from the captured `options`).
+- **Recon harnesses** (read-only, kept): `RUN_CDP_FOS_RECON` (enumerability verdict) + `RUN_CDP_FOS_CAPTURE`
+  (full scroll-scrape probe with scroll metrics + field-unchanged check) + their popup buttons.
