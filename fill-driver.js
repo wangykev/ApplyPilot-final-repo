@@ -1772,6 +1772,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // to persist (the standalone re-audit). Flag-only — never auto-refills.
   // (AI-4 targeted re-fill skips the inline audit — the remediation's Save & Continue retry verifies.)
   const auditEntries = only ? [] : auditEntriesFromResults(results);
+  // Summary editability: scrape the full option list for choice fields that lack one (tagged FoS
+  // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
+  // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
+  if (!only) await captureChoiceOptions(act, results, budgets);
   if (!only) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
@@ -1838,7 +1842,7 @@ const LANGUAGE_MAP = [
 const EDUCATION_MAP = [
   { field: "schoolName", widget: "text", key: "school_or_university", path: "school_or_university" },
   { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
-  { field: "fieldOfStudy", widget: "typeahead", key: "field_of_study", path: "field_of_study" },
+  { field: "fieldOfStudy", widget: "typeahead", key: "field_of_study", path: "field_of_study", captureOptions: true }, // FoS Round 3: scrape the full option list into the bundle → summary searchable editor
   { field: "gradeAverage", widget: "text", key: "gpa", path: "gpa" },
   { field: "firstYearAttended", widget: "year", key: "fromYearParsed", path: "from_year" },
   { field: "lastYearAttended", widget: "year", key: "toYearParsed", path: "to_year" }
@@ -1938,6 +1942,10 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     const loc = { wrapperSel: fd.wrapperSel };
     rec.auditLoc = fd.wrapperSel; // M40: retain the entry-scoped locator for the post-fill audit re-read
     rec.auditTag = f.widget === "textarea" ? "textarea" : undefined;
+    // FoS Round 3: tag so the END-OF-PAGE option-capture pass can find this record (captureKey groups
+    // same-vocabulary fields across entries → one scrape). Captured at end-of-page, NOT inline — an
+    // inline scrape races the field's post-commit settle (empty scrape) / corrupts the commit.
+    if (f.captureOptions) { rec.captureOptions = true; rec.captureKey = f.field || String(f.labelRegex); }
     try {
       if (f.widget === "year" || f.widget === "date") {
         // M36: fill via the M34 date composite. item[f.key] is SW-parsed — a "YYYY"
@@ -2309,6 +2317,99 @@ function applyAuditVerdicts(results, verdicts) {
   }
 }
 
+// FoS Round 3: scrape a typeahead's FULL option list (read-only) so the summary can render a
+// searchable editor over the COMPLETE list (the fill itself only ever records captured_options =
+// the partial search matches). Called INLINE in fillEntryCdp RIGHT AFTER the field is committed —
+// so the open/scroll happens DURING that typeahead's fill step (adjacent, the operator's ask), not
+// as a disjoint end-of-page sweep. AFTER (never before) the commit: a scrape before the fill
+// scrolled the virtualized list + corrupted the immediately-following keptLowerTier re-commit.
+//
+// READ-ONLY: opens the field + scrolls (act.scrapeTaOptions = scrollTop + reads, no type/Enter/arrow
+// → nothing arms), then a stray-safe close (disarmHighlight ensures no armed highlight survives).
+// Returns the options array, or null (NON-FATAL: null → the summary falls back to captured_options).
+// Called from captureChoiceOptions at END OF PAGE (when fields are settled/closed → a fresh re-open
+// shows the empty-filter full list); an inline call races the post-commit state (banner / residual
+// search → empty scrape) or corrupts the commit, so it is NOT called inline.
+async function captureFieldOptions(act, loc, budgets) {
+  if (!act || !act.scrapeTaOptions) return null; // substrate (or an older fake) without the scrape → no-op
+  try {
+    // open + re-assert focus on the searchBox so the full (empty-filter) list renders
+    const ensureFocused = async () => {
+      let st = await act.readTypeahead(loc);
+      if (!st || !st.searchBox || !st.searchBox.visible) {
+        await act.openTypeahead(loc);
+        const t0 = Date.now();
+        while (Date.now() - t0 < budgets.taOpenCeilingMs) {
+          await act.delayFull(budgets.taOpenIntervalMs);
+          st = await act.readTypeahead(loc);
+          if (st && st.searchBox && st.searchBox.visible) break;
+        }
+      }
+      if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(budgets.taOpenIntervalMs); }
+      const r = await act.readTypeahead(loc);
+      return !!(r && r.searchBox && r.searchBox.visible);
+    };
+    let options = null;
+    if (await ensureFocused()) {
+      const scrape = await act.scrapeTaOptions(loc);
+      if (scrape && scrape.ok && Array.isArray(scrape.options) && scrape.options.length) options = scrape.options.slice();
+    }
+    // stray-safe close (the scrape doesn't arm, but be defensive on the stray-prone field): disarm-poll
+    // the highlight to null (real time), then Escape + settle → the fill that follows opens clean.
+    await disarmHighlight(act, ensureFocused, (l) => act.readTypeahead(l), loc, budgets);
+    await act.pressEscape();
+    await act.delayFull(budgets.reopenSettleMs);
+    return options;
+  } catch (e) { return null; } // non-fatal: null → summary falls back to captured_options
+}
+
+// Capture a DROPDOWN's full option list (read-only) for the summary's editable <select>. A
+// `dropdown-prefilled-kept` dropdown (M27.C zero-actuation short-circuit) never opened during the
+// fill, so it carries no options; at end-of-page (resting/closed) a fresh open scrapes them cleanly.
+// READ-ONLY: openAndReadDropdown (open-retry + GATE-2 option settle) → enabled option texts →
+// closeAndVerifyBlank on the KEPT value (Escape-close, no commit; value preserved — a stray is caught
+// + M40-backstopped). Returns the options array or null (non-fatal). Reuses the proven AI-1 readers.
+async function captureDropdownOptions(act, loc, budgets) {
+  if (!act || !act.openDropdown || !act.readDropdownState) return null;
+  try {
+    const { before, state } = await openAndReadDropdown(act, loc, budgets);
+    const opts = state && Array.isArray(state.options) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+    await closeAndVerifyBlank(act, loc, before, budgets); // close, no commit (kept value preserved)
+    return opts.length ? opts : null;
+  } catch (e) { return null; } // non-fatal: null → summary shows the current value only
+}
+
+// END-OF-PAGE option capture for the summary's editable choice fields. Runs in drivePageFill AFTER
+// the whole page is filled but BEFORE the M40 audit (which then re-reads each VALUE + backstops any
+// capture-induced stray). For every filled/filled_review choice record that LACKS options (a committed
+// dropdown already carries enabledTexts → skipped; a prefilled-kept dropdown or a tagged FoS typeahead
+// does not), scrape the full list into rec.options. Dispatch by widget; cache per option-set key so
+// same-vocabulary fields (FoS across education entries; language/proficiency dropdowns across entries)
+// re-open ONCE, not N times. Non-fatal throughout.
+async function captureChoiceOptions(act, results, budgets) {
+  if (!act) return;
+  const cache = new Map(); // key → options[] | null (already attempted)
+  for (const rec of results || []) {
+    if (!rec || !rec.auditLoc) continue;
+    if (rec.status !== "filled" && rec.status !== "filled_review") continue;
+    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown already has them
+    let key, scrape;
+    if (rec.widgetType === "typeahead" && rec.captureOptions && act.scrapeTaOptions) {
+      key = "ta:" + (rec.captureKey || rec.fieldName);
+      scrape = () => captureFieldOptions(act, { wrapperSel: rec.auditLoc }, budgets);
+    } else if (rec.widgetType === "dropdown" && act.openDropdown && /\[\d+\]\./.test(rec.fieldName || "")) {
+      // REPEATING-section dropdowns only (fieldName = "education[0].degree" / "language[1].readingProficiency"
+      // — small lists). Flat dropdowns (country/state/phone, page 1) are SKIPPED: those are large cold lists
+      // (re-opening them is exactly the M27.C cost) and they fill fresh WITH options on a first run anyway.
+      key = "dd:" + String(rec.fieldName).split(".").pop(); // recName stem (degree/language/readingProficiency) — same stem ⇒ same option vocabulary
+      scrape = () => captureDropdownOptions(act, { wrapperSel: rec.auditLoc }, budgets);
+    } else continue;
+    if (!cache.has(key)) cache.set(key, await scrape());
+    const opts = cache.get(key);
+    if (opts && opts.length) rec.options = opts.slice();
+  }
+}
+
 // ============================================================================
 // M38 Part 2 — CDP review-summary bundle (the persisted review UI for the CDP path).
 // Reproduces the page-engine fillEngine's buildEntry + mapFillStatus/deriveConfidence/
@@ -2455,5 +2556,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions };
 }

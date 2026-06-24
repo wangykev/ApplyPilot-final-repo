@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2735,4 +2735,158 @@ test("typeahead: a candidate that AUTOCOMMITS the pre-fill + closes → closed-c
   assert.strictEqual(rec.matchTier, "closed-commit");
   assert.strictEqual(rec.flag, "autocommit-containment"); // HONEST flag — NOT "overwrite-success" (nothing was overwritten)
   assert.match(rec.detail, /kept pre-fill/);              // provenance: kept, never "overwrote" (Hold 1)
+});
+
+// ── FoS Round 3: captureFieldOptions (INLINE option scrape, read-only) ──────────────────────
+// Called RIGHT BEFORE a tagged typeahead's fill (fillEntryCdp) to scrape the FULL option list →
+// rec.options → the summary's searchable editor. Open → scrape → stray-safe close. Returns the
+// options array or null (non-fatal: null → summary falls back to captured_options).
+const CAP_BUDGETS = { taOpenCeilingMs: 50, taOpenIntervalMs: 1, taSettleCeilingMs: 50, commitIntervalMs: 1, reopenSettleMs: 1 };
+const FOS_OPTS = ["Accounting", "Biology", "Computer Science", "Engineering General"];
+const CAP_LOC = { wrapperSel: '[data-fkit-id="education-7--null"] [data-automation-id="formField-fieldOfStudy"]' };
+function makeCaptureAct(opts = {}) {
+  const calls = [];
+  const scrape = opts.scrape === undefined ? { ok: true, options: FOS_OPTS.slice() } : opts.scrape;
+  const taState = { searchBox: { visible: true, focused: true }, activeText: null, chips: opts.chips || [] };
+  const act = {
+    delay: () => { calls.push(["delay"]); return Promise.resolve(); },
+    delayFull: () => { calls.push(["delayFull"]); return Promise.resolve(); },
+    openTypeahead: (loc) => { calls.push(["openTypeahead", loc.wrapperSel]); return Promise.resolve(true); },
+    readTypeahead: (loc) => { calls.push(["readTypeahead", loc.wrapperSel]); return Promise.resolve(taState); },
+    focusSearchBox: (loc) => { calls.push(["focusSearchBox", loc.wrapperSel]); return Promise.resolve(true); },
+    pressEscape: () => { calls.push(["pressEscape"]); return Promise.resolve(); }
+  };
+  if (!opts.noScrape) act.scrapeTaOptions = (loc) => { calls.push(["scrapeTaOptions", loc.wrapperSel]); return Promise.resolve(scrape); };
+  return { act, calls };
+}
+
+test("FoS capture: a successful scrape returns the full option list", async () => {
+  const { act, calls } = makeCaptureAct();
+  const options = await captureFieldOptions(act, CAP_LOC, CAP_BUDGETS);
+  assert.deepStrictEqual(options, FOS_OPTS);
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1);
+});
+
+test("FoS capture: a failed / empty / null scrape returns null (fallback to captured_options)", async () => {
+  for (const scrape of [{ ok: false, error: "no wrapper" }, { ok: true, options: [] }, null]) {
+    const { act } = makeCaptureAct({ scrape });
+    assert.strictEqual(await captureFieldOptions(act, CAP_LOC, CAP_BUDGETS), null);
+  }
+});
+
+test("FoS capture: no-op (null, no calls) when the substrate lacks scrapeTaOptions (older fake)", async () => {
+  const { act, calls } = makeCaptureAct({ noScrape: true });
+  assert.strictEqual(await captureFieldOptions(act, CAP_LOC, CAP_BUDGETS), null);
+  assert.strictEqual(calls.length, 0); // returned before touching the field
+});
+
+test("FoS capture is READ-ONLY: never commits — only open/read/focus/scrape/escape (named invariant)", async () => {
+  const { act, calls } = makeCaptureAct();
+  await captureFieldOptions(act, CAP_LOC, CAP_BUDGETS);
+  const allowed = new Set(["delay", "delayFull", "openTypeahead", "readTypeahead", "focusSearchBox", "pressEscape", "scrapeTaOptions"]);
+  assert.deepStrictEqual(calls.filter((c) => !allowed.has(c[0])), [], "capture made a non-read-only call");
+  for (const bad of ["typeInSearch", "pressEnter", "clearSearch", "typeText", "clickDropdownOptionByText"])
+    assert.strictEqual(calls.some((c) => c[0] === bad), false, "capture must never call " + bad);
+});
+
+// ── captureChoiceOptions (END-OF-PAGE pass over the results) — typeaheads (FoS) + dropdowns ──
+const taggedRec = (over = {}) => Object.assign({
+  fieldName: "education-7--null--fieldOfStudy", widgetType: "typeahead", status: "filled",
+  captureOptions: true, captureKey: "fieldOfStudy", auditLoc: "[w-fos]"
+}, over);
+
+test("choice-capture: typeahead scrapes ONCE for two same-key records and copies options to both", async () => {
+  const recs = [taggedRec({ auditLoc: "[w-fos-0]" }), taggedRec({ auditLoc: "[w-fos-1]" })];
+  const { act, calls } = makeCaptureAct();
+  await captureChoiceOptions(act, recs, CAP_BUDGETS);
+  assert.deepStrictEqual(recs[0].options, FOS_OPTS);
+  assert.deepStrictEqual(recs[1].options, FOS_OPTS);
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // cached per captureKey → one re-open
+});
+
+test("choice-capture: untagged-typeahead / not-filled / unlocated records are untouched", async () => {
+  const recs = [
+    taggedRec({ captureOptions: false, auditLoc: "[w-a]" }), // untagged typeahead (no captureOptions) → not captured
+    taggedRec({ status: "needs_review", auditLoc: "[w-c]" }), // not filled
+    taggedRec({ auditLoc: null }) // no locator
+  ];
+  const { act, calls } = makeCaptureAct();
+  await captureChoiceOptions(act, recs, CAP_BUDGETS);
+  for (const r of recs) assert.strictEqual(r.options, undefined);
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0);
+});
+
+test("choice-capture: distinct captureKeys each get their own scrape", async () => {
+  const recs = [taggedRec({ auditLoc: "[w-fos]", captureKey: "fieldOfStudy" }), taggedRec({ auditLoc: "[w-cert]", captureKey: "certification", fieldName: "cert" })];
+  const { act, calls } = makeCaptureAct();
+  await captureChoiceOptions(act, recs, CAP_BUDGETS);
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 2);
+  assert.ok(recs[0].options && recs[1].options);
+});
+
+// ── captureDropdownOptions (read-only open → enabled texts → no-commit close) ──────────────
+const DD_OPTS = [{ text: "Select One", disabled: true }, { text: "Bachelors" }, { text: "Masters" }, { text: "Doctorate" }];
+function makeDropdownAct(opts = {}) {
+  const calls = [];
+  const options = opts.options || DD_OPTS;
+  const trigger = opts.trigger || "Bachelors";
+  let open = false;
+  const act = {
+    delay: () => { calls.push(["delay"]); return Promise.resolve(); },
+    delayFull: () => { calls.push(["delayFull"]); return Promise.resolve(); },
+    pressEscape: () => { calls.push(["pressEscape"]); open = false; return Promise.resolve(); },
+    openDropdown: () => { calls.push(["openDropdown"]); if (opts.noOpen) return Promise.resolve(false); open = true; return Promise.resolve(true); },
+    readDropdownState: () => { calls.push(["readDropdownState"]); return Promise.resolve({ triggerText: trigger, ariaExpanded: open ? "true" : "false", optionCount: open ? options.length : 0, options: open ? options : [] }); }
+  };
+  return { act, calls };
+}
+
+test("dropdown-capture: returns the ENABLED option texts (disabled placeholder dropped)", async () => {
+  const { act } = makeDropdownAct();
+  const opts = await captureDropdownOptions(act, { wrapperSel: "[w-degree]" }, T_BUDGETS);
+  assert.deepStrictEqual(opts, ["Bachelors", "Masters", "Doctorate"]); // "Select One" disabled → excluded
+});
+
+test("dropdown-capture: returns null when the dropdown never expands (trigger dead)", async () => {
+  const { act } = makeDropdownAct({ noOpen: true });
+  assert.strictEqual(await captureDropdownOptions(act, { wrapperSel: "[w]" }, T_BUDGETS), null);
+});
+
+test("dropdown-capture is READ-ONLY: never commits (no type/arrow/click-option) — open/read/escape only", async () => {
+  const { act, calls } = makeDropdownAct();
+  await captureDropdownOptions(act, { wrapperSel: "[w]" }, T_BUDGETS);
+  const allowed = new Set(["delay", "delayFull", "pressEscape", "openDropdown", "readDropdownState"]);
+  assert.deepStrictEqual(calls.filter((c) => !allowed.has(c[0])), [], "dropdown-capture made a non-read-only call");
+});
+
+test("choice-capture: a repeating prefilled-kept dropdown (no options) gets rec.options; a committed one is skipped", async () => {
+  const recs = [
+    { fieldName: "education[0].degree", widgetType: "dropdown", status: "filled", auditLoc: "[w-degree]" },              // kept, no options → capture
+    { fieldName: "language[0].language", widgetType: "dropdown", status: "filled", auditLoc: "[w-lang]", options: ["English", "Chinese"] } // committed (has options) → skip
+  ];
+  const { act, calls } = makeDropdownAct();
+  await captureChoiceOptions(act, recs, T_BUDGETS);
+  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]);
+  assert.deepStrictEqual(recs[1].options, ["English", "Chinese"]); // untouched
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // only the optionless one re-opened
+});
+
+test("choice-capture: a FLAT dropdown (page 1, no [idx].) is NOT re-opened — M27.C preserved for big cold lists", async () => {
+  const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }]; // prefilled-kept, no options
+  const { act, calls } = makeDropdownAct();
+  await captureChoiceOptions(act, recs, T_BUDGETS);
+  assert.strictEqual(recs[0].options, undefined);                 // flat dropdown not captured
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0); // never re-opened
+});
+
+test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cache), both get options", async () => {
+  const recs = [
+    { fieldName: "language[0].readingProficiency", widgetType: "dropdown", status: "filled", auditLoc: "[w-r0]" },
+    { fieldName: "language[1].readingProficiency", widgetType: "dropdown", status: "filled", auditLoc: "[w-r1]" }
+  ];
+  const { act, calls } = makeDropdownAct();
+  await captureChoiceOptions(act, recs, T_BUDGETS);
+  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]);
+  assert.deepStrictEqual(recs[1].options, ["Bachelors", "Masters", "Doctorate"]);
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // cached by stem "readingProficiency"
 });

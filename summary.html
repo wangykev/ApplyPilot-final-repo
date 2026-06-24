@@ -35,6 +35,14 @@
       .submit-blocked { background: #b00020; color: #fff; font-weight: 700; padding: 10px 14px; border-radius: 6px; margin: 10px 0; font-size: 14px; }
       .cellval { font-weight: 500; }
       select.editor { display: block; max-width: 340px; font-size: 12px; margin-top: 3px; }
+      /* FoS Round 3: searchable typeahead editor (filter input + clickable result list) */
+      .ta-editor { position: relative; display: inline-block; margin-top: 3px; }
+      input.ta-input { display: block; width: 260px; max-width: 340px; font-size: 12px; padding: 2px 5px; box-sizing: border-box; }
+      .ta-list { position: absolute; z-index: 20; left: 0; top: 100%; min-width: 260px; max-width: 340px; max-height: 220px; overflow-y: auto; background: #fff; border: 1px solid #b9c4d4; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.14); }
+      .ta-opt { padding: 3px 8px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+      .ta-opt:hover { background: #eef4ff; }
+      .ta-opt.sel { font-weight: 600; background: #e3eeff; }
+      .ta-clear { font-style: italic; color: #777; border-bottom: 1px solid #eee; }
       .partial-note { font-size: 11px; color: #a35200; margin-top: 4px; max-width: 360px; }
       .badge-slot { margin-top: 3px; }
       .edit-tag { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px; background: #cfe3ff; color: #1c4d8c; }

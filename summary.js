@@ -43,11 +43,15 @@ const editKindOf = (entry) => {
 
 // Which option list + partialness drives a choice field's editor; null = not editable.
 //   dropdown     → full options (complete option set, raised cap)
-//   typeahead    → captured_options (the filtered set the bot's search surfaced — PARTIAL)
+//   typeahead    → options (the FULL list captured post-fill — FoS Round 3 → SEARCHABLE editor)
+//                  else captured_options (the filtered set the bot's search surfaced — PARTIAL)
 //   hierarchical → options (the source picker's level-1 leaves — PARTIAL)
 const editorFor = (entry) => {
   if (entry.widget_type === "dropdown") return { list: entry.options || [], partial: false };
-  if (entry.widget_type === "typeahead") return { list: entry.captured_options || [], partial: true };
+  if (entry.widget_type === "typeahead") {
+    if (Array.isArray(entry.options) && entry.options.length) return { list: entry.options, partial: false, searchable: true };
+    return { list: entry.captured_options || [], partial: true };
+  }
   if (entry.widget_type === "hierarchical") return { list: entry.options || [], partial: true };
   return null;
 };
@@ -100,6 +104,67 @@ const valueCell = (entry, tr) => {
     if (rv) rv.textContent = fmt(entry.current_value);
   };
 
+  // Shared write-back (M14 semantics): current_value ← pick (null = cleared), edit_kind/is_edited
+  // recorded, original_ai_value preserved, persisted, row refreshed in place.
+  const commit = (val) => {
+    entry.current_value = val === "" || val == null ? null : val;
+    entry.edit_kind = editKindOf(entry);
+    entry.is_edited = entry.edit_kind !== null;
+    persist();
+    refreshLocal();
+  };
+
+  // FoS Round 3: a typeahead carrying the FULL captured option list → a type-to-filter combobox
+  // (an <input> that filters entry.options + a clickable result list). Same write-back as the <select>.
+  if (m.searchable) {
+    const wrap = el("div", { class: "ta-editor" });
+    const input = el("input", { class: "editor ta-input", type: "text", placeholder: "type to filter…" });
+    input.value = entry.current_value == null ? "" : String(entry.current_value);
+    const listBox = el("div", { class: "ta-list", hidden: "" });
+    wrap.appendChild(input);
+    wrap.appendChild(listBox);
+
+    const matchesFor = () => {
+      const q = input.value.trim().toLowerCase();
+      return q === "" ? list.slice() : list.filter((o) => String(o).toLowerCase().includes(q));
+    };
+    // pick(val): clear ("") keeps the list OPEN showing the FULL list (so you can choose anew without
+    // re-typing); choosing a real value closes it.
+    const pick = (val) => {
+      commit(val);
+      input.value = entry.current_value == null ? "" : String(entry.current_value);
+      if (val === "" || val == null) { renderList(true); }
+      else { listBox.hidden = true; listBox.textContent = ""; }
+    };
+    // renderList(showAll): showAll → the WHOLE list (used on focus + after clear, so the full list is
+    // visible from the start); otherwise filtered by what's typed.
+    const renderList = (showAll) => {
+      listBox.textContent = "";
+      const clearRow = el("div", { class: "ta-opt ta-clear", text: "— clear —" });
+      clearRow.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(""); });
+      listBox.appendChild(clearRow);
+      const matches = showAll ? list.slice() : matchesFor();
+      for (const o of matches) { // show ALL matches — the list is scrollable (max-height + overflow-y)
+        const row = el("div", { class: String(o) === norm(entry.current_value) ? "ta-opt sel" : "ta-opt", text: String(o) });
+        row.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(String(o)); });
+        listBox.appendChild(row);
+      }
+      listBox.hidden = false;
+    };
+    input.addEventListener("focus", () => { input.select(); renderList(true); }); // FULL list at the start (select text → typing replaces)
+    input.addEventListener("input", () => renderList(false));                      // narrow as you type
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); const ms = matchesFor(); if (ms.length) pick(String(ms[0])); }
+      else if (ev.key === "Escape") { listBox.hidden = true; }
+    });
+    input.addEventListener("blur", () => { setTimeout(() => { listBox.hidden = true; }, 150); }); // let a row mousedown land first
+    td.appendChild(wrap);
+    td.appendChild(badgeSlot);
+    const b1 = editedBadge(entry);
+    if (b1) badgeSlot.appendChild(b1);
+    return td;
+  }
+
   // Graceful degrade: a partial set too small to be a useful pick-list → value + note.
   if (m.partial && list.length <= 2) {
     td.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
@@ -119,13 +184,7 @@ const valueCell = (entry, tr) => {
       if (o === cur) oEl.selected = true;
       sel.appendChild(oEl);
     }
-    sel.addEventListener("change", () => {
-      entry.current_value = sel.value === "" ? null : sel.value;
-      entry.edit_kind = editKindOf(entry);
-      entry.is_edited = entry.edit_kind !== null;
-      persist();
-      refreshLocal();
-    });
+    sel.addEventListener("change", () => commit(sel.value));
     td.appendChild(sel);
     if (m.partial) td.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
   }
