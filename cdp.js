@@ -675,6 +675,39 @@ function cdpReadSessionState() {
   };
 }
 
+// AI-4: the visible Workday validation-ERROR links. Recon (2026-06-22, Magna): each error in the
+// top summary is a HYPERLINK that, when clicked, jump-FOCUSES the offending field — Workday's own
+// error→field map (more robust than text-matching the label). Returns each error's rect (for the
+// GATED cdpClickAt) + text (for logging / the field-name parse). Best-effort selector (anchors +
+// role=link + errorMessage/alert/*error* elements, visible, with text); live-tune if a tenant differs.
+function cdpReadErrorLinks() {
+  const cands = Array.from(document.querySelectorAll(
+    'a[href], [role="link"], [data-automation-id="errorMessage"], [role="alert"] a, [data-automation-id*="rror"] a, [data-automation-id*="rror"]'
+  ));
+  const out = [], seen = new Set();
+  for (const el of cands) {
+    const r = el.getBoundingClientRect && el.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) continue;
+    const text = (el.textContent || "").trim();
+    if (!text) continue;
+    const anchor = el.tagName === "A" || el.getAttribute("role") === "link" || !!el.closest("a");
+    const key = Math.round(r.y) + "|" + text.slice(0, 60);
+    if (seen.has(key)) continue; seen.add(key);
+    out.push({ text: text.slice(0, 200), anchor, x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) });
+  }
+  return out;
+}
+
+// AI-4: after clicking an error link (Workday focuses the offending field), identify WHICH field is
+// now focused → its enclosing formField-* wrapper. Returns {fieldName, wrapperSel} or null.
+function cdpFocusedFieldName() {
+  const el = document.activeElement;
+  const wrap = el && el.closest && el.closest('[data-automation-id^="formField-"]');
+  if (!wrap) return null;
+  const id = wrap.getAttribute("data-automation-id");
+  return { fieldName: id.slice("formField-".length), wrapperSel: '[data-automation-id="' + id + '"]' };
+}
+
 // Fresh rect for `sel` (optionally scrollIntoView first — instant, not smooth:
 // smooth is rAF-driven and rAF is frozen hidden).
 function cdpRectOf(sel, scroll) {
@@ -1313,6 +1346,11 @@ function makeCdpActuation(llmConfig) {
       await cdpClickAt(rect.cx, rect.cy);
       return { clicked: true };
     },
+
+    // ── AI-4 validation-error remediation ──
+    readErrorLinks: () => cdpEval(cdpReadErrorLinks),            // the visible error anchors (rect + text)
+    focusedFieldName: () => cdpEval(cdpFocusedFieldName),        // the field an error-anchor click focused
+    clickAt: (cx, cy) => cdpClickAt(cx, cy),                     // GATED click (bumps __apActing) — for an error anchor's rect
 
     // ── repeating sections (M32) ──
     // Substrate for driveRepeatingSectionCdp. The brain stays substrate-agnostic:

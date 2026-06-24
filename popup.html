@@ -79,6 +79,10 @@
          empty required specialty blocks Save & Continue). Keep the tab VISIBLE to watch it
          reach review and stop. [CDP-WALK] in the SW console. -->
     <button id="cdp-walk">CDP WALK to review (fills all pages; never submits)</button>
+    <!-- AI-4 TEST HARNESS: fill a page, deliberately clear a required field, watch AI-4 remediate.
+         Run on page 1 / My Information (fully fillable, no required upload). [CDP-TEST-AI4]. -->
+    <button id="cdp-test-ai4">CDP TEST AI-4 (fixable — re-fill + advance)</button>
+    <button id="cdp-test-ai4-unfixable">CDP TEST AI-4 (unfixable — watch cap halt)</button>
     <!-- Label/field regex for "CDP fill one date" below (the remaining fill-one harness). -->
     <label for="ta-label">CDP fill-one target (label/field regex):</label>
     <input id="ta-label" type="text" placeholder="e.g. issuedDate">

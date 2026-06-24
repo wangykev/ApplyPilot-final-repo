@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2006,6 +2006,8 @@ function makeFakeDateAct(segs, opts) {
   const log = [];
   let focused = null;
   const focusFails = new Set(opts.focusFailsFor || []);
+  const focusFailsOnce = new Set(opts.focusFailsOnceFor || []); // fail focus on the FIRST call only (self-heals on the outer retry)
+  const _focusFailedOnce = new Set();
   const perCharFails = new Set(opts.perCharFailsFor || []);
   const bothFail = new Set(opts.bothFailFor || []);
   const readSeq = opts.readSequenceFor || {}; // { seg: [read1, read2, ...] } — dequeue per read, last sticks (laggy/partial read-back)
@@ -2016,6 +2018,7 @@ function makeFakeDateAct(segs, opts) {
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     focusDateSegment: async (loc, seg) => {
       log.push(["focusDateSegment", seg]);
+      if (focusFailsOnce.has(seg) && !_focusFailedOnce.has(seg)) { _focusFailedOnce.add(seg); focused = null; return null; }
       if (focusFails.has(seg) || !(seg in segs)) { focused = null; return null; }
       focused = seg;
       return rung(seg);
@@ -2521,4 +2524,175 @@ test("M40 audit: a clean drivePageFill run gets NO audit-* flags (no false flags
   const out = await drivePageFill(makeFakeAct([ddField()]), usProfile, {}, {}, T_BUDGETS);
   assert.ok(!out.results.some((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable"), "a correct fill must not be audit-flagged");
   assert.strictEqual(out.results[0].status, "filled");
+});
+
+// ── AI-4: validation-error remediation ──────────────────────────────────────
+// The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
+// these pin the decision/parse UNITS it depends on.
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan } = require("../lib.js");
+const llmAct = (text) => ({ llm: async () => (text === undefined ? { ok: false, error: "no reply" } : (typeof text === "string" ? { ok: true, text } : text)) });
+
+test("AI-4 parseErrorFieldName: Magna '<…>' bracket form", () => {
+  assert.strictEqual(parseErrorFieldName("Error: The field <How Did You Hear About Us?> is required."), "How Did You Hear About Us?");
+});
+test("AI-4 parseErrorFieldName: bare 'field X is required' form", () => {
+  assert.strictEqual(parseErrorFieldName("The field Phone Number is required."), "Phone Number");
+});
+test("AI-4 parseErrorFieldName: generic error with no field name → null (Tier-1 anchors are the primary)", () => {
+  assert.strictEqual(parseErrorFieldName("This field is required"), null); // "field" immediately followed by "is" → no name captured
+  assert.strictEqual(parseErrorFieldName(""), null);
+  assert.strictEqual(parseErrorFieldName(null), null);
+});
+
+test("AI-4 errorSetUnchanged: identical sets (any order) → true; different/longer → false", () => {
+  assert.strictEqual(errorSetUnchanged(["a", "b"], ["b", "a"]), true);   // order-independent
+  assert.strictEqual(errorSetUnchanged([" a ", "b"], ["a", "b"]), true); // trim-normalized
+  assert.strictEqual(errorSetUnchanged(["a"], ["a", "b"]), false);       // a new error appeared = progress
+  assert.strictEqual(errorSetUnchanged(["a", "b"], ["a"]), false);       // one cleared = progress
+  assert.strictEqual(errorSetUnchanged([], []), true);
+});
+
+test("AI-4 parseRemediation: restricted whitelist — refill / delete_entry parse; everything else → none", () => {
+  assert.deepStrictEqual(parseRemediation('{"action":"refill","field":"phoneNumber","value":"555-123-4567"}'),
+    { action: "refill", field: "phoneNumber", value: "555-123-4567", reason: "" });
+  assert.deepStrictEqual(parseRemediation('```json\n{"action":"delete_entry","section":"language-","index":2}\n```'),
+    { action: "delete_entry", section: "language-", index: 2, reason: "" });
+  assert.strictEqual(parseRemediation('{"action":"none","reason":"cannot fix"}').action, "none");
+  // SAFETY: a hallucinated out-of-set action can NEVER escape the whitelist.
+  assert.strictEqual(parseRemediation('{"action":"submit"}').action, "none");
+  assert.strictEqual(parseRemediation('{"action":"click","x":10,"y":20}').action, "none");
+  assert.strictEqual(parseRemediation("not json at all").action, "none");
+  // malformed required fields → none (never a half-specified action)
+  assert.strictEqual(parseRemediation('{"action":"refill","value":"x"}').action, "none");      // missing field
+  assert.strictEqual(parseRemediation('{"action":"delete_entry","section":"x"}').action, "none"); // missing index
+});
+
+test("AI-4 aiRemediateError: a 'Duplicate … entries' error → delete_entry action", async () => {
+  const d = await aiRemediateError(llmAct('{"action":"delete_entry","section":"language-","index":2,"reason":"duplicate Chinese"}'),
+    ["Duplicate language entries are not allowed."], { fields: [], sections: { "language-": 3 } }, {});
+  assert.strictEqual(d.action, "delete_entry");
+  assert.strictEqual(d.section, "language-");
+  assert.strictEqual(d.index, 2);
+});
+test("AI-4 aiRemediateError: an invalid-format error → refill with a corrected value", async () => {
+  const d = await aiRemediateError(llmAct('{"action":"refill","field":"phoneNumber","value":"+1 555-123-4567"}'),
+    ["Phone number format is invalid."], { fields: [{ fieldName: "phoneNumber", label: "Phone", widgetType: "text", after: "5551234567" }] }, {});
+  assert.strictEqual(d.action, "refill");
+  assert.strictEqual(d.field, "phoneNumber");
+  assert.strictEqual(d.value, "+1 555-123-4567");
+});
+test("AI-4 aiRemediateError: AI call fails → action 'none' (never blind-acts)", async () => {
+  const d = await aiRemediateError(llmAct(undefined), ["err"], { fields: [] }, {});
+  assert.strictEqual(d.action, "none");
+  assert.match(d.reason, /AI call failed/);
+});
+
+// ── AI-4 deterministic Tier-1 + hardcoded dup-language (no AI for the common cases) ─────────
+const FM = { "legalName--firstName": "personal_info.first_name", "phoneNumber": "personal_info.phone_number" };
+const scanFor = [
+  { fieldName: "legalName--firstName", label: "First Name*", widgetType: "text" },
+  { fieldName: "phoneNumber", label: "Phone Number*", widgetType: "text" },
+  { fieldName: "preferredCheck", label: "Preferred Name?", widgetType: "checkbox" } // UNMAPPED
+];
+test("AI-4 mappedFieldsFromErrors: a MAPPED field named by the error (label match) → re-fill set", () => {
+  assert.deepStrictEqual(mappedFieldsFromErrors(["The field <First Name> is required."], scanFor, FM), ["legalName--firstName"]);
+});
+test("AI-4 mappedFieldsFromErrors: an UNMAPPED named field is EXCLUDED (→ left for the AI tier)", () => {
+  assert.deepStrictEqual(mappedFieldsFromErrors(["The field <Preferred Name> is required."], scanFor, FM), []);
+});
+test("AI-4 mappedFieldsFromErrors: no field name in the error → empty", () => {
+  assert.deepStrictEqual(mappedFieldsFromErrors(["Duplicate language entries are not allowed."], scanFor, FM), []);
+  assert.deepStrictEqual(mappedFieldsFromErrors([], scanFor, FM), []);
+});
+
+test("AI-4 isDuplicateLanguageError: matches the live Magna text; false otherwise", () => {
+  assert.strictEqual(isDuplicateLanguageError(["Error-LanguageDuplicate language entries are not allowed."]), true);
+  assert.strictEqual(isDuplicateLanguageError(["Duplicate education entries are not allowed."]), false); // scoped to LANGUAGES
+  assert.strictEqual(isDuplicateLanguageError(["The field <First Name> is required."]), false);
+  assert.strictEqual(isDuplicateLanguageError([]), false);
+});
+
+test("AI-4 languageDeletionPlan: distinct values → PHANTOM (delete all)", () => {
+  const results = [
+    { fieldName: "language[0].language", after: "English" }, { fieldName: "language[0].readingProficiency", after: "Fluent" }, { fieldName: "language[0].native", after: "true" },
+    { fieldName: "language[1].language", after: "Chinese" }, { fieldName: "language[1].speakingProficiency", after: "Advanced" }
+  ];
+  const entries = languageEntriesFromResults(results);
+  assert.strictEqual(entries.length, 2);
+  assert.match(entries[0].summary, /English \(read Fluent, native\)/);
+  const plan = languageDeletionPlan(entries);
+  assert.strictEqual(plan.mode, "phantom");
+  assert.deepStrictEqual(plan.deleteIndices.slice().sort(), [0, 1]); // ALL
+  assert.match(plan.summary, /English/);
+  assert.match(plan.summary, /Chinese/);
+});
+test("AI-4 languageDeletionPlan: a REAL duplicate value → delete only the later occurrence", () => {
+  const results = [
+    { fieldName: "language[0].language", after: "English" },
+    { fieldName: "language[1].language", after: "Chinese" },
+    { fieldName: "language[2].language", after: "English" } // a genuine duplicate
+  ];
+  const plan = languageDeletionPlan(languageEntriesFromResults(results));
+  assert.strictEqual(plan.mode, "real");
+  assert.deepStrictEqual(plan.deleteIndices, [2]); // keep the first English, delete the dupe — NOT all
+});
+
+// ── Read-back self-heal (in-fill retry + M40 re-fill) ───────────────────────
+// (a) fillTextCdp in-fill retry: a WRONG first type (the "fFirmware…" stray-char class) is re-done.
+test("self-heal: fillTextCdp re-fills on a wrong first type → filled (not needs_review)", async () => {
+  let n = 0;
+  const field = textField({ mangle: (t) => (n++ === 0 ? "f" + t : t) }); // attempt 1 prepends a stray "f", attempt 2 clean
+  const [rec] = await run([field], nameProfile, {});
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Kevin");
+  assert.match(rec.detail, /self-healed on attempt 2/);
+});
+test("self-heal: fillTextCdp still flags needs_review when ALL attempts mismatch", async () => {
+  const [rec] = await run([textField({ mangle: () => "WRONG" })], nameProfile, {}); // every type lands wrong
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /read-back mismatch after 2 attempt/);
+});
+
+// (b) fillDateCompositeCdp outer retry: a segment whose FOCUS flakes on attempt 1 self-heals on retry.
+test("self-heal: a date segment whose focus flakes on attempt 1 self-heals on the outer retry → filled", async () => {
+  const segs = { Month: seg0(), Year: seg0() };
+  const { rec } = await runDate(segs, { month: "5", year: "2025" }, { focusFailsOnceFor: ["Year"] });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "5/2025");
+  assert.deepStrictEqual([segs.Month.value, segs.Year.value], ["5", "2025"]);
+});
+
+// (c) M40 audit re-fill-once: a TRANSIENT post-fill drift recovers; a DETERMINISTIC clobber stays flagged.
+test("self-heal: M40 audit re-fills a drifted field that RECOVERS → 'recovered', kept filled + a note", async () => {
+  const field = textField({ value: "DRIFTED" }); // live value drifted away from the recorded "Kevin"
+  const act = makeFakeAct([field]);
+  const entry = { key: field.fieldName, widgetType: "text", auditLoc: field.wrapperSel, auditTag: null, expected: "Kevin" };
+  const verdicts = await reconcileAudit(act, [entry], T_BUDGETS, { refillOnMismatch: true });
+  assert.strictEqual(verdicts[0].verdict, "recovered");
+  assert.strictEqual(verdicts[0].actual, "Kevin");
+  const results = [{ fieldName: field.fieldName, status: "filled", verified: true, after: "Kevin", flag: null, detail: "x" }];
+  applyAuditVerdicts(results, verdicts);
+  assert.strictEqual(results[0].status, "filled");   // KEPT filled — the self-heal worked
+  assert.strictEqual(results[0].flag, null);
+  assert.match(results[0].detail, /re-filled to "Kevin"/);
+});
+test("self-heal: M40 audit re-fill that STILL mismatches stays audit-mismatch (deterministic clobber)", async () => {
+  const field = textField({ value: "DRIFTED", mangle: () => "CLOBBERED" }); // any re-fill lands wrong
+  const act = makeFakeAct([field]);
+  const entry = { key: field.fieldName, widgetType: "text", auditLoc: field.wrapperSel, auditTag: null, expected: "Kevin" };
+  const verdicts = await reconcileAudit(act, [entry], T_BUDGETS, { refillOnMismatch: true });
+  assert.strictEqual(verdicts[0].verdict, "mismatch");
+  const results = [{ fieldName: field.fieldName, status: "filled", verified: true, after: "Kevin", flag: null, detail: null }];
+  applyAuditVerdicts(results, verdicts);
+  assert.strictEqual(results[0].status, "needs_review");
+  assert.strictEqual(results[0].flag, "audit-mismatch");
+  assert.strictEqual(results[0].after, "CLOBBERED");  // bundle shows the live truth
+});
+test("self-heal: M40 standalone re-audit (no opts) stays FLAG-ONLY — never re-fills", async () => {
+  const field = textField({ value: "DRIFTED" });
+  const act = makeFakeAct([field]);
+  const entry = { key: field.fieldName, widgetType: "text", auditLoc: field.wrapperSel, auditTag: null, expected: "Kevin" };
+  const verdicts = await reconcileAudit(act, [entry], T_BUDGETS); // no refillOnMismatch → diagnostic mode
+  assert.strictEqual(verdicts[0].verdict, "mismatch");
+  assert.strictEqual(field.value, "DRIFTED");          // untouched — no re-fill happened
 });

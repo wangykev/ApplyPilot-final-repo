@@ -203,6 +203,23 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
   });
 });
 
+// AI-4 test harness: fill a page, deliberately clear a required field, watch AI-4 remediate.
+function runAi4Test(unfixable) {
+  setStatus(`AI-4 TEST (${unfixable ? "unfixable — watch the cap halt" : "fixable — watch Tier-1 re-fill + advance"}): filling page 1 then clearing a required field to trigger an error. Keep the tab VISIBLE. See [CDP-TEST-AI4].`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_TEST_REMEDIATION", unfixable }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup likely closed — SW console has it all
+    if (resp.ok === false && resp.error === "no-profile") setStatus('No profile in storage — click "Load default profile" first.');
+    else if (resp.ok === false) setStatus("AI-4 test failed: " + resp.error + " — see [CDP-TEST-AI4].");
+    else if (resp.stopped === "remediated-advanced") setStatus(`✓ AI-4 FIXED the error + advanced (${resp.attempts} attempt(s)). See [CDP-TEST-AI4].`);
+    else if (resp.stopped === "remediation-halted") setStatus(`AI-4 halted CLEANLY (${resp.reason}, ${resp.attempts} attempt(s)) — never looped/submitted. See [CDP-TEST-AI4].`);
+    else if (resp.stopped === "advanced-no-error") setStatus(`⚠ Cleared field didn't block S&C — try My Information (page 1, required First/Last/Phone). See [CDP-TEST-AI4].`);
+    else if (resp.stopped === "no-target") setStatus("No perturbable required text field on this page — run on My Information (page 1). See [CDP-TEST-AI4].");
+    else setStatus(`AI-4 test stopped — ${resp.stopped}. See [CDP-TEST-AI4].`);
+  });
+}
+document.getElementById("cdp-test-ai4").addEventListener("click", () => runAi4Test(false));
+document.getElementById("cdp-test-ai4-unfixable").addEventListener("click", () => runAi4Test(true));
+
 // SESSION RECON (M30 Step 0): read-only static snapshot to classify live-form vs
 // logged-out/expired. No minimize. Run on a VALID form + a LOGGED-OUT state, diff.
 document.getElementById("cdp-session-recon").addEventListener("click", () => {

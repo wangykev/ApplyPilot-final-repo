@@ -270,6 +270,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // AI-4 TEST HARNESS: fill the page, deliberately clear a required field, then watch AI-4 remediate.
+  if (message.type === "RUN_CDP_TEST_REMEDIATION") {
+    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-TEST-AI4] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpTestRemediation(tab.id, profile, defaults, jobContext, { unfixable: !!message.unfixable });
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // CDP RE-AUDIT (M40 standalone): re-read the live page vs the persisted reviewAudit
   // expectations + report mismatches. No profile needed (reads stored expectations).
   if (message.type === "RUN_CDP_AUDIT") {
@@ -1997,8 +2015,17 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       LOG("resume: NOT attached — no resume stored (upload one in the popup).");
     } else {
       let ar = null, arErr = null;
+      // The input-lock's capture-phase blocker SWALLOWS attachResume's SYNTHETIC delete/attach clicks
+      // (they're dispatchEvent, not the gated cdpClickAt) whenever window.__apActing is 0 — that's why
+      // clearing an EXISTING attachment intermittently failed under the walk's lock ("removed 0, N
+      // remain"; a clean 0-attachment page worked because the attach's `change` event isn't blocked).
+      // Bump __apActing around the attach (exactly how the gated CDP primitives gate themselves) so
+      // attachResume's events pass. Gated on the lock being active so non-lock runs pay nothing.
+      const lockOn = !(opts && opts.skipLock);
+      if (lockOn) { try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ } }
       try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
       catch (e) { arErr = String((e && e.message) || e); }
+      finally { if (lockOn) { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } } }
       if (ar && ar.attached) {
         uploadRec.status = "filled"; uploadRec.verified = true; uploadRec.after = ar.fileName || resumeRec.filename || null;
         uploadRec.detail = `resume attached (file-upload-successful, cleared ${ar.deletedCount || 0} existing)`;
@@ -2023,7 +2050,175 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
   const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
   await persistAccumulated(bundle);
-  return { out, bundle, auditFlags };
+  return { out, bundle, auditFlags, pageKey };
+}
+
+// AI-4: rebuild + re-persist the page bundle from the CURRENT out.results (after remediation
+// mutates them) — reuses the SAME pageKey so the accumulation merge replaces this page (no
+// duplicate). Keeps the persisted review bundle an honest audit trail of what AI-4 changed.
+async function repersistPageBundle(out, pageKey) {
+  const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
+  const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  await persistAccumulated(bundle);
+  return bundle;
+}
+
+// AI-4: re-fill ONE field with a SPECIFIC value (Tier-2's corrected value) through the SAME
+// per-widget CDP handler the page fill uses — choice widgets still clear the match ladder (never
+// blind-commit). Tier-1 uses drivePageFill(onlyFieldNames) instead (re-fills from the PROFILE).
+async function refillFieldWithValue(act, f, value, budgets) {
+  const loc = { wrapperSel: f.wrapperSel };
+  const v = value == null ? "" : String(value);
+  if (f.widgetType === "text") return await fillTextCdp(act, loc, v, budgets, "input");
+  if (f.widgetType === "textarea") return await fillTextCdp(act, loc, v, budgets, "textarea");
+  if (f.widgetType === "dropdown") return await fillDropdownCdp(act, loc, [v], budgets);
+  if (f.widgetType === "typeahead") return await fillTypeaheadCdp(act, loc, [v], budgets);
+  if (f.widgetType === "hierarchical") return await fillSourceCdp(act, loc, [v], budgets);
+  return { status: "needs_review", after: null, detail: "AI-4: cannot refill widget type " + f.widgetType };
+}
+
+// AI-4: merge a remediation record into out.results — replace the existing record for that field
+// (so the bundle shows the post-remediation state), else append.
+function mergeRemediationRecord(out, rec) {
+  const i = out.results.findIndex((r) => r.fieldName === rec.fieldName);
+  if (i !== -1) out.results[i] = rec; else out.results.push(rec);
+}
+
+// AI-4 validation-error remediation loop (Tier 1 anchors → Tier 2 AI), bounded + halt-on-no-progress.
+// Runs ONLY when the session is LIVE (the caller already excluded sessionDead) and Save & Continue
+// stayed put. GLOBAL shared cap across both tiers (REMEDIATION_MAX — Hold 1, "not 2+2"); halts the
+// instant the error set is UNCHANGED after an action (no point re-firing the same fix). Every action
+// is recorded into out.results (flag ai-remediation) + the bundle re-persisted. NEVER submits — the
+// re-Save&Continue is the GUARDED clickPageNext (refuses on the review marker).
+const REMEDIATION_MAX = 3;
+async function remediatePageErrors(act, profile, defaults, jobContext, out, pageKey, page, LOG) {
+  const actions = [];
+  let st = null; try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
+  let prevErrors = (st && st.errorMarkers && st.errorMarkers.samples) || [];
+  LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s). Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
+
+  for (let attempt = 1; attempt <= REMEDIATION_MAX; attempt++) {
+    let didSomething = false;
+
+    // ── Tier 0 (HARDCODED, DETERMINISTIC, no AI): the known Magna/Workday phantom "Duplicate
+    //    language entries are not allowed" bug. Scoped to LANGUAGES. Real-vs-phantom is read from
+    //    the already-audited fill results (the M40 audit just confirmed they match the live page):
+    //    a REAL dupe (two same language values) → delete only the later occurrence(s); a PHANTOM
+    //    (distinct values, Workday's bug) → delete ALL. Recorded with the deleted CONTENT so the
+    //    languages are re-addable; the delete loop halts on no-progress. ──
+    if (isDuplicateLanguageError(prevErrors)) {
+      const entries = languageEntriesFromResults(out.results);
+      const plan = languageDeletionPlan(entries);
+      LOG(`  attempt ${attempt} (Tier 0, dup-language ${plan.mode}): deleting ${plan.deleteIndices.length}/${entries.length} entry(ies) [${plan.summary}]`);
+      let deleted = 0;
+      for (const idx of plan.deleteIndices.slice().sort((a, b) => b - a)) { // highest-first → lower indices stay valid
+        const before = await act.entryCount("language-");
+        if (before <= 0) break;
+        const clicked = await act.clickDeleteEntry("language-", idx);
+        if (!clicked || !clicked.ok) break;
+        let now = before, polls = 0;
+        while (polls++ < 20) { now = await act.entryCount("language-"); if (now < before) break; await act.delay(DEFAULT_BUDGETS.interFieldMs); }
+        if (now >= before) break; // NO PROGRESS (count didn't drop) → stop, don't spin the bound (Hold B3)
+        deleted++;
+      }
+      mergeRemediationRecord(out, {
+        fieldName: "language.duplicate-fix", label: "Duplicate-language workaround", widgetType: "remediation",
+        status: "needs_review", flag: "ai-remediation", after: null,
+        detail: `AI-4 hardcoded Workday duplicate-language fix (${plan.mode}): deleted ${deleted}/${entries.length} entry(ies) — re-add manually if needed: ${plan.summary}`
+      });
+      actions.push({ tier: 0, action: "delete-language-" + plan.mode, deleted, languages: plan.summary });
+      didSomething = true;
+    }
+
+    // ── Tier 1 (DETERMINISTIC, no AI): re-fill the MAPPED fields the error TEXT names, from the
+    //    profile, through the SAME drivePageFill path. Replaces the old anchor-click-to-focus
+    //    (which didn't fire on Magna; the text-parse does). Unmapped named fields fall through to
+    //    the AI tier. Re-filling an already-correct field is harmless (same value). ──
+    if (!didSomething) {
+      const scan = await act.scanPage();
+      const refill = new Set(mappedFieldsFromErrors(prevErrors, scan.fields, FIELD_MAP));
+      if (refill.size) {
+        LOG(`  attempt ${attempt} (Tier 1, deterministic): error names → re-fill mapped field(s) [${[...refill].join(", ")}] from the profile (no AI).`);
+        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlyFieldNames: refill });
+        for (const r of (rOut.results || [])) {
+          r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
+          r.detail = "AI-4 Tier-1 deterministic re-fill — " + (r.detail || "");
+          mergeRemediationRecord(out, r);
+        }
+        actions.push({ tier: 1, refilled: [...refill] });
+        didSomething = true;
+      }
+    }
+
+    // ── Tier 2 (AI, LAST RESORT — only when the deterministic tiers couldn't act): parse the field
+    //    name + ask the AI for ONE bounded action (refill a named field / delete a duplicate entry / none). ──
+    if (!didSomething) {
+      const scan = await act.scanPage();
+      let rscan = null; try { rscan = await act.repeatingScan(); } catch (e) { /* flat-only */ }
+      const sections = rscan && rscan.sections ? rscan.sections : null;
+      const named = prevErrors.map((t) => parseErrorFieldName(t)).filter(Boolean);
+      const fieldsForAi = scan.fields.map((f) => {
+        const rec = out.results.find((r) => r.fieldName === f.fieldName);
+        return { fieldName: f.fieldName, label: f.label, widgetType: f.widgetType, after: rec ? rec.after : null };
+      });
+      const decision = await aiRemediateError(act, prevErrors, { fields: fieldsForAi, sections }, DEFAULT_BUDGETS);
+      LOG(`  attempt ${attempt} (Tier 2, AI): action=${decision.action}` +
+        (decision.field ? ` field=${decision.field}` : "") +
+        (decision.section ? ` section=${decision.section}#${decision.index}` : "") +
+        (named.length ? ` | error named: ${named.join(", ")}` : "") + ` (${decision.reason || ""})`);
+      if (decision.action === "refill") {
+        const f = scan.fields.find((x) => x.fieldName === decision.field);
+        if (f) {
+          const r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+          mergeRemediationRecord(out, Object.assign({ fieldName: f.fieldName, label: f.label, widgetType: f.widgetType }, r, {
+            flag: "ai-remediation", status: r.status === "filled" ? "filled_review" : r.status,
+            detail: `AI-4 Tier-2 refill "${decision.value}" — ` + (r.detail || decision.reason || "")
+          }));
+          actions.push({ tier: 2, action: "refill", field: decision.field, value: decision.value });
+          didSomething = true;
+        } else { LOG(`    AI named field "${decision.field}" not on the page — skipping.`); }
+      } else if (decision.action === "delete_entry") {
+        const del = await act.clickDeleteEntry(decision.section, decision.index);
+        LOG(`    delete_entry ${decision.section}#${decision.index}: ${JSON.stringify(del)}`);
+        mergeRemediationRecord(out, {
+          // widgetType "remediation" (NOT "section") so buildReviewBundle KEEPS it — a deletion leaves
+          // no field to review otherwise, and the plan wants the autonomous deletion conspicuous.
+          fieldName: `${decision.section}[${decision.index}]`, label: "Removed duplicate/extra entry", widgetType: "remediation",
+          status: "needs_review", flag: "ai-remediation", after: null,
+          detail: `AI-4 Tier-2 DELETED ${decision.section} entry #${decision.index} (${decision.reason || "duplicate/extra"}) — verify the remaining entries`
+        });
+        actions.push({ tier: 2, action: "delete_entry", section: decision.section, index: decision.index });
+        didSomething = decision.action ? (del && del.ok) : false;
+      } else {
+        LOG(`    AI declined (${decision.reason || "none"}) — no safe action.`);
+      }
+    }
+
+    if (!didSomething) { await repersistPageBundle(out, pageKey); return { advanced: false, reason: "no-action", attempts: attempt, actions }; }
+
+    // Record the remediation trail into the persisted bundle BEFORE the re-advance (so it's kept
+    // whether or not this attempt advances).
+    await repersistPageBundle(out, pageKey);
+
+    // ── re-Save & Continue (GUARDED — refuses on the review marker) + wait. ──
+    const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+    const click = await act.clickPageNext();
+    if (!click.clicked) return { advanced: false, reason: "click-refused:" + (click.refused || "?"), attempts: attempt, actions };
+    const res = await cdpWaitNextPage(prevSig);
+    if (res.sessionDead) return { sessionDead: true, attempts: attempt, actions };
+    if (res.advanced) return { advanced: true, attempts: attempt, actions };
+
+    // ── not advanced → HALT on NO-PROGRESS (error set unchanged); else continue. ──
+    let st2 = null; try { st2 = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
+    const newErrors = (st2 && st2.errorMarkers && st2.errorMarkers.samples) || [];
+    if (errorSetUnchanged(prevErrors, newErrors)) {
+      LOG(`  remediation made NO PROGRESS (error set unchanged after the action) — halting.`);
+      return { advanced: false, reason: "no-progress", attempts: attempt, actions, errors: newErrors };
+    }
+    LOG(`  error set changed (${prevErrors.length}→${newErrors.length}) — continuing.`);
+    prevErrors = newErrors;
+  }
+  return { advanced: false, reason: "cap-exhausted", attempts: REMEDIATION_MAX, actions };
 }
 
 // ============================================================================
@@ -2067,6 +2262,73 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — stuck-lock is the worst operator failure
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// AI-4 TEST HARNESS — stage a fixable validation error so AI-4 remediation fires.
+// The form fills correctly (no natural error) and the input-lock blocks the operator
+// from manually breaking a field mid-run, so the SW does it: fill the page → DELIBERATELY
+// clear a required, mapped text field (lock-immune, via the gated clear primitive) → Save &
+// Continue ERRORS → run the remediation loop. FIXABLE (default): Tier-1 clicks the error
+// anchor → focuses the field → re-fills from profile → ADVANCES. UNFIXABLE (opts.unfixable):
+// wrap clickPageNext to RE-CLEAR the target before each click → the error never clears →
+// the no-progress/cap halt fires CLEANLY (never loops, never submits). Run on a fully-
+// fillable page WITHOUT a required upload (page 1 / My Information). [CDP-TEST-AI4] console.
+// ============================================================================
+async function runCdpTestRemediation(tabId, profile, defaults, jobContext, opts) {
+  const unfixable = !!(opts && opts.unfixable);
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-TEST-AI4]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG(`AI-4 TEST (${unfixable ? "UNFIXABLE — watch the no-progress/cap halt" : "FIXABLE — watch Tier-1 re-fill + advance"}). Filling, then DELIBERATELY clearing a required field to trigger a Save & Continue error. Run on a fully-fillable page WITHOUT a required upload (page 1 / My Information).`);
+
+    const prepared = prepareProfile(profile);
+    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam (Tier-2 needs the AI toggle ON; Tier-1 works either way)
+    const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
+
+    // PERTURB: pick the first REQUIRED, MAPPED text field (Tier-1 can re-fill it from the profile),
+    // then blank it via the gated clear (lock-immune — bypasses the operator, passes the input-lock).
+    const scan = await act.scanPage();
+    const isMapped = (fn) => (typeof FIELD_MAP !== "undefined") && !!FIELD_MAP[fn];
+    const target = scan.fields.find((f) => f.widgetType === "text" && f.isRequired && isMapped(f.fieldName))
+      || scan.fields.find((f) => f.widgetType === "text" && f.isRequired)
+      || scan.fields.find((f) => f.widgetType === "text" && isMapped(f.fieldName));
+    if (!target) { LOG("no perturbable required/mapped text field on this page — run on My Information (page 1)."); return { ok: true, stopped: "no-target" }; }
+    const targetLoc = { wrapperSel: target.wrapperSel };
+    const clearTarget = async () => { await act.focusText(targetLoc, "input"); await act.clearText(); };
+    await clearTarget();
+    LOG(`PERTURBED: cleared "${target.label}" (${target.fieldName}) — Save & Continue should now error.`);
+
+    // UNFIXABLE: a thin wrapper that re-clears the target before EVERY Save & Continue, so the
+    // error never clears no matter what AI-4 re-fills → deterministic no-progress halt. Test-only.
+    const driveAct = unfixable
+      ? Object.assign({}, act, { clickPageNext: async () => { await clearTarget(); return act.clickPageNext(); } })
+      : act;
+
+    const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+    const click = await driveAct.clickPageNext();
+    LOG("initial Save & Continue:", JSON.stringify(click));
+    if (!click.clicked) { LOG(`advance refused (${click.refused}) — cannot test here.`); return { ok: true, stopped: "click-refused:" + (click.refused || "?") }; }
+    const res = await cdpWaitNextPage(prevSig);
+    if (res.advanced) { LOG(`⚠ page ADVANCED without an error — clearing "${target.fieldName}" didn't block Save & Continue (not actually required?). Try another page (My Information has required First/Last/Phone).`); return { ok: true, stopped: "advanced-no-error", target: target.fieldName }; }
+    if (res.sessionDead) { LOG("session dead — cannot test."); return { ok: true, stopped: "session-dead" }; }
+
+    // res.timeout → the EXPECTED validation error. Fire AI-4.
+    LOG(`Save & Continue blocked (expected${res.errorDetected ? ", detected fast via error markers" : ""}) → running AI-4 remediation.`);
+    const rem = await remediatePageErrors(driveAct, prepared, defaults, jobContext, out, pageKey, 1, LOG);
+    if (rem.sessionDead) { LOG("session dead during remediation."); return { ok: true, stopped: "session-dead" }; }
+    if (rem.advanced) { LOG(`✓✓ AI-4 FIXED it — advanced after ${rem.attempts} attempt(s). Actions: ${JSON.stringify(rem.actions)}`); return { ok: true, stopped: "remediated-advanced", attempts: rem.attempts, actions: rem.actions }; }
+    LOG(`AI-4 HALTED CLEANLY (${rem.reason}) after ${rem.attempts} attempt(s) — never looped, never submitted. Actions: ${JSON.stringify(rem.actions)}`);
+    return { ok: true, stopped: "remediation-halted", reason: rem.reason, attempts: rem.attempts, actions: rem.actions };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("test aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await removeInputLock();
     await cdpDetach();
   }
 }
@@ -2859,7 +3121,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-      const { out } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
+      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
       pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length });
 
       // ── (c.1) Required-upload guard (walk prereq 1, hold #1): a file_upload that didn't
@@ -2897,9 +3159,25 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
       if (res.timeout) {
-        LOG(`⚠ nav-timeout on page ${page} — clicked Save & Continue but the page neither advanced nor showed a session error. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        // AI-4: clicked Save & Continue but the page neither advanced nor died → a LIVE validation
+        // error (sessionLooksDead already excluded above). Attempt BOUNDED remediation before the
+        // dirty halt: Tier-0 dup-language / Tier-1 deterministic re-fill → Tier-2 AI, capped + halt-on-no-progress.
+        if (res.errorDetected) LOG(`page ${page} Save & Continue blocked — error markers detected fast (~1s).`);
+        const rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        // refresh the page-summary entry with the remediation outcome
+        pagesFilled[pagesFilled.length - 1].remediation = { attempts: rem.attempts, advanced: !!rem.advanced, reason: rem.reason || null, actions: rem.actions };
+        if (rem.sessionDead) {
+          LOG(`⚠⚠ SESSION EXPIRED during remediation on page ${page} — refresh, log in, reopen, retry.`);
+          const diag = await reportPageErrors(out);
+          return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+        }
+        if (rem.advanced) {
+          LOG(`✓ page ${page} → advanced after AI-4 remediation (${rem.attempts} attempt(s)).`);
+          continue; // top-of-loop re-checks review/session on the new page
+        }
+        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
-        return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+        return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
       LOG(`✓ page ${page} → advanced.`);
       // res.advanced → next iteration (top-of-loop re-checks review/session on the new page).
@@ -4626,7 +4904,16 @@ async function attachResume(base64, filename, mime) {
   const remaining = countItems();
   const cleared = remaining === 0;
   if (!cleared) {
-    return { attached: false, cleared: false, deletedCount, remaining, detail: `could not clear existing attachment(s) — removed ${deletedCount}, ${remaining} remain (confirm dialog or persistent stale node?)` };
+    // Diagnostic: if the delete didn't take, capture any visible confirm dialog/modal markup so the
+    // NEXT failure self-reports whether a dialog blocked it (the message's "confirm dialog" hypothesis)
+    // — without another recon round. (The primary suspect is the input-lock swallowing the synthetic
+    // delete-click; the SW bumps __apActing around this call to rule that out first.)
+    let dialog = null;
+    try {
+      const d = document.querySelector('[role="dialog"], [aria-modal="true"], [data-automation-id*="onfirm" i], [data-automation-id*="odal" i]');
+      if (d) dialog = { automationId: d.getAttribute("data-automation-id") || null, text: (d.textContent || "").trim().slice(0, 200) };
+    } catch (e) { /* ignore */ }
+    return { attached: false, cleared: false, deletedCount, remaining, dialog, detail: `could not clear existing attachment(s) — removed ${deletedCount}, ${remaining} remain` + (dialog ? ` (CONFIRM DIALOG present: "${dialog.text}")` : " (no dialog seen — likely the input-lock swallowed the delete-click; should be fixed by the __apActing bump)") };
   }
 
   // ── 2. Rebuild the File and attach via DataTransfer ──────────────────────

@@ -219,6 +219,7 @@ const DEFAULT_BUDGETS = {
   // ceiling = give-up only (survives laggy wifi — the page registers the value when it does).
   textReadCeilingMs: 6000,
   textReadIntervalMs: 60,
+  textFillAttempts: 2,    // self-heal: re-fill text/date once on a read-back mismatch (a WRONG value, not a slow one)
   typeJumpDelayMs: 700,   // type-to-jump chars → highlight settles
   arrowStepMs: 110,       // per arrow step (verified walk)
   maxArrowSteps: 60,      // walk bound — type-jump should land near; farther = something's off → needs_review
@@ -391,24 +392,37 @@ const fillTextCdp = async (act, loc, value, budgets, tag) => {
   const pre = await act.readTextValue(loc, tag);
   if (!pre) return { status: "error", detail: "no " + (tag || "input") + " in wrapper" };
   const before = pre.value;
-  const focusMethod = await act.focusText(loc, tag);
-  if (!focusMethod) return { status: "error", detail: "could not focus " + (tag || "input"), after: before };
-  await act.clearText(); // local DOM op; CDP clear→type events apply in order — no fixed settle needed
-  await act.typeText(value);
-  // Reactive read-back: POLL until the field reads back the COMPLETE typed value (survives any
-  // lag — laggy wifi, a throttled tick), NEVER a fixed sleep then a single read. `after === value`
-  // is the COMPLETE-state condition (not "something appeared") — the same lesson as the dropdown
-  // false-verify: a partial/momentary read must not satisfy it. Ceiling = give-up bound only.
-  let after = before;
-  const deadline = Date.now() + budgets.textReadCeilingMs;
-  do {
-    const read = await act.readTextValue(loc, tag);
-    after = read ? read.value : null;
-    if (after === value) break;
-    await act.delay(budgets.textReadIntervalMs);
-  } while (Date.now() < deadline);
-  if (after !== value) return { status: "needs_review", after, verified: false, detail: `read-back mismatch (typed via ${focusMethod}, field shows "${after}")` };
-  return { status: "filled", after, verified: true, detail: before ? `overwrote "${before}"` : null };
+  // SELF-HEAL retry: a read-back mismatch (the live "fFirmware…" stray-char bug) is a WRONG value,
+  // not a slow one — the reactive poll below already waits out lag, so a miss means a bad fill. Retry
+  // the whole focus→clear→type→poll up to budgets.textFillAttempts before flagging. The happy path is
+  // unchanged (attempt 1's poll matches on its first read); only a genuine miss pays the extra attempt.
+  const attempts = budgets.textFillAttempts || 1;
+  let after = before, focusMethod = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    focusMethod = await act.focusText(loc, tag);
+    if (!focusMethod) { if (attempt < attempts) continue; return { status: "error", detail: "could not focus " + (tag || "input"), after: before }; }
+    await act.clearText(); // local DOM op; CDP clear→type events apply in order — no fixed settle needed
+    await act.typeText(value);
+    // Reactive read-back: POLL until the field reads back the COMPLETE typed value (survives any
+    // lag — laggy wifi, a throttled tick), NEVER a fixed sleep then a single read. `after === value`
+    // is the COMPLETE-state condition (not "something appeared") — the same lesson as the dropdown
+    // false-verify: a partial/momentary read must not satisfy it. Ceiling = give-up bound only.
+    after = before;
+    const deadline = Date.now() + budgets.textReadCeilingMs;
+    do {
+      const read = await act.readTextValue(loc, tag);
+      after = read ? read.value : null;
+      if (after === value) break;
+      await act.delay(budgets.textReadIntervalMs);
+    } while (Date.now() < deadline);
+    if (after === value) {
+      let detail = before ? `overwrote "${before}"` : null;
+      if (attempt > 1) detail = (detail ? detail + " | " : "") + `self-healed on attempt ${attempt}`;
+      return { status: "filled", after, verified: true, detail };
+    }
+    // mismatch → re-focus/clear/type on the next attempt (the prior type landed a wrong value)
+  }
+  return { status: "needs_review", after, verified: false, detail: `read-back mismatch after ${attempts} attempt(s) (typed via ${focusMethod}, field shows "${after}")` };
 };
 
 // ── AI-1 dropdown helpers (shared open/settle + verified-blank close) ─────────
@@ -773,6 +787,54 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-eeo-commit-failed", detail: "AI EEO chose \"" + opt + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   if (declined) return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "eeo_declined", detail: "AI declined to guess a required demographic → neutral \"" + opt + "\"", options: enabledTexts, auditLoc: loc.wrapperSel };
   return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "ai-eeo-guess", confidence: ai.confidence, detail: "AI inferred a required demographic → \"" + opt + "\" (confident guess — VERIFY)", options: enabledTexts, auditLoc: loc.wrapperSel };
+};
+
+// AI-4 validation-error remediation DECISION (Tier 2). When Save & Continue stays blocked AFTER the
+// deterministic anchor re-fill, feed the AI the error text(s) + the page's fields + repeating sections
+// → ONE corrective action from a RESTRICTED set. The AI DECIDES here, never actuates — the SW loop
+// executes through the SAME fill path / clickDeleteEntry (bounded, capped, never submit). Returns
+// { action:"refill", field, value } | { action:"delete_entry", section, index } | { action:"none", reason }.
+const aiRemediateError = async (act, errorTexts, pageState, budgets) => {
+  const errs = (Array.isArray(errorTexts) ? errorTexts : []).filter(Boolean);
+  const fields = (pageState && Array.isArray(pageState.fields)) ? pageState.fields : [];
+  const sections = (pageState && pageState.sections) || null;
+  const system = "A job-application page failed its \"Save & Continue\" with the validation error(s) below. "
+    + "Decide ONE corrective action to clear the error, choosing ONLY from this restricted set:\n"
+    + "1. {\"action\":\"refill\",\"field\":\"<exact fieldName>\",\"value\":\"<corrected value>\"} — set a named field to a corrected value (a wrong/invalid/missing value the error names).\n"
+    + "2. {\"action\":\"delete_entry\",\"section\":\"<containerPrefix>\",\"index\":<0-based entry index>} — remove a duplicate/extra repeating-section entry (e.g. \"Duplicate ... entries are not allowed\").\n"
+    + "3. {\"action\":\"none\",\"reason\":\"...\"} — if you cannot safely fix it from the information given.\n"
+    + "Fix ONLY what the error explicitly names. NEVER invent unrelated data, never accept terms/consents, never submit. If unsure, choose \"none\".";
+  const user = "Validation error(s): " + JSON.stringify(errs)
+    + "\nPage fields (fieldName, label, widgetType, current value): "
+    + JSON.stringify(fields.map((f) => ({ fieldName: f.fieldName, label: f.label, widgetType: f.widgetType, value: f.after != null ? f.after : (f.value != null ? f.value : null) })))
+    + (sections ? "\nRepeating sections (containerPrefix → entry count): " + JSON.stringify(sections) : "")
+    + "\n\nReply ONLY with a JSON object and nothing else (one of the three action shapes above).";
+  const res = await act.llm({ system, user, maxTokens: 256 });
+  if (!res || !res.ok) return { action: "none", reason: "AI call failed — " + ((res && res.error) || "no reply") };
+  return parseRemediation(res.text);
+};
+
+// Parse + SANITIZE the remediation reply into a SAFE {action,...}. The restricted whitelist is
+// enforced HERE, never trusted from the model — a hallucinated "submit"/"click"/free-form action
+// can never escape this gate (everything unknown/malformed → {action:"none"}).
+const parseRemediation = (text) => {
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) { const mm = t.match(/\{[\s\S]*\}/); if (mm) { try { obj = JSON.parse(mm[0]); } catch (e2) { /* best-effort */ } } }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return { action: "none", reason: "unparseable remediation reply" };
+  const action = String(obj.action == null ? "" : obj.action).trim().toLowerCase();
+  if (action === "refill") {
+    const field = String(obj.field == null ? "" : obj.field).trim();
+    if (!field) return { action: "none", reason: "refill missing field" };
+    return { action: "refill", field, value: obj.value == null ? "" : String(obj.value), reason: String(obj.reason || "").trim() };
+  }
+  if (action === "delete_entry") {
+    const section = String(obj.section == null ? "" : obj.section).trim();
+    const index = Number.isInteger(obj.index) ? obj.index : parseInt(obj.index, 10);
+    if (!section || !Number.isInteger(index) || index < 0) return { action: "none", reason: "delete_entry missing section/index" };
+    return { action: "delete_entry", section, index, reason: String(obj.reason || "").trim() };
+  }
+  return { action: "none", reason: String(obj.reason || (action ? "unknown action: " + action : "no action")).trim() };
 };
 
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
@@ -1457,12 +1519,18 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
 };
 
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
-async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
+// `opts.onlyFieldNames` (a Set) = AI-4 TARGETED RE-FILL: fill ONLY those flat fields through the
+// SAME per-field loop (byte-identical to the full fill — no parallel re-impl, no drift) and skip
+// the section fold + the inline audit (the remediation's Save & Continue retry is the verification).
+// Default (no opts) = the full page fill, unchanged.
+async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
+  const only = opts && opts.onlyFieldNames ? opts.onlyFieldNames : null; // AI-4 targeted re-fill
   const scan = await act.scanPage();
   const results = [];
 
   for (const f of scan.fields) {
+    if (only && !only.has(f.fieldName)) continue; // AI-4: re-fill only the targeted field(s)
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
     const rawValue = mappedPath ? getByPath(profile, mappedPath) : undefined;
@@ -1617,8 +1685,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
   // is the PREPARED profile (the SW prepareProfile's it), so profile[itemsKey] carries the
   // annotated arrays. Driven in registry order.
   let rscan = null;
-  try { rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
-  if (rscan && (rscan.sections || rscan.addButtons)) {
+  try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
+  if (!only && rscan && (rscan.sections || rscan.addButtons)) {
     for (const sec of PAGE_SECTIONS) {
       const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
       const re = new RegExp(sec.headingRegex, "i");
@@ -1639,9 +1707,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn) {
   // → needs_review/audit-mismatch (after = the live truth); unre-readable → audit-unverifiable.
   // `auditEntries` (expected = the value just filled, BEFORE any mutation) is returned for the SW
   // to persist (the standalone re-audit). Flag-only — never auto-refills.
-  const auditEntries = auditEntriesFromResults(results);
-  const auditVerdicts = await reconcileAudit(act, auditEntries, budgets);
-  applyAuditVerdicts(results, auditVerdicts);
+  // (AI-4 targeted re-fill skips the inline audit — the remediation's Save & Continue retry verifies.)
+  const auditEntries = only ? [] : auditEntriesFromResults(results);
+  if (!only) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
@@ -1987,10 +2055,13 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
   const after = {};
   const trace = {};
   let allVerified = true;
-  for (const [seg, val] of segs) {
+  // Fill ONE segment: focus → type (typeChars, then insertText fallback) → reactive read-back poll.
+  // Returns { read, ok, focusRung, inputMethod }. The outer loop retries the WHOLE thing (self-heal,
+  // symmetric with fillTextCdp) so a focus flake or a wrong-value land gets a fresh attempt.
+  const fillSegment = async (seg, val) => {
     const focusRung = await act.focusDateSegment(loc, seg);
-    if (!focusRung) { trace[seg] = "focus-failed"; after[seg] = null; allVerified = false; continue; }
-    const attempt = async (how) => {
+    if (!focusRung) return { read: null, ok: false, focusRung: null, inputMethod: null };
+    const typeAndPoll = async (how) => {
       // NO clearText (Ctrl+A+Delete) — it spans the WHOLE date composite and resets the
       // active segment to Month, so per-char Day/Year digits pile into Month (the M34
       // M/D/Y bug; mechanics probe proved it the sole culprit). focusDateSegment
@@ -2010,15 +2081,23 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
       return { read: read ? read.value : null, ok: false };
     };
     let inputMethod = "typeChars";
-    let res = await attempt("typeChars");
+    let res = await typeAndPoll("typeChars");
     if (!res.ok) { // insertText fallback — re-focus first (typing may have shifted focus/auto-advanced)
       await act.focusDateSegment(loc, seg);
       inputMethod = "insertText";
-      res = await attempt("insertText");
+      res = await typeAndPoll("insertText");
     }
-    after[seg] = res.read;
-    trace[seg] = focusRung + "/" + (res.ok ? inputMethod : inputMethod + "-FAILED");
-    if (!res.ok) allVerified = false;
+    return { read: res.read, ok: res.ok, focusRung, inputMethod };
+  };
+  for (const [seg, val] of segs) {
+    let r = null;
+    for (let attempt = 1; attempt <= (b.textFillAttempts || 1); attempt++) {
+      r = await fillSegment(seg, val);
+      if (r.ok) { if (attempt > 1) trace[seg + "_healed"] = attempt; break; }
+    }
+    after[seg] = r ? r.read : null;
+    trace[seg] = (r && r.focusRung ? r.focusRung : "focus-failed") + "/" + (r && r.ok ? r.inputMethod : ((r && r.inputMethod) || "?") + "-FAILED");
+    if (!r || !r.ok) allVerified = false;
   }
 
   const afterStr = ["Month", "Day", "Year"].filter((s) => after[s] != null).map((s) => after[s]).join("/");
@@ -2079,21 +2158,58 @@ async function auditReReadActual(act, e) {
   } catch (err) { return { actual: null, readable: false }; }
 }
 
+// M40 re-fill (operator-chosen self-heal): re-fill ONE audited field with its RECORDED value
+// (e.expected — the value that matched + committed, so a single candidate re-clears the match
+// ladder), routed by widget type through the SAME handler the fill used. Used only on a mismatch,
+// best-effort (the caller try/catches): a transient post-fill clobber recovers; a deterministic
+// cross-field reset re-fails the re-read → stays flagged. THROWS if `act` lacks the fill primitives
+// (a minimal audit fake) → the caller treats it as "not attempted" and flags the original mismatch.
+async function auditRefillEntry(act, e, b) {
+  const loc = { wrapperSel: e.auditLoc };
+  const exp = e.expected;
+  switch (e.widgetType) {
+    case "text": case "textarea": return await fillTextCdp(act, loc, exp, b, e.auditTag);
+    case "dropdown": return await fillDropdownCdp(act, loc, [exp], b);
+    case "typeahead": return await fillTypeaheadCdp(act, loc, [exp], b);
+    case "hierarchical": return await fillSourceCdp(act, loc, [exp], b);
+    case "radio": return await fillRadioCdp(act, loc, [exp], b);
+    case "checkbox": return await fillCheckboxCdp(act, loc, String(exp) === "true", b);
+    case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(exp)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
+    default: throw new Error("audit re-fill: unsupported widget " + e.widgetType);
+  }
+}
+
 // reconcileAudit: re-read each entry's live value + classify match / mismatch / unverifiable.
 // One settle first (delayFull — the page's render takes real wall-clock; the foreground
 // speedup must not shorten it). Pure verdict list; the caller (inline or SW) acts on it.
-async function reconcileAudit(act, entries, budgets) {
+// opts.refillOnMismatch (INLINE audit only): on a mismatch, attempt ONE re-fill with the recorded
+// value + re-read; recovered ⇒ "recovered" (kept filled + a note), still wrong ⇒ "mismatch". The
+// standalone re-audit omits it (stays FLAG-ONLY — auto-correcting a manual perturbation re-check
+// would undermine its diagnostic purpose).
+async function reconcileAudit(act, entries, budgets, opts) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const norm = apMatch.normalize;
+  const refillOnMismatch = !!(opts && opts.refillOnMismatch);
+  const classify = (e, actual, readable) => {
+    if (!readable || actual === null) return "unverifiable";
+    if (e.widgetType === "text" || e.widgetType === "textarea" || e.widgetType === "checkbox") return actual === e.expected ? "match" : "mismatch";
+    if (e.widgetType === "date") return auditDateMatches(actual, e.expected) ? "match" : "mismatch";
+    return norm(actual) === norm(e.expected) ? "match" : "mismatch"; // dropdown / radio / typeahead / source
+  };
   await act.delayFull(b.auditSettleMs);
   const verdicts = [];
   for (const e of entries) {
-    const { actual, readable } = await auditReReadActual(act, e);
-    let verdict;
-    if (!readable || actual === null) verdict = "unverifiable";
-    else if (e.widgetType === "text" || e.widgetType === "textarea" || e.widgetType === "checkbox") verdict = actual === e.expected ? "match" : "mismatch";
-    else if (e.widgetType === "date") verdict = auditDateMatches(actual, e.expected) ? "match" : "mismatch";
-    else verdict = norm(actual) === norm(e.expected) ? "match" : "mismatch"; // dropdown / radio / typeahead / source
+    let { actual, readable } = await auditReReadActual(act, e);
+    let verdict = classify(e, actual, readable);
+    if (verdict === "mismatch" && refillOnMismatch) {
+      try {
+        await auditRefillEntry(act, e, b);
+        const re = await auditReReadActual(act, e);
+        const v2 = classify(e, re.actual, re.readable);
+        if (v2 === "match") { verdict = "recovered"; actual = re.actual; }
+        else if (re.actual !== null) { actual = re.actual; } // surface the latest live truth on the still-mismatch flag
+      } catch (err) { /* act lacks fill primitives / re-fill threw → flag the ORIGINAL mismatch */ }
+    }
     verdicts.push({ key: e.key, widgetType: e.widgetType, expected: e.expected, actual, verdict });
   }
   return verdicts;
@@ -2111,6 +2227,12 @@ function applyAuditVerdicts(results, verdicts) {
     if (v.verdict === "match") continue;
     const rec = (results || []).find((r) => r.fieldName === v.key);
     if (!rec) continue;
+    if (v.verdict === "recovered") {
+      // M40 self-heal: the field drifted post-fill but a re-fill restored it — KEEP it filled/verified
+      // (rec.after already equals the value), just note the auto-correction. NOT needs_review.
+      rec.detail = (rec.detail ? rec.detail + " | " : "") + `AUDIT: drifted post-fill, re-filled to "${v.actual}"`;
+      continue;
+    }
     rec.verified = false;
     rec.status = "needs_review";
     if (v.verdict === "mismatch") {
@@ -2194,6 +2316,7 @@ function buildReviewBundle(results, meta) {
       else if (rec.flag === "ai-eeo-guess") reason = "ai_eeo_inferred";        // AI-3: a confident DEMOGRAPHIC guess on a required EEO field — VERIFY
       else if (rec.flag === "ai-choice-sensitive") reason = "ai_inferred_sensitive";
       else if (rec.flag === "ai-choice") reason = "ai_inferred";
+      else if (rec.flag === "ai-remediation") reason = "ai_remediation";       // AI-4: a field the bot autonomously re-filled/deleted to clear a Save & Continue error — VERIFY
       else reason = "ai_no_answer"; // ai-nomatch / ai-no-options / ai-commit-failed / ai-text-commit-failed / ai-canon-* / ai-eeo-* / ai-error
     }
     else if (rec.flag === "eeo_declined") reason = "eeo_declined";             // AI-3: the AI declined to guess a required demographic → neutral decline
@@ -2269,5 +2392,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation };
 }
