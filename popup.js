@@ -456,6 +456,36 @@ document.getElementById("cdp-ta-stray-recon").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-fos-recon").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
+  setStatus(`FoS option recon ("${labelRegex}", READ-ONLY)… open My Experience (page 2). See [CDP-FOS-RECON] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FOS_RECON", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("FoS recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.found === false) {
+      setStatus("No matching typeahead on this page — run on the page with the field (page 2 for Field of Study).");
+    } else {
+      setStatus(`FoS recon done — on-open ${resp.onOpenCount} opt(s); ${resp.unchanged ? "field unchanged ✓" : "⚠ field MODIFIED — restore it"}. See the [CDP-FOS-RECON] verdict.`);
+    }
+  });
+});
+
+document.getElementById("cdp-fos-capture").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
+  setStatus(`FoS capture-probe ("${labelRegex}", READ-ONLY)… open My Experience (page 2). See [CDP-FOS-CAPTURE] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FOS_CAPTURE", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("FoS capture failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.found === false) {
+      setStatus("No matching typeahead on this page — run on page 2 (Field of Study).");
+    } else {
+      setStatus(`FoS capture done — ${resp.count} option(s) in ${resp.ms}ms; ${resp.unchanged ? "field unchanged ✓" : "⚠ field MODIFIED — restore it"}. See [CDP-FOS-CAPTURE].`);
+    }
+  });
+});
+
 // ── M16.2: resume upload → IndexedDB ────────────────────────────────────────
 // One fixed resume, stored as base64 under resume:default (db.js, loaded before
 // this script). The SW reads these bytes and passes them as a string into the

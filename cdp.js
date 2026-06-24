@@ -951,6 +951,66 @@ function cdpReadTaState(wrapperSel) {
   };
 }
 
+// FoS option CAPTURE (Round 2): scroll-accumulate a VIRTUALIZED typeahead's full option list,
+// FAST + safe. Runs ENTIRELY in-page (one cdpEval, awaitPromise) → frame-paced via rAF, NO per-step
+// SW round-trips, so it finishes in well under a second (a manual scroll is ~1s). READ-ONLY: it
+// only sets scrollTop + reads [role="option"] text — NO click / type / Enter / arrow, so no listbox
+// highlight ever arms (FoS is the stray-prone field). Returns the de-duped, in-order option list +
+// scroll metrics so the SW can confirm the bottom was reached (complete) vs a cap hit (truncated).
+async function cdpScrapeTaOptions(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, error: "no wrapper" };
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  const acId = sb ? sb.getAttribute("aria-controls") : null;
+  const acEl = acId ? document.getElementById(acId) : null;
+  const optSel = '[role="option"]';
+  const root = (acEl && acEl.querySelector(optSel)) ? acEl : document;
+  const curOpts = () => Array.from(root.querySelectorAll(optSel))
+    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]'));
+  // Scroll container = the nearest scrollable ancestor of an option (overflow-y auto/scroll +
+  // scrollHeight > clientHeight); fall back to acEl / the option's parent.
+  const findScroller = () => {
+    let el = curOpts()[0] || acEl;
+    for (let i = 0; i < 8 && el; i++) {
+      const cs = window.getComputedStyle(el);
+      if (el.scrollHeight > el.clientHeight + 4 && /(auto|scroll)/.test(cs.overflowY)) return el;
+      el = el.parentElement;
+    }
+    return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
+  };
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); // 2 frames: let the virtualizer render
+  const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
+  const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
+  const sc = findScroller();
+  collect();
+  let steps = 0, stable = 0, atBottom = false;
+  const MAX_STEPS = 60; // safety bound — a curated FoS list is tens of options / a few windows
+  if (sc) {
+    sc.scrollTop = 0; await frame(); collect();
+    while (steps < MAX_STEPS) {
+      const before = seen.size;
+      const prevTop = sc.scrollTop;
+      sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight, sc.scrollHeight);
+      await frame();
+      collect();
+      steps++;
+      atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
+      const movedNothing = sc.scrollTop === prevTop;
+      if (seen.size === before && (atBottom || movedNothing)) { if (++stable >= 2) break; } else stable = 0;
+    }
+  }
+  const options = Array.from(seen.keys());
+  return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
+    scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
+}
+
 // scrollIntoView + fresh rect of the VISIBLE [role="option"] whose trimmed text
 // equals `text` (chip lists excluded — same scrape rules as cdpReadTaState's
 // page-wide scope). Text-keyed, not index-keyed.
@@ -1281,6 +1341,10 @@ function makeCdpActuation(llmConfig) {
     typeInSearch: (text) => cdpTypeChars(text, 40),
     clearSearch: () => cdpSelectAllDelete(),         // trusted clear (focused searchBox)
     focusSearchBox: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    // FoS Round 3: scroll-accumulate the FULL virtualized option list (read-only, in-page,
+    // frame-paced → <1s). Used by captureFieldOptions to populate the bundle entry's
+    // options for the summary searchable editor. NO commit (only scrollTop + reads).
+    scrapeTaOptions: (loc) => cdpEval(cdpScrapeTaOptions, loc.wrapperSel),
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
     // shifts between the settle read and the click; a missed click dismisses
     // (no-op) rather than mis-commits, and the chip gate verifies either way.

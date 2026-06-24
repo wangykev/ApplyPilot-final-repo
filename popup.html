@@ -65,6 +65,15 @@
          Reads chip/activeText/firstOption between each resting step. Run on page 2.
          [CDP-TA-STRAY] in the SW console. -->
     <button id="cdp-ta-stray-recon">CDP recon: typeahead stray (page 2; uses label below)</button>
+    <!-- FoS OPTION-ENUMERATION RECON (read-only): does the Field-of-Study typeahead enumerate a
+         bounded option list (on open / a broad search) or is it server-search-only? Decides whether
+         a later round can capture all options for an editable summary typeahead. Uses the label
+         input (default "field of study"). Run on page 2. [CDP-FOS-RECON] in the SW console. -->
+    <button id="cdp-fos-recon">CDP recon: FoS options (read-only; page 2; uses label below)</button>
+    <!-- FoS CAPTURE-PROBE (read-only): prove the FAST in-page scroll-accumulate scrape gets the
+         COMPLETE bounded FoS option list (frame-paced, <1s). Uses the label input. Page 2.
+         [CDP-FOS-CAPTURE] in the SW console. -->
+    <button id="cdp-fos-capture">CDP FoS capture-probe (read-only; fast scroll-scrape; page 2)</button>
     <!-- INPUT-LOCK RECON: probe whether an operator input-lock is feasible — does a
          pointer-events overlay block the bot's OWN cdpClickAt; does a keydown-blocker eat
          insertText vs per-char keys; the __apActing flag-gate cost + the toggle-timing

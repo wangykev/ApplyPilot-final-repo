@@ -326,6 +326,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // FoS OPTION-ENUMERATION RECON (read-only): does the Field-of-Study typeahead enumerate a
+  // bounded option list (on open / a broad search) or is it server-search-only? Decides whether
+  // a later round can capture entry.options for an editable summary typeahead. Label regex from
+  // the ta-label input (default "field of study"). Run on My Experience (page 2).
+  if (message.type === "RUN_CDP_FOS_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpFosRecon(tab.id, String(message.labelRegex || ""));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
+  // FoS OPTION CAPTURE-PROBE (read-only): prove the fast in-page scroll-accumulate scrape gets the
+  // COMPLETE bounded FoS option list (before wiring it into the fill + the summary typeahead). Page 2.
+  if (message.type === "RUN_CDP_FOS_CAPTURE") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpFosCapture(tab.id, String(message.labelRegex || ""));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // LLM TEST-CONNECTION (AI-0): round-trip a trivial prompt through the configured provider
   // to prove the call path + key + host_permissions BEFORE wiring the AI into the fill. The
   // popup sends the current config (test-before-save). No tab/attach needed (direct SW fetch).
@@ -2570,6 +2596,191 @@ async function runCdpTaStrayRecon(tabId, labelRegexStr) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("typeahead-stray recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// FoS OPTION-ENUMERATION RECON (read-only) — does the Field-of-Study typeahead enumerate a
+// BOUNDED option list (on open / a broad search) or is it server-search-only? The answer decides
+// whether a later round can capture entry.options for an editable summary typeahead. READ-MOSTLY:
+// broad multi-match probes (no single-exact autocommit), a chip-guard after each Enter, and a
+// DISARM-verified close + a SETTLED re-read confirming the field is unchanged (FoS is THE stray-
+// prone field — open-then-dismiss + a delayed stray are exactly what bit the earlier recons).
+// ============================================================================
+async function runCdpFosRecon(tabId, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-FOS-RECON]", ...a);
+  const eq = (a, b) => String(a == null ? "" : a).trim().toLowerCase() === String(b == null ? "" : b).trim().toLowerCase();
+  let re;
+  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+
+    // Locate the typeahead by label — repeating-section entries first, then flat (mirrors runCdpTaStrayRecon).
+    let loc = null, where = null;
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
+        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+      }
+      if (loc) break;
+    }
+    if (!loc) {
+      const ps = await cdpEval(cdpPageScan);
+      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
+    }
+    if (!loc) { LOG(`no typeahead matching /${re.source}/ on this page — run on the page with the field (page 2 for Field of Study).`); return { ok: true, found: false }; }
+
+    const ensureFocused = async () => {
+      let st = await act.readTypeahead(loc);
+      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); }
+      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
+      return await act.readTypeahead(loc);
+    };
+
+    const pre = await act.readTypeahead(loc);
+    const preChip = ((pre && pre.chips) || []).join("; ");
+    LOG(`probing ${where} (${loc.wrapperSel}). pre-fill chip = "${preChip}". READ-ONLY (broad multi-match probes; chip-guard + settled unchanged-check).`);
+
+    // (1) ON-OPEN read — no typing. Does FoS render a default option list on open?
+    let st = await ensureFocused();
+    const onOpenCount = st && st.pageWide ? st.pageWide.count : 0;
+    const onOpenSample = (st && st.pageWide && st.pageWide.texts) ? st.pageWide.texts.slice(0, 12) : [];
+    LOG(`ON-OPEN: ${onOpenCount} option(s) rendered (un-capped count; texts sample 40-cap). sample: ${JSON.stringify(onOpenSample)}`);
+
+    // (2) BROAD multi-match probes (many matches → no single-exact autocommit). Read count + sample.
+    const probes = ["a", "e", "s", "engineering", "science", "art"];
+    const results = [];
+    let strayed = false;
+    for (const q of probes) {
+      await ensureFocused();
+      await act.clearSearch(); await act.delayFull(400);
+      await act.typeInSearch(q); await act.delayFull(500);
+      await act.pressEnter(); await act.delayFull(1400);
+      const s = await act.readTypeahead(loc);
+      const count = s && s.pageWide ? s.pageWide.count : 0;
+      const sample = (s && s.pageWide && s.pageWide.texts) ? s.pageWide.texts.slice(0, 10) : [];
+      const chipNow = ((s && s.chips) || []).join("; ");
+      const banner = !!(s && s.banner);
+      results.push({ q, count, banner, sample });
+      LOG(`  q="${q}" → ${count} option(s)${banner ? " [No-matches banner]" : ""} | sample: ${JSON.stringify(sample)}`);
+      if (!eq(chipNow, preChip)) { strayed = true; LOG(`  ⚠ chip CHANGED to "${chipNow}" on q="${q}" — an unintended autocommit; STOPPING probes.`); break; }
+    }
+
+    // (3) SAFE close: clear → DISARM (re-focus + poll activeText null, real-time) → Escape → SETTLED re-read.
+    await act.clearSearch(); await act.delayFull(500);
+    await ensureFocused();
+    const t0 = Date.now();
+    let ds = await act.readTypeahead(loc);
+    while (ds && ds.activeText != null && Date.now() - t0 < 4000) { await act.delayFull(300); ds = await act.readTypeahead(loc); }
+    await act.pressEscape(); await act.delayFull(700);
+    await act.delayFull(1300); // settle: a delayed stray commits AFTER the immediate read (the earlier false-clean)
+    const endChip = ((await act.readTypeahead(loc)).chips || []).join("; ");
+    const unchanged = eq(endChip, preChip);
+
+    // (4) Verdict heuristic (raw counts are the real answer; this is a hint).
+    const maxProbe = results.reduce((m, r) => Math.max(m, r.count), 0);
+    const big = Math.max(onOpenCount, maxProbe);
+    const verdict = big >= 10
+      ? `LIKELY ENUMERABLE — a broad read surfaced ${big} options (size ~${big}; may be a virtualized FLOOR — capture would raise the 40-text cap + scroll). Round 2 can capture entry.options.`
+      : (onOpenCount === 0 && maxProbe > 0 && maxProbe < 10)
+        ? `LIKELY SERVER-SEARCH / NARROW — nothing on open; broad queries returned only ${maxProbe} (server filters per-query). "All options" not cheaply capturable → keep the form-edit note.`
+        : `INCONCLUSIVE — on-open ${onOpenCount}, max broad ${maxProbe}. Re-run / try other probes.`;
+    LOG("════ VERDICT ════");
+    LOG(verdict);
+    LOG(`field left ${unchanged ? "UNCHANGED ✓ (chip still \"" + preChip + "\")" : "⚠ MODIFIED to \"" + endChip + "\" — restore Field of Study manually"}.`);
+    if (strayed) LOG("a stray committed during probing (flagged above) — verify/fix the field on the form.");
+    return { ok: true, found: true, onOpenCount, probes: results, verdict, unchanged, strayed, preChip, endChip };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("FoS option recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// FoS OPTION CAPTURE-PROBE (read-only) — prove the FAST in-page scroll-accumulate scrape gets the
+// COMPLETE bounded option list (the Round-1 verdict was "enumerable but virtualized"). Open FoS →
+// cdpScrapeTaOptions (one in-page eval, frame-paced, <1s) → log the full list + scroll metrics →
+// stray-safe close + SETTLED unchanged-check. Read-only (the scrape only scrolls + reads).
+// ============================================================================
+async function runCdpFosCapture(tabId, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-FOS-CAPTURE]", ...a);
+  const eq = (a, b) => String(a == null ? "" : a).trim().toLowerCase() === String(b == null ? "" : b).trim().toLowerCase();
+  let re;
+  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+
+    // Locate the typeahead by label — repeating entries first, then flat (mirrors runCdpFosRecon).
+    let loc = null, where = null;
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
+        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+      }
+      if (loc) break;
+    }
+    if (!loc) {
+      const ps = await cdpEval(cdpPageScan);
+      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
+    }
+    if (!loc) { LOG(`no typeahead matching /${re.source}/ on this page — run on page 2 (Field of Study).`); return { ok: true, found: false }; }
+
+    const ensureFocused = async () => {
+      let st = await act.readTypeahead(loc);
+      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); }
+      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
+      return await act.readTypeahead(loc);
+    };
+
+    const pre = await act.readTypeahead(loc);
+    const preChip = ((pre && pre.chips) || []).join("; ");
+    LOG(`capturing ${where} (${loc.wrapperSel}). pre-fill chip = "${preChip}". READ-ONLY scroll-scrape (in-page, fast).`);
+
+    await ensureFocused(); // open the list
+
+    const t0 = Date.now();
+    const scrape = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
+    const ms = Date.now() - t0;
+    if (!scrape || !scrape.ok) { LOG("scrape failed:", JSON.stringify(scrape)); }
+    else {
+      LOG(`scraped ${scrape.count} option(s) in ${ms}ms (${scrape.steps} scroll step(s); scroller ${scrape.scrollerFound ? "found" : "NOT found"}; ` +
+        `${scrape.atBottom ? "reached bottom ✓" : "did NOT reach bottom"}${scrape.cappedOut ? " ⚠ HIT STEP CAP (likely truncated)" : ""}; ` +
+        `scrollTop ${scrape.scrollTop}/${scrape.scrollHeight}, window ${scrape.clientHeight}).`);
+      LOG("FULL option list:");
+      (scrape.options || []).forEach((o, i) => LOG(`    ${i + 1}. ${o}`));
+    }
+
+    // Stray-safe close: disarm any armed highlight (none should arm — no type/Enter/arrow) + Escape + settled re-read.
+    await ensureFocused();
+    const tD = Date.now();
+    let ds = await act.readTypeahead(loc);
+    while (ds && ds.activeText != null && Date.now() - tD < 4000) { await act.delayFull(300); ds = await act.readTypeahead(loc); }
+    await act.pressEscape(); await act.delayFull(700);
+    await act.delayFull(1300); // settle: catch a delayed stray AFTER the immediate read
+    const endChip = ((await act.readTypeahead(loc)).chips || []).join("; ");
+    const unchanged = eq(endChip, preChip);
+    LOG(`field left ${unchanged ? "UNCHANGED ✓ (chip still \"" + preChip + "\")" : "⚠ MODIFIED to \"" + endChip + "\" — restore Field of Study manually"}.`);
+    LOG(scrape && scrape.ok && scrape.atBottom && !scrape.cappedOut
+      ? "VERDICT: complete bounded list captured — Round 3 can store this as entry.options for the summary typeahead."
+      : "VERDICT: scrape INCOMPLETE (no bottom / cap hit / failed) — fix the scroll loop before integrating.");
+    return { ok: true, found: true, count: scrape ? scrape.count : 0, options: scrape ? scrape.options : [], scrape, ms, unchanged, preChip, endChip };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("FoS capture-probe aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
