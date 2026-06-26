@@ -1370,6 +1370,11 @@ function makeCdpActuation(llmConfig) {
     pressEnter: () => cdpKeyTap(CDP_KEYS.enter),
     pressEscape: () => cdpKeyTap(CDP_KEYS.escape),
     pressSpace: () => cdpKeyTap(CDP_KEYS.space),
+    // The ONLY clean non-committing typeahead/source exit (recon 2026-06-26): Enter commits the armed
+    // row; Escape hides the popup but KEEPS focus + the armed row → the next field's focus blur-commits
+    // the stray; Tab blurs and ABANDONS the armed row without committing. cdpKeyTap is counter-gated so
+    // the bot's own Tab passes the input-lock.
+    pressTab: () => cdpKeyTap(CDP_KEYS.tab),
     // Last resort only (recon: out-of-view coordinate clicks dismiss the popup;
     // Enter-commit is primary) — scrollIntoView makes the coordinate paintable.
     clickOptionByIndex: async (loc, index) => {

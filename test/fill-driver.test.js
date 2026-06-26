@@ -235,6 +235,15 @@ function makeFakeAct(fields, opts) {
       // across the Escape while the VALUE stays the placeholder → must still read blank:true.
       if (openField) { if (openField.strayValueOnEscape) openField.triggerText = openField.strayValueOnEscape; if (!openField.escapeWontClose) openField.open = false; }
     },
+    pressTab: async () => {
+      log.push(["pressTab"]);
+      // Tab is the ONLY clean non-committing exit (recon 2026-06-26): it blurs + ABANDONS the armed
+      // row WITHOUT committing → chips unchanged (the CORRECT behavior, no flag). strayChipOnTab
+      // models a hypothetical tenant where Tab STILL commits an armed row-0 — the strayed-check
+      // backstop must then flag it (overwrite-stray), never a false "kept original".
+      if (focusedTa) { if (focusedTa.strayChipOnTab) focusedTa.chips = [focusedTa.strayChipOnTab]; focusedTa._open = false; }
+      if (focusedSrc) { if (focusedSrc.strayChipOnTab) focusedSrc.chips = [focusedSrc.strayChipOnTab]; focusedSrc._open = false; }
+    },
 
     // ── source (backlog C) — filter-Enter only (commit is clickSourceLeaf) ──
     openSource: async (loc) => {
@@ -1449,7 +1458,7 @@ test("overwrite: mismatched pre-fill + matching candidate → filled_review / ov
   assert.deepStrictEqual(field.chips, ["United States of America (+1)"], "REPLACE — exactly one chip, the new value");
 });
 
-test("overwrite: no candidate matches → needs_review / overwrite-nomatch-original-kept, ORIGINAL preserved + resting {chips:[original], query:''}", async () => {
+test("overwrite: no candidate matches → needs_review / overwrite-nomatch-original-kept, ORIGINAL preserved + Tab-blur exit", async () => {
   const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { banner: true } } });
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
@@ -1459,19 +1468,20 @@ test("overwrite: no candidate matches → needs_review / overwrite-nomatch-origi
   assert.strictEqual(rec.after, "Canada (+1)");                          // the original, NOT empty
   assert.deepStrictEqual(rec.overwrite, { original: "Canada (+1)", refilled: false });
   assert.deepStrictEqual(field.chips, ["Canada (+1)"], "original chip NEVER destroyed on a no-match");
-  assert.strictEqual(field._value, "", "leftover filter text cleared — field rests clean");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "exited via Tab (the only clean non-committing exit)");
+  assert.ok(!act.log.some(([m]) => m === "pressEscape"), "NOT via Escape (Escape keeps the armed row → next-field stray)");
 });
 
-test("overwrite no-match: the resting dismissal STRAYS the chip (armed row-0 race) → needs_review/overwrite-stray, NEVER a false keep", async () => {
-  // The fieldOfStudy "Accounting" class: the no-match search arms row-0; if the exit/dismiss
-  // commits it despite the disarm-verify, the strayed-check must FLAG the live value (not report
-  // a false "kept original"). Models the stray via strayChipOnEscape.
-  const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { banner: true } }, strayChipOnEscape: "Accounting" });
+test("overwrite no-match: a post-Tab chip differing from the original (stray backstop) → needs_review/overwrite-stray, NEVER a false keep", async () => {
+  // The fieldOfStudy "Accounting" class: the no-match search arms row-0. Tab is meant to abandon it,
+  // but on a hypothetical tenant where Tab STILL commits the armed row, the strayed-check must FLAG
+  // the live value (not report a false "kept original"). Models the stray via strayChipOnTab.
+  const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { banner: true } }, strayChipOnTab: "Accounting" });
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "overwrite-stray", "a strayed dismissal is flagged, not a false keep");
+  assert.strictEqual(rec.flag, "overwrite-stray", "a strayed Tab-exit is flagged, not a false keep");
   assert.strictEqual(rec.after, "Accounting", "surfaces the LIVE strayed value, not the original");
 });
 
@@ -1606,6 +1616,8 @@ test("typeahead: searchBox focus cannot be confirmed → ZERO actuation, needs_r
   assert.ok(!act.log.some(([m]) => m === "clearSearch"), "no Ctrl+A clear");
   assert.ok(!act.log.some(([m]) => m === "typeInSearch"), "no typing");
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
+  // …but DO blur via Tab on the way out: a prior candidate may have armed row-0; Tab abandons it.
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "blurred via Tab so no armed row can stray to the next field");
 });
 
 test("typeahead: searchBox focus RACES on the first try → open/focus retry RECOVERS, commits", async () => {
@@ -1657,6 +1669,7 @@ test("main loop echo-guard (supersedes M39.2 proceed-to-Enter): echo NEVER confi
   const rec = out.results[0];
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(enters(act), 0, "NEVER pressed Enter — the echo never confirmed the full value landed in a focused box");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "blurred via Tab on the could-not-type bail — no armed row left to stray");
 });
 
 // ── M27 flag taxonomy (Commit A) ────────────────────────────────────────────
@@ -1822,6 +1835,7 @@ test("source: searchBox focus cannot be confirmed → ZERO actuation, needs_revi
   assert.ok(!act.log.some(([m]) => m === "typeInSourceSearch"), "no typing");
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
   assert.ok(!act.log.some(([m]) => m === "clickSourceLeaf"), "no leaf click");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "blurred via Tab (lockstep with typeahead)");
 });
 
 test("source: pre-filled chip matching a candidate → kept with ZERO actuation", async () => {
@@ -1842,14 +1856,15 @@ test("source overwrite: mismatched pre-fill + matching candidate → filled_revi
   assert.deepStrictEqual(field.chips, ["LinkedIn"]);
 });
 
-test("source overwrite: no candidate matches → needs_review / overwrite-nomatch-original-kept, original preserved + resting", async () => {
+test("source overwrite: no candidate matches → needs_review / overwrite-nomatch-original-kept, original preserved + Tab-blur exit (lockstep)", async () => {
   const field = srcField({ chips: ["Family"], filterMap: { LinkedIn: { banner: true } } });
-  const { rec } = await runSource(field, ["LinkedIn"]);
+  const { rec, act } = await runSource(field, ["LinkedIn"]);
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.flag, "overwrite-nomatch-original-kept");
   assert.strictEqual(rec.after, "Family");
   assert.deepStrictEqual(field.chips, ["Family"], "original source chip never destroyed");
-  assert.strictEqual(field._value, "", "leftover source filter text cleared");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "exited via Tab (lockstep with typeahead)");
+  assert.ok(!act.log.some(([m]) => m === "pressEscape"), "NOT via Escape");
 });
 
 // M36.1 tier-aware pre-filled guard — source, in LOCKSTEP with the typeahead tests above.
@@ -1902,11 +1917,11 @@ test("typeahead: walk-dry but a stray chip is present → record reports it, nev
     fallbackTexts: ["Afghanistan (+93)"],
     filterMap: { "United States of America (+1)": { banner: true } }
   })]);
-  // The stray exists only at walk-END (the honesty read happens after Escape):
-  // flip a flag in pressEscape, inject the chip on reads after it.
-  const origRead = act.readTypeahead, origEsc = act.pressEscape;
+  // The stray exists only at walk-END (the honesty read inside tabBlurExit happens after the Tab):
+  // flip a flag in pressTab, inject the chip on reads after it.
+  const origRead = act.readTypeahead, origTab = act.pressTab;
   let walkEnded = false;
-  act.pressEscape = async (...a) => { walkEnded = true; return origEsc(...a); };
+  act.pressTab = async (...a) => { walkEnded = true; return origTab(...a); };
   act.readTypeahead = async (loc) => {
     const st = await origRead(loc);
     if (walkEnded) st.chips = ["Afghanistan (+93)"];
@@ -2027,6 +2042,7 @@ function makeFakeRepeatAct(state) {
       f.triggerText = text; f._open = false; return true; // commit: trigger now shows the picked option
     },
     pressEscape: async () => { log.push(["pressEscape"]); state.entries.forEach((e) => e.fields.forEach((f) => { f._open = false; })); },
+    pressTab: async () => { log.push(["pressTab"]); state.entries.forEach((e) => e.fields.forEach((f) => { f._open = false; })); },
     // date segments (M36): a date field carries `segments: { Month/Day/Year: { value } }`.
     // focusDateSegment returns the triple-click-display rung; typeDigits/typeText WRITE the
     // focused segment's value (so a test can prove the write actually happened).
@@ -2999,7 +3015,8 @@ function makeCaptureAct(opts = {}) {
     openTypeahead: (loc) => { calls.push(["openTypeahead", loc.wrapperSel]); return Promise.resolve(true); },
     readTypeahead: (loc) => { calls.push(["readTypeahead", loc.wrapperSel]); return Promise.resolve(taState); },
     focusSearchBox: (loc) => { calls.push(["focusSearchBox", loc.wrapperSel]); return Promise.resolve(true); },
-    pressEscape: () => { calls.push(["pressEscape"]); return Promise.resolve(); }
+    pressEscape: () => { calls.push(["pressEscape"]); return Promise.resolve(); },
+    pressTab: () => { calls.push(["pressTab"]); return Promise.resolve(); }
   };
   if (!opts.noScrape) act.scrapeTaOptions = (loc) => { calls.push(["scrapeTaOptions", loc.wrapperSel]); return Promise.resolve(scrape); };
   return { act, calls };
@@ -3025,12 +3042,13 @@ test("FoS capture: no-op (null, no calls) when the substrate lacks scrapeTaOptio
   assert.strictEqual(calls.length, 0); // returned before touching the field
 });
 
-test("FoS capture is READ-ONLY: never commits — only open/read/focus/scrape/escape (named invariant)", async () => {
+test("FoS capture is READ-ONLY: never commits — only open/read/focus/scrape, exits via Tab (named invariant)", async () => {
   const { act, calls } = makeCaptureAct();
   await captureFieldOptions(act, CAP_LOC, CAP_BUDGETS);
-  const allowed = new Set(["delay", "delayFull", "openTypeahead", "readTypeahead", "focusSearchBox", "pressEscape", "scrapeTaOptions"]);
+  const allowed = new Set(["delay", "delayFull", "openTypeahead", "readTypeahead", "focusSearchBox", "pressTab", "scrapeTaOptions"]);
   assert.deepStrictEqual(calls.filter((c) => !allowed.has(c[0])), [], "capture made a non-read-only call");
-  for (const bad of ["typeInSearch", "pressEnter", "clearSearch", "typeText", "clickDropdownOptionByText"])
+  assert.ok(calls.some((c) => c[0] === "pressTab"), "closes via Tab (the clean non-committing exit)");
+  for (const bad of ["typeInSearch", "pressEnter", "clearSearch", "typeText", "clickDropdownOptionByText", "pressEscape"])
     assert.strictEqual(calls.some((c) => c[0] === bad), false, "capture must never call " + bad);
 });
 

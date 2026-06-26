@@ -116,22 +116,21 @@ async function pollSearchValue(act, read, want, budgets) {
   return false;
 }
 
-// disarmHighlight: after a no-match search the listbox row-0 stays ARMED (activeText, e.g.
-// "Accounting" — the first option). RE-FOCUSING the searchBox DISARMS it (recon 2026-06-22:
-// activeText→null right after focus) — BUT the disarm is async/page-side: at fast (foreground)
-// pacing the field can be EXITED before it completes, and the NEXT field's focus then COMMITS
-// the still-armed stray (the live fieldOfStudy "Other"→"Accounting" bug; recon: slow=safe,
-// fast=strays). So: re-focus to TRIGGER the disarm, then POLL with `delayFull` (REAL time, NOT
-// the adaptive speedup — the page's disarm takes wall-clock the tab speedup must not shorten)
-// until activeText is null. Returns { focused, armed } (armed=null ⇒ disarmed/clean). If focus
-// can't be confirmed → { focused:false } (caller must NOT actuate blind — the M25 rule).
-async function disarmHighlight(act, ensureFocusedFn, readFn, loc, budgets) {
-  const focused = await ensureFocusedFn();
-  if (!focused) return { focused: false, armed: null };
-  const deadline = Date.now() + budgets.taSettleCeilingMs;
-  let st = await readFn(loc);
-  while (st && st.activeText != null && Date.now() < deadline) { await act.delayFull(budgets.commitIntervalMs); st = await readFn(loc); }
-  return { focused: true, armed: st ? st.activeText : null };
+// tabBlurExit: the ONLY clean non-committing exit from an open typeahead/source widget (recon
+// 2026-06-26, supersedes the disarmHighlight model). THREE corrected DOM facts killed the old
+// disarm code: (1) RE-FOCUSING the searchBox does NOT clear the armed row-0 highlight — the armed
+// row only changes by typing a new non-empty query, so "disarm by refocus + poll" was a no-op that
+// either burned the ceiling or exited on a transient null and LIED; (2) `""` + Enter is a no-op
+// (clearing + Enter leaves the banner/list/armed row intact — clearing is valid ONLY as
+// delete-old-text-before-the-next-query); (3) Enter commits the armed row, Escape hides the popup
+// but KEEPS focus + the armed row (so the next field's focus blur-commits the stray — the live
+// fieldOfStudy "Other"→"Accounting" bug), and only TAB blurs + abandons the armed row WITHOUT
+// committing (operator-verified). So we Tab, then read the resting chips (the caller's stray-check
+// flags any chip that differs from the original). Returns the chips array, [] (none), or null (read
+// error → caller keeps priorChips, never a false stray).
+async function tabBlurExit(act, loc, readFn) {
+  await act.pressTab();
+  try { const st = await readFn(loc); return st && st.chips ? st.chips : []; } catch (e) { return null; }
 }
 
 // awaitListTerminal: BLOCK until the typeahead/source result list reaches a CONFIRMED terminal render state —
@@ -202,11 +201,12 @@ const TYPEAHEAD_SELF_VERIFY = false;
 //     `prefilled-better-tier-unavailable`; a re-commit that strays/fails → needs_review with the
 //     LIVE value (never a false "kept").
 //   • plain overwrite no-match (original NOT a candidate — can't re-type it) — the original chip
-//     is intact (never deleted). DISARM-VERIFY the armed highlight (real-time) before dismissing
-//     so no armed stray survives the exit, then rest clean. A chip that strayed despite the
-//     disarm → flagged (overwrite-stray), never a false keep.
-// Parametrized (readFn/clearFn/ensureFocusedFn/recommitFn) to keep typeahead+source LOCKSTEP.
-async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier, recommitFn) {
+//     is intact (never deleted). Exit via TAB — the ONLY clean non-committing exit (refocus does
+//     NOT disarm, "" + Enter is a no-op; both removed) — which abandons any armed row WITHOUT
+//     committing it, then rest clean. A chip that strayed despite the Tab → flagged
+//     (overwrite-stray), never a false keep.
+// Parametrized (readFn/ensureFocusedFn/recommitFn) to keep typeahead+source LOCKSTEP.
+async function overwriteNoMatchResting(act, loc, readFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier, recommitFn) {
   const norm = apMatch.normalize;
   const original = priorChips.join("; ");
 
@@ -231,24 +231,23 @@ async function overwriteNoMatchResting(act, loc, readFn, clearFn, ensureFocusedF
     };
   }
 
-  // Plain overwrite no-match: disarm the armed highlight (real-time) BEFORE dismissing.
-  const { focused } = await disarmHighlight(act, ensureFocusedFn, readFn, loc, budgets);
-  if (focused) { await clearFn(); await pollSearchValue(act, () => readFn(loc), "", budgets); }
-  await act.pressEscape();
-  let endChips = priorChips;
-  try { const st = await readFn(loc); if (st && st.chips) endChips = st.chips; } catch (e) { /* keep priorChips */ }
+  // Plain overwrite no-match: Tab-blur — the ONLY clean non-committing exit (refocus does NOT
+  // disarm; "" + Enter is a no-op — both removed). Tab abandons any armed row WITHOUT committing it.
+  // The original chip is intact (never deleted); a chip that strayed despite the Tab is flagged.
+  const tabbed = await tabBlurExit(act, loc, readFn);
+  const endChips = tabbed == null ? priorChips : tabbed; // read error → keep priorChips (no false stray)
   const after = endChips.length ? endChips.join("; ") : original;
   if (endChips.length && norm(endChips.join("; ")) !== norm(original)) {
     return {
       status: "needs_review", after, verified: false, flag: "overwrite-stray", confidence: "none",
-      detail: `resting dismissal strayed to "${after}" (expected original "${original}") — review`,
+      detail: `resting Tab-exit strayed to "${after}" (expected original "${original}") — review`,
       captured_options: lastOptions || undefined, settle_trace: trace, overwrite: { original, refilled: false }
     };
   }
   return {
     status: "needs_review", after, verified: false,
     flag: "overwrite-nomatch-original-kept", confidence: "none",
-    detail: `no candidate matched — original pre-fill "${original}" kept, filter text cleared (future-AI candidate)`,
+    detail: `no candidate matched — original pre-fill "${original}" kept, exited via Tab (future-AI candidate)`,
     captured_options: lastOptions || undefined, settle_trace: trace, overwrite: { original, refilled: false }
   };
 }
@@ -1238,6 +1237,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // exact path that committed a stray "Afghanistan" via the listbox highlight).
     if (!(await ensureSearchFocused())) {
       step.note = "could not focus search field — not actuating blind";
+      await act.pressTab(); // BLUR before leaving: a prior candidate's no-match ARMED row-0 (e.g. "Accounting"); Tab abandons it so the next field's focus can't blur-commit the stray
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the search field — not actuating blind (no clear/type/Enter)", settle_trace: trace };
     }
     // FOCUS-SAFE clear + type (structurally closed, same bail as the recommit): clearSearch is FOCUS-BLIND, and
@@ -1260,6 +1260,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     }
     if (!landed) {
       step.note = "could not type the full candidate into a focused box (partial/blur) — not pressing Enter";
+      await act.pressTab(); // BLUR before leaving: an armed row from a prior/partial filter must not survive to the next field
       return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
     }
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
@@ -1389,7 +1390,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // we never deleted it): rest the field clean ({chips:[original], query:""}) and
   // flag overwrite-nomatch-original-kept (future-AI candidate).
   if (isOverwrite) {
-    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
+    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
       // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
       async (value) => {
         // STEP 1 — TERMINAL GATE (the keptLowerTier stray fix): the higher-tier no-match's empty-results render
@@ -1437,18 +1438,14 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
         return r ? (r.chips || []) : [];
       });
   }
-  // Empty-field honesty read: after closing the list, a final chip read so the
-  // record NEVER reports after:null when the page physically holds a value —
-  // catches a late/stray commit our settle missed (e.g. a highlight-Enter that
-  // landed after we moved on). A committed chip (selectedItem) survives Escape, so
-  // this reflects the true settled state; an uncommanded chip is flagged for review.
-  // DISARM-VERIFY first (same fast-pacing armed-row-0 race as the overwrite rest): re-focus
-  // to trigger the disarm + poll real-time until activeText is null, so no armed stray
-  // survives to the next field's focus. (The honesty read below still backstops it.)
-  await disarmHighlight(act, ensureSearchFocused, (l) => act.readTypeahead(l), loc, budgets);
-  await act.pressEscape();
-  let strayChip = null;
-  try { const endState = await act.readTypeahead(loc); strayChip = endState && endState.chips.length ? endState.chips.join("; ") : null; } catch (e) { /* ignore read error */ }
+  // Empty-field honesty read: exit via TAB (the only clean non-committing exit — Escape kept
+  // focus + the armed row so the next field's focus blur-committed the stray), then read the
+  // resting chips so the record NEVER reports after:null when the page physically holds a value —
+  // catches a late/stray commit our settle missed (e.g. a highlight-Enter that landed after we
+  // moved on). A committed chip (selectedItem) survives the blur, so this reflects the true settled
+  // state; an uncommanded chip is flagged for review.
+  const endChips = await tabBlurExit(act, loc, (l) => act.readTypeahead(l));
+  const strayChip = endChips && endChips.length ? endChips.join("; ") : null;
   if (strayChip) {
     return { status: "needs_review", after: strayChip, verified: false, detail: "uncommanded value on the field — review (no candidate matched; chip overwrite is a later milestone)", captured_options: lastFiltered || undefined, settle_trace: trace };
   }
@@ -1533,6 +1530,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     if (ci > 0) step.priorSettle = await awaitListTerminal(act, (l) => act.readSource(l), loc, budgets, chipSetIsNew);
     if (!(await ensureFocused())) {
       step.note = "could not focus source search field — not actuating blind";
+      await act.pressTab(); // BLUR before leaving: a prior candidate may have ARMED a leaf — Tab abandons it (lockstep with typeahead)
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the source search field — not actuating blind", settle_trace: trace };
     }
     // FOCUS-SAFE clear + type (structurally closed, lockstep with the typeahead): ECHO-VERIFY the FULL
@@ -1551,6 +1549,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     }
     if (!landed) {
       step.note = "could not type the full candidate into a focused source box (partial/blur) — not pressing Enter";
+      await act.pressTab(); // BLUR before leaving: an armed leaf from a prior/partial filter must not survive to the next field (lockstep)
       return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused source search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
     }
     await act.pressEnter(); // these filter on ENTER, not live (recon)
@@ -1652,7 +1651,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   // Walk exhausted. Under OVERWRITE the original source chip is intact: rest the
   // field clean ({chips:[original], query:""}) and flag for review (lockstep).
   if (isOverwrite) {
-    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), () => act.clearSourceSearch(), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0,
+    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0,
       // recommitFn (source): re-select `value` via the source commit machinery (clickSourceLeaf).
       async (value) => {
         await act.clearSourceSearch(); await pollSearchValue(act, () => act.readSource(loc), "", budgets);
@@ -1666,9 +1665,9 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
         return r ? (r.chips || []) : [];
       });
   }
-  // DISARM-VERIFY before exit (same armed-row-0 fast-pacing race as typeahead — lockstep).
-  await disarmHighlight(act, ensureFocused, (l) => act.readSource(l), loc, budgets);
-  await act.pressEscape();
+  // Tab-blur exit (the only clean non-committing exit — lockstep with typeahead; Escape kept
+  // focus + the armed row so the next field's focus blur-committed the stray).
+  await tabBlurExit(act, loc, (l) => act.readSource(l));
   // M38 Bug B1 — GENUINE no-match (deleteOnNoMatch) ONLY if every candidate gave a
   // definitive negative (banner / filtered-but-absent); a timeout or present-but-
   // uncommitted leaf is NOT genuine → keep + surface (lockstep with typeahead/dropdown).
@@ -2433,7 +2432,8 @@ function applyAuditVerdicts(results, verdicts) {
 // scrolled the virtualized list + corrupted the immediately-following keptLowerTier re-commit.
 //
 // READ-ONLY: opens the field + scrolls (act.scrapeTaOptions = scrollTop + reads, no type/Enter/arrow
-// → nothing arms), then a stray-safe close (disarmHighlight ensures no armed highlight survives).
+// → nothing arms), then a stray-safe close (Tab — the only clean non-committing exit; Escape kept
+// focus + any armed row, Tab abandons it).
 // Returns the options array, or null (NON-FATAL: null → the summary falls back to captured_options).
 // Called from captureChoiceOptions at END OF PAGE (when fields are settled/closed → a fresh re-open
 // shows the empty-filter full list); an inline call races the post-commit state (banner / residual
@@ -2462,10 +2462,10 @@ async function captureFieldOptions(act, loc, budgets) {
       const scrape = await act.scrapeTaOptions(loc);
       if (scrape && scrape.ok && Array.isArray(scrape.options) && scrape.options.length) options = scrape.options.slice();
     }
-    // stray-safe close (the scrape doesn't arm, but be defensive on the stray-prone field): disarm-poll
-    // the highlight to null (real time), then Escape + settle → the fill that follows opens clean.
-    await disarmHighlight(act, ensureFocused, (l) => act.readTypeahead(l), loc, budgets);
-    await act.pressEscape();
+    // stray-safe close (the scrape is read-only — no type/Enter/arrow → nothing arms): exit via TAB,
+    // the only clean non-committing exit (Escape keeps focus + any armed row; Tab abandons it). The
+    // field's existing chip is preserved; the end-of-page M40 audit backstops any stray.
+    await act.pressTab();
     await act.delayFull(budgets.reopenSettleMs);
     return options;
   } catch (e) { return null; } // non-fatal: null → summary falls back to captured_options

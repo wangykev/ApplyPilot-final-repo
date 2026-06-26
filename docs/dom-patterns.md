@@ -1365,6 +1365,13 @@ path; it is SELF-CONTAINED (closes over nothing — built for injection), so it 
 
 ## 2026-06-22 — typeahead keptLowerTier STRAY ("Other"→"Accounting") — a fast-pacing disarm race
 
+> **⚠ SUPERSEDED by 2026-06-26 (typeahead exit redesign — Tab-blur).** The keptLowerTier `recommitFn`
+> fix (1) and the strayed-check (3) below STILL HOLD. But part (2) — `disarmHighlight` (re-focus + poll
+> `activeText`→null) — rested on a FALSE assumption: **re-focusing does NOT disarm the armed row** (recon
+> 2026-06-26). The "slow-safe / fast-strays" reading was a coincidence of the poll's wall-clock, not a real
+> disarm. `disarmHighlight` is DELETED; the plain overwrite + empty-field exits now use Tab-blur (the only
+> clean non-committing exit). Read the 2026-06-26 entry for the corrected model.
+
 M40 surfaced a silent corruption: `fieldOfStudy` pre-filled "Other" (a tier-1 candidate) → the M36.1
 keptLowerTier path reported KEPT "Other" but the page held "Accounting" (the audit caught it). Recon
 (`RUN_CDP_TA_STRAY_RECON`, per-action chip+activeText reads) + the full-page fill pinned the mechanism:
@@ -1617,3 +1624,69 @@ immediately, VISIBLE=fast (watch it) or minimized=slow/background, adapting live
 live-filter (Enter filters); typing into an UNFOCUSED box HIGHLIGHTS the first-letter option and Enter commits
 that highlight — which is why the render gate (wait for the banner) + the focus-safe echo-verified type loop
 (re-assert focus, never Enter on a partial/unfocused box) together close the stray.
+
+## 2026-06-26 — typeahead EXIT redesign: Tab-blur, the disarm fallacy DELETED
+
+The FoS "Other"→"Accounting" stray had ONE more layer under the terminal-state gate above: the EXIT/disarm
+code rested on a false DOM model. Operator recon (Magna FoS) corrected it. Three facts invalidate the old
+`disarmHighlight` / clear-to-reset / Escape-dismiss code:
+
+1. **Re-focusing the searchBox does NOT clear the armed row-0 highlight.** `disarmHighlight` polled
+   `while (activeText != null …)` assuming a refocus nulls the highlight — it never does. The armed row
+   can ONLY change by typing a new non-empty query. So the "disarm" was structurally a no-op that either
+   burned `taSettleCeilingMs` or exited on a transient null read and LIED (reporting "kept original" while
+   the row stayed armed). The 2026-06-22 "slow-safe / fast-strays" reading was a coincidence of the poll's
+   wall-clock, NOT a real disarm.
+2. **`""` + Enter is a no-op.** Clearing the box and pressing Enter does nothing — the prior banner +
+   result list + armed row all persist. "Clear to reset the widget" is FALSE; clearing is valid ONLY as
+   *delete-old-text-before-typing-the-next-query* (the between-candidate clears, which still hold).
+3. **Tab is the ONLY clean non-committing exit.** Enter on the armed row commits it + blurs. Escape hides
+   the popup but KEEPS focus + the armed row, so the *next field's focus* blur-commits the stray (this was
+   the live corruption mechanism). **Tab blurs and ABANDONS the armed row without committing** (operator-
+   verified manually).
+
+**The root-cause path (overwrite no-match):** `disarmHighlight` (no-op) → `clearFn()` re-rendered the full
+list and RE-ARMED row-0 → `pressEscape()` hid the popup but kept focus → the function read the still-intact
+"Other" chip and returned `overwrite-nomatch-original-kept | "Other"` (honest at that instant) → ~2 s later
+the next field's focus blur-committed the armed "Accounting". Report said "Other", page held "Accounting" —
+silent corruption.
+
+**The fix (minimal, typeahead + source LOCKSTEP) — Tab is the UNIVERSAL non-commit close (dropdowns keep
+Escape):**
+- `act.pressTab` (cdp.js) = `cdpKeyTap(CDP_KEYS.tab)`, next to `pressEnter`/`pressEscape` — counter-gated so
+  the bot's own Tab passes the input-lock.
+- **DELETED `disarmHighlight`.** **EVERY non-commit exit from `fillTypeaheadCdp` / `fillSourceCdp` Tab-blurs**
+  (a commit closes the list itself, so only the non-commit paths "need" the close):
+  - the honesty-read exits via the shared `tabBlurExit(act, loc, readFn)` (Tab → read the resting chips, null
+    on read error): `overwriteNoMatchResting` plain path, the typeahead empty-field exit, the source
+    empty-field exit;
+  - the **early bails** (`could-not-focus` / `could-not-type`, both handlers) via a bare `await act.pressTab()`
+    before their `needs_review` return — these were the live gap: a prior candidate's no-match ARMS row-0, then
+    a LATE candidate's focus drops (the documented post-banner focus loss) → the bail returned WITHOUT blurring
+    → the armed "Accounting" strayed on the next field's focus (this is what "the walk exhausted, strays
+    Accounting" actually was);
+  - the read-only `captureFieldOptions` close via a bare `act.pressTab`.
+  - Commit exits (autocommit / directed click) are untouched — the commit already closed the list, no armed
+    row survives.
+- Dropped the now-unused `clearFn` param from `overwriteNoMatchResting` (the keptLowerTier path uses
+  `recommitFn`, not `clearFn`) + both call sites.
+- **UNCHANGED (verified still correct):** the keptLowerTier `recommitFn` (already disarm-free — type →
+  filter-Enter in place → affirmative click); the stray-backstop (post-exit chip ≠ original →
+  `overwrite-stray`, never a false keep); the `overwrite-nomatch-original-kept` keep; the empty-field
+  honesty read + `genuineNoMatch`; the candidate-walk commit ladder; the between-candidate `clearSearch`
+  (legit delete-before-type). `activeText` stays in `cdpReadTaState`/`cdpReadSourcePick` (the recon
+  harnesses `cdp-ta-stray-recon` / `cdp-fos-*` still read it).
+
+**Post-no-match rest state (the foundation the deferred AI typeahead fallback builds on):** after a no-match
+exit the field rests on the INTACT pre-fill chip, the banner gone, the armed row ABANDONED, focus left the
+box (Tab). No armed highlight survives to the next field's focus.
+
+**Latency:** a no-match exit goes from a multi-second (or ceiling-length) useless disarm poll to an instant
+Tab.
+
+**Status:** unit-green (256 tests; overwrite/stray/walk-dry/capture tests + the two focus-cannot-confirm
+bails + the could-not-type bail all assert Tab-exit, no net new). **Live-verified:** the OVERWRITE no-match
+case (pre-filled "Other" → genuine no-match → stays "Other", no "Accounting" stray). **Live-verify PENDING**
+for the extension: the EMPTY-field / early-bail case — an empty FoS whose walk arms row-0 then exhausts or
+bails (focus drops after a banner) must end BLANK, no "Accounting" stray; the in-list-value + clean-overwrite
++ keptLowerTier-recommit regressions still commit.
