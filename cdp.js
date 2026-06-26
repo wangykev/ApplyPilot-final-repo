@@ -929,6 +929,16 @@ function cdpReadTaState(wrapperSel) {
     break;
   }
 
+  // Results banner ("Search Results" — recon 2026-06-26): a VISIBLE promptTitle (the SAME host as the no-match
+  // banner; text distinguishes them). The terminal-state gate uses resultsBanner + a stable non-zero
+  // pageWide.count as the positive-match terminal — distinguishing a CONFIRMED results render from the
+  // bannerless fallback-list-before-the-banner (the stray source). No count in the banner text (recon) → the
+  // count comes from pageWide, not here.
+  let resultsBanner = false;
+  for (const el of document.querySelectorAll('[data-automation-id="promptTitle"]')) {
+    if (isVisible(el) && /search results/i.test((el.textContent || "").trim())) { resultsBanner = true; break; }
+  }
+
   const adFrom = (el) => (el && el.getAttribute && el.getAttribute("aria-activedescendant")) || null;
   const activeId = adFrom(document.activeElement) || adFrom(sb) || (acEl ? adFrom(acEl) : null);
   const activeEl = activeId ? document.getElementById(activeId) : null;
@@ -939,6 +949,7 @@ function cdpReadTaState(wrapperSel) {
       : { present: false, visible: false, focused: false, value: null },
     chips,
     banner,
+    resultsBanner,
     ariaScope: acId
       ? (acEl
         ? { id: acId, resolved: true, tag: acEl.tagName, automationId: acEl.getAttribute("data-automation-id"), role: acEl.getAttribute("role"), count: acOpts.length, sig: sig(acTexts), sample: acTexts.slice(0, 10) }
@@ -948,6 +959,55 @@ function cdpReadTaState(wrapperSel) {
     // filtered sets are small and even the virtualized fallback window is ~17.
     pageWide: { count: pwOpts.length, sig: sig(pwTexts), sample: pwTexts.slice(0, 10), texts: pwTexts.slice(0, 40) },
     activeText: activeEl ? (activeEl.textContent || "").trim() : null
+  };
+}
+
+// RESULTS-BANNER RECON (read-only DOM dump) — capture the exact markup of BOTH typeahead banners so the
+// terminal-state gate (next round) can distinguish them: the "No matches found" no-match banner (already
+// detected) vs the "Search Results (N)" results banner (NOT currently surfaced anywhere). Dumps every visible
+// promptTitle node (the likely host of both) + every short banner-ish text node (catches a non-promptTitle
+// host) + the aria-controls listbox option count (the "N"). NO mutation / click / type / Enter — pure read.
+function cdpResultsBannerScan(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, error: "no wrapper" };
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  const chips = Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim());
+  const acId = sb ? sb.getAttribute("aria-controls") : null;
+  const acEl = acId ? document.getElementById(acId) : null;
+  const optionCount = acEl
+    ? Array.from(acEl.querySelectorAll('[role="option"]')).filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true").length
+    : 0;
+  // Every visible promptTitle node (both banners are expected to render here).
+  const promptTitles = Array.from(document.querySelectorAll('[data-automation-id="promptTitle"]'))
+    .filter(isVisible)
+    .map((el) => ({ text: (el.textContent || "").trim().slice(0, 80), automationId: el.getAttribute("data-automation-id"), role: el.getAttribute("role"), tag: el.tagName }));
+  // Any short, leaf-most visible node whose text reads like a banner (catches a non-promptTitle host).
+  const bannerish = [];
+  for (const el of document.querySelectorAll("[data-automation-id], [role], p, span, h1, h2, h3, h4, div")) {
+    if (!isVisible(el)) continue;
+    const t = (el.textContent || "").trim();
+    if (t.length > 60 || !/(search results|no matches|results?\s*\(|matches found|found)/i.test(t)) continue;
+    if (Array.from(el.children).some((c) => /(search results|no matches|results?\s*\(|matches found|found)/i.test((c.textContent || "").trim()))) continue; // leaf-most only
+    bannerish.push({ text: t, automationId: el.getAttribute("data-automation-id"), role: el.getAttribute("role"), tag: el.tagName });
+    if (bannerish.length >= 12) break;
+  }
+  return {
+    ok: true,
+    searchBoxValue: sb ? sb.value : null,
+    searchBoxVisible: sb ? isVisible(sb) : false,
+    focused: document.activeElement === sb,
+    chips,
+    optionCount,
+    ariaControls: acId,
+    promptTitles,
+    bannerish
   };
 }
 
@@ -1208,15 +1268,21 @@ function cdpReadSourcePick(wrapperSel) {
       && !el.closest('[data-automation-id="selectedItemList"]'))
     .map(leafLabel);
   const sig = leaves.length + "|" + leaves.slice(0, 3).join("~") + "|" + leaves.slice(-3).join("~");
-  let banner = false;
+  let banner = false, resultsBanner = false;
   for (const el of document.querySelectorAll('[data-automation-id="promptTitle"]')) {
-    if (isVisible(el) && /no matches found/i.test((el.textContent || "").trim())) { banner = true; break; }
+    if (!isVisible(el)) continue;
+    const t = (el.textContent || "").trim();
+    if (/no matches found/i.test(t)) banner = true;
+    // Results banner — INFERRED from the typeahead recon (source uses the SAME promptPopup; its no-match
+    // banner is already promptTitle-scoped). Confirmed by the source live-verify; if source never shows it,
+    // awaitListTerminal times out → needs_review (safe — source commits via an explicit clickSourceLeaf).
+    else if (/search results/i.test(t)) resultsBanner = true;
   }
   return {
     searchBox: sb
       ? { present: true, visible: isVisible(sb), focused: document.activeElement === sb, value: sb.value }
       : { present: false, visible: false, focused: false, value: null },
-    leaves, leafCount: leaves.length, sig, banner,
+    leaves, leafCount: leaves.length, sig, banner, resultsBanner,
     chips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim())
   };
 }
@@ -1342,9 +1408,15 @@ function makeCdpActuation(llmConfig) {
     clearSearch: () => cdpSelectAllDelete(),         // trusted clear (focused searchBox)
     focusSearchBox: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     // FoS Round 3: scroll-accumulate the FULL virtualized option list (read-only, in-page,
-    // frame-paced → <1s). Used by captureFieldOptions to populate the bundle entry's
-    // options for the summary searchable editor. NO commit (only scrollTop + reads).
-    scrapeTaOptions: (loc) => cdpEval(cdpScrapeTaOptions, loc.wrapperSel),
+    // frame-paced → <1s). Used by the END-OF-PAGE capture AND the single-open during-fill capture
+    // (fillTypeaheadCdp's onCapture, before the candidate loop) to populate the bundle entry's options
+    // for the summary searchable editor. NO commit (only scrollTop + reads). Logs the count so the
+    // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
+    scrapeTaOptions: async (loc) => {
+      const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") : "FAILED");
+      return r;
+    },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
     // shifts between the settle read and the click; a missed click dismisses
     // (no-op) rather than mis-commits, and the chip gate verifies either way.

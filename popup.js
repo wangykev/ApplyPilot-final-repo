@@ -318,7 +318,7 @@ document.getElementById("cdp-textarea-recon").addEventListener("click", () => {
 // reconcile to N + fill each entry's url (date-free Websites). Run on My
 // Experience (page 2); minimize within 60s. Results land as [CDP-WEB] in the SW console.
 document.getElementById("cdp-fill-websites").addEventListener("click", () => {
-  setStatus("CDP websites fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-WEB] in the service worker console.");
+  setStatus("CDP websites fill… open My Experience (page 2); keep the tab VISIBLE for a fast fill (watch it) or minimize for background — it adapts. See [CDP-WEB] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_WEBSITES" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
@@ -336,7 +336,7 @@ document.getElementById("cdp-fill-websites").addEventListener("click", () => {
 // LANGUAGES FILL (M35): reuse the repeating-section driver for the date-free Languages section.
 // Run on My Experience (page 2); minimize within 60s. Results land as [CDP-LANG] in the SW console.
 document.getElementById("cdp-fill-languages").addEventListener("click", () => {
-  setStatus("CDP languages fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-LANG] in the service worker console.");
+  setStatus("CDP languages fill… open My Experience (page 2); keep the tab VISIBLE for a fast fill (watch it) or minimize for background — it adapts. See [CDP-LANG] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_LANGUAGES" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
@@ -355,7 +355,7 @@ document.getElementById("cdp-fill-languages").addEventListener("click", () => {
 // checkbox + M/Y dates + the roleDescription <textarea>. Run on My Experience (page 2); minimize within
 // 60s. Results land as [CDP-WE] in the SW console.
 document.getElementById("cdp-fill-work-experience").addEventListener("click", () => {
-  setStatus("CDP work-experience fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-WE] in the service worker console.");
+  setStatus("CDP work-experience fill… open My Experience (page 2); keep the tab VISIBLE for a fast fill (watch it) or minimize for background — it adapts. See [CDP-WE] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_WORK_EXPERIENCE" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
@@ -373,7 +373,7 @@ document.getElementById("cdp-fill-work-experience").addEventListener("click", ()
 // EDUCATION FILL (M36): reuse the repeating-section driver for Education (incl. from/to YEAR dates).
 // Run on My Experience (page 2); minimize within 60s. Results land as [CDP-EDU] in the SW console.
 document.getElementById("cdp-fill-education").addEventListener("click", () => {
-  setStatus("CDP education fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-EDU] in the service worker console.");
+  setStatus("CDP education fill… open My Experience (page 2); keep the tab VISIBLE for a fast fill (watch it) or minimize for background — it adapts. See [CDP-EDU] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_EDUCATION" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
@@ -391,7 +391,7 @@ document.getElementById("cdp-fill-education").addEventListener("click", () => {
 // CERTIFICATIONS FILL (M36): reuse the repeating-section driver for Certifications (incl. issued/
 // expiration M/D/Y dates). Run on My Experience (page 2); minimize within 60s. [CDP-CERT] in SW console.
 document.getElementById("cdp-fill-certifications").addEventListener("click", () => {
-  setStatus("CDP certifications fill… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-CERT] in the service worker console.");
+  setStatus("CDP certifications fill… open My Experience (page 2); keep the tab VISIBLE for a fast fill (watch it) or minimize for background — it adapts. See [CDP-CERT] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_CERTIFICATIONS" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
@@ -412,7 +412,7 @@ document.getElementById("cdp-fill-certifications").addEventListener("click", () 
 document.getElementById("cdp-fill-date").addEventListener("click", () => {
   const labelRegex = document.getElementById("ta-label").value.trim();
   if (!labelRegex) { setStatus("Enter a label regex first (e.g. From, To, Issued Date)."); return; }
-  setStatus(`CDP date fill ("${labelRegex}")… open My Experience (page 2), then MINIMIZE now (60s). See [CDP-DATE] in the service worker console.`);
+  setStatus(`CDP date fill ("${labelRegex}")… open My Experience (page 2); keep the tab VISIBLE for a fast fill (watch it) or minimize for background — it adapts. See [CDP-DATE] in the service worker console.`);
   chrome.runtime.sendMessage({ type: "RUN_CDP_FILL_DATE", labelRegex }, (resp) => {
     if (chrome.runtime.lastError || !resp) return; // popup likely closed on minimize — SW console has it all
     if (resp.ok === false && resp.error === "no-profile") {
@@ -482,6 +482,37 @@ document.getElementById("cdp-fos-capture").addEventListener("click", () => {
       setStatus("No matching typeahead on this page — run on page 2 (Field of Study).");
     } else {
       setStatus(`FoS capture done — ${resp.count} option(s) in ${resp.ms}ms; ${resp.unchanged ? "field unchanged ✓" : "⚠ field MODIFIED — restore it"}. See [CDP-FOS-CAPTURE].`);
+    }
+  });
+});
+
+document.getElementById("cdp-fos-focus-recon").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
+  setStatus(`FoS FOCUS-recon ("${labelRegex}", read-mostly; no commit)… open My Experience (page 2). Read [CDP-FOS-FOCUS]: (2) empty-results DROPS focus + ARMS row-0, (3) re-focus RESTORES focus + disarms (highlight=null) — the page facts the re-commit fix depends on.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_FOS_FOCUS_RECON", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("FoS focus-recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.found === false) {
+      setStatus("No matching typeahead on this page — run on page 2 (Field of Study).");
+    } else {
+      setStatus("FoS focus-recon done — read [CDP-FOS-FOCUS]: (2) empty-results focus DROP + armed highlight, (3) re-focus → focus RESTORED + highlight=null (disarmed).");
+    }
+  });
+});
+
+document.getElementById("cdp-results-banner-recon").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
+  const matchQuery = document.getElementById("results-banner-query").value.trim() || "a";
+  setStatus(`Results-banner recon ("${labelRegex}", match "${matchQuery}", read-only; no commit)… open My Experience (page 2). Read [CDP-RESULTS-BANNER]: (1) the RESULTS banner ("Search Results (N)") node/text, (2) the NO-MATCH banner ("No matches found") — confirm they're DISTINCT.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_RESULTS_BANNER_RECON", labelRegex, matchQuery }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("Results-banner recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.found === false) {
+      setStatus("No matching typeahead on this page — run on page 2 (Field of Study).");
+    } else {
+      setStatus("Results-banner recon done — read [CDP-RESULTS-BANNER] (1) vs (2): which promptTitle/node + text carries 'Search Results (N)' vs 'No matches found'? (restore FoS if a chip committed.)");
     }
   });
 });

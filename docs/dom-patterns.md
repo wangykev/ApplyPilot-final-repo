@@ -1554,3 +1554,66 @@ summary `<select>` for degree/language/proficiency showed only the current value
   persist). Dropdowns keep the `<select>` (now populated from the captured `options`).
 - **Recon harnesses** (read-only, kept): `RUN_CDP_FOS_RECON` (enumerability verdict) + `RUN_CDP_FOS_CAPTURE`
   (full scroll-scrape probe with scroll metrics + field-unchanged check) + their popup buttons.
+
+## 2026-06-26 — FoS typeahead stray RESOLVED: the terminal-state GATE (`awaitListTerminal`) + the two-banner model
+
+The FoS stray ("Other" → "Economics"/"Accounting"/"Religion") that survived several rounds (a settle-race
+diagnosis, then an arming diagnosis, then a between-candidate settle) is finally fixed by gating on a
+**CONFIRMED terminal render state** before the typeahead reads/matches/commits. The earlier `settleResults`
+(banner-OR-count-steady) was the wrong gate; the real rule is **banner-or-autocommit ONLY — a bannerless list
+is never terminal**. The during-fill option capture (2026-06-24/25) was NEVER the cause and now runs fine
+(live: `[CDP-SCRAPE-TA] 65 options` during the fill + FoS commits correctly).
+
+**Root cause.** A Magna typeahead no-match is a throttle-LAGGED page reaction: the page first renders a
+**non-zero alphabetical FALLBACK list** (row-0 armed, e.g. "Accounting") and only SLIGHTLY LATER the "No
+matches found" banner. The old code treated a bannerless non-zero list as "filtered" → it
+read/matched/committed during that window → committed the armed row (the stray). Likewise the between-candidate
+and re-commit transitions touched the box mid-render.
+
+**The two-banner model (recon `RUN_CDP_RESULTS_BANNER_RECON`, Magna wd3 page-2 FoS — CONFIRMED):**
+- Both banners render on the SAME node: `<div data-automation-id="promptTitle">`, distinguished ONLY by text.
+  - RESULTS state → `promptTitle` text **"Search Results"** (NO count in the text — recon).
+  - NO-MATCH state → `promptTitle` text **"No matches found"**.
+- The aria-controls listbox `optionCount` reads **0 in BOTH states** (options are portaled to the document
+  root, OUTSIDE aria-controls) → the count must come from **`pageWide.count`** (page-wide `[role=option]`),
+  NOT aria-controls. And the no-match state carries a non-zero (~15) fallback list, so a **bannerless non-zero
+  count is genuinely ambiguous** ⇒ the BANNER is the only terminal signal.
+
+**The fix — `awaitListTerminal(act, readFn, loc, budgets, chipSetIsNew)`** (fill-driver.js), used by BOTH
+`fillTypeaheadCdp` and `fillSourceCdp` (lockstep), returning ONE of:
+- `"autocommit"` — a NEW chip, OR the box closed holding a chip (checked first, exits immediately).
+- `"nomatch"` — `s.banner` ("No matches found") present AND count stable across `stableReads`.
+- `"results"` — `s.resultsBanner` ("Search Results") present AND count > 0 stable across `stableReads`.
+- `"timeout"` — `taSettleCeilingMs` ceiling (treated as no-match).
+- A bannerless non-zero list and `count===0`-no-banner are **NOT terminal → keep polling**. The input ECHO
+  (`pollSearchValue`) is NEVER the render signal. Read layer: `cdpReadTaState`/`cdpReadSourcePick` gained
+  `resultsBanner` (a visible `promptTitle` matching `/search results/i`); the existing no-match `banner`
+  (`/no matches found/i`) is unchanged. **Match ONLY on `"results"`**, never a bannerless list. The initial
+  recon-scrape open is gated by `awaitListStable` (count>0 stable, shorter `taOpenCeilingMs` ceiling — a
+  cold/empty open never burns the big settle budget; a timed-out-but-proceed is fine for a read-only scrape).
+  `settleResults` + `taBannerGraceMs` retired. Termination is guaranteed: the stability counter resets only on
+  a count CHANGE, and the fallback/filtered list stops changing once rendered, so once a banner is present it
+  resolves within ~`stableReads` intervals.
+
+**Trade-off (accepted):** a no-match on a hypothetical NO-banner tenant now times out (`taSettleCeilingMs`)
+instead of a fast "empty" exit. Magna shows "No matches found" so it's fast there (banner ~1-2 s); cert "CPP"
+autocommits. Per-candidate timeout never STACKS on Magna because each no-match tier resolves on the banner —
+a `"timeout"` on a no-match tier in the SW log is the latency smell to watch.
+
+**Live-verified (Magna wd3 page-2, VISIBLE, multiple runs, no minimize):** FoS correct in every pre-fill
+state, **no stray** — empty → `directed-exact` "Other" (the live no-match→match walk: "Electrical and Computer
+Engineering" → "No matches found", "Other" → "Search Results" → committed); pre-filled "Other" →
+`prefilled-better-tier-unavailable` (kept + re-committed); pre-filled "Biological Science"/"Electrical
+Engineering" → `overwrite-success` "Other" (`filled_review`, surfaced for review). Full-page fill + persisted
+review summary also correct. The page-engine `fillTypeahead` (page substrate) is unchanged.
+
+**Operator-ergonomics (same round):** the page-2 section-fill harnesses (education / websites / languages /
+work-experience / certifications / single date) **dropped the `cdpWaitHidden` "MINIMIZE NOW" gate** — they fill
+immediately, VISIBLE=fast (watch it) or minimized=slow/background, adapting live (the M39 visibility-adaptive
+`act.delay`; the full-page `cdp-fill-page` already worked this way). The recons + the page-1 `cdp-fill`/
+`cdp-source-fill` keep the hidden gate (throttle probes / out of the page-2 testing path).
+
+**Mechanics (operator-confirmed, kept for reference):** the searchBox must be FOCUSED to type; it does NOT
+live-filter (Enter filters); typing into an UNFOCUSED box HIGHLIGHTS the first-letter option and Enter commits
+that highlight — which is why the render gate (wait for the banner) + the focus-safe echo-verified type loop
+(re-assert focus, never Enter on a partial/unfocused box) together close the stray.

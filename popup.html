@@ -74,6 +74,18 @@
          COMPLETE bounded FoS option list (frame-paced, <1s). Uses the label input. Page 2.
          [CDP-FOS-CAPTURE] in the SW console. -->
     <button id="cdp-fos-capture">CDP FoS capture-probe (read-only; fast scroll-scrape; page 2)</button>
+    <!-- FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
+         empty-results (a higher-tier no-match) DROP searchBox focus, and does RE-FOCUS restore + disarm the
+         highlight? cand-1 Enter→0 (no commit); "Other" typed char-by-char, never Enter'd. Page 2, uses the
+         label input. [CDP-FOS-FOCUS] in the SW console. -->
+    <button id="cdp-fos-focus-recon">CDP FoS FOCUS-recon (read-mostly; empty-results focus drop; page 2)</button>
+    <!-- RESULTS-BANNER RECON: capture the exact markup of the "Search Results (N)" results banner vs the
+         "No matches found" no-match banner, so the terminal-state gate can distinguish them. Types a matching
+         query (the input below, default "a" → broad multi-match → results banner) + a non-match, dumps both
+         states, NEVER commits. Page 2, uses the label input. [CDP-RESULTS-BANNER] in the SW console. -->
+    <button id="cdp-results-banner-recon">CDP recon: results-vs-no-match banner markup (read-only; page 2)</button>
+    <label for="results-banner-query">↑ results-banner recon: matching query (broad → multi-match):</label>
+    <input id="results-banner-query" type="text" placeholder="a" value="a">
     <!-- INPUT-LOCK RECON: probe whether an operator input-lock is feasible — does a
          pointer-events overlay block the bot's OWN cdpClickAt; does a keydown-blocker eat
          insertText vs per-char keys; the __apActing flag-gate cost + the toggle-timing

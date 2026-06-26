@@ -352,6 +352,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
+  // empty-results drop searchBox focus, and does re-focus restore + disarm? cand-1 Enter→0 (no commit);
+  // "Other" typed char-by-char, never Enter'd. Page 2. [CDP-FOS-FOCUS] in the SW console.
+  if (message.type === "RUN_CDP_FOS_FOCUS_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpFosFocusRecon(tab.id, String(message.labelRegex || ""));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
+  // RESULTS-BANNER RECON (read-only): dump the typeahead's banner markup in BOTH the results state
+  // ("Search Results (N)") and the no-match state ("No matches found") so the terminal-state gate can
+  // distinguish them. Types a matching + a non-matching query, NEVER commits. Page 2. [CDP-RESULTS-BANNER].
+  if (message.type === "RUN_CDP_RESULTS_BANNER_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpResultsBannerRecon(tab.id, String(message.labelRegex || ""), String(message.matchQuery || "a"));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // LLM TEST-CONNECTION (AI-0): round-trip a trivial prompt through the configured provider
   // to prove the call path + key + host_permissions BEFORE wiring the AI into the fill. The
   // popup sends the current config (test-before-save). No tab/attach needed (direct SW fetch).
@@ -2788,6 +2814,163 @@ async function runCdpFosCapture(tabId, labelRegexStr) {
 }
 
 // ============================================================================
+// FoS FOCUS-RECON (read-mostly) — confirm the two page facts the keptLowerTier re-commit fix depends on:
+//   (2) cand-1 "Electrical and Computer Engineering" → Enter → empty-results DROPS searchBox focus AND ARMS
+//       listbox row-0 (the alphabetical "Accounting" — the stray source).
+//   (3) RE-FOCUSING the searchBox RESTORES focus AND DISARMS the highlight (activeText→null) — the page fact
+//       the focus-safe loop's ensureSearchFocused relies on.
+// The FIX itself does NOT poll-disarm (operator: it SETTLES then affirmatively clicks the "Other" leaf, which
+// overwrites any armed row — verified by the full-page fill + M40, not here). This recon only confirms the
+// drop is real (snap 2) and recoverable (snap 3). READ-MOSTLY: cand-1's Enter filters to 0 (no commit);
+// "Other" is NEVER typed/Enter'd; safe-close. [CDP-FOS-FOCUS].
+// ============================================================================
+async function runCdpFosFocusRecon(tabId, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-FOS-FOCUS]", ...a);
+  let re;
+  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+  const CAND1 = "Electrical and Computer Engineering"; // a higher-tier no-match → 0 options (empty-results)
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+    // Locate FoS by label — repeating entries first, then flat (mirrors runCdpFosCapture).
+    let loc = null, where = null;
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
+        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+      }
+      if (loc) break;
+    }
+    if (!loc) {
+      const ps = await cdpEval(cdpPageScan);
+      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
+    }
+    if (!loc) { LOG(`no typeahead matching /${re.source}/ — run on My Experience (page 2, Field of Study).`); return { ok: true, found: false }; }
+
+    const activeEl = async () => {
+      try { return await cdpEval(() => { const a = document.activeElement; if (!a) return "null"; const aid = a.getAttribute && a.getAttribute("data-automation-id"); const role = a.getAttribute && a.getAttribute("role"); return a.tagName + (aid ? "#" + aid : "") + (role ? "[" + role + "]" : "") + (a === document.body ? " ←BODY" : ""); }); } catch (e) { return "?"; }
+    };
+    const snap = async (lbl) => { const s = await act.readTypeahead(loc); LOG(`${lbl}: focused=${!!(s && s.searchBox && s.searchBox.focused)} activeEl=${await activeEl()} count=${s && s.pageWide ? s.pageWide.count : "?"} highlight=${(s && s.activeText) || null} chip="${((s && s.chips) || []).join("; ")}"`); return s; };
+    const ensureFocused = async () => {
+      let st = await act.readTypeahead(loc);
+      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); }
+      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
+      return await act.readTypeahead(loc);
+    };
+
+    const pre = await act.readTypeahead(loc);
+    LOG(`probing ${where} (${loc.wrapperSel}). pre-fill chip="${((pre && pre.chips) || []).join("; ")}". READ-MOSTLY (cand-1 Enter→0 no-commit; "Other" NEVER typed/Enter'd; re-focus disarm-probe only).`);
+    await ensureFocused(); await snap("(1) opened");
+    // cand-1: a higher-tier no-match → 0 options. DOES THE EMPTY-RESULTS DROP FOCUS?
+    await act.clearSearch(); await act.delayFull(400);
+    await act.typeInSearch(CAND1); await act.delayFull(500);
+    await act.pressEnter(); await act.delayFull(1500);
+    await snap(`(2) cand-1 "${CAND1}" → Enter → empty-results  ⟵ FOCUS DROPPED? armed highlight (the stray source)?`);
+    // (3) RE-FOCUS + DISARM-POLL (operator verify): re-focusing the searchBox should RESTORE focus AND clear
+    // the armed row-0 (activeText→null, the disarm pattern from the other recons). This is the page fact the
+    // focus-safe loop's ensureSearchFocused relies on; the fix's re-commit settles + affirmatively clicks
+    // rather than poll-disarming — this snap just confirms the drop is recoverable.
+    await act.focusSearchBox(loc); await act.delayFull(400);
+    let ds = await act.readTypeahead(loc); const t0 = Date.now();
+    while (ds && ds.activeText != null && Date.now() - t0 < 4000) { await act.delayFull(300); ds = await act.readTypeahead(loc); }
+    await snap("(3) after RE-FOCUS + disarm-poll  ⟵ focus RESTORED? highlight=null (disarmed)?");
+    // safe close: clear + Escape (NO Enter — no commit; "Other" never typed).
+    await act.clearSearch(); await act.delayFull(400); await act.pressEscape(); await act.delayFull(700);
+    const endChip = ((await act.readTypeahead(loc)).chips || []).join("; ");
+    LOG(`field left chip="${endChip}" (pre-fill was "${((pre && pre.chips) || []).join("; ")}").`);
+    return { ok: true, found: true, endChip };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("FoS focus-recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// RESULTS-BANNER RECON (read-only) — capture the exact markup of the typeahead's TWO banners so the
+// terminal-state gate (next round) can distinguish them: the RESULTS banner ("Search Results (N)" — NOT
+// currently surfaced anywhere) vs the NO-MATCH banner ("No matches found" — the existing detection). Drives
+// FoS into both states (a MATCHING query → results; a NON-matching query → no-match) and dumps every visible
+// promptTitle + banner-ish node + the option count via cdpResultsBannerScan. NEVER commits a value (clears +
+// Escape; the matching query is broad → multi-match → filters WITHOUT autocommitting). [CDP-RESULTS-BANNER].
+// ============================================================================
+async function runCdpResultsBannerRecon(tabId, labelRegexStr, matchQuery) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-RESULTS-BANNER]", ...a);
+  let re;
+  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+  const MATCH = (matchQuery && matchQuery.trim()) || "a"; // a broad query → MULTI-match → the results banner (no autocommit)
+  const NOMATCH = "Zxqwbogus";                            // definitely no-match → the no-match banner
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+    // Locate FoS by label — repeating entries first, then flat (mirrors runCdpFosFocusRecon).
+    let loc = null, where = null;
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
+        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+      }
+      if (loc) break;
+    }
+    if (!loc) {
+      const ps = await cdpEval(cdpPageScan);
+      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
+      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
+    }
+    if (!loc) { LOG(`no typeahead matching /${re.source}/ — run on My Experience (page 2, Field of Study).`); return { ok: true, found: false }; }
+
+    const ensureFocused = async () => {
+      let st = await act.readTypeahead(loc);
+      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(600); st = await act.readTypeahead(loc); }
+      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
+    };
+    const dump = async (lbl) => {
+      const r = await cdpEval(cdpResultsBannerScan, loc.wrapperSel);
+      if (!r || !r.ok) { LOG(`${lbl}: scan FAILED — ${r && r.error}`); return r; }
+      LOG(`${lbl}: optionCount=${r.optionCount} sbValue=${JSON.stringify(r.searchBoxValue)} sbVisible=${r.searchBoxVisible} focused=${r.focused} chips=${JSON.stringify(r.chips)}`);
+      LOG(`    promptTitles=${JSON.stringify(r.promptTitles)}`);
+      LOG(`    bannerish=${JSON.stringify(r.bannerish)}`);
+      return r;
+    };
+
+    LOG(`probing ${where} (${loc.wrapperSel}). READ-ONLY: types "${MATCH}" (match) + "${NOMATCH}" (no-match), NEVER commits. Compare promptTitles/bannerish across (1) results vs (2) no-match to find the distinct "Search Results (N)" node.`);
+    await ensureFocused();
+    await act.delayFull(800); // let the initial list settle before the first dump
+    await dump("(0) initial (opened)");
+    // (1) MATCHING query → the RESULTS state ("Search Results (N)")
+    await act.clearSearch(); await act.delayFull(500);
+    await act.typeInSearch(MATCH); await act.delayFull(600);
+    await act.pressEnter(); await act.delayFull(2500);
+    const r1 = await dump(`(1) after MATCHING "${MATCH}" → Enter  ⟵ the RESULTS banner ("Search Results (N)")?`);
+    if (r1 && r1.ok && r1.chips && r1.chips.length) LOG(`  ⚠ a chip committed ("${r1.chips.join("; ")}") — "${MATCH}" single-exact-matched (no results banner). Re-run with a BROADER multi-match query in the input, and RESTORE Field of Study manually.`);
+    // (2) NON-matching query → the NO-MATCH state ("No matches found")
+    await ensureFocused();
+    await act.clearSearch(); await act.delayFull(500);
+    await act.typeInSearch(NOMATCH); await act.delayFull(600);
+    await act.pressEnter(); await act.delayFull(2500);
+    await dump(`(2) after NON-matching "${NOMATCH}" → Enter  ⟵ the NO-MATCH banner ("No matches found")?`);
+    // safe close: clear + Escape — NEVER commit a value.
+    await act.clearSearch(); await act.delayFull(400); await act.pressEscape(); await act.delayFull(500);
+    const endChips = ((await act.readTypeahead(loc)).chips || []);
+    LOG(`done. field left chips=${JSON.stringify(endChips)}. Compare (1) vs (2): which promptTitle/bannerish node + text carries "Search Results (N)" vs "No matches found"? Are they DISTINCT? (restore FoS manually if a chip committed.)`);
+    return { ok: true, found: true, results: r1 || null };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("results-banner recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // INPUT-LOCK RECON — resolve the 3 unknowns before building the operator input-lock
 // (block the operator's pointer/keyboard while the bot's CDP input proceeds). The bot's
 // CDP input is isTrusted through the SAME pipeline as the operator's, so "block user,
@@ -2932,14 +3115,9 @@ async function runCdpFillWebsites(tabId, profile) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
     const prepared = prepareProfile(profile);
     const items = Array.isArray(prepared.websites) ? prepared.websites : [];
-    LOG(`tab is hidden — websites fill starting. ${items.length} meaningful website(s). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful website(s).`);
 
     const act = makeCdpActuation();
     const out = await driveRepeatingSectionCdp(act, {
@@ -2982,14 +3160,9 @@ async function runCdpFillLanguages(tabId, profile) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
     const prepared = prepareProfile(profile);
     const items = Array.isArray(prepared.languages) ? prepared.languages : [];
-    LOG(`tab is hidden — languages fill starting. ${items.length} meaningful language(s). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful language(s).`);
 
     const act = makeCdpActuation();
     const out = await driveRepeatingSectionCdp(act, {
@@ -3033,14 +3206,9 @@ async function runCdpFillWorkExperience(tabId, profile) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
     const prepared = prepareProfile(profile);
     const items = Array.isArray(prepared.work_experience) ? prepared.work_experience : [];
-    LOG(`tab is hidden — work-experience fill starting. ${items.length} meaningful entr(y/ies). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful entr(y/ies).`);
 
     const act = makeCdpActuation();
     const out = await driveRepeatingSectionCdp(act, {
@@ -3083,14 +3251,9 @@ async function runCdpFillEducation(tabId, profile) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
     const prepared = prepareProfile(profile);
     const items = Array.isArray(prepared.education) ? prepared.education : [];
-    LOG(`tab is hidden — education fill starting. ${items.length} meaningful entr(y/ies). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful entr(y/ies).`);
 
     const act = makeCdpActuation();
     const out = await driveRepeatingSectionCdp(act, {
@@ -3133,14 +3296,9 @@ async function runCdpFillCertifications(tabId, profile) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
     const prepared = prepareProfile(profile);
     const items = Array.isArray(prepared.certifications) ? prepared.certifications : [];
-    LOG(`tab is hidden — certifications fill starting. ${items.length} meaningful cert(s). (Δperf ~1000ms on the page loop is EXPECTED, not failure.)`);
+    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful cert(s).`);
 
     const act = makeCdpActuation();
     const out = await driveRepeatingSectionCdp(act, {
@@ -3194,11 +3352,7 @@ async function runCdpFillDate(tabId, profile, labelRegexStr) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
+    LOG("attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2).");
     let re;
     try { re = new RegExp(labelRegexStr || ".", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
 
@@ -3226,7 +3380,7 @@ async function runCdpFillDate(tabId, profile, labelRegexStr) {
       return { ok: false, error: "no-value" };
     }
     LOG("value (parsed):", JSON.stringify(parsed));
-    LOG("tab is hidden — date fill starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
+    LOG("date fill starting. (visible = fast; minimized = slow/background, adapts live.)");
 
     const act = makeCdpActuation();
     const rec = await fillDateCompositeCdp(act, { wrapperSel: target.field.wrapperSel }, parsed, DEFAULT_BUDGETS);

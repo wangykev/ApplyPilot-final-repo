@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -162,9 +162,19 @@ function makeFakeAct(fields, opts) {
         const fm = (src.filterMap || {})[src._value];
         if (fm) {
           src._rev = (src._rev || 0) + 1;
-          if (fm.banner) { src._banner = true; src._leaves = (src.fallbackLeaves || src._leaves || []).slice(); }
-          else if (fm.autoCommit) { src.chips = [fm.autoCommit]; src._open = false; src._banner = false; }
-          else if (fm.filtered) { src._leaves = fm.filtered.slice(); src._banner = false; }
+          if (fm.banner) { src._banner = true; src._resultsBanner = false; src._leaves = (src.fallbackLeaves || src._leaves || []).slice(); }
+          else if (fm.autoCommit) { src.chips = [fm.autoCommit]; src._open = false; src._banner = false; src._resultsBanner = false; }
+          else if (fm.filtered) { src._banner = false;
+            if (fm.lateResultsBanner) {
+              // LATE RESULTS banner (lockstep with the typeahead): a transient bannerless leaf list renders NOW;
+              // the "Search Results" banner + the REAL leaves land after N reads. awaitListTerminal must WAIT.
+              src._leaves = (src.fallbackLeaves || []).slice(); src._resultsBanner = false;
+              src._resultsBannerPending = true; src._resultsBannerReadsLeft = fm.lateResultsBanner; src._pendingLeaves = fm.filtered.slice();
+            } else {
+              src._leaves = fm.filtered.slice();
+              src._resultsBanner = src._leaves.length > 0; // a non-empty leaf list → the "Search Results" banner
+            }
+          }
         }
         return;
       }
@@ -175,11 +185,28 @@ function makeFakeAct(fields, opts) {
           const fm = (ta.filterMap || {})[ta._value];
           if (fm) {
             ta._rev = (ta._rev || 0) + 1; // page transitions through a cleared list — sig changes on a response
-            if (fm.banner) { ta._banner = true; ta._texts = (ta.fallbackTexts || ta._texts || []).slice(); ta._filtered = true; }
+            if (fm.banner) { ta._banner = true; ta._resultsBanner = false; ta._texts = (ta.fallbackTexts || ta._texts || []).slice(); ta._filtered = true; }
             // residualChipAfterCommit: simulate a tenant that ADDS a chip instead of
             // REPLACING (recon = REPLACE on Magna; this drives the defensive assertion).
-            else if (fm.autoCommit) { ta.chips = ta.residualChipAfterCommit ? (ta.chips || []).concat([fm.autoCommit]) : [fm.autoCommit]; ta._open = false; ta._banner = false; }
-            else if (fm.filtered) { ta._texts = fm.filtered.slice(); ta._banner = false; ta._filtered = true; }
+            else if (fm.autoCommit) { ta.chips = ta.residualChipAfterCommit ? (ta.chips || []).concat([fm.autoCommit]) : [fm.autoCommit]; ta._open = false; ta._banner = false; ta._resultsBanner = false; }
+            else if (fm.filtered) { ta._banner = false; ta._filtered = true;
+              // strayChip: model the filter-Enter ALSO committing the armed row-0 (a stray) while the list
+              // stays OPEN — the affirmative clickTaOption must then OVERWRITE it back to the kept value.
+              if (fm.strayChip) ta.chips = [fm.strayChip];
+              if (fm.lateResultsBanner) {
+                // LATE RESULTS banner: a transient bannerless list (fallbackTexts) renders NOW; the "Search
+                // Results" banner + the REAL filtered list land only after N reads. awaitListTerminal must WAIT
+                // (never match the bannerless transient → that would commit a stray / a wrong row).
+                ta._texts = (ta.fallbackTexts || []).slice(); ta._resultsBanner = false;
+                ta._resultsBannerPending = true; ta._resultsBannerReadsLeft = fm.lateResultsBanner; ta._pendingTexts = fm.filtered.slice();
+              } else {
+                ta._texts = fm.filtered.slice();
+                ta._resultsBanner = ta._texts.length > 0; // a non-empty filtered list → the "Search Results" banner
+              }
+              // empty-results (filtered to 0, no banner): a 0-options filter DROPS searchBox focus (the
+              // keptLowerTier re-commit re-asserts). NOT terminal under awaitListTerminal → it times out.
+              if (ta._texts.length === 0 && ta.dropsFocusAfterEmpty) { ta._focusedSb = false; if (ta.focusUnrecoverableAfterEmpty) ta.focusUnconfirmable = true; }
+            }
           }
           // no filterMap entry → the page never responds (the stable pre-filter case)
         } else if (!ta.enterCommitFails && (ta._texts || []).length && !ta._banner) {
@@ -222,17 +249,19 @@ function makeFakeAct(fields, opts) {
     },
     readSource: async (loc) => {
       const f = byLoc(loc);
+      if (f._resultsBannerPending) { f._resultsBannerReadsLeft -= 1; if (f._resultsBannerReadsLeft <= 0) { f._resultsBanner = true; f._resultsBannerPending = false; if (f._pendingLeaves) f._leaves = f._pendingLeaves; } } // late RESULTS banner lands after N reads
       const leaves = f._open ? (f._leaves || []) : [];
       const sig = (f._rev || 0) + "|" + leaves.length + "|" + leaves.slice(0, 3).join("~");
       return {
         searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: f._value || "" },
         leaves, leafCount: leaves.length, sig,
         banner: !!(f._open && f._banner),
+        resultsBanner: !!(f._open && f._resultsBanner),
         chips: (f.chips || []).slice()
       };
     },
     focusSourceSearch: async (loc) => { log.push(["focusSourceSearch"]); const f = byLoc(loc); if (!f.focusUnconfirmable) f._focusedSb = true; focusedSrc = f; return true; },
-    typeInSourceSearch: async (t) => { log.push(["typeInSourceSearch", t]); if (focusedSrc) { focusedSrc._value = t; focusedSrc._filtered = false; } },
+    typeInSourceSearch: async (t) => { log.push(["typeInSourceSearch", t]); if (focusedSrc) { focusedSrc._value = t; focusedSrc._filtered = false; focusedSrc._resultsBanner = false; focusedSrc._resultsBannerPending = false; } },
     clearSourceSearch: async () => { log.push(["clearSourceSearch"]); if (focusedSrc) { focusedSrc._value = ""; focusedSrc._filtered = false; } },
     probeSourceLeaf: async (label) => {
       const f = focusedSrc;
@@ -271,6 +300,9 @@ function makeFakeAct(fields, opts) {
     },
     readTypeahead: async (loc) => {
       const f = byLoc(loc);
+      // lateResultsBanner: the "Search Results" banner + the REAL filtered list LAND after N reads (throttle-
+      // lag), over a transient bannerless list — every read brings it closer; awaitListTerminal polling waits it.
+      if (f._resultsBannerPending) { f._resultsBannerReadsLeft -= 1; if (f._resultsBannerReadsLeft <= 0) { f._resultsBanner = true; f._resultsBannerPending = false; if (f._pendingTexts) f._texts = f._pendingTexts; } }
       const texts = f._open ? (f._texts || []) : [];
       const sig = (f._rev || 0) + "|" + texts.length + "|" + texts.slice(0, 3).join("~");
       // M39.2 lag model: the searchBox VALUE reflects the typed text only after N reads
@@ -285,6 +317,7 @@ function makeFakeAct(fields, opts) {
         searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: sbValue },
         chips: (f.chips || []).slice(),
         banner: f._open && f._banner ? { text: "No matches found", automationId: "promptTitle" } : null,
+        resultsBanner: !!(f._open && f._resultsBanner),
         pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) },
         activeText: null
       };
@@ -293,12 +326,23 @@ function makeFakeAct(fields, opts) {
       log.push(["typeInSearch", text]);
       if (!focusedTa) return;
       focusedTa._value = text; focusedTa._filtered = false; // _value (used by filter-Enter) lands immediately
+      focusedTa._resultsBanner = false; focusedTa._resultsBannerPending = false; // new search → the results state resets
       if (focusedTa.searchValueLagReads !== undefined) { focusedTa._lagPending = text; focusedTa._lagReflected = ""; focusedTa._lagLeft = focusedTa.searchValueLagReads; } // but the READ echoes late
     },
     clearSearch: async () => {
       log.push(["clearSearch"]);
       if (focusedTa) { focusedTa._value = ""; focusedTa._filtered = false; }
       // stale banner + rendered list deliberately PERSIST (recon finding)
+    },
+    // FoS capture (single-open): read-only scroll-scrape. dropsFocusOnScrape models the scroll dropping
+    // searchBox focus → the loop's ensureSearchFocused must re-focus (focusSearchBox) before the type.
+    scrapeTaOptions: async (loc) => {
+      log.push(["scrapeTaOptions", loc.wrapperSel]);
+      const f = byLoc(loc);
+      if (f && f.dropsFocusOnScrape) f._focusedSb = false;
+      if (!f || f.scrapeFails) return { ok: false, error: "no wrapper" };
+      const options = (f.scrapeOptions || []).slice();
+      return { ok: true, options, count: options.length, atBottom: true };
     },
     // Trusted-click commit fallback. Default: commits the named option (trusted
     // clicks work); flags: clickCommitFails (dispatched, page ignores it),
@@ -1031,6 +1075,145 @@ const taField = (flags) => Object.assign({
 const taProfile = (candidates) => ({ personal_info: { country_phone_code: candidates } });
 const enters = (act) => act.log.filter(([m]) => m === "pressEnter").length;
 
+// ── FoS capture (single-open): scrape BEFORE the candidate loop, the loop's ensureSearchFocused cleans up ──
+// Corrected design: opts.onCapture scrapes the full option list BEFORE the loop, so the loop's existing
+// ensureSearchFocused — the LAST focus action immediately before clear/type — is the sole re-assert.
+// Load-bearing: nothing focus-dropping between the scrape and the loop, NOR between the loop's focus and
+// typeInSearch. (The fake can't model the live async blur — these pin the call STRUCTURE that prevents it.)
+const TA_LOC = { wrapperSel: "[w-ta]" };
+const FOS_FULL = ["Accounting", "Biology", "Economics", "Other", "Religion"];
+
+test("capture single-open: onCapture scrapes BEFORE the loop's first clearSearch (and commits the typed value)", async () => {
+  const f = taField({ scrapeOptions: FOS_FULL, filterMap: { "Other": { autoCommit: "Other" } } });
+  const act = makeFakeAct([f]);
+  let scraped = null;
+  const onCapture = async () => { const sc = await act.scrapeTaOptions(TA_LOC); if (sc.ok) scraped = sc.options.slice(); };
+  const rec = await fillTypeaheadCdp(act, TA_LOC, ["Other"], T_BUDGETS, { onCapture });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");                 // commits the typed value, no stray
+  assert.deepStrictEqual(scraped, FOS_FULL);              // the scrape ran + captured the full list
+  const idx = (m) => act.log.findIndex(([x]) => x === m);
+  assert.ok(idx("scrapeTaOptions") >= 0 && idx("scrapeTaOptions") < idx("clearSearch"), "scrape ran BEFORE the first clearSearch (i.e. before the candidate loop)");
+});
+
+test("capture single-open: the loop's re-assert is AFTER the scrape, with ONLY clearSearch before typeInSearch (the invariant)", async () => {
+  // dropsFocusOnScrape models the scroll dropping focus → the loop's ensureSearchFocused must re-focus
+  // (focusSearchBox) before clear/type, with the scrape strictly before that re-assert and NOTHING
+  // focus-dropping between the re-assert and the type.
+  const f = taField({ dropsFocusOnScrape: true, scrapeOptions: FOS_FULL, filterMap: { "Other": { autoCommit: "Other" } } });
+  const act = makeFakeAct([f]);
+  const onCapture = async () => { await act.scrapeTaOptions(TA_LOC); };
+  const rec = await fillTypeaheadCdp(act, TA_LOC, ["Other"], T_BUDGETS, { onCapture });
+  assert.strictEqual(rec.after, "Other");                 // the re-assert recovered focus → typed value commits
+  const seq = act.log.map(([m]) => m);
+  const typeIdx = seq.indexOf("typeInSearch");
+  const reassertIdx = seq.lastIndexOf("focusSearchBox", typeIdx); // the loop's focus re-assert
+  assert.ok(seq.indexOf("scrapeTaOptions") < reassertIdx, "scrape is BEFORE the loop's focus re-assert");
+  assert.ok(reassertIdx >= 0 && reassertIdx < typeIdx, "re-assert is immediately before the type");
+  assert.deepStrictEqual(seq.slice(reassertIdx + 1, typeIdx).filter((m) => m !== "clearSearch"), [], "ONLY clearSearch between the re-assert and the type — no scrape/read/settle in that gap");
+});
+
+test("capture single-open: no onCapture → no scrape (4-arg callers / non-tagged typeaheads unaffected)", async () => {
+  const f = taField({ scrapeOptions: FOS_FULL, filterMap: { "Other": { autoCommit: "Other" } } });
+  const act = makeFakeAct([f]);
+  const rec = await fillTypeaheadCdp(act, TA_LOC, ["Other"], T_BUDGETS); // no opts
+  assert.strictEqual(rec.after, "Other");
+  assert.ok(!act.log.some(([m]) => m === "scrapeTaOptions"), "no scrape without onCapture");
+});
+
+// ── keptLowerTier RE-COMMIT: focus-safe re-type (the REAL FoS stray fix) ──────────────────────
+// cand-0's empty-results (0 options) DROPS searchBox focus; the re-commit (overwriteNoMatchResting→
+// recommitFn) must re-verify focus IMMEDIATELY before its re-type and NEVER pressEnter on a
+// partial/unfocused box (Enter commits the highlighted listbox row — the live "Healthcare" stray).
+// Field: pre-filled tier-1 "Other"; cand-0 "X" no-matches (0 options) → re-commit "Other".
+const reField = (flags) => taField(Object.assign({ chips: ["Other"], filterMap: { "X": { filtered: [] }, "Other": { autoCommit: "Other" } } }, flags || {}));
+
+test("keptLowerTier re-commit: empty-results drops focus → the re-commit RE-FOCUSES + lands the kept value", async () => {
+  const act = makeFakeAct([reField({ dropsFocusAfterEmpty: true })]);
+  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");                          // recovered → committed the kept value, NO stray
+  assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
+  assert.ok(act.log.some(([m]) => m === "focusSearchBox"), "the re-commit re-focused the dropped searchBox before re-typing");
+});
+
+test("keptLowerTier re-commit: focus UNRECOVERABLE → needs_review, NEVER pressEnter on the unfocused re-type (invariant)", async () => {
+  const act = makeFakeAct([reField({ dropsFocusAfterEmpty: true, focusUnrecoverableAfterEmpty: true })]);
+  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");                  // couldn't hold focus → honest, no stray committed
+  assert.strictEqual(enters(act), 1, "only cand-0's filter-Enter — the re-commit NEVER pressed Enter on the unfocused box (which would commit the highlighted stray)");
+});
+
+// ── the operator's two re-commit guards (no disarm; affirmative click is the committing action) ──
+test("keptLowerTier re-commit: filter-Enter strays the chip (armed row-0) → the AFFIRMATIVE clickTaOption OVERWRITES it back to the kept value → filled", async () => {
+  // The settled re-type's filter-Enter commits the armed row-0 ("Accounting") while the "Other" list stays
+  // open — the affirmative clickTaOption("Other") is a real selection that OVERWRITES the stray (no disarm).
+  const act = makeFakeAct([reField({ filterMap: { "X": { filtered: [] }, "Other": { filtered: ["Other", "Other Technology"], strayChip: "Accounting" } } })]);
+  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");
+  assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
+  assert.ok(act.log.some(([m, t]) => m === "clickTaOption" && t === "Other"), "the affirmative click overwrote the stray with the kept value");
+});
+
+test("keptLowerTier re-commit STRAY GUARD: a stray the click can't overwrite → needs_review with the HONEST live after (never silent, never [])", async () => {
+  // The filter-Enter commits a STRAY ("Accounting") and CLOSES the list, so clickTaOption("Other") can't reach
+  // the leaf. The chip is neither "Other" nor empty → must surface needs_review/overwrite-stray with the LIVE
+  // value (not a false "Other", not a [] that would hide "Accounting" from the record + the M40 audit).
+  const act = makeFakeAct([reField({ filterMap: { "X": { filtered: [] }, "Other": { autoCommit: "Accounting" } } })]);
+  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "overwrite-stray");
+  assert.strictEqual(rec.after, "Accounting");                     // HONEST live value, never a false "Other"
+});
+
+// ── awaitListTerminal: the terminal-state gate (banner or autocommit ONLY; bannerless = NOT terminal) ──
+const TERM_ACT = { delay: async () => {} };
+const noNewChip = () => false;            // no new chip vs priorChips (the empty/no-match cases)
+const anyChip = (chips) => chips.length > 0; // empty field: any chip is a NEW chip
+test("awaitListTerminal (a): no-match banner + stable count → 'nomatch'", async () => {
+  const read = async () => ({ banner: { text: "No matches found" }, resultsBanner: false, pageWide: { count: 15 }, searchBox: { visible: true }, chips: [] });
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, read, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "nomatch");
+});
+
+test("awaitListTerminal (b): results banner + stable non-zero count → 'results'", async () => {
+  const read = async () => ({ banner: null, resultsBanner: true, pageWide: { count: 5 }, searchBox: { visible: true }, chips: [] });
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, read, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "results");
+});
+
+test("awaitListTerminal (c): a stable NON-ZERO count with NO banner is NOT terminal → polls to 'timeout' (the FoS fallback-before-the-banner)", async () => {
+  let n = 0;
+  const read = async () => { n++; return { banner: null, resultsBanner: false, pageWide: { count: 5 }, searchBox: { visible: true }, chips: [] }; };
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, read, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "timeout");
+  assert.ok(n > 2, "kept polling past the steady non-zero count (never concluded 'results' without the banner)");
+});
+
+test("awaitListTerminal (d): count===0 with no banner is NOT terminal → 'timeout'", async () => {
+  const read = async () => ({ banner: null, resultsBanner: false, pageWide: { count: 0 }, searchBox: { visible: true }, chips: [] });
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, read, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "timeout");
+});
+
+test("awaitListTerminal (e): a NEW chip appears → 'autocommit' (checked first, immediate)", async () => {
+  const read = async () => ({ banner: null, resultsBanner: false, pageWide: { count: 0 }, searchBox: { visible: true }, chips: ["LinkedIn"] });
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, read, { wrapperSel: "[w]" }, T_BUDGETS, anyChip), "autocommit");
+});
+
+test("awaitListTerminal (f): box closes holding a (non-new) chip → 'autocommit'", async () => {
+  const read = async () => ({ banner: null, resultsBanner: false, pageWide: { count: 0 }, searchBox: { visible: false }, chips: ["Kept Value"] });
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, read, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "autocommit");
+});
+
+test("awaitListTerminal: source shape (leafCount) — banner confirmation works for the source loop too (lockstep)", async () => {
+  const nomatch = async () => ({ banner: { text: "No matches found" }, resultsBanner: false, leafCount: 13, searchBox: { visible: true }, chips: [] });
+  const results = async () => ({ banner: null, resultsBanner: true, leafCount: 3, searchBox: { visible: true }, chips: [] });
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, nomatch, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "nomatch");
+  assert.strictEqual(await awaitListTerminal(TERM_ACT, results, { wrapperSel: "[w]" }, T_BUDGETS, noNewChip), "results");
+});
+
 test("typeahead: banner hard-block — never commits from the fallback full list", async () => {
   // The fallback list rendered UNDER the banner CONTAINS the candidate's value —
   // the exact false-fill condition. The banner must block any pick.
@@ -1094,6 +1277,47 @@ test("typeahead: per-candidate isolation — a later tier's value in the fallbac
   const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
   assert.deepStrictEqual(typed, ["Electrical and Computer Engineering", "Other"]);
   assert.strictEqual(enters(act), 3, "cand-0: filter-Enter only (banner); cand-1: filter-Enter + commit-Enter");
+});
+
+test("typeahead main loop (empty field, FAILURE-DIRECTION): the post-type gate WAITS for the LATE 'Search Results' banner — never matches the transient bannerless fallback → filled 'Other'", async () => {
+  // The empty-first-fill FoS bug. cand-0 "Electrical…" no-matches ("No matches found"). cand-1 "Other": the
+  // filter-Enter first shows a TRANSIENT bannerless fallback list that does NOT contain "Other" (["Accounting",
+  // "Zoology"]); only after N reads does the "Search Results" banner + the REAL ["Other", …] list land.
+  // awaitListTerminal must WAIT for the results banner; if it concluded on the bannerless transient it would
+  // match the WRONG list (no "Other" → no commit). filled "Other" + outcome "results" PROVES the gate waited —
+  // it FAILS without the render gate (the old bannerless "filtered" would conclude on the transient → no-match).
+  const f = taField({
+    fallbackTexts: ["Accounting", "Zoology"], // the transient bannerless list (NO "Other")
+    filterMap: {
+      "Electrical and Computer Engineering": { banner: true },
+      "Other": { filtered: ["Other", "Other Technology"], lateResultsBanner: 4 }
+    }
+  });
+  const out = await drivePageFill(makeFakeAct([f]), taProfile(["Electrical and Computer Engineering", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");
+  assert.strictEqual(rec.settle_trace[1].outcome, "results", "cand-1 concluded on the 'Search Results' banner terminal, never the bannerless transient");
+});
+
+test("typeahead walk (combined Step 4 + Step 3, the real FoS shape): tier-0 no-match resolves on 'nomatch' banner (NOT timeout/premature-results), tier-1 reaches 'results' + commits 'Other'", async () => {
+  // tier-0 "Electrical…" no-matches → "No matches found"; tier-1 "Other" → "Search Results" + matches. Exercises
+  // the BETWEEN-candidates gate (Step 4) AND the post-type gate (Step 3) together. The between-candidates gate
+  // MUST resolve tier-0 on "nomatch" (the banner), NOT "timeout" (which would stack 25s waits across a multi-tier
+  // walk) and NOT a premature "results".
+  const f = taField({
+    filterMap: {
+      "Electrical and Computer Engineering": { banner: true },
+      "Other": { filtered: ["Other", "Other Technology"] }
+    }
+  });
+  const out = await drivePageFill(makeFakeAct([f]), taProfile(["Electrical and Computer Engineering", "Other"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Other");
+  assert.strictEqual(rec.settle_trace[0].outcome, "nomatch", "tier-0 post-type gate concluded on the 'No matches found' banner");
+  assert.strictEqual(rec.settle_trace[1].priorSettle, "nomatch", "the BETWEEN-candidates gate confirmed tier-0's no-match via the banner — NOT a timeout (latency smell), NOT a premature results");
+  assert.strictEqual(rec.settle_trace[1].outcome, "results", "tier-1 reached the 'Search Results' terminal and committed");
 });
 
 test("typeahead: single exact match auto-commits on the filter-Enter; chip verified", async () => {
@@ -1417,11 +1641,13 @@ test("typeahead M39.2: typed value reflects LATE → poll WAITS for the echo, TH
   assert.strictEqual(enters(act), 1, "exactly one filter-Enter, fired AFTER the echo landed");
 });
 
-test("typeahead M39.2: echo NEVER lands within the ceiling → PROCEEDS to Enter anyway (no hang; ceiling = give-up)", async () => {
-  // Strictly-better-than-today: if the searchBox value never reflects, the poll gives up at the
-  // ceiling and proceeds to Enter (today's behavior — the post-Enter transition-settle is the real
-  // commit gate). Here the underlying value DID land (the type happened), so it still commits —
-  // proving the fallback PROCEEDS rather than hangs.
+test("main loop echo-guard (supersedes M39.2 proceed-to-Enter): echo NEVER confirms → needs_review, NEVER pressEnter on an unverified value", async () => {
+  // Lock-down 2 (lockstep with the recommit): the main loop ECHO-VERIFIES the FULL candidate landed in the
+  // FOCUSED box before the filter-Enter. If the echo never confirms (a focus-drop truncating the type — the
+  // FoS "half-typed oth" stray condition), it re-focuses + re-clears + re-types (bounded) and then BAILS to
+  // needs_review — it NEVER presses Enter on an unverified value (which would commit the armed listbox row).
+  // This is STRUCTURALLY closed, replacing M39.2's old proceed-to-Enter (which was only probabilistically safe
+  // via the post-Enter settle). A genuinely-laggy-but-landed echo is the (rare) cost — needs_review is safe.
   const act = makeFakeAct([taField({
     searchValueLagReads: Infinity,
     openTexts: ["United States of America (+1)"],
@@ -1429,8 +1655,8 @@ test("typeahead M39.2: echo NEVER lands within the ceiling → PROCEEDS to Enter
   })]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(enters(act), 1, "Enter still fired after the ceiling — proceeds, never hangs");
-  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(enters(act), 0, "NEVER pressed Enter — the echo never confirmed the full value landed in a focused box");
 });
 
 // ── M27 flag taxonomy (Commit A) ────────────────────────────────────────────
@@ -1555,6 +1781,25 @@ test("source: banner on tier-0 → walks to tier-1 and commits", async () => {
   }), ["LinkedIn", "Other"]);
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "Other");
+});
+
+test("source main loop (FAILURE-DIRECTION, lockstep): the post-type gate WAITS for the LATE 'Search Results' banner — never matches the transient bannerless leaves → filled 'LinkedIn'", async () => {
+  // Lockstep mirror of the typeahead failure-direction. cand-0 "Facebook" no-matches. cand-1 "LinkedIn": the
+  // filter-Enter first shows a TRANSIENT bannerless leaf list WITHOUT "LinkedIn" (["Family"]); only after N
+  // reads does the "Search Results" banner + the REAL ["LinkedIn"] land. awaitListTerminal must WAIT — matching
+  // the transient would find no "LinkedIn" → no commit. filled "LinkedIn" + outcome "results" PROVES the wait.
+  const f = srcField({
+    commitVia: "leaf", fallbackLeaves: ["Family"], // transient bannerless leaves (NO "LinkedIn")
+    filterMap: {
+      Facebook: { banner: true },
+      LinkedIn: { filtered: ["LinkedIn"], lateResultsBanner: 4 }
+    }
+  });
+  const act = makeFakeAct([f]);
+  const rec = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, ["Facebook", "LinkedIn"], T_BUDGETS);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "LinkedIn");
+  assert.strictEqual(rec.settle_trace[1].outcome, "results", "cand-1 concluded on the 'Search Results' banner terminal, never the bannerless transient (lockstep)");
 });
 
 test("source: no candidate in its filtered set → needs_review", async () => {
@@ -2697,26 +2942,26 @@ test("self-heal: M40 standalone re-audit (no opts) stays FLAG-ONLY — never re-
   assert.strictEqual(field.value, "DRIFTED");          // untouched — no re-fill happened
 });
 
-// ── CPP delay (Round 2): empty filtered list (0 options, no banner) → fast 'empty' no-match ──
-// The settle had no exit for empty-no-banner → it burned the full 25s ceiling. The 'empty' outcome
-// is a fast no-match treated EXACTLY like timeout downstream (kept, not delete-on-no-match).
-test("typeahead: a candidate filtering to 0 options + no banner → fast 'empty' no-match (not a ceiling burn)", async () => {
+// ── count===0 + no banner is NOT terminal (awaitListTerminal) → timeout no-match ──
+// Per the strict terminal spec, a 0-options-no-banner list is NOT a confirmed terminal (it could be a
+// transient mid-render), so awaitListTerminal keeps polling to "timeout" (treated like a no-match, kept, not
+// delete-on-no-match). Magna shows a "No matches found" banner so it's fast there; only a hypothetical
+// no-banner tenant pays the ceiling — the operator's accepted banner-or-timeout trade-off.
+test("typeahead: 0 options + no banner is NOT terminal → 'timeout' no-match (kept, never a false commit)", async () => {
   const act = makeFakeAct([taField({ filterMap: { "Nonexistent Cert (CPP)": { filtered: [] } } })]);
   const out = await drivePageFill(act, taProfile(["Nonexistent Cert (CPP)"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "needs_review");        // no-match (kept, never a false commit)
   assert.strictEqual(rec.after, null);
-  assert.strictEqual(rec.settle_trace[0].outcome, "empty", "the empty-list fast exit fired, not a 'timeout' ceiling burn");
-  assert.strictEqual(rec.settle_trace[0].count, 0);
-  assert.strictEqual(rec.genuineNoMatch, false, "empty behaves like timeout for genuineNoMatch — kept, not delete-on-no-match");
+  assert.strictEqual(rec.settle_trace[0].outcome, "timeout", "0+no-banner is not terminal → timeout (not a premature commit)");
+  assert.strictEqual(rec.genuineNoMatch, false, "timeout behaves like a no-match but is NOT genuineNoMatch — kept, not delete-on-no-match");
 });
-test("source: a candidate filtering to 0 leaves + no banner → fast 'empty' no-match (lockstep)", async () => {
+test("source: 0 leaves + no banner is NOT terminal → 'timeout' no-match (lockstep)", async () => {
   const act = makeFakeAct([srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { filtered: [] } } })]);
   const out = await drivePageFill(act, nameProfile, { how_did_you_hear: { preferred: ["LinkedIn"] } }, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.settle_trace[0].outcome, "empty", "source empty-leaf fast exit fired (lockstep with typeahead)");
-  assert.strictEqual(rec.settle_trace[0].count, 0);
+  assert.strictEqual(rec.settle_trace[0].outcome, "timeout", "source 0-leaf-no-banner is not terminal → timeout (lockstep with typeahead)");
 });
 
 // ── CPP delay Round 3: AUTOCOMMIT-CLOSE — the dropdown closes holding a chip == the pre-fill ──
@@ -2728,7 +2973,7 @@ test("typeahead: a candidate that AUTOCOMMITS the pre-fill + closes → closed-c
   const act = makeFakeAct([taField({ chips: [CPP], filterMap: { "CPP": { autoCommit: CPP } } })]);
   const out = await drivePageFill(act, taProfile(["CPP"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.settle_trace[0].outcome, "closed-commit", "the autocommit-close was detected (not an empty/timeout burn)");
+  assert.strictEqual(rec.settle_trace[0].outcome, "autocommit", "the autocommit-close was detected via awaitListTerminal (matchTier below records the closed-commit shape)");
   assert.strictEqual(rec.status, "filled_review");        // kept + flagged (containment), NOT needs_review "no match"
   assert.strictEqual(rec.after, CPP);                     // value intact (kept, not moved)
   assert.strictEqual(rec.verified, true);

@@ -134,6 +134,65 @@ async function disarmHighlight(act, ensureFocusedFn, readFn, loc, budgets) {
   return { focused: true, armed: st ? st.activeText : null };
 }
 
+// awaitListTerminal: BLOCK until the typeahead/source result list reaches a CONFIRMED terminal render state —
+// the ONLY safe moment to read/match/commit or move to the next candidate. A no-match is a throttle-LAGGED page
+// REACTION: the page renders a non-zero alphabetical FALLBACK list (row-0 armed) and, slightly LATER, a
+// promptTitle banner. Acting on the box during that bannerless window races the focus drop + commits the armed
+// row (the FoS stray). So the only non-timeout terminals require a BANNER or an autocommit — a bannerless list
+// (EVEN a stable non-zero one) is NOT terminal, and count===0+no-banner is NOT terminal. Returns:
+//   "autocommit" — a NEW chip appeared, OR the box closed holding a chip (checked FIRST → exits immediately).
+//   "nomatch"    — the "No matches found" banner present AND count stable across stableReads.
+//   "results"    — the "Search Results" banner present AND count > 0 stable across stableReads.
+//   "timeout"    — taSettleCeilingMs ceiling (caller treats like no-match; the focus-safe type loops gate focus).
+// Count = pageWide.count (typeahead) | leafCount (source). The input ECHO (pollSearchValue) is NEVER consulted.
+// TERMINATION (not poll-forever): the stability counter resets ONLY on a count CHANGE; the fallback/filtered
+// list STOPS changing once rendered, so once a banner is present the count goes stable within ~stableReads
+// intervals → it resolves. It does NOT loop indefinitely because the banner co-arrived with a still-ticking
+// count: we require count stable across stableReads reads FROM the point both hold, and the fallback is itself
+// stable. A banner co-arriving with an already-stable count returns immediately. `read` is a thunk; chipSetIsNew
+// is the caller's overwrite-aware new-chip test.
+async function awaitListTerminal(act, readFn, loc, budgets, chipSetIsNew) {
+  const deadline = Date.now() + budgets.taSettleCeilingMs;
+  let prevCount = null, stable = 0;
+  do {
+    const s = await readFn(loc);
+    if (s && chipSetIsNew(s.chips)) return "autocommit";                                  // a NEW chip committed
+    if (s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length) return "autocommit"; // box closed holding a chip
+    const count = s && s.pageWide ? s.pageWide.count : (s && s.leafCount != null ? s.leafCount : null);
+    if (count === prevCount && count != null) stable++; else { stable = 0; prevCount = count; }
+    const stableEnough = stable >= budgets.stableReads - 1;
+    if (stableEnough && s && s.banner) return "nomatch";                                  // "No matches found" + stable
+    if (stableEnough && s && s.resultsBanner && count > 0) return "results";              // "Search Results" + stable non-zero
+    // bannerless (neither banner), even a stable non-zero count → NOT terminal; count===0 + no banner → NOT terminal
+    await act.delay(budgets.taSettleIntervalMs);
+  } while (Date.now() < deadline);
+  return "timeout";
+}
+
+// awaitListStable: the INITIAL-open gate (pre-filter, NO banner expected) — wait until the opened option list is
+// rendered + stable before the READ-ONLY recon scrape, so it never scrapes a mid-render list. SHORTER ceiling
+// (taOpenCeilingMs, NOT the big taSettleCeilingMs): a cold/empty catalog or slow open must not burn 25s before
+// the read-only scrape; a timed-out-but-proceed is acceptable here (worst case the scrape reads a slightly-early
+// list — it does NOT gate the fill, which matches via pageWide.texts). Returns "stable" | "timeout".
+async function awaitListStable(act, readFn, loc, budgets) {
+  const deadline = Date.now() + budgets.taOpenCeilingMs;
+  let prevCount = null, stable = 0;
+  do {
+    const s = await readFn(loc);
+    const count = s && s.pageWide ? s.pageWide.count : (s && s.leafCount != null ? s.leafCount : null);
+    if (count === prevCount && count != null) stable++; else { stable = 0; prevCount = count; }
+    if (count > 0 && stable >= budgets.stableReads - 1) return "stable";
+    await act.delay(budgets.taOpenIntervalMs);
+  } while (Date.now() < deadline);
+  return "timeout";
+}
+
+// TYPEAHEAD_SELF_VERIFY (operator step 5, OFF by default): when on, the keptLowerTier re-commit does a settle
+// + chip RE-READ before returning, so the handler is honest on its own. REDUNDANT with the end-of-fill M40
+// audit once the settle + affirmative-click re-commit holds — and it adds ~1.3s PER such re-commit. Leave OFF
+// (M40 is the intended backstop); flip on only if M40 ever catches a re-commit the handler missed.
+const TYPEAHEAD_SELF_VERIFY = false;
+
 // overwriteNoMatchResting: the walk-end resting state under overwrite. Two paths:
 //   • keptLowerTier (M36.1) — the pre-fill EXACT-matched a LOWER candidate tier and no higher
 //     tier is offered → the pre-fill IS the best answer. RE-COMMIT it AFFIRMATIVELY (recommitFn:
@@ -237,6 +296,7 @@ const DEFAULT_BUDGETS = {
   taSettleIntervalMs: 400,
   taEmptyNoMatchMs: 8000,   // a filtered list that stays EMPTY (0 options, no banner) this long = no-match (CPP: avoids the 25s burn; above the ~5.6s cold-list latency). FAST path (sawChange+stable) usually fires sooner.
   taEnterCommitCeilingMs: 5000, // commit-Enter → chip, before the click fallback takes over
+  selfVerifyMs: 1300,      // OFF-by-default (TYPEAHEAD_SELF_VERIFY) post-commit settle before the honesty chip re-read; M40 is the real backstop
   // M32 repeating-section reconcile poll (Add/Delete → entry count moves). In-tree
   // budget is 4s/150ms; the page mounts the new/removed entry on its throttled loop.
   entryReconcileCeilingMs: 4000,
@@ -1076,7 +1136,7 @@ const fillCheckboxCdp = async (act, loc, want, budgets) => {
 //     settle trace, never a silent or false fill.
 // The listbox + searchBox self-unmount after a trusted commit (recon (f)) —
 // no close workaround needed.
-const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
+const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const norm = apMatch.normalize;
   const pre = await act.readTypeahead(loc);
   if (!pre) return { status: "error", detail: "typeahead wrapper not found" };
@@ -1147,88 +1207,94 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   const trace = [];
   let lastFiltered = null;
   let s = null;
-  for (const cand of overwriteCandidates) {
+  // FoS capture (single-open, operator's corrected design): scrape the FULL option list BEFORE the
+  // candidate loop, so the loop's ensureSearchFocused() — the LAST focus action immediately before
+  // clear/type — erases any focus disruption the scrape caused. LOAD-BEARING: nothing that can drop
+  // focus (no settle, no read, no delay) sits between the scrape and the loop's ensureSearchFocused
+  // (only the pure-JS loop entry below), NOR between that ensureSearchFocused and typeInSearch (only
+  // the intended clearSearch + pollSearchValue). The scrape leaves the dropdown OPEN; the loop
+  // re-focuses the already-open field. NO settle/type AFTER the scrape here. (The abandoned
+  // capture-first put this INSIDE the loop with a settle + a 2nd re-assert between the re-assert and
+  // the type → the async blur landed in that gap → the keptLowerTier re-commit strayed. This puts the
+  // scrape entirely BEFORE the loop's single re-assert; the keptLowerTier re-commit path
+  // [overwriteNoMatchResting → recommitFn] is UNTOUCHED — byte-identical, no settle before its re-type.)
+  if (opts.onCapture) {
+    await act.openTypeahead(loc);
+    await awaitListStable(act, (l) => act.readTypeahead(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
+    await opts.onCapture();                       // scroll-scrape → records options (read-only); leaves the dropdown OPEN
+  }
+  for (const [ci, cand] of overwriteCandidates.entries()) {
     const step = { candidate: cand };
     trace.push(step);
+    // BETWEEN CANDIDATES: a prior no-match leaves a throttle-LAGGED empty-results re-render still landing (a
+    // non-zero fallback list while the "No matches found" banner is pending). Clearing/typing the NEXT
+    // candidate into that mid-render state races the focus drop (the live "half-typed oth" + armed-row stray).
+    // awaitListTerminal BLOCKS until the prior candidate reaches a terminal state (its banner / autocommit)
+    // before we re-focus + clear — never a bannerless list. Resolves on the banner (fast on Magna); a "timeout"
+    // here on a no-match tier is the latency smell to flag. Skipped for the first candidate.
+    if (ci > 0) step.priorSettle = await awaitListTerminal(act, (l) => act.readTypeahead(l), loc, budgets, chipSetIsNew);
     // Focus hygiene: re-assert (recover) focus before touching the field. If it
     // can't be confirmed, STOP — never blind Ctrl+A / type / Enter (that is the
     // exact path that committed a stray "Afghanistan" via the listbox highlight).
-    const focused = await ensureSearchFocused();
-    if (!focused) {
+    if (!(await ensureSearchFocused())) {
       step.note = "could not focus search field — not actuating blind";
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the search field — not actuating blind (no clear/type/Enter)", settle_trace: trace };
     }
-    await act.clearSearch();
-    await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets); // reactive: the clear has LANDED in the input before snapshot
-    const snap = await act.readTypeahead(loc);
-    const snapSig = snap ? snap.pageWide.sig : null;
-    step.staleBannerAtStart = !!(snap && snap.banner);
-    await act.typeInSearch(cand);
-    await pollSearchValue(act, () => act.readTypeahead(loc), cand, budgets); // reactive: the full candidate has LANDED before the filter-Enter
+    // FOCUS-SAFE clear + type (structurally closed, same bail as the recommit): clearSearch is FOCUS-BLIND, and
+    // a mid-type focus drop truncates the query → the filter-Enter then commits the armed listbox row (the
+    // stray). So re-verify focus after the clear and ECHO-VERIFY the FULL candidate landed (pollSearchValue)
+    // BEFORE the filter-Enter; on a blur/partial, re-focus + re-clear + re-type (bounded). NEVER pressEnter on
+    // a partial/unfocused box. (The settle above makes a mid-type drop rare; this makes the loop closed, not
+    // just probabilistically safe.)
+    let snap = null, snapSig = null, landed = false;
+    for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
+      if (attempt > 1 && !(await ensureSearchFocused())) break; // re-assert focus on retry (blur after a prior clear/type)
+      await act.clearSearch();
+      await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets); // the clear has LANDED in the input before snapshot
+      snap = await act.readTypeahead(loc);
+      if (!(snap && snap.searchBox && snap.searchBox.focused)) continue; // blur after the clear → re-loop
+      snapSig = snap.pageWide.sig;
+      step.staleBannerAtStart = !!(snap && snap.banner);
+      await act.typeInSearch(cand);
+      landed = await pollSearchValue(act, () => act.readTypeahead(loc), cand, budgets); // FULL candidate echoed in the FOCUSED box?
+    }
+    if (!landed) {
+      step.note = "could not type the full candidate into a focused box (partial/blur) — not pressing Enter";
+      return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
+    }
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
 
-    let sawChange = false, stable = 0, emptyStable = 0, emptySince = null, prevSig = null, outcome = "timeout";
+    // RENDER GATE (the core fix): block until the list reaches a CONFIRMED terminal render state — banner or
+    // autocommit, NEVER a bannerless list — before reading/matching/committing. A bannerless non-zero list is
+    // the fallback-before-the-banner; matching it commits the armed row (the stray). The focus-safe type loop
+    // above is the focus guard; this is the render guard.
     const tSettle = Date.now();
-    while (Date.now() - tSettle < budgets.taSettleCeilingMs) {
-      await act.delay(budgets.taSettleIntervalMs);
-      s = await act.readTypeahead(loc);
-      const sig = s ? s.pageWide.sig : null;
-      if (sig !== snapSig) sawChange = true;
-      // Transition-aware: a commit is a chip set that DIFFERS from priorChips
-      // (M27). Empty field (priorChips=[]) → any chip; overwrite → only a NEW chip
-      // (the pre-existing one alone is not a commit). Sampled here in settlePoll.
-      if (s && chipSetIsNew(s.chips)) { outcome = "chip"; break; }
-      if (s && s.banner && sawChange) { outcome = "banner"; break; }
-      if (sawChange && s && s.pageWide.count > 0 && !s.banner && sig !== snapSig) {
-        stable = sig === prevSig ? stable + 1 : 0;
-        if (stable >= budgets.stableReads - 1) { outcome = "filtered"; break; }
-      }
-      // AUTOCOMMIT-CLOSE (recon 2026-06-23): the dropdown CLOSED (searchBox gone) holding a chip — the
-      // filter-Enter autocommitted a value. The CPP case: typing "CPP" autocommits "…(CPP)…" + closes,
-      // but the chip EQUALS the pre-fill so chipSetIsNew was false → the chip-path above missed it → the
-      // settle burned the backstop + mislabeled a correct value. A closed dropdown is a SETTLED state →
-      // stop now + classify the chip below. Checked AFTER chip/banner/filtered (a NEW-chip autocommit
-      // stays on the chip-path) and BEFORE empty (a closed-with-value is classified, never read as empty).
-      if (s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length) { outcome = "closed-commit"; break; }
-      // Empty filtered list (0 options, no banner) — a no-match the settle had no exit for (the CPP
-      // 25s ceiling-burn; some tenants render 0 options instead of a "No matches" banner). FAST: the
-      // list demonstrably responded-empty (sawChange) + stable across reads → conclude now (~2 reads).
-      // sawChange can't fire on a still-loading cold list (sig stays the post-clear snapshot until it
-      // responds), so this never pre-empts a slow real match. BACKSTOP: 0 options + no banner for
-      // taEmptyNoMatchMs (the no-observable-change edge). Treated downstream EXACTLY like timeout (NOT
-      // added to genuineNoMatch) — identical no-match outcome, just not a 25s stall.
-      if (s && s.pageWide.count === 0 && !s.banner) {
-        if (emptySince == null) emptySince = Date.now();
-        if (sawChange) { emptyStable = sig === prevSig ? emptyStable + 1 : 0; if (emptyStable >= budgets.stableReads - 1) { outcome = "empty"; break; } }
-        if (Date.now() - emptySince >= budgets.taEmptyNoMatchMs) { outcome = "empty"; break; }
-      } else { emptySince = null; emptyStable = 0; }
-      prevSig = sig;
-    }
+    const outcome = await awaitListTerminal(act, (l) => act.readTypeahead(l), loc, budgets, chipSetIsNew);
+    s = await act.readTypeahead(loc); // fresh snapshot at the SETTLED terminal (stable → consistent re-read)
     step.outcome = outcome;
     step.settleMs = Date.now() - tSettle;
-    step.count = s ? s.pageWide.count : null;  // instrumentation (additive): filtered option count at settle end
-    step.banner = !!(s && s.banner);           //   + whether a "No matches" banner showed (Round-1 recon, no logic change)
-    step.open = !!(s && s.searchBox && s.searchBox.visible); // RE-RECON: dropdown OPEN (empty list) vs CLOSED (autocommitted)?
-    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null; //   + the committed chip value (distinguishes the two)
+    step.count = s ? s.pageWide.count : null;
+    step.banner = !!(s && s.banner);               // "No matches found"
+    step.resultsBanner = !!(s && s.resultsBanner); // "Search Results"
+    step.open = !!(s && s.searchBox && s.searchBox.visible);
+    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null;
 
-    if (outcome === "chip" || outcome === "closed-commit") {
-      // An auto-commit fired on the filter-Enter (chip = a NEW chip vs priorChips; closed-commit =
-      // the dropdown CLOSED holding a chip that EQUALS the pre-fill — the CPP case). Classify the chip
-      // by its match tier vs THIS candidate (M27 taxonomy via commitOutcome): exact → filled;
-      // containment/fuzzy → filled_review + soft flag (kept, never silently trusted as plain "filled");
-      // no match → needs_review (the stray, e.g. a "Canada" chip for a US query). Walk stops either way.
-      // `unchanged` = closed-commit whose chip equals the prior value (the overwrite produced NO new
-      // value, but the EXISTING value still satisfies the candidate) → KEPT provenance, NOT "overwrote".
-      // No disarm needed before stopping: the dropdown is ALREADY CLOSED with a committed value, so
-      // there is no armed listbox highlight for the overwrite-resting path to disarm.
+    if (outcome === "autocommit") {
+      // An auto-commit fired on the filter-Enter: a NEW chip (vs priorChips), OR the dropdown CLOSED holding a
+      // chip (closedCommit — the CPP case, chip EQUALS the pre-fill). Classify the chip by its match tier vs
+      // THIS candidate (M27 commitOutcome): exact → filled; containment/fuzzy → filled_review + soft flag; no
+      // match → needs_review (the stray, e.g. a "Canada" chip for a US query). Walk stops either way. `unchanged`
+      // = closedCommit whose chip equals the prior value (NO new value, but it still satisfies the candidate) →
+      // KEPT provenance, NOT "overwrote". No disarm needed (already closed/committed — no armed highlight).
+      // closedCommit re-derived from the snapshot (awaitListTerminal conflates the two autocommit shapes): the
+      // box CLOSED holding a chip that is NOT a new chip (it equals the pre-fill — the CPP case). A NEW chip is
+      // an "enter-auto-commit" even if the box also closed, so closedCommit REQUIRES !chipSetIsNew.
+      const closedCommit = !!(s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length && !chipSetIsNew(s.chips));
       step.chip = s.chips.join("; ");
       const cm = apMatch.matchCandidates([cand], s.chips);
-      const unchanged = outcome === "closed-commit" && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
-      // An unchanged closed-commit = NO overwrite happened (the chip IS the pre-fill) → classify via the
-      // AUTOCOMMIT taxonomy (honest flags: autocommit-exact/containment/fuzzy), never overwrite-success/
-      // -stray (Hold 1 — don't claim an overwrite that didn't happen).
+      const unchanged = closedCommit && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
       const oc = commitOutcome(unchanged ? false : isOverwrite, "auto", cm.matchTier);
-      const mt = outcome === "closed-commit" ? "closed-commit" : "enter-auto-commit";
+      const mt = closedCommit ? "closed-commit" : "enter-auto-commit";
       step.flag = oc.flag;
       if (oc.status === "needs_review") {
         // kept original (unchanged) → overwrite-nomatch-original-kept (NOT a "stray" — nothing strayed, the
@@ -1248,11 +1314,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
         return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
       }
       const prov = unchanged ? `kept pre-fill "${priorChips.join("; ")}" (matches candidate "${cand}" via ${cm.matchTier}) → ` : isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}${outcome === "closed-commit" ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}${closedCommit ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
     }
-    if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
-    if (outcome === "empty") { step.note = "filtered to 0 options (no banner) — no match (fast, like banner)"; continue; }
-    if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
+    if (outcome === "nomatch") { step.note = "no-match terminal (\"No matches found\" banner + stable) — hard block, next candidate"; continue; }
+    if (outcome !== "results") { step.note = "no terminal results within budget (timeout) — treated as no-match"; continue; } // timeout → no-match
+    // outcome === "results": "Search Results" banner + stable non-zero count — NOW safe to read + match.
 
     const texts = s.pageWide.texts;
     lastFiltered = texts;
@@ -1326,14 +1392,48 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
     return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), () => act.clearSearch(), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
       // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
       async (value) => {
-        await act.clearSearch(); await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets);
-        await act.typeInSearch(value); await pollSearchValue(act, () => act.readTypeahead(loc), value, budgets);
+        // STEP 1 — TERMINAL GATE (the keptLowerTier stray fix): the higher-tier no-match's empty-results render
+        // is throttle-LAGGED. Touching the box mid-render races the focus-drop (the "half-typed oth" + armed-row
+        // stray). awaitListTerminal BLOCKS until a CONFIRMED terminal (the "No matches found" banner / autocommit)
+        // before clearing — never a bannerless list. NO disarm: a clean full "Other" typed into a settled,
+        // focused box + step 4's affirmative click (a real selection that OVERWRITES any armed row-0) makes a
+        // disarm redundant — and polling an auto-highlight that never clears would burn to the ceiling.
+        await awaitListTerminal(act, (l) => act.readTypeahead(l), loc, budgets, chipSetIsNew);
+        // STEPS 3-4 — FOCUS-SAFE re-type: clearSearch is FOCUS-BLIND (Ctrl+A to whatever has focus), so
+        // re-verify focus IMMEDIATELY before the type (the focus-blind clear is INSIDE the re-assert), and on a
+        // blur (focus not confirmed after the clear, OR a PARTIAL landed value) re-focus + re-clear + re-type
+        // (bounded). NEVER pressEnter on a partial/unfocused box — Enter commits the highlighted listbox row.
+        let landed = false;
+        for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
+          if (!(await ensureSearchFocused())) return []; // can't focus → no blind actuation (caller → needs_review)
+          await act.clearSearch();
+          await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets);
+          const fs = await act.readTypeahead(loc);
+          if (!(fs && fs.searchBox && fs.searchBox.focused)) continue; // blur after the clear → re-loop (re-focus re-clears)
+          await act.typeInSearch(value);
+          landed = await pollSearchValue(act, () => act.readTypeahead(loc), value, budgets); // FULL value echoed in the FOCUSED box?
+          // landed === false → partial value (blur mid-type) → re-loop
+        }
+        if (!landed) return []; // never Enter on a partial/unfocused box → [] → overwriteNoMatchResting returns needs_review (honest, no stray)
+        // ORDERING GUARD: the only step between the settled re-type and the affirmative click is the
+        // filter-pressEnter — IN-PLACE (the box stays focused while the list filters), NOT a focus-leaving
+        // blur — then a read. So the affirmative click is reached blur-free and is the FINAL committing
+        // action, pre-empting any exit-blur-commit of an armed row.
         await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
         let r = await act.readTypeahead(loc);
         if (!(r && (r.chips || []).some((c) => norm(c) === norm(value)))) {
-          try { await act.clickTaOption(loc, value); } catch (e) { /* commit-Enter only */ }
+          // AFFIRMATIVE re-commit: a TRUSTED click on the resolved "value" leaf overwrites whatever the
+          // filter-Enter armed/committed (the proven recon recommitOther recovery). Can't truncate or stray.
+          try { await act.clickTaOption(loc, value); } catch (e) { /* leaf not clickable → STRAY GUARD below */ }
           await act.delayFull(budgets.commitIntervalMs); r = await act.readTypeahead(loc);
         }
+        // STEP 5 (TYPEAHEAD_SELF_VERIFY, OFF) — settle + chip RE-READ before returning, so the record reflects
+        // the SETTLED chip rather than the momentary post-click read. Redundant with M40 once the above holds.
+        if (TYPEAHEAD_SELF_VERIFY) { await act.delayFull(budgets.selfVerifyMs || 1300); r = await act.readTypeahead(loc); }
+        // STRAY GUARD: return the REAL post-click chips (never [] for a stray — that would hide the live
+        // value). overwriteNoMatchResting is the needs_review bail: chip == value → filled; empty →
+        // needs_review; anything else (a blur-stray the click didn't overwrite) → needs_review/overwrite-stray
+        // with the HONEST live `after`. Never a silent filled.
         return r ? (r.chips || []) : [];
       });
   }
@@ -1357,7 +1457,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets) => {
   // A timeout (no fresh transition — transient) or a present-but-uncommitted candidate
   // (commit-ladder limitation, the data IS valid) is NOT genuine → keep + surface, never
   // delete. (Mirrors fillDropdownCdp's genuineNoMatch — the data-loss safety, lockstep.)
-  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "banner" || (s.outcome === "filtered" && !s.match));
+  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "nomatch" || (s.outcome === "results" && !s.match));
   return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace, genuineNoMatch };
 };
 
@@ -1422,72 +1522,67 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   // tell (distinct from "loaded but no candidate matched"). Surfaced on the
   // walk-end no-commit return for drivePageFill's session warning.
   let optionsEverLoaded = false;
-  for (const cand of overwriteCandidates) {
+  for (const [ci, cand] of overwriteCandidates.entries()) {
     const step = { candidate: cand };
     trace.push(step);
-    const focused = await ensureFocused();
-    if (!focused) {
+    // BETWEEN CANDIDATES (lockstep with the typeahead): BLOCK until the prior no-match reaches a terminal
+    // (its banner / autocommit) before clearing/typing the next — never a bannerless list. Source's filter-Enter
+    // CAN auto-commit a leaf (M26 "LinkedIn auto-commits"), so a truncated type → a wrong auto-commit is an
+    // analogous stray. Resolves on the banner (fast); a "timeout" on a no-match tier is the latency smell.
+    // Skipped for the first candidate.
+    if (ci > 0) step.priorSettle = await awaitListTerminal(act, (l) => act.readSource(l), loc, budgets, chipSetIsNew);
+    if (!(await ensureFocused())) {
       step.note = "could not focus source search field — not actuating blind";
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the source search field — not actuating blind", settle_trace: trace };
     }
-    await act.clearSourceSearch();
-    await pollSearchValue(act, () => act.readSource(loc), "", budgets); // reactive: the clear has LANDED before snapshot
-    const snap = await act.readSource(loc);
-    const snapSig = snap ? snap.sig : null;
-    await act.typeInSourceSearch(cand);
-    await pollSearchValue(act, () => act.readSource(loc), cand, budgets); // reactive: the full candidate has LANDED before the filter-Enter
+    // FOCUS-SAFE clear + type (structurally closed, lockstep with the typeahead): ECHO-VERIFY the FULL
+    // candidate landed (pollSearchValue) BEFORE the filter-Enter; on a blur/partial, re-focus + re-clear +
+    // re-type (bounded); NEVER pressEnter on a partial/unfocused box.
+    let snap = null, snapSig = null, landed = false;
+    for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
+      if (attempt > 1 && !(await ensureFocused())) break; // re-assert focus on retry
+      await act.clearSourceSearch();
+      await pollSearchValue(act, () => act.readSource(loc), "", budgets); // the clear has LANDED before snapshot
+      snap = await act.readSource(loc);
+      if (!(snap && snap.searchBox && snap.searchBox.focused)) continue; // blur after the clear → re-loop
+      snapSig = snap.sig;
+      await act.typeInSourceSearch(cand);
+      landed = await pollSearchValue(act, () => act.readSource(loc), cand, budgets); // FULL candidate echoed in the FOCUSED box?
+    }
+    if (!landed) {
+      step.note = "could not type the full candidate into a focused source box (partial/blur) — not pressing Enter";
+      return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused source search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
+    }
     await act.pressEnter(); // these filter on ENTER, not live (recon)
 
-    let sawChange = false, stable = 0, emptyStable = 0, emptySince = null, prevSig = null, outcome = "timeout";
+    // RENDER GATE (lockstep with fillTypeaheadCdp): block until a CONFIRMED terminal (banner / autocommit),
+    // never a bannerless leaf list, before reading/matching/committing.
     let s = null;
     const tSettle = Date.now();
-    while (Date.now() - tSettle < budgets.taSettleCeilingMs) {
-      await act.delay(budgets.taSettleIntervalMs);
-      s = await act.readSource(loc);
-      const sig = s ? s.sig : null;
-      if (sig !== snapSig) sawChange = true;
-      if (s && (s.leafCount > 0 || (s.chips && s.chips.length > 0))) optionsEverLoaded = true; // M30 liveness
-      // Transition-aware (M27): a commit is a chip set DIFFERING from priorChips.
-      if (s && chipSetIsNew(s.chips)) { outcome = "chip"; break; }
-      if (s && s.banner && sawChange) { outcome = "banner"; break; }
-      if (sawChange && s && s.leafCount > 0 && !s.banner && sig !== snapSig) {
-        stable = sig === prevSig ? stable + 1 : 0;
-        if (stable >= budgets.stableReads - 1) { outcome = "filtered"; break; }
-      }
-      // AUTOCOMMIT-CLOSE (lockstep with fillTypeaheadCdp): the picker CLOSED holding a chip — stop now
-      // + classify the chip below. AFTER chip/banner/filtered (a NEW-chip autocommit stays on the chip-
-      // path) and BEFORE empty (a closed-with-value is classified, never read as an empty leaf list).
-      if (s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length) { outcome = "closed-commit"; break; }
-      // Empty filtered leaf list (0 leaves, no banner) = no-match (lockstep with fillTypeaheadCdp —
-      // some tenants show 0 instead of a banner). FAST: responded-empty (sawChange) + stable; BACKSTOP:
-      // taEmptyNoMatchMs. Treated downstream EXACTLY like timeout (not added to genuineNoMatch).
-      if (s && s.leafCount === 0 && !s.banner) {
-        if (emptySince == null) emptySince = Date.now();
-        if (sawChange) { emptyStable = sig === prevSig ? emptyStable + 1 : 0; if (emptyStable >= budgets.stableReads - 1) { outcome = "empty"; break; } }
-        if (Date.now() - emptySince >= budgets.taEmptyNoMatchMs) { outcome = "empty"; break; }
-      } else { emptySince = null; emptyStable = 0; }
-      prevSig = sig;
-    }
+    const outcome = await awaitListTerminal(act, (l) => act.readSource(l), loc, budgets, chipSetIsNew);
+    s = await act.readSource(loc); // fresh snapshot at the SETTLED terminal (stable → consistent re-read)
+    if (s && (s.leafCount > 0 || (s.chips && s.chips.length > 0))) optionsEverLoaded = true; // M30 liveness (the source responded with leaves/a chip)
     step.outcome = outcome;
     step.settleMs = Date.now() - tSettle;
-    step.count = s ? s.leafCount : null;       // instrumentation (additive): filtered leaf count at settle end
-    step.banner = !!(s && s.banner);           //   + whether a "No matches" banner showed (Round-1 recon, no logic change)
-    step.open = !!(s && s.searchBox && s.searchBox.visible); // RE-RECON: source picker OPEN (empty) vs CLOSED (autocommitted)?
-    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null; //   + the committed chip value (distinguishes the two)
+    step.count = s ? s.leafCount : null;
+    step.banner = !!(s && s.banner);               // "No matches found"
+    step.resultsBanner = !!(s && s.resultsBanner); // "Search Results"
+    step.open = !!(s && s.searchBox && s.searchBox.visible);
+    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null;
 
-    if (outcome === "chip" || outcome === "closed-commit") {
-      // Auto-commit on the filter-Enter (chip = NEW chip; closed-commit = picker CLOSED holding a chip
-      // that equals the pre-fill) — classify by tier (M27, lockstep with fillTypeaheadCdp): exact →
-      // filled; containment/fuzzy → filled_review + flag; no match → needs_review (stray). `unchanged` =
-      // closed-commit whose chip equals the prior value → KEPT provenance, not "overwrote". No disarm
-      // needed: the picker is ALREADY CLOSED with a committed value (no armed highlight to disarm).
+    if (outcome === "autocommit") {
+      // Auto-commit on the filter-Enter (NEW chip, OR picker CLOSED holding a chip = closedCommit, the
+      // chip-equals-pre-fill case) — classify by tier (M27, lockstep with fillTypeaheadCdp): exact → filled;
+      // containment/fuzzy → filled_review + flag; no match → needs_review (stray). `unchanged` = closedCommit
+      // whose chip equals the prior value → KEPT provenance, not "overwrote". No disarm needed (already closed/
+      // committed). closedCommit re-derived from the snapshot: box CLOSED holding a NON-new chip (the pre-fill);
+      // a NEW chip is an enter-auto-commit even if the box closed, so closedCommit REQUIRES !chipSetIsNew.
+      const closedCommit = !!(s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length && !chipSetIsNew(s.chips));
       step.chip = s.chips.join("; ");
       const cm = apMatch.matchCandidates([cand], s.chips);
-      const unchanged = outcome === "closed-commit" && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
-      // Unchanged closed-commit = NO overwrite (chip IS the pre-fill) → AUTOCOMMIT taxonomy (honest
-      // flags), never overwrite-success/-stray (Hold 1, lockstep with fillTypeaheadCdp).
+      const unchanged = closedCommit && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
       const oc = commitOutcome(unchanged ? false : isOverwrite, "auto", cm.matchTier);
-      const mt = outcome === "closed-commit" ? "closed-commit" : "enter-auto-commit";
+      const mt = closedCommit ? "closed-commit" : "enter-auto-commit";
       step.flag = oc.flag;
       if (oc.status === "needs_review") {
         const flag = unchanged ? "overwrite-nomatch-original-kept" : oc.flag;
@@ -1503,11 +1598,11 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
         return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
       }
       const prov = unchanged ? `kept source pre-fill "${priorChips.join("; ")}" (matches candidate "${cand}" via ${cm.matchTier}) → ` : isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}source ${outcome === "closed-commit" ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
+      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}source ${closedCommit ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
     }
-    if (outcome === "banner") { step.note = "fresh no-match banner — hard block"; continue; }
-    if (outcome === "empty") { step.note = "filtered to 0 options (no banner) — no match (fast, like banner)"; continue; }
-    if (outcome !== "filtered") { step.note = "no fresh transition within budget"; continue; }
+    if (outcome === "nomatch") { step.note = "no-match terminal (\"No matches found\" banner + stable) — hard block, next candidate"; continue; }
+    if (outcome !== "results") { step.note = "no terminal results within budget (timeout) — treated as no-match"; continue; } // timeout → no-match
+    // outcome === "results": "Search Results" banner + stable non-zero leaf count — NOW safe to read + match.
 
     const leaves = s.leaves;
     lastLeaves = leaves;
@@ -1577,7 +1672,7 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   // M38 Bug B1 — GENUINE no-match (deleteOnNoMatch) ONLY if every candidate gave a
   // definitive negative (banner / filtered-but-absent); a timeout or present-but-
   // uncommitted leaf is NOT genuine → keep + surface (lockstep with typeahead/dropdown).
-  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "banner" || (s.outcome === "filtered" && !s.match));
+  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "nomatch" || (s.outcome === "results" && !s.match));
   return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded, genuineNoMatch };
 };
 
@@ -1969,7 +2064,20 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
           else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
-          else if (f.widget === "typeahead") Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets));
+          else if (f.widget === "typeahead") {
+            // FoS capture (single-open): when tagged for option capture, scrape the full list BEFORE the
+            // candidate loop (fillTypeaheadCdp's onCapture runs before the loop). The full list →
+            // rec.options → the summary's searchable picker; the END-OF-PAGE pass then SKIPS this rec.
+            // Substrate-guarded (older fakes lack scrapeTaOptions). Tier-0 KEEP never reaches onCapture →
+            // end-of-page captures it (the rec.captureOptions tag below drives that fallback).
+            let scrapedOptions = null;
+            const onCapture = (f.captureOptions && act.scrapeTaOptions) ? async () => {
+              const sc = await act.scrapeTaOptions(loc);
+              if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) scrapedOptions = sc.options.slice();
+            } : undefined;
+            Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture }));
+            if (scrapedOptions && scrapedOptions.length) rec.options = scrapedOptions;
+          }
           else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
           else { rec.status = "skipped"; rec.detail = "no handler for widget " + f.widget; }
         }
@@ -2556,5 +2664,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable };
 }
