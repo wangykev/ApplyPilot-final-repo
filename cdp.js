@@ -668,6 +668,9 @@ function cdpReadSessionState() {
     // session / timeout / error banners (capped text scan)
     sessionBanner: /(session (has )?(expired|timed out|ended)|sign in again|log in again|your session|been (signed|logged) out|timed out)/i.test(bodyText),
     vpsErrorPresent: /error code:\s*vps\|/i.test(bodyText),
+    // Workday PLANNED-MAINTENANCE page ("Workday is currently unavailable") — a transient retry-later
+    // state, NOT a dead session (recon 2026-06-27). isWorkdayMaintenance keys off this (+ title/bodyText).
+    maintenancePresent: /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(bodyText),
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
     // M31: error-element detail for the validation-vs-VPS recon diff
     errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 120)).filter(Boolean) },
@@ -1203,6 +1206,56 @@ function cdpReadSourceState(wrapperSel) {
     rows: rows.slice(0, 30).map(nodeInfo),
     chips: Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim()),
     banner
+  };
+}
+
+// GENERIC page-identity dump (read-only) — for IDENTIFYING an unknown page state (maintenance / dead
+// session / login / error / a normal form) so future code can detect it instead of reporting an opaque
+// "unknown error". Captures title / URL / nav status / heading / body-text sample / the distinct
+// data-automation-id set / headings / metas + boolean state markers. NO actuation, NO field changes.
+function cdpPageIdentityDump() {
+  const norm = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const bodyText = norm(document.body ? document.body.innerText : "");
+  const lower = bodyText.toLowerCase();
+  // distinct data-automation-id values + counts (capped) — the structural fingerprint of the page.
+  const aidCounts = {};
+  for (const el of document.querySelectorAll("[data-automation-id]")) {
+    const a = el.getAttribute("data-automation-id");
+    if (a) aidCounts[a] = (aidCounts[a] || 0) + 1;
+  }
+  const automationIds = Object.keys(aidCounts).slice(0, 80).map((k) => ({ id: k, n: aidCounts[k] }));
+  const headings = Array.from(document.querySelectorAll("h1,h2,h3,[role='heading']")).slice(0, 12)
+    .map((h) => ({ tag: h.tagName, text: norm(h.textContent).slice(0, 160) }));
+  const metas = Array.from(document.querySelectorAll("meta[name],meta[http-equiv],meta[property]")).slice(0, 24)
+    .map((m) => ({ k: m.getAttribute("name") || m.getAttribute("http-equiv") || m.getAttribute("property"), v: norm(m.getAttribute("content")).slice(0, 140) }));
+  let httpStatusFromNav = null;
+  try { const nav = performance.getEntriesByType("navigation")[0]; if (nav && typeof nav.responseStatus === "number") httpStatusFromNav = nav.responseStatus; } catch (e) { /* not available */ }
+  const hasPasswordField = !!document.querySelector('input[type="password"]');
+  const formFieldCount = document.querySelectorAll('[data-automation-id^="formField-"]').length;
+  return {
+    url: location.href,
+    host: location.hostname,
+    title: document.title,
+    readyState: document.readyState,
+    httpStatusFromNav,
+    formFieldCount,
+    hasPasswordField,
+    automationIdCount: Object.keys(aidCounts).length,
+    automationIds,
+    headings,
+    metas,
+    bodyClass: document.body ? norm(document.body.className).slice(0, 200) : null,
+    bodyTextSample: bodyText.slice(0, 2000),
+    // candidate state markers (heuristics — captured so we can pick the most reliable one for a detector).
+    markers: {
+      maintenance: /performing (planned )?maintenance|under maintenance|scheduled maintenance|check back later|temporarily unavailable/.test(lower),
+      apology: /we apologize for the inconvenience/.test(lower),
+      workdayAdmin: /workday administrator/.test(lower),
+      login: hasPasswordField || /\b(sign in|log in|log on|username|password)\b/.test(lower),
+      vpsError: /error code:\s*vps/i.test(bodyText),
+      sessionExpired: /session (has )?(expired|timed out)|your session has/.test(lower),
+      noForm: formFieldCount === 0
+    }
   };
 }
 

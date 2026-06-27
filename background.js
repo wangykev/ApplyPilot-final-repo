@@ -367,6 +367,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // PAGE-IDENTITY RECON (read-only): dump title / URL / automation-ids / headings / body text + state
+  // markers for ANY page (maintenance / dead session / login / error / a normal form) so an unknown page
+  // state can be DETECTED in code instead of surfacing an opaque "unknown error". [CDP-PAGE-RECON] in SW.
+  if (message.type === "RUN_CDP_PAGE_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpPageRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
   // empty-results drop searchBox focus, and does re-focus restore + disarm? cand-1 Enter→0 (no commit);
   // "Other" typed char-by-char, never Enter'd. Page 2. [CDP-FOS-FOCUS] in the SW console.
@@ -2820,6 +2833,42 @@ async function runCdpTreeRecon(tabId) {
 }
 
 // ============================================================================
+// PAGE-IDENTITY RECON (read-only) — fingerprint an UNKNOWN page state so future code can DETECT it
+// (e.g. a Workday planned-maintenance page, a dead/expired session, a login redirect, an error page)
+// instead of bubbling an opaque "unknown error". Works on ANY page (no form fields needed): attaches,
+// evals cdpPageIdentityDump (title / URL / nav status / headings / body-text sample / the distinct
+// data-automation-id set / metas + boolean state markers), logs the full dump, detaches. NO actuation.
+// ============================================================================
+async function runCdpPageRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE-RECON]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second debugger client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const dump = await cdpEval(cdpPageIdentityDump);
+    if (!dump) { LOG("no dump (eval returned null)"); return { ok: false, error: "no-dump" }; }
+    LOG("════ PAGE IDENTITY (read-only) ════");
+    LOG("url:", dump.url, "| host:", dump.host);
+    LOG("title:", JSON.stringify(dump.title), "| readyState:", dump.readyState, "| httpStatus(nav):", dump.httpStatusFromNav);
+    LOG("formFields:", dump.formFieldCount, "| passwordField:", dump.hasPasswordField, "| distinct automation-ids:", dump.automationIdCount);
+    LOG("MARKERS:", JSON.stringify(dump.markers));
+    LOG("headings:", JSON.stringify(dump.headings));
+    LOG("automation-ids:", JSON.stringify(dump.automationIds));
+    LOG("metas:", JSON.stringify(dump.metas));
+    LOG("bodyClass:", dump.bodyClass);
+    LOG("── body text sample (≤2000 chars) ──");
+    LOG(dump.bodyTextSample);
+    LOG("════ END ════ (nothing actuated; paste this whole block to record the page)");
+    return { ok: true, dump };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("page recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // FoS OPTION CAPTURE-PROBE (read-only) — prove the FAST in-page scroll-accumulate scrape gets the
 // COMPLETE bounded option list (the Round-1 verdict was "enumerable but virtualized"). Open FoS →
 // cdpScrapeTaOptions (one in-page eval, frame-paced, <1s) → log the full list + scroll metrics →
@@ -3519,6 +3568,7 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
     await cdpDelay(intervalMs);
     let state = null;
     try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
+    if (state && isWorkdayMaintenance(state)) return { advanced: false, maintenance: true, state }; // transient, retry-later — NOT dead (checked first)
     if (state && sessionLooksDead(state)) return { advanced: false, sessionDead: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
@@ -3589,6 +3639,10 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // checked BEFORE any fill/click, so we never fill or advance the review page). ──
       let nav = null;
       try { nav = await cdpEval(cdpReadSessionState); } catch (e) { /* treat as not-ready below */ }
+      if (nav && isWorkdayMaintenance(nav)) {
+        LOG(`⛔ WORKDAY PLANNED MAINTENANCE at page ${page} ("Workday is currently unavailable") — NOT a dead session, no re-login needed. Retry after the maintenance window, then re-run.`);
+        return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
       if (nav && sessionLooksDead(nav)) {
         LOG(`⚠⚠ SESSION EXPIRED at page ${page} (login/VPS/no-form) — refresh, log in, reopen the form, retry.`);
         const diag = await reportPageErrors(null);
@@ -3634,6 +3688,10 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (f) Wait for the transition OR session-death OR a nav-timeout (dirty halt). ──
       const res = await cdpWaitNextPage(prevSig);
+      if (res.maintenance) {
+        LOG(`⛔ WORKDAY PLANNED MAINTENANCE after Save & Continue on page ${page} ("Workday is currently unavailable") — NOT a dead session. Retry after the maintenance window.`);
+        return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
       if (res.sessionDead) {
         LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`);
         const diag = await reportPageErrors(out);

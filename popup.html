@@ -80,6 +80,10 @@
          Run on page 1 (source, countryPhoneCode) AND page 2 (Field of Study, certification).
          [CDP-TREE-RECON] in the SW console. -->
     <button id="cdp-tree-recon">CDP recon: tree-vs-flat (read-only; pages 1 & 2)</button>
+    <!-- PAGE-IDENTITY RECON (read-only): fingerprint ANY page (maintenance / dead session / login /
+         error / a normal form) so an unknown page state can be detected in code. Run it on whatever
+         page is showing (e.g. the Workday maintenance page). [CDP-PAGE-RECON] in the SW console. -->
+    <button id="cdp-page-recon">CDP recon: page identity (read-only; ANY page — maintenance/error/login)</button>
     <!-- FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
          empty-results (a higher-tier no-match) DROP searchBox focus, and does RE-FOCUS restore + disarm the
          highlight? cand-1 Enter→0 (no commit); "Other" typed char-by-char, never Enter'd. Page 2, uses the

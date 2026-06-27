@@ -502,6 +502,20 @@ document.getElementById("cdp-tree-recon").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-page-recon").addEventListener("click", () => {
+  setStatus("Page-identity recon (READ-ONLY)… dumps title/markers/automation-ids/body text for whatever page is showing. See [CDP-PAGE-RECON] in the service worker console, then paste the whole block.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_PAGE_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("Page recon failed: " + resp.error + " — see the service worker console.");
+    } else {
+      const m = (resp.dump && resp.dump.markers) || {};
+      const tags = Object.keys(m).filter((k) => m[k]);
+      setStatus(`Page recon done — title "${(resp.dump && resp.dump.title) || ""}", ${(resp.dump && resp.dump.formFieldCount) || 0} formFields, markers: ${tags.join(", ") || "none"}. See [CDP-PAGE-RECON] — paste the whole block here.`);
+    }
+  });
+});
+
 document.getElementById("cdp-fos-focus-recon").addEventListener("click", () => {
   const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
   setStatus(`FoS FOCUS-recon ("${labelRegex}", read-mostly; no commit)… open My Experience (page 2). Read [CDP-FOS-FOCUS]: (2) empty-results DROPS focus + ARMS row-0, (3) re-focus RESTORES focus + disarms (highlight=null) — the page facts the re-commit fix depends on.`);

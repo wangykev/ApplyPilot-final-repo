@@ -4,7 +4,16 @@
 // validation error has vpsErrorPresent=false).
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { sessionLooksDead, cdpPageKey } = require("../lib.js");
+const { sessionLooksDead, isWorkdayMaintenance, cdpPageKey } = require("../lib.js");
+
+// The live-reconned Workday planned-maintenance page (2026-06-27, see dom-patterns).
+const maintenancePage = {
+  title: "Workday is currently unavailable.",
+  formFieldCount: 0, applyFlowPagePresent: false,
+  passwordInputPresent: false, signInButtonPresent: false, authUrl: false,
+  sessionBanner: false, vpsErrorPresent: false, maintenancePresent: true,
+  bodyTextSample: "English Workday is currently unavailable. Workday is performing planned maintenance during the following period:"
+};
 
 // The recon-captured valid-form baseline (Magna My Information).
 const validForm = {
@@ -52,6 +61,36 @@ test("sessionLooksDead: 0 fields BUT the applyFlow page shell is present → ali
 test("sessionLooksDead: null / undefined → alive (never dead on missing data)", () => {
   assert.strictEqual(sessionLooksDead(null), false);
   assert.strictEqual(sessionLooksDead(undefined), false);
+});
+
+// 2026-06-27 — isWorkdayMaintenance: the planned-maintenance page is a TRANSIENT retry-later state,
+// NOT a dead session. It MUST be detected before sessionLooksDead (which says "dead" on no-form).
+test("isWorkdayMaintenance: the live maintenance page → true (and sessionLooksDead would MISreport it dead)", () => {
+  assert.strictEqual(isWorkdayMaintenance(maintenancePage), true);
+  assert.strictEqual(sessionLooksDead(maintenancePage), true, "no-form → sessionLooksDead says dead; the maintenance check MUST run first in the walk");
+});
+
+test("isWorkdayMaintenance: detects via title/body even without the maintenancePresent marker", () => {
+  assert.strictEqual(isWorkdayMaintenance(Object.assign({}, maintenancePage, { maintenancePresent: false })), true);
+});
+
+test("isWorkdayMaintenance: a valid form (or one with the text matched somewhere) is NEVER maintenance", () => {
+  assert.strictEqual(isWorkdayMaintenance(validForm), false);
+  assert.strictEqual(isWorkdayMaintenance(Object.assign({}, validForm, { maintenancePresent: true })), false, "formFieldCount>0 guard wins");
+});
+
+test("isWorkdayMaintenance: a login redirect → NOT maintenance (falls through to sessionLooksDead)", () => {
+  assert.strictEqual(isWorkdayMaintenance({ formFieldCount: 0, passwordInputPresent: true, maintenancePresent: true }), false);
+  assert.strictEqual(isWorkdayMaintenance({ formFieldCount: 0, signInButtonPresent: true, bodyTextSample: "sign in to continue" }), false);
+});
+
+test("isWorkdayMaintenance: a blank / hard-redirect dead session (no maintenance text) → NOT maintenance", () => {
+  assert.strictEqual(isWorkdayMaintenance({ formFieldCount: 0, title: "", bodyTextSample: "" }), false);
+});
+
+test("isWorkdayMaintenance: null / undefined → false", () => {
+  assert.strictEqual(isWorkdayMaintenance(null), false);
+  assert.strictEqual(isWorkdayMaintenance(undefined), false);
 });
 
 // M38 Part 2 — cdpPageKey: the STABLE per-page accumulation merge key.

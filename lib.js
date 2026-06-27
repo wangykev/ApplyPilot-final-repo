@@ -162,6 +162,23 @@ function sessionLooksDead(state) {
   return false;
 }
 
+// Classify a page as Workday's PLANNED-MAINTENANCE page ("Workday is currently unavailable") — a
+// TRANSIENT, retry-later state that is NOT a dead session (no re-login needed). Recon (2026-06-27,
+// Magna during the maintenance window): title === "Workday is currently unavailable.", an H2 with the
+// same text, ZERO data-automation-ids, ZERO form fields, HTTP 200 (NOT 503 — status is useless), body
+// = "...performing planned maintenance during the following period: <window>... please check back
+// later. © Workday, Inc." No login/VPS/session markers. Checked BEFORE sessionLooksDead (which returns
+// true on "no form" → would MISreport maintenance as an expired session → wrong "re-login" guidance).
+// CONSERVATIVE: a real form page (formFieldCount>0) or a login redirect is never maintenance.
+function isWorkdayMaintenance(state) {
+  if (!state) return false;
+  if ((state.formFieldCount || 0) > 0) return false;                          // a real form page is never maintenance
+  if (state.passwordInputPresent || state.signInButtonPresent) return false;  // login redirect, not maintenance
+  if (state.maintenancePresent === true) return true;                         // the cdpReadSessionState body-text marker
+  const hay = String(state.title || "") + " " + String(state.bodyTextSample || state.bodyText || "");
+  return /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(hay);
+}
+
 // M38 Part 2 — STABLE per-page key for the review-summary accumulation merge (write-
 // per-page). Unlike cdpPageSig (which keys the M31 transition detector off the FULL url
 // incl. query — fine for "did anything change", but VOLATILE: a session token in the
@@ -292,5 +309,5 @@ function languageDeletionPlan(entries) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
 }

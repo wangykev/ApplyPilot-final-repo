@@ -1690,3 +1690,38 @@ case (pre-filled "Other" → genuine no-match → stays "Other", no "Accounting"
 for the extension: the EMPTY-field / early-bail case — an empty FoS whose walk arms row-0 then exhausts or
 bails (focus drops after a banner) must end BLANK, no "Accounting" stray; the in-list-value + clean-overwrite
 + keptLowerTier-recommit regressions still commit.
+
+## 2026-06-27 — Workday PLANNED-MAINTENANCE page ("Workday is currently unavailable") — fingerprint + detector
+
+**Why:** during a planned-maintenance window Workday serves a barren "currently unavailable" page instead
+of the app. With no form on it, `sessionLooksDead(state)` returns TRUE (its "no form" branch) → the walk
+would MISreport it as a dead/expired session ("refresh + log in") when the right action is "retry after the
+window, no re-login." Captured LIVE with the new read-only page-identity recon (`RUN_CDP_PAGE_RECON` /
+the `cdp-page-recon` button → `cdpPageIdentityDump`) during the actual window (Magna, wd3 host).
+
+**Live dump (verbatim markers):**
+- `title`: **"Workday is currently unavailable."** (also the page's only `<h2>`).
+- `httpStatusFromNav`: **200** — NOT 503. **HTTP status is useless for detection.**
+- `formFieldCount`: **0**; distinct `data-automation-id` count: **0** (a Workday *app* page always has many
+  `data-automation-id`s — a maintenance page has NONE); `passwordField`: false.
+- `markers`: `maintenance:true, apology:true, workdayAdmin:true, noForm:true`; `login:false`,
+  `vpsError:false`, `sessionExpired:false`.
+- body text: "English Workday is currently unavailable. Workday is performing planned maintenance during
+  the following period: <window> We apologize for the inconvenience. If you are a Workday customer and
+  require additional assistance please contact the Workday Administrator within your organization.
+  Otherwise, please check back later. America: Los Angeles © 2026 Workday, Inc. All rights reserved."
+- metas: only generic mobile/viewport (`msapplication-config`, `MobileOptimized`, `HandheldFriendly`,
+  `viewport`) — no useful structural marker.
+
+**Detector (`isWorkdayMaintenance(state)`, lib.js — pure, unit-pinned):** TRUE when `formFieldCount===0`
+AND not a login redirect (no password / sign-in) AND the title/body matches `/workday is currently
+unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back
+later/i` (or the `maintenancePresent` marker now set by `cdpReadSessionState`). CONSERVATIVE: a real form
+page (`formFieldCount>0`) or a login page is never maintenance. Checked **BEFORE** `sessionLooksDead` at
+all three walk gates (`runCdpWalk` top-of-iteration + after Save&Continue, and inside `cdpWaitNextPage`)
+→ a distinct halt `stopped:"workday-maintenance"` ("retry after the window", never re-login). Text-based
+(no automation-id / status to key off) → an English-locale signal; a localized maintenance page would
+need its phrase added.
+
+**Status:** LIVE-RECONNED (the dump above) + detector wired + unit-pinned. The end-to-end "walk halts
+workday-maintenance" path is naturally only exercisable while Workday is actually down.
