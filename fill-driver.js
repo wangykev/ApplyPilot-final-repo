@@ -1209,6 +1209,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
 
   const trace = [];
   let lastFiltered = null;
+  let capturedFull = null; // the FULL option list from onCapture (for the inline AI rescue) — see opts.ai
   let s = null;
   // FoS capture (single-open, operator's corrected design): scrape the FULL option list BEFORE the
   // candidate loop, so the loop's ensureSearchFocused() — the LAST focus action immediately before
@@ -1224,7 +1225,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   if (opts.onCapture) {
     await act.openTypeahead(loc);
     await awaitListStable(act, (l) => act.readTypeahead(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
-    await opts.onCapture();                       // scroll-scrape → records options (read-only); leaves the dropdown OPEN
+    capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
   }
   for (const [ci, cand] of overwriteCandidates.entries()) {
     const step = { candidate: cand };
@@ -1390,10 +1391,36 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     step.note = "no chip from commit-Enter or click — commit did not take";
   }
 
+  // INLINE AI RESCUE (Option B) — the walk exhausted (genuine no-match). If the call site supplied
+  // opts.ai (AI eligible: not cert, EEO allowed) and AI is ON, hand the captured option list + profile to
+  // the LLM and commit its pick ON THE OPEN FIELD — no Tab-abandon, no defer to an end-of-page pass.
+  // aiTypeaheadFallback re-enters fillTypeaheadCdp(loc,[target]) WITHOUT opts.ai (the re-entry is a fresh
+  // 4-arg call → opts.ai undefined → no recursion); the field is still open, so that re-entry REUSES it
+  // (ensureSearchFocused re-asserts focus on the post-banner box — the proven recommit machinery). Returns
+  // the AI result (committed → filled_review, or an honest needs_review after a clean Tab). null ⇒ AI off /
+  // no context / nothing to evaluate ⇒ the caller falls through to the existing Tab-exit (unchanged).
+  const tryInlineAi = async () => {
+    if (!(opts.ai && act.aiEnabled)) return null;
+    const rec = {
+      auditLoc: loc.wrapperSel, widgetType: "typeahead",
+      options: (capturedFull && capturedFull.length) ? capturedFull : (lastFiltered || []),
+      captured_options: lastFiltered || undefined,
+      isRequired: !!opts.ai.isRequired, label: opts.ai.label, fieldName: opts.ai.fieldName
+    };
+    const aiRes = await aiTypeaheadFallback(act, rec, opts.ai.profile, opts.ai.jobContext, budgets);
+    if (!aiRes || !aiRes.status) return null; // "no options to evaluate" → fall through to the normal no-match exit
+    if (aiRes.status === "filled_review" && isEeoField(rec)) aiRes.flag = "ai-eeo-guess"; // EEO retraction: demographic badge
+    // Clean exit if the AI did NOT commit (decline / failure leaves the field open on the failed query).
+    try { const st = await act.readTypeahead(loc); if (st && st.searchBox && st.searchBox.visible) await act.pressTab(); } catch (e) { /* best-effort */ }
+    return aiRes;
+  };
+
   // Walk exhausted. Under OVERWRITE the original chip is intact (non-destructive —
   // we never deleted it): rest the field clean ({chips:[original], query:""}) and
   // flag overwrite-nomatch-original-kept (future-AI candidate).
   if (isOverwrite) {
+    const aiR = await tryInlineAi();
+    if (aiR) return aiR;
     return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
       // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
       async (value) => {
@@ -1442,6 +1469,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
         return r ? (r.chips || []) : [];
       });
   }
+  // INLINE AI RESCUE (Option B) — empty-field genuine no-match: try the AI on the OPEN field BEFORE the
+  // Tab-exit (same as the overwrite branch above). null ⇒ AI off / no context ⇒ the existing Tab honesty
+  // read runs unchanged.
+  const aiR = await tryInlineAi();
+  if (aiR) return aiR;
   // Empty-field honesty read: exit via TAB (the only clean non-committing exit — Escape kept
   // focus + the armed row so the next field's focus blur-committed the stray), then read the
   // resting chips so the record NEVER reports after:null when the page physically holds a value —
@@ -1955,7 +1987,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
           else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
-          else if (f.widgetType === "typeahead") Object.assign(record, await fillTypeaheadCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "typeahead") Object.assign(record, await fillTypeaheadCdp(act, loc, arg, budgets,
+            { ai: { profile, jobContext, fieldName: f.fieldName, label: f.label, isRequired: f.isRequired } })); // Option B: inline AI on no-match (gated on act.aiEnabled inside)
           else { record.status = "skipped"; record.detail = `no handler for type ${f.widgetType}`; }
         }
       }
@@ -2032,21 +2065,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const items = Array.isArray(profile[sec.itemsKey]) ? profile[sec.itemsKey] : [];
       const out = await driveRepeatingSectionCdp(act, {
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
-        items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch
+        items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
+        aiContext: { profile, jobContext } // Option B: inline AI rescue context for the section's typeaheads (FoS)
       }, budgets);
       if (out && Array.isArray(out.results)) results.push(...out.results);
     }
   }
 
-  // ── AI TYPEAHEAD FALLBACK ── a FLAT typeahead that GENUINELY no-matched → hand the captured option
-  // list + profile to the LLM → commit its pick through the proven filler (ALWAYS filled_review). One
-  // pass over ALL results (flat fields + repeating-section recs from driveRepeatingSectionCdp). Runs
-  // BEFORE the M40 audit SNAPSHOT below so a committed AI value lands in auditEntries (the audit then
-  // re-reads it → the post-settle-clobber backstop covers AI commits too). Input options come from the
-  // INLINE scrape (rec.options — set in fillEntryCdp even on a no-match) / captured_options, NOT from
-  // captureChoiceOptions (which SKIPS needs_review recs), so this needn't wait for that pass. Extracted
-  // to runAiTypeaheadPass — SHARED with the per-section harness (runCdpFillEducation); no-op when AI OFF.
-  if (!only) await runAiTypeaheadPass(act, results, profile, jobContext, budgets);
+  // ── AI TYPEAHEAD FALLBACK is now INLINE (Option B) ── a typeahead that GENUINELY no-matches hands the
+  // captured option list + profile to the LLM and commits its pick ON THE OPEN FIELD right then, inside
+  // fillTypeaheadCdp's no-match exit (gated on opts.ai — passed by the flat loop above + fillEntryCdp for
+  // non-cert typeaheads). No end-of-page pass: by the time we reach here, every typeahead is already
+  // resolved (filled_review on an AI commit, or an honest needs_review). The committed values are in
+  // `results` BEFORE the M40 audit snapshot below, so the audit still re-reads them. AI OFF ⇒ no-op
+  // (the no-match exits Tab-blur as before). runAiTypeaheadPass is retained for unit tests only.
 
   // M40 post-fill page AUDIT (inline backstop): after the WHOLE page has settled, re-read
   // every field that claims a value + reconcile vs what it recorded. Catches a value clobbered
@@ -2180,7 +2212,7 @@ const PAGE_SECTIONS = [
 // core warning). Resolves the field by automation-id (`f.field`) OR by label
 // (`f.labelRegex`, for hashed ids — Languages). Records use the SAME shape as
 // drivePageFill so the report/table code is shared.
-async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets) {
+async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx) {
   const recs = [];
   const base = sectionName + "[" + idx + "].";
   for (const f of fieldMap) {
@@ -2262,9 +2294,16 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
             let scrapedOptions = null;
             const onCapture = (f.captureOptions && act.scrapeTaOptions) ? async () => {
               const sc = await act.scrapeTaOptions(loc);
-              if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) scrapedOptions = sc.options.slice();
+              if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { scrapedOptions = sc.options.slice(); return scrapedOptions; }
+              return null;
             } : undefined;
-            Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture }));
+            // Inline AI rescue context (Option B) — pass for AI-eligible typeaheads ONLY: NOT the cert section
+            // (a Magna TREE mis-tagged "typeahead"; excluded by section name — the structural isTreePicker
+            // can't run on the open field). EEO allowed (re-tagged ai-eeo-guess inside fillTypeaheadCdp).
+            const aiForField = (aiCtx && sectionName !== "certification")
+              ? { profile: aiCtx.profile, jobContext: aiCtx.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired }
+              : undefined;
+            Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture, ai: aiForField }));
             if (scrapedOptions && scrapedOptions.length) rec.options = scrapedOptions;
           }
           else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
@@ -2358,7 +2397,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const fillCount = Math.min(N, await act.entryCount(containerPrefix));
   const perEntry = [];
   for (let i = 0; i < fillCount; i++) {
-    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets);
+    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets, section.aiContext);
     // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.

@@ -1979,6 +1979,8 @@ function makeFakeRepeatAct(state) {
     // delete-vs-AI defer: driveRepeatingSectionCdp reads act.aiEnabled. Defaults OFF (existing tests
     // unchanged → aiWillRescue false → delete behavior identical).
     aiEnabled: !!state.aiEnabled,
+    // Option B inline AI: the LLM seam (canned reply from state.ai), for the inline-rescue repeating tests.
+    llm: async (req) => { log.push(["llm", req && req.user]); const a = state.ai; if (a === undefined || a === null) return { ok: false, error: "no canned reply" }; return typeof a === "string" ? { ok: true, text: a } : a; },
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     entryCount: async () => state.entries.length,
@@ -3327,12 +3329,13 @@ const cpcField = (extra) => Object.assign({
 }, extra || {});
 const cpcProfile = { personal_info: { country_phone_code: "Narnia (+99)" } };
 
-test("AI-TA orchestration: AI ON rescues a flat no-match typeahead → filled_review/ai-choice", async () => {
+test("AI-TA orchestration: AI ON rescues a flat no-match typeahead INLINE on the open field → filled_review/ai-choice, NO Tab", async () => {
   const act = makeFakeAct([cpcField()], { aiEnabled: true, ai: '{"choice":"United States (+1)","represented":true,"confidence":"High"}' });
   const rec = (await drivePageFill(act, cpcProfile, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(rec.status, "filled_review");
   assert.strictEqual(rec.flag, "ai-choice");
   assert.strictEqual(rec.after, "United States (+1)");
+  assert.ok(!act.log.some(([m]) => m === "pressTab"), "Option B: the AI committed on the OPEN field — no Tab-exit then re-open");
 });
 
 test("AI-TA orchestration: AI OFF is a byte-identical no-op (stays needs_review, NO LLM)", async () => {
@@ -3343,12 +3346,32 @@ test("AI-TA orchestration: AI OFF is a byte-identical no-op (stays needs_review,
   assert.ok(!act.log.some(([m]) => m === "llm"), "AI OFF → no provider call, no spend");
 });
 
-test("AI-TA orchestration: a TREE picker (act.isTreePicker true) is EXCLUDED → ai-tree-excluded, no commit", async () => {
-  const act = makeFakeAct([cpcField({ isTree: true })], { aiEnabled: true, ai: '{"choice":"United States (+1)","represented":true}' });
-  const rec = (await drivePageFill(act, cpcProfile, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.flag, "ai-tree-excluded");
-  assert.strictEqual(rec.status, "needs_review", "a tree is left for review, never AI-filled blind");
-  assert.ok(!act.log.some(([m]) => m === "llm"), "excluded before any LLM call");
+test("inline AI (repeating): a FoS no-match in Education is rescued INLINE on the open field — no Tab, filled_review/ai-choice", async () => {
+  // "Zzz" filters to a list WITHOUT it → genuine no-match (results) with captured options → the inline AI
+  // (driven by section.aiContext) commits the AI's pick on the still-open field, NO Tab-exit.
+  const eduEntry = (fkit) => ({ fkit, fields: [{ fieldName: "fieldOfStudy", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Zzz": { filtered: ["Economics", "Biology"] }, "Economics": { filtered: ["Economics"] } } }] });
+  const fieldMap = [{ field: "fieldOfStudy", widget: "typeahead", key: "fos", path: "fos" }];
+  const items = [{ fos: ["Zzz"] }];
+  const state = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Economics","represented":true,"confidence":"High"}', newEntry: (i) => eduEntry("education-new" + i), entries: [eduEntry("education-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-", items, fieldMap, deleteOnNoMatch: false, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
+  const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
+  assert.strictEqual(fos.status, "filled_review");
+  assert.strictEqual(fos.flag, "ai-choice");
+  assert.strictEqual(fos.after, "Economics");
+  assert.ok(act.log.some(([m]) => m === "llm"), "the LLM was consulted INLINE (not at end-of-page)");
+  assert.ok(!act.log.some(([m]) => m === "pressTab"), "Option B: committed on the OPEN field — no Tab-exit");
+});
+
+test("inline AI (repeating): a CERTIFICATION typeahead is NOT AI-rescued (cert = tree, excluded by section name)", async () => {
+  const certEntry = (fkit) => ({ fkit, fields: [{ fieldName: "certification", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Zzz": { banner: true } } }] });
+  const fieldMap = [{ field: "certification", widget: "typeahead", key: "cert", path: "cert" }];
+  const items = [{ cert: ["Zzz"] }];
+  const state = { prefix: "certification-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Anything","represented":true}', newEntry: (i) => certEntry("certification-new" + i), entries: [certEntry("certification-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  await driveRepeatingSectionCdp(act, { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", items, fieldMap, deleteOnNoMatch: true, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "llm"), "cert is excluded from the inline AI (section name) — no LLM call");
+  assert.strictEqual(state.entries.length, 0, "cert entry deleted on genuine no-match (NOT AI-rescued)");
 });
 
 test("delete-vs-AI defer: AI ON DEFERS deleting an entry whose required typeahead no-matched; AI OFF still deletes", async () => {

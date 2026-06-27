@@ -3392,29 +3392,27 @@ async function runCdpFillEducation(tabId, profile) {
     LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful entr(y/ies).`);
 
     const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
-    LOG("AI typeahead fallback:", act.aiEnabled ? "ON (a Field-of-Study no-match → LLM picks from the scraped list)" : "OFF (enable the AI toggle + set a provider/model/key in the popup to test the FoS rescue)");
+    LOG("AI typeahead fallback:", act.aiEnabled ? "ON (a Field-of-Study no-match → LLM picks from the scraped list, INLINE on the open field)" : "OFF (enable the AI toggle + set a provider/model/key in the popup to test the FoS rescue)");
+    // Option B: the AI rescue is now INLINE (inside fillTypeaheadCdp, on the open field at no-match) — driven
+    // by section.aiContext. driveRepeatingSectionCdp's finalize() runs AFTER the inline AI, so out.needsReview
+    // / out.counts already reflect the rescued recs (no separate end-of-page pass / recompute).
     const out = await driveRepeatingSectionCdp(act, {
       name: "education", headingRegex: "education", containerPrefix: "education-",
-      items, fieldMap: EDUCATION_MAP, deleteOnNoMatch: false
+      items, fieldMap: EDUCATION_MAP, deleteOnNoMatch: false,
+      aiContext: { profile: prepared, jobContext: {} }
     }, DEFAULT_BUDGETS);
-    // AI typeahead fallback over the section's recs (the SAME pass drivePageFill runs — shared helper).
-    // No-op when AI is OFF. Rescues a genuine-no-match FoS; excludes the cert tree (name-belt + isTreePicker).
-    await runAiTypeaheadPass(act, out.results, prepared, {}, DEFAULT_BUDGETS);
-    // The section's finalize() computed needsReview/counts BEFORE the AI pass — recompute from the mutated recs.
-    const needsReview = out.results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
-    const counts = out.results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
 
     LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${needsReview.length}) ════`);
-    for (const r of needsReview) {
+    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
+    for (const r of out.needsReview) {
       LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
     }
     console.table(out.results.map((r) => ({
       field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
       verified: r.verified, flag: r.flag, detail: r.detail
     })));
-    LOG("counts:", JSON.stringify(counts));
-    return { ok: true, counts, needs_review: needsReview.length };
+    LOG("counts:", JSON.stringify(out.counts));
+    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("education fill aborted:", msg);

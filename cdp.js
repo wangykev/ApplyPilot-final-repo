@@ -196,9 +196,18 @@ async function actingDelta(d) { try { await cdpEval((dd) => { window.__apActing 
 
 // ── Input primitives (trusted, off-loop) ────────────────────────────────────
 
+// Debug trace of EVERY trusted input the bot fires (each click / triple-click / key / insertText),
+// in the SW console with an [ApplyPilot][INPUT] prefix — so a fill can be replayed keystroke-by-keystroke
+// when chasing a bug. Always on (flip INPUT_TRACE to false to silence). cdpClickAt/cdpTripleClickAt/
+// cdpKeyTap/cdpInsertText are the can't-miss choke points (cdpTypeChars + cdpSelectAllDelete + the
+// pressEnter/Tab/Escape/arrow taps ALL route through cdpKeyTap), so logging here captures every input.
+const INPUT_TRACE = true;
+function inputLog(...a) { if (INPUT_TRACE) console.log("[ApplyPilot][INPUT]", ...a); }
+
 // Full mouse click at viewport CSS-pixel coords: move → press → release — the
 // closest CDP analog to a real click; the resulting page events are isTrusted.
 async function cdpClickAt(x, y) {
+  inputLog("click", "(" + Math.round(x) + "," + Math.round(y) + ")");
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
@@ -212,6 +221,7 @@ async function cdpClickAt(x, y) {
 // `-input` by clicking its VISIBLE `-display` sibling (M33 proven recipe; the
 // masked input can't be coordinate-clicked directly).
 async function cdpTripleClickAt(x, y) {
+  inputLog("triple-click", "(" + Math.round(x) + "," + Math.round(y) + ")");
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
@@ -227,6 +237,7 @@ async function cdpTripleClickAt(x, y) {
 // beforeinput/input (no per-key events). Recon (a) decides if this is enough
 // for Workday's React or whether per-char key events are needed.
 async function cdpInsertText(text) {
+  inputLog("insertText", JSON.stringify(String(text)));
   if (inputLockActive) await actingDelta(+1);
   try { return await cdpSend("Input.insertText", { text: String(text) }); }
   finally { if (inputLockActive) await actingDelta(-1); }
@@ -237,6 +248,7 @@ async function cdpInsertText(text) {
 // route through here, so gating cdpKeyTap covers the bot's entire key path (counter-based,
 // so the nested cdpTypeChars→cdpKeyTap stays "acting" throughout — no per-char gap).
 async function cdpKeyTap(def) {
+  inputLog("key", JSON.stringify(def.key) + (def.modifiers ? " +mod" + def.modifiers : ""));
   if (inputLockActive) await actingDelta(+1);
   try {
     const down = {
