@@ -667,6 +667,11 @@ chrome.storage.local.get("llmConfig", ({ llmConfig }) => {
   if (c.apiKey) llmKeyEl.value = c.apiKey;
   llmEnabledEl.checked = !!c.enabled;
 });
+// Debug input-trace toggle — logs every CDP keystroke/click in the SW console. Saved IMMEDIATELY on
+// change (no Save button — an easy on/off); cdp.js reads chrome.storage.local.debugInputTrace per run.
+const debugInputTraceEl = document.getElementById("debug-input-trace");
+chrome.storage.local.get("debugInputTrace", ({ debugInputTrace }) => { debugInputTraceEl.checked = !!debugInputTrace; });
+debugInputTraceEl.addEventListener("change", () => chrome.storage.local.set({ debugInputTrace: debugInputTraceEl.checked }));
 // On provider change, repopulate the model list + select that provider's default.
 llmProviderEl.addEventListener("change", () => populateModelOptions(llmProviderEl.value));
 const readLlmConfig = () => ({ provider: llmProviderEl.value, model: llmModelEl.value, apiKey: llmKeyEl.value.trim(), enabled: llmEnabledEl.checked });

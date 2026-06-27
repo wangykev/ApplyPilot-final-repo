@@ -183,6 +183,9 @@
          prompt to prove the call path. [LLM-TEST] in the SW console. Key stays local to the
          extension on this machine. -->
     <label><input id="llm-enabled" type="checkbox"> AI fill ON (opt-in — uses your API key)</label>
+    <!-- DEBUG: log every CDP keystroke/click ([ApplyPilot][INPUT]) in the SW console. Saved on toggle;
+         cdp.js reads it at each run start. Off by default (keeps production fills quiet). -->
+    <label><input id="debug-input-trace" type="checkbox"> Debug: log every keystroke/click (SW console)</label>
     <label for="llm-provider">AI provider:</label>
     <select id="llm-provider">
       <option value="gemini">Gemini (Google)</option>

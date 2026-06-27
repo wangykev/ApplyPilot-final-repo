@@ -57,6 +57,8 @@ function cdpAttach(tabId) {
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
+        // Refresh the debug input-trace toggle per run (popup checkbox → chrome.storage.local).
+        try { const { debugInputTrace } = await new Promise((r) => chrome.storage.local.get("debugInputTrace", r)); setInputTrace(!!debugInputTrace); } catch (e) { /* default stays OFF */ }
         resolve({ ok: true });
       } catch (e) {
         resolve({ ok: false, error: String((e && e.message) || e) });
@@ -198,11 +200,13 @@ async function actingDelta(d) { try { await cdpEval((dd) => { window.__apActing 
 
 // Debug trace of EVERY trusted input the bot fires (each click / triple-click / key / insertText),
 // in the SW console with an [ApplyPilot][INPUT] prefix — so a fill can be replayed keystroke-by-keystroke
-// when chasing a bug. Always on (flip INPUT_TRACE to false to silence). cdpClickAt/cdpTripleClickAt/
-// cdpKeyTap/cdpInsertText are the can't-miss choke points (cdpTypeChars + cdpSelectAllDelete + the
-// pressEnter/Tab/Escape/arrow taps ALL route through cdpKeyTap), so logging here captures every input.
-const INPUT_TRACE = true;
-function inputLog(...a) { if (INPUT_TRACE) console.log("[ApplyPilot][INPUT]", ...a); }
+// when chasing a bug. TOGGLEABLE: default OFF; the popup "Debug: log keystrokes" checkbox writes
+// chrome.storage.local.debugInputTrace, which cdpAttach reads per run (setInputTrace). cdpClickAt/
+// cdpTripleClickAt/cdpKeyTap/cdpInsertText are the can't-miss choke points (cdpTypeChars + cdpSelectAllDelete
+// + the pressEnter/Tab/Escape/arrow taps ALL route through cdpKeyTap), so logging here captures every input.
+let inputTraceEnabled = false;
+function setInputTrace(b) { inputTraceEnabled = !!b; }
+function inputLog(...a) { if (inputTraceEnabled) console.log("[ApplyPilot][INPUT]", ...a); }
 
 // Full mouse click at viewport CSS-pixel coords: move → press → release — the
 // closest CDP analog to a real click; the resulting page events are isTrusted.
