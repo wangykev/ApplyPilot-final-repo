@@ -1455,6 +1455,27 @@ function makeCdpActuation(llmConfig) {
       return true;
     },
 
+    // ── structural tree-vs-flat discriminator (0.4) — EXCLUDE tree pickers from the AI typeahead
+    // fallback. A "typeahead"-classified field whose opened popup shows CATEGORY rows (chevron svg /
+    // aria-expanded / role=treeitem+aria-level / aria-haspopup → cdpReadSourceState's isCategory) is a
+    // TREE (Magna's certification — recon 2026-06-26: 3 menuItem category rows), NOT a flat typeahead
+    // (Field of Study / countryPhoneCode → 0 category rows). READ-ONLY: open → read markers → Tab-close
+    // (no type/Enter/arrow/click → nothing arms; the recon proved this leaves the field unchanged).
+    isTreePicker: async (loc) => {
+      // open (the broad multiselect/source opener ladder; works for either chrome)
+      for (const part of [' button[aria-haspopup="listbox"]', ' [data-automation-id="multiselectInputContainer"]', ' [data-uxi-widget-type="selectinput"]', " input", ""]) {
+        const rect = await cdpEval(cdpRectOf, loc.wrapperSel + part, true);
+        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); break; }
+      }
+      await cdpDelay(700); // let the portaled list render (non-adaptive — the page's own render)
+      const dump = await cdpEval(cdpReadSourceState, loc.wrapperSel);
+      const rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
+      const isTree = rows.some((r) => r && r.isCategory);
+      await cdpKeyTap(CDP_KEYS.tab); // clean non-committing close
+      await cdpDelay(200);
+      return isTree;
+    },
+
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
     clickRadioLabel: async (loc, id) => {

@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -62,6 +62,8 @@ function makeFakeAct(fields, opts) {
       if (a === undefined || a === null) return { ok: false, error: "no canned reply" };
       return typeof a === "string" ? { ok: true, text: a } : a;
     },
+    // structural tree discriminator (0.4): default FLAT; a field with `isTree: true` is excluded.
+    isTreePicker: async (loc) => { log.push(["isTreePicker", loc.wrapperSel]); const f = byLoc(loc); return !!(f && f.isTree); },
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     scanPage: async () => ({
@@ -860,31 +862,35 @@ test("AI-3 CANONICALIZATION: AI can't map the stated value to any option → nee
   assert.strictEqual(rec.after, null);
 });
 
-test("AI-3 EEO: an OPTIONAL unmapped EEO field → blank, act.llm NEVER called; a MANDATORY one → the EEO inference runs", async () => {
-  // OPTIONAL EEO, no value → blank, no LLM (a blank optional doesn't block the walk).
+test("EEO retraction: an UNMAPPED EEO field is now AI-FILLED like any field (optional + required) → ai-eeo-guess badge", async () => {
+  // OPTIONAL unmapped EEO → the AI fills it now (the exclusion was retracted; always-guess commits).
   const opt = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: false })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
   const optRec = (await drivePageFill(opt, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(optRec.status, "skipped");
-  assert.ok(!opt.log.some(([m]) => m === "llm"), "optional EEO with no value → never calls the LLM");
-  // MANDATORY EEO, no value → the EEO inference runs (would block otherwise).
+  assert.ok(opt.log.some(([m]) => m === "llm"), "EEO is no longer excluded — the AI fills it");
+  assert.strictEqual(optRec.status, "filled_review");
+  assert.strictEqual(optRec.flag, "ai-eeo-guess", "an AI-filled demographic gets the verify badge");
+  assert.strictEqual(optRec.after, "Male");
+  // REQUIRED unmapped EEO → same generic inference path, same badge.
   const req = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: true })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
   const reqRec = (await drivePageFill(req, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.ok(req.log.some(([m]) => m === "llm"), "a MANDATORY unmapped EEO field → the AI EEO inference runs");
+  assert.ok(req.log.some(([m]) => m === "llm"));
   assert.strictEqual(reqRec.flag, "ai-eeo-guess");
   assert.strictEqual(reqRec.after, "Male");
   assert.strictEqual(reqRec.status, "filled_review");
 });
 
-test("AI-3 EEO inference: high-confidence guess commits (ai-eeo-guess); low-confidence or a chosen decline → neutral (eeo_declined)", async () => {
+test("AI-3 EEO inference (mapped-but-empty required → the confidence-gated path): high-conf commits (ai-eeo-guess); low-conf/decline → neutral (eeo_declined)", async () => {
   const opts = [{ text: "Select One", disabled: true }, { text: "Female" }, { text: "Male" }, { text: "Undeclared" }];
+  // fieldName "gender" is MAPPED but the profile has no value → status "skipped" → the generic infer
+  // block skips it (producedNothing is false) → the confidence-gated AI-3 path handles it.
   // low confidence → NOT committed as a guess; falls back to the neutral decline ("Undeclared")
-  const lo = makeFakeAct([genderField({ fieldName: "g2", label: "Gender", isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"Low"}' });
+  const lo = makeFakeAct([genderField({ fieldName: "gender", label: "Gender", isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"Low"}' });
   const loRec = (await drivePageFill(lo, {}, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(loRec.flag, "eeo_declined", "a low-confidence demographic guess is NOT committed");
   assert.strictEqual(loRec.after, "Undeclared");
   assert.strictEqual(loRec.status, "filled_review");
   // the AI choosing to decline → eeo_declined
-  const dec = makeFakeAct([genderField({ fieldName: "g3", label: "Gender", isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Undeclared","confidence":"High"}' });
+  const dec = makeFakeAct([genderField({ fieldName: "gender", label: "Gender", isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Undeclared","confidence":"High"}' });
   const decRec = (await drivePageFill(dec, {}, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(decRec.flag, "eeo_declined");
   assert.strictEqual(decRec.after, "Undeclared");
@@ -897,22 +903,22 @@ test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays determi
   assert.strictEqual(out.results[0].status, "skipped", "stays the deterministic skipped (no mapping)");
 });
 
-test("AI INVARIANT: the screening-question INFERENCE never touches an EEO field — an OPTIONAL EEO dropdown ⇒ act.llm NEVER called", async () => {
-  // aiEligible excludes EEO from the screening inference; an OPTIONAL EEO field also doesn't hit the
-  // AI-3 mandatory-EEO inference (which requires isRequired) → no LLM at all. (A MANDATORY EEO field
-  // DOES call the eeo-infer path — covered by the AI-3 EEO tests.)
-  const act = makeFakeAct([aiDd({ label: "What is your gender?", isRequired: false })], { aiEnabled: true, ai: "Male" });
-  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
-  assert.ok(!act.log.some(([m]) => m === "llm"), "an optional protected EEO field is never AI-touched");
-  assert.strictEqual(out.results[0].status, "skipped");
+test("EEO retraction: an UNMAPPED OPTIONAL EEO dropdown IS now AI-inferred (the 'never touch EEO' rule was removed) → ai-eeo-guess", async () => {
+  // aiDd's fieldName "screen_q" is unmapped; the gender LABEL makes it EEO. Previously skipped (no LLM);
+  // now the generic inference fills it and re-tags the demographic badge.
+  const act = makeFakeAct([aiDd({ label: "What is your gender?", isRequired: false })], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(act.log.some(([m]) => m === "llm"), "EEO is no longer excluded from inference");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-eeo-guess", "demographic verify badge kept");
 });
 
-test("AI INVARIANT: prev-worker / file_upload / radio / EEO never AI-eligible; dropdown + text/textarea ARE (AI-2 extends to free-text)", () => {
+test("AI INVARIANT: prev-worker / file_upload / radio never AI-eligible; dropdown + text/textarea ARE — and EEO is NOW eligible (rule retracted)", () => {
   assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "candidateIsPreviousWorker", label: "Have you worked here?" }), false);
   assert.strictEqual(aiEligible({ widgetType: "file_upload", fieldName: "resume", label: "Resume" }), false);
   assert.strictEqual(aiEligible({ widgetType: "radio", fieldName: "x", label: "Pick one" }), false);
-  assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "gender", label: "What is your gender?" }), false, "EEO never AI (any widget)");
-  assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "disabilityStatus", label: "Disability status" }), false, "EEO label blocks even text");
+  assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "gender", label: "What is your gender?" }), true, "EEO is NOW AI-eligible (exclusion retracted)");
+  assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "disabilityStatus", label: "Disability status" }), true, "EEO text is NOW eligible too");
   assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "screen_q", label: "Eligible to work in Canada?" }), true);
   assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "whyUs", label: "Why us?" }), true, "free-text now eligible (AI-2)");
   assert.strictEqual(aiEligible({ widgetType: "textarea", fieldName: "coverLetter", label: "Cover letter" }), true);
@@ -1964,11 +1970,15 @@ function makeFakeRepeatAct(state) {
   let focusedText = null;
   let focusedInputId = null;
   let focusedSeg = null; // { f, seg } — a focused date segment (M36)
+  let focusedTa = null;  // a focused typeahead (the delete-vs-AI-defer test)
   let scanCount = 0;     // M37: a field with `appearsAtScan: N` is OMITTED until the Nth
                          // repeatingScan — models a field that REMOUNTS (WE endDate after
                          // unchecking currentlyWorkHere) so the waitForPresence poll is testable.
   return {
     log,
+    // delete-vs-AI defer: driveRepeatingSectionCdp reads act.aiEnabled. Defaults OFF (existing tests
+    // unchanged → aiWillRescue false → delete behavior identical).
+    aiEnabled: !!state.aiEnabled,
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     entryCount: async () => state.entries.length,
@@ -2061,6 +2071,37 @@ function makeFakeRepeatAct(state) {
     typeDigits: async (text) => {
       log.push(["typeDigits", String(text)]);
       if (focusedSeg && !focusedSeg.f.dateTypeFails) focusedSeg.f.segments[focusedSeg.seg].value = String(text);
+    },
+    // typeahead (the delete-vs-AI-defer test) — a minimal mirror of makeFakeAct's typeahead model
+    // (chips/filterMap/_open/_texts/_banner). Drives a required repeating typeahead to a GENUINE
+    // no-match (filterMap → banner) so the defer's aiTypeaheadEligible path is exercised.
+    openTypeahead: async (loc) => { log.push(["openTypeahead", loc.wrapperSel]); const f = byLoc(loc); if (!f) return false; f._open = true; if (!f.focusUnconfirmable) f._focusedSb = true; if (f._texts === undefined) f._texts = (f.openTexts || []).slice(); if (f._banner === undefined) f._banner = false; focusedTa = f; return true; },
+    focusSearchBox: async (loc) => { log.push(["focusSearchBox", loc.wrapperSel]); const f = byLoc(loc); if (f && !f.focusUnconfirmable) f._focusedSb = true; focusedTa = f; return true; },
+    readTypeahead: async (loc) => {
+      const f = byLoc(loc); if (!f) return null;
+      const texts = f._open ? (f._texts || []) : [];
+      const sig = (f._rev || 0) + "|" + texts.length + "|" + texts.slice(0, 3).join("~");
+      return { searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: f._value || "" },
+        chips: (f.chips || []).slice(),
+        banner: f._open && f._banner ? { text: "No matches found", automationId: "promptTitle" } : null,
+        resultsBanner: !!(f._open && f._resultsBanner),
+        pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) }, activeText: null };
+    },
+    clearSearch: async () => { log.push(["clearSearch"]); if (focusedTa) { focusedTa._value = ""; focusedTa._filtered = false; } },
+    typeInSearch: async (t) => { log.push(["typeInSearch", t]); if (focusedTa) { focusedTa._value = t; focusedTa._filtered = false; focusedTa._resultsBanner = false; } },
+    clickTaOption: async (loc, text) => { log.push(["clickTaOption", text]); const f = byLoc(loc); if (!f || !f._open || !(f._texts || []).some((t) => t === text)) return false; f.chips = [text]; f._open = false; return true; },
+    pressEnter: async () => {
+      log.push(["pressEnter"]);
+      const ta = focusedTa;
+      if (!ta || !ta._open) return;
+      if (!ta._filtered) {
+        const fm = (ta.filterMap || {})[ta._value];
+        if (fm) { ta._rev = (ta._rev || 0) + 1;
+          if (fm.banner) { ta._banner = true; ta._resultsBanner = false; ta._texts = (ta.fallbackTexts || ta._texts || []).slice(); ta._filtered = true; }
+          else if (fm.autoCommit) { ta.chips = [fm.autoCommit]; ta._open = false; ta._banner = false; ta._resultsBanner = false; }
+          else if (fm.filtered) { ta._banner = false; ta._filtered = true; ta._texts = fm.filtered.slice(); ta._resultsBanner = ta._texts.length > 0; }
+        }
+      } else if (!ta.enterCommitFails && (ta._texts || []).length && !ta._banner) { ta.chips = [ta._texts[0]]; ta._open = false; }
     }
   };
 }
@@ -3152,4 +3193,202 @@ test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cac
   assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]);
   assert.deepStrictEqual(recs[1].options, ["Bachelors", "Masters", "Doctorate"]);
   assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // cached by stem "readingProficiency"
+});
+
+// ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
+// A genuine-no-match flat typeahead → the LLM picks from the captured option list → commit through the
+// proven filler, ALWAYS filled_review. Tree pickers (cert/source) EXCLUDED. Headline: Field of Study.
+
+// A typeahead field for the COMMIT re-entry (fillTypeaheadCdp([target])): typing `target` filters to
+// exactly it → the commit-Enter takes it as the chip. `filterMap` keys the AI target(s) we expect.
+const aiTaField = (filterMap) => ({ wrapperSel: "[w-fos]", fieldName: "fieldOfStudy", widgetType: "typeahead", chips: [], filterMap });
+// A no-match rec as drivePageFill would hand the AI pass (entry-scoped auditLoc; options = captured list).
+const aiTaRec = (opts) => Object.assign({
+  fieldName: "education[0].fieldOfStudy", widgetType: "typeahead", status: "needs_review",
+  genuineNoMatch: true, isRequired: true, label: "Field of Study", auditLoc: "[w-fos]"
+}, opts);
+
+test("parseAiTypeaheadReply: JSON / fenced / embedded / non-JSON — represented DEFAULTS false", () => {
+  assert.deepStrictEqual(parseAiTypeaheadReply('{"choice":"Economics","represented":true,"confidence":"High"}'), { choice: "Economics", represented: true, confidence: "high" });
+  assert.deepStrictEqual(parseAiTypeaheadReply('```json\n{"choice":"Arts","represented":false}\n```'), { choice: "Arts", represented: false, confidence: "low" });
+  const emb = parseAiTypeaheadReply('sure: {"choice":"Biology","represented":"true"} done');
+  assert.strictEqual(emb.choice, "Biology"); assert.strictEqual(emb.represented, true, "string \"true\" → true");
+  assert.deepStrictEqual(parseAiTypeaheadReply("just prose"), { choice: "just prose", represented: false, confidence: "low" });
+  assert.strictEqual(parseAiTypeaheadReply('{"choice":"X"}').represented, false, "missing represented → false (conservative)");
+  assert.strictEqual(parseAiTypeaheadReply('{"answer":"Y","represented":true}').choice, "Y", "answer is the choice fallback");
+});
+
+test("isOtherOption: matches 'Other' case/space-insensitively, never a real option", () => {
+  assert.strictEqual(isOtherOption("Other"), true);
+  assert.strictEqual(isOtherOption(" other "), true);
+  assert.strictEqual(isOtherOption("Accounting"), false);
+});
+
+test("aiTypeaheadEligible: a genuine-no-match flat typeahead is eligible; dropdown/EEO/cert/filled/transient are NOT", () => {
+  const base = { widgetType: "typeahead", status: "needs_review", genuineNoMatch: true, fieldName: "education[0].fieldOfStudy", label: "Field of Study" };
+  assert.strictEqual(aiTypeaheadEligible(base), true);
+  assert.strictEqual(aiTypeaheadEligible({ ...base, widgetType: "dropdown" }), false, "dropdown → no");
+  assert.strictEqual(aiTypeaheadEligible({ ...base, status: "filled" }), false, "already filled → no");
+  assert.strictEqual(aiTypeaheadEligible({ ...base, genuineNoMatch: false }), false, "transient (not genuine) → no");
+  assert.strictEqual(aiTypeaheadEligible({ ...base, label: "Gender" }), true, "EEO is NOW eligible (exclusion retracted) — it gets the demographic badge in the pass, not blocked here");
+  assert.strictEqual(aiTypeaheadEligible({ ...base, fieldName: "certification[0].certification", label: "Certification" }), false, "cert section (Magna tree) → no (name-belt)");
+  // a PRE-FILLED field whose every candidate missed (the overwrite path kept the original, e.g. "Other")
+  // is ALSO a rescuable no-match — even without genuineNoMatch (the overwrite path doesn't set it).
+  assert.strictEqual(aiTypeaheadEligible({ ...base, genuineNoMatch: false, flag: "overwrite-nomatch-original-kept", after: "Other" }), true, "pre-filled-kept no-match (the 'future-AI candidate') → eligible");
+});
+
+test("AI-TA pre-filled overwrite: a kept 'Other' (overwrite-nomatch-original-kept) → AI upgrades it to a represented pick", async () => {
+  const field = { wrapperSel: "[w-fos]", fieldName: "fieldOfStudy", widgetType: "typeahead", chips: ["Other"], filterMap: { "Computer Science": { filtered: ["Computer Science"] } } };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Computer Science","represented":true,"confidence":"High"}' });
+  const rec = aiTaRec({ options: ["Accounting", "Computer Science", "Other"], after: "Other", flag: "overwrite-nomatch-original-kept" });
+  const out = await aiTypeaheadFallback(act, rec, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.status, "filled_review");
+  assert.strictEqual(out.flag, "ai-choice");
+  assert.strictEqual(out.after, "Computer Science", "the kept 'Other' was overwritten with the represented option");
+});
+
+test("AI-TA leaf 1: only 'Other' in the list → commit 'Other' DETERMINISTICALLY, NO LLM call", async () => {
+  const act = makeFakeAct([aiTaField({ "Other": { filtered: ["Other"] } })], { aiEnabled: true, ai: '{"choice":"X","represented":true}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Other"] }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.status, "filled_review");
+  assert.strictEqual(out.after, "Other");
+  assert.strictEqual(out.flag, "ai-other-only");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "NO LLM call — nothing to choose among (the only deterministic-Other shortcut)");
+});
+
+test("AI-TA leaf 2: represented=true → commit the pick (ai-choice, filled_review, AI confidence carried)", async () => {
+  const act = makeFakeAct([aiTaField({ "Accounting": { filtered: ["Accounting"] } })], { aiEnabled: true, ai: '{"choice":"Accounting","represented":true,"confidence":"High"}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Biology", "Other"] }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.status, "filled_review");
+  assert.strictEqual(out.after, "Accounting");
+  assert.strictEqual(out.flag, "ai-choice");
+  assert.strictEqual(out.confidence, "high");
+  assert.ok(act.log.some(([m]) => m === "llm"), "the LLM was consulted");
+});
+
+test("AI-TA leaf 3: represented=false + 'Other' present → commit 'Other' (ai-choice-other, the honest answer)", async () => {
+  const act = makeFakeAct([aiTaField({ "Other": { filtered: ["Other"] } })], { aiEnabled: true, ai: '{"choice":"Finance","represented":false,"confidence":"Medium"}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Finance", "Other"] }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.flag, "ai-choice-other");
+  assert.strictEqual(out.after, "Other");
+  assert.strictEqual(out.status, "filled_review");
+});
+
+test("AI-TA leaf 4: represented=false + NO 'Other' + REQUIRED → closest pick, ai-closest-forced (super-hard)", async () => {
+  const act = makeFakeAct([aiTaField({ "Finance": { filtered: ["Finance"] } })], { aiEnabled: true, ai: '{"choice":"Finance","represented":false,"confidence":"Low"}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Finance"], isRequired: true }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.flag, "ai-closest-forced");
+  assert.strictEqual(out.after, "Finance");
+  assert.strictEqual(out.status, "filled_review");
+});
+
+test("AI-TA leaf 4b: required + NO 'Other' + UNRESOLVABLE choice → FORCES the nearest real option (never declines/blocks the walk)", async () => {
+  // The AI returns text that clears NO option (resolved===null); a REQUIRED field must still commit
+  // SOMETHING (a blank required field halts the walk). It snaps to the nearest real option, super-hard.
+  const act = makeFakeAct([aiTaField({ "Accounting": { filtered: ["Accounting"] }, "Finance": { filtered: ["Finance"] } })], { aiEnabled: true, ai: '{"choice":"Underwater Basketweaving","represented":false,"confidence":"Low"}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Finance"], isRequired: true }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.status, "filled_review", "a REQUIRED field never declines — it forces a pick so the walk advances");
+  assert.strictEqual(out.flag, "ai-closest-forced");
+  assert.ok(["Accounting", "Finance"].includes(out.after), "snapped to a real option (nearest-neighbor)");
+});
+
+test("AI-TA leaf 5: represented=false + NO 'Other' + OPTIONAL → needs_review, NOTHING committed", async () => {
+  const act = makeFakeAct([aiTaField({})], { aiEnabled: true, ai: '{"choice":"Finance","represented":false}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Finance"], isRequired: false }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.status, "needs_review");
+  assert.strictEqual(out.flag, "ai-typeahead-decline");
+  assert.strictEqual(out.after, null);
+  assert.ok(!act.log.some(([m]) => m === "openTypeahead" || m === "clickTaOption"), "no commit was attempted");
+});
+
+test("AI-TA leaf 6: the AI pick can't commit (banner) → ai-commit-failed (needs_review, honest, never a false fill)", async () => {
+  const act = makeFakeAct([aiTaField({ "Accounting": { banner: true } })], { aiEnabled: true, ai: '{"choice":"Accounting","represented":true}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Other"] }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.status, "needs_review");
+  assert.strictEqual(out.flag, "ai-commit-failed");
+});
+
+test("AI-TA anti-hallucination: AI choice isn't a real option → can't commit as represented → falls through to 'Other'", async () => {
+  const act = makeFakeAct([aiTaField({ "Other": { filtered: ["Other"] } })], { aiEnabled: true, ai: '{"choice":"Underwater Basketweaving","represented":true}' });
+  const out = await aiTypeaheadFallback(act, aiTaRec({ options: ["Accounting", "Other"] }), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.flag, "ai-choice-other", "a non-option choice can't be a represented commit → Other");
+  assert.strictEqual(out.after, "Other");
+});
+
+// ── orchestration through drivePageFill (a MAPPED flat typeahead: countryPhoneCode) ──
+// A bogus profile value → genuine no-match (results, candidate absent) → captured_options set → the
+// AI pass rescues. countryPhoneCode is in FIELD_MAP (personal_info.country_phone_code).
+const cpcField = (extra) => Object.assign({
+  wrapperSel: "[w-cpc]", fieldName: "countryPhoneCode", widgetType: "typeahead", isRequired: true, label: "Country Phone Code", chips: [],
+  filterMap: {
+    "Narnia (+99)": { filtered: ["United States (+1)", "Canada (+1)"] }, // bogus → genuine no-match (results), captured_options populated
+    "United States (+1)": { filtered: ["United States (+1)"] }            // the AI target commits
+  }
+}, extra || {});
+const cpcProfile = { personal_info: { country_phone_code: "Narnia (+99)" } };
+
+test("AI-TA orchestration: AI ON rescues a flat no-match typeahead → filled_review/ai-choice", async () => {
+  const act = makeFakeAct([cpcField()], { aiEnabled: true, ai: '{"choice":"United States (+1)","represented":true,"confidence":"High"}' });
+  const rec = (await drivePageFill(act, cpcProfile, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-choice");
+  assert.strictEqual(rec.after, "United States (+1)");
+});
+
+test("AI-TA orchestration: AI OFF is a byte-identical no-op (stays needs_review, NO LLM)", async () => {
+  const act = makeFakeAct([cpcField()], { aiEnabled: false, ai: '{"choice":"United States (+1)","represented":true}' });
+  const rec = (await drivePageFill(act, cpcProfile, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.genuineNoMatch, true);
+  assert.ok(!act.log.some(([m]) => m === "llm"), "AI OFF → no provider call, no spend");
+});
+
+test("AI-TA orchestration: a TREE picker (act.isTreePicker true) is EXCLUDED → ai-tree-excluded, no commit", async () => {
+  const act = makeFakeAct([cpcField({ isTree: true })], { aiEnabled: true, ai: '{"choice":"United States (+1)","represented":true}' });
+  const rec = (await drivePageFill(act, cpcProfile, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.flag, "ai-tree-excluded");
+  assert.strictEqual(rec.status, "needs_review", "a tree is left for review, never AI-filled blind");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "excluded before any LLM call");
+});
+
+test("delete-vs-AI defer: AI ON DEFERS deleting an entry whose required typeahead no-matched; AI OFF still deletes", async () => {
+  const taEntry = (fkit) => ({ fkit, fields: [{ fieldName: "fieldOfStudy", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Zzz": { banner: true } } }] });
+  const fieldMap = [{ field: "fieldOfStudy", widget: "typeahead", key: "fos", path: "fos" }];
+  const items = [{ fos: ["Zzz"] }];
+  const section = { name: "education", headingRegex: "education", containerPrefix: "education-", items, fieldMap, deleteOnNoMatch: true };
+  // AI ON → the failed required pick is an AI-rescuable typeahead → DEFER (entry kept for the AI pass).
+  const stateOn = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, newEntry: (i) => taEntry("education-new" + i), entries: [taEntry("education-0--null")] };
+  await driveRepeatingSectionCdp(makeFakeRepeatAct(stateOn), section, T_BUDGETS);
+  assert.strictEqual(stateOn.entries.length, 1, "AI ON → entry DEFERRED, not deleted");
+  // AI OFF → genuine no-match + deleteOnNoMatch → the entry is deleted (unchanged behavior).
+  const stateOff = { prefix: "education-", addable: true, deletable: true, aiEnabled: false, newEntry: (i) => taEntry("education-new" + i), entries: [taEntry("education-0--null")] };
+  await driveRepeatingSectionCdp(makeFakeRepeatAct(stateOff), section, T_BUDGETS);
+  assert.strictEqual(stateOff.entries.length, 0, "AI OFF → genuine no-match deletes (cert/language behavior preserved)");
+});
+
+test("EEO retraction (typeahead): an EEO typeahead no-match is AI-filled and re-tagged ai-eeo-guess", async () => {
+  const field = { wrapperSel: "[w-eth]", fieldName: "ethnicity", widgetType: "typeahead", chips: [], filterMap: { "Asian": { filtered: ["Asian"] } } };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Asian","represented":true,"confidence":"High"}' });
+  const rec = { fieldName: "ethnicity", widgetType: "typeahead", status: "needs_review", genuineNoMatch: true, isRequired: true, label: "Ethnicity", auditLoc: "[w-eth]", options: ["Asian", "White", "Other"] };
+  await runAiTypeaheadPass(act, [rec], {}, {}, T_BUDGETS);
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-eeo-guess", "EEO typeahead → demographic verify badge (not the plain ai-choice)");
+  assert.strictEqual(rec.after, "Asian");
+});
+
+test("runAiTypeaheadPass (the shared helper): no-op when AI OFF; rescues a no-match typeahead when ON", async () => {
+  const mkRec = () => aiTaRec({ options: ["Accounting", "Other"] });
+  // OFF → untouched, no LLM (the per-section harness with AI off is byte-identical to today).
+  const off = makeFakeAct([aiTaField({ "Accounting": { filtered: ["Accounting"] } })], { aiEnabled: false, ai: '{"choice":"Accounting","represented":true}' });
+  const recOff = mkRec();
+  await runAiTypeaheadPass(off, [recOff], {}, {}, T_BUDGETS);
+  assert.strictEqual(recOff.status, "needs_review", "AI OFF → the helper is a no-op");
+  assert.ok(!off.log.some(([m]) => m === "llm"));
+  // ON → rescued through the shared pass (same as drivePageFill).
+  const on = makeFakeAct([aiTaField({ "Accounting": { filtered: ["Accounting"] } })], { aiEnabled: true, ai: '{"choice":"Accounting","represented":true,"confidence":"High"}' });
+  const recOn = mkRec();
+  await runAiTypeaheadPass(on, [recOn], {}, {}, T_BUDGETS);
+  assert.strictEqual(recOn.status, "filled_review");
+  assert.strictEqual(recOn.flag, "ai-choice");
+  assert.strictEqual(recOn.after, "Accounting");
 });

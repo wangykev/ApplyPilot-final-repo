@@ -486,6 +486,22 @@ document.getElementById("cdp-fos-capture").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-tree-recon").addEventListener("click", () => {
+  setStatus("Tree-vs-flat recon (READ-ONLY)… run on page 1 (source, countryPhoneCode) AND page 2 (Field of Study, certification). See [CDP-TREE-RECON] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_TREE_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) {
+      setStatus("Tree recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.found === false) {
+      setStatus("No typeahead/hierarchical field on this page — run on page 1 (source) and page 2 (Field of Study, certification).");
+    } else {
+      const trees = resp.fields.filter((f) => f.isTree).map((f) => f.fieldName);
+      const flats = resp.fields.filter((f) => !f.isTree).map((f) => f.fieldName);
+      setStatus(`Tree recon done — TREE: ${trees.join(", ") || "none"} · FLAT: ${flats.join(", ") || "none"}. See [CDP-TREE-RECON] for the per-row markers.`);
+    }
+  });
+});
+
 document.getElementById("cdp-fos-focus-recon").addEventListener("click", () => {
   const labelRegex = document.getElementById("ta-label").value.trim() || "field of study";
   setStatus(`FoS FOCUS-recon ("${labelRegex}", read-mostly; no commit)… open My Experience (page 2). Read [CDP-FOS-FOCUS]: (2) empty-results DROPS focus + ARMS row-0, (3) re-focus RESTORES focus + disarms (highlight=null) — the page facts the re-commit fix depends on.`);

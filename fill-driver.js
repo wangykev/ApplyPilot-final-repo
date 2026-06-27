@@ -28,7 +28,7 @@
 // lib.js globals in the SW scope).
 const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
-  : { normalize: normalize, matchCandidates: matchCandidates };
+  : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -568,19 +568,23 @@ const reconDropdownDump = async (act, loc, budgets) => {
 const AI_LEGALLY_LOADED_RE = /criminal|convict|pardon|eligib|authoriz|work permit|right to work|currently employed|sponsor|\bage\b|over (the age of )?\d+|under \d+|\b18\b/i;
 const legallyLoaded = (label) => AI_LEGALLY_LOADED_RE.test(String(label || ""));
 
-// Protected EEO/demographic attributes are NEVER AI-guessed (review-NOTE instead — AI-3). The
-// EXCLUSION ships now: an EEO-labelled choice field is not AI-eligible. Over-exclude = safe.
+// EEO/demographic detector. The "never AI-guess EEO" exclusion was RETRACTED (operator decision): EEO
+// fields now fill via the SAME AI inference as any other field — the AI may ASSUME them. AI_EEO_RE
+// survives ONLY to (a) tag an AI-committed demographic with the louder "AI-GUESSED DEMOGRAPHIC — VERIFY"
+// review badge (ai-eeo-guess), and (b) route a mapped-but-empty REQUIRED EEO dropdown to the
+// confidence-gated AI-3 path (aiInferEeoField). It NO LONGER blocks eligibility.
 const AI_EEO_RE = /gender|\brace\b|ethnic|veteran|disab|sexual orientation|\bsex\b|hispanic|latino|pronoun/i;
+const isEeoField = (o) => !!o && (AI_EEO_RE.test(String(o.label || "")) || AI_EEO_RE.test(String(o.fieldName || "")));
 
 // AI-fill is allowed for an unmapped/unmatched CHOICE field (AI-1: dropdown) or free-text
-// (AI-2: text/textarea). NEVER the employer-match radio (its own logic), file_upload, an EEO
-// field, radio, or checkbox. Hard gate — unit-pinned (act.llm must never be called for an
-// excluded field). MAPPED text fields (phone/postal/…) never reach the AI hook anyway —
-// they fill deterministically so producedNothing(record) is false; only UNMAPPED text reaches AI-2.
+// (AI-2: text/textarea). NEVER the employer-match radio (its own logic), file_upload, radio, or
+// checkbox. EEO is NO LONGER excluded (the operator retracted that rule) — an EEO dropdown/text fills
+// via AI inference like any field, then gets the demographic review badge (re-tagged at the call site).
+// Hard gate — unit-pinned. MAPPED text fields (phone/postal/…) never reach the AI hook anyway (they
+// fill deterministically so producedNothing(record) is false; only UNMAPPED text reaches AI-2).
 const aiEligible = (f) => {
   if (!f) return false;
   if (f.fieldName === "candidateIsPreviousWorker") return false;  // employer-match path
-  if (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || ""))) return false; // EEO never AI (any widget)
   return f.widgetType === "dropdown" || f.widgetType === "text" || f.widgetType === "textarea";
 };
 
@@ -1675,6 +1679,173 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
   return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded, genuineNoMatch };
 };
 
+// ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
+// When a FLAT typeahead exhausts its tiers and GENUINELY no-matches (genuineNoMatch — every candidate
+// gave a banner/absent), hand the captured option list + the profile to the LLM, commit its pick
+// through the PROVEN filler, and ALWAYS surface it filled_review (never silent). Headline: Field of
+// Study. Tree pickers EXCLUDED — source by widgetType "hierarchical" (upstream); Magna's certification
+// (a tree mis-tagged "typeahead") by the name-belt in aiTypeaheadEligible + the structural
+// act.isTreePicker (the 0.4 discriminator, applied in drivePageFill). Provider-agnostic (act.llm).
+
+// Parse the LLM's typeahead reply: {choice, represented, confidence}. Modeled on parseAiReply —
+// tolerate ```-fences / the first {…} block / a non-JSON reply. `represented` (is the applicant's
+// real answer genuinely in the list, or is `choice` only the nearest approximation?) DEFAULTS FALSE
+// when missing/unparseable (conservative — an unresolvable reply must not claim representation).
+const parseAiTypeaheadReply = (text) => {
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const mm = t.match(/\{[\s\S]*\}/);
+    if (mm) { try { obj = JSON.parse(mm[0]); } catch (e2) { /* fall through to best-effort */ } }
+  }
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    const choice = String(obj.choice != null ? obj.choice : (obj.answer != null ? obj.answer : "")).trim();
+    const represented = obj.represented === true || String(obj.represented).trim().toLowerCase() === "true";
+    return { choice, represented, confidence: _aiConf(obj.confidence) };
+  }
+  return { choice: t, represented: false, confidence: "low" }; // unparseable → conservative: not represented
+};
+
+// "Other" detection (normalize lowercases + strips trailing (+digits) + collapses whitespace).
+const isOtherOption = (o) => apMatch.normalize(o) === "other";
+
+// Snap an UNRESOLVABLE AI choice to the CLOSEST real option — argmax fuzzyRatio, NO threshold. Used
+// ONLY on a REQUIRED field with no "Other", where SOMETHING must be committed (a blank required field
+// HALTS the walk). Distinct from matchCandidates (which returns -1 below 90 to avoid SILENT wrong fills):
+// here a forced low-quality pick is acceptable because it's flagged super-hard (ai-closest-forced) for
+// human review. Empty/garbled choice → the first option. Always returns an option when options is non-empty.
+const nearestOption = (choice, options) => {
+  if (!options || !options.length) return null;
+  const c = apMatch.normalize(choice);
+  if (!c) return options[0];
+  let best = options[0], bestScore = -1;
+  for (const o of options) {
+    const s = apMatch.fuzzyRatio(c, apMatch.normalize(o));
+    if (s > bestScore) { bestScore = s; best = o; }
+  }
+  return best;
+};
+
+// Eligibility for the AI typeahead rescue (PURE — used by BOTH the AI pass AND the delete-vs-AI defer):
+// a GENUINE no-match flat typeahead. NEVER the cert section (a tree mis-tagged "typeahead" on Magna →
+// name-belt; source is already excluded by widgetType "hierarchical" before the pass). EEO is NOT
+// excluded (the operator retracted that rule) — an EEO typeahead fills via AI and gets the demographic
+// badge (re-tagged in the pass). The structural act.isTreePicker is the cross-tenant tree guard, applied
+// in the AI pass (it needs an open, so it can't live in this pure predicate).
+const aiTypeaheadEligible = (rec) => {
+  if (!rec) return false;
+  if (rec.widgetType !== "typeahead") return false;
+  // A genuine no-match the AI can rescue (both are status needs_review):
+  //   • EMPTY field, every candidate definitively missed → genuineNoMatch === true; OR
+  //   • PRE-FILLED field, every candidate missed so the deterministic fallback was kept →
+  //     flag "overwrite-nomatch-original-kept" (the field shows e.g. "Other"; the overwrite path
+  //     itself tags this the "future-AI candidate" — the AI may upgrade it to a represented option).
+  const noMatch = rec.status === "needs_review"
+    && (rec.genuineNoMatch === true || rec.flag === "overwrite-nomatch-original-kept");
+  if (!noMatch) return false;
+  if (/^certification\[/.test(String(rec.fieldName || ""))) return false; // cert = Magna tree (name-belt)
+  return true;
+};
+
+// Commit an AI-chosen option through the PROVEN filler: re-enter fillTypeaheadCdp with a SINGLE
+// candidate (the empty-field commit path on a no-match-blanked field — NOT a clear-first sequence).
+// matchCandidates([target], options) is the anti-hallucination belt (target MUST be a real option →
+// commit the CANONICAL option text). ALWAYS filled_review on success (an AI guess is never silently
+// "filled"); unverified → ai-commit-failed (honest after, never a false fill).
+const commitAiTypeahead = async (act, loc, target, flag, confidence, detail, options, budgets) => {
+  const m = apMatch.matchCandidates([target], options);
+  if (m.targetIndex === -1) return { status: "needs_review", after: null, verified: false, flag: "ai-commit-failed", confidence,
+    detail: "AI target \"" + target + "\" is not a real option (hallucination guard)", options, auditLoc: loc.wrapperSel };
+  const canonical = options[m.targetIndex];
+  const commit = await fillTypeaheadCdp(act, loc, [canonical], budgets);
+  const ok = commit && commit.verified === true && (commit.status === "filled" || commit.status === "filled_review");
+  if (!ok) return { status: "needs_review", after: commit ? commit.after : null, verified: false, flag: "ai-commit-failed", confidence,
+    detail: detail + " — commit did not persist (" + ((commit && (commit.flag || commit.detail)) || "no result") + ")", options, auditLoc: loc.wrapperSel };
+  return { status: "filled_review", after: commit.after, verified: true, matchTier: commit.matchTier, flag, confidence, detail, options, auditLoc: loc.wrapperSel };
+};
+
+// The decision tree (in CODE, each leaf unit-tested). options = the captured full list
+// (rec.options || rec.captured_options); realOptions = options minus "Other"; otherOpt = "Other".
+const aiTypeaheadFallback = async (act, rec, profile, jobContext, budgets) => {
+  const loc = { wrapperSel: rec.auditLoc };
+  const options = (Array.isArray(rec.options) && rec.options.length) ? rec.options
+    : (Array.isArray(rec.captured_options) ? rec.captured_options : []);
+  const realOptions = options.filter((o) => !isOtherOption(o));
+  const otherOpt = options.find(isOtherOption);
+  const required = !!rec.isRequired;
+
+  // No real option to evaluate (the list is only "Other") + Other present → commit "Other"
+  // deterministically. The ONLY no-LLM shortcut (no spend — nothing to choose among).
+  if (realOptions.length === 0) {
+    if (otherOpt) return await commitAiTypeahead(act, loc, otherOpt, "ai-other-only", "medium",
+      "no selectable options besides \"Other\" → committed \"Other\" (no AI call)", options, budgets);
+    return { detail: "AI typeahead: no options to evaluate — left for review" }; // leave needs_review untouched
+  }
+
+  // ≥1 real option → the LLM picks the closest + judges genuine representation.
+  const system = "You help an applicant pick a value for a job-application typeahead/autocomplete field (e.g. Field of Study). Given the applicant's profile (JSON), the field's question, and the FULL list of selectable options, return the SINGLE option that best represents the applicant. ALSO judge representation: set represented=true when an option is the SAME field of study OR a clear PARENT / CHILD / SIBLING discipline of the applicant's — e.g. \"Electrical and Computer Engineering\"→\"Electrical Engineering\", \"Software Engineering\"→\"Computer Science\", \"Applied Mathematics\"→\"Mathematics\" are GENUINE matches (represented=true; pick that option). Set represented=false ONLY when NO option is in the applicant's field at all — e.g. \"Economics\" when nothing economics/business/finance-like is offered — then the caller falls back to \"Other\". Copy the chosen option's text EXACTLY. Reply ONLY with a JSON object.";
+  const user = "Question: " + String(rec.label || rec.fieldName || "")
+    + "\nSelectable options (choose exactly one; reply with its EXACT text): " + JSON.stringify(realOptions)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"represented\":true|false,\"confidence\":\"High|Medium|Low\"}";
+  const res = await act.llm({ system, user, maxTokens: 512 });
+  if (!res || !res.ok) return { status: "needs_review", after: null, verified: false, flag: "ai-call-failed", confidence: "low",
+    detail: "AI typeahead call failed — " + ((res && res.error) || "no reply"), options, auditLoc: loc.wrapperSel };
+  const reply = parseAiTypeaheadReply(res.text);
+  const conf = reply.confidence;
+  const cm = apMatch.matchCandidates([reply.choice], realOptions); // anti-hallucination → canonical real option
+  const resolved = cm.targetIndex !== -1 ? realOptions[cm.targetIndex] : null;
+
+  // represented + resolves to a real option → commit the pick.
+  if (reply.represented && resolved) {
+    return await commitAiTypeahead(act, loc, resolved, "ai-choice", conf,
+      "AI: \"" + resolved + "\" (genuinely represented in the list)", options, budgets);
+  }
+  // not represented (or unresolvable) + "Other" available → "Other" is the honest answer.
+  if (otherOpt) {
+    return await commitAiTypeahead(act, loc, otherOpt, "ai-choice-other", conf,
+      "AI: the applicant's answer isn't in the list" + (resolved ? " (nearest: \"" + resolved + "\")" : "") + " → \"Other\"", options, budgets);
+  }
+  // not represented + no "Other" + REQUIRED → MUST commit a real option (a blank REQUIRED field HALTS
+  // the walk — the AI-1 principle). Prefer the clean match; else SNAP the AI's (unresolvable/hallucinated)
+  // choice to the nearest real option — never decline. SUPER-HARD flag (the applicant didn't claim it).
+  if (required) {
+    const forced = resolved || nearestOption(reply.choice, realOptions);
+    return await commitAiTypeahead(act, loc, forced, "ai-closest-forced", conf,
+      "AI FORCED \"" + forced + "\" — NOT genuinely represented, no \"Other\" on a REQUIRED field"
+      + (resolved ? "" : " (snapped from \"" + reply.choice + "\")") + " — VERIFY", options, budgets);
+  }
+  // not represented + no "Other" + OPTIONAL → leave needs_review, commit nothing (a blank OPTIONAL field
+  // doesn't block the walk, so we don't force a value the applicant didn't claim).
+  return { status: "needs_review", after: null, verified: false, flag: "ai-typeahead-decline", confidence: conf,
+    detail: "AI: the applicant's answer isn't among the options and there is no \"Other\"" + (resolved ? " (nearest: \"" + resolved + "\")" : "") + " — left for review", options, auditLoc: loc.wrapperSel };
+};
+
+// The AI typeahead pass: rescue every GENUINE no-match flat typeahead in `results` via the LLM.
+// Extracted so BOTH drivePageFill (full-page + walk) and the per-section harness (runCdpFillEducation)
+// run the IDENTICAL logic. No-op when act.aiEnabled is false (AI OFF ⇒ no provider call — byte-identical).
+async function runAiTypeaheadPass(act, results, profile, jobContext, budgets) {
+  if (!act || !act.aiEnabled) return;
+  for (const rec of results || []) {
+    if (!aiTypeaheadEligible(rec)) continue;
+    try {
+      // Structural tree guard (the 0.4 cross-tenant discriminator): a "typeahead"-classified field whose
+      // opened popup shows category rows is a TREE (cert) → exclude. Defense-in-depth over the name-belt.
+      if (act.isTreePicker && await act.isTreePicker({ wrapperSel: rec.auditLoc })) {
+        rec.flag = "ai-tree-excluded";
+        rec.detail = "AI typeahead skipped — tree picker (chevron categories), not a flat typeahead";
+        continue;
+      }
+      const aiRes = await aiTypeaheadFallback(act, rec, profile, jobContext, budgets);
+      // EEO retraction: an AI-inferred demographic typeahead still gets the loud "AI-GUESSED DEMOGRAPHIC
+      // — VERIFY" badge (only on a committed fill).
+      if (aiRes && aiRes.status === "filled_review" && isEeoField(rec)) aiRes.flag = "ai-eeo-guess";
+      Object.assign(rec, aiRes);
+    } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI typeahead error: " + String((e && e.message) || e); }
+  }
+}
+
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
 // `opts.onlyFieldNames` (a Set) = AI-4 TARGETED RE-FILL: fill ONLY those flat fields through the
 // SAME per-field loop (byte-identical to the full fill — no parallel re-impl, no drift) and skip
@@ -1797,26 +1968,35 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // gated — the deterministic record above is untouched unless this fires (existing paths
     // unchanged when AI is OFF). TWO distinct paths, never confused:
     //  • CANONICALIZE (AI-3): a MAPPED dropdown whose STATED profile value didn't match the option
-    //    vocab → map the KNOWN value to an option. NEVER infers → ALLOWED for EEO (not aiEligible-gated).
+    //    vocab → map the KNOWN value to an option. NEVER infers; keeps its own ai-canonicalized flag.
     //  • INFER (AI-1/AI-2): an unmapped/unanswerable field with NO known value → the AI decides.
-    //    aiEligible-gated (NEVER the employer-match radio / file_upload / EEO). dropdown→aiFillField,
+    //    aiEligible-gated (NEVER the employer-match radio / file_upload). EEO is now INCLUDED (the
+    //    operator retracted the exclusion) → an AI-inferred demographic is re-tagged ai-eeo-guess so the
+    //    viewer still shows the loud "AI-GUESSED DEMOGRAPHIC — VERIFY" badge. dropdown→aiFillField,
     //    text/textarea→aiFillText. ALWAYS filled_review, never silent.
     if (act.aiEnabled && producedNothing(record)) {
       const canonicalize = !!mappedPath && record.resolved != null && record.genuineNoMatch === true && f.widgetType === "dropdown";
       try {
         let aiRes = null;
-        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers; EEO-allowed)
-        else if (aiEligible(f)) aiRes = (f.widgetType === "dropdown")
-          ? await aiFillField(act, loc, f, profile, jobContext, budgets)
-          : await aiFillText(act, loc, f, profile, jobContext, budgets);
+        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers)
+        else if (aiEligible(f)) {
+          aiRes = (f.widgetType === "dropdown")
+            ? await aiFillField(act, loc, f, profile, jobContext, budgets)
+            : await aiFillText(act, loc, f, profile, jobContext, budgets);
+          // EEO retraction: an AI-INFERRED demographic still gets the loud demographic badge. Only a
+          // committed inference (filled_review); canonicalize keeps ai-canonicalized (maps a STATED value).
+          if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess";
+        }
         if (aiRes) Object.assign(record, aiRes);
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
     }
 
-    // ── AI-3 MANDATORY-EEO inference ── a REQUIRED EEO dropdown left blank (status `skipped` —
-    // unmapped, or mapped-but-empty) would HALT the walk → the AI confident-guesses-or-declines
-    // (operator-decided; the canon/infer hook above is a no-op here — EEO inference is aiEligible-
-    // blocked and canon needs a value). OPTIONAL EEO never reaches here (a blank optional doesn't block).
+    // ── AI-3 MANDATORY-EEO inference ── now ONLY the mapped-but-empty REQUIRED EEO dropdown corner: an
+    // unmapped EEO field already filled via the generic INFER block above (EEO is no longer excluded), so
+    // its status is filled_review (not `skipped`) and this won't fire. A MAPPED-but-empty required EEO
+    // dropdown (status `skipped`, producedNothing false → the infer block skipped it) would HALT the walk
+    // → the confidence-gated AI-3 path guesses-or-declines (ai-eeo-guess / eeo_declined). Optional never
+    // reaches here (a blank optional doesn't block). Mutually exclusive with the infer block (status gate).
     if (act.aiEnabled && f.isRequired && record.status === "skipped" && f.widgetType === "dropdown"
         && (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || "")))) {
       try { Object.assign(record, await aiInferEeoField(act, loc, f, profile, budgets)); }
@@ -1857,6 +2037,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (out && Array.isArray(out.results)) results.push(...out.results);
     }
   }
+
+  // ── AI TYPEAHEAD FALLBACK ── a FLAT typeahead that GENUINELY no-matched → hand the captured option
+  // list + profile to the LLM → commit its pick through the proven filler (ALWAYS filled_review). One
+  // pass over ALL results (flat fields + repeating-section recs from driveRepeatingSectionCdp). Runs
+  // BEFORE the M40 audit SNAPSHOT below so a committed AI value lands in auditEntries (the audit then
+  // re-reads it → the post-settle-clobber backstop covers AI commits too). Input options come from the
+  // INLINE scrape (rec.options — set in fillEntryCdp even on a no-match) / captured_options, NOT from
+  // captureChoiceOptions (which SKIPS needs_review recs), so this needn't wait for that pass. Extracted
+  // to runAiTypeaheadPass — SHARED with the per-section harness (runCdpFillEducation); no-op when AI OFF.
+  if (!only) await runAiTypeaheadPass(act, results, profile, jobContext, budgets);
 
   // M40 post-fill page AUDIT (inline backstop): after the WHOLE page has settled, re-read
   // every field that claims a value + reconcile vs what it recorded. Catches a value clobbered
@@ -2180,7 +2370,13 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // didn't take / typeahead focus-unconfirmable) is NOT invalid data → KEEP + surface
     // (needs_review), NEVER silently destroy valid data (the live English/Chinese loss when the
     // language dropdown failed to render deep in a long fold).
-    const deletable = failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true);
+    // Delete-vs-AI DEFER: if AI is ON and EVERY failed required pick is an AI-rescuable typeahead
+    // (aiTypeaheadEligible — the AI pass runs AFTER this section, in drivePageFill), DON'T delete the
+    // entry — let the AI rescue it (a committed value, or an honest needs_review the operator fixes).
+    // Cert is name-belted (aiTypeaheadEligible false) ⇒ still deletes; Languages is a dropdown ⇒ still
+    // deletes. Dormant today (no AI-eligible typeahead lives in a deleteOnNoMatch section); unit-pinned.
+    const aiWillRescue = !!act.aiEnabled && failedRequired.length > 0 && failedRequired.every(aiTypeaheadEligible);
+    const deletable = !aiWillRescue && failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true);
     perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
   }
 
@@ -2664,5 +2860,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass };
 }

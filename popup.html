@@ -74,6 +74,12 @@
          COMPLETE bounded FoS option list (frame-paced, <1s). Uses the label input. Page 2.
          [CDP-FOS-CAPTURE] in the SW console. -->
     <button id="cdp-fos-capture">CDP FoS capture-probe (read-only; fast scroll-scrape; page 2)</button>
+    <!-- TREE-vs-FLAT RECON (read-only, 0.4): open every typeahead/hierarchical field on the page, dump
+         its option-row markers (chevron / aria-expanded / role=treeitem), classify TREE vs FLAT — the
+         discriminator that excludes tree pickers (source, certification) from the AI typeahead fallback.
+         Run on page 1 (source, countryPhoneCode) AND page 2 (Field of Study, certification).
+         [CDP-TREE-RECON] in the SW console. -->
+    <button id="cdp-tree-recon">CDP recon: tree-vs-flat (read-only; pages 1 & 2)</button>
     <!-- FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
          empty-results (a higher-tier no-match) DROP searchBox focus, and does RE-FOCUS restore + disarm the
          highlight? cand-1 Enter→0 (no commit); "Other" typed char-by-char, never Enter'd. Page 2, uses the

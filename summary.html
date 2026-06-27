@@ -31,6 +31,11 @@
       .badge.sensitive { background: #b00020; color: #fff; font-weight: 700; letter-spacing: 0.3px; }
       .review.sensitive { border: 2px solid #b00020; background: #fff0f1; }
       .review.sensitive .label { color: #8a0017; }
+      /* SUPER-HARD: an AI typeahead pick the applicant didn't claim (ai-closest-forced) or a LOW-confidence
+         AI guess — the riskiest committed AI answers → loudest (≥ legally-loaded), rendered FIRST. */
+      .badge.superhard { background: #7a0016; color: #fff; font-weight: 800; letter-spacing: 0.4px; }
+      .review.superhard { border: 3px solid #7a0016; background: #ffe9ec; }
+      .review.superhard .label { color: #5e0011; }
       /* AI-2: a REQUIRED field still holds an AI placeholder → submit is BLOCKED until it's replaced. */
       .submit-blocked { background: #b00020; color: #fff; font-weight: 700; padding: 10px 14px; border-radius: 6px; margin: 10px 0; font-size: 14px; }
       .cellval { font-weight: 500; }

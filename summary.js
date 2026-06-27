@@ -239,9 +239,17 @@ const render = () => {
   const isSensitive = (e) => e.flag && /sensitive/.test(e.flag);
   const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
   const isEeoGuess = (e) => e.flag === "ai-eeo-guess"; // AI-3: a GUESSED demographic — must be verified
-  const mustReplace = (e) => isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
+  // SUPER-HARD: an AI typeahead pick the applicant didn't claim (ai-closest-forced — forced a value on
+  // a required field with no "Other"), OR any AI guess the model itself flagged LOW confidence. These
+  // are the riskiest committed AI answers → loudest badge, rendered FIRST (≥ legally-loaded).
+  const isSuperHard = (e) => e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
+  const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
   const flaggedAll = bundle.entries.filter((e) => e.needs_review);
-  const flagged = [...flaggedAll.filter(mustReplace), ...flaggedAll.filter((e) => !mustReplace(e))]; // must-replace FIRST (flag-driven)
+  const flagged = [
+    ...flaggedAll.filter(isSuperHard),                                // super-hard FIRST
+    ...flaggedAll.filter((e) => mustReplace(e) && !isSuperHard(e)),   // then the rest of must-replace
+    ...flaggedAll.filter((e) => !mustReplace(e))                      // then everything else
+  ];
   root.appendChild(el("h2", { text: `Needs review (${flagged.length})` }));
   if (!flagged.length) {
     root.appendChild(el("div", { class: "meta", text: "Nothing flagged." }));
@@ -249,10 +257,12 @@ const render = () => {
     for (const e of flagged) {
       const sensitive = isSensitive(e);
       const isAi = isAiFlag(e);
-      const card = el("div", { class: mustReplace(e) ? "review sensitive" : "review" });
+      const superHard = isSuperHard(e);
+      const card = el("div", { class: superHard ? "review superhard" : mustReplace(e) ? "review sensitive" : "review" });
       const label = el("div", { class: "label" });
       label.appendChild(document.createTextNode(`${fmt(e.question_label)}  (${fmt(e.widget_type)})  `));
       // The loud marker is flag-driven: conspicuous at ANY confidence.
+      if (superHard) label.appendChild(el("span", { class: "badge superhard", text: e.flag === "ai-closest-forced" ? "⚠ AI FORCED A CHOICE — VERIFY" : "⚠ LOW-CONFIDENCE AI — VERIFY" }));
       if (sensitive) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ LEGALLY-LOADED — VERIFY" }));
       if (needsAnswer(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ NEEDS YOUR ANSWER — REPLACE BEFORE SUBMIT" }));
       if (isEeoGuess(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ AI-GUESSED DEMOGRAPHIC — VERIFY" }));

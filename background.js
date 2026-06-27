@@ -352,6 +352,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // TREE-vs-FLAT RECON (read-only, 0.4): open every typeahead/hierarchical field on the current page,
+  // dump its option-row markers (isCategory / chevron / aria-expanded / role=treeitem+aria-level), and
+  // classify TREE vs FLAT — the discriminator that EXCLUDES tree pickers (source, Magna certification)
+  // from the AI typeahead fallback. Run on page 1 (source, countryPhoneCode) + page 2 (Field of Study,
+  // certification). [CDP-TREE-RECON] in the SW console.
+  if (message.type === "RUN_CDP_TREE_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpTreeRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
   // empty-results drop searchBox focus, and does re-focus restore + disarm? cand-1 Enter→0 (no commit);
   // "Other" typed char-by-char, never Enter'd. Page 2. [CDP-FOS-FOCUS] in the SW console.
@@ -2733,6 +2748,78 @@ async function runCdpFosRecon(tabId, labelRegexStr) {
 }
 
 // ============================================================================
+// TREE-vs-FLAT RECON (read-only, 0.4) — the structural discriminator probe. The AI typeahead fallback
+// must EXCLUDE tree pickers (source, Magna's certification — a chevron tree mis-tagged "typeahead") and
+// fire ONLY on flat typeaheads (Field of Study, countryPhoneCode). source is already excluded by
+// widgetType "hierarchical"; cert is the ambiguous one (identical multiselect chrome on the wrapper —
+// tree-ness is a POPUP-content property). This opens every typeahead/hierarchical field present, dumps
+// its option-row markers via cdpReadSourceState (the verbose recon reader: isCategory / hasChevron /
+// ariaExpanded / ariaLevel / role per row), and classifies TREE (any category row) vs FLAT. PURE
+// READ-ONLY: open → read → Tab-close (no type / Enter / arrow / option-click → nothing arms, no field
+// changes). Run on page 1 (source, countryPhoneCode) AND page 2 (Field of Study, certification).
+// ============================================================================
+async function runCdpTreeRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-TREE-RECON]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+
+    // Collect every typeahead + hierarchical field on this page (flat + repeating entries).
+    const targets = [];
+    const ps = await cdpEval(cdpPageScan);
+    for (const f of (ps && ps.fields) || []) {
+      if (f.widgetType === "typeahead" || f.widgetType === "hierarchical")
+        targets.push({ wrapperSel: f.wrapperSel, label: f.label, fieldName: f.fieldName, widgetType: f.widgetType, where: "flat" });
+    }
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      const entries = (rscan.sections[prefix] && rscan.sections[prefix].entries) || [];
+      for (let i = 0; i < entries.length; i++) {
+        for (const f of entries[i].fields || []) {
+          if (f.widgetType === "typeahead" || f.widgetType === "hierarchical")
+            targets.push({ wrapperSel: f.wrapperSel, label: f.label, fieldName: f.fieldName, widgetType: f.widgetType, where: `${prefix}[${i}]` });
+        }
+      }
+    }
+    if (!targets.length) {
+      LOG("no typeahead/hierarchical field on this page — run on page 1 (source, countryPhoneCode) and page 2 (Field of Study, certification).");
+      return { ok: true, found: false };
+    }
+
+    LOG(`found ${targets.length} typeahead/hierarchical field(s). READ-ONLY: open each → dump option-row markers → Tab-close. No type/Enter/click → no field changes.`);
+    const out = [];
+    for (const t of targets) {
+      const loc = { wrapperSel: t.wrapperSel };
+      const opened = t.widgetType === "hierarchical" ? await act.openSource(loc) : await act.openTypeahead(loc);
+      await act.delayFull(700); // let the portaled list render
+      const dump = await cdpEval(cdpReadSourceState, t.wrapperSel); // verbose marker dump (isCategory/hasChevron/ariaExpanded/ariaLevel/role)
+      const rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
+      const categoryRows = rows.filter((r) => r.isCategory);
+      const isTree = categoryRows.length > 0;
+      const sample = rows.slice(0, 8).map((r) => ({ label: r.label, role: r.role, automationId: r.automationId, isCategory: r.isCategory, hasChevron: r.hasChevron, ariaExpanded: r.ariaExpanded, ariaLevel: r.ariaLevel }));
+      LOG(`── ${t.where} "${t.label}" (${t.fieldName}, classified=${t.widgetType}) ──`);
+      LOG(`   opened=${opened} searchBox=${dump && dump.searchBox ? !!dump.searchBox.visible : "n/a"} rows=${rows.length} categoryRows=${categoryRows.length} → ${isTree ? "TREE ⛔" : "FLAT ✓"}`);
+      LOG(`   sample rows: ${JSON.stringify(sample)}`);
+      out.push({ where: t.where, label: t.label, fieldName: t.fieldName, widgetType: t.widgetType, opened, rowCount: rows.length, categoryRowCount: categoryRows.length, isTree, sample });
+      await act.pressTab(); // clean non-committing close (no type/Enter/arrow → nothing armed)
+      await act.delayFull(400);
+    }
+
+    LOG("════ SUMMARY ════");
+    for (const r of out) LOG(`   ${r.isTree ? "TREE ⛔" : "FLAT ✓"}  ${r.fieldName}  "${r.label}"  (rows=${r.rowCount}, categoryRows=${r.categoryRowCount})`);
+    LOG("Discriminator marker = any option row with isCategory (chevron svg / aria-expanded / role=treeitem+aria-level / aria-haspopup). EXPECTED: source + certification = TREE; fieldOfStudy + countryPhoneCode = FLAT. If a flat field rendered 0 rows on open (search-only), it is correctly FLAT (no category rows).");
+    return { ok: true, found: true, fields: out };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("tree recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // FoS OPTION CAPTURE-PROBE (read-only) — prove the FAST in-page scroll-accumulate scrape gets the
 // COMPLETE bounded option list (the Round-1 verdict was "enumerable but virtualized"). Open FoS →
 // cdpScrapeTaOptions (one in-page eval, frame-paced, <1s) → log the full list + scroll metrics →
@@ -3255,23 +3342,30 @@ async function runCdpFillEducation(tabId, profile) {
     const items = Array.isArray(prepared.education) ? prepared.education : [];
     LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful entr(y/ies).`);
 
-    const act = makeCdpActuation();
+    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
+    LOG("AI typeahead fallback:", act.aiEnabled ? "ON (a Field-of-Study no-match → LLM picks from the scraped list)" : "OFF (enable the AI toggle + set a provider/model/key in the popup to test the FoS rescue)");
     const out = await driveRepeatingSectionCdp(act, {
       name: "education", headingRegex: "education", containerPrefix: "education-",
       items, fieldMap: EDUCATION_MAP, deleteOnNoMatch: false
     }, DEFAULT_BUDGETS);
+    // AI typeahead fallback over the section's recs (the SAME pass drivePageFill runs — shared helper).
+    // No-op when AI is OFF. Rescues a genuine-no-match FoS; excludes the cert tree (name-belt + isTreePicker).
+    await runAiTypeaheadPass(act, out.results, prepared, {}, DEFAULT_BUDGETS);
+    // The section's finalize() computed needsReview/counts BEFORE the AI pass — recompute from the mutated recs.
+    const needsReview = out.results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
+    const counts = out.results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
 
     LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
+    LOG(`════ NEEDS REVIEW (${needsReview.length}) ════`);
+    for (const r of needsReview) {
       LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
     }
     console.table(out.results.map((r) => ({
       field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
       verified: r.verified, flag: r.flag, detail: r.detail
     })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
+    LOG("counts:", JSON.stringify(counts));
+    return { ok: true, counts, needs_review: needsReview.length };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("education fill aborted:", msg);
