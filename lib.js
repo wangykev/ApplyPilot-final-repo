@@ -125,12 +125,18 @@ function matchCandidates(candidates, optionTexts) {
     const idx = optionTexts.findIndex((t) => normalize(t) === nc);
     if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
   }
-  // Tier 2: containment — startsWith, then includes.
+  // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate
+  // contained in 2+ options is NOT a confident match (e.g. "United States" is in both
+  // "...of America" and "...Virgin Islands") → skip it, never silently pick the first.
+  // Commit ONLY when EXACTLY ONE option contains it. startsWith still beats includes.
   for (const cand of candidates) {
     const nc = normalize(cand);
-    let idx = optionTexts.findIndex((t) => normalize(t).startsWith(nc));
-    if (idx === -1) idx = optionTexts.findIndex((t) => normalize(t).includes(nc));
-    if (idx !== -1) return { targetIndex: idx, matchTier: "containment", matchedCandidate: cand };
+    const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
+    if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
+    if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
+    const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
+    if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
+    // 0 or 2+ includes → not a confident containment match for this candidate
   }
   // Tier 3: fuzzy >= 90 — typo tolerance only.
   let best = -1, bestScore = 0, bestCand = null;

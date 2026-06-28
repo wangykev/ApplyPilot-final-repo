@@ -502,6 +502,17 @@ document.getElementById("cdp-tree-recon").addEventListener("click", () => {
   });
 });
 
+document.getElementById("cdp-tree-drill-recon").addEventListener("click", () => {
+  const labelRegex = document.getElementById("ta-label").value.trim() || "certification";
+  setStatus(`Tree-DRILL recon ("${labelRegex}", read-mostly)… open My Experience (page 2). See [CDP-TREE-DRILL] in the service worker console — paste the whole block.`);
+  chrome.runtime.sendMessage({ type: "RUN_CDP_TREE_DRILL_RECON", labelRegex }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false) setStatus("Tree-drill recon failed: " + resp.error + " — see the service worker console.");
+    else if (resp.found === false) setStatus("No matching tree field on this page — run on page 2 (Certification).");
+    else setStatus(`Tree-drill recon done — see [CDP-TREE-DRILL]: did the category expand + reveal leaves? Paste the block.`);
+  });
+});
+
 document.getElementById("cdp-page-recon").addEventListener("click", () => {
   setStatus("Page-identity recon (READ-ONLY)… dumps title/markers/automation-ids/body text for whatever page is showing. See [CDP-PAGE-RECON] in the service worker console, then paste the whole block.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_PAGE_RECON" }, (resp) => {

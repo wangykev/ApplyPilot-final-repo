@@ -48,6 +48,12 @@ const editKindOf = (entry) => {
 //   hierarchical → options (the source picker's level-1 leaves — PARTIAL)
 const editorFor = (entry) => {
   if (entry.widget_type === "dropdown") return { list: entry.options || [], partial: false };
+  // TREE-AI (cert): the recon captured the CHOSEN category's leaves → a searchable editor over them
+  // (partial — only that category's options, not the whole tree). Checked before the typeahead branch
+  // (cert is mis-tagged "typeahead").
+  if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) {
+    return { list: entry.tree_structure.leaves, partial: true, searchable: true, tree: entry.tree_structure };
+  }
   if (entry.widget_type === "typeahead") {
     if (Array.isArray(entry.options) && entry.options.length) return { list: entry.options, partial: false, searchable: true };
     return { list: entry.captured_options || [], partial: true };
@@ -277,6 +283,11 @@ const render = () => {
       // AI provenance — the flag (which AI path) + confidence, so the human sanity-checks HOW it answered.
       if (isAi) card.appendChild(el("div", { class: "reason", text: `AI provenance: ${fmt(e.flag)}  ·  confidence: ${fmt(e.confidence)}` }));
       if (e.detail) card.appendChild(el("div", { class: "detail", text: e.detail })); // the AI's RATIONALE (names its basis)
+      // TREE-AI recon: show the chosen category + the options the AI picked from (operator asked to surface it).
+      if (e.tree_structure && e.tree_structure.chosen) {
+        const ts = e.tree_structure, lv = Array.isArray(ts.leaves) ? ts.leaves : [];
+        card.appendChild(el("div", { class: "options", text: `tree recon — category «${fmt(ts.chosen)}» → ${lv.slice(0, 12).join(", ")}${lv.length > 12 ? ` … (${lv.length} options)` : ""}` }));
+      }
       const opts = e.options || e.captured_options;
       if (opts && opts.length) {
         // Cap the flat-text dump (options can now be ~250 for plain dropdowns).

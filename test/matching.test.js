@@ -30,6 +30,33 @@ test("tier 2: containment — startsWith before includes", () => {
   assert.strictEqual(m.matchTier, "containment");
 });
 
+test("tier 2 AMBIGUITY-SAFE: a candidate contained in 2+ options does NOT commit the first — escalates", () => {
+  // The bug: "United States" is a prefix of BOTH options → must NOT silently pick index 0.
+  const m = matchCandidates(["United States"], ["United States of America (+1)", "United States Virgin Islands"]);
+  assert.strictEqual(m.targetIndex, -1);
+  assert.strictEqual(m.matchTier, null);
+});
+
+test("tier 2 AMBIGUITY-SAFE: a more-specific candidate disambiguates (exactly one startsWith)", () => {
+  // "United States of" starts only "United States of America" → unambiguous → commits it.
+  const m = matchCandidates(["United States of"], ["United States of America (+1)", "United States Virgin Islands"]);
+  assert.strictEqual(m.targetIndex, 0);
+  assert.strictEqual(m.matchTier, "containment");
+});
+
+test("tier 2 AMBIGUITY-SAFE: includes-level ambiguity (2+ contain it mid-string) also escalates", () => {
+  const m = matchCandidates(["States"], ["United States of America (+1)", "United States Virgin Islands"]);
+  assert.strictEqual(m.targetIndex, -1);
+  assert.strictEqual(m.matchTier, null);
+});
+
+test("tier 2 AMBIGUITY-SAFE: an unambiguous containment still fills (the cert/tree-leaf case kept)", () => {
+  // The operator's cert: the profile value is contained in exactly ONE suffixed leaf → still commits.
+  const m = matchCandidates(["Training Instructor - AEVO"], ["Training Instructor - AEVO - Multiple Recognized Providers"]);
+  assert.strictEqual(m.targetIndex, 0);
+  assert.strictEqual(m.matchTier, "containment");
+});
+
 test("tier 3: fuzzy >= 90 is typo tolerance only", () => {
   // "enginering" (typo) vs "Engineering": distance 1 over 11 → ratio 91 (>= 90).
   const m = matchCandidates(["enginering"], ["Marketing", "Engineering"]);

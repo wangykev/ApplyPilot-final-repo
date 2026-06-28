@@ -367,6 +367,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // TREE-DRILL RECON (read-mostly, Step 0 of the tree-AI milestone): how does a cert category expand on
+  // CDP? Open → click category → re-read revealed leaves. Run on page 2 (Certification). [CDP-TREE-DRILL].
+  if (message.type === "RUN_CDP_TREE_DRILL_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpTreeDrillRecon(tab.id, String(message.labelRegex || ""));
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // PAGE-IDENTITY RECON (read-only): dump title / URL / automation-ids / headings / body text + state
   // markers for ANY page (maintenance / dead session / login / error / a normal form) so an unknown page
   // state can be DETECTED in code instead of surfacing an opaque "unknown error". [CDP-PAGE-RECON] in SW.
@@ -2869,6 +2881,97 @@ async function runCdpPageRecon(tabId) {
 }
 
 // ============================================================================
+// TREE-DRILL RECON (read-mostly, Step 0 of the tree-AI milestone) — HOW does a Magna cert CATEGORY
+// expand on CDP? Open the cert tree → dump categories → CLICK category[0] (NON-committing) → re-read
+// (did its leaves appear in-place? aria-expanded flip? leaf markers/role/automationId?) → CLICK
+// category[1] (does cat[0] collapse — toggle?) → PROBE a leaf (read-only, NEVER clicked). Reuses
+// cdpReadSourceState (verbose row markers + isCategory), cdpSourceCategoryRect (category rect +
+// ariaExpandedBefore), cdpSourceLeafProbe. Tab-close; chips read on-open vs at-end to catch any
+// unintended commit. Decides the Step-1 drill substrate (act.expandCategory + readTreeRows).
+// ============================================================================
+async function runCdpTreeDrillRecon(tabId, labelRegexStr) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-TREE-DRILL]", ...a);
+  let re;
+  try { re = new RegExp(labelRegexStr || "certification", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const act = makeCdpActuation();
+
+    // Locate the tree typeahead/hierarchical field by label — repeating entries first, then flat.
+    let loc = null, where = null;
+    const rscan = await cdpEval(cdpRepeatingScan);
+    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
+      const entries = (rscan.sections[prefix] && rscan.sections[prefix].entries) || [];
+      for (let i = 0; i < entries.length; i++) {
+        const f = entries[i].fields.find((x) => (x.widgetType === "typeahead" || x.widgetType === "hierarchical") && (re.test(x.label || "") || re.test(x.fieldName)));
+        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+      }
+      if (loc) break;
+    }
+    if (!loc) {
+      const ps = await cdpEval(cdpPageScan);
+      const f = (ps && ps.fields || []).find((x) => (x.widgetType === "typeahead" || x.widgetType === "hierarchical") && (re.test(x.label || "") || re.test(x.fieldName)));
+      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
+    }
+    if (!loc) { LOG(`no typeahead/hierarchical matching /${re.source}/ on this page — run on page 2 (Certification).`); return { ok: true, found: false }; }
+
+    const dump = () => cdpEval(cdpReadSourceState, loc.wrapperSel);
+    const fmt = (d) => {
+      const rows = d ? [].concat(d.promptOptions || [], d.rows || []) : [];
+      return {
+        catCount: rows.filter((r) => r.isCategory).length,
+        leafCount: rows.filter((r) => !r.isCategory).length,
+        cats: rows.filter((r) => r.isCategory).map((r) => ({ label: r.label, role: r.role, aid: r.automationId, ariaExpanded: r.ariaExpanded })),
+        leaves: rows.filter((r) => !r.isCategory).map((r) => ({ label: r.label, role: r.role, aid: r.automationId })),
+        chips: d ? d.chips : [], searchBox: d && d.searchBox ? !!d.searchBox.visible : null
+      };
+    };
+
+    const opened = await act.openTypeahead(loc);
+    await act.delayFull(800);
+    const pre = fmt(await dump());
+    LOG(`probing ${where} (${loc.wrapperSel}). opened=${opened}. READ-MOSTLY (clicks CATEGORIES to expand — non-committing; only PROBES a leaf, never clicks it).`);
+    LOG(`(1) ON OPEN: ${pre.catCount} categories, ${pre.leafCount} leaves, searchBox=${pre.searchBox}, chips=${JSON.stringify(pre.chips)}`);
+    LOG(`    categories: ${JSON.stringify(pre.cats.slice(0, 12))}`);
+    LOG(`    leaves: ${JSON.stringify(pre.leaves.slice(0, 12))}`);
+
+    const stages = [];
+    const catLabels = pre.cats.map((c) => c.label).filter(Boolean);
+    const clickCat = async (label, n) => {
+      const cr = await cdpEval(cdpSourceCategoryRect, label);
+      if (!cr || !cr.found || !cr.rect || cr.rect.w <= 0) { LOG(`(${n}) category "${label}" — rect NOT FOUND, skipping`); return; }
+      LOG(`(${n}) CLICK category "${label}" (rect ${JSON.stringify(cr.rect)}, ariaExpandedBefore=${cr.ariaExpandedBefore})`);
+      await cdpClickAt(cr.rect.cx, cr.rect.cy);
+      await act.delayFull(900);
+      const after = fmt(await dump());
+      LOG(`    AFTER: ${after.catCount} categories, ${after.leafCount} leaves (on-open had ${pre.leafCount}). chips=${JSON.stringify(after.chips)}`);
+      LOG(`    leaves now: ${JSON.stringify(after.leaves.slice(0, 20))}`);
+      LOG(`    category states now: ${JSON.stringify(after.cats.slice(0, 12))}`);
+      stages.push({ stage: "expand:" + label, leafCount: after.leafCount, leaves: after.leaves.slice(0, 40), cats: after.cats });
+    };
+    if (catLabels[0]) await clickCat(catLabels[0], 2);
+    if (catLabels[1]) await clickCat(catLabels[1], 3);
+
+    const probeLeaf = (stages[0] && stages[0].leaves[0] && stages[0].leaves[0].label) || (pre.leaves[0] && pre.leaves[0].label);
+    if (probeLeaf) { const probe = await cdpEval(cdpSourceLeafProbe, probeLeaf); LOG(`(4) PROBE leaf "${probeLeaf}" (read-only, NOT clicked): ${JSON.stringify(probe)}`); }
+    else LOG(`(4) no leaf to probe (no leaves revealed by the expands).`);
+
+    await act.pressTab();
+    await act.delayFull(400);
+    const end = fmt(await dump());
+    LOG(`════ DONE ════ chips at end=${JSON.stringify(end.chips)} (vs on-open ${JSON.stringify(pre.chips)} — should be UNCHANGED; if changed, a category click committed → restore the field). Paste this whole block.`);
+    return { ok: true, found: true, where, onOpen: pre, stages, endChips: end.chips };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("tree-drill recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
 // FoS OPTION CAPTURE-PROBE (read-only) — prove the FAST in-page scroll-accumulate scrape gets the
 // COMPLETE bounded option list (the Round-1 verdict was "enumerable but virtualized"). Open FoS →
 // cdpScrapeTaOptions (one in-page eval, frame-paced, <1s) → log the full list + scroll metrics →
@@ -3952,12 +4055,18 @@ async function fillEngine(profile, defaults, jobContext) {
       const idx = optionTexts.findIndex((t) => normalize(t) === nc);
       if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
     }
-    // Tier 2: containment — startsWith, then includes.
+    // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate
+    // contained in 2+ options is NOT a confident match (e.g. "United States" is in both
+    // "...of America" and "...Virgin Islands") → skip it, never silently pick the first.
+    // Commit ONLY when EXACTLY ONE option contains it. startsWith still beats includes.
     for (const cand of candidates) {
       const nc = normalize(cand);
-      let idx = optionTexts.findIndex((t) => normalize(t).startsWith(nc));
-      if (idx === -1) idx = optionTexts.findIndex((t) => normalize(t).includes(nc));
-      if (idx !== -1) return { targetIndex: idx, matchTier: "containment", matchedCandidate: cand };
+      const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
+      if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
+      if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
+      const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
+      if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
+      // 0 or 2+ includes → not a confident containment match for this candidate
     }
     // Tier 3: fuzzy >= 90 — typo tolerance only.
     let best = -1, bestScore = 0, bestCand = null;

@@ -1524,6 +1524,31 @@ function makeCdpActuation(llmConfig) {
       return true;
     },
 
+    // ── tree DRILL (cert) — the two-prompt AI's substrate (recon 2026-06-27: clicking a category
+    // REPLACES the list with that category's leaves; leaves = data-automation-id="promptOption" with the
+    // " - <Category>" suffix; clickSourceLeaf commits a leaf). The poll lives in the brain (aiTreeFallback).
+    readTreeCategories: async (loc) => {
+      const d = await cdpEval(cdpReadSourceState, loc.wrapperSel);
+      const rows = d ? [].concat(d.promptOptions || [], d.rows || []) : [];
+      return rows.filter((r) => r && r.isCategory).map((r) => r.label).filter(Boolean);
+    },
+    // The drilled category's leaves — promptOption labels (FULL, suffixed), chip-excluded. cdpScrapeTaOptions
+    // is WRONG here (it scrapes role="option" → the TRUNCATED menuItem dupes); cdpReadSourcePick reads the
+    // promptOption leaves. (No scroll: Magna renders the full category list; a huge virtualized category is a
+    // future scroll-scrape.)
+    readTreeLeaves: async (loc) => {
+      const d = await cdpEval(cdpReadSourcePick, loc.wrapperSel);
+      return (d && Array.isArray(d.leaves)) ? d.leaves.slice() : [];
+    },
+    // Click a category to expand/drill it (NON-committing — recon-proven). Returns whether the click fired;
+    // the caller polls readTreeCategories/readTreeLeaves until the list flips to the leaves.
+    expandCategory: async (loc, label) => {
+      const cr = await cdpEval(cdpSourceCategoryRect, label);
+      if (!cr || !cr.found || !cr.rect || cr.rect.w <= 0) return false;
+      await cdpClickAt(cr.rect.cx, cr.rect.cy);
+      return true;
+    },
+
     // ── structural tree-vs-flat discriminator (0.4) — EXCLUDE tree pickers from the AI typeahead
     // fallback. A "typeahead"-classified field whose opened popup shows CATEGORY rows (chevron svg /
     // aria-expanded / role=treeitem+aria-level / aria-haspopup → cdpReadSourceState's isCategory) is a

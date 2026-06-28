@@ -1407,7 +1407,24 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
       captured_options: lastFiltered || undefined,
       isRequired: !!opts.ai.isRequired, label: opts.ai.label, fieldName: opts.ai.fieldName
     };
-    const aiRes = await aiTypeaheadFallback(act, rec, opts.ai.profile, opts.ai.jobContext, budgets);
+    // TREE vs FLAT routing: clear the search to restore the on-open view, then check for CATEGORY rows.
+    // A TREE (cert) → the two-prompt drill (aiTreeFallback, which SEES the real leaves); else the flat
+    // single-prompt (aiTypeaheadFallback). The clear is harmless for a flat field (its options are already
+    // captured in rec.options/captured_options).
+    let aiRes = null;
+    let isTree = false;
+    if (act.readTreeCategories) {
+      // Read the STALE view directly — NO clear. clearSearch is focus-blind (the deterministic filter-Enter
+      // dropped searchBox focus → an unfocused Ctrl+A/Delete no-ops: the wasted first clear + a pollSearchValue
+      // wait), AND clearing a typeahead does NOT restore the on-open view anyway. On a no-match the widget
+      // falls back to the ORIGINAL list + a "No matches found" banner, so a TREE's category rows are already
+      // visible here → aiTreeFallback drills from them (no reopen); an ambiguous-containment shows the filtered
+      // LEAVES (no categories → routes flat → AI picks from the visible matches). The flat commit's single,
+      // FOCUSED clear happens in commitAiTypeahead's re-entry (its main loop ensureSearchFocused()es first).
+      try { isTree = (await act.readTreeCategories(loc)).length > 0; } catch (e) { isTree = false; }
+    }
+    if (isTree) aiRes = await aiTreeFallback(act, loc, rec, opts.ai.profile, opts.ai.jobContext, budgets);
+    if (!isTree || aiRes === null) aiRes = await aiTypeaheadFallback(act, rec, opts.ai.profile, opts.ai.jobContext, budgets);
     if (!aiRes || !aiRes.status) return null; // "no options to evaluate" → fall through to the normal no-match exit
     if (aiRes.status === "filled_review" && isEeoField(rec)) aiRes.flag = "ai-eeo-guess"; // EEO retraction: demographic badge
     // Clean exit if the AI did NOT commit (decline / failure leaves the field open on the failed query).
@@ -1741,6 +1758,21 @@ const parseAiTypeaheadReply = (text) => {
 // "Other" detection (normalize lowercases + strips trailing (+digits) + collapses whitespace).
 const isOtherOption = (o) => apMatch.normalize(o) === "other";
 
+// Parse the AI's TREE-CATEGORY reply: {choice, confidence} (no `represented` — the category is a
+// navigation step, not the answer). Tolerant like parseAiTypeaheadReply (```-fences / embedded / non-JSON).
+const parseAiTreeReply = (text) => {
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const mm = t.match(/\{[\s\S]*\}/);
+    if (mm) { try { obj = JSON.parse(mm[0]); } catch (e2) { /* fall through */ } }
+  }
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    return { choice: String(obj.choice != null ? obj.choice : (obj.category != null ? obj.category : "")).trim(), confidence: _aiConf(obj.confidence) };
+  }
+  return { choice: t, confidence: "low" };
+};
+
 // Snap an UNRESOLVABLE AI choice to the CLOSEST real option — argmax fuzzyRatio, NO threshold. Used
 // ONLY on a REQUIRED field with no "Other", where SOMETHING must be committed (a blank required field
 // HALTS the walk). Distinct from matchCandidates (which returns -1 below 90 to avoid SILENT wrong fills):
@@ -1852,6 +1884,89 @@ const aiTypeaheadFallback = async (act, rec, profile, jobContext, budgets) => {
   // doesn't block the walk, so we don't force a value the applicant didn't claim).
   return { status: "needs_review", after: null, verified: false, flag: "ai-typeahead-decline", confidence: conf,
     detail: "AI: the applicant's answer isn't among the options and there is no \"Other\"" + (resolved ? " (nearest: \"" + resolved + "\")" : "") + " — left for review", options, auditLoc: loc.wrapperSel };
+};
+
+// TWO-PROMPT AI for a TREE picker (cert). Called from tryInlineAi when the OPEN no-matched field shows
+// CATEGORY rows. Drill to SEE the real options (no blind typing): Prompt 1 picks a CATEGORY → expand it →
+// poll for the leaves → Prompt 2 picks a LEAF (the flat decision tree) → commit via clickSourceLeaf (NOT
+// typing; leaves carry the " - <Category>" suffix, stripped for the prompt, restored for the commit).
+// Records rec.tree_structure (categories + the chosen category's leaves) for the summary. ALWAYS
+// filled_review on a commit. Returns null if no categories (not actually a tree → caller falls back).
+const aiTreeFallback = async (act, loc, rec, profile, jobContext, budgets) => {
+  const norm = apMatch.normalize;
+  const cats = act.readTreeCategories ? await act.readTreeCategories(loc) : [];
+  if (!cats.length) return null; // not a tree (or categories not visible) → caller falls back to flat/normal
+  const required = !!rec.isRequired;
+  const fail = (flag, confidence, detail, extra) => Object.assign({ status: "needs_review", after: null, verified: false, flag, confidence, detail, auditLoc: loc.wrapperSel, tree_structure: { categories: cats } }, extra || {});
+
+  // ── PROMPT 1 — pick the CATEGORY ──
+  const sys1 = "You are navigating a job-application TREE picker (e.g. Certification — the top level is CATEGORIES that group the options by provider/source). Given the applicant's profile and the field, choose the SINGLE category most likely to CONTAIN the applicant's answer (a broad 'multiple/various providers' category is usually the catch-all). Reply ONLY with a JSON object.";
+  const user1 = "Field: " + String(rec.label || rec.fieldName || "")
+    + "\nCategories (choose exactly one; reply with its EXACT text): " + JSON.stringify(cats)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact category text>\",\"confidence\":\"High|Medium|Low\"}";
+  const r1 = await act.llm({ system: sys1, user: user1, maxTokens: 256 });
+  if (!r1 || !r1.ok) return fail("ai-call-failed", "low", "AI tree category call failed — " + ((r1 && r1.error) || "no reply"));
+  const cReply = parseAiTreeReply(r1.text);
+  const cm = apMatch.matchCandidates([cReply.choice], cats);
+  const category = cm.targetIndex !== -1 ? cats[cm.targetIndex] : nearestOption(cReply.choice, cats);
+  if (!category) return fail("ai-nomatch", cReply.confidence, "AI category \"" + cReply.choice + "\" matched no category");
+
+  // ── DRILL — expand the category, poll until the list flips to its leaves ──
+  if (!(await act.expandCategory(loc, category))) return fail("ai-commit-failed", cReply.confidence, "could not expand category \"" + category + "\"", { tree_structure: { categories: cats, chosen: category } });
+  let leavesFull = [];
+  const t0 = Date.now();
+  while (Date.now() - t0 < (budgets.taOpenCeilingMs || 4000)) {
+    await act.delay(budgets.taOpenIntervalMs || 120);
+    const stillCats = await act.readTreeCategories(loc);
+    leavesFull = await act.readTreeLeaves(loc);
+    if (!stillCats.length && leavesFull.length) break; // categories replaced by leaves
+  }
+  if (!leavesFull.length) return fail("ai-no-options", cReply.confidence, "category \"" + category + "\" revealed no leaves", { tree_structure: { categories: cats, chosen: category } });
+
+  // strip the " - <Category>" suffix for the prompt; keep clean→full for the commit.
+  const suffix = " - " + category;
+  const cleanToFull = new Map();
+  const cleanLeaves = leavesFull.map((f) => { const c = f.endsWith(suffix) ? f.slice(0, -suffix.length) : f; cleanToFull.set(c, f); return c; });
+  const tree_structure = { categories: cats, chosen: category, leaves: cleanLeaves };
+  const realLeaves = cleanLeaves.filter((o) => !isOtherOption(o));
+  const otherLeaf = cleanLeaves.find(isOtherOption);
+
+  // commit a leaf via clickSourceLeaf (NOT typing) + verify the chip.
+  const commitLeaf = async (cleanPick, flag, confidence, detail) => {
+    const full = cleanToFull.get(cleanPick) || cleanPick;
+    const clicked = await act.clickSourceLeaf(full);
+    if (!clicked) return { status: "needs_review", after: null, verified: false, flag: "ai-commit-failed", confidence, detail: detail + " — leaf click failed (\"" + full + "\")", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
+    await act.delayFull(budgets.commitIntervalMs);
+    const st = await act.readSource(loc);
+    const chips = (st && st.chips) || [];
+    if (!chips.some((c) => norm(c) === norm(full))) return { status: "needs_review", after: chips.join("; ") || null, verified: false, flag: "ai-commit-failed", confidence, detail: detail + " — leaf commit did not persist", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
+    return { status: "filled_review", after: chips.join("; "), verified: true, matchTier: "tree-leaf", flag, confidence, detail, tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
+  };
+
+  // No real leaves under the category + "Other" → commit "Other" (no 2nd LLM call).
+  if (!realLeaves.length) {
+    if (otherLeaf) return await commitLeaf(otherLeaf, "ai-other-only", "medium", "no real options under \"" + category + "\" → \"Other\"");
+    return fail("ai-no-options", cReply.confidence, "no selectable leaves under \"" + category + "\"", { tree_structure });
+  }
+
+  // ── PROMPT 2 — pick the LEAF (the flat decision tree over THIS category's leaves) ──
+  const sys2 = "You are picking the exact option for a job-application field, from the options under the category \"" + category + "\". Given the applicant's profile and the option list, return the SINGLE option that best represents the applicant. ALSO judge representation: represented=true if an option genuinely matches the applicant's answer (incl. a clear parent/child/sibling), false if it's only the nearest approximation. Copy the option's text EXACTLY. Reply ONLY with a JSON object.";
+  const user2 = "Field: " + String(rec.label || rec.fieldName || "") + "  (category: " + category + ")"
+    + "\nOptions (choose exactly one; reply with its EXACT text): " + JSON.stringify(realLeaves)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"represented\":true|false,\"confidence\":\"High|Medium|Low\"}";
+  const r2 = await act.llm({ system: sys2, user: user2, maxTokens: 512 });
+  if (!r2 || !r2.ok) return fail("ai-call-failed", "low", "AI tree leaf call failed — " + ((r2 && r2.error) || "no reply"), { tree_structure });
+  const lReply = parseAiTypeaheadReply(r2.text);
+  const lm = apMatch.matchCandidates([lReply.choice], realLeaves);
+  const resolved = lm.targetIndex !== -1 ? realLeaves[lm.targetIndex] : null;
+  if (lReply.represented && resolved) return await commitLeaf(resolved, "ai-choice", lReply.confidence, "AI tree: " + category + " → \"" + resolved + "\" (genuinely represented)");
+  if (otherLeaf) return await commitLeaf(otherLeaf, "ai-choice-other", lReply.confidence, "AI tree: applicant's answer isn't under \"" + category + "\"" + (resolved ? " (nearest: \"" + resolved + "\")" : "") + " → \"Other\"");
+  if (required) { const forced = resolved || nearestOption(lReply.choice, realLeaves); return await commitLeaf(forced, "ai-closest-forced", lReply.confidence, "AI tree FORCED closest \"" + forced + "\" under \"" + category + "\" (no \"Other\", REQUIRED) — VERIFY"); }
+  return { status: "needs_review", after: null, verified: false, flag: "ai-typeahead-decline", confidence: lReply.confidence, detail: "AI tree: no represented leaf under \"" + category + "\" + no \"Other\" (optional) — left for review", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
 };
 
 // The AI typeahead pass: rescue every GENUINE no-match flat typeahead in `results` via the LLM.
@@ -2297,10 +2412,10 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
               if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { scrapedOptions = sc.options.slice(); return scrapedOptions; }
               return null;
             } : undefined;
-            // Inline AI rescue context (Option B) — pass for AI-eligible typeaheads ONLY: NOT the cert section
-            // (a Magna TREE mis-tagged "typeahead"; excluded by section name — the structural isTreePicker
-            // can't run on the open field). EEO allowed (re-tagged ai-eeo-guess inside fillTypeaheadCdp).
-            const aiForField = (aiCtx && sectionName !== "certification")
+            // Inline AI rescue context (Option B) — passed for ALL section typeaheads now (incl. the cert
+            // TREE). tryInlineAi decides tree-vs-flat structurally (category rows on the open field) → the
+            // two-prompt drill for cert, the flat single-prompt for FoS. EEO allowed (re-tagged inside).
+            const aiForField = aiCtx
               ? { profile: aiCtx.profile, jobContext: aiCtx.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired }
               : undefined;
             Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture, ai: aiForField }));
@@ -2409,13 +2524,19 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // didn't take / typeahead focus-unconfirmable) is NOT invalid data → KEEP + surface
     // (needs_review), NEVER silently destroy valid data (the live English/Chinese loss when the
     // language dropdown failed to render deep in a long fold).
-    // Delete-vs-AI DEFER: if AI is ON and EVERY failed required pick is an AI-rescuable typeahead
-    // (aiTypeaheadEligible — the AI pass runs AFTER this section, in drivePageFill), DON'T delete the
-    // entry — let the AI rescue it (a committed value, or an honest needs_review the operator fixes).
-    // Cert is name-belted (aiTypeaheadEligible false) ⇒ still deletes; Languages is a dropdown ⇒ still
-    // deletes. Dormant today (no AI-eligible typeahead lives in a deleteOnNoMatch section); unit-pinned.
-    const aiWillRescue = !!act.aiEnabled && failedRequired.length > 0 && failedRequired.every(aiTypeaheadEligible);
-    const deletable = !aiWillRescue && failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true);
+    // Step 2.5 — an AI-rescued REQUIRED pick is KEPT only if it's CONFIDENT + genuinely represented
+    // (ai-choice, high/medium). Anything shakier — low-confidence, ai-closest-forced (forced a value the
+    // applicant didn't claim), ai-choice-other ("Other" fallback), ai-typeahead-decline, ai-commit-failed
+    // — is UNCONFIDENT: in a deleteOnNoMatch (optional) section a shaky entry is worse than none → DELETE
+    // it (operator rule). The AI is INLINE now (it already ran in fillEntryCdp), so there is no end-of-page
+    // defer (the old aiWillRescue). `deletable` is acted on ONLY by the deleteOnNoMatch sweep below, so a
+    // non-deletable section (education/FoS) keeps + flags regardless.
+    const isAiRec = (r) => r.flag && String(r.flag).indexOf("ai-") === 0;
+    const aiConfidentKeep = (r) => r.flag === "ai-choice" && (r.confidence === "high" || r.confidence === "medium");
+    const aiUnconfident = entryRecs.some((r) => r.isRequired && isAiRec(r) && !aiConfidentKeep(r));
+    const deletable =
+      (failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true)) // deterministic genuine no-match (AI off / not eligible)
+      || aiUnconfident;                                                                       // an unconfident AI pick (optional section only — sweep-gated)
     perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
   }
 
@@ -2866,6 +2987,7 @@ function buildReviewBundle(results, meta) {
       flag: rec.flag != null ? rec.flag : null, // PROVENANCE (was dropped) — the viewer badges "AI-INFERRED" off flag.startsWith("ai-")
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
+      tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       character_count: null
     };
   });
@@ -2899,5 +3021,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback };
 }

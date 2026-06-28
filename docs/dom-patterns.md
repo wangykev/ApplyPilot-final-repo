@@ -1725,3 +1725,38 @@ need its phrase added.
 
 **Status:** LIVE-RECONNED (the dump above) + detector wired + unit-pinned. The end-to-end "walk halts
 workday-maintenance" path is naturally only exercisable while Workday is actually down.
+
+## 2026-06-27 — Containment matching is AMBIGUITY-SAFE (the "United States → Virgin Islands" first-wins hazard)
+
+**Why:** the match ladder's containment tier (`matchCandidates`, lib.js Tier 2) used `findIndex` — it
+committed the **FIRST** option that `startsWith`/`includes` the candidate, with NO ambiguity check. So a
+generic value like `"United States"` silently committed whichever of `"United States of America"` /
+`"United States Virgin Islands"` the tenant listed first — an arbitrary, possibly-WRONG commit (the worst
+failure for an accuracy tool). Operator caught it off a cert that filled via `directed-containment` and asked
+to stop the guess-among-ambiguous. A unit test (`fill-driver.test.js` directed-containment) had even baked
+the hazard in as "expected" — `"United States"` + two containing options asserted commit index 0, "lucky"
+that `of America` was first.
+
+**Fix (LOCKSTEP, both copies — lib.js + the inline `fillEngine` copy in background.js):** containment commits
+ONLY when **exactly one** option contains the candidate. Per candidate: count `startsWith` matches → if 1,
+commit; if **>1, ambiguous → skip this candidate** (try the next, more-specific one); if 0, count `includes`
+→ 1 commits, 0-or-2+ skips. All candidates exhausted → fall to fuzzy → escalate (`targetIndex -1`).
+
+**Why this is the whole fix:** every `matchCandidates` consumer already escalates on `-1` — dropdown →
+needs_review, typeahead directed (`fillTypeaheadCdp`) → `continue` → genuineNoMatch → AI/needs_review, source
+→ `continue`, AI guards → ai-commit-failed. So ambiguous→-1 flows through the existing safe paths; no other
+code changed. `commitOutcome`/`flagTierCategory`/`deriveConfidence` untouched (the `"containment"` tier still
+exists, just fires only when unambiguous). The **exact tier (Tier 1) runs first**, so a candidate that IS a
+complete option (`"United States"` exact-matching a `"United States"` option) is unaffected.
+
+**Preserved (unambiguous containment unchanged):** the cert tree-leaf `"Training Instructor - AEVO"` → its
+single suffixed leaf still fills (`directed-containment`/`filled_review`); `"Bachelor"` → `"Bachelors"`;
+single-result autocommits. **Residual (not fixed, documented):** the typeahead AUTOCOMMIT path validates a
+SINGLE committed chip, so ambiguity-among-options can't apply there — but Workday only auto-commits on the
+filter-Enter for a *single* result; multi-result lists stay open → the directed path (covered). The pure
+"Enter auto-commits row 0 of a multi-result list" edge is unaddressed; revisit only if observed live.
+
+**Status:** BUILT + unit-pinned (matching.test.js: ambiguous-prefix→-1, more-specific-disambiguates,
+includes-ambiguity→-1, cert-leaf-unambiguous→fills; fill-driver.test.js: directed-containment flipped to
+escalate-on-ambiguity + a still-commits-when-unambiguous companion). 293 tests green. Live-verify pending
+(cert still fills; a generic-prefix field now escalates).
