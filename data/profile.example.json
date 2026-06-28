@@ -1,6 +1,12 @@
 {
   "schema_version": "2.0",
 
+  "how_did_you_hear": {
+    "preferred": ["LinkedIn", "Handshake", "Campus Recruiting Event", "College / University Recruiting"],
+    "fallback": "Other"
+  },
+  "_how_did_you_hear_note": "Source picker ('How did you hear about us?') candidates, most-preferred first. Profile value WINS over application_defaults.how_did_you_hear (which remains as a shared fallback). On a genuine no-match the AI drills the source tree (category -> leaf) when the AI toggle is on.",
+
   "employment_history_companies": [],
   "_employment_history_companies_note": "INDUSTRY EMPLOYERS ONLY — companies you were formally employed by (on payroll). EXCLUDES academic/university research positions, lab affiliations, and student clubs (e.g. FSU CISCOR lab research, Carnegie Mellon Racing are NOT employment). This list's completeness is what makes the auto-'No' to 'previously employed here?' safe — keep it accurate and complete. NOT derived from work_experience; maintain it by hand. An empty list [] is treated as UNFILLED and will flag every such question for manual review. If you have genuinely never been formally employed in industry, set this to [\"none\"] to auto-answer 'No'. These names are ALSO matched against the QUESTION TEXT itself, which often names the entities that count (affiliates/subsidiaries/predecessors, e.g. \"Elavon, U.S. Bancorp Investments, or Union Bank\") — so list the specific legal-entity names you were employed by, not just a parent brand; a known employer named in the question fills 'Yes' (always flagged for review).",
 

@@ -48,6 +48,7 @@ function makeFakeAct(fields, opts) {
   let openField = null;
   let focusedTa = null;
   let focusedSrc = null;
+  let _llmIdx = 0; // for a SEQUENCE of canned llm replies (aiTreeFallback makes two: category, then leaf)
   const probe = { clearedWhileUnfocused: false }; // observe a focus-blind clear that hit an unfocused box
   const enabledIdxs = (f) => f.options.map((o, i) => ({ o, i })).filter((x) => !x.o.disabled).map((x) => x.i);
 
@@ -60,15 +61,39 @@ function makeFakeAct(fields, opts) {
     aiEnabled: o.aiEnabled === true,
     llm: async (req) => {
       log.push(["llm", req && req.user]);
-      const a = o.ai;
+      // o.ai is a single reply (string/object) OR a SEQUENCE (array) consumed in order — the latter
+      // for aiTreeFallback's two prompts (category, then leaf).
+      const a = Array.isArray(o.ai) ? o.ai[Math.min(_llmIdx++, o.ai.length - 1)] : o.ai;
       if (a === undefined || a === null) return { ok: false, error: "no canned reply" };
       return typeof a === "string" ? { ok: true, text: a } : a;
     },
     // structural tree discriminator (0.4): default FLAT; a field with `isTree: true` is excluded.
     isTreePicker: async (loc) => { log.push(["isTreePicker", loc.wrapperSel]); const f = byLoc(loc); return !!(f && f.isTree); },
-    // tree-vs-flat router for the inline AI (read on the STALE view): category rows visible (a tree on its
-    // no-match fallback) → the field's `treeCategories`; a flat field → [].
-    readTreeCategories: async (loc) => { log.push(["readTreeCategories", loc.wrapperSel]); const f = byLoc(loc); return (f && Array.isArray(f.treeCategories)) ? f.treeCategories.slice() : []; },
+    // tree-vs-flat router + drill for the inline AI (read on the STALE view). A tree field carries
+    // `treeCategories` (visible on its no-match fallback) + `treeLeaves[category]`. readTreeCategories →
+    // [] once a category is expanded (so aiTreeFallback's drill poll breaks); expandCategory drills (sets
+    // _leaves so clickSourceLeaf can commit); readTreeLeaves → the drilled category's leaves.
+    readTreeCategories: async (loc) => { log.push(["readTreeCategories", loc.wrapperSel]); const f = byLoc(loc); if (!f || !Array.isArray(f.treeCategories)) return []; return f._treeExpanded ? [] : f.treeCategories.slice(); },
+    expandCategory: async (loc, label) => {
+      log.push(["expandCategory", label]);
+      const f = byLoc(loc);
+      if (!f || !Array.isArray(f.treeCategories) || !f.treeCategories.includes(label)) return false;
+      f._treeExpanded = label; f._open = true;
+      f._leaves = (f.treeLeaves && f.treeLeaves[label]) ? f.treeLeaves[label].slice() : [];
+      focusedSrc = f;
+      return true;
+    },
+    readTreeLeaves: async (loc) => { const f = byLoc(loc); if (!f) return []; return f._treeExpanded ? (f._leaves || []) : (Array.isArray(f.treeCategories) ? f.treeCategories.slice() : []); },
+    // scroll-accumulate (virtualized): on-open → categories; after a drill → that category's leaves. Returns
+    // the FULL lists (the fake doesn't truncate — it models the post-scroll complete enumeration).
+    scrapeSourceRows: async (loc) => {
+      log.push(["scrapeSourceRows", loc.wrapperSel]);
+      const f = byLoc(loc);
+      if (!f) return { ok: false };
+      // on-open → category labels (banner = no-match); after a drill → that category's leaves (banner = cat name).
+      if (f._treeExpanded) return { ok: true, options: ((f.treeLeaves && f.treeLeaves[f._treeExpanded]) || []).slice(), banner: f._treeExpanded, atBottom: true };
+      return { ok: true, options: Array.isArray(f.treeCategories) ? f.treeCategories.slice() : [], banner: "No matches found", atBottom: true };
+    },
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     scanPage: async () => ({
@@ -1039,7 +1064,7 @@ test("source with NO how_did_you_hear defaults → needs_review, ZERO actuation;
   ]);
   const out = await drivePageFill(act, nameProfile, {}, {}, T_BUDGETS); // defaults = {} → no hdyh
   assert.strictEqual(out.results[0].status, "needs_review");
-  assert.match(out.results[0].detail, /no how_did_you_hear defaults/);
+  assert.match(out.results[0].detail, /no how_did_you_hear value/);
   assert.strictEqual(out.results[1].status, "skipped");
   assert.strictEqual(out.results[1].detail, "no mapping");
   assert.strictEqual(act.log.length, 0, "no-defaults source + unmapped widgets must never be actuated");
@@ -1081,6 +1106,70 @@ test("M30 session warning: source loaded-but-no-match → NO warning (false-posi
   assert.strictEqual(out.results[0].status, "needs_review");
   assert.strictEqual(out.results[0].optionsLoaded, true, "leaves rendered");
   assert.strictEqual(out.sessionWarning, null, "a matching miss is NOT a session warning");
+});
+
+// ── source AI tree drill + profile-driven how_did_you_hear ───────────────────
+
+test("source: profile.how_did_you_hear WINS over defaults (candidate list comes from the profile)", async () => {
+  const act = makeFakeAct([srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } })]);
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["LinkedIn"] } });
+  const defaults = { how_did_you_hear: { preferred: ["Indeed"], fallback: "Other" } };
+  const out = await drivePageFill(act, profile, defaults, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.deepStrictEqual(rec.resolved, ["LinkedIn"], "candidates from PROFILE, not defaults");
+  assert.strictEqual(rec.after, "LinkedIn");
+  assert.strictEqual(rec.status, "filled");
+});
+
+test("source AI: TWO-PROMPT drill — scroll-enumerate categories + leaves, AI picks, commit by TYPING (filled_review/ai-choice)", async () => {
+  // "carrier pidgon" deterministically misses → genuine no-match. tryInlineAiSource: scroll-enumerate the
+  // categories → Prompt 1 picks a category → DRILL it → scroll-enumerate its leaves → Prompt 2 picks a SEEN
+  // leaf ("Other") → commit DIRECTLY on the open field (focus → Ctrl+A+Delete → type "Other" → Enter).
+  const field = srcField({
+    wrapperSel: "[w-src]",
+    filterMap: {
+      "carrier pidgon": { banner: true },  // deterministic no-match → category fallback
+      "Other": { autoCommit: "Other" }      // the typed-commit of the chosen leaf
+    },
+    treeCategories: ["Job Boards", "Social Media", "Other"],
+    treeLeaves: { "Other": ["Newspaper", "Word of Mouth", "Other"] }
+  });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: [
+    '{"choice":"Other","confidence":"Medium"}', // Prompt 1: category
+    '{"choice":"Other","confidence":"Medium"}'  // Prompt 2: leaf
+  ] });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["carrier pidgon"] } });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-choice");
+  assert.strictEqual(rec.after, "Other");
+  assert.ok(rec.tree_structure && rec.tree_structure.chosen === "Other", "tree recon recorded (category + leaves)");
+  assert.ok(act.log.some(([m]) => m === "scrapeSourceRows"), "scroll-enumerated the options");
+  assert.ok(act.log.some(([m]) => m === "expandCategory"), "drilled the chosen category");
+  assert.ok(act.log.some(([m]) => m === "typeInSourceSearch"), "committed by TYPING (focus → Ctrl+A+Delete → type the chosen leaf)");
+});
+
+test("source AI: no categories (nothing to enumerate) → needs_review, no LLM (never guess blind)", async () => {
+  const field = srcField({ wrapperSel: "[w-src]", filterMap: { "carrier pidgon": { banner: true } } }); // no treeCategories
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Other"}' });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["carrier pidgon"] } });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "no categories → bailed before any LLM call");
+});
+
+test("source AI OFF: a no-match with a category view is a byte-identical no-op (needs_review, NO drill, NO LLM)", async () => {
+  const field = srcField({
+    wrapperSel: "[w-src]",
+    filterMap: { "Carrier Pigeon": { filtered: ["Facebook", "Twitter"] } },
+    treeCategories: ["Job Boards"], treeLeaves: { "Job Boards": ["LinkedIn"] }, commitVia: "chip"
+  });
+  const act = makeFakeAct([field], { aiEnabled: false, ai: ['{"choice":"Job Boards"}', '{"choice":"LinkedIn","represented":true}'] });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["Carrier Pigeon"] } });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "AI off → no provider call, no drill");
 });
 
 test("M30 session warning: source commits normally → NO warning", async () => {

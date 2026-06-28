@@ -1090,6 +1090,194 @@ async function cdpScrapeTaOptions(wrapperSel) {
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
 
+// Scroll-accumulate the source promptOption LABELS — a VIRTUALIZED list needs scrolling to enumerate EVERY
+// option. On the on-open / no-match-fallback view these labels are the CATEGORIES; after a drill they're the
+// drilled category's LEAVES (the brain distinguishes by TIMING, not isCategory — the source chevron lives on
+// the sibling [role=option] menuItem, NOT the promptOption, so isCategory-on-promptOption is always false).
+// Reads data-automation-id="promptOption" — NOT role="option" (source's role=option is the TRUNCATED menuItem
+// dup; cdpScrapeTaOptions is for the flat FoS typeahead). Also returns `banner` = the current promptTitle text
+// ("No matches found" on the fallback; the CLICKED CATEGORY NAME once drilled — the drill-confirmation signal).
+// Mirrors cdpScrapeTaOptions's scroll loop; resets scrollTop to 0 at the end so early rows are mounted for a
+// subsequent category click. Async — awaited via cdpEval.
+async function cdpScrapeSourceRows(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const leafLabel = (el) => el.getAttribute("data-automation-label") || (el.textContent || "").trim();
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, error: "no wrapper" };
+  const optSel = '[data-automation-id="promptOption"]';
+  const curOpts = () => Array.from(document.querySelectorAll(optSel))
+    .filter((el) => isVisible(el) && !el.closest('[data-automation-id="selectedItemList"]'));
+  const findScroller = () => {
+    let el = curOpts()[0];
+    for (let i = 0; i < 8 && el; i++) {
+      const cs = window.getComputedStyle(el);
+      if (el.scrollHeight > el.clientHeight + 4 && /(auto|scroll)/.test(cs.overflowY)) return el;
+      el = el.parentElement;
+    }
+    return null;
+  };
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const seen = new Map(); // label → order (first-seen, de-dupe within ONE view)
+  const collect = () => { for (const o of curOpts()) { const t = leafLabel(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
+  const sc = findScroller();
+  let steps = 0, stable = 0, atBottom = false;
+  const MAX_STEPS = 40;
+  collect();
+  if (sc) {
+    // SLOW, OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window
+    // (overlap, no row skipped) and wait a real ~120ms per step so every window's rows render before collect().
+    const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
+    sc.scrollTop = 0; await frame(); await sleep(120); collect();
+    while (steps < MAX_STEPS) {
+      const before = seen.size;
+      const prevTop = sc.scrollTop;
+      sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
+      await frame(); await sleep(120); collect();
+      steps++;
+      atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
+      const movedNothing = sc.scrollTop === prevTop;
+      if (seen.size === before && (atBottom || movedNothing)) { if (++stable >= 2) break; } else stable = 0;
+    }
+    sc.scrollTop = 0; await frame(); // back to top so early rows are mounted for a subsequent category click
+  }
+  // banner = the current promptTitle text (drill-confirmation: the clicked category name once drilled).
+  let banner = "";
+  for (const el of document.querySelectorAll('[data-automation-id="promptTitle"]')) {
+    if (!isVisible(el)) continue;
+    const t = (el.textContent || "").trim();
+    if (t) { banner = t; break; }
+  }
+  return { ok: true, options: Array.from(seen.keys()), banner, count: seen.size, steps, atBottom };
+}
+
+// READ-ONLY recon (source-AI debug): dump every visible element whose label matches `label`, across the
+// source rows (role=option / treeitem / promptOption), with the attrs that decide HOW to click a category —
+// is it a drillable role=option (chevron / aria-expanded) or only a promptOption label? Tells us why
+// expandCategory (role=option-only) missed it on the no-match fallback view.
+function cdpSourceRowProbe(label) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  const want = norm(label);
+  const out = [];
+  for (const el of document.querySelectorAll('[role="option"],[role="treeitem"],[data-automation-id="promptOption"]')) {
+    const txt = norm(el.textContent), dal = norm(el.getAttribute("data-automation-label"));
+    if (!(txt === want || txt.indexOf(want) === 0 || dal === want)) continue;
+    const r = el.getBoundingClientRect();
+    out.push({
+      tag: el.tagName, role: el.getAttribute("role"), automationId: el.getAttribute("data-automation-id"),
+      dataLabel: el.getAttribute("data-automation-label"), text: (el.textContent || "").trim().slice(0, 50),
+      ariaExpanded: el.getAttribute("aria-expanded"), ariaHaspopup: el.getAttribute("aria-haspopup"),
+      hasChevron: !!el.querySelector('svg, [data-automation-id*="chevron" i], [class*="chevron" i]'),
+      visible: isVisible(el), rectW: Math.round(r.width), rectH: Math.round(r.height),
+      inSelectedList: !!el.closest('[data-automation-id="selectedItemList"]')
+    });
+    if (out.length >= 12) break;
+  }
+  return { want, count: out.length, matches: out };
+}
+
+// Scroll-to-FIND a source category/row by label in the react-virtualized listbox (only ~10 rows mounted; NO
+// snap-back — live browser-diag 2026-06-28), and return the rect of its **promptLeafNode** — the node that
+// carries the onClick/DRILL handler. NOT `menuItem`/role=option (handlers: mouseover/contextmenu, NO onClick)
+// and NOT `promptOption` (text only, no handlers). The caller TRUSTED-clicks that rect. CRITICAL ORDER:
+// scroll the container → **SETTLE ~350ms** (let react-virtualized finish recycling so the mounted rows are
+// STABLE) → **RE-QUERY fresh** → read the LIVE rect. Do NOT `scrollIntoView` — it fires another onScroll →
+// the row recycles → the rect points at a detached node (the live "click misses / doesn't drill"). Match the
+// promptOption's label (data-automation-label / textContent), excluding selectedItemList chips. Async.
+async function cdpSourceRowRect(label) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  const want = norm(label);
+  // The deepest LABEL node (promptOption); the drill handler is on its promptLeafNode ancestor.
+  const matchPO = () => Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+    .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'))
+    .find((o) => { const t = norm(o.textContent), d = norm(o.getAttribute("data-automation-label")); return t === want || t.indexOf(want) === 0 || d === want; });
+  const leafOf = (po) => (po && (po.closest('[data-automation-id="promptLeafNode"]') || po)) || null;
+  const findScroller = () => {
+    // From a DROPDOWN promptOption (identical to cdpScrapeSourceRows's curOpts), excluding selectedItemList —
+    // a committed chip embeds a promptOption FIRST in document order; without the exclusion findScroller
+    // started from the chip's (non-scrollable) subtree → null → never scrolled (live scrollerFound:false).
+    let el = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]')).filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'))[0];
+    for (let i = 0; i < 8 && el; i++) {
+      const cs = window.getComputedStyle(el);
+      if (el.scrollHeight > el.clientHeight + 4 && /(auto|scroll)/.test(cs.overflowY)) return el;
+      el = el.parentElement;
+    }
+    return null;
+  };
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Is the leaf's center inside the CLICKABLE viewport AND not occluded? CDP's Input.dispatchMouseEvent uses
+  // VIEWPORT coords, so a row with cy > innerHeight is unclickable even when it's mounted + "visible" + inside
+  // the inner scroller's own band — the dropdown panel extends past the fold (live browser-diag 2026-06-28).
+  const inClickableViewport = (leaf) => {
+    const rr = leaf.getBoundingClientRect();
+    const cx = rr.x + rr.width / 2, cy = rr.y + rr.height / 2;
+    if (cy < 0 || cy > window.innerHeight || cx < 0 || cx > window.innerWidth) return false;
+    const hit = document.elementFromPoint(Math.round(cx), Math.round(cy));
+    return !!(hit && hit.closest('[data-automation-id="promptLeafNode"]') === leaf);
+  };
+  // 1. Find the target promptOption. react-virtualized usually MOUNTS it (clipped below the fold) so matchPO
+  //    finds it immediately; only if truly unmounted does a small bounded inner-list scroll mount it.
+  let po = matchPO();
+  if (!po) {
+    const sc = findScroller();
+    if (sc) {
+      const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
+      sc.scrollTop = 0; await frame(); await sleep(120); po = matchPO();
+      for (let i = 0; !po && i < 20; i++) {
+        const prev = sc.scrollTop;
+        sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
+        await frame(); await sleep(120); po = matchPO();
+        if (sc.scrollTop === prev) break; // bottom
+      }
+    }
+  }
+  if (!po) {
+    const sampleLabels = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+      .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'))
+      .slice(0, 20).map((o) => o.getAttribute("data-automation-label") || (o.textContent || "").trim());
+    return { found: false, reason: "no-match", sampleLabels };
+  }
+  // 2. Bring the leaf's center INTO the clickable viewport. scrollIntoView scrolls the page + ancestors (the
+  //    panel reaches below innerHeight, so the inner scroll alone can't put it on-screen). Re-query after each
+  //    settle (scroll recycles the virtualized rows); validate with elementFromPoint before trusting the rect.
+  //    One-shot scrollIntoView converges in 1–2 iters — NOT a 40×150ms loop (that risks the eval timeout).
+  let leaf = leafOf(po);
+  for (let i = 0; i < 12 && leaf && !inClickableViewport(leaf); i++) {
+    leaf.scrollIntoView({ block: "center", behavior: "instant" });
+    await frame(); await sleep(150);
+    po = matchPO(); leaf = leafOf(po);
+  }
+  if (!leaf) return { found: false, reason: "recycled" };
+  if (!inClickableViewport(leaf)) {
+    const r0 = leaf.getBoundingClientRect();
+    return { found: false, reason: "off-viewport", cy: Math.round(r0.y + r0.height / 2), innerHeight: window.innerHeight };
+  }
+  const r = leaf.getBoundingClientRect();
+  return { found: true, automationId: leaf.getAttribute("data-automation-id"), tag: leaf.tagName, role: leaf.getAttribute("role"),
+    rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) } };
+}
+
 // scrollIntoView + fresh rect of the VISIBLE [role="option"] whose trimmed text
 // equals `text` (chip lists excluded — same scrape rules as cdpReadTaState's
 // page-wide scope). Text-keyed, not index-keyed.
@@ -1540,14 +1728,30 @@ function makeCdpActuation(llmConfig) {
       const d = await cdpEval(cdpReadSourcePick, loc.wrapperSel);
       return (d && Array.isArray(d.leaves)) ? d.leaves.slice() : [];
     },
+    // Scroll-accumulate the source rows (VIRTUALIZED) → { categories, leaves }. Used by the source AI to
+    // enumerate EVERY category (on open) and EVERY leaf (after a drill), so the AI never picks from a
+    // partial, on-screen-only list. Read-only (scrolls + reads; resets scrollTop to 0).
+    scrapeSourceRows: async (loc) => {
+      const r = await cdpEval(cdpScrapeSourceRows, loc.wrapperSel);
+      console.log("[ApplyPilot][CDP-SRC-SCRAPE]", loc.wrapperSel, r && r.ok ? (r.options.length + " options, banner=" + JSON.stringify(r.banner) + (r.atBottom ? " (bottom)" : "")) : "FAILED");
+      return r;
+    },
     // Click a category to expand/drill it (NON-committing — recon-proven). Returns whether the click fired;
     // the caller polls readTreeCategories/readTreeLeaves until the list flips to the leaves.
     expandCategory: async (loc, label) => {
-      const cr = await cdpEval(cdpSourceCategoryRect, label);
-      if (!cr || !cr.found || !cr.rect || cr.rect.w <= 0) return false;
-      await cdpClickAt(cr.rect.cx, cr.rect.cy);
+      // Scroll-to-find the category's promptLeafNode (the drill handler) with cdpSourceRowRect (which SETTLES
+      // before reading the live rect — react-virtualized recycles during scroll), then TRUSTED-click its
+      // freshly-read center. No scrollIntoView / no synthetic click (browser-diag 2026-06-28). The list is
+      // idle when the rect is read, so it doesn't recycle out from under this click.
+      const rr = await cdpEval(cdpSourceRowRect, label);
+      if (!rr || !rr.found || !rr.rect || rr.rect.w <= 0) return false;
+      await cdpClickAt(rr.rect.cx, rr.rect.cy);
       return true;
     },
+    // READ-ONLY recon for the source-AI debug harness — see cdpSourceRowProbe / cdpSourceRowRect.
+    sourceRowProbe: async (label) => cdpEval(cdpSourceRowProbe, label),
+    sourceRowRect: async (label) => cdpEval(cdpSourceRowRect, label),
+    clickAt: async (x, y) => cdpClickAt(x, y), // trusted coordinate click (debug: click a rect from sourceRowRect)
 
     // ── structural tree-vs-flat discriminator (0.4) — EXCLUDE tree pickers from the AI typeahead
     // fallback. A "typeahead"-classified field whose opened popup shows CATEGORY rows (chevron svg /

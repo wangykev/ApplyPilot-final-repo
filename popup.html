@@ -48,6 +48,10 @@
          operator input-lock OFF, so a lock run can be compared field-by-field to confirm the
          lock's gating drops/corrupts nothing (no self-block). [CDP-PAGE]. -->
     <button id="cdp-fill-page-nolock">CDP fill FULL PAGE — NO input-lock (baseline)</button>
+    <!-- FULL source AI (isolated to the "How did you hear about us?" field): deterministic fill → AI picks the
+         CATEGORY → DRILL → scroll-enumerate the leaves → AI picks the leaf → typed commit. Verbose
+         [CDP-SRC-DEBUG] log. AI toggle must be ON; keep the tab VISIBLE to watch. -->
+    <button id="cdp-source-ai-debug">Source AI (isolated): det → category → drill → leaf → commit</button>
     <!-- RE-AUDIT (M40): re-read the live page vs the last full-page fill's recorded values
          + report any field that no longer matches. The independent backstop for the
          false-verify class. To TEST it: fill, then manually change a committed field on the

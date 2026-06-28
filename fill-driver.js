@@ -1525,7 +1525,8 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
 //     `multiselectlistitem-isselected==="true"` (act.probeSourceLeaf) OR a
 //     selectedItem chip normalize-matching the candidate;
 //   • categories shown on open are bypassed — typing filters straight to leaves.
-const fillSourceCdp = async (act, loc, candidates, budgets) => {
+const fillSourceCdp = async (act, loc, candidates, budgets, opts) => {
+  opts = opts || {};
   const norm = apMatch.normalize;
   const pre = await act.readSource(loc);
   if (!pre) return { status: "error", detail: "source wrapper not found" };
@@ -1701,9 +1702,127 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
     step.note = "matched leaf but commit did not verify (no isselected flip / chip)";
   }
 
+  // INLINE AI RESCUE (source) — TWO-PROMPT DRILL (scroll-enumerate) + TYPED commit. The DOM facts
+  // (operator): typing does NOT drill — it filters the WHOLE tree and a UNIQUE match autocommits; clicking a
+  // category chevron drills it to reveal its leaves; lists are VIRTUALIZED (scroll to see every option); the
+  // same label can sit in multiple trees (e.g. two "Other") so a typed filter shows >1 → commit the TOP. So:
+  // (1) scroll-enumerate ALL categories → AI picks one; (2) DRILL it → scroll-enumerate ALL its leaves → AI
+  // picks a SEEN leaf; (3) commit by TYPING that leaf via the PROVEN path (re-enter fillSourceCdp([leaf]) — no
+  // opts.ai → no recursion — whose commit ladder autocommits a unique match or clicks the top of a tie). The
+  // AI only ever types a leaf it actually SAW (no blind guessing). Cert keeps the click-in-drilled-view drill
+  // (aiTreeFallback); source can't use that because its drilled "Other" is the CATEGORY, which re-drills.
+  const tryInlineAiSource = async () => {
+    if (!(opts.ai && act.aiEnabled)) return null;
+    const profile = opts.ai.profile, jobContext = opts.ai.jobContext;
+    const label = String(opts.ai.label || opts.ai.fieldName || "How did you hear about us?");
+    const eeo = isEeoField({ widgetType: "hierarchical", fieldName: opts.ai.fieldName, label });
+    const fail = (flag, confidence, detail, extra) => Object.assign({ status: "needs_review", after: null, verified: false, flag, confidence, detail, auditLoc: loc.wrapperSel }, extra || {});
+
+    // (1) Settle, then enumerate ALL categories (scroll-accumulate). On the no-match fallback the category
+    //     LABELS render as promptOptions → scrapeSourceRows returns them in `options`. No isCategory split
+    //     (the chevron isn't on the promptOption), and NO reopen (the no-match already shows them).
+    const norm = apMatch.normalize;
+    await act.delayFull(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner)
+    let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
+    const categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
+    if (!categories.length) return null; // no options visible → caller's needs_review (never guess blind)
+
+    // PROMPT 1 — pick the CATEGORY.
+    const sys1 = "You are answering 'How did you hear about us?' on a job application. The options are grouped into CATEGORIES. Choose the SINGLE category most likely to CONTAIN the applicant's answer. Reply ONLY with a JSON object.";
+    const user1 = "Field: " + label
+      + "\nCategories (choose exactly one; reply with its EXACT text): " + JSON.stringify(categories)
+      + "\nApplicant profile: " + JSON.stringify(profile) + "\nJob context: " + JSON.stringify(jobContext || {})
+      + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact category text>\",\"confidence\":\"High|Medium|Low\"}";
+    const r1 = await act.llm({ system: sys1, user: user1, maxTokens: 256 });
+    if (!r1 || !r1.ok) return fail("ai-call-failed", "low", "AI source category call failed — " + ((r1 && r1.error) || "no reply"), { options: categories });
+    const cReply = parseAiTreeReply(r1.text);
+    const cm = apMatch.matchCandidates([cReply.choice], categories);
+    const category = cm.targetIndex !== -1 ? categories[cm.targetIndex] : nearestOption(cReply.choice, categories);
+    if (!category) return fail("ai-nomatch", cReply.confidence, "AI source category \"" + cReply.choice + "\" matched no category", { options: categories });
+
+    // DEBUG isolation (operator harness): BEFORE the production drill — dump the category element (recon) +
+    // test which click drills (role=option via expandCategory, else the promptOption via clickSourceLeaf) +
+    // read the post-click state (banner/options = drilled? chips = committed?), then STOP. Flag-gated →
+    // production path unaffected.
+    if (opts.ai.debugStopAfterCategory) {
+      // Scroll-to-find ONCE (slow), then click its rect — same as expandCategory but a single scroll (no
+      // double-scroll thrash). category_dom shows what was found; clicked = the click fired on a real rect.
+      const category_dom = act.sourceRowRect ? await act.sourceRowRect(category) : null; // scroll+settle → promptLeafNode rect
+      let clicked = false;
+      if (category_dom && category_dom.found && category_dom.rect && category_dom.rect.w > 0 && act.clickAt) {
+        await act.clickAt(category_dom.rect.cx, category_dom.rect.cy); clicked = true; // TRUSTED click on the leaf's live center
+      }
+      await act.delayFull(budgets.commitIntervalMs);
+      let post = null, chips = null;
+      try { post = await act.scrapeSourceRows(loc); } catch (e) {}
+      try { const s = await act.readSource(loc); chips = (s && s.chips) || []; } catch (e) {}
+      return { status: "skipped", flag: "ai-source-debug", verified: null, after: null,
+        detail: "DEBUG: no-match → AI category \"" + category + "\" → click(" + (clicked ? "ok" : "FAILED") + "); stopped (no leaf/commit)",
+        debug: { categories, ai_category_reply: cReply.choice, ai_confidence: cReply.confidence, chosen_category: category, category_dom, clicked, post_click: { banner: (post && post.banner) || null, options: (post && post.options) || [] }, chips },
+        tree_structure: { categories, chosen: category, leaves: (post && post.options) || [] }, auditLoc: loc.wrapperSel };
+    }
+    // (2) DRILL the category; wait until the BANNER == the chosen category (drill confirmed — the operator's
+    //     reliable signal) and the leaves are stable (2 equal scrapes). Banner-match primary; "options flipped
+    //     from the category list" is the fallback for a tenant that shows no drilled-category banner.
+    if (!(await act.expandCategory(loc, category))) return fail("ai-commit-failed", cReply.confidence, "could not drill category \"" + category + "\"", { tree_structure: { categories, chosen: category } });
+    const wantBanner = norm(category), catSig = categories.join("|");
+    let leaves = [], prevSig = "";
+    const t0 = Date.now();
+    while (Date.now() - t0 < (budgets.taOpenCeilingMs || 5000)) {
+      await act.delay(budgets.taOpenIntervalMs || 120);
+      let s = null; try { s = await act.scrapeSourceRows(loc); } catch (e) {}
+      if (!s || !s.ok || !s.options.length) continue;
+      const bannerHit = !!(s.banner && norm(s.banner).indexOf(wantBanner) !== -1); // the drilled-category banner
+      const flipped = s.options.join("|") !== catSig;                              // list replaced by leaves
+      if (!bannerHit && !flipped) continue;                                        // still on the category view
+      const sig = s.options.join("|");
+      leaves = s.options;
+      if (sig === prevSig) break;  // stable (2 equal reads)
+      prevSig = sig;
+    }
+    if (!leaves.length) return fail("ai-no-options", cReply.confidence, "category \"" + category + "\" revealed no leaves (no drill banner / list never flipped)", { tree_structure: { categories, chosen: category } });
+
+    // PROMPT 2 — pick the LEAF (the full scrolled list).
+    const tree_structure = { categories, chosen: category, leaves };
+    const sys2 = "You are picking the exact source under the category \"" + category + "\" for 'How did you hear about us?'. Choose the SINGLE option that best fits the applicant; prefer \"Other\" when nothing else fits. Reply ONLY with a JSON object.";
+    const user2 = "Field: " + label + "  (category: " + category + ")"
+      + "\nOptions (choose exactly one; reply with its EXACT text): " + JSON.stringify(leaves)
+      + "\nApplicant profile: " + JSON.stringify(profile) + "\nJob context: " + JSON.stringify(jobContext || {})
+      + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
+    const r2 = await act.llm({ system: sys2, user: user2, maxTokens: 256 });
+    if (!r2 || !r2.ok) return fail("ai-call-failed", "low", "AI source leaf call failed — " + ((r2 && r2.error) || "no reply"), { tree_structure, options: leaves });
+    const lReply = parseAiTreeReply(r2.text);
+    const lm = apMatch.matchCandidates([lReply.choice], leaves);
+    const leaf = lm.targetIndex !== -1 ? leaves[lm.targetIndex] : nearestOption(lReply.choice, leaves);
+    if (!leaf) return fail("ai-nomatch", lReply.confidence, "AI source leaf \"" + lReply.choice + "\" matched no option", { tree_structure, options: leaves });
+
+    // (3) COMMIT the SEEN leaf (operator recipe, 2026-06-28) — directly on the open drilled field, NO settle-wait /
+    //     second focus (live-confirmed a single focus → clear → type lands the value):
+    //       (a) FOCUS the search;
+    //       (d) Ctrl+A + Delete to clear the leftover no-match query ("carrier pidgon");
+    //       (e) TYPE the actual match → Enter filters → unique → autocommit; a multi-tree tie → click the TOP.
+    try { await act.focusSourceSearch(loc); } catch (e) {}                                    // (a)
+    await act.clearSourceSearch();                                                            // (d) Ctrl+A + Delete
+    await pollSearchValue(act, () => act.readSource(loc), "", budgets);
+    await act.typeInSourceSearch(leaf);                                                       // (e) type the match
+    await pollSearchValue(act, () => act.readSource(loc), leaf, budgets);
+    await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
+    let cr = null; try { cr = await act.readSource(loc); } catch (e) {}
+    if (!(cr && (cr.chips || []).some((c) => norm(c) === norm(leaf)))) {                       // not auto-committed → click the TOP match
+      try { await act.clickSourceLeaf(leaf); } catch (e) { /* filter-Enter-only tenant */ }
+      await act.delayFull(budgets.commitIntervalMs);
+      try { cr = await act.readSource(loc); } catch (e) {}
+    }
+    const committedChips = (cr && cr.chips) || [];
+    if (!committedChips.some((c) => norm(c) === norm(leaf))) return fail("ai-commit-failed", lReply.confidence, "AI source: typed-commit of \"" + leaf + "\" did not persist (chips: " + JSON.stringify(committedChips) + ")", { tree_structure, options: leaves });
+    return { status: "filled_review", after: committedChips.join("; "), verified: true, matchTier: "ai-source-tree", flag: eeo ? "ai-eeo-guess" : "ai-choice", confidence: lReply.confidence, detail: "AI source: " + category + " → typed \"" + leaf + "\" (drilled + scroll-enumerated; focus→settle→focus→clear→type commit)", options: leaves, tree_structure, auditLoc: loc.wrapperSel };
+  };
+
   // Walk exhausted. Under OVERWRITE the original source chip is intact: rest the
   // field clean ({chips:[original], query:""}) and flag for review (lockstep).
   if (isOverwrite) {
+    const aiR = await tryInlineAiSource();
+    if (aiR) return aiR;
     return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0,
       // recommitFn (source): re-select `value` via the source commit machinery (clickSourceLeaf).
       async (value) => {
@@ -1718,6 +1837,11 @@ const fillSourceCdp = async (act, loc, candidates, budgets) => {
         return r ? (r.chips || []) : [];
       });
   }
+  // Empty-field genuine no-match: try the AI tree drill on the OPEN field BEFORE the Tab-exit (lockstep
+  // with the typeahead's empty-field branch). null ⇒ AI off / no context / not a category view ⇒ the Tab
+  // honesty read runs unchanged.
+  const aiR = await tryInlineAiSource();
+  if (aiR) return aiR;
   // Tab-blur exit (the only clean non-committing exit — lockstep with typeahead; Escape kept
   // focus + the armed row so the next field's focus blur-committed the stray).
   await tabBlurExit(act, loc, (l) => act.readSource(l));
@@ -2029,19 +2153,25 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
 
     try {
       if (f.widgetType === "hierarchical") {
-        // Source ("How did you hear about us?") — candidates come from
-        // application_defaults.how_did_you_hear (NOT the profile), mirroring the
-        // in-tree fillEngine. The Magna SEARCH shape is handled by fillSourceCdp;
-        // the tree/expand-walk shape (no searchBox) is still deferred.
-        const hdyh = defaults && defaults.how_did_you_hear;
+        // Source ("How did you hear about us?") — candidates: profile.how_did_you_hear
+        // WINS, falling back to application_defaults.how_did_you_hear (the value is now
+        // profile-driven, not policy-only). The Magna SEARCH shape is handled by
+        // fillSourceCdp; on a genuine no-match the AI drills the source TREE
+        // (tryInlineAiSource → aiTreeFallback) when AI is on.
+        const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
         if (!hdyh || !Array.isArray(hdyh.preferred)) {
           record.status = "needs_review";
-          record.detail = "no how_did_you_hear defaults loaded";
+          record.detail = "no how_did_you_hear value (profile or defaults)";
         } else {
           const candidates = [...hdyh.preferred];
           if (hdyh.fallback) candidates.push(hdyh.fallback);
           record.resolved = candidates;
-          Object.assign(record, await fillSourceCdp(act, loc, candidates, budgets));
+          // Inline AI rescue context (mirrors the typeahead's aiForField): on no-match
+          // the source tree is drilled by aiTreeFallback. Only when AI is toggled on.
+          const aiForSource = act.aiEnabled
+            ? { profile, jobContext, isRequired: f.isRequired, label: f.label, fieldName: f.fieldName }
+            : undefined;
+          Object.assign(record, await fillSourceCdp(act, loc, candidates, budgets, { ai: aiForSource }));
         }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every

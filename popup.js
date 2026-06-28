@@ -148,6 +148,22 @@ document.getElementById("cdp-fill-page-nolock").addEventListener("click", () => 
   });
 });
 
+document.getElementById("cdp-source-ai-debug").addEventListener("click", () => {
+  setStatus('Source AI (isolated)… deterministic fill → AI category → drill → AI leaf → typed commit. Open the source page, enable AI, keep the tab VISIBLE. See [CDP-SRC-DEBUG] in the service worker console.');
+  chrome.runtime.sendMessage({ type: "RUN_CDP_SOURCE_AI_DEBUG" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false && resp.error === "no-profile") {
+      setStatus('No profile in storage — click "Load default profile" first.');
+    } else if (resp.ok === false && resp.error === "ai-off") {
+      setStatus("AI toggle is OFF — enable AI (provider/model/key + toggle), then rerun.");
+    } else if (resp.ok === false) {
+      setStatus("Source AI failed: " + resp.error + " — see [CDP-SRC-DEBUG].");
+    } else {
+      setStatus(`Source AI: ${resp.status}${resp.after ? ' → "' + resp.after + '"' : ""}${resp.flag ? " (" + resp.flag + ")" : ""}. See [CDP-SRC-DEBUG].`);
+    }
+  });
+});
+
 document.getElementById("cdp-audit").addEventListener("click", () => {
   setStatus("CDP re-audit… re-reading the live page vs the last fill. See [CDP-AUDIT] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_AUDIT" }, (resp) => {

@@ -270,6 +270,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // DEBUG: "How did you hear" — deterministic fill → AI picks the best CATEGORY → click it → STOP.
+  if (message.type === "RUN_CDP_SOURCE_AI_DEBUG") {
+    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-SRC-DEBUG] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpSourceAiDebug(tab.id, profile, defaults, jobContext);
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // AI-4 TEST HARNESS: fill the page, deliberately clear a required field, then watch AI-4 remediate.
   if (message.type === "RUN_CDP_TEST_REMEDIATION") {
     chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
@@ -2364,6 +2382,42 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — stuck-lock is the worst operator failure
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// DEBUG HARNESS — "How did you hear about us?" ISOLATED to the first half: deterministic fill →
+// AI picks the best CATEGORY → click (drill) it → STOP. No Prompt-2 / leaf / commit, no other fields.
+// Verbose [CDP-SRC-DEBUG] logging so we can pinpoint where the source AI breaks (scrape / AI pick /
+// category click / drill). Drives fillSourceCdp with `{ai:{debugStopAfterCategory:true}}`; candidates =
+// profile.how_did_you_hear.preferred ONLY (fallback dropped → always no-matches → reaches the AI).
+// ============================================================================
+async function runCdpSourceAiDebug(tabId, profile, defaults, jobContext) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-SRC-DEBUG]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const prepared = prepareProfile(profile);
+    const act = makeCdpActuation(await getLlmConfig());
+    if (!act.aiEnabled) { LOG("AI toggle is OFF — enable AI (provider/model/key + toggle) in the popup, then rerun."); return { ok: false, error: "ai-off" }; }
+    const hdyh = (prepared && prepared.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
+    if (!hdyh || !Array.isArray(hdyh.preferred) || !hdyh.preferred.length) { LOG("no how_did_you_hear.preferred — set it in the profile."); return { ok: false, error: "no-candidates" }; }
+    const candidates = hdyh.preferred.slice(); // fallback DROPPED on purpose → force the deterministic no-match
+    LOG("candidates (no fallback → forces no-match → AI):", JSON.stringify(candidates));
+    LOG("keep the tab VISIBLE to watch; FULL source AI: deterministic fill → AI category → DRILL → scroll-enumerate leaves → AI leaf → typed commit.");
+    const loc = { wrapperSel: '[data-automation-id="formField-source"]' };
+    const rec = await fillSourceCdp(act, loc, candidates, DEFAULT_BUDGETS, {
+      ai: { profile: prepared, jobContext, isRequired: true, label: "How Did You Hear About Us?", fieldName: "source" }
+    });
+    LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, flag: rec.flag, confidence: rec.confidence, detail: rec.detail }, null, 2));
+    if (rec.tree_structure) LOG("tree:", JSON.stringify({ chosen: rec.tree_structure.chosen, leaves: rec.tree_structure.leaves }, null, 2));
+    return { ok: true, status: rec.status, after: rec.after || null, flag: rec.flag || null };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("source debug aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
     await cdpDetach();
   }
 }
@@ -5194,11 +5248,12 @@ async function fillEngine(profile, defaults, jobContext) {
     try {
       if (widgetType === "hierarchical") {
         // `source` is currently the only hierarchical field; its candidates come
-        // from application_defaults (how_did_you_hear), NOT the profile.
-        const hdyh = defaults && defaults.how_did_you_hear;
+        // from profile.how_did_you_hear (WINS) falling back to application_defaults
+        // (profile-driven, lockstep with the CDP drivePageFill source block).
+        const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
         if (!hdyh || !Array.isArray(hdyh.preferred)) {
           record.status = "needs_review";
-          record.detail = "no how_did_you_hear defaults loaded";
+          record.detail = "no how_did_you_hear value (profile or defaults)";
         } else {
           const candidates = [...hdyh.preferred];
           if (hdyh.fallback) candidates.push(hdyh.fallback);

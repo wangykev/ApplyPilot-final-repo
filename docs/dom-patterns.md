@@ -172,8 +172,23 @@ M7 (radio), and M8 (typeahead).
   (no searchBox)** — consistent with the classifier treating it as button+listbox,
   not a multiselect/typeahead. `fillSource` opens it, then **expand-walks**:
   level-1 leaf check, else expand each category and scan revealed sub-options.
-- Candidate list is policy, not profile: `application_defaults.how_did_you_hear`
-  (`[...preferred, fallback "Other"]`), tried in order; `needs_review` if none match.
+- Candidate list is now **profile-driven**: `profile.how_did_you_hear` WINS, falling back to
+  `application_defaults.how_did_you_hear` (`[...preferred, fallback "Other"]`), tried in order. On the CDP
+  path a genuine no-match (AI on) runs a **two-prompt drill + scroll-enumerate + TYPED commit**
+  (`tryInlineAiSource`) — DOM facts (operator, 2026-06-27): **typing does NOT drill** (it filters the WHOLE
+  tree; a UNIQUE match autocommits), **clicking a category chevron drills it**, lists are **VIRTUALIZED**
+  (scroll to enumerate every option), and the **same label can sit in multiple trees** (two "Other") so a
+  typed filter shows >1 → commit the **TOP**. Flow: (1) `scrapeSourceRows` scroll-enumerates ALL categories →
+  Prompt 1 picks one; (2) `expandCategory` drills it (the row is react-virtualized + BELOW the viewport fold →
+  scroll the `promptLeafNode` into the clickable viewport + `elementFromPoint`-validate before the trusted
+  click — see 2026-06-28) → `scrapeSourceRows` scroll-enumerates ALL leaves → Prompt 2 picks a SEEN leaf;
+  (3) commit DIRECTLY on the still-open field — **focus → Ctrl+A+Delete → type the leaf → Enter** (autocommit
+  unique / click-top tie); the `fillSourceCdp([leaf])` re-entry was dropped (`openSource` disturbs the settled
+  view). The AI only types a leaf it SAW. Source does NOT use the cert click-in-drilled-view drill
+  (`aiTreeFallback`) — its drilled "Other" is the CATEGORY chevron, which re-drills instead of committing
+  (the "clicked into the other box but did not pick the other option" live bug). No categories →
+  `needs_review` (never guess blind). (The earlier "policy, not profile" rule is RETRACTED.) LIVE-VERIFIED
+  2026-06-28.
 - Built to **discover-and-trace** (emits `sourceTrace` with stable per-row
   identifiers) so a failed run yields selectors, not guesses. Verified filling
   "LinkedIn" on Cambium — see the 2026-05-30 entry.
@@ -1760,3 +1775,45 @@ filter-Enter for a *single* result; multi-result lists stay open → the directe
 includes-ambiguity→-1, cert-leaf-unambiguous→fills; fill-driver.test.js: directed-containment flipped to
 escalate-on-ambiguity + a still-commits-when-unambiguous companion). 293 tests green. Live-verify pending
 (cert still fills; a generic-prefix field now escalates).
+
+## 2026-06-28 — Source tree-drill AI: the react-virtualized category click (CDP viewport-coords) + the direct commit
+
+**Context.** The source picker ("How did you hear about us?") is a SEARCH typeahead whose no-match fallback shows
+~13 chevron CATEGORY rows; on a genuine no-match (AI on), `tryInlineAiSource` drills a category, scroll-enumerates
+its leaves, and types the AI's pick (see the 2026-06-27 source entry for the two-prompt flow). The drill CLICK is
+where it kept failing — three compounding DOM facts, pinned by operator browser-diagnosis:
+
+- **The onClick/DRILL handler is on `promptLeafNode`** (the MIDDLE node), NOT on the `menuItem` (`role="option"`,
+  which carries only `mouseover`/`contextmenu`) nor the `promptOption` (the text leaf). Clicking the wrong node
+  fired an event that did nothing. Climb `promptOption` → `closest('[data-automation-id="promptLeafNode"]')`.
+- **The category rows are react-virtualized** (`div[data-automation-id="activeListContainer"]` →
+  `ReactVirtualized__Grid ReactVirtualized__List`, `role="listbox"`; ~10 rows mounted at once). The scroll
+  CONTAINER must be found from the first **`promptOption`** EXCLUDING `selectedItemList` — a stale committed chip
+  (e.g. "LinkedIn") embeds its own `promptOption` first in DOM order and poisons the search → `scrollerFound:false`.
+- **🔑 CDP `Input.dispatchMouseEvent` clicks at VIEWPORT coordinates.** The AI-chosen row (often the LAST category)
+  renders **BELOW the viewport fold** — the dropdown panel is taller than the space under the field, so the row's
+  center `cy ≈ 717–900 > window.innerHeight ≈ 711`. A coordinate click there hits **dead space** and never drills
+  (Playwright's element-click auto-scrolls and hid this class of bug). The row is *mounted* (clipped), so a
+  `while(!found) scroll` loop never even runs — the bug is purely "mounted but off-viewport."
+
+**Fix (`cdpSourceRowRect`, cdp.js).** Find the `promptOption` (immediate; small bounded mount-scroll fallback) →
+loop (≤12) `leaf.scrollIntoView({block:"center"})` (scrolls the PAGE + ancestors, not just the inner list) +
+double-`requestAnimationFrame` + `sleep(150)` + **re-query** (recycle-safe) until `inClickableViewport(leaf)` —
+which requires `cx/cy` within the viewport AND `document.elementFromPoint(cx,cy).closest('promptLeafNode') === leaf`
+— then return the live rect; `expandCategory` does a trusted `cdpClickAt(cx,cy)`. **Dead ends disproven:** a
+synthetic `dispatchEvent` click never drilled (the handler needs a trusted/`isTrusted` event); a 40×150 ms scroll
+loop risked the `Runtime.evaluate` eval timeout (the ≤12 loop converges in 1–2 iterations).
+
+**The commit — leaving the drill RE-RENDERS + clears focus.** Operator: returning from the drilled leaf view to
+type the leaf re-renders the original list and then CLEARS searchbox focus after it paints. Two approaches tried
+and dropped: (1) re-entering `fillSourceCdp([leaf])` — its `openSource` re-opens and disturbs the settled view;
+(2) a settle-wait (poll the drilled-category banner clearing) + a second focus — unnecessary. **What works
+(live-confirmed):** directly on the still-open field — **focus → Ctrl+A+Delete (`clearSourceSearch`) → type the
+leaf → Enter** (autocommit a unique match / `clickSourceLeaf` the TOP on a multi-tree tie like two "Other") →
+verify the chip. ONE focus, no settle-wait.
+
+**Live-verified (Magna, visible).** `how_did_you_hear.preferred:["carrier pigeon"]` → deterministic no-match → AI
+category "Website / Digital" drilled (`promptLeafNode` rect `cy:328` in viewport, trusted click, view changed) →
+leaf enumerated → Prompt 2 → typed commit. Isolated harness: popup "Source AI (isolated)" (`RUN_CDP_SOURCE_AI_DEBUG`,
+`runCdpSourceAiDebug` in background.js — candidates = `how_did_you_hear.preferred` with the fallback dropped to
+FORCE the no-match). 298 tests.
