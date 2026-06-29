@@ -2277,7 +2277,8 @@ const WORK_EXPERIENCE_MAP = [
   { field: "startDate", widget: "date", key: "fromParsed", path: "from" },
   { field: "endDate", widget: "date", key: "toParsed", path: "to",
     skipWhen: (i) => i.currently_work_here === true,
-    skipDetail: "currently_work_here = true → no end date (To box removed)", waitForPresence: true },
+    skipDetail: "currently_work_here = true → no end date (To box removed)",
+    todayIfStuckRequired: true, waitForPresence: true },
   { field: "roleDescription", widget: "textarea", key: "bulletsText", path: "role_description" }
 ];
 
@@ -2296,6 +2297,14 @@ const PAGE_SECTIONS = [
   { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
 ];
 
+// Today's date as a {month, day, year} composite — the WE "currently_work_here but the required
+// To box didn't disappear" fallback (a blank required field would block Save & Continue). SW/Node
+// runtime (not the Workflow sandbox), so new Date() is fine.
+function todayYMD() {
+  const d = new Date();
+  return { month: String(d.getMonth() + 1), day: String(d.getDate()), year: String(d.getFullYear()) };
+}
+
 // Fill one entry's mapped fields. Re-reads act.repeatingScan() FRESH per field — a
 // commit can re-render the entry subtree and orphan a held descriptor (the recon's
 // core warning). Resolves the field by automation-id (`f.field`) OR by label
@@ -2306,17 +2315,6 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
   const base = sectionName + "[" + idx + "].";
   for (const f of fieldMap) {
     const recName = f.name || f.field;
-    // M37 skipWhen: a conditional field (WE endDate when currentlyWorkHere is checked →
-    // Workday removes the "To" box) — record skipped, ZERO actuation, no wrapper lookup.
-    if (f.skipWhen && f.skipWhen(item)) {
-      recs.push({
-        fieldName: base + recName, label: null, widgetType: f.widget === "year" ? "date" : f.widget,
-        isRequired: false, mappedPath: base + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
-        resolved: null, status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null,
-        detail: f.skipDetail || "skipped (skipWhen)"
-      });
-      await act.delay(budgets.interFieldMs); continue;
-    }
     const findFd = (entry) => entry ? (f.labelRegex
       ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
       : entry.fields.find((x) => x.fieldName === f.field)) : null;
@@ -2325,6 +2323,43 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       const sec = scan && scan.sections ? scan.sections[prefix] : null;
       return findFd(sec && sec.entries ? sec.entries[idx] : null);
     };
+    // M37 skipWhen: a conditional field (WE endDate when currentlyWorkHere is checked →
+    // Workday removes the "To" box). It SHOULD vanish → record skipped. BUT a `todayIfStuckRequired`
+    // field VERIFIES that: if the box did NOT get removed and is STILL required, a blank required
+    // field would block Save & Continue → fall back to TODAY's date (operator decision; flagged
+    // for review), never a blind skip.
+    if (f.skipWhen && f.skipWhen(item)) {
+      let fd = f.todayIfStuckRequired ? await scanFd() : null;
+      // The box-removal is async after the checkbox commit — give it a bounded beat; the loop
+      // exits the instant the field is gone (the common case = no added latency).
+      if (fd && f.todayIfStuckRequired) {
+        const t0 = Date.now();
+        while (fd && Date.now() - t0 < budgets.entryReconcileCeilingMs) { await act.delay(budgets.entryReconcileIntervalMs); fd = await scanFd(); }
+      }
+      if (fd && fd.isRequired) {
+        // STILL present + required → today's date so it can't block the walk (flagged to verify).
+        const today = todayYMD();
+        const rec = {
+          fieldName: base + recName, label: fd.label, widgetType: "date", isRequired: true,
+          mappedPath: base + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
+          resolved: today, status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+          auditLoc: fd.wrapperSel
+        };
+        Object.assign(rec, await fillDateCompositeCdp(act, { wrapperSel: fd.wrapperSel }, today, budgets));
+        if (rec.status === "filled") rec.status = "filled_review";
+        rec.flag = "we-currentwork-today";
+        rec.detail = "currently_work_here = true but the required To box did not disappear — filled TODAY's date (verify)";
+        recs.push(rec); await act.delay(budgets.interFieldMs); continue;
+      }
+      // box removed (or present-but-optional) → the original ZERO-actuation skip
+      recs.push({
+        fieldName: base + recName, label: null, widgetType: f.widget === "year" ? "date" : f.widget,
+        isRequired: false, mappedPath: base + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
+        resolved: null, status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null,
+        detail: f.skipDetail || "skipped (skipWhen)"
+      });
+      await act.delay(budgets.interFieldMs); continue;
+    }
     let fd = await scanFd();
     // M37 waitForPresence: a field that REMOUNTS (WE endDate after UNchecking
     // currentlyWorkHere) — POLL until present (bounded), NEVER a fixed wait (the M29

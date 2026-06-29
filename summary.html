@@ -139,8 +139,10 @@
 
       /* approval (Plan 2) — per-flagged-row Approve toggle + the header progress strip + the
          disabled-until-ready submit button. Un-flagged fields are approved-by-default (no toggle). */
-      .approve { margin-top: 3px; display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
-      .apbtn { appearance: none; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-2); border-radius: 999px; padding: 1px 9px; cursor: pointer; font-size: 11px; font-weight: 560; display: inline-flex; align-items: center; gap: 4px; }
+      /* editor + Approve on one line (approve beside the box, not below — saves vertical space) */
+      .ved { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .ved > .editor, .ved > .ta-wrap { flex: 0 1 340px; min-width: 0; }
+      .apbtn { appearance: none; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-2); border-radius: 999px; padding: 1px 9px; cursor: pointer; font-size: 11px; font-weight: 560; display: inline-flex; align-items: center; gap: 4px; flex: none; }
       .apbtn:hover { border-color: var(--ok); color: var(--ok); }
       .apbtn.on { background: #e7f4ec; border-color: #bfe3cd; color: var(--ok); }
       .apbtn.on:hover { border-color: var(--crit); color: var(--crit); }

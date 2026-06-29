@@ -2943,7 +2943,11 @@ const weEntry = (fkit, o) => {
     { fieldName: "location", label: "Location", widgetType: "text", value: "" },
     { fieldName: "startDate", label: "From*", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } } }
   ];
-  if (o.endDate !== "absent") fields.push({ fieldName: "endDate", label: "To", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } } });
+  // endDate: omitted ("absent" → box removed), present-optional (default), or present-REQUIRED
+  // (endDateRequired → the "stuck To box" case: required + M/D/Y segments for the today fallback).
+  if (o.endDate !== "absent") fields.push({ fieldName: "endDate", label: o.endDateRequired ? "To*" : "To", widgetType: "date",
+    isRequired: !!o.endDateRequired,
+    segments: o.endDateRequired ? { Month: { value: "" }, Day: { value: "" }, Year: { value: "" } } : { Month: { value: "" }, Year: { value: "" } } });
   fields.push({ fieldName: "roleDescription", label: "Role Description", widgetType: "textarea", value: "", writeFails: !!o.roleDescWriteFails });
   return { fkit, fields };
 };
@@ -3004,6 +3008,32 @@ test("M37 WE: endDate REMOUNTS (absent then present) — waitForPresence POLLS u
   const ed = withWait.results.find((r) => /endDate/.test(r.fieldName));
   assert.strictEqual(ed.status, "filled", "the bounded poll found the remounted endDate");
   assert.strictEqual(ed.verified, true);
+});
+
+test("WE: currently_work_here=true but the To box STAYS present + required → fills TODAY's date (filled_review, we-currentwork-today)", async () => {
+  // The box did NOT get removed AND is required → a blank required field would block Save &
+  // Continue, so fall back to today's date (flagged to verify), never a blind skip.
+  const { out } = await runWE([weEntry("workExperience-0--null", { cwhChecked: true, endDateRequired: true })], [weItem({ currently_work_here: true })]);
+  const ed = weRec(out, 0, "endDate");
+  assert.strictEqual(ed.status, "filled_review");
+  assert.strictEqual(ed.flag, "we-currentwork-today");
+  const t = new Date();
+  assert.strictEqual(ed.after, `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`); // today, M/D/Y, all segments
+  assert.match(ed.detail, /did not disappear/);
+});
+
+test("WE: currently_work_here=true and the To box is present but OPTIONAL → skipped (no today fallback)", async () => {
+  const { out } = await runWE([weEntry("workExperience-0--null", { cwhChecked: true })], [weItem({ currently_work_here: true })]);
+  const ed = weRec(out, 0, "endDate");
+  assert.strictEqual(ed.status, "skipped");
+  assert.strictEqual(ed.flag, null);
+});
+
+test("WE: currently_work_here=true and the To box is ABSENT (removed) → skipped, zero actuation (the normal case)", async () => {
+  const { out } = await runWE([weEntry("workExperience-0--null", { cwhChecked: true, endDate: "absent" })], [weItem({ currently_work_here: true })]);
+  const ed = weRec(out, 0, "endDate");
+  assert.strictEqual(ed.status, "skipped");
+  assert.match(ed.detail, /currently_work_here/);
 });
 
 test("M37 WE: a roleDescription textarea write that doesn't stick → needs_review, NEVER silent filled", async () => {

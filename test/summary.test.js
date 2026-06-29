@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems } = require("../summary-lib.js");
 
 // ── editKindOf — the replay provenance ──
 test("editKindOf: unedited → null (original === current)", () => {
@@ -112,4 +112,42 @@ test("approvalEnvelope: a soft-deleted required-flagged entry is EXCLUDED from t
 test("submitReady: convenience predicate agrees with the envelope", () => {
   assert.strictEqual(submitReady([mk({ needs_review: true })]), false);
   assert.strictEqual(submitReady([mk({ needs_review: true, is_approved: true })]), true);
+});
+
+// ── "I currently work here" hides the "To" (endDate) row in the review (mirror the form) ──
+const cwhField = (checked) => ({ widget_type: "checkbox", field_id: "P::formField-workExperience[0].currentlyWorkHere", canonical_field: "workExperience[0].currently_work_here", current_value: checked });
+const endDateField = (over) => Object.assign({ widget_type: "date", field_id: "P::formField-workExperience[0].endDate", canonical_field: "workExperience[0].to", needs_review: false }, over || {});
+const jobField = { widget_type: "text", field_id: "P::formField-workExperience[0].jobTitle", canonical_field: "workExperience[0].job_title" };
+
+test("isCurrentlyWorkHere / isWorkExpEndDate: match the WE map's fields, not others", () => {
+  assert.strictEqual(isCurrentlyWorkHere(cwhField("Yes")), true);
+  assert.strictEqual(isCurrentlyWorkHere(jobField), false);                       // text field
+  assert.strictEqual(isCurrentlyWorkHere({ widget_type: "checkbox", field_id: "P::formField-agreeToTerms" }), false);
+  assert.strictEqual(isWorkExpEndDate(endDateField()), true);                     // canonical .to
+  assert.strictEqual(isWorkExpEndDate({ field_id: "P::formField-workExperience[1].endDate" }), true); // by id
+  assert.strictEqual(isWorkExpEndDate({ canonical_field: "workExperience[0].from" }), false); // startDate
+  assert.strictEqual(isWorkExpEndDate(jobField), false);
+});
+
+test("visibleEntryItems: 'currently work here' CHECKED drops the (unflagged) To row", () => {
+  const items = [cwhField("Yes"), jobField, endDateField()];
+  const vis = visibleEntryItems(items);
+  assert.ok(!vis.some(isWorkExpEndDate), "endDate hidden when currently-work-here is checked");
+  assert.ok(vis.includes(jobField) && vis.some(isCurrentlyWorkHere), "other fields kept");
+});
+
+test("visibleEntryItems: UNCHECKED keeps the To row", () => {
+  const items = [cwhField(false), jobField, endDateField()];
+  assert.strictEqual(visibleEntryItems(items).length, 3);
+  assert.ok(visibleEntryItems(items).some(isWorkExpEndDate));
+});
+
+test("visibleEntryItems: a FLAGGED endDate (today's-date fallback) is NOT hidden even when checked", () => {
+  const items = [cwhField("Yes"), endDateField({ needs_review: true, flag: "we-currentwork-today" })];
+  assert.ok(visibleEntryItems(items).some(isWorkExpEndDate), "a needs_review endDate stays visible to be verified");
+});
+
+test("visibleEntryItems: a non-WE entry set is returned unchanged", () => {
+  const items = [{ widget_type: "dropdown", canonical_field: "education[0].degree" }];
+  assert.deepStrictEqual(visibleEntryItems(items), items);
 });

@@ -78,6 +78,22 @@ function approvalEnvelope(entries) {
 
 const submitReady = (entries) => approvalEnvelope(entries).submit_ready;
 
+// "I currently work here" → the form removes the "To" (endDate) box; mirror that in the review.
+// Match on the field's id/canonical (the WE map names: currentlyWorkHere checkbox, endDate→`to`).
+const _idstr = (e) => String((e && e.field_id) || "") + "|" + String((e && e.canonical_field) || "");
+const isCurrentlyWorkHere = (e) => !!e && e.widget_type === "checkbox" && /currentlyworkhere|currently_work_here/i.test(_idstr(e));
+const isWorkExpEndDate = (e) => !!e && /workexperience\[\d+\]\.(to|enddate)\b/i.test(_idstr(e));
+
+// Given one repeating-entry's fields, return the ones to SHOW: when "I currently work here" is
+// CHECKED, drop the endDate ("To") field — EXCEPT keep it if it's flagged needs_review (e.g. the
+// today's-date fallback when the box stayed required), so a flagged value is never hidden.
+function visibleEntryItems(items) {
+  const list = items || [];
+  const cw = list.find(isCurrentlyWorkHere);
+  if (cw && checkedOf(cw.current_value)) return list.filter((e) => !(isWorkExpEndDate(e) && !e.needs_review));
+  return list;
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems };
 }

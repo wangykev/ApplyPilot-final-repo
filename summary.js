@@ -104,6 +104,9 @@ const commit = (entry, val) => {
   persist();
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
   updateApprovalUI();
+  // "I currently work here" controls whether the entry's "To" row shows — re-render to apply
+  // (mirrors the form removing the To box). render() preserves collapsed state.
+  if (isCurrentlyWorkHere(entry)) render();
 };
 
 // Plan 2: per-field approval toggle. Sets is_approved + approved_at, persists, refreshes the
@@ -234,18 +237,22 @@ const fieldRow = (e, opts = {}) => {
 
   const val = el("div", { class: "val" });
   const ed = buildEditor(e);
-  if (ed) val.appendChild(ed.node); else val.appendChild(el("span", { class: e.current_value ? "static" : "static empty", text: fmt(e.current_value) }));
-  if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
-  const afref = el("div", { class: "afref" });
-  val.appendChild(afref);
-  // Plan 2: an Approve toggle on every FLAGGED row (needs_review) — the explicit human sign-off
-  // the future SUBMIT gate reads. Un-flagged fields are approved-by-default → no toggle.
+  // Plan 2: editor + Approve toggle sit on ONE horizontal line (approve NEXT TO the box, not
+  // below — saves vertical space). The "autofilled" ref + partial note stay beneath.
+  const line = el("div", { class: "ved" });
+  if (ed) line.appendChild(ed.node); else line.appendChild(el("span", { class: e.current_value ? "static" : "static empty", text: fmt(e.current_value) }));
+  // an Approve toggle on every FLAGGED row (needs_review) — the explicit human sign-off the
+  // future SUBMIT gate reads. Un-flagged fields are approved-by-default → no toggle.
   let apBtn = null;
   if (requiresApproval(e)) {
     apBtn = el("button", { class: "apbtn" });
     apBtn.addEventListener("click", () => setApproved(e, !e.is_approved));
-    val.appendChild(el("div", { class: "approve" }, [apBtn]));
+    line.appendChild(apBtn);
   }
+  val.appendChild(line);
+  if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
+  const afref = el("div", { class: "afref" });
+  val.appendChild(afref);
   row.appendChild(val);
 
   const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence].filter(Boolean).join("  ·  ");
@@ -413,7 +420,8 @@ const renderFieldList = (mount) => {
         for (const ix of idxOrder) {
           const items = byIdx[ix];
           if (items.every((e) => e.is_deleted)) { if (currentFilter === "all") body.appendChild(deletedRow(g.sec, ix, pg)); continue; }
-          const vis = items.filter(filterPass);
+          // "I currently work here" CHECKED → drop this entry's "To" (endDate) row (mirror the form).
+          const vis = visibleEntryItems(items).filter(filterPass);
           if (!vis.length) continue;
           body.appendChild(entryHead(g.sec, ix, pg));
           for (const e of vis) body.appendChild(fieldRow(e));
