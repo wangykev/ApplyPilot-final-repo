@@ -2408,7 +2408,7 @@ async function runCdpSourceAiDebug(tabId, profile, defaults, jobContext) {
     LOG("keep the tab VISIBLE to watch; FULL source AI: deterministic fill → AI category → DRILL → scroll-enumerate leaves → AI leaf → typed commit.");
     const loc = { wrapperSel: '[data-automation-id="formField-source"]' };
     const rec = await fillSourceCdp(act, loc, candidates, DEFAULT_BUDGETS, {
-      ai: { profile: prepared, jobContext, isRequired: true, label: "How Did You Hear About Us?", fieldName: "source" }
+      ai: { profile: prepared, jobContext, isRequired: true, label: "How Did You Hear About Us?", fieldName: "source", sourceTree: true }
     });
     LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, flag: rec.flag, confidence: rec.confidence, detail: rec.detail }, null, 2));
     if (rec.tree_structure) LOG("tree:", JSON.stringify({ chosen: rec.tree_structure.chosen, leaves: rec.tree_structure.leaves }, null, 2));

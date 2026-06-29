@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -196,6 +196,12 @@ function makeFakeAct(fields, opts) {
           src._rev = (src._rev || 0) + 1;
           if (fm.banner) { src._banner = true; src._resultsBanner = false; src._leaves = (src.fallbackLeaves || src._leaves || []).slice(); }
           else if (fm.autoCommit) { src.chips = [fm.autoCommit]; src._open = false; src._banner = false; src._resultsBanner = false; }
+          // commitOnReEnter: models the operator bug — a value that filters to MULTIPLE results ("Search Results (2)")
+          // does NOT autocommit on the first Enter; pressing Enter AGAIN commits the top (the exact match).
+          else if (fm.commitOnReEnter) { src._banner = false;
+            if (src._reEnterArmed) { src.chips = [fm.commitOnReEnter]; src._open = false; src._resultsBanner = false; }
+            else { src._leaves = (fm.results || [fm.commitOnReEnter]).slice(); src._resultsBanner = true; src._reEnterArmed = true; }
+          }
           else if (fm.filtered) { src._banner = false;
             if (fm.lateResultsBanner) {
               // LATE RESULTS banner (lockstep with the typeahead): a transient bannerless leaf list renders NOW;
@@ -217,7 +223,7 @@ function makeFakeAct(fields, opts) {
           const fm = (ta.filterMap || {})[ta._value];
           if (fm) {
             ta._rev = (ta._rev || 0) + 1; // page transitions through a cleared list — sig changes on a response
-            if (fm.banner) { ta._banner = true; ta._resultsBanner = false; ta._texts = (ta.fallbackTexts || ta._texts || []).slice(); ta._filtered = true; }
+            if (fm.banner) { ta._banner = true; ta._resultsBanner = false; ta._texts = (ta.fallbackTexts || ta.fallbackLeaves || ta._texts || []).slice(); ta._filtered = true; }
             // residualChipAfterCommit: simulate a tenant that ADDS a chip instead of
             // REPLACING (recon = REPLACE on Magna; this drives the defensive assertion).
             else if (fm.autoCommit) { ta.chips = ta.residualChipAfterCommit ? (ta.chips || []).concat([fm.autoCommit]) : [fm.autoCommit]; ta._open = false; ta._banner = false; ta._resultsBanner = false; }
@@ -229,7 +235,7 @@ function makeFakeAct(fields, opts) {
                 // LATE RESULTS banner: a transient bannerless list (fallbackTexts) renders NOW; the "Search
                 // Results" banner + the REAL filtered list land only after N reads. awaitListTerminal must WAIT
                 // (never match the bannerless transient → that would commit a stray / a wrong row).
-                ta._texts = (ta.fallbackTexts || []).slice(); ta._resultsBanner = false;
+                ta._texts = (ta.fallbackTexts || ta.fallbackLeaves || []).slice(); ta._resultsBanner = false;
                 ta._resultsBannerPending = true; ta._resultsBannerReadsLeft = fm.lateResultsBanner; ta._pendingTexts = fm.filtered.slice();
               } else {
                 ta._texts = fm.filtered.slice();
@@ -319,6 +325,15 @@ function makeFakeAct(fields, opts) {
       if (!f || !(f._leaves || []).includes(label)) return false;
       if (f.clickCommitFails) return true;
       if (f.commitVia === "chip") f.chips = [label]; else f._selectedLeaf = label;
+      return true;
+    },
+    // viewport-aware tree-leaf commit (aiTreeFallback's commitLeaf): commits a leaf from the drilled
+    // category's leaves (_leaves, set by expandCategory) → a chip (read back via readSource).
+    clickTreeLeaf: async (loc, label) => {
+      log.push(["clickTreeLeaf", label]);
+      const f = byLoc(loc);
+      if (!f || !(f._leaves || []).includes(label)) return false;
+      f.chips = [label]; f._open = false;
       return true;
     },
 
@@ -411,6 +426,58 @@ function makeFakeAct(fields, opts) {
       f.open = false;
       return true;
     },
+    // ── unified hierarchical-typeahead (merge 2026-06-28) — the methods the merged fillTypeaheadCdp
+    // (cert + source) actually drives. They reuse the typeahead internals (focusedTa/_texts) so the existing
+    // typeahead fixtures (openTexts/filterMap/fallbackTexts) work; source fixtures (openLeaves/fallbackLeaves)
+    // are accepted too. clickHierLeaf commits a leaf BY LABEL from _texts — the first match — and (default)
+    // sets BOTH a chip and the promptLeafNode isselected flag; commitVia:"isselected" sets ONLY isselected
+    // (verify-via-leaf), clickCommitFails dispatches without committing, clickCommitsWrongText mis-commits.
+    openHier: async (loc) => {
+      log.push(["openHier", loc.wrapperSel]);
+      const f = byLoc(loc);
+      f._open = true;
+      if (!f.focusUnconfirmable && !f.focusRaces) f._focusedSb = true;
+      if (f._texts === undefined) f._texts = (f.openTexts || f.openLeaves || []).slice();
+      if (f._banner === undefined) f._banner = false;
+      focusedTa = f;
+      return true;
+    },
+    readHier: async (loc) => {
+      const f = byLoc(loc);
+      if (f._resultsBannerPending) { f._resultsBannerReadsLeft -= 1; if (f._resultsBannerReadsLeft <= 0) { f._resultsBanner = true; f._resultsBannerPending = false; if (f._pendingTexts) f._texts = f._pendingTexts; } }
+      const texts = f._open ? (f._texts || []) : [];
+      const sig = (f._rev || 0) + "|" + texts.length + "|" + texts.slice(0, 3).join("~");
+      let sbValue = f._value || "";
+      if (f._lagLeft !== undefined) { if (f._lagLeft > 0) f._lagLeft -= 1; else f._lagReflected = f._lagPending; sbValue = f._lagReflected; }
+      return {
+        searchBox: { present: !!f._open, visible: !!f._open, focused: !!(f._open && f._focusedSb), value: sbValue },
+        chips: (f.chips || []).slice(),
+        banner: f._open && f._banner ? { text: "No matches found", automationId: "promptTitle" } : null,
+        resultsBanner: !!(f._open && f._resultsBanner),
+        pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) },
+        leaves: texts.slice(0, 40), leafCount: texts.length,
+        msId: f.msId || null, activeText: null
+      };
+    },
+    focusHierSearch: async (loc) => { log.push(["focusHierSearch", loc.wrapperSel]); const f = byLoc(loc); if (!f.focusUnconfirmable) f._focusedSb = f.focusRaces ? ((f._fsbTries = (f._fsbTries || 0) + 1) >= 2) : true; focusedTa = f; return true; },
+    typeInHier: async (text) => { log.push(["typeInHier", text]); if (!focusedTa) return; focusedTa._value = text; focusedTa._filtered = false; focusedTa._resultsBanner = false; focusedTa._resultsBannerPending = false; if (focusedTa.searchValueLagReads !== undefined) { focusedTa._lagPending = text; focusedTa._lagReflected = ""; focusedTa._lagLeft = focusedTa.searchValueLagReads; } },
+    clearHierSearch: async () => { log.push(["clearHierSearch"]); if (focusedTa && focusedTa._focusedSb) { focusedTa._value = ""; focusedTa._filtered = false; } else if (focusedTa) { probe.clearedWhileUnfocused = true; } },
+    clickHierLeaf: async (loc, label) => {
+      log.push(["clickHierLeaf", label]);
+      const f = focusedTa || byLoc(loc);
+      if (!f || !(f._texts || []).some((t) => t === label)) return false; // leaf not visible
+      if (f.clickCommitFails) return true; // click dispatched, nothing committed (verify will fail)
+      const committed = f.clickCommitsWrongText || label;
+      if (f.commitVia === "isselected" || f.commitVia === "leaf") { f._selectedLeaf = committed; }
+      else { f.chips = [committed]; f._selectedLeaf = committed; }
+      f._open = false;
+      return true;
+    },
+    probeHierLeaf: async (label) => {
+      const f = focusedTa;
+      return { found: !!(f && (f._texts || []).includes(label)), commitWrapper: { isSelectedValue: (f && f._selectedLeaf === label) ? "true" : "false" }, rect: { cx: 1, cy: 1, w: 10, h: 10 } };
+    },
+
     // M28: text-keyed dropdown option click. clickDismisses = click dispatched but
     // nothing commits (the Uruguay out-of-view shape) — trigger stays unchanged.
     clickDropdownOptionByText: async (loc, text) => {
@@ -1121,33 +1188,116 @@ test("source: profile.how_did_you_hear WINS over defaults (candidate list comes 
   assert.strictEqual(rec.status, "filled");
 });
 
-test("source AI: TWO-PROMPT drill — scroll-enumerate categories + leaves, AI picks, commit by TYPING (filled_review/ai-choice)", async () => {
-  // "carrier pidgon" deterministically misses → genuine no-match. tryInlineAiSource: scroll-enumerate the
-  // categories → Prompt 1 picks a category → DRILL it → scroll-enumerate its leaves → Prompt 2 picks a SEEN
-  // leaf ("Other") → commit DIRECTLY on the open field (focus → Ctrl+A+Delete → type "Other" → Enter).
+test("source AI: TWO-PROMPT drill — AI category → CLICK-drill (expandCategory) → AI leaf → TYPED commit (filled_review/ai-choice)", async () => {
+  // Source is a TREE you DRILL (live 2026-06-28: "College/University" is a drillable category). The deterministic
+  // value misses → genuine no-match → tryInlineAi routes to aiSourceTreeFallback (the sourceTree flag): scroll-
+  // enumerate categories → Prompt 1 picks one → CLICK it open (expandCategory — typing a category filters to
+  // NOTHING) → scroll-enumerate its leaves → Prompt 2 picks a SEEN leaf → commit by TYPING it (autocommit / click
+  // the top on a tie). This is the regression the merge broke (the flat path TYPED the category + failed).
   const field = srcField({
     wrapperSel: "[w-src]",
     filterMap: {
-      "carrier pidgon": { banner: true },  // deterministic no-match → category fallback
-      "Other": { autoCommit: "Other" }      // the typed-commit of the chosen leaf
+      "university of carnegie": { banner: true },                            // deterministic no-match → categories
+      "Carnegie Mellon University": { autoCommit: "Carnegie Mellon University" } // the TYPED commit of the chosen leaf
     },
-    treeCategories: ["Job Boards", "Social Media", "Other"],
-    treeLeaves: { "Other": ["Newspaper", "Word of Mouth", "Other"] }
+    treeCategories: ["Job Boards", "Social Media", "College / University"],
+    treeLeaves: { "College / University": ["Carnegie Mellon University", "Other University"] }
   });
   const act = makeFakeAct([field], { aiEnabled: true, ai: [
-    '{"choice":"Other","confidence":"Medium"}', // Prompt 1: category
-    '{"choice":"Other","confidence":"Medium"}'  // Prompt 2: leaf
+    '{"choice":"College / University","confidence":"Medium"}',  // Prompt 1: category
+    '{"choice":"Carnegie Mellon University","confidence":"Medium"}' // Prompt 2: leaf
   ] });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["university of carnegie"] } });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-choice");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+  assert.ok(rec.tree_structure && rec.tree_structure.chosen === "College / University", "tree recon recorded (category + leaves)");
+  assert.ok(act.log.some(([m]) => m === "scrapeSourceRows"), "scroll-enumerated the options");
+  assert.ok(act.log.some(([m]) => m === "expandCategory"), "CLICK-drilled the chosen category (NOT typed)");
+  assert.ok(act.log.some(([m]) => m === "typeInSourceSearch" && true), "committed the leaf by TYPING it on the open drilled field");
+  assert.ok(!act.log.some(([m]) => m === "clickTreeLeaf"), "source uses the type-commit drill, NOT clickTreeLeaf");
+});
+
+test("source AI: the AI gets ONLY the STATED answer (not the whole profile) → a typo'd 'Otherrr' maps to 'Other', NOT an inferred profile fact", async () => {
+  // The operator's "Otherrr → Carnegie Mellon" bug: a typo'd how_did_you_hear no-matches → the AI must MATCH the
+  // STATED answer ("Otherrr" → "Other"), and must NOT be handed the whole profile (which contains the school →
+  // it would infer "Carnegie Mellon"). Token-saving + intent-honoring.
+  const field = srcField({
+    wrapperSel: "[w-src]",
+    filterMap: { "Otherrr": { banner: true }, "Other": { autoCommit: "Other" } }, // the typed-commit of the chosen leaf
+    treeCategories: ["College / University", "Other Sources"],
+    treeLeaves: { "Other Sources": ["Newspaper", "Other"] }
+  });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: ['{"choice":"Other Sources"}', '{"choice":"Other"}'] });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["Otherrr"] }, education: [{ school: "Carnegie Mellon University" }] });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].after, "Other", "mapped the typo'd stated answer to the option");
+  const prompts = act.log.filter(([m]) => m === "llm").map(([, u]) => u).join("\n");
+  assert.ok(/Otherrr/.test(prompts), "the AI prompt carried the applicant's STATED answer");
+  assert.ok(!/Carnegie/.test(prompts), "the AI prompt did NOT carry the whole profile (no school → no wrong inference, fewer tokens)");
+});
+
+test("source AI commit: a multi-result that does NOT autocommit → Enter-AGAIN commits the top (the exact match) → filled with the AI's leaf", async () => {
+  // Operator bug: after the AI types the leaf, Workday filters to "Search Results (2): Other / Others" and does
+  // NOT autocommit. The commit ladder DETECTS no-autocommit, falls to a click (here disabled to force the next
+  // rung), then presses Enter AGAIN, which commits the TOP (always the exact match). Verify lands the AI's leaf.
+  const field = srcField({
+    wrapperSel: "[w-src]",
+    clickCommitFails: true, // force past the click rung to the Enter-again rung
+    filterMap: { "carrier pidgon": { banner: true }, "Other": { commitOnReEnter: "Other", results: ["Other", "Others"] } },
+    treeCategories: ["Job Boards", "Other Sources"],
+    treeLeaves: { "Other Sources": ["Newspaper", "Other"] }
+  });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: ['{"choice":"Other Sources"}', '{"choice":"Other"}'] });
   const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["carrier pidgon"] } });
   const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled_review");
   assert.strictEqual(rec.flag, "ai-choice");
+  assert.strictEqual(rec.after, "Other", "committed exactly the AI's leaf (the top exact match), never 'Others'");
+  assert.strictEqual(act.log.filter(([m]) => m === "pressEnter").length >= 2, true, "pressed Enter AGAIN to commit the un-autocommitted top");
+});
+
+test("source AI commit: the AI's leaf ALREADY equals the committed chip → SKIP the re-commit (zero actuation)", async () => {
+  // Optimization: the field is pre-filled "Other"; the deterministic candidate ("LinkedIn") doesn't match → the
+  // AI drills and picks "Other" — which is already committed. The commit ladder must SKIP entirely (no clear/
+  // type/Enter), keeping the existing chip.
+  const field = srcField({
+    wrapperSel: "[w-src]",
+    chips: ["Other"], // pre-filled
+    filterMap: { "LinkedIn": { banner: true } }, // the deterministic candidate no-matches → overwrite path → AI drill
+    treeCategories: ["Social", "Other Sources"],
+    treeLeaves: { "Other Sources": ["Newspaper", "Other"] }
+  });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: ['{"choice":"Other Sources"}', '{"choice":"Other"}'] });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["LinkedIn"] } });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review");
   assert.strictEqual(rec.after, "Other");
-  assert.ok(rec.tree_structure && rec.tree_structure.chosen === "Other", "tree recon recorded (category + leaves)");
-  assert.ok(act.log.some(([m]) => m === "scrapeSourceRows"), "scroll-enumerated the options");
-  assert.ok(act.log.some(([m]) => m === "expandCategory"), "drilled the chosen category");
-  assert.ok(act.log.some(([m]) => m === "typeInSourceSearch"), "committed by TYPING (focus → Ctrl+A+Delete → type the chosen leaf)");
+  assert.match(rec.detail, /already committed/);
+  assert.ok(!act.log.some(([m]) => m === "typeInSourceSearch"), "skipped the re-commit — no re-typing of an already-correct chip");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "closed the still-open drill box via Tab (chip kept)");
+});
+
+test("source AI commit (SAFETY): the leaf never lands → ai-commit-failed, never a false fill", async () => {
+  // If neither the filter-Enter, the click, NOR Enter-again lands a chip equal to the AI's leaf, the commit gate
+  // REJECTS it (ai-commit-failed) — what the AI chose is what gets filled, or nothing is reported filled.
+  const field = srcField({
+    wrapperSel: "[w-src]",
+    clickCommitFails: true,
+    filterMap: { "carrier pidgon": { banner: true }, "Other": { filtered: ["Other", "Others"] } }, // multi-result, never commits
+    treeCategories: ["Job Boards", "Other Sources"],
+    treeLeaves: { "Other Sources": ["Newspaper", "Other"] }
+  });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: ['{"choice":"Other Sources"}', '{"choice":"Other"}'] });
+  const profile = Object.assign({}, nameProfile, { how_did_you_hear: { preferred: ["carrier pidgon"] } });
+  const out = await drivePageFill(act, profile, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-commit-failed");
 });
 
 test("source AI: no categories (nothing to enumerate) → needs_review, no LLM (never guess blind)", async () => {
@@ -1208,7 +1358,7 @@ test("capture single-open: onCapture scrapes BEFORE the loop's first clearSearch
   assert.strictEqual(rec.after, "Other");                 // commits the typed value, no stray
   assert.deepStrictEqual(scraped, FOS_FULL);              // the scrape ran + captured the full list
   const idx = (m) => act.log.findIndex(([x]) => x === m);
-  assert.ok(idx("scrapeTaOptions") >= 0 && idx("scrapeTaOptions") < idx("clearSearch"), "scrape ran BEFORE the first clearSearch (i.e. before the candidate loop)");
+  assert.ok(idx("scrapeTaOptions") >= 0 && idx("scrapeTaOptions") < idx("clearHierSearch"), "scrape ran BEFORE the first clearSearch (i.e. before the candidate loop)");
 });
 
 test("capture single-open: the loop's re-assert is AFTER the scrape, with ONLY clearSearch before typeInSearch (the invariant)", async () => {
@@ -1221,11 +1371,11 @@ test("capture single-open: the loop's re-assert is AFTER the scrape, with ONLY c
   const rec = await fillTypeaheadCdp(act, TA_LOC, ["Other"], T_BUDGETS, { onCapture });
   assert.strictEqual(rec.after, "Other");                 // the re-assert recovered focus → typed value commits
   const seq = act.log.map(([m]) => m);
-  const typeIdx = seq.indexOf("typeInSearch");
-  const reassertIdx = seq.lastIndexOf("focusSearchBox", typeIdx); // the loop's focus re-assert
+  const typeIdx = seq.indexOf("typeInHier");
+  const reassertIdx = seq.lastIndexOf("focusHierSearch", typeIdx); // the loop's focus re-assert
   assert.ok(seq.indexOf("scrapeTaOptions") < reassertIdx, "scrape is BEFORE the loop's focus re-assert");
   assert.ok(reassertIdx >= 0 && reassertIdx < typeIdx, "re-assert is immediately before the type");
-  assert.deepStrictEqual(seq.slice(reassertIdx + 1, typeIdx).filter((m) => m !== "clearSearch"), [], "ONLY clearSearch between the re-assert and the type — no scrape/read/settle in that gap");
+  assert.deepStrictEqual(seq.slice(reassertIdx + 1, typeIdx).filter((m) => m !== "clearHierSearch"), [], "ONLY clearSearch between the re-assert and the type — no scrape/read/settle in that gap");
 });
 
 test("capture single-open: no onCapture → no scrape (4-arg callers / non-tagged typeaheads unaffected)", async () => {
@@ -1250,7 +1400,7 @@ test("keptLowerTier re-commit: empty-results drops focus → the re-commit RE-FO
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "Other");                          // recovered → committed the kept value, NO stray
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.ok(act.log.some(([m]) => m === "focusSearchBox"), "the re-commit re-focused the dropped searchBox before re-typing");
+  assert.ok(act.log.some(([m]) => m === "focusHierSearch"), "the re-commit re-focused the dropped searchBox before re-typing");
 });
 
 test("keptLowerTier re-commit: focus UNRECOVERABLE → needs_review, NEVER pressEnter on the unfocused re-type (invariant)", async () => {
@@ -1271,7 +1421,7 @@ test("keptLowerTier re-commit: filter-Enter strays the chip (armed row-0) → th
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "Other");
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.ok(act.log.some(([m, t]) => m === "clickTaOption" && t === "Other"), "the affirmative click overwrote the stray with the kept value");
+  assert.ok(act.log.some(([m, t]) => m === "clickHierLeaf" && t === "Other"), "the affirmative click overwrote the stray with the kept value");
 });
 
 test("keptLowerTier re-commit STRAY GUARD: a stray the click can't overwrite → needs_review with the HONEST live after (never silent, never [])", async () => {
@@ -1389,9 +1539,9 @@ test("typeahead: per-candidate isolation — a later tier's value in the fallbac
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.after, "Other");
-  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
   assert.deepStrictEqual(typed, ["Electrical and Computer Engineering", "Other"]);
-  assert.strictEqual(enters(act), 3, "cand-0: filter-Enter only (banner); cand-1: filter-Enter + commit-Enter");
+  assert.strictEqual(enters(act), 2, "cand-0: filter-Enter (banner); cand-1: filter-Enter then click-by-label commit (no commit-Enter)");
 });
 
 test("typeahead main loop (empty field, FAILURE-DIRECTION): the post-type gate WAITS for the LATE 'Search Results' banner — never matches the transient bannerless fallback → filled 'Other'", async () => {
@@ -1456,22 +1606,68 @@ test("typeahead: an auto-commit chip that mismatches the candidate is NEVER repo
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.after, "Canada (+1)"); // surfaced, not accepted
   assert.strictEqual(rec.verified, false);
-  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
   assert.deepStrictEqual(typed, ["United States of America (+1)"], "walk stops — a chip exists; more typing contaminates");
 });
 
-test("typeahead: commit-Enter fires only when the match is the FIRST filtered option", async () => {
-  // exact match at index 1 → no commit-Enter (highlight is unreadable; never blind)
+test("typeahead: click-by-label commits the matched leaf at ANY index (merge: index-0 gate removed)", async () => {
+  // Pre-merge a match not at index 0 was REFUSED (the commit-Enter could only take the highlighted first
+  // option). The unified filler commits by VIEWPORT-AWARE click-by-LABEL → an exact match at index 1 commits.
   let act = makeFakeAct([taField({ filterMap: { "Other": { filtered: ["Other Technology", "Other"] } } })]);
   let out = await drivePageFill(act, taProfile(["Other"]), {}, {}, T_BUDGETS);
-  assert.strictEqual(out.results[0].status, "needs_review");
-  assert.strictEqual(enters(act), 1);
-  // exact match at index 0 → commit
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Other");
+  assert.strictEqual(out.results[0].verified, true);
+  assert.ok(act.log.some(([m, t]) => m === "clickHierLeaf" && t === "Other"), "committed the matched leaf by label, not by position");
+  assert.strictEqual(enters(act), 1, "only the filter-Enter — no commit-Enter (click commits)");
+  // index 0 also commits
   act = makeFakeAct([taField({ filterMap: { "Other": { filtered: ["Other", "Other Technology"] } } })]);
   out = await drivePageFill(act, taProfile(["Other"]), {}, {}, T_BUDGETS);
   assert.strictEqual(out.results[0].status, "filled");
   assert.strictEqual(out.results[0].after, "Other");
+});
+
+test("typeahead: two identical 'Other' leaves (multi-tree tie) → commit the FIRST by click-by-label (the AI-'Other' edge case)", async () => {
+  // The operator edge case: a typed 'Other' doesn't auto-commit because two sub-trees each carry an 'Other';
+  // matchCandidates' exact tier resolves the duplicate to its FIRST index, and clickHierLeaf clicks the first
+  // DOM node with that label → "pick the first if it matches" (never a blind auto-commit on the ambiguous filter).
+  const act = makeFakeAct([taField({ filterMap: { "Other": { filtered: ["Other", "Other"] } } })]);
+  const out = await drivePageFill(act, taProfile(["Other"]), {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Other");
   assert.strictEqual(out.results[0].verified, true);
+  assert.ok(act.log.some(([m, t]) => m === "clickHierLeaf" && t === "Other"), "clicked 'Other' (the first matching leaf)");
+});
+
+test("Fix 2: a FLAT typeahead start-scrapes options ONCE → rec.options (review) + the flat AI uses them, NO scrape after the deterministic fail", async () => {
+  // A FLAT typeahead scrapes its full list at the START (before the candidate loop). The captured list is
+  // recorded for the REVIEW page AND reused by the inline AI on a no-match — so there is NO scrape after the
+  // deterministic fill fails (the operator's ask). The AI's 'Other' commits via the re-entry.
+  const f = taField({ scrapeOptions: ["Accounting", "Other", "Biology"], filterMap: { "Zzz": { banner: true }, "Other": { autoCommit: "Other" } } });
+  const act = makeFakeAct([f], { aiEnabled: true, ai: '{"choice":"Other","represented":false}' });
+  const out = await drivePageFill(act, taProfile(["Zzz"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.deepStrictEqual(rec.options, ["Accounting", "Other", "Biology"], "the START-scrape is recorded for the review page");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.match(rec.flag, /^ai-choice/, "the flat AI committed from the START-scraped list");
+  assert.ok(!act.log.some(([m]) => m === "scrapeSourceRows"), "NO AI-stage scrape — the flat options came from the START scrape");
+  // scrapeTaOptions ran exactly ONCE (the start), never again at the AI stage.
+  assert.strictEqual(act.log.filter(([m]) => m === "scrapeTaOptions").length, 1, "scraped once, at the start");
+});
+
+test("Fix 2: makeStartCapture — FLAT scrapes once (review options); a TREE returns null with NO scrape (no wasted scroll)", async () => {
+  // FLAT: scrapeTaOptions → the full list is returned (capturedFull for the AI) AND recorded for the review page.
+  const flat = makeFakeAct([taField({ scrapeOptions: ["Accounting", "Biology"] })]);
+  const capF = makeStartCapture(flat, { wrapperSel: "[w-ta]" });
+  assert.deepStrictEqual(await capF.onCapture(), ["Accounting", "Biology"], "flat → the start-scrape returns the full list");
+  assert.deepStrictEqual(capF.reviewOptions(), ["Accounting", "Biology"], "flat → recorded for the review page");
+  // TREE: the cheap readTreeCategories detect sees categories → returns null, scraping NOTHING (no scroll), and
+  // recording NO review options — the AI tree drill self-scrapes categories/leaves only if the deterministic fails.
+  const tree = makeFakeAct([srcField({ treeCategories: ["Social Media", "Job Board"], scrapeOptions: ["should-not-be-scraped"] })]);
+  const capT = makeStartCapture(tree, { wrapperSel: "[w-src]" });
+  assert.strictEqual(await capT.onCapture(), null, "tree → NOT start-scraped");
+  assert.strictEqual(capT.reviewOptions(), null, "tree → no review options");
+  assert.ok(!tree.log.some(([m]) => m === "scrapeTaOptions"), "tree → no scrapeTaOptions (no wasted scroll on a successful fill)");
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
@@ -1498,7 +1694,7 @@ test("typeahead: Enter-commit fails → trusted click commits the matched option
   assert.strictEqual(rec.after, "Other");
   assert.strictEqual(rec.verified, true);
   assert.match(rec.detail, /click-commit/);
-  assert.ok(act.log.some(([m]) => m === "clickTaOption"));
+  assert.ok(act.log.some(([m]) => m === "clickHierLeaf"));
 });
 
 test("typeahead: click commits the WRONG option → chip mismatch → needs_review, walk stops", async () => {
@@ -1511,7 +1707,7 @@ test("typeahead: click commits the WRONG option → chip mismatch → needs_revi
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.after, "Other Technology"); // surfaced, never accepted
   assert.strictEqual(rec.verified, false);
-  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
   assert.deepStrictEqual(typed, ["Other"], "walk stops — a chip exists; more typing contaminates");
 });
 
@@ -1528,7 +1724,7 @@ test("typeahead: Enter and click both fail → next candidate carries, never a s
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "Engineering"); // tier-2 carried after tier-1's commit failed
   assert.strictEqual(rec.matchTier, "enter-auto-commit");
-  assert.strictEqual(rec.settle_trace[0].note, "no chip from commit-Enter or click — commit did not take");
+  assert.strictEqual(rec.settle_trace[0].note, "matched leaf but commit did not verify (no isselected flip / chip)");
 });
 
 test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", async () => {
@@ -1618,7 +1814,7 @@ test("typeahead: first candidate to commit wins — later candidates never typed
   })]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America"]), {}, {}, T_BUDGETS);
   assert.strictEqual(out.results[0].status, "filled");
-  const typed = act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
   assert.deepStrictEqual(typed, ["United States of America (+1)"]);
 });
 
@@ -1628,7 +1824,7 @@ test("typeahead: first candidate to commit wins — later candidates never typed
 // "Other"). Now: tier 0 → keep, ZERO actuation (countryPhoneCode auto-derive);
 // tier k>0 → walk only the HIGHER tiers and overwrite to the BEST offered, keeping
 // the pre-fill if none is offered; tier -1 → full overwrite walk (unchanged).
-const taTypedQueries = (act) => act.log.filter(([m]) => m === "typeInSearch").map(([, t]) => t);
+const taTypedQueries = (act) => act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
 
 test('INVARIANT (M36.1): a tier-0 pre-fill is KEPT with ZERO actuation — countryPhoneCode auto-derive is never re-typed', async () => {
   // The chip carries the (+1) suffix; normalize() strips it, so it is tier 0 vs the
@@ -1719,8 +1915,8 @@ test("typeahead: searchBox focus cannot be confirmed → ZERO actuation, needs_r
   assert.strictEqual(rec.status, "needs_review");
   assert.match(rec.detail, /could not focus the search field/);
   // The whole point: NO blind Ctrl+A / type / Enter when focus isn't confirmed.
-  assert.ok(!act.log.some(([m]) => m === "clearSearch"), "no Ctrl+A clear");
-  assert.ok(!act.log.some(([m]) => m === "typeInSearch"), "no typing");
+  assert.ok(!act.log.some(([m]) => m === "clearHierSearch"), "no Ctrl+A clear");
+  assert.ok(!act.log.some(([m]) => m === "typeInHier"), "no typing");
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
   // …but DO blur via Tab on the way out: a prior candidate may have armed row-0; Tab abandons it.
   assert.ok(act.log.some(([m]) => m === "pressTab"), "blurred via Tab so no armed row can stray to the next field");
@@ -1867,7 +2063,7 @@ test("typeahead directed containment STILL commits when UNAMBIGUOUS (only one op
   assert.strictEqual(rec.flag, "directed-containment");
   assert.strictEqual(rec.confidence, "low");
   assert.strictEqual(rec.after, "United States of America (+1)");
-  assert.strictEqual(rec.matchTier, "enter-commit"); // commit-path, not the match tier
+  assert.strictEqual(rec.matchTier, "click-commit"); // commit-path (unified click-by-label), not the match tier
 });
 
 // ── source picker (backlog C — the Magna SEARCH shape; mirrors the typeahead walk) ──
@@ -1894,7 +2090,7 @@ test("source: multi-match → trusted leaf-click, verified via promptLeafNode is
   assert.strictEqual(rec.after, "LinkedIn");
   assert.strictEqual(rec.verified, true);
   assert.match(rec.detail, /promptLeafNode-isselected/);
-  assert.ok(act.log.some(([m]) => m === "clickSourceLeaf"));
+  assert.ok(act.log.some(([m]) => m === "clickHierLeaf"));
 });
 
 test("source: commit verified via selectedItem chip", async () => {
@@ -1959,24 +2155,24 @@ test("awaitSourceListStable: a tenant that opens straight to LEAVES (no categori
   assert.strictEqual(await awaitSourceListStable(act, { wrapperSel: "[w]" }, T_BUDGETS), "stable");
 });
 
-test("source first-open render gate: the popup render is awaited (category content read) BEFORE the first type", async () => {
-  // Wired into fillSourceCdp: the gate reads the popup content, then re-asserts focus, then types — so the
-  // first deterministic search never lands in an unrendered popup. LinkedIn auto-commits (happy path unchanged).
-  const f = srcField({ treeCategories: ["Social Media", "Job Board"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } });
+test("source first-open render gate: source routes through the unified filler; opened BEFORE the first type", async () => {
+  // Source is the SAME widget as the cert typeahead (recon 2026-06-28) → it routes through the merged
+  // fillTypeaheadCdp, whose unified open-race gate (awaitListStable, unit-tested separately) awaits the OPEN
+  // popup before typing. Source opens to a FLAT leaf list (no categories); LinkedIn auto-commits (happy path).
+  const f = srcField({ openLeaves: ["LinkedIn", "Facebook", "Indeed"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } });
   const act = makeFakeAct([f]);
   const rec = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, ["LinkedIn"], T_BUDGETS);
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "LinkedIn");
-  const firstCatRead = act.log.findIndex(([m]) => m === "readTreeCategories");
-  const firstType = act.log.findIndex(([m]) => m === "typeInSourceSearch");
-  assert.ok(firstCatRead >= 0, "the render gate read the popup content (categories)");
-  assert.ok(firstCatRead < firstType, "the render gate ran BEFORE the first type — no typing into an unrendered popup");
+  const firstOpen = act.log.findIndex(([m]) => m === "openHier");
+  const firstType = act.log.findIndex(([m]) => m === "typeInHier");
+  assert.ok(firstOpen >= 0 && firstOpen < firstType, "opened the popup BEFORE the first type (unified open-race gate)");
 });
 
 test("source: no candidate in its filtered set → needs_review", async () => {
   const { rec } = await runSource(srcField({ filterMap: { LinkedIn: { filtered: ["Facebook", "Twitter"] } } }), ["LinkedIn"]);
   assert.strictEqual(rec.status, "needs_review");
-  assert.match(rec.detail, /no source candidate/);
+  assert.match(rec.detail, /no candidate produced a verified chip/);
 });
 
 test("source: matched leaf but commit click fails → needs_review, never false-filled", async () => {
@@ -1988,11 +2184,11 @@ test("source: matched leaf but commit click fails → needs_review, never false-
 test("source: searchBox focus cannot be confirmed → ZERO actuation, needs_review", async () => {
   const { rec, act } = await runSource(srcField({ focusUnconfirmable: true, filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } }), ["LinkedIn"]);
   assert.strictEqual(rec.status, "needs_review");
-  assert.match(rec.detail, /could not focus the source search field/);
-  assert.ok(!act.log.some(([m]) => m === "clearSourceSearch"), "no clear");
-  assert.ok(!act.log.some(([m]) => m === "typeInSourceSearch"), "no typing");
+  assert.match(rec.detail, /could not focus the search field/);
+  assert.ok(!act.log.some(([m]) => m === "clearHierSearch"), "no clear");
+  assert.ok(!act.log.some(([m]) => m === "typeInHier"), "no typing");
   assert.ok(!act.log.some(([m]) => m === "pressEnter"), "no Enter");
-  assert.ok(!act.log.some(([m]) => m === "clickSourceLeaf"), "no leaf click");
+  assert.ok(!act.log.some(([m]) => m === "clickHierLeaf"), "no leaf click");
   assert.ok(act.log.some(([m]) => m === "pressTab"), "blurred via Tab (lockstep with typeahead)");
 });
 
@@ -2026,7 +2222,7 @@ test("source overwrite: no candidate matches → needs_review / overwrite-nomatc
 });
 
 // M36.1 tier-aware pre-filled guard — source, in LOCKSTEP with the typeahead tests above.
-const srcTypedQueries = (act) => act.log.filter(([m]) => m === "typeInSourceSearch").map(([, t]) => t);
+const srcTypedQueries = (act) => act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
 
 test("M36.1 source k>0: upgrades to the HIGHEST offered tier (lockstep)", async () => {
   // Pre-fill = tier-2 "Friend"; tier-0 "LinkedIn" AND tier-1 "Other" both offered →
@@ -2064,7 +2260,7 @@ test("source: directed exact leaf-click → filled, directed-exact (commit-path 
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "directed-exact");
   assert.strictEqual(rec.confidence, "high");
-  assert.strictEqual(rec.matchTier, "source-click-commit");
+  assert.strictEqual(rec.matchTier, "click-commit");
 });
 
 test("typeahead: walk-dry but a stray chip is present → record reports it, never after:null", async () => {
@@ -2077,10 +2273,10 @@ test("typeahead: walk-dry but a stray chip is present → record reports it, nev
   })]);
   // The stray exists only at walk-END (the honesty read inside tabBlurExit happens after the Tab):
   // flip a flag in pressTab, inject the chip on reads after it.
-  const origRead = act.readTypeahead, origTab = act.pressTab;
+  const origRead = act.readHier, origTab = act.pressTab;
   let walkEnded = false;
   act.pressTab = async (...a) => { walkEnded = true; return origTab(...a); };
-  act.readTypeahead = async (loc) => {
+  act.readHier = async (loc) => {
     const st = await origRead(loc);
     if (walkEnded) st.chips = ["Afghanistan (+93)"];
     return st;
@@ -2231,9 +2427,9 @@ function makeFakeRepeatAct(state) {
     // typeahead (the delete-vs-AI-defer test) — a minimal mirror of makeFakeAct's typeahead model
     // (chips/filterMap/_open/_texts/_banner). Drives a required repeating typeahead to a GENUINE
     // no-match (filterMap → banner) so the defer's aiTypeaheadEligible path is exercised.
-    openTypeahead: async (loc) => { log.push(["openTypeahead", loc.wrapperSel]); const f = byLoc(loc); if (!f) return false; f._open = true; if (!f.focusUnconfirmable) f._focusedSb = true; if (f._texts === undefined) f._texts = (f.openTexts || []).slice(); if (f._banner === undefined) f._banner = false; focusedTa = f; return true; },
-    focusSearchBox: async (loc) => { log.push(["focusSearchBox", loc.wrapperSel]); const f = byLoc(loc); if (f && !f.focusUnconfirmable) f._focusedSb = true; focusedTa = f; return true; },
-    readTypeahead: async (loc) => {
+    openHier: async (loc) => { log.push(["openHier", loc.wrapperSel]); const f = byLoc(loc); if (!f) return false; f._open = true; if (!f.focusUnconfirmable) f._focusedSb = true; if (f._texts === undefined) f._texts = (f.openTexts || f.openLeaves || []).slice(); if (f._banner === undefined) f._banner = false; focusedTa = f; return true; },
+    focusHierSearch: async (loc) => { log.push(["focusHierSearch", loc.wrapperSel]); const f = byLoc(loc); if (f && !f.focusUnconfirmable) f._focusedSb = true; focusedTa = f; return true; },
+    readHier: async (loc) => {
       const f = byLoc(loc); if (!f) return null;
       const texts = f._open ? (f._texts || []) : [];
       const sig = (f._rev || 0) + "|" + texts.length + "|" + texts.slice(0, 3).join("~");
@@ -2241,11 +2437,13 @@ function makeFakeRepeatAct(state) {
         chips: (f.chips || []).slice(),
         banner: f._open && f._banner ? { text: "No matches found", automationId: "promptTitle" } : null,
         resultsBanner: !!(f._open && f._resultsBanner),
-        pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) }, activeText: null };
+        pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) },
+        leaves: texts.slice(0, 40), leafCount: texts.length, msId: (f && f.msId) || null, activeText: null };
     },
-    clearSearch: async () => { log.push(["clearSearch"]); if (focusedTa) { focusedTa._value = ""; focusedTa._filtered = false; } },
-    typeInSearch: async (t) => { log.push(["typeInSearch", t]); if (focusedTa) { focusedTa._value = t; focusedTa._filtered = false; focusedTa._resultsBanner = false; } },
-    clickTaOption: async (loc, text) => { log.push(["clickTaOption", text]); const f = byLoc(loc); if (!f || !f._open || !(f._texts || []).some((t) => t === text)) return false; f.chips = [text]; f._open = false; return true; },
+    clearHierSearch: async () => { log.push(["clearHierSearch"]); if (focusedTa) { focusedTa._value = ""; focusedTa._filtered = false; } },
+    typeInHier: async (t) => { log.push(["typeInHier", t]); if (focusedTa) { focusedTa._value = t; focusedTa._filtered = false; focusedTa._resultsBanner = false; } },
+    clickHierLeaf: async (loc, label) => { log.push(["clickHierLeaf", label]); const f = focusedTa || byLoc(loc); if (!f || !(f._texts || []).some((t) => t === label)) return false; if (f.clickCommitFails) return true; const committed = f.clickCommitsWrongText || label; if (f.commitVia === "isselected" || f.commitVia === "leaf") { f._selectedLeaf = committed; } else { f.chips = [committed]; f._selectedLeaf = committed; } f._open = false; return true; },
+    probeHierLeaf: async (label) => { const f = focusedTa; return { found: !!(f && (f._texts || []).includes(label)), commitWrapper: { isSelectedValue: (f && f._selectedLeaf === label) ? "true" : "false" }, rect: { cx: 1, cy: 1, w: 10, h: 10 } }; },
     pressEnter: async () => {
       log.push(["pressEnter"]);
       const ta = focusedTa;
@@ -2260,13 +2458,19 @@ function makeFakeRepeatAct(state) {
       } else if (!ta.enterCommitFails && (ta._texts || []).length && !ta._banner) { ta.chips = [ta._texts[0]]; ta._open = false; }
     },
     // ── tree picker (cert) seams ── a field carries `tree: { categories:[], leaves:{cat:[full…]} }`. NO `tree`
-    // ⇒ readTreeCategories returns [] ⇒ tryInlineAi routes FLAT (every non-tree test byte-identical). Drill sets
-    // `_treeExpanded`; clickTreeLeaf commits a chip; readSource exposes chips for aiTreeFallback's commit-verify.
+    // ⇒ readTreeCategories returns [] ⇒ tryInlineAi routes FLAT (every non-tree test byte-identical). The UNIFIED
+    // type-commit drill (aiTreeDrillFallback): scrapeSourceRows → on-open categories / drilled-category leaves;
+    // expandCategory CLICK-drills (sets `_treeExpanded`); the chosen leaf is committed by TYPING (focus → clear →
+    // type → pressEnter → clickSourceLeaf fallback). readSource exposes searchBox.value (for the echo poll) + chips.
     readTreeCategories: async (loc) => { const f = byLoc(loc); if (!f || !f.tree) return []; return f._treeExpanded ? [] : f.tree.categories.slice(); },
-    expandCategory: async (loc, label) => { log.push(["expandCategory", label]); const f = byLoc(loc); if (!f || !f.tree || !f.tree.categories.includes(label)) return false; f._treeExpanded = label; return true; },
+    scrapeSourceRows: async (loc) => { log.push(["scrapeSourceRows", loc.wrapperSel]); const f = byLoc(loc); if (!f || !f.tree) return { ok: false }; return f._treeExpanded ? { ok: true, options: (f.tree.leaves[f._treeExpanded] || []).slice(), banner: f._treeExpanded, atBottom: true } : { ok: true, options: f.tree.categories.slice(), banner: "No matches found", atBottom: true }; },
+    expandCategory: async (loc, label) => { log.push(["expandCategory", label]); const f = byLoc(loc); if (!f || !f.tree || !f.tree.categories.includes(label)) return false; f._treeExpanded = label; focusedTa = f; return true; },
     readTreeLeaves: async (loc) => { const f = byLoc(loc); if (!f || !f.tree || !f._treeExpanded) return []; return (f.tree.leaves[f._treeExpanded] || []).slice(); },
-    clickTreeLeaf: async (loc, label) => { log.push(["clickTreeLeaf", label]); const f = byLoc(loc); if (!f || !f.tree || !f._treeExpanded || !(f.tree.leaves[f._treeExpanded] || []).includes(label)) return false; f.chips = [label]; f._open = false; return true; },
-    readSource: async (loc) => { const f = byLoc(loc); return { chips: (f && f.chips) ? f.chips.slice() : [] }; }
+    focusSourceSearch: async (loc) => { log.push(["focusSourceSearch"]); const f = byLoc(loc); focusedTa = f; if (f && !f.focusUnconfirmable) f._focusedSb = true; return true; },
+    clearSourceSearch: async () => { if (focusedTa) focusedTa._value = ""; },
+    typeInSourceSearch: async (t) => { log.push(["typeInSourceSearch", t]); if (focusedTa) focusedTa._value = t; },
+    clickSourceLeaf: async (label) => { log.push(["clickSourceLeaf", label]); const f = focusedTa; if (!f || !f.tree || !f._treeExpanded || !(f.tree.leaves[f._treeExpanded] || []).includes(label)) return false; f.chips = [label]; f._open = false; return true; },
+    readSource: async (loc) => { const f = byLoc(loc); return { searchBox: { present: !!(f && f._open), visible: !!(f && f._open), focused: !!(f && f._focusedSb), value: (f && f._value) || "" }, chips: (f && f.chips) ? f.chips.slice() : [] }; }
   };
 }
 
@@ -2907,6 +3111,7 @@ function makeAuditAct(live) {
     readCheckboxState: async (loc) => { const f = g(loc); return f.missing ? null : { inputId: "i", checked: f.checked }; },
     readRadioState: async (loc) => { const f = g(loc); return f.missing ? null : [{ labelText: f.radioLabel, checked: true }]; },
     readTypeahead: async (loc) => { const f = g(loc); return f.missing ? null : { chips: f.chips || [] }; },
+    readHier: async (loc) => { const f = g(loc); return f.missing ? null : { chips: f.chips || [] }; },
     readSource: async (loc) => { const f = g(loc); return f.missing ? null : { chips: f.chips || [] }; },
     readDateSegment: async (loc, seg) => { const f = g(loc); if (f.missing || !f.segments || f.segments[seg] == null) return null; return { value: String(f.segments[seg]) }; }
   };
@@ -3217,9 +3422,9 @@ function makeCaptureAct(opts = {}) {
   const act = {
     delay: () => { calls.push(["delay"]); return Promise.resolve(); },
     delayFull: () => { calls.push(["delayFull"]); return Promise.resolve(); },
-    openTypeahead: (loc) => { calls.push(["openTypeahead", loc.wrapperSel]); return Promise.resolve(true); },
-    readTypeahead: (loc) => { calls.push(["readTypeahead", loc.wrapperSel]); return Promise.resolve(taState); },
-    focusSearchBox: (loc) => { calls.push(["focusSearchBox", loc.wrapperSel]); return Promise.resolve(true); },
+    openHier: (loc) => { calls.push(["openHier", loc.wrapperSel]); return Promise.resolve(true); },
+    readHier: (loc) => { calls.push(["readHier", loc.wrapperSel]); return Promise.resolve(taState); },
+    focusHierSearch: (loc) => { calls.push(["focusHierSearch", loc.wrapperSel]); return Promise.resolve(true); },
     pressEscape: () => { calls.push(["pressEscape"]); return Promise.resolve(); },
     pressTab: () => { calls.push(["pressTab"]); return Promise.resolve(); }
   };
@@ -3250,10 +3455,10 @@ test("FoS capture: no-op (null, no calls) when the substrate lacks scrapeTaOptio
 test("FoS capture is READ-ONLY: never commits — only open/read/focus/scrape, exits via Tab (named invariant)", async () => {
   const { act, calls } = makeCaptureAct();
   await captureFieldOptions(act, CAP_LOC, CAP_BUDGETS);
-  const allowed = new Set(["delay", "delayFull", "openTypeahead", "readTypeahead", "focusSearchBox", "pressTab", "scrapeTaOptions"]);
+  const allowed = new Set(["delay", "delayFull", "openHier", "readHier", "focusHierSearch", "pressTab", "scrapeTaOptions"]);
   assert.deepStrictEqual(calls.filter((c) => !allowed.has(c[0])), [], "capture made a non-read-only call");
   assert.ok(calls.some((c) => c[0] === "pressTab"), "closes via Tab (the clean non-committing exit)");
-  for (const bad of ["typeInSearch", "pressEnter", "clearSearch", "typeText", "clickDropdownOptionByText", "pressEscape"])
+  for (const bad of ["typeInHier", "pressEnter", "clearHierSearch", "typeText", "clickHierLeaf", "clickDropdownOptionByText", "pressEscape"])
     assert.strictEqual(calls.some((c) => c[0] === bad), false, "capture must never call " + bad);
 });
 
@@ -3462,7 +3667,7 @@ test("AI-TA leaf 5: represented=false + NO 'Other' + OPTIONAL → needs_review, 
   assert.strictEqual(out.status, "needs_review");
   assert.strictEqual(out.flag, "ai-typeahead-decline");
   assert.strictEqual(out.after, null);
-  assert.ok(!act.log.some(([m]) => m === "openTypeahead" || m === "clickTaOption"), "no commit was attempted");
+  assert.ok(!act.log.some(([m]) => m === "openHier" || m === "clickHierLeaf"), "no commit was attempted");
 });
 
 test("AI-TA leaf 6: the AI pick can't commit (banner) → ai-commit-failed (needs_review, honest, never a false fill)", async () => {
@@ -3547,16 +3752,16 @@ const CERT_TREE_FIELD = {
   "Workday": ["Workday Pro - Workday"]
 };
 
-test("inline AI (repeating): a CERTIFICATION tree no-match DRILLS → commits the leaf via clickTreeLeaf (ai-choice) → entry KEPT", async () => {
+test("inline AI (repeating): a CERTIFICATION tree no-match DRILLS → CLICK-drill + TYPE-commit the leaf (ai-choice) → entry KEPT", async () => {
   // Cert is a TREE: a bogus name no-matches (banner); tryInlineAi reads the category rows on the still-open
-  // field → routes to aiTreeFallback (Prompt 1 category → drill → Prompt 2 leaf) → commits via the
-  // viewport-aware clickTreeLeaf. A confident ai-choice in a deleteOnNoMatch section is KEPT (Step 2.5).
+  // field → routes to the UNIFIED aiTreeDrillFallback (Prompt 1 category → CLICK-drill → Prompt 2 leaf → TYPE
+  // commit, the same path as source). A confident ai-choice in a deleteOnNoMatch section is KEPT (Step 2.5).
   const tree = { categories: ["Multiple Recognized Providers", "Workday"], leaves: CERT_TREE_FIELD };
   const certEntry = (fkit) => ({ fkit, fields: [{ fieldName: "certification", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Bogus Cert XYZ": { banner: true } }, tree }] });
   const fieldMap = [{ field: "certification", widget: "typeahead", key: "cert", path: "cert" }];
   const items = [{ cert: ["Bogus Cert XYZ"] }];
   const state = { prefix: "certification-", addable: true, deletable: true, aiEnabled: true,
-    ai: ['{"choice":"Multiple Recognized Providers","confidence":"High"}', '{"choice":"Certified Payroll Professional (CPP)","represented":true,"confidence":"High"}'],
+    ai: ['{"choice":"Multiple Recognized Providers","confidence":"High"}', '{"choice":"Certified Payroll Professional (CPP)","confidence":"High"}'],
     newEntry: (i) => certEntry("certification-new" + i), entries: [certEntry("certification-0--null")] };
   const act = makeFakeRepeatAct(state);
   const out = await driveRepeatingSectionCdp(act, { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", items, fieldMap, deleteOnNoMatch: true, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
@@ -3564,25 +3769,26 @@ test("inline AI (repeating): a CERTIFICATION tree no-match DRILLS → commits th
   assert.strictEqual(cert.status, "filled_review");
   assert.strictEqual(cert.flag, "ai-choice");
   assert.strictEqual(cert.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers", "committed the FULL suffixed leaf");
-  assert.ok(act.log.some(([m]) => m === "expandCategory"), "drilled the category");
-  assert.ok(act.log.some(([m]) => m === "clickTreeLeaf"), "committed via the viewport-aware leaf click (not clickSourceLeaf)");
+  assert.ok(act.log.some(([m]) => m === "expandCategory"), "CLICK-drilled the category");
+  assert.ok(act.log.some(([m]) => m === "typeInSourceSearch"), "committed the leaf by TYPING (the unified drill, same as source)");
+  assert.ok(!act.log.some(([m]) => m === "clickTreeLeaf"), "the retired clickTreeLeaf commit is NOT used");
   assert.strictEqual(state.entries.length, 1, "confident ai-choice → entry KEPT");
 });
 
-test("inline AI (repeating): a CERTIFICATION tree no-match with NO 'Other' + unrepresented leaf → ai-closest-forced → entry DELETED", async () => {
-  // Chosen category "Workday" has a single leaf + NO "Other"; the AI's leaf isn't represented → forced nearest
-  // (ai-closest-forced, never blank on required) → unconfident → a deleteOnNoMatch section DELETES it (Step 2.5).
+test("inline AI (repeating): a CERTIFICATION tree no-match, AI low-confidence forced leaf → entry DELETED", async () => {
+  // Chosen category "Workday" has a single leaf + NO "Other"; the AI's leaf doesn't match → nearest (never blank)
+  // → ai-choice with LOW confidence → a deleteOnNoMatch section DELETES the unconfident entry (Step 2.5).
   const tree = { categories: ["Workday"], leaves: { "Workday": ["Workday Pro - Workday"] } };
   const certEntry = (fkit) => ({ fkit, fields: [{ fieldName: "certification", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Bogus Cert XYZ": { banner: true } }, tree }] });
   const fieldMap = [{ field: "certification", widget: "typeahead", key: "cert", path: "cert" }];
   const items = [{ cert: ["Bogus Cert XYZ"] }];
   const state = { prefix: "certification-", addable: true, deletable: true, aiEnabled: true,
-    ai: ['{"choice":"Workday"}', '{"choice":"Nope Not Here","represented":false,"confidence":"Low"}'],
+    ai: ['{"choice":"Workday"}', '{"choice":"Nope Not Here","confidence":"Low"}'],
     newEntry: (i) => certEntry("certification-new" + i), entries: [certEntry("certification-0--null")] };
   const act = makeFakeRepeatAct(state);
   await driveRepeatingSectionCdp(act, { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", items, fieldMap, deleteOnNoMatch: true, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
-  assert.ok(act.log.some(([m]) => m === "expandCategory") && act.log.some(([m]) => m === "clickTreeLeaf"), "the tree AI drilled + forced a pick");
-  assert.strictEqual(state.entries.length, 0, "ai-closest-forced (unconfident) → entry DELETED");
+  assert.ok(act.log.some(([m]) => m === "expandCategory") && act.log.some(([m]) => m === "clickSourceLeaf"), "the tree AI drilled + committed a forced nearest pick");
+  assert.strictEqual(state.entries.length, 0, "ai-choice LOW confidence → entry DELETED");
 });
 
 test("inline AI (repeating): a cert typeahead with NO tree categories + no captured options → flat path, no LLM, genuine no-match → deleted", async () => {
@@ -3651,11 +3857,16 @@ test("runAiTypeaheadPass (the shared helper): no-op when AI OFF; rescues a no-ma
 // ── AI fallback for TREE pickers (cert) — two-prompt drill (Step 2 of the tree-AI milestone) ───────────
 // A fake act with the tree-drill substrate (readTreeCategories / expandCategory / readTreeLeaves /
 // clickTreeLeaf / readSource). `ai` is a SEQUENCE of LLM replies [categoryReply, leafReply].
+// Models the UNIFIED tree drill (aiTreeDrillFallback, the source-style type-commit): scrapeSourceRows returns
+// the categories on-open and the drilled category's leaves after expandCategory; the leaf is committed by TYPING
+// (focusSourceSearch → clearSourceSearch → typeInSourceSearch → pressEnter → clickSourceLeaf fallback). `ai` is a
+// SEQUENCE of LLM replies [categoryReply, leafReply].
 function makeFakeTreeAct(tree, opts) {
   const o = opts || {};
   const replies = Array.isArray(o.ai) ? o.ai : [o.ai];
-  let replyIdx = 0, expanded = null, committed = null;
+  let replyIdx = 0, expanded = null, committed = null, value = "";
   const log = [];
+  const leavesOf = () => (expanded ? (tree.leaves[expanded] || []).slice() : []);
   const act = {
     log,
     aiEnabled: o.aiEnabled !== false,
@@ -3668,17 +3879,30 @@ function makeFakeTreeAct(tree, opts) {
       return typeof a === "string" ? { ok: true, text: a } : a;
     },
     readTreeCategories: async () => (expanded ? [] : tree.categories.slice()),
+    // scroll-accumulate: on-open → categories (banner "No matches found"); after a drill → that category's leaves
+    // (banner = the category name, the drill-confirmation).
+    scrapeSourceRows: async (loc) => {
+      log.push(["scrapeSourceRows", loc && loc.wrapperSel]);
+      return expanded
+        ? { ok: true, options: leavesOf(), banner: expanded, atBottom: true }
+        : { ok: true, options: tree.categories.slice(), banner: "No matches found", atBottom: true };
+    },
     expandCategory: async (loc, label) => {
       if (!tree.categories.includes(label)) return false;
       expanded = label; log.push(["expand", label]); return true;
     },
-    readTreeLeaves: async () => (expanded ? (tree.leaves[expanded] || []).slice() : tree.categories.slice()),
-    clickTreeLeaf: async (loc, label) => {
-      log.push(["clickTreeLeaf", label]);
-      if (!expanded || !(tree.leaves[expanded] || []).includes(label)) return false;
+    sourceRowRect: async () => ({ found: true, rect: { cx: 1, cy: 1, w: 10, h: 10 } }),
+    clickAt: async () => {},
+    focusSourceSearch: async () => { log.push(["focusSourceSearch"]); return true; },
+    clearSourceSearch: async () => { value = ""; },
+    typeInSourceSearch: async (t) => { log.push(["typeInSourceSearch", t]); value = t; },
+    pressEnter: async () => { log.push(["pressEnter"]); }, // filter-Enter only; the leaf commits via clickSourceLeaf
+    clickSourceLeaf: async (label) => {
+      log.push(["clickSourceLeaf", label]);
+      if (!expanded || !leavesOf().includes(label)) return false;
       committed = label; return true;
     },
-    readSource: async () => ({ chips: committed ? [committed] : [] }),
+    readSource: async () => ({ searchBox: { present: true, visible: true, focused: true, value }, chips: committed ? [committed] : [] }),
   };
   return act;
 }
@@ -3702,66 +3926,67 @@ test("parseAiTreeReply: {choice,confidence}; category alias; fenced / embedded /
   assert.deepStrictEqual(parseAiTreeReply("just a category"), { choice: "just a category", confidence: "low" });
 });
 
-test("aiTreeFallback: category + leaf represented → drills + commits the leaf via click (ai-choice, FULL chip, tree_structure)", async () => {
+test("aiTreeDrillFallback: category + leaf → CLICK-drills + TYPE-commits the matched leaf (ai-choice, FULL chip)", async () => {
   const act = makeFakeTreeAct(CERT_TREE, { ai: [
     '{"choice":"Multiple Recognized Providers","confidence":"High"}',
-    '{"choice":"Certified Payroll Professional (CPP)","represented":true,"confidence":"High"}',
+    '{"choice":"Certified Payroll Professional (CPP)","confidence":"High"}',
   ] });
-  const rec = { auditLoc: "[w]", isRequired: true, label: "Certification", fieldName: "certification[0].certification" };
-  const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, rec, { certifications: [{ name: "CPP" }] }, {}, T_BUDGETS);
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: { certifications: [{ name: "CPP" }] }, jobContext: {}, isRequired: true, label: "Certification", fieldName: "certification[0].certification" }, T_BUDGETS);
   assert.strictEqual(out.status, "filled_review");
   assert.strictEqual(out.flag, "ai-choice");
-  assert.strictEqual(out.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers", "committed the FULL suffixed leaf");
+  assert.strictEqual(out.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers", "containment-matched the AI's clean pick → committed the FULL suffixed leaf");
   assert.strictEqual(out.tree_structure.chosen, "Multiple Recognized Providers");
-  assert.ok(out.tree_structure.leaves.includes("Certified Payroll Professional (CPP)"), "tree_structure carries the CLEAN (suffix-stripped) leaves");
-  assert.ok(act.log.some(([m]) => m === "expand"), "drilled the category");
-  assert.ok(act.log.some(([m]) => m === "clickTreeLeaf"), "committed via a viewport-aware leaf CLICK (no blind typing)");
+  assert.ok(act.log.some(([m]) => m === "expand"), "CLICK-drilled the category (not typed)");
+  assert.ok(act.log.some(([m]) => m === "typeInSourceSearch"), "committed the leaf by TYPING (the unified type-commit, not clickTreeLeaf)");
 });
 
-test("aiTreeFallback: leaf NOT represented + 'Other' present → commits Other (ai-choice-other)", async () => {
+test("aiTreeDrillFallback: AI picks 'Other' → commits the suffixed Other leaf (ai-choice)", async () => {
   const act = makeFakeTreeAct(CERT_TREE, { ai: [
     '{"choice":"Multiple Recognized Providers"}',
-    '{"choice":"Some Cert The Form Lacks","represented":false}',
+    '{"choice":"Other","confidence":"Medium"}',
   ] });
-  const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, { auditLoc: "[w]", isRequired: true, label: "Certification" }, {}, {}, T_BUDGETS);
-  assert.strictEqual(out.flag, "ai-choice-other");
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {}, isRequired: true, label: "Certification" }, T_BUDGETS);
+  assert.strictEqual(out.flag, "ai-choice");
   assert.strictEqual(out.after, "Other - Multiple Recognized Providers");
 });
 
-test("aiTreeFallback: leaf NOT represented + NO 'Other' + REQUIRED → forced nearest (ai-closest-forced, never blank)", async () => {
+test("aiTreeDrillFallback: an unresolvable leaf snaps to the NEAREST real leaf; the AI's low confidence flows through", async () => {
+  // No separate ai-closest-forced flag (source semantics) — a forced/uncertain pick is ai-choice with the AI's
+  // confidence, and a deleteOnNoMatch section deletes it when that confidence is low (the driver's Step 2.5).
   const act = makeFakeTreeAct(CERT_TREE, { ai: [
     '{"choice":"Workday"}',
-    '{"choice":"Nope Not Here","represented":false,"confidence":"Low"}',
+    '{"choice":"Nope Not Here","confidence":"Low"}',
   ] });
-  const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, { auditLoc: "[w]", isRequired: true, label: "Certification" }, {}, {}, T_BUDGETS);
-  assert.strictEqual(out.flag, "ai-closest-forced");
-  assert.strictEqual(out.after, "Workday Pro - Workday", "the only leaf → forced nearest");
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {}, isRequired: true, label: "Certification" }, T_BUDGETS);
+  assert.strictEqual(out.flag, "ai-choice");
+  assert.strictEqual(out.confidence, "low");
+  assert.strictEqual(out.after, "Workday Pro - Workday", "the only leaf → nearest, never blank");
 });
 
-test("aiTreeFallback: a hallucinated/typo CATEGORY snaps to the nearest, then drills (proceeds, never stalls)", async () => {
+test("aiTreeDrillFallback: a hallucinated/typo CATEGORY snaps to the nearest, then drills (proceeds, never stalls)", async () => {
   const act = makeFakeTreeAct(CERT_TREE, { ai: [
     '{"choice":"Multiple Recgnized Providrs"}', // typo → nearestOption → real category
-    '{"choice":"Certified Payroll Professional (CPP)","represented":true,"confidence":"High"}',
+    '{"choice":"Certified Payroll Professional (CPP)","confidence":"High"}',
   ] });
-  const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, { auditLoc: "[w]", isRequired: true, label: "Certification" }, {}, {}, T_BUDGETS);
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {}, isRequired: true, label: "Certification" }, T_BUDGETS);
   assert.strictEqual(out.tree_structure.chosen, "Multiple Recognized Providers", "typo category snapped to the nearest real one");
   assert.strictEqual(out.flag, "ai-choice");
   assert.strictEqual(out.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers");
 });
 
-test("aiTreeFallback: NO categories visible → returns null (not a tree → caller falls back to the flat path)", async () => {
+test("aiTreeDrillFallback: NO categories visible → returns null (nothing to drill → caller falls to needs_review)", async () => {
   const act = makeFakeTreeAct({ categories: [], leaves: {} }, { ai: ["x"] });
-  const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, { auditLoc: "[w]" }, {}, {}, T_BUDGETS);
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {} }, T_BUDGETS);
   assert.strictEqual(out, null);
 });
 
-test("aiTreeFallback: suffix round-trip — the CLEAN leaf the AI picks restores to the FULL label for the commit click", async () => {
+test("aiTreeDrillFallback: the AI's CLEAN leaf containment-matches + commits the FULL suffixed label", async () => {
   const act = makeFakeTreeAct(CERT_TREE, { ai: [
     '{"choice":"Multiple Recognized Providers"}',
-    '{"choice":"Certified Information Systems Auditor (CISA)","represented":true,"confidence":"Medium"}',
+    '{"choice":"Certified Information Systems Auditor (CISA)","confidence":"Medium"}',
   ] });
-  const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, { auditLoc: "[w]", isRequired: true, label: "Certification" }, {}, {}, T_BUDGETS);
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {}, isRequired: true, label: "Certification" }, T_BUDGETS);
   assert.strictEqual(out.after, "Certified Information Systems Auditor (CISA) - Multiple Recognized Providers");
-  const clicked = act.log.find(([m]) => m === "clickTreeLeaf");
-  assert.strictEqual(clicked[1], "Certified Information Systems Auditor (CISA) - Multiple Recognized Providers", "clicked the FULL label, not the clean one");
+  const clicked = act.log.find(([m]) => m === "clickSourceLeaf");
+  assert.strictEqual(clicked[1], "Certified Information Systems Auditor (CISA) - Multiple Recognized Providers", "committed the FULL label");
 });

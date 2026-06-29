@@ -105,7 +105,7 @@ function chipSetChanged(priorChips, chips) {
 // lag on a slow connection. Read-only (never changes focus). On give-up returns false and
 // the caller PROCEEDS to Enter anyway (today's fixed-delay behavior — the post-Enter settle
 // is the real commit gate) → strictly-better-than-today, never a hang. `read` is a thunk
-// (() => act.readTypeahead(loc) | act.readSource(loc)).
+// (() => act.readHier(loc) | act.readSource(loc)).
 async function pollSearchValue(act, read, want, budgets) {
   const deadline = Date.now() + budgets.taActionSettleCeilingMs;
   do {
@@ -1165,7 +1165,7 @@ const fillCheckboxCdp = async (act, loc, want, budgets) => {
 // no close workaround needed.
 const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const norm = apMatch.normalize;
-  const pre = await act.readTypeahead(loc);
+  const pre = await act.readHier(loc);
   if (!pre) return { status: "error", detail: "typeahead wrapper not found" };
 
   // Pre-filled guard — TIER-AWARE (M36.1). countryPhoneCode is auto-derived by
@@ -1211,19 +1211,19 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // Returns the focused state, or null after exhausting attempts → the caller
     // MUST NOT actuate (no blind clear/type/Enter).
     for (let attempt = 1; attempt <= budgets.taOpenRetries; attempt++) {
-      let st = await act.readTypeahead(loc);
+      let st = await act.readHier(loc);
       if (!st || !st.searchBox.present || !st.searchBox.visible) {
-        if (!(await act.openTypeahead(loc))) { await act.delay(budgets.reopenSettleMs); continue; } // unmounted — re-open
+        if (!(await act.openHier(loc))) { await act.delay(budgets.reopenSettleMs); continue; } // unmounted — re-open
         const t0 = Date.now();
         while (Date.now() - t0 < budgets.taOpenCeilingMs) {
           await act.delay(budgets.taOpenIntervalMs);
-          st = await act.readTypeahead(loc);
+          st = await act.readHier(loc);
           if (st && st.searchBox.visible) break;
         }
       }
       if (st && st.searchBox.visible && !st.searchBox.focused) {
-        await act.focusSearchBox(loc); // already-visible search → focus only, never re-open
-        st = await act.readTypeahead(loc);
+        await act.focusHierSearch(loc); // already-visible search → focus only, never re-open
+        st = await act.readHier(loc);
       }
       if (st && st.searchBox.focused) return st;
       await act.delay(budgets.reopenSettleMs); // let a racing re-render settle, then retry
@@ -1234,6 +1234,10 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const trace = [];
   let lastFiltered = null;
   let capturedFull = null; // the FULL option list from onCapture (for the inline AI rescue) — see opts.ai
+  // M30 liveness (source): did the options EVER render during the walk? If they never load (leafCount stays 0,
+  // no chip) the server didn't return them — the dead-session tell. Surfaced on the walk-end no-commit return
+  // for drivePageFill's session warning (only meaningful for the source field; harmless for cert/FoS).
+  let optionsEverLoaded = false;
   let s = null;
   // FoS capture (single-open, operator's corrected design): scrape the FULL option list BEFORE the
   // candidate loop, so the loop's ensureSearchFocused() — the LAST focus action immediately before
@@ -1247,8 +1251,8 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // scrape entirely BEFORE the loop's single re-assert; the keptLowerTier re-commit path
   // [overwriteNoMatchResting → recommitFn] is UNTOUCHED — byte-identical, no settle before its re-type.)
   if (opts.onCapture) {
-    await act.openTypeahead(loc);
-    await awaitListStable(act, (l) => act.readTypeahead(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
+    await act.openHier(loc);
+    await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
     capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
   }
   for (const [ci, cand] of overwriteCandidates.entries()) {
@@ -1260,7 +1264,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // awaitListTerminal BLOCKS until the prior candidate reaches a terminal state (its banner / autocommit)
     // before we re-focus + clear — never a bannerless list. Resolves on the banner (fast on Magna); a "timeout"
     // here on a no-match tier is the latency smell to flag. Skipped for the first candidate.
-    if (ci > 0) step.priorSettle = await awaitListTerminal(act, (l) => act.readTypeahead(l), loc, budgets, chipSetIsNew);
+    if (ci > 0) step.priorSettle = await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
     // Focus hygiene: re-assert (recover) focus before touching the field. If it
     // can't be confirmed, STOP — never blind Ctrl+A / type / Enter (that is the
     // exact path that committed a stray "Afghanistan" via the listbox highlight).
@@ -1278,7 +1282,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     //   • ci > 0 — the between-candidates awaitListTerminal already left a known terminal render state; and
     //   • opts.onCapture — the pre-loop open+awaitListStable+scrape already rendered the list and left it open.
     if (ci === 0 && !opts.onCapture) {
-      await awaitListStable(act, (l) => act.readTypeahead(l), loc, budgets);
+      await awaitListStable(act, (l) => act.readHier(l), loc, budgets);
       if (!(await ensureSearchFocused())) {
         step.note = "could not re-focus after the open list rendered — not actuating blind";
         await act.pressTab(); // BLUR before leaving (lockstep with the focus-fail bail above)
@@ -1294,14 +1298,14 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     let snap = null, snapSig = null, landed = false;
     for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
       if (attempt > 1 && !(await ensureSearchFocused())) break; // re-assert focus on retry (blur after a prior clear/type)
-      await act.clearSearch();
-      await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets); // the clear has LANDED in the input before snapshot
-      snap = await act.readTypeahead(loc);
+      await act.clearHierSearch();
+      await pollSearchValue(act, () => act.readHier(loc), "", budgets); // the clear has LANDED in the input before snapshot
+      snap = await act.readHier(loc);
       if (!(snap && snap.searchBox && snap.searchBox.focused)) continue; // blur after the clear → re-loop
       snapSig = snap.pageWide.sig;
       step.staleBannerAtStart = !!(snap && snap.banner);
-      await act.typeInSearch(cand);
-      landed = await pollSearchValue(act, () => act.readTypeahead(loc), cand, budgets); // FULL candidate echoed in the FOCUSED box?
+      await act.typeInHier(cand);
+      landed = await pollSearchValue(act, () => act.readHier(loc), cand, budgets); // FULL candidate echoed in the FOCUSED box?
     }
     if (!landed) {
       step.note = "could not type the full candidate into a focused box (partial/blur) — not pressing Enter";
@@ -1315,8 +1319,9 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // the fallback-before-the-banner; matching it commits the armed row (the stray). The focus-safe type loop
     // above is the focus guard; this is the render guard.
     const tSettle = Date.now();
-    const outcome = await awaitListTerminal(act, (l) => act.readTypeahead(l), loc, budgets, chipSetIsNew);
-    s = await act.readTypeahead(loc); // fresh snapshot at the SETTLED terminal (stable → consistent re-read)
+    const outcome = await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
+    s = await act.readHier(loc); // fresh snapshot at the SETTLED terminal (stable → consistent re-read)
+    if (s && (s.leafCount > 0 || (s.chips && s.chips.length))) optionsEverLoaded = true; // M30 source liveness
     step.outcome = outcome;
     step.settleMs = Date.now() - tSettle;
     step.count = s ? s.pageWide.count : null;
@@ -1372,63 +1377,56 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     const m = apMatch.matchCandidates([cand], texts);
     if (m.targetIndex !== -1) step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
     if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set"; continue; }
-    if (m.targetIndex !== 0) { step.note = `match at index ${m.targetIndex}, not the auto-highlighted first option — not committing`; continue; }
 
-    const matchedOption = texts[0];
+    // Commit = VIEWPORT-AWARE click-by-label of the matched leaf (act.clickHierLeaf scrolls an off-fold leaf
+    // into the clickable viewport, matches by data-automation-label||text → the FIRST DOM node). NO index-0
+    // gate and NO commit-Enter (the old typeahead ladder): under CDP-injected typing the widget never arms a
+    // row highlight (recon), so a second Enter is a no-op; the filter-Enter only AUTO-commits a UNIQUE match
+    // (the "autocommit" terminal above handles that). A MULTI-match — e.g. two "Other" leaves across sub-trees
+    // — does NOT auto-commit → we click the FIRST matching leaf: matchCandidates' exact tier already resolves a
+    // duplicate label to its first index, and clickHierLeaf then hits the first DOM node with that label
+    // ("pick the first if it matches"). Verify (lockstep source-style) via the matched leaf's promptLeafNode
+    // isselected flip OR a chip == the matched option; a chip that is a DIFFERENT value is a stray (flagged).
+    const matchedOption = texts[m.targetIndex];
     step.matchedOption = matchedOption;
-
-    // Commit ladder: (1) commit-Enter — works when keystroke-driven typing
-    // armed the first-option highlight; (2) trusted CDP click on the matched
-    // option BY TEXT — the fallback for a never-armed highlight (live
-    // 2026-06-12: the Enter no-op'd and tier-1 "Other" lost to a tier-3
-    // auto-commit). Both paths end at the SAME chip gate.
-    const pollChips = async (ceilingMs) => {
-      let cs = null;
-      const t0 = Date.now();
-      while (Date.now() - t0 < ceilingMs) {
-        await act.delay(budgets.commitIntervalMs);
-        cs = await act.readTypeahead(loc);
-        // Break on a NEW chip (overwrite) OR a chip == the matched option (covers
-        // the same-value overwrite where the matched target already equals the
-        // original — no needless timeout). Empty field: equivalent to "any chip".
-        if (cs && (chipSetIsNew(cs.chips) || cs.chips.some((c) => norm(c) === norm(matchedOption)))) break;
-      }
-      return cs ? cs.chips : [];
+    const verifyCommitted = async () => {
+      let probe = null; try { probe = await act.probeHierLeaf(matchedOption); } catch (e) {}
+      const leafSelected = !!(probe && probe.commitWrapper && probe.commitWrapper.isSelectedValue === "true");
+      const st = await act.readHier(loc);
+      const chips = st ? st.chips : [];
+      const chipMatch = chips.some((c) => norm(c) === norm(matchedOption));
+      return { committed: leafSelected || chipMatch, via: chipMatch ? "selectedItem-chip" : "promptLeafNode-isselected", chips };
     };
-    await act.pressEnter(); // the commit-Enter
-    let chips = await pollChips(budgets.taEnterCommitCeilingMs);
-    let commitPath = "enter-commit";
-    if (!chips.length) {
-      // Click fallback — only while the filtered set still shows the matched text.
-      const re = await act.readTypeahead(loc);
-      if (re && re.pageWide.texts.some((t) => norm(t) === norm(matchedOption))) {
-        if (await act.clickTaOption(loc, matchedOption)) {
-          commitPath = "click-commit";
-          chips = await pollChips(budgets.commitCeilingMs);
-        }
+    let committed = false, via = null, vc = null;
+    if (await act.clickHierLeaf(loc, matchedOption)) {
+      const d0 = Date.now();
+      while (Date.now() - d0 < budgets.commitCeilingMs) {
+        await act.delay(budgets.commitIntervalMs);
+        vc = await verifyCommitted();
+        if (vc.committed) { committed = true; via = vc.via; break; }
       }
     }
-    step.chip = chips.join("; ") || null;
-    step.commitPath = chips.length ? commitPath : null;
-    if (chips.length && chips.some((c) => norm(c) === norm(matchedOption))) {
-      // Directed commit verified (chip == the matched option). Grade by the
-      // candidate→option tier `m.matchTier` (M27): exact → filled; containment/fuzzy
-      // → filled_review + flag. Under overwrite → overwrite-success + provenance.
-      // `matchTier` = the commit-path; quality → confidence.
+    step.commitPath = committed ? "click-commit" : null;
+    step.chip = vc && vc.chips.length ? vc.chips.join("; ") : null;
+    if (committed) {
+      // Directed commit verified. Grade by the candidate→option tier `m.matchTier` (M27): exact → filled;
+      // containment/fuzzy → filled_review + flag. Under overwrite → overwrite-success + provenance.
       const oc = commitOutcome(isOverwrite, "directed", m.matchTier);
       step.flag = oc.flag;
-      if (isOverwrite && chips.length > 1) {
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: commitPath, flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${chips.length} chips (expected single REPLACE) — review`, captured_options: texts, settle_trace: trace }, true);
+      const finalChips = vc ? vc.chips : [];
+      if (isOverwrite && finalChips.length > 1) {
+        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "click-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `overwrite left ${finalChips.length} chips (expected single REPLACE) — review`, captured_options: texts, settle_trace: trace }, true);
       }
       const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: commitPath, flag: oc.flag, confidence: oc.confidence, detail: `${prov}${commitPath} on "${matchedOption}" (${m.matchTier})`, captured_options: texts, settle_trace: trace }, true);
+      return withOverwrite({ status: oc.status, after: step.chip || matchedOption, verified: true, matchTier: "click-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}click-commit on "${matchedOption}" (verified via ${via}, ${m.matchTier})`, captured_options: texts, settle_trace: trace }, true);
     }
-    if (chips.length) {
-      // A chip exists but isn't the matched option — overwrite → overwrite-stray
-      // (a different value replaced the original); empty field → directed-mismatch.
-      return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: commitPath, flag: isOverwrite ? "overwrite-stray" : "directed-mismatch", confidence: "none", detail: `chip "${step.chip}" does not match "${matchedOption}" — flagged, walk stopped`, captured_options: texts, settle_trace: trace }, false);
+    // A chip exists but isn't the matched option — a stray: overwrite → overwrite-stray (a different value
+    // replaced the original); empty field → directed-mismatch. Surfaced for review, never a silent fill.
+    const strayChips = (vc && vc.chips && vc.chips.length) ? vc.chips : [];
+    if (strayChips.length && !strayChips.some((c) => norm(c) === norm(matchedOption))) {
+      return withOverwrite({ status: "needs_review", after: strayChips.join("; "), verified: false, matchTier: "click-commit", flag: isOverwrite ? "overwrite-stray" : "directed-mismatch", confidence: "none", detail: `chip "${strayChips.join("; ")}" does not match "${matchedOption}" — flagged, walk stopped`, captured_options: texts, settle_trace: trace }, false);
     }
-    step.note = "no chip from commit-Enter or click — commit did not take";
+    step.note = "matched leaf but commit did not verify (no isselected flip / chip)";
   }
 
   // INLINE AI RESCUE (Option B) — the walk exhausted (genuine no-match). If the call site supplied
@@ -1441,34 +1439,39 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // no context / nothing to evaluate ⇒ the caller falls through to the existing Tab-exit (unchanged).
   const tryInlineAi = async () => {
     if (!(opts.ai && act.aiEnabled)) return null;
+    // TREE vs FLAT. A hierarchical picker — source (the sourceTree flag) OR any field whose open no-match view
+    // shows CATEGORY rows (cert / generic) — is DRILLED by the ONE unified tree drill (CLICK the category →
+    // scrape its leaves → TYPE the chosen leaf): typing a category filters to NOTHING, so it must be clicked.
+    // A flat typeahead (FoS) uses the single-prompt flat fallback. readTreeCategories reads the STALE no-match
+    // view (NO clear — the no-match falls back to the on-open list + banner, so a tree's category rows are
+    // visible there); clearing wouldn't restore the on-open view anyway and is focus-blind.
+    let isTree = !!opts.ai.sourceTree;
+    if (!isTree && act.readTreeCategories) { try { isTree = (await act.readTreeCategories(loc)).length > 0; } catch (e) { isTree = false; } }
+    if (isTree) {
+      // capturedFull = the Fix 2 START-scraped CATEGORIES for a tree (else aiTreeDrillFallback self-scrapes). The
+      // drill commits on the open field (a commit closes it; a fail returns an honest needs_review) — no extra Tab;
+      // it tags ai-choice / ai-eeo-guess (EEO) itself.
+      // `candidates` = the field's STATED answer → the drill MATCHES it (typo-tolerant) instead of inferring from
+      // the whole profile (the "Otherrr → Carnegie Mellon" fix).
+      const aiRes = await aiTreeDrillFallback(act, loc, opts.ai, budgets, capturedFull, candidates);
+      return (aiRes && aiRes.status) ? aiRes : null;
+    }
+    // FLAT: the full option list is the Fix 2 onCapture START-scrape (capturedFull) — a flat typeahead is now
+    // ALWAYS start-scraped, so there is NO scrape after the deterministic fill fails (the operator's ask). The
+    // last filtered set is the only fallback (e.g. a start-scrape that returned nothing). statedAnswer =
+    // `candidates` → the AI MATCHES it (typo-tolerant) instead of inferring from the whole profile.
     const rec = {
       auditLoc: loc.wrapperSel, widgetType: "typeahead",
       options: (capturedFull && capturedFull.length) ? capturedFull : (lastFiltered || []),
       captured_options: lastFiltered || undefined,
+      statedAnswer: candidates,
       isRequired: !!opts.ai.isRequired, label: opts.ai.label, fieldName: opts.ai.fieldName
     };
-    // TREE vs FLAT routing: clear the search to restore the on-open view, then check for CATEGORY rows.
-    // A TREE (cert) → the two-prompt drill (aiTreeFallback, which SEES the real leaves); else the flat
-    // single-prompt (aiTypeaheadFallback). The clear is harmless for a flat field (its options are already
-    // captured in rec.options/captured_options).
-    let aiRes = null;
-    let isTree = false;
-    if (act.readTreeCategories) {
-      // Read the STALE view directly — NO clear. clearSearch is focus-blind (the deterministic filter-Enter
-      // dropped searchBox focus → an unfocused Ctrl+A/Delete no-ops: the wasted first clear + a pollSearchValue
-      // wait), AND clearing a typeahead does NOT restore the on-open view anyway. On a no-match the widget
-      // falls back to the ORIGINAL list + a "No matches found" banner, so a TREE's category rows are already
-      // visible here → aiTreeFallback drills from them (no reopen); an ambiguous-containment shows the filtered
-      // LEAVES (no categories → routes flat → AI picks from the visible matches). The flat commit's single,
-      // FOCUSED clear happens in commitAiTypeahead's re-entry (its main loop ensureSearchFocused()es first).
-      try { isTree = (await act.readTreeCategories(loc)).length > 0; } catch (e) { isTree = false; }
-    }
-    if (isTree) aiRes = await aiTreeFallback(act, loc, rec, opts.ai.profile, opts.ai.jobContext, budgets);
-    if (!isTree || aiRes === null) aiRes = await aiTypeaheadFallback(act, rec, opts.ai.profile, opts.ai.jobContext, budgets);
+    const aiRes = await aiTypeaheadFallback(act, rec, opts.ai.profile, opts.ai.jobContext, budgets);
     if (!aiRes || !aiRes.status) return null; // "no options to evaluate" → fall through to the normal no-match exit
     if (aiRes.status === "filled_review" && isEeoField(rec)) aiRes.flag = "ai-eeo-guess"; // EEO retraction: demographic badge
     // Clean exit if the AI did NOT commit (decline / failure leaves the field open on the failed query).
-    try { const st = await act.readTypeahead(loc); if (st && st.searchBox && st.searchBox.visible) await act.pressTab(); } catch (e) { /* best-effort */ }
+    try { const st = await act.readHier(loc); if (st && st.searchBox && st.searchBox.visible) await act.pressTab(); } catch (e) { /* best-effort */ }
     return aiRes;
   };
 
@@ -1478,7 +1481,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   if (isOverwrite) {
     const aiR = await tryInlineAi();
     if (aiR) return aiR;
-    return await overwriteNoMatchResting(act, loc, (l) => act.readTypeahead(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
+    return await overwriteNoMatchResting(act, loc, (l) => act.readHier(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
       // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
       async (value) => {
         // STEP 1 — TERMINAL GATE (the keptLowerTier stray fix): the higher-tier no-match's empty-results render
@@ -1487,7 +1490,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
         // before clearing — never a bannerless list. NO disarm: a clean full "Other" typed into a settled,
         // focused box + step 4's affirmative click (a real selection that OVERWRITES any armed row-0) makes a
         // disarm redundant — and polling an auto-highlight that never clears would burn to the ceiling.
-        await awaitListTerminal(act, (l) => act.readTypeahead(l), loc, budgets, chipSetIsNew);
+        await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
         // STEPS 3-4 — FOCUS-SAFE re-type: clearSearch is FOCUS-BLIND (Ctrl+A to whatever has focus), so
         // re-verify focus IMMEDIATELY before the type (the focus-blind clear is INSIDE the re-assert), and on a
         // blur (focus not confirmed after the clear, OR a PARTIAL landed value) re-focus + re-clear + re-type
@@ -1495,12 +1498,12 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
         let landed = false;
         for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
           if (!(await ensureSearchFocused())) return []; // can't focus → no blind actuation (caller → needs_review)
-          await act.clearSearch();
-          await pollSearchValue(act, () => act.readTypeahead(loc), "", budgets);
-          const fs = await act.readTypeahead(loc);
+          await act.clearHierSearch();
+          await pollSearchValue(act, () => act.readHier(loc), "", budgets);
+          const fs = await act.readHier(loc);
           if (!(fs && fs.searchBox && fs.searchBox.focused)) continue; // blur after the clear → re-loop (re-focus re-clears)
-          await act.typeInSearch(value);
-          landed = await pollSearchValue(act, () => act.readTypeahead(loc), value, budgets); // FULL value echoed in the FOCUSED box?
+          await act.typeInHier(value);
+          landed = await pollSearchValue(act, () => act.readHier(loc), value, budgets); // FULL value echoed in the FOCUSED box?
           // landed === false → partial value (blur mid-type) → re-loop
         }
         if (!landed) return []; // never Enter on a partial/unfocused box → [] → overwriteNoMatchResting returns needs_review (honest, no stray)
@@ -1509,16 +1512,16 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
         // blur — then a read. So the affirmative click is reached blur-free and is the FINAL committing
         // action, pre-empting any exit-blur-commit of an armed row.
         await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
-        let r = await act.readTypeahead(loc);
+        let r = await act.readHier(loc);
         if (!(r && (r.chips || []).some((c) => norm(c) === norm(value)))) {
           // AFFIRMATIVE re-commit: a TRUSTED click on the resolved "value" leaf overwrites whatever the
           // filter-Enter armed/committed (the proven recon recommitOther recovery). Can't truncate or stray.
-          try { await act.clickTaOption(loc, value); } catch (e) { /* leaf not clickable → STRAY GUARD below */ }
-          await act.delayFull(budgets.commitIntervalMs); r = await act.readTypeahead(loc);
+          try { await act.clickHierLeaf(loc, value); } catch (e) { /* leaf not clickable → STRAY GUARD below */ }
+          await act.delayFull(budgets.commitIntervalMs); r = await act.readHier(loc);
         }
         // STEP 5 (TYPEAHEAD_SELF_VERIFY, OFF) — settle + chip RE-READ before returning, so the record reflects
         // the SETTLED chip rather than the momentary post-click read. Redundant with M40 once the above holds.
-        if (TYPEAHEAD_SELF_VERIFY) { await act.delayFull(budgets.selfVerifyMs || 1300); r = await act.readTypeahead(loc); }
+        if (TYPEAHEAD_SELF_VERIFY) { await act.delayFull(budgets.selfVerifyMs || 1300); r = await act.readHier(loc); }
         // STRAY GUARD: return the REAL post-click chips (never [] for a stray — that would hide the live
         // value). overwriteNoMatchResting is the needs_review bail: chip == value → filled; empty →
         // needs_review; anything else (a blur-stray the click didn't overwrite) → needs_review/overwrite-stray
@@ -1537,7 +1540,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // catches a late/stray commit our settle missed (e.g. a highlight-Enter that landed after we
   // moved on). A committed chip (selectedItem) survives the blur, so this reflects the true settled
   // state; an uncommanded chip is flagged for review.
-  const endChips = await tabBlurExit(act, loc, (l) => act.readTypeahead(l));
+  const endChips = await tabBlurExit(act, loc, (l) => act.readHier(l));
   const strayChip = endChips && endChips.length ? endChips.join("; ") : null;
   if (strayChip) {
     return { status: "needs_review", after: strayChip, verified: false, detail: "uncommanded value on the field — review (no candidate matched; chip overwrite is a later milestone)", captured_options: lastFiltered || undefined, settle_trace: trace };
@@ -1548,365 +1551,20 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // (commit-ladder limitation, the data IS valid) is NOT genuine → keep + surface, never
   // delete. (Mirrors fillDropdownCdp's genuineNoMatch — the data-loss safety, lockstep.)
   const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "nomatch" || (s.outcome === "results" && !s.match));
-  return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace, genuineNoMatch };
+  return { status: "needs_review", after: null, verified: false, detail: "no candidate produced a verified chip", captured_options: lastFiltered || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded, genuineNoMatch };
 };
 
-// Source ("How did you hear about us?") — the Magna SEARCH shape, recon 2026-06-12.
-// TODO(dup): this MIRRORS fillTypeaheadCdp's walk structure (focus hygiene,
-// per-candidate clear/type/Enter-filter, transition-aware settle + banner block,
-// candidate-only match, commit ladder, honesty read). Kept SEPARATE to leave the
-// shipped typeahead path untouched; if a third picker appears, factor the shared
-// walk into a picker-adapter and collapse both. Change in lockstep with
-// fillTypeaheadCdp. Source-specific deltas vs typeahead:
-//   • leaves = act.readSource().leaves (page-wide promptOption, data-automation-label,
-//     CHIP-EXCLUDED — a committed chip elsewhere embeds a promptOption and otherwise
-//     contaminates; recon Phase A hit exactly this);
-//   • commit-verify accepts EITHER the matched leaf's promptLeafNode
-//     `multiselectlistitem-isselected==="true"` (act.probeSourceLeaf) OR a
-//     selectedItem chip normalize-matching the candidate;
-//   • categories shown on open are bypassed — typing filters straight to leaves.
-const fillSourceCdp = async (act, loc, candidates, budgets, opts) => {
-  opts = opts || {};
-  const norm = apMatch.normalize;
-  const pre = await act.readSource(loc);
-  if (!pre) return { status: "error", detail: "source wrapper not found" };
-
-  // Pre-filled guard — TIER-AWARE (M36.1, lockstep with fillTypeaheadCdp). tier 0 →
-  // keep, ZERO actuation; tier k>0 → walk only the higher tiers (slice(0,k), priority
-  // order) and overwrite to the best the form offers, else keep (walk-end
-  // prefilled-better-tier-unavailable); tier -1 → genuine mismatch → full overwrite
-  // walk (recon proved source is symmetric: search-while-populated, clearSourceSearch
-  // preserves the chip, commit REPLACES).
-  const priorChips = pre.chips.slice();
-  const preTierIndex = priorChips.length
-    ? candidates.findIndex((cand) => priorChips.some((c) => norm(c) === norm(cand)))
-    : -1;
-  if (preTierIndex === 0) {
-    return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled source chip is already the top candidate — kept (no actuation)" };
-  }
-  const overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
-  const isOverwrite = priorChips.length > 0;
-  const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
-  const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
-
-  if (!(await act.openSource(loc))) return { status: "error", detail: "could not open source (opener rects dead)" };
-  // ensure searchBox focused (focus hygiene; a banner can drop focus — M25 leak).
-  const ensureFocused = async () => {
-    let s = await act.readSource(loc);
-    if (!s || !s.searchBox.present || !s.searchBox.visible) {
-      if (!(await act.openSource(loc))) return null;
-      const t0 = Date.now();
-      while (Date.now() - t0 < budgets.taOpenCeilingMs) {
-        await act.delay(budgets.taOpenIntervalMs);
-        s = await act.readSource(loc);
-        if (s && s.searchBox.visible) break;
-      }
-    }
-    if (s && s.searchBox.visible && !s.searchBox.focused) { await act.focusSourceSearch(loc); s = await act.readSource(loc); }
-    return s && s.searchBox.focused ? s : null;
-  };
-
-  const trace = [];
-  let lastLeaves = null;
-  // M30: did the source options EVER render during the walk? If they never load
-  // (leafCount stays 0, no chip) the server didn't return them — the dead-session
-  // tell (distinct from "loaded but no candidate matched"). Surfaced on the
-  // walk-end no-commit return for drivePageFill's session warning.
-  let optionsEverLoaded = false;
-  for (const [ci, cand] of overwriteCandidates.entries()) {
-    const step = { candidate: cand };
-    trace.push(step);
-    // BETWEEN CANDIDATES (lockstep with the typeahead): BLOCK until the prior no-match reaches a terminal
-    // (its banner / autocommit) before clearing/typing the next — never a bannerless list. Source's filter-Enter
-    // CAN auto-commit a leaf (M26 "LinkedIn auto-commits"), so a truncated type → a wrong auto-commit is an
-    // analogous stray. Resolves on the banner (fast); a "timeout" on a no-match tier is the latency smell.
-    // Skipped for the first candidate.
-    if (ci > 0) step.priorSettle = await awaitListTerminal(act, (l) => act.readSource(l), loc, budgets, chipSetIsNew);
-    if (!(await ensureFocused())) {
-      step.note = "could not focus source search field — not actuating blind";
-      await act.pressTab(); // BLUR before leaving: a prior candidate may have ARMED a leaf — Tab abandons it (lockstep with typeahead)
-      return { status: "needs_review", after: null, verified: false, detail: "could not focus the source search field — not actuating blind", settle_trace: trace };
-    }
-    // FIRST-OPEN RENDER GATE (lockstep with fillTypeaheadCdp's open-race fix, source variant): ensureFocused
-    // above returns the moment the searchBox is visible+focused, but the freshly-opened popup is still
-    // rendering. Typing into that mid-render state races the render (the typed query can be dropped/misfiltered)
-    // AND the render can steal focus off the box. Source's on-open view is the CHEVRON CATEGORY rows, not a leaf
-    // list (leafCount is 0 until a query filters to leaves) — so the "rendered" signal is the popup CONTENT:
-    // categories OR leaves (awaitSourceListStable), NOT the leaf count alone. Then RE-ASSERT focus (the render
-    // may have blurred the box) before the clear/type. Only the first candidate of the freshly-opened picker;
-    // ci>0 already passed through the between-candidates awaitListTerminal (a known terminal render state).
-    if (ci === 0) {
-      await awaitSourceListStable(act, loc, budgets);
-      if (!(await ensureFocused())) {
-        step.note = "could not re-focus after the source popup rendered — not actuating blind";
-        await act.pressTab(); // BLUR before leaving (lockstep with the focus-fail bail above)
-        return { status: "needs_review", after: null, verified: false, detail: "could not re-focus the source search field after the popup rendered — not actuating blind", settle_trace: trace };
-      }
-    }
-    // FOCUS-SAFE clear + type (structurally closed, lockstep with the typeahead): ECHO-VERIFY the FULL
-    // candidate landed (pollSearchValue) BEFORE the filter-Enter; on a blur/partial, re-focus + re-clear +
-    // re-type (bounded); NEVER pressEnter on a partial/unfocused box.
-    let snap = null, snapSig = null, landed = false;
-    for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
-      if (attempt > 1 && !(await ensureFocused())) break; // re-assert focus on retry
-      await act.clearSourceSearch();
-      await pollSearchValue(act, () => act.readSource(loc), "", budgets); // the clear has LANDED before snapshot
-      snap = await act.readSource(loc);
-      if (!(snap && snap.searchBox && snap.searchBox.focused)) continue; // blur after the clear → re-loop
-      snapSig = snap.sig;
-      await act.typeInSourceSearch(cand);
-      landed = await pollSearchValue(act, () => act.readSource(loc), cand, budgets); // FULL candidate echoed in the FOCUSED box?
-    }
-    if (!landed) {
-      step.note = "could not type the full candidate into a focused source box (partial/blur) — not pressing Enter";
-      await act.pressTab(); // BLUR before leaving: an armed leaf from a prior/partial filter must not survive to the next field (lockstep)
-      return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused source search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
-    }
-    await act.pressEnter(); // these filter on ENTER, not live (recon)
-
-    // RENDER GATE (lockstep with fillTypeaheadCdp): block until a CONFIRMED terminal (banner / autocommit),
-    // never a bannerless leaf list, before reading/matching/committing.
-    let s = null;
-    const tSettle = Date.now();
-    const outcome = await awaitListTerminal(act, (l) => act.readSource(l), loc, budgets, chipSetIsNew);
-    s = await act.readSource(loc); // fresh snapshot at the SETTLED terminal (stable → consistent re-read)
-    if (s && (s.leafCount > 0 || (s.chips && s.chips.length > 0))) optionsEverLoaded = true; // M30 liveness (the source responded with leaves/a chip)
-    step.outcome = outcome;
-    step.settleMs = Date.now() - tSettle;
-    step.count = s ? s.leafCount : null;
-    step.banner = !!(s && s.banner);               // "No matches found"
-    step.resultsBanner = !!(s && s.resultsBanner); // "Search Results"
-    step.open = !!(s && s.searchBox && s.searchBox.visible);
-    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null;
-
-    if (outcome === "autocommit") {
-      // Auto-commit on the filter-Enter (NEW chip, OR picker CLOSED holding a chip = closedCommit, the
-      // chip-equals-pre-fill case) — classify by tier (M27, lockstep with fillTypeaheadCdp): exact → filled;
-      // containment/fuzzy → filled_review + flag; no match → needs_review (stray). `unchanged` = closedCommit
-      // whose chip equals the prior value → KEPT provenance, not "overwrote". No disarm needed (already closed/
-      // committed). closedCommit re-derived from the snapshot: box CLOSED holding a NON-new chip (the pre-fill);
-      // a NEW chip is an enter-auto-commit even if the box closed, so closedCommit REQUIRES !chipSetIsNew.
-      const closedCommit = !!(s && s.searchBox && !s.searchBox.visible && s.chips && s.chips.length && !chipSetIsNew(s.chips));
-      step.chip = s.chips.join("; ");
-      const cm = apMatch.matchCandidates([cand], s.chips);
-      const unchanged = closedCommit && isOverwrite && apMatch.normalize(step.chip) === apMatch.normalize(priorChips.join("; "));
-      const oc = commitOutcome(unchanged ? false : isOverwrite, "auto", cm.matchTier);
-      const mt = closedCommit ? "closed-commit" : "enter-auto-commit";
-      step.flag = oc.flag;
-      if (oc.status === "needs_review") {
-        const flag = unchanged ? "overwrite-nomatch-original-kept" : oc.flag;
-        step.flag = flag;
-        const d = unchanged
-          ? `kept source pre-fill "${priorChips.join("; ")}" (autocommitted + closed) but it matches no candidate — review`
-          : isOverwrite
-          ? `overwrote source pre-fill "${priorChips.join("; ")}" but the auto-commit chip "${step.chip}" matches no candidate — ${oc.flag}, walk stopped`
-          : `source auto-commit chip "${step.chip}" does not match candidate "${cand}" — flagged (${oc.flag}), walk stopped`;
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag, confidence: oc.confidence, detail: d, settle_trace: trace }, false);
-      }
-      if (isOverwrite && s.chips.length > 1) {
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: mt, flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${s.chips.length} chips (expected single REPLACE) — review`, settle_trace: trace }, true);
-      }
-      const prov = unchanged ? `kept source pre-fill "${priorChips.join("; ")}" (matches candidate "${cand}" via ${cm.matchTier}) → ` : isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip, verified: true, matchTier: mt, flag: oc.flag, confidence: oc.confidence, detail: `${prov}source ${closedCommit ? "autocommit-closed" : "auto-committed"} on the filter-Enter (candidate "${cand}", ${oc.flag})`, settle_trace: trace }, true);
-    }
-    if (outcome === "nomatch") { step.note = "no-match terminal (\"No matches found\" banner + stable) — hard block, next candidate"; continue; }
-    if (outcome !== "results") { step.note = "no terminal results within budget (timeout) — treated as no-match"; continue; } // timeout → no-match
-    // outcome === "results": "Search Results" banner + stable non-zero leaf count — NOW safe to read + match.
-
-    const leaves = s.leaves;
-    lastLeaves = leaves;
-    step.leafCount = s.leafCount;
-    const m = apMatch.matchCandidates([cand], leaves);
-    if (m.targetIndex !== -1) step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
-    if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set"; continue; }
-
-    const matchedLeaf = leaves[m.targetIndex];
-    step.matchedLeaf = matchedLeaf;
-    // Commit ladder: trusted CLICK the matched leaf (recon: no highlight arms under
-    // CDP typing). Verify via the promptLeafNode isselected flip OR a selectedItem chip.
-    const verifyCommitted = async () => {
-      const probe = await act.probeSourceLeaf(matchedLeaf);
-      const leafSelected = !!(probe && probe.commitWrapper && probe.commitWrapper.isSelectedValue === "true");
-      const st = await act.readSource(loc);
-      const chipMatch = !!(st && st.chips.some((c) => norm(c) === norm(matchedLeaf)));
-      return { leafSelected, chipMatch, chips: st ? st.chips : [] };
-    };
-    let committed = false, via = null, vc = null;
-    if (await act.clickSourceLeaf(matchedLeaf)) {
-      const d0 = Date.now();
-      while (Date.now() - d0 < budgets.commitCeilingMs) {
-        await act.delay(budgets.commitIntervalMs);
-        vc = await verifyCommitted();
-        if (vc.leafSelected || vc.chipMatch) { committed = true; via = vc.chipMatch ? "selectedItem-chip" : "promptLeafNode-isselected"; break; }
-      }
-    }
-    step.commitVia = via;
-    step.chip = vc && vc.chips.length ? vc.chips.join("; ") : null;
-    if (committed) {
-      // Directed leaf-click verified. Grade by candidate→leaf tier (M27); under
-      // overwrite → overwrite-success + provenance. matchTier = commit path,
-      // quality → confidence, provenance → flag.
-      const oc = commitOutcome(isOverwrite, "directed", m.matchTier);
-      step.flag = oc.flag;
-      const finalChips = vc ? vc.chips : [];
-      if (isOverwrite && finalChips.length > 1) {
-        return withOverwrite({ status: "needs_review", after: step.chip, verified: false, matchTier: "source-click-commit", flag: "overwrite-residual-flagged", confidence: "none", detail: `source overwrite left ${finalChips.length} chips (expected single REPLACE) — review`, captured_options: leaves, settle_trace: trace }, true);
-      }
-      const prov = isOverwrite ? `overwrote "${priorChips.join("; ")}" → ` : "";
-      return withOverwrite({ status: oc.status, after: step.chip || matchedLeaf, verified: true, matchTier: "source-click-commit", flag: oc.flag, confidence: oc.confidence, detail: `${prov}source click-commit on "${matchedLeaf}" (verified via ${via}, ${m.matchTier})`, captured_options: leaves, settle_trace: trace }, true);
-    }
-    step.note = "matched leaf but commit did not verify (no isselected flip / chip)";
-  }
-
-  // INLINE AI RESCUE (source) — TWO-PROMPT DRILL (scroll-enumerate) + TYPED commit. The DOM facts
-  // (operator): typing does NOT drill — it filters the WHOLE tree and a UNIQUE match autocommits; clicking a
-  // category chevron drills it to reveal its leaves; lists are VIRTUALIZED (scroll to see every option); the
-  // same label can sit in multiple trees (e.g. two "Other") so a typed filter shows >1 → commit the TOP. So:
-  // (1) scroll-enumerate ALL categories → AI picks one; (2) DRILL it → scroll-enumerate ALL its leaves → AI
-  // picks a SEEN leaf; (3) commit by TYPING that leaf via the PROVEN path (re-enter fillSourceCdp([leaf]) — no
-  // opts.ai → no recursion — whose commit ladder autocommits a unique match or clicks the top of a tie). The
-  // AI only ever types a leaf it actually SAW (no blind guessing). Cert keeps the click-in-drilled-view drill
-  // (aiTreeFallback); source can't use that because its drilled "Other" is the CATEGORY, which re-drills.
-  const tryInlineAiSource = async () => {
-    if (!(opts.ai && act.aiEnabled)) return null;
-    const profile = opts.ai.profile, jobContext = opts.ai.jobContext;
-    const label = String(opts.ai.label || opts.ai.fieldName || "How did you hear about us?");
-    const eeo = isEeoField({ widgetType: "hierarchical", fieldName: opts.ai.fieldName, label });
-    const fail = (flag, confidence, detail, extra) => Object.assign({ status: "needs_review", after: null, verified: false, flag, confidence, detail, auditLoc: loc.wrapperSel }, extra || {});
-
-    // (1) Settle, then enumerate ALL categories (scroll-accumulate). On the no-match fallback the category
-    //     LABELS render as promptOptions → scrapeSourceRows returns them in `options`. No isCategory split
-    //     (the chevron isn't on the promptOption), and NO reopen (the no-match already shows them).
-    const norm = apMatch.normalize;
-    await act.delayFull(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner)
-    let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
-    const categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
-    if (!categories.length) return null; // no options visible → caller's needs_review (never guess blind)
-
-    // PROMPT 1 — pick the CATEGORY.
-    const sys1 = "You are answering 'How did you hear about us?' on a job application. The options are grouped into CATEGORIES. Choose the SINGLE category most likely to CONTAIN the applicant's answer. Reply ONLY with a JSON object.";
-    const user1 = "Field: " + label
-      + "\nCategories (choose exactly one; reply with its EXACT text): " + JSON.stringify(categories)
-      + "\nApplicant profile: " + JSON.stringify(profile) + "\nJob context: " + JSON.stringify(jobContext || {})
-      + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact category text>\",\"confidence\":\"High|Medium|Low\"}";
-    const r1 = await act.llm({ system: sys1, user: user1, maxTokens: 256 });
-    if (!r1 || !r1.ok) return fail("ai-call-failed", "low", "AI source category call failed — " + ((r1 && r1.error) || "no reply"), { options: categories });
-    const cReply = parseAiTreeReply(r1.text);
-    const cm = apMatch.matchCandidates([cReply.choice], categories);
-    const category = cm.targetIndex !== -1 ? categories[cm.targetIndex] : nearestOption(cReply.choice, categories);
-    if (!category) return fail("ai-nomatch", cReply.confidence, "AI source category \"" + cReply.choice + "\" matched no category", { options: categories });
-
-    // DEBUG isolation (operator harness): BEFORE the production drill — dump the category element (recon) +
-    // test which click drills (role=option via expandCategory, else the promptOption via clickSourceLeaf) +
-    // read the post-click state (banner/options = drilled? chips = committed?), then STOP. Flag-gated →
-    // production path unaffected.
-    if (opts.ai.debugStopAfterCategory) {
-      // Scroll-to-find ONCE (slow), then click its rect — same as expandCategory but a single scroll (no
-      // double-scroll thrash). category_dom shows what was found; clicked = the click fired on a real rect.
-      const category_dom = act.sourceRowRect ? await act.sourceRowRect(category) : null; // scroll+settle → promptLeafNode rect
-      let clicked = false;
-      if (category_dom && category_dom.found && category_dom.rect && category_dom.rect.w > 0 && act.clickAt) {
-        await act.clickAt(category_dom.rect.cx, category_dom.rect.cy); clicked = true; // TRUSTED click on the leaf's live center
-      }
-      await act.delayFull(budgets.commitIntervalMs);
-      let post = null, chips = null;
-      try { post = await act.scrapeSourceRows(loc); } catch (e) {}
-      try { const s = await act.readSource(loc); chips = (s && s.chips) || []; } catch (e) {}
-      return { status: "skipped", flag: "ai-source-debug", verified: null, after: null,
-        detail: "DEBUG: no-match → AI category \"" + category + "\" → click(" + (clicked ? "ok" : "FAILED") + "); stopped (no leaf/commit)",
-        debug: { categories, ai_category_reply: cReply.choice, ai_confidence: cReply.confidence, chosen_category: category, category_dom, clicked, post_click: { banner: (post && post.banner) || null, options: (post && post.options) || [] }, chips },
-        tree_structure: { categories, chosen: category, leaves: (post && post.options) || [] }, auditLoc: loc.wrapperSel };
-    }
-    // (2) DRILL the category; wait until the BANNER == the chosen category (drill confirmed — the operator's
-    //     reliable signal) and the leaves are stable (2 equal scrapes). Banner-match primary; "options flipped
-    //     from the category list" is the fallback for a tenant that shows no drilled-category banner.
-    if (!(await act.expandCategory(loc, category))) return fail("ai-commit-failed", cReply.confidence, "could not drill category \"" + category + "\"", { tree_structure: { categories, chosen: category } });
-    const wantBanner = norm(category), catSig = categories.join("|");
-    let leaves = [], prevSig = "";
-    const t0 = Date.now();
-    while (Date.now() - t0 < (budgets.taOpenCeilingMs || 5000)) {
-      await act.delay(budgets.taOpenIntervalMs || 120);
-      let s = null; try { s = await act.scrapeSourceRows(loc); } catch (e) {}
-      if (!s || !s.ok || !s.options.length) continue;
-      const bannerHit = !!(s.banner && norm(s.banner).indexOf(wantBanner) !== -1); // the drilled-category banner
-      const flipped = s.options.join("|") !== catSig;                              // list replaced by leaves
-      if (!bannerHit && !flipped) continue;                                        // still on the category view
-      const sig = s.options.join("|");
-      leaves = s.options;
-      if (sig === prevSig) break;  // stable (2 equal reads)
-      prevSig = sig;
-    }
-    if (!leaves.length) return fail("ai-no-options", cReply.confidence, "category \"" + category + "\" revealed no leaves (no drill banner / list never flipped)", { tree_structure: { categories, chosen: category } });
-
-    // PROMPT 2 — pick the LEAF (the full scrolled list).
-    const tree_structure = { categories, chosen: category, leaves };
-    const sys2 = "You are picking the exact source under the category \"" + category + "\" for 'How did you hear about us?'. Choose the SINGLE option that best fits the applicant; prefer \"Other\" when nothing else fits. Reply ONLY with a JSON object.";
-    const user2 = "Field: " + label + "  (category: " + category + ")"
-      + "\nOptions (choose exactly one; reply with its EXACT text): " + JSON.stringify(leaves)
-      + "\nApplicant profile: " + JSON.stringify(profile) + "\nJob context: " + JSON.stringify(jobContext || {})
-      + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
-    const r2 = await act.llm({ system: sys2, user: user2, maxTokens: 256 });
-    if (!r2 || !r2.ok) return fail("ai-call-failed", "low", "AI source leaf call failed — " + ((r2 && r2.error) || "no reply"), { tree_structure, options: leaves });
-    const lReply = parseAiTreeReply(r2.text);
-    const lm = apMatch.matchCandidates([lReply.choice], leaves);
-    const leaf = lm.targetIndex !== -1 ? leaves[lm.targetIndex] : nearestOption(lReply.choice, leaves);
-    if (!leaf) return fail("ai-nomatch", lReply.confidence, "AI source leaf \"" + lReply.choice + "\" matched no option", { tree_structure, options: leaves });
-
-    // (3) COMMIT the SEEN leaf (operator recipe, 2026-06-28) — directly on the open drilled field, NO settle-wait /
-    //     second focus (live-confirmed a single focus → clear → type lands the value):
-    //       (a) FOCUS the search;
-    //       (d) Ctrl+A + Delete to clear the leftover no-match query ("carrier pidgon");
-    //       (e) TYPE the actual match → Enter filters → unique → autocommit; a multi-tree tie → click the TOP.
-    try { await act.focusSourceSearch(loc); } catch (e) {}                                    // (a)
-    await act.clearSourceSearch();                                                            // (d) Ctrl+A + Delete
-    await pollSearchValue(act, () => act.readSource(loc), "", budgets);
-    await act.typeInSourceSearch(leaf);                                                       // (e) type the match
-    await pollSearchValue(act, () => act.readSource(loc), leaf, budgets);
-    await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
-    let cr = null; try { cr = await act.readSource(loc); } catch (e) {}
-    if (!(cr && (cr.chips || []).some((c) => norm(c) === norm(leaf)))) {                       // not auto-committed → click the TOP match
-      try { await act.clickSourceLeaf(leaf); } catch (e) { /* filter-Enter-only tenant */ }
-      await act.delayFull(budgets.commitIntervalMs);
-      try { cr = await act.readSource(loc); } catch (e) {}
-    }
-    const committedChips = (cr && cr.chips) || [];
-    if (!committedChips.some((c) => norm(c) === norm(leaf))) return fail("ai-commit-failed", lReply.confidence, "AI source: typed-commit of \"" + leaf + "\" did not persist (chips: " + JSON.stringify(committedChips) + ")", { tree_structure, options: leaves });
-    return { status: "filled_review", after: committedChips.join("; "), verified: true, matchTier: "ai-source-tree", flag: eeo ? "ai-eeo-guess" : "ai-choice", confidence: lReply.confidence, detail: "AI source: " + category + " → typed \"" + leaf + "\" (drilled + scroll-enumerated; focus→settle→focus→clear→type commit)", options: leaves, tree_structure, auditLoc: loc.wrapperSel };
-  };
-
-  // Walk exhausted. Under OVERWRITE the original source chip is intact: rest the
-  // field clean ({chips:[original], query:""}) and flag for review (lockstep).
-  if (isOverwrite) {
-    const aiR = await tryInlineAiSource();
-    if (aiR) return aiR;
-    return await overwriteNoMatchResting(act, loc, (l) => act.readSource(l), ensureFocused, priorChips, trace, lastLeaves, budgets, preTierIndex > 0,
-      // recommitFn (source): re-select `value` via the source commit machinery (clickSourceLeaf).
-      async (value) => {
-        await act.clearSourceSearch(); await pollSearchValue(act, () => act.readSource(loc), "", budgets);
-        await act.typeInSourceSearch(value); await pollSearchValue(act, () => act.readSource(loc), value, budgets);
-        await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
-        let r = await act.readSource(loc);
-        if (!(r && (r.chips || []).some((c) => norm(c) === norm(value)))) {
-          try { await act.clickSourceLeaf(value); } catch (e) { /* filter-Enter only */ }
-          await act.delayFull(budgets.commitIntervalMs); r = await act.readSource(loc);
-        }
-        return r ? (r.chips || []) : [];
-      });
-  }
-  // Empty-field genuine no-match: try the AI tree drill on the OPEN field BEFORE the Tab-exit (lockstep
-  // with the typeahead's empty-field branch). null ⇒ AI off / no context / not a category view ⇒ the Tab
-  // honesty read runs unchanged.
-  const aiR = await tryInlineAiSource();
-  if (aiR) return aiR;
-  // Tab-blur exit (the only clean non-committing exit — lockstep with typeahead; Escape kept
-  // focus + the armed row so the next field's focus blur-committed the stray).
-  await tabBlurExit(act, loc, (l) => act.readSource(l));
-  // M38 Bug B1 — GENUINE no-match (deleteOnNoMatch) ONLY if every candidate gave a
-  // definitive negative (banner / filtered-but-absent); a timeout or present-but-
-  // uncommitted leaf is NOT genuine → keep + surface (lockstep with typeahead/dropdown).
-  const genuineNoMatch = trace.length > 0 && trace.every((s) => s.outcome === "nomatch" || (s.outcome === "results" && !s.match));
-  return { status: "needs_review", after: null, verified: false, detail: "no source candidate produced a verified commit", captured_options: lastLeaves || undefined, settle_trace: trace, optionsLoaded: optionsEverLoaded, genuineNoMatch };
-};
+// fillSourceCdp + tryInlineAiSource were MERGED into fillTypeaheadCdp — the unified hierarchical-typeahead
+// filler (2026-06-28). The Certification typeahead and "How did you hear about us?" are the SAME Workday
+// multiselect widget (operator recon): same selectors/structure/state attrs, both reading promptOption +
+// data-automation-label scoped by data-uxi-multiselect-id, committing the FIRST matching leaf. Source now
+// routes through fillTypeaheadCdp in drivePageFill (its how_did_you_hear candidates + M30 optionsLoaded +
+// EEO preserved); the AI no-match path is fillTypeaheadCdp.tryInlineAi (flat by default; the gated
+// aiTreeDrillFallback drill only when GENUINE categories render).
+// Back-compat alias: the source/debug harnesses (background.js RUN_CDP_SOURCE_FILL / RUN_CDP_SOURCE_AI_DEBUG)
+// + a few tests call fillSourceCdp(act, loc, candidates, budgets, opts) — signature-identical → the unified
+// filler. (debugStopAfterCategory is now a no-op; that debug dump lived in the removed tryInlineAiSource.)
+const fillSourceCdp = fillTypeaheadCdp;
 
 // ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
 // When a FLAT typeahead exhausts its tiers and GENUINELY no-matches (genuineNoMatch — every candidate
@@ -2010,6 +1668,20 @@ const commitAiTypeahead = async (act, loc, target, flag, confidence, detail, opt
 
 // The decision tree (in CODE, each leaf unit-tested). options = the captured full list
 // (rec.options || rec.captured_options); realOptions = options minus "Other"; otherOpt = "Other".
+// Build the AI's "what to base the pick on" line. When the applicant HAS a stated answer for THIS field (the
+// candidates the deterministic walk tried), give the AI ONLY that stated answer + have it MATCH it to an option
+// (typo-tolerant, e.g. "Otherrr"→"Other") — NOT the whole profile, which (a) wastes tokens and (b) lets the AI
+// OVERRIDE the stated answer by inferring from unrelated facts (the "Otherrr → Carnegie Mellon" bug: it picked
+// the applicant's school instead of their stated "Other"). Fall back to the full profile ONLY when there is no
+// stated answer for the field (e.g. an EEO field to infer). Used by both the flat + tree typeahead AI fallbacks.
+const statedAnswerBlock = (candidates, profile) => {
+  const stated = (Array.isArray(candidates) ? candidates : (candidates == null ? [] : [candidates]))
+    .map((c) => String(c == null ? "" : c).trim()).filter(Boolean);
+  return stated.length
+    ? { stated: true, line: "Applicant's STATED answer for this field (MATCH it to an option; correct obvious spelling/typos, e.g. \"Otherrr\"→\"Other\"): " + JSON.stringify(stated) }
+    : { stated: false, line: "Applicant profile: " + JSON.stringify(profile || {}) };
+};
+
 const aiTypeaheadFallback = async (act, rec, profile, jobContext, budgets) => {
   const loc = { wrapperSel: rec.auditLoc };
   const options = (Array.isArray(rec.options) && rec.options.length) ? rec.options
@@ -2026,11 +1698,16 @@ const aiTypeaheadFallback = async (act, rec, profile, jobContext, budgets) => {
     return { detail: "AI typeahead: no options to evaluate — left for review" }; // leave needs_review untouched
   }
 
-  // ≥1 real option → the LLM picks the closest + judges genuine representation.
-  const system = "You help an applicant pick a value for a job-application typeahead/autocomplete field (e.g. Field of Study). Given the applicant's profile (JSON), the field's question, and the FULL list of selectable options, return the SINGLE option that best represents the applicant. ALSO judge representation: set represented=true when an option is the SAME field of study OR a clear PARENT / CHILD / SIBLING discipline of the applicant's — e.g. \"Electrical and Computer Engineering\"→\"Electrical Engineering\", \"Software Engineering\"→\"Computer Science\", \"Applied Mathematics\"→\"Mathematics\" are GENUINE matches (represented=true; pick that option). Set represented=false ONLY when NO option is in the applicant's field at all — e.g. \"Economics\" when nothing economics/business/finance-like is offered — then the caller falls back to \"Other\". Copy the chosen option's text EXACTLY. Reply ONLY with a JSON object.";
+  // ≥1 real option → the LLM picks. STATED-ANSWER mode (the applicant gave an answer for this field) → match it
+  // to an option, typo-tolerant; PROFILE mode (no stated answer, e.g. EEO) → infer + judge representation.
+  const ctx = statedAnswerBlock(rec.statedAnswer, profile);
+  const system = "You help an applicant pick a value for a job-application typeahead/autocomplete field (e.g. Field of Study). "
+    + "If the applicant's STATED answer is provided, return the SINGLE option that best MATCHES it, correcting obvious spelling/typos (e.g. \"Otherrr\"→\"Other\"), and set represented=true when an option matches the stated answer. "
+    + "OTHERWISE (only their profile is given), return the SINGLE option that best represents the applicant and judge representation: set represented=true when an option is the SAME field of study OR a clear PARENT / CHILD / SIBLING discipline — e.g. \"Electrical and Computer Engineering\"→\"Electrical Engineering\", \"Applied Mathematics\"→\"Mathematics\" — and represented=false ONLY when NO option fits at all (the caller then falls back to \"Other\"). "
+    + "Copy the chosen option's text EXACTLY. Reply ONLY with a JSON object.";
   const user = "Question: " + String(rec.label || rec.fieldName || "")
     + "\nSelectable options (choose exactly one; reply with its EXACT text): " + JSON.stringify(realOptions)
-    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\n" + ctx.line
     + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"represented\":true|false,\"confidence\":\"High|Medium|Low\"}";
   const res = await act.llm({ system, user, maxTokens: 512 });
@@ -2066,88 +1743,152 @@ const aiTypeaheadFallback = async (act, rec, profile, jobContext, budgets) => {
     detail: "AI: the applicant's answer isn't among the options and there is no \"Other\"" + (resolved ? " (nearest: \"" + resolved + "\")" : "") + " — left for review", options, auditLoc: loc.wrapperSel };
 };
 
-// TWO-PROMPT AI for a TREE picker (cert). Called from tryInlineAi when the OPEN no-matched field shows
-// CATEGORY rows. Drill to SEE the real options (no blind typing): Prompt 1 picks a CATEGORY → expand it →
-// poll for the leaves → Prompt 2 picks a LEAF (the flat decision tree) → commit via clickTreeLeaf (NOT
-// typing; leaves carry the " - <Category>" suffix, stripped for the prompt, restored for the commit).
-// Records rec.tree_structure (categories + the chosen category's leaves) for the summary. ALWAYS
-// filled_review on a commit. Returns null if no categories (not actually a tree → caller falls back).
-const aiTreeFallback = async (act, loc, rec, profile, jobContext, budgets) => {
+// ── AI TREE drill — the ONE drill for EVERY hierarchical typeahead (source "How did you hear about us?" AND
+// cert AND any generic Workday TREE picker; operator: "fill the exact same way the source scrape fills, no need
+// for two functions"). A TREE's on-no-match rows are CATEGORIES, and typing a category into the searchBox
+// filters to NOTHING (typing finds LEAVES, not categories) — so the AI's chosen category must be CLICKED
+// (act.expandCategory → cdpSourceRowRect viewport-aware trusted click) to reveal its leaves, NOT typed (the merge
+// bug: the flat path TYPED "College/University" and failed). The chosen LEAF is then committed by TYPING it
+// (Enter autocommits a unique match / clicks the TOP on a multi-tree tie) — NOT clickTreeLeaf, because a drilled
+// leaf can re-drill on a click (the old cert-only clickTreeLeaf path is RETIRED). Flow: categories (the Fix 2
+// START-scrape `preCats` if supplied, else scroll-enumerate now) → Prompt 1 picks one → CLICK-drill (wait until
+// the banner == the category / the list flips) → scroll-enumerate ALL its leaves → Prompt 2 picks a SEEN leaf →
+// focus → clear → type the leaf → Enter. Returns the result, or null (no categories visible → caller falls to
+// the Tab-exit + needs_review; never a blind guess). aiCtx = { profile, jobContext, label, fieldName,
+// isRequired, debugStopAfterCategory }; preCats = the START-scraped category list (Fix 2) or undefined;
+// candidates = the field's STATED answer (what the deterministic walk tried) — given to the AI to MATCH (instead
+// of the whole profile) so a typo'd answer maps to the option (e.g. "Otherrr"→"Other") rather than the AI
+// inferring an unrelated profile fact (the "Carnegie Mellon" bug). See statedAnswerBlock.
+const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates) => {
+  const profile = aiCtx.profile, jobContext = aiCtx.jobContext;
+  const label = String(aiCtx.label || aiCtx.fieldName || "this field");
+  const eeo = isEeoField({ widgetType: "hierarchical", fieldName: aiCtx.fieldName, label });
   const norm = apMatch.normalize;
-  const cats = act.readTreeCategories ? await act.readTreeCategories(loc) : [];
-  if (!cats.length) return null; // not a tree (or categories not visible) → caller falls back to flat/normal
-  const required = !!rec.isRequired;
-  const fail = (flag, confidence, detail, extra) => Object.assign({ status: "needs_review", after: null, verified: false, flag, confidence, detail, auditLoc: loc.wrapperSel, tree_structure: { categories: cats } }, extra || {});
+  const ctx = statedAnswerBlock(candidates, profile); // STATED answer (match it) vs PROFILE (infer)
+  const fail = (flag, confidence, detail, extra) => Object.assign({ status: "needs_review", after: null, verified: false, flag, confidence, detail, auditLoc: loc.wrapperSel }, extra || {});
 
-  // ── PROMPT 1 — pick the CATEGORY ──
-  const sys1 = "You are navigating a job-application TREE picker (e.g. Certification — the top level is CATEGORIES that group the options by provider/source). Given the applicant's profile and the field, choose the SINGLE category most likely to CONTAIN the applicant's answer (a broad 'multiple/various providers' category is usually the catch-all). Reply ONLY with a JSON object.";
-  const user1 = "Field: " + String(rec.label || rec.fieldName || "")
-    + "\nCategories (choose exactly one; reply with its EXACT text): " + JSON.stringify(cats)
-    + "\nApplicant profile: " + JSON.stringify(profile)
-    + "\nJob context: " + JSON.stringify(jobContext || {})
+  // (1) Categories: the Fix 2 START-scrape (`preCats`) if available, else scroll-enumerate the on-no-match
+  //     fallback now (its category LABELS render as promptOptions → scrapeSourceRows returns them in `options`).
+  let categories = (Array.isArray(preCats) && preCats.length) ? preCats.slice() : [];
+  if (!categories.length) {
+    await act.delayFull(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner)
+    let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
+    categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
+  }
+  if (!categories.length) return null; // no options visible → caller's needs_review (never guess blind)
+
+  // PROMPT 1 — pick the CATEGORY (the one most likely to CONTAIN the applicant's stated answer, or — with no
+  // stated answer — inferred from the profile).
+  const sys1 = "You are navigating a job-application TREE picker: the options are grouped into CATEGORIES. If the applicant's STATED answer for this field is given, choose the category most likely to CONTAIN it (correct obvious spelling/typos); otherwise choose the category most likely to contain their answer inferred from the profile. A broad 'multiple/various/other' category is the usual catch-all. Reply ONLY with a JSON object.";
+  const user1 = "Field: " + label
+    + "\nCategories (choose exactly one; reply with its EXACT text): " + JSON.stringify(categories)
+    + "\n" + ctx.line + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact category text>\",\"confidence\":\"High|Medium|Low\"}";
   const r1 = await act.llm({ system: sys1, user: user1, maxTokens: 256 });
-  if (!r1 || !r1.ok) return fail("ai-call-failed", "low", "AI tree category call failed — " + ((r1 && r1.error) || "no reply"));
+  if (!r1 || !r1.ok) return fail("ai-call-failed", "low", "AI source category call failed — " + ((r1 && r1.error) || "no reply"), { options: categories });
   const cReply = parseAiTreeReply(r1.text);
-  const cm = apMatch.matchCandidates([cReply.choice], cats);
-  const category = cm.targetIndex !== -1 ? cats[cm.targetIndex] : nearestOption(cReply.choice, cats);
-  if (!category) return fail("ai-nomatch", cReply.confidence, "AI category \"" + cReply.choice + "\" matched no category");
+  const cm = apMatch.matchCandidates([cReply.choice], categories);
+  const category = cm.targetIndex !== -1 ? categories[cm.targetIndex] : nearestOption(cReply.choice, categories);
+  if (!category) return fail("ai-nomatch", cReply.confidence, "AI source category \"" + cReply.choice + "\" matched no category", { options: categories });
 
-  // ── DRILL — expand the category, poll until the list flips to its leaves ──
-  if (!(await act.expandCategory(loc, category))) return fail("ai-commit-failed", cReply.confidence, "could not expand category \"" + category + "\"", { tree_structure: { categories: cats, chosen: category } });
-  let leavesFull = [];
-  const t0 = Date.now();
-  while (Date.now() - t0 < (budgets.taOpenCeilingMs || 4000)) {
-    await act.delay(budgets.taOpenIntervalMs || 120);
-    const stillCats = await act.readTreeCategories(loc);
-    leavesFull = await act.readTreeLeaves(loc);
-    if (!stillCats.length && leavesFull.length) break; // categories replaced by leaves
-  }
-  if (!leavesFull.length) return fail("ai-no-options", cReply.confidence, "category \"" + category + "\" revealed no leaves", { tree_structure: { categories: cats, chosen: category } });
-
-  // strip the " - <Category>" suffix for the prompt; keep clean→full for the commit.
-  const suffix = " - " + category;
-  const cleanToFull = new Map();
-  const cleanLeaves = leavesFull.map((f) => { const c = f.endsWith(suffix) ? f.slice(0, -suffix.length) : f; cleanToFull.set(c, f); return c; });
-  const tree_structure = { categories: cats, chosen: category, leaves: cleanLeaves };
-  const realLeaves = cleanLeaves.filter((o) => !isOtherOption(o));
-  const otherLeaf = cleanLeaves.find(isOtherOption);
-
-  // commit a leaf via clickTreeLeaf (viewport-aware: scrolls an off-fold leaf into the clickable viewport; NOT
-  // typing) + verify the chip.
-  const commitLeaf = async (cleanPick, flag, confidence, detail) => {
-    const full = cleanToFull.get(cleanPick) || cleanPick;
-    const clicked = await act.clickTreeLeaf(loc, full);
-    if (!clicked) return { status: "needs_review", after: null, verified: false, flag: "ai-commit-failed", confidence, detail: detail + " — leaf click failed (\"" + full + "\")", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
+  // DEBUG isolation (operator harness): BEFORE the production drill — dump the category element + click test, then STOP.
+  if (aiCtx.debugStopAfterCategory) {
+    const category_dom = act.sourceRowRect ? await act.sourceRowRect(category) : null; // scroll+settle → promptLeafNode rect
+    let clicked = false;
+    if (category_dom && category_dom.found && category_dom.rect && category_dom.rect.w > 0 && act.clickAt) {
+      await act.clickAt(category_dom.rect.cx, category_dom.rect.cy); clicked = true; // TRUSTED click on the leaf's live center
+    }
     await act.delayFull(budgets.commitIntervalMs);
-    const st = await act.readSource(loc);
-    const chips = (st && st.chips) || [];
-    if (!chips.some((c) => norm(c) === norm(full))) return { status: "needs_review", after: chips.join("; ") || null, verified: false, flag: "ai-commit-failed", confidence, detail: detail + " — leaf commit did not persist", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
-    return { status: "filled_review", after: chips.join("; "), verified: true, matchTier: "tree-leaf", flag, confidence, detail, tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
-  };
-
-  // No real leaves under the category + "Other" → commit "Other" (no 2nd LLM call).
-  if (!realLeaves.length) {
-    if (otherLeaf) return await commitLeaf(otherLeaf, "ai-other-only", "medium", "no real options under \"" + category + "\" → \"Other\"");
-    return fail("ai-no-options", cReply.confidence, "no selectable leaves under \"" + category + "\"", { tree_structure });
+    let post = null, chips = null;
+    try { post = await act.scrapeSourceRows(loc); } catch (e) {}
+    try { const s = await act.readSource(loc); chips = (s && s.chips) || []; } catch (e) {}
+    return { status: "skipped", flag: "ai-source-debug", verified: null, after: null,
+      detail: "DEBUG: no-match → AI category \"" + category + "\" → click(" + (clicked ? "ok" : "FAILED") + "); stopped (no leaf/commit)",
+      debug: { categories, ai_category_reply: cReply.choice, ai_confidence: cReply.confidence, chosen_category: category, category_dom, clicked, post_click: { banner: (post && post.banner) || null, options: (post && post.options) || [] }, chips },
+      tree_structure: { categories, chosen: category, leaves: (post && post.options) || [] }, auditLoc: loc.wrapperSel };
   }
 
-  // ── PROMPT 2 — pick the LEAF (the flat decision tree over THIS category's leaves) ──
-  const sys2 = "You are picking the exact option for a job-application field, from the options under the category \"" + category + "\". Given the applicant's profile and the option list, return the SINGLE option that best represents the applicant. ALSO judge representation: represented=true if an option genuinely matches the applicant's answer (incl. a clear parent/child/sibling), false if it's only the nearest approximation. Copy the option's text EXACTLY. Reply ONLY with a JSON object.";
-  const user2 = "Field: " + String(rec.label || rec.fieldName || "") + "  (category: " + category + ")"
-    + "\nOptions (choose exactly one; reply with its EXACT text): " + JSON.stringify(realLeaves)
-    + "\nApplicant profile: " + JSON.stringify(profile)
-    + "\nJob context: " + JSON.stringify(jobContext || {})
-    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"represented\":true|false,\"confidence\":\"High|Medium|Low\"}";
-  const r2 = await act.llm({ system: sys2, user: user2, maxTokens: 512 });
-  if (!r2 || !r2.ok) return fail("ai-call-failed", "low", "AI tree leaf call failed — " + ((r2 && r2.error) || "no reply"), { tree_structure });
-  const lReply = parseAiTypeaheadReply(r2.text);
-  const lm = apMatch.matchCandidates([lReply.choice], realLeaves);
-  const resolved = lm.targetIndex !== -1 ? realLeaves[lm.targetIndex] : null;
-  if (lReply.represented && resolved) return await commitLeaf(resolved, "ai-choice", lReply.confidence, "AI tree: " + category + " → \"" + resolved + "\" (genuinely represented)");
-  if (otherLeaf) return await commitLeaf(otherLeaf, "ai-choice-other", lReply.confidence, "AI tree: applicant's answer isn't under \"" + category + "\"" + (resolved ? " (nearest: \"" + resolved + "\")" : "") + " → \"Other\"");
-  if (required) { const forced = resolved || nearestOption(lReply.choice, realLeaves); return await commitLeaf(forced, "ai-closest-forced", lReply.confidence, "AI tree FORCED closest \"" + forced + "\" under \"" + category + "\" (no \"Other\", REQUIRED) — VERIFY"); }
-  return { status: "needs_review", after: null, verified: false, flag: "ai-typeahead-decline", confidence: lReply.confidence, detail: "AI tree: no represented leaf under \"" + category + "\" + no \"Other\" (optional) — left for review", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
+  // (2) DRILL the category (CLICK, not type); wait until the BANNER == the chosen category (drill confirmed) and
+  //     the leaves are stable (2 equal scrapes). Banner-match primary; "options flipped from the category list"
+  //     is the fallback for a tenant that shows no drilled-category banner.
+  if (!(await act.expandCategory(loc, category))) return fail("ai-commit-failed", cReply.confidence, "could not drill category \"" + category + "\"", { tree_structure: { categories, chosen: category } });
+  const wantBanner = norm(category), catSig = categories.join("|");
+  let leaves = [];
+  const t0 = Date.now();
+  while (Date.now() - t0 < (budgets.taOpenCeilingMs || 5000)) {
+    await act.delay(budgets.taOpenIntervalMs || 120);
+    let s = null; try { s = await act.scrapeSourceRows(loc); } catch (e) {}
+    if (!s || !s.ok || !s.options.length) continue;
+    const bannerHit = !!(s.banner && norm(s.banner).indexOf(wantBanner) !== -1); // the drilled-category banner
+    const flipped = s.options.join("|") !== catSig;                              // list replaced by leaves
+    if (!bannerHit && !flipped) continue;                                        // still on the category view — keep waiting for the drill
+    // Drilled + a FULL scroll-accumulate done in THIS scrape → accept it. (Dropped the old "2 equal scrapes"
+    // stability re-read: scrapeSourceRows is already internally virtualization-complete — it scroll-accumulates
+    // until the option set stops growing — and the drilled-category banner confirms the render, so re-scrolling
+    // the whole list a second time only adds the duplicate down-then-top scroll the operator saw, no safety.)
+    leaves = s.options;
+    break;
+  }
+  if (!leaves.length) return fail("ai-no-options", cReply.confidence, "category \"" + category + "\" revealed no leaves (no drill banner / list never flipped)", { tree_structure: { categories, chosen: category } });
+
+  // PROMPT 2 — pick the LEAF (the full scrolled list).
+  const tree_structure = { categories, chosen: category, leaves };
+  const sys2 = "You are picking the exact option under the category \"" + category + "\" for the field \"" + label + "\". If the applicant's STATED answer is given, choose the option that best MATCHES it, correcting obvious spelling/typos (e.g. \"Otherrr\"→\"Other\"); otherwise choose the option that best fits the applicant. Prefer \"Other\"/a catch-all only when nothing matches. Reply ONLY with a JSON object.";
+  const user2 = "Field: " + label + "  (category: " + category + ")"
+    + "\nOptions (choose exactly one; reply with its EXACT text): " + JSON.stringify(leaves)
+    + "\n" + ctx.line + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
+  const r2 = await act.llm({ system: sys2, user: user2, maxTokens: 256 });
+  if (!r2 || !r2.ok) return fail("ai-call-failed", "low", "AI source leaf call failed — " + ((r2 && r2.error) || "no reply"), { tree_structure, options: leaves });
+  const lReply = parseAiTreeReply(r2.text);
+  const lm = apMatch.matchCandidates([lReply.choice], leaves);
+  const leaf = lm.targetIndex !== -1 ? leaves[lm.targetIndex] : nearestOption(lReply.choice, leaves);
+  if (!leaf) return fail("ai-nomatch", lReply.confidence, "AI source leaf \"" + lReply.choice + "\" matched no option", { tree_structure, options: leaves });
+
+  // SKIP-IF-ALREADY-COMMITTED (optimization): if the field ALREADY holds the AI's chosen leaf (e.g. a pre-filled
+  // chip the deterministic walk didn't recognize as a match, or the drill's filter already committed it), there
+  // is nothing to do — return it kept, ZERO actuation, never disturbing an already-correct value.
+  let cur = null; try { cur = await act.readSource(loc); } catch (e) {}
+  if (cur && (cur.chips || []).some((c) => norm(c) === norm(leaf))) {
+    try { await act.pressTab(); } catch (e) {} // close the still-open drill box (Tab blurs WITHOUT committing — the already-correct chip survives)
+    return { status: "filled_review", after: (cur.chips || []).join("; "), verified: true, matchTier: "ai-source-tree", flag: eeo ? "ai-eeo-guess" : "ai-choice", confidence: lReply.confidence, detail: "AI source: " + category + " → \"" + leaf + "\" already committed — kept (no re-commit)", options: leaves, tree_structure, auditLoc: loc.wrapperSel };
+  }
+
+  // (3) COMMIT the SEEN leaf by TYPING it on the still-open drilled field: focus → Ctrl+A+Delete (clear the
+  //     leftover no-match query) → TYPE the leaf → Enter (autocommit a unique match / click the TOP on a tie).
+  try { await act.focusSourceSearch(loc); } catch (e) {}
+  await act.clearSourceSearch();
+  await pollSearchValue(act, () => act.readSource(loc), "", budgets);
+  await act.typeInSourceSearch(leaf);
+  await pollSearchValue(act, () => act.readSource(loc), leaf, budgets);
+  await act.pressEnter(); // the filter-Enter
+  // COMMIT + VERIFY (operator): Workday autocommits ONLY a UNIQUE filtered match — a value like "Other" that
+  // filters to "Search Results (2): Other / Others" does NOT autocommit. So DETECT no-autocommit by polling for
+  // the leaf's chip, and if it didn't land, ESCALATE: (a) trusted CLICK the leaf (clickSourceLeaf matches by
+  // EXACT label → "Other", never "Others"); (b) press Enter AGAIN (commits the top result, which is always the
+  // exact match). At EVERY step the gate is identical — a committed chip that normalize-EQUALS `leaf` — so what
+  // the AI chose is exactly what ends up filled; a stray (e.g. "Others") is NEVER accepted (→ ai-commit-failed).
+  // settleCommit DOES NOT burn the full commitCeilingMs (10s) waiting for an autocommit a multi-result never
+  // gives (the operator's "long pause before the click"): it returns the MOMENT the leaf's chip lands, OR the
+  // results render WITHOUT a chip (stable across stableReads → no autocommit is coming → escalate to the click NOW).
+  const committedAsLeaf = (cr) => !!(cr && (cr.chips || []).some((c) => norm(c) === norm(leaf)));
+  const settleCommit = async () => {
+    let cr = null, resultsStable = 0; const t0 = Date.now();
+    while (Date.now() - t0 < budgets.commitCeilingMs) {
+      await act.delay(budgets.commitIntervalMs);
+      try { cr = await act.readSource(loc); } catch (e) {}
+      if (committedAsLeaf(cr)) return cr;                                                       // the leaf's chip landed → done
+      if (cr && cr.resultsBanner && !(cr.chips && cr.chips.length)) { if (++resultsStable >= budgets.stableReads) return cr; } // results shown, no chip → escalate
+      else resultsStable = 0;
+    }
+    return cr;
+  };
+  let cr = await settleCommit();                                                                                 // (a) autocommit on the filter-Enter, or results → escalate
+  if (!committedAsLeaf(cr)) { try { await act.clickSourceLeaf(leaf); } catch (e) { /* filter-Enter-only tenant */ } cr = await settleCommit(); } // (b) CLICK the exact leaf
+  if (!committedAsLeaf(cr)) { try { await act.pressEnter(); } catch (e) {} cr = await settleCommit(); }           // (c) press Enter AGAIN (commits the top exact-match result)
+  const committedChips = (cr && cr.chips) || [];
+  if (!committedAsLeaf(cr)) return fail("ai-commit-failed", lReply.confidence, "AI source: typed-commit of \"" + leaf + "\" did not persist (chips: " + JSON.stringify(committedChips) + ")", { tree_structure, options: leaves });
+  return { status: "filled_review", after: committedChips.join("; "), verified: true, matchTier: "ai-source-tree", flag: eeo ? "ai-eeo-guess" : "ai-choice", confidence: lReply.confidence, detail: "AI source: " + category + " → typed \"" + leaf + "\" (drilled + scroll-enumerated; click-drill → typed commit)", options: leaves, tree_structure, auditLoc: loc.wrapperSel };
 };
 
 // The AI typeahead pass: rescue every GENUINE no-match flat typeahead in `results` via the LLM.
@@ -2172,6 +1913,30 @@ async function runAiTypeaheadPass(act, results, profile, jobContext, budgets) {
       Object.assign(rec, aiRes);
     } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI typeahead error: " + String((e && e.message) || e); }
   }
+}
+
+// ── Fix 2 — start-of-fill option capture for EVERY typeahead (was FoS-only) ──────────────────────
+// Build the onCapture that fillTypeaheadCdp runs ONCE at the START (after opening, before the candidate loop):
+//   • FLAT field (no categories on open) → scrape the full leaf list (scrapeTaOptions) → recorded for the REVIEW
+//     page (reviewOptions()) AND returned as `capturedFull` for the flat AI rescue. So a normal typeahead never
+//     needs a scrape AFTER the deterministic fill fails — it's all done at the start (the FoS pattern, generalized).
+//   • TREE field (categories on open) → return null: NOT start-scraped (the cheap readTreeCategories detect does
+//     not scroll), so a successful tree fill pays no wasted scroll; its categories + leaves are scraped by the AI
+//     tree drill ONLY if the deterministic fill fails ("the tree scrapes are only used if AI needs to be called").
+// Substrate-guarded (older fakes/recon-only acts may omit a method). Returns { onCapture, reviewOptions }.
+function makeStartCapture(act, loc) {
+  let reviewOpts = null;
+  const onCapture = async () => {
+    let cats = [];
+    try { cats = act.readTreeCategories ? (await act.readTreeCategories(loc)) : []; } catch (e) { cats = []; }
+    if (cats && cats.length) return null; // TREE → no start-scrape (the drill self-scrapes only on a no-match)
+    try {
+      const sc = act.scrapeTaOptions ? await act.scrapeTaOptions(loc) : null;
+      if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { reviewOpts = sc.options.slice(); return reviewOpts; }
+    } catch (e) { /* best-effort — the flat AI falls back to the last filtered set */ }
+    return null;
+  };
+  return { onCapture, reviewOptions: () => reviewOpts };
 }
 
 // ── The page driver (the M22 flat-loop semantics over the actuation) ────────
@@ -2212,9 +1977,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (f.widgetType === "hierarchical") {
         // Source ("How did you hear about us?") — candidates: profile.how_did_you_hear
         // WINS, falling back to application_defaults.how_did_you_hear (the value is now
-        // profile-driven, not policy-only). The Magna SEARCH shape is handled by
-        // fillSourceCdp; on a genuine no-match the AI drills the source TREE
-        // (tryInlineAiSource → aiTreeFallback) when AI is on.
+        // profile-driven, not policy-only). Source is the SAME widget as the cert
+        // typeahead (recon 2026-06-28) → handled by the unified fillTypeaheadCdp; on a
+        // genuine no-match its inline AI rescues (flat by default; the gated aiTreeDrillFallback
+        // drills only when GENUINE categories render) when AI is toggled on.
         const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
         if (!hdyh || !Array.isArray(hdyh.preferred)) {
           record.status = "needs_review";
@@ -2223,12 +1989,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           const candidates = [...hdyh.preferred];
           if (hdyh.fallback) candidates.push(hdyh.fallback);
           record.resolved = candidates;
-          // Inline AI rescue context (mirrors the typeahead's aiForField): on no-match
-          // the source tree is drilled by aiTreeFallback. Only when AI is toggled on.
+          // Inline AI rescue context (the typeahead's aiForField shape) + sourceTree → on a no-match the source
+          // TREE is DRILLED (click category → leaves → type leaf), NOT the flat typed path. Only when AI is on.
           const aiForSource = act.aiEnabled
-            ? { profile, jobContext, isRequired: f.isRequired, label: f.label, fieldName: f.fieldName }
+            ? { profile, jobContext, isRequired: f.isRequired, label: f.label, fieldName: f.fieldName, sourceTree: true }
             : undefined;
-          Object.assign(record, await fillSourceCdp(act, loc, candidates, budgets, { ai: aiForSource }));
+          Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource }));
         }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
@@ -2289,8 +2055,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
           else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
-          else if (f.widgetType === "typeahead") Object.assign(record, await fillTypeaheadCdp(act, loc, arg, budgets,
-            { ai: { profile, jobContext, fieldName: f.fieldName, label: f.label, isRequired: f.isRequired } })); // Option B: inline AI on no-match (gated on act.aiEnabled inside)
+          else if (f.widgetType === "typeahead") {
+            // Fix 2: start-scrape the options (FLAT → review + AI; TREE → no start-scrape). Inline AI on no-match.
+            const cap = makeStartCapture(act, loc);
+            Object.assign(record, await fillTypeaheadCdp(act, loc, arg, budgets,
+              { onCapture: cap.onCapture, ai: { profile, jobContext, fieldName: f.fieldName, label: f.label, isRequired: f.isRequired } }));
+            const ro = cap.reviewOptions(); if (ro && ro.length) record.options = ro;
+          }
           else { record.status = "skipped"; record.detail = `no handler for type ${f.widgetType}`; }
         }
       }
@@ -2588,25 +2359,21 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
           else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widget === "typeahead") {
-            // FoS capture (single-open): when tagged for option capture, scrape the full list BEFORE the
-            // candidate loop (fillTypeaheadCdp's onCapture runs before the loop). The full list →
-            // rec.options → the summary's searchable picker; the END-OF-PAGE pass then SKIPS this rec.
-            // Substrate-guarded (older fakes lack scrapeTaOptions). Tier-0 KEEP never reaches onCapture →
-            // end-of-page captures it (the rec.captureOptions tag below drives that fallback).
-            let scrapedOptions = null;
-            const onCapture = (f.captureOptions && act.scrapeTaOptions) ? async () => {
-              const sc = await act.scrapeTaOptions(loc);
-              if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { scrapedOptions = sc.options.slice(); return scrapedOptions; }
-              return null;
-            } : undefined;
-            // Inline AI rescue context (Option B) — passed for ALL section typeaheads now (incl. the cert
-            // TREE). tryInlineAi decides tree-vs-flat structurally (category rows on the open field) → the
-            // two-prompt drill for cert, the flat single-prompt for FoS. EEO allowed (re-tagged inside).
+            // Fix 2: start-of-fill option capture for EVERY section typeahead (was FoS-only). makeStartCapture
+            // scrapes the full leaf list at the START for a FLAT field (FoS → rec.options for the summary
+            // searchable picker + the flat AI), and returns null for a TREE (cert) — no wasted scroll on a
+            // successful fill; the AI tree drill self-scrapes categories + leaves only on a no-match. The END-OF-
+            // PAGE pass (captureChoiceOptions) still backstops a tier-0 prefilled-kept FLAT field (never reaches
+            // onCapture) via the rec.captureOptions tag.
+            const cap = makeStartCapture(act, loc);
+            // Inline AI rescue context (Option B) — passed for ALL section typeaheads (incl. the cert TREE).
+            // tryInlineAi decides tree-vs-flat structurally (category rows on the open field) → the unified tree
+            // drill for cert, the flat single-prompt for FoS. EEO allowed (re-tagged inside).
             const aiForField = aiCtx
               ? { profile: aiCtx.profile, jobContext: aiCtx.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired }
               : undefined;
-            Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture, ai: aiForField }));
-            if (scrapedOptions && scrapedOptions.length) rec.options = scrapedOptions;
+            Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture: cap.onCapture, ai: aiForField }));
+            const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
           }
           else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
           else { rec.status = "skipped"; rec.detail = "no handler for widget " + f.widget; }
@@ -2866,7 +2633,7 @@ async function auditReReadActual(act, e) {
       case "dropdown": { const r = await act.readDropdownState(loc); return { actual: r ? r.triggerText : null, readable: !!r }; }
       case "checkbox": { const r = await act.readCheckboxState(loc); return { actual: r ? String(r.checked) : null, readable: !!(r && r.inputId != null) }; }
       case "radio": { const r = await act.readRadioState(loc); const ok = Array.isArray(r) && r.length > 0; const c = ok && r.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
-      case "typeahead": { const r = await act.readTypeahead(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
+      case "typeahead": { const r = await act.readHier(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
       case "hierarchical": { const r = await act.readSource(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
       case "date": {
         const segs = auditDateSegments(e.expected);
@@ -2892,7 +2659,7 @@ async function auditRefillEntry(act, e, b) {
     case "text": case "textarea": return await fillTextCdp(act, loc, exp, b, e.auditTag);
     case "dropdown": return await fillDropdownCdp(act, loc, [exp], b);
     case "typeahead": return await fillTypeaheadCdp(act, loc, [exp], b);
-    case "hierarchical": return await fillSourceCdp(act, loc, [exp], b);
+    case "hierarchical": return await fillTypeaheadCdp(act, loc, [exp], b); // merged: source uses the unified filler
     case "radio": return await fillRadioCdp(act, loc, [exp], b);
     case "checkbox": return await fillCheckboxCdp(act, loc, String(exp) === "true", b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(exp)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
@@ -2986,18 +2753,18 @@ async function captureFieldOptions(act, loc, budgets) {
   try {
     // open + re-assert focus on the searchBox so the full (empty-filter) list renders
     const ensureFocused = async () => {
-      let st = await act.readTypeahead(loc);
+      let st = await act.readHier(loc);
       if (!st || !st.searchBox || !st.searchBox.visible) {
-        await act.openTypeahead(loc);
+        await act.openHier(loc);
         const t0 = Date.now();
         while (Date.now() - t0 < budgets.taOpenCeilingMs) {
           await act.delayFull(budgets.taOpenIntervalMs);
-          st = await act.readTypeahead(loc);
+          st = await act.readHier(loc);
           if (st && st.searchBox && st.searchBox.visible) break;
         }
       }
-      if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(budgets.taOpenIntervalMs); }
-      const r = await act.readTypeahead(loc);
+      if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs); }
+      const r = await act.readHier(loc);
       return !!(r && r.searchBox && r.searchBox.visible);
     };
     let options = null;
@@ -3208,5 +2975,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

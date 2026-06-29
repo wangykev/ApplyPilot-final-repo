@@ -1361,7 +1361,10 @@ function cdpReadSourceState(wrapperSel) {
     };
   }
 
-  // Category vs leaf — mirror the in-tree fillSource isCategory heuristics.
+  // Category vs leaf — mirror the in-tree fillSource isCategory heuristics. (The merge briefly dropped the
+  // svg/chevron clause on a "side-charm" reading, but live evidence 2026-06-28 [source AI: "College/University"
+  // is a DRILLABLE category] proved cert + source DO have categories you click to drill — so it's restored.
+  // The source AI uses the scrape-based drill, NOT this; this gates the cert tree path's readTreeCategories.)
   const isCategory = (el) =>
     el.hasAttribute("aria-expanded") || el.hasAttribute("aria-haspopup") ||
     !!el.querySelector('svg, [data-automation-id*="chevron" i], [class*="chevron" i]') ||
@@ -1544,6 +1547,69 @@ function cdpReadSourcePick(wrapperSel) {
   };
 }
 
+// ── Unified hierarchical-typeahead read (merge 2026-06-28) ──────────────────────────────────────
+// The Certification typeahead (My Experience) and "How did you hear about us?" (My Information) are the
+// SAME Workday multiselect prompt component (operator recon 2026-06-28). This ONE reader serves the merged
+// filler for both — superseding cdpReadTaState ([role=option]/textContent + aria-controls, which is NULL on
+// both widgets) and cdpReadSourcePick for the FILL path. Both legacy readers stay for the recon harnesses.
+//   • Options = the page-wide VISIBLE promptOption leaves (label = data-automation-label || textContent),
+//     chip-excluded (a committed chip elsewhere embeds a promptOption → contamination).
+//   • SCOPE by data-uxi-multiselect-id — the reliable join key, stamped on the searchBox AND every
+//     promptLeafNode (recon). DEFENSIVE page-wide fallback when the id is absent (both observed widgets
+//     carry it, so this branch is belt-and-suspenders, not a real case).
+//   • Returns the typeahead-compatible `pageWide` shape (so the shared filler reads it unchanged) PLUS
+//     `leaves`/`leafCount` aliases (the source loop's shape) + `activeText` (aria-activedescendant) +
+//     `banner`/`resultsBanner` (both on the SAME promptTitle host; text distinguishes them — recon 2026-06-26).
+function cdpReadHierState(wrapperSel) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  const msId = sb ? sb.getAttribute("data-uxi-multiselect-id") : null;
+  const leafLabel = (el) => el.getAttribute("data-automation-label") || (el.textContent || "").trim();
+  // Resolve the option-label nodes. msId-scoped promptLeafNodes (robust if a 2nd widget is open); the inner
+  // promptOption carries the label. Defensive page-wide promptOption fallback when msId is absent.
+  let texts;
+  if (msId) {
+    const esc = (window.CSS && CSS.escape) ? CSS.escape(msId) : msId.replace(/"/g, '\\"');
+    texts = Array.from(document.querySelectorAll('[data-uxi-multiselect-id="' + esc + '"][data-automation-id="promptLeafNode"]'))
+      .filter((ln) => isVisible(ln) && ln.getAttribute("aria-disabled") !== "true" && !ln.closest('[data-automation-id="selectedItemList"]'))
+      .map((ln) => leafLabel(ln.querySelector('[data-automation-id="promptOption"]') || ln));
+  } else {
+    texts = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+      .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]'))
+      .map(leafLabel);
+  }
+  const sig = texts.length + "|" + texts.slice(0, 3).join("~") + "|" + texts.slice(-3).join("~");
+  // Banner + results banner: both live on a VISIBLE promptTitle (recon 2026-06-26), text-distinguished.
+  let banner = null, resultsBanner = false;
+  for (const el of document.querySelectorAll('[data-automation-id="promptTitle"]')) {
+    if (!isVisible(el)) continue;
+    const t = (el.textContent || "").trim();
+    if (/no matches found/i.test(t)) banner = { text: t, automationId: "promptTitle" };
+    else if (/search results/i.test(t)) resultsBanner = true;
+  }
+  const chips = Array.from(w.querySelectorAll('[data-automation-id="selectedItem"]')).map((c) => (c.textContent || "").trim());
+  const adFrom = (el) => (el && el.getAttribute && el.getAttribute("aria-activedescendant")) || null;
+  const activeId = adFrom(document.activeElement) || adFrom(sb);
+  const activeEl = activeId ? document.getElementById(activeId) : null;
+  return {
+    searchBox: sb
+      ? { present: true, visible: isVisible(sb), focused: document.activeElement === sb, value: sb.value }
+      : { present: false, visible: false, focused: false, value: null },
+    chips, banner, resultsBanner, msId: msId || null,
+    pageWide: { count: texts.length, sig, sample: texts.slice(0, 10), texts: texts.slice(0, 40) },
+    leaves: texts.slice(0, 40), leafCount: texts.length,
+    activeText: activeEl ? (activeEl.textContent || "").trim() : null
+  };
+}
+
 // Expand a category node by label (trusted-click its rect) — the non-committing
 // drill probe (Q4). Returns the rect clicked, or {found:false}.
 function cdpSourceCategoryRect(label) {
@@ -1709,6 +1775,34 @@ function makeCdpActuation(llmConfig) {
       const probe = await cdpEval(cdpSourceLeafProbe, label);
       if (!probe || !probe.found || !probe.rect || probe.rect.w <= 0) return false;
       await cdpClickAt(probe.rect.cx, probe.rect.cy);
+      return true;
+    },
+
+    // ── unified hierarchical-typeahead (merge 2026-06-28) ──
+    // The merged fillTypeaheadCdp drives BOTH cert and source through THESE methods (the legacy
+    // typeahead/source methods above stay for the recon harnesses). openHier = the broad source opener
+    // ladder (a button-trigger source AND a bare-input typeahead both resolve — the button rect simply
+    // misses on a typeahead and falls through). readHier = the unified promptOption/data-automation-label
+    // reader. clear/type/focus are the same trusted primitives both pickers already used. clickHierLeaf is
+    // VIEWPORT-AWARE (cdpSourceRowRect scrolls an off-fold leaf into the clickable viewport +
+    // elementFromPoint-validates) and matches by data-automation-label||text → the FIRST DOM node (the
+    // "two Other leaves → pick the first" rule). probeHierLeaf reads the promptLeafNode isselected commit-signal.
+    openHier: async (loc) => {
+      for (const part of [' button[aria-haspopup="listbox"]', ' [data-automation-id="multiselectInputContainer"]', ' [data-uxi-widget-type="selectinput"]', " input", ""]) {
+        const rect = await cdpEval(cdpRectOf, loc.wrapperSel + part, true);
+        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); return true; }
+      }
+      return false;
+    },
+    readHier: (loc) => cdpEval(cdpReadHierState, loc.wrapperSel),
+    focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    typeInHier: (text) => cdpTypeChars(text, 40),
+    clearHierSearch: () => cdpSelectAllDelete(),
+    probeHierLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),
+    clickHierLeaf: async (loc, label) => {
+      const rr = await cdpEval(cdpSourceRowRect, label);
+      if (!rr || !rr.found || !rr.rect || rr.rect.w <= 0) return false;
+      await cdpClickAt(rr.rect.cx, rr.rect.cy);
       return true;
     },
 
