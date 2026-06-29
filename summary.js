@@ -1,331 +1,382 @@
 // Viewer + EDITOR for the persistent per-field review summary (reviewSummary in
-// chrome.storage.local), written by background.js after a completed fill.
+// chrome.storage.local), written by the fill engine after a completed fill/walk.
 //
-// M14 (Review stage, slice 1): dropdown/choice fields are EDITABLE. A human pick is
-// written back into the SAME reviewSummary record — current_value becomes the pick,
-// original_ai_value preserves the bot's value, is_edited flips, and edit_kind records
-// provenance (override | filled_blank | cleared) for the later strict-replay round.
-// Text/radio/checkbox stay display-only this slice; replay/submit + approval are later.
+// Layout: a dense, glance-and-verify table. A compact header + summary/filter strip,
+// a SUBMIT-BLOCKED banner when a required field still holds an AI placeholder, a
+// "Needs review" list at the top (flag-driven prominence: LEGALLY-LOADED / DEMOGRAPHIC /
+// NEEDS-ANSWER first and loud, regardless of confidence), then ALL fields grouped into
+// collapsible sections (derived from canonical_field). Repeating-section entries
+// (canonical_field shaped `sectionName[idx].field`) get an "Entry N" header with a
+// per-entry trash (soft delete + Undo).
 //
-// Edits update the DOM in place (no full re-render → no scroll jump / heavy rebuild).
-// All values go through textContent / option.value — Workday labels and option texts
-// are untrusted page content; never innerHTML.
+// EDITING (M14 semantics): every field carries an in-place editor pre-filled with what
+// the bot put — dropdown/radio → <select>, checkbox → a real <input type=checkbox>,
+// typeahead with a full option list → a type-to-filter combobox, else a text box. A pick
+// writes back into the SAME record: current_value ← pick (null = cleared), edit_kind/
+// is_edited recomputed, original_ai_value preserved, persisted to chrome.storage.local.
+// When a value differs from the bot's, an "autofilled: <bot value>" reference shows. The
+// same field can appear in both the review list and the section list; commit() refreshes
+// EVERY editor for that field_id so the two stay in sync (no full re-render on edit).
+//
+// SECURITY: all page-derived text (Workday labels, option texts, values) is set via
+// textContent / option.value / createTextNode — NEVER innerHTML (untrusted page content).
 
 const root = document.getElementById("root");
-let currentBundle = null; // the loaded reviewSummary, mutated in place on edit
+let currentBundle = null;            // the loaded reviewSummary, mutated in place on edit
+let currentFilter = "all";           // all | review | edited
+const collapsed = new Set();         // section keys the user collapsed
+const fieldRefreshers = new Map();   // field_id -> Set<fn>  (keeps every editor for a field in sync)
+const fieldRowNodes = new Map();     // field_id -> section row (jump target)
 
-// Tiny element helper. props: { class, text, ...attrs }; children: node | string | array.
+// Tiny element helper. props.text → textContent (never innerHTML); props.onX → addEventListener.
 const el = (tag, props = {}, children = []) => {
-  const node = document.createElement(tag);
+  const n = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
-    if (k === "class") node.className = v;
-    else if (k === "text") node.textContent = v;
-    else if (v != null) node.setAttribute(k, v);
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else if (v != null && v !== false) n.setAttribute(k, v === true ? "" : v);
   }
-  for (const c of [].concat(children)) {
-    if (c == null) continue;
-    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return node;
+  for (const c of [].concat(children)) { if (c == null) continue; n.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }
+  return n;
 };
-
 const fmt = (v) => (v == null || v === "" ? "—" : String(v));
 const norm = (v) => (v == null ? "" : String(v));
-
-// Provenance of a human edit, for the later replay round (override vs gap-fill differ).
-const editKindOf = (entry) => {
-  const o = norm(entry.original_ai_value), c = norm(entry.current_value);
-  if (o === c) return null;          // unchanged
-  if (o === "") return "filled_blank"; // AI left it blank, human supplied a value
-  if (c === "") return "cleared";      // AI had a value, human cleared it
-  return "override";                   // AI had a value, human changed it
-};
-
-// Which option list + partialness drives a choice field's editor; null = not editable.
-//   dropdown     → full options (complete option set, raised cap)
-//   typeahead    → options (the FULL list captured post-fill — FoS Round 3 → SEARCHABLE editor)
-//                  else captured_options (the filtered set the bot's search surfaced — PARTIAL)
-//   hierarchical → options (the source picker's level-1 leaves — PARTIAL)
-const editorFor = (entry) => {
-  if (entry.widget_type === "dropdown") return { list: entry.options || [], partial: false };
-  // TREE-AI (cert): the recon captured the CHOSEN category's leaves → a searchable editor over them
-  // (partial — only that category's options, not the whole tree). Checked before the typeahead branch
-  // (cert is mis-tagged "typeahead").
-  if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) {
-    return { list: entry.tree_structure.leaves, partial: true, searchable: true, tree: entry.tree_structure };
-  }
-  if (entry.widget_type === "typeahead") {
-    if (Array.isArray(entry.options) && entry.options.length) return { list: entry.options, partial: false, searchable: true };
-    return { list: entry.captured_options || [], partial: true };
-  }
-  if (entry.widget_type === "hierarchical") return { list: entry.options || [], partial: true };
-  return null;
-};
-
-const PARTIAL_NOTE =
-  "These are the options that matched the original search — not the full list. " +
-  "To choose a different value, edit this field on the form directly.";
-
+const autofilledOf = (e) => (e.original_ai_value != null ? e.original_ai_value : e.current_value);
+const editKindOf = (e) => { const o = norm(e.original_ai_value), c = norm(e.current_value); if (o === c) return null; if (o === "") return "filled_blank"; if (c === "") return "cleared"; return "override"; };
+const PARTIAL_NOTE = "Options the search surfaced — not the full list. Edit on the form for other values.";
 const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle });
 
-// field_id → the value text node in the NEEDS REVIEW card (so an edit can keep it fresh).
-const reviewValueNodes = {};
-
-const refreshButton = () => {
-  const btn = el("button", { text: "Refresh" });
-  btn.addEventListener("click", load);
-  return btn;
+// Section grouping. Keys = the REAL canonical-field prefixes the fill engine emits
+// (FIELD_MAP flat paths like personal_info.* + PAGE_SECTIONS names, which are camelCase).
+// humanize() splits camelCase as a fallback so an unmapped name still reads cleanly.
+const SECTION_LABELS = {
+  personal_info: "Personal Information", self_identification: "Self-Identification", agreements: "Agreements",
+  workExperience: "Work Experience", education: "Education", language: "Languages", website: "Websites",
+  certification: "Certifications", skill: "Skills", _documents: "Documents", _other: "Other Fields",
+};
+const humanize = (k) => SECTION_LABELS[k] || k.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+const sectionOf = (e) => {
+  const cf = e.canonical_field || "";
+  let m = cf.match(/^([A-Za-z_]+)\s*\[(\d+)\]/); if (m) return { key: m[1], label: humanize(m[1]), index: +m[2] }; // repeating: base[idx]
+  m = cf.match(/^([A-Za-z_]+)\./); if (m) return { key: m[1], label: humanize(m[1]), index: null };               // flat: prefix.rest
+  if (e.widget_type === "file_upload") return { key: "_documents", label: "Documents", index: null };
+  return { key: "_other", label: "Other Fields", index: null };
 };
 
-// The "edited" indicator for a row, reflecting edit_kind (null → no indicator).
-const editedBadge = (entry) => {
-  const kind = editKindOf(entry);
-  if (!kind) return null;
-  if (kind === "filled_blank") return el("span", { class: "edit-tag filled", text: "you filled (AI left blank)" });
-  if (kind === "cleared") return el("span", { class: "edit-tag", text: `cleared (AI chose: ${fmt(entry.original_ai_value)})` });
-  return el("span", { class: "edit-tag", text: `edited (AI chose: ${fmt(entry.original_ai_value)})` });
+// Review-card prominence predicates (UNCHANGED from the original viewer): prominence keys
+// off the FLAG, never confidence — a high-confidence reasoning-from-absence answer
+// (criminal→"No") must still be the most conspicuous, not buried.
+const isSensitive = (e) => e.flag && /sensitive/.test(e.flag);
+const needsAnswer = (e) => e.flag === "ai-text-needs-answer";
+const isEeoGuess = (e) => e.flag === "ai-eeo-guess";
+const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
+// SUPER-HARD: an AI typeahead pick the applicant didn't claim (ai-closest-forced — forced a value
+// on a required field with no "Other"), OR any AI guess the model itself flagged LOW confidence —
+// the riskiest committed AI answers → loudest, rendered FIRST (≥ legally-loaded).
+const isSuperHard = (e) => e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
+const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
+
+const addRefresher = (id, fn) => { if (!fieldRefreshers.has(id)) fieldRefreshers.set(id, new Set()); fieldRefreshers.get(id).add(fn); };
+// Shared write-back (M14): current_value ← pick (null = cleared), edit_kind/is_edited recomputed,
+// original_ai_value preserved, persisted, then EVERY editor for this field refreshed (sync).
+const commit = (entry, val) => {
+  entry.current_value = val === "" || val == null ? null : val;
+  entry.edit_kind = editKindOf(entry); entry.is_edited = entry.edit_kind !== null;
+  persist();
+  for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
 };
 
-// The current_value cell: value text + (for choice fields) an editable widget beside it
-// + an edited indicator. Edits update value text, badge, the row tint, and the NEEDS
-// REVIEW value node in place — no re-render.
-const valueCell = (entry, tr) => {
-  const td = el("td");
-  const valNode = el("span", { class: "cellval", text: fmt(entry.current_value) });
-  td.appendChild(valNode);
+// Checkbox value helpers — a toggle commits a token in the SAME family as the bot's value,
+// so flipping back to the original state reads as "not edited", not a false override.
+const checkedOf = (v) => v === true || /^(checked|true|yes|1|on)$/i.test(norm(v));
+const tokenFor = (orig, want) => {
+  if (typeof orig === "boolean") return want;
+  const fam = [["Checked", "Unchecked"], ["True", "False"], ["Yes", "No"], ["1", "0"], ["On", "Off"]];
+  const s = norm(orig).trim();
+  for (const [c, u] of fam) { if (s.toLowerCase() === c.toLowerCase()) return want ? s : u; if (s.toLowerCase() === u.toLowerCase()) return want ? c : s; }
+  return want ? "Checked" : "Unchecked";
+};
 
-  const m = editorFor(entry);
-  if (!m) return td; // text / radio / checkbox → display-only this slice
+// A 13px trash glyph (SVG via createElementNS — el() is textContent-only by design).
+const svgTrash = () => {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  for (const [k, v] of Object.entries({ viewBox: "0 0 24 24", width: "13", height: "13", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round" })) svg.setAttribute(k, v);
+  for (const d of ["M3 6h18", "M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2", "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6", "M10 11v5", "M14 11v5"]) { const p = document.createElementNS(ns, "path"); p.setAttribute("d", d); svg.appendChild(p); }
+  return svg;
+};
 
-  const list = m.list || [];
-  const badgeSlot = el("div", { class: "badge-slot" });
+// Per-entry SOFT delete for repeating sections (like the form's per-entry Delete). Marks every
+// field of the entry is_deleted, persists, re-renders. Deleted entries drop out of the counts /
+// needs-review / active list; an Undo restores them. The later strict-replay round honors
+// is_deleted (skips the entry on submit) — nothing is removed from the bundle here.
+const entryFieldsOf = (page, key, index) => currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key && sectionOf(e).index === index);
+const setEntryDeleted = (page, key, index, del) => { for (const e of entryFieldsOf(page, key, index)) e.is_deleted = del; persist(); render(); };
+const entryHead = (sec, ix, page) => {
+  const h = el("div", { class: "ehead" }, [el("span", { class: "et", text: `Entry ${ix + 1}` })]);
+  const del = el("button", { class: "del", title: "Delete this entry" }, [svgTrash(), el("span", { text: "Delete" })]);
+  del.addEventListener("click", () => setEntryDeleted(page, sec.key, ix, true));
+  h.appendChild(del);
+  return h;
+};
+const deletedRow = (sec, ix, page) => {
+  const u = el("button", { class: "undo", text: "Undo" });
+  u.addEventListener("click", () => setEntryDeleted(page, sec.key, ix, false));
+  return el("div", { class: "edel" }, [el("s", { text: `Entry ${ix + 1}` }), document.createTextNode("removed"), u]);
+};
 
-  const refreshLocal = () => {
-    valNode.textContent = fmt(entry.current_value);
-    badgeSlot.textContent = "";
-    const b = editedBadge(entry);
-    if (b) badgeSlot.appendChild(b);
-    tr.classList.toggle("edited", !!editKindOf(entry));
-    const rv = reviewValueNodes[entry.field_id];
-    if (rv) rv.textContent = fmt(entry.current_value);
-  };
-
-  // Shared write-back (M14 semantics): current_value ← pick (null = cleared), edit_kind/is_edited
-  // recorded, original_ai_value preserved, persisted, row refreshed in place.
-  const commit = (val) => {
-    entry.current_value = val === "" || val == null ? null : val;
-    entry.edit_kind = editKindOf(entry);
-    entry.is_edited = entry.edit_kind !== null;
-    persist();
-    refreshLocal();
-  };
-
-  // FoS Round 3: a typeahead carrying the FULL captured option list → a type-to-filter combobox
-  // (an <input> that filters entry.options + a clickable result list). Same write-back as the <select>.
-  if (m.searchable) {
-    const wrap = el("div", { class: "ta-editor" });
-    const input = el("input", { class: "editor ta-input", type: "text", placeholder: "type to filter…" });
-    input.value = entry.current_value == null ? "" : String(entry.current_value);
-    const listBox = el("div", { class: "ta-list", hidden: "" });
-    wrap.appendChild(input);
-    wrap.appendChild(listBox);
-
-    const matchesFor = () => {
-      const q = input.value.trim().toLowerCase();
-      return q === "" ? list.slice() : list.filter((o) => String(o).toLowerCase().includes(q));
-    };
-    // pick(val): clear ("") keeps the list OPEN showing the FULL list (so you can choose anew without
-    // re-typing); choosing a real value closes it.
-    const pick = (val) => {
-      commit(val);
-      input.value = entry.current_value == null ? "" : String(entry.current_value);
-      if (val === "" || val == null) { renderList(true); }
-      else { listBox.hidden = true; listBox.textContent = ""; }
-    };
-    // renderList(showAll): showAll → the WHOLE list (used on focus + after clear, so the full list is
-    // visible from the start); otherwise filtered by what's typed.
-    const renderList = (showAll) => {
-      listBox.textContent = "";
-      const clearRow = el("div", { class: "ta-opt ta-clear", text: "— clear —" });
-      clearRow.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(""); });
-      listBox.appendChild(clearRow);
-      const matches = showAll ? list.slice() : matchesFor();
-      for (const o of matches) { // show ALL matches — the list is scrollable (max-height + overflow-y)
-        const row = el("div", { class: String(o) === norm(entry.current_value) ? "ta-opt sel" : "ta-opt", text: String(o) });
-        row.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(String(o)); });
-        listBox.appendChild(row);
-      }
-      listBox.hidden = false;
-    };
-    input.addEventListener("focus", () => { input.select(); renderList(true); }); // FULL list at the start (select text → typing replaces)
-    input.addEventListener("input", () => renderList(false));                      // narrow as you type
-    input.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") { ev.preventDefault(); const ms = matchesFor(); if (ms.length) pick(String(ms[0])); }
-      else if (ev.key === "Escape") { listBox.hidden = true; }
-    });
-    input.addEventListener("blur", () => { setTimeout(() => { listBox.hidden = true; }, 150); }); // let a row mousedown land first
-    td.appendChild(wrap);
-    td.appendChild(badgeSlot);
-    const b1 = editedBadge(entry);
-    if (b1) badgeSlot.appendChild(b1);
-    return td;
-  }
-
-  // Graceful degrade: a partial set too small to be a useful pick-list → value + note.
-  if (m.partial && list.length <= 2) {
-    td.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
-  } else {
+// Build the in-place editor for a field, pre-filled with the current value. Returns
+// { node, set(v), partial? } or null (file_upload → display-only). `set` lets commit()
+// sync a second copy of the same field elsewhere on the page.
+function buildEditor(entry) {
+  const wt = entry.widget_type, cur = entry.current_value;
+  const onCommit = (v) => commit(entry, v);
+  const selectFrom = (opts) => {
     const sel = el("select", { class: "editor" });
-    const cur = entry.current_value;
-    if (cur == null || cur === "") {
-      const ph = document.createElement("option");
-      ph.value = ""; ph.textContent = "— choose —"; ph.selected = true;
-      sel.appendChild(ph);
+    const list = opts.slice();
+    if (cur == null || cur === "") { const ph = document.createElement("option"); ph.value = ""; ph.textContent = "— choose —"; sel.appendChild(ph); }
+    else if (!list.includes(cur)) list.unshift(cur);
+    for (const o of list) { const oe = document.createElement("option"); oe.value = o; oe.textContent = o; if (o === entry.current_value) oe.selected = true; sel.appendChild(oe); }
+    sel.addEventListener("change", () => onCommit(sel.value));
+    return { node: sel, set: (v) => { sel.value = v == null ? "" : String(v); } };
+  };
+  const textInput = (tag) => {
+    const inp = el(tag, { class: "editor", type: "text" });
+    inp.value = cur == null ? "" : String(cur);
+    inp.addEventListener("change", () => onCommit(inp.value));
+    return { node: inp, set: (v) => { inp.value = v == null ? "" : String(v); } };
+  };
+  const combobox = (list) => {
+    const wrap = el("div", { class: "ta-wrap" });
+    const inp = el("input", { class: "editor", type: "text", placeholder: "type to filter…" });
+    inp.value = cur == null ? "" : String(cur);
+    const box = el("div", { class: "ta-list", hidden: "" });
+    wrap.appendChild(inp); wrap.appendChild(box);
+    const matches = () => { const q = inp.value.trim().toLowerCase(); return q === "" ? list.slice() : list.filter((o) => String(o).toLowerCase().includes(q)); };
+    const pick = (v) => { onCommit(v); inp.value = entry.current_value == null ? "" : String(entry.current_value); if (v === "" || v == null) draw(true); else { box.hidden = true; box.textContent = ""; } };
+    const draw = (all) => {
+      box.textContent = "";
+      const cr = el("div", { class: "ta-opt ta-clear", text: "— clear —" }); cr.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(""); }); box.appendChild(cr);
+      for (const o of (all ? list.slice() : matches())) { const r = el("div", { class: String(o) === norm(entry.current_value) ? "ta-opt sel" : "ta-opt", text: String(o) }); r.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(String(o)); }); box.appendChild(r); }
+      box.hidden = false;
+    };
+    inp.addEventListener("focus", () => { inp.select(); draw(true); });
+    inp.addEventListener("input", () => draw(false));
+    inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); const ms = matches(); if (ms.length) pick(String(ms[0])); } else if (ev.key === "Escape") box.hidden = true; });
+    inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; }, 150));
+    return { node: wrap, set: (v) => { inp.value = v == null ? "" : String(v); } };
+  };
+  if (wt === "file_upload") return null;
+  // TREE-AI (cert): the recon captured the chosen category's leaves → a searchable editor over them
+  // (partial — only that category, not the whole tree). Checked before widget_type (cert is mis-tagged typeahead).
+  if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) return Object.assign(combobox(entry.tree_structure.leaves), { partial: true });
+  if (wt === "dropdown" && entry.options && entry.options.length) return selectFrom(entry.options);
+  if (wt === "radio" && entry.options && entry.options.length) return selectFrom(entry.options);
+  if (wt === "checkbox") {
+    const cb = el("input", { class: "editor-check", type: "checkbox" });
+    cb.checked = checkedOf(entry.current_value);
+    cb.addEventListener("change", () => onCommit(tokenFor(entry.original_ai_value, cb.checked)));
+    return { node: cb, set: (v) => { cb.checked = checkedOf(v); } };
+  }
+  if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return Object.assign(textInput("input"), { partial: co.length > 0 }); }
+  if (wt === "hierarchical") { const opts = entry.options || entry.captured_options || []; if (opts.length > 2) return Object.assign(selectFrom(opts), { partial: true }); return Object.assign(textInput("input"), { partial: opts.length > 0 }); }
+  if (wt === "textarea") return textInput("textarea");
+  return textInput("input"); // text / date / unknown
+}
+
+const statusOf = (e) => {
+  if (e.fill_status === "skipped") return "skip";
+  if (e.fill_status === "error" || e.fill_status === "not_filled") return "crit";
+  if (e.needs_review) return mustReplace(e) ? "crit" : "warn";
+  return "ok";
+};
+
+// One field row, used in BOTH the review list and the section list (editors kept in sync
+// via the field_id refresher). opts.review → loud flag label + reason line + "go to field".
+const fieldRow = (e, opts = {}) => {
+  const row = el("div", { class: "row" });
+  if (!opts.review) fieldRowNodes.set(e.field_id, row); // the section row is the jump target
+
+  const lab = el("div", { class: "lab" });
+  if (opts.review) {
+    // super-hard shows ALONGSIDE legally-loaded/demographic/needs-answer (never hides them — safety-first)
+    if (isSuperHard(e)) lab.appendChild(el("span", { class: "lb superhard", text: e.flag === "ai-closest-forced" ? "AI FORCED" : "LOW-CONF AI" }));
+    if (isSensitive(e)) lab.appendChild(el("span", { class: "lb crit", text: "LEGALLY-LOADED" }));
+    else if (isEeoGuess(e)) lab.appendChild(el("span", { class: "lb eeo", text: "DEMOGRAPHIC" }));
+    else if (needsAnswer(e)) lab.appendChild(el("span", { class: "lb crit", text: "NEEDS ANSWER" }));
+    else if (isAiFlag(e) && !isSuperHard(e)) lab.appendChild(el("span", { class: "lb ai", text: "AI" }));
+  }
+  lab.appendChild(document.createTextNode(fmt(e.question_label)));
+  if (e.is_required) lab.appendChild(el("span", { class: "req", title: "required", text: "✱" }));
+  row.appendChild(lab);
+
+  const val = el("div", { class: "val" });
+  const ed = buildEditor(e);
+  if (ed) val.appendChild(ed.node); else val.appendChild(el("span", { class: e.current_value ? "static" : "static empty", text: fmt(e.current_value) }));
+  if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
+  const afref = el("div", { class: "afref" });
+  val.appendChild(afref);
+  row.appendChild(val);
+
+  const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence].filter(Boolean).join("  ·  ");
+  row.appendChild(el("span", { class: "dot " + statusOf(e), title: tip }));
+
+  if (opts.review) {
+    const r = el("div", { class: "reason" });
+    if (e.detail) r.appendChild(el("span", { text: e.detail }));
+    // TREE-AI recon: surface the chosen category + the options the AI picked from (operator-requested).
+    if (e.tree_structure && e.tree_structure.chosen) {
+      const ts = e.tree_structure, lv = Array.isArray(ts.leaves) ? ts.leaves : [];
+      r.appendChild(el("span", { text: `tree: «${fmt(ts.chosen)}» → ${lv.slice(0, 12).join(", ")}${lv.length > 12 ? ` … (${lv.length})` : ""}` }));
     }
-    const opts = list.slice();
-    if (cur != null && cur !== "" && !opts.includes(cur)) opts.unshift(cur); // keep current selectable
-    for (const o of opts) {
-      const oEl = document.createElement("option");
-      oEl.value = o; oEl.textContent = o;
-      if (o === cur) oEl.selected = true;
-      sel.appendChild(oEl);
-    }
-    sel.addEventListener("change", () => commit(sel.value));
-    td.appendChild(sel);
-    if (m.partial) td.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
+    const j = el("button", { class: "jump", text: "go to field ↓" }); j.addEventListener("click", () => jumpToField(e)); r.appendChild(j);
+    row.appendChild(r);
   }
 
-  td.appendChild(badgeSlot);
-  const b0 = editedBadge(entry);
-  if (b0) badgeSlot.appendChild(b0);
-  return td;
+  const refresh = () => {
+    if (ed && ed.set) ed.set(e.current_value);
+    const kind = editKindOf(e);
+    afref.textContent = "";
+    if (kind) { afref.appendChild(document.createTextNode("autofilled: ")); afref.appendChild(el("b", { text: fmt(autofilledOf(e)) })); }
+    row.classList.toggle("f-crit", !!(e.needs_review && mustReplace(e)));
+    row.classList.toggle("f-warn", !!(e.needs_review && !mustReplace(e)));
+    row.classList.toggle("f-edit", !e.needs_review && !!kind);
+  };
+  addRefresher(e.field_id, refresh); refresh();
+  return row;
 };
 
 const render = () => {
   const bundle = currentBundle;
-  root.textContent = "";
-  for (const k of Object.keys(reviewValueNodes)) delete reviewValueNodes[k];
+  root.textContent = ""; fieldRefreshers.clear(); fieldRowNodes.clear();
+  if (!bundle || !Array.isArray(bundle.entries)) { root.appendChild(el("div", { class: "empty", text: "No summary yet — run a fill, then open “View last summary”." })); return; }
+  const entries = bundle.entries;
+  const live = entries.filter((e) => !e.is_deleted);           // deleted entries drop out of counts/list
+  const removed = entries.length - live.length;
+  const editedCount = live.filter((e) => editKindOf(e)).length;
+  const reviewCount = live.filter((e) => e.needs_review).length;
+  const liveCounts = live.reduce((a, e) => { a[e.fill_status] = (a[e.fill_status] || 0) + 1; return a; }, {});
 
-  if (!bundle || !Array.isArray(bundle.entries)) {
-    root.appendChild(el("div", { class: "empty", text: "No summary yet — run “Fill current page” from the popup." }));
-    root.appendChild(refreshButton());
-    return;
-  }
+  // ── header ──
+  root.appendChild(el("div", { class: "head" }, [
+    el("div", { class: "brand" }, [
+      el("div", { class: "logo", "aria-hidden": "true", text: "✈" }),
+      el("div", { class: "title", text: "Review your application" }),
+      el("div", { class: "meta" }, [document.createTextNode(fmt(bundle.page)), el("span", { class: "d", text: "·" }), document.createTextNode(fmt(bundle.tenant)), el("span", { class: "d", text: "·" }), document.createTextNode(relTime(bundle.captured_at))]),
+    ]),
+    el("div", { class: "toolbar" }, [
+      el("button", { class: "tbtn", text: "Expand all", onclick: () => { collapsed.clear(); render(); } }),
+      el("button", { class: "tbtn", text: "Collapse all", onclick: () => { groupKeys().forEach((k) => collapsed.add(k)); render(); } }),
+      el("button", { class: "tbtn", text: "↻ Refresh", onclick: load }),
+    ]),
+  ]));
 
-  // ── Header ───────────────────────────────────────────────────────────────
-  root.appendChild(el("h1", { text: "ApplyPilot — Last fill summary" }));
-  root.appendChild(el("div", { class: "meta", text: `${fmt(bundle.page)}  ·  ${fmt(bundle.tenant)}  ·  ${fmt(bundle.captured_at)}` }));
+  // ── summary + filter strip ──
+  const fl = (key, glyph, label, count) => { const c = el("button", { class: "fl", "aria-pressed": currentFilter === key ? "true" : "false" }, [glyph ? el("span", { class: "gl " + glyph }) : null, document.createTextNode(label + " "), el("span", { class: "n", text: String(count) })]); c.addEventListener("click", () => setFilter(currentFilter === key && key !== "all" ? "all" : key)); return c; };
+  const bar = el("div", { class: "bar" }, [fl("all", null, "All", live.length), fl("review", "warn", "Needs review", reviewCount), fl("edited", "edit", "Edited", editedCount)]);
+  const info = el("div", { class: "info" });
+  info.appendChild(el("b", { text: String(liveCounts.filled || 0) })); info.appendChild(document.createTextNode(" filled"));
+  if (liveCounts.skipped) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(liveCounts.skipped) })); info.appendChild(document.createTextNode(" skipped")); }
+  if (liveCounts.error) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(liveCounts.error) })); info.appendChild(document.createTextNode(" error")); }
+  if (removed) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(removed) })); info.appendChild(document.createTextNode(" removed")); }
+  bar.appendChild(info); root.appendChild(bar);
 
-  const counts = el("div", { class: "counts" });
-  counts.appendChild(el("span", { text: `Total: ${bundle.total}` }));
-  counts.appendChild(el("span", { text: `Needs review: ${bundle.needs_review_count}` }));
-  for (const [k, v] of Object.entries(bundle.counts || {})) counts.appendChild(el("span", { text: `${k}: ${v}` }));
-  root.appendChild(counts);
+  // ── SUBMIT-BLOCKED banner (a REQUIRED field still holds an AI placeholder) ──
+  const blocked = live.filter(needsAnswer);
+  if (blocked.length) root.appendChild(el("div", { class: "submit-blocked" }, [el("span", { text: "⛔", "aria-hidden": "true" }), el("div", {}, [el("b", { text: `Submit blocked — ${blocked.length} required field${blocked.length > 1 ? "s" : ""} still hold${blocked.length > 1 ? "" : "s"} an AI placeholder. ` }), el("span", { class: "s", text: "Replace each on the form before submitting." })])]));
 
-  const byType = el("div", { class: "counts" });
-  for (const [k, v] of Object.entries(bundle.by_type || {})) byType.appendChild(el("span", { text: `${k}: ${v}` }));
-  root.appendChild(byType);
-
-  root.appendChild(refreshButton());
-
-  // ── SUBMIT-BLOCKED banner (AI-2) — a REQUIRED field the AI declined holds a placeholder that
-  // MUST NOT ship. Removal is a CHECKED precondition of submit, not just conspicuous: this banner
-  // is the visible gate now (the deferred strict-replay SUBMIT must live-re-read + refuse too). ──
-  const needsAnswer = (e) => e.flag === "ai-text-needs-answer";
-  const blocked = bundle.entries.filter((e) => needsAnswer(e));
-  if (blocked.length) {
-    root.appendChild(el("div", { class: "submit-blocked", text: `⛔ SUBMIT BLOCKED — ${blocked.length} required field(s) still hold an AI placeholder. Replace each on the form before submitting.` }));
-  }
-
-  // ── NEEDS REVIEW first (informational; editors live in the ALL FIELDS table) ──
-  // LEGALLY-LOADED (ai-choice-sensitive) + NEEDS-YOUR-ANSWER (ai-text-needs-answer) render FIRST and
-  // loud, REGARDLESS of confidence — prominence keys off the FLAG, never confidence. A "reasoning-
-  // from-absence" answer (criminal→No) is exactly the one the model marks HIGH, so confidence must
-  // NOT bury it; ditto a must-replace placeholder. Confidence prioritizes scrutiny only AMONG the rest.
-  const isSensitive = (e) => e.flag && /sensitive/.test(e.flag);
-  const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
-  const isEeoGuess = (e) => e.flag === "ai-eeo-guess"; // AI-3: a GUESSED demographic — must be verified
-  // SUPER-HARD: an AI typeahead pick the applicant didn't claim (ai-closest-forced — forced a value on
-  // a required field with no "Other"), OR any AI guess the model itself flagged LOW confidence. These
-  // are the riskiest committed AI answers → loudest badge, rendered FIRST (≥ legally-loaded).
-  const isSuperHard = (e) => e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
-  const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
-  const flaggedAll = bundle.entries.filter((e) => e.needs_review);
+  // ── NEEDS REVIEW (compact rows, must-replace first — prominence keys off the FLAG) ──
+  const flaggedAll = live.filter((e) => e.needs_review);
   const flagged = [
-    ...flaggedAll.filter(isSuperHard),                                // super-hard FIRST
-    ...flaggedAll.filter((e) => mustReplace(e) && !isSuperHard(e)),   // then the rest of must-replace
-    ...flaggedAll.filter((e) => !mustReplace(e))                      // then everything else
+    ...flaggedAll.filter(isSuperHard),                              // super-hard FIRST
+    ...flaggedAll.filter((e) => mustReplace(e) && !isSuperHard(e)), // then the rest of must-replace
+    ...flaggedAll.filter((e) => !mustReplace(e)),                   // then everything else
   ];
-  root.appendChild(el("h2", { text: `Needs review (${flagged.length})` }));
-  if (!flagged.length) {
-    root.appendChild(el("div", { class: "meta", text: "Nothing flagged." }));
-  } else {
-    for (const e of flagged) {
-      const sensitive = isSensitive(e);
-      const isAi = isAiFlag(e);
-      const superHard = isSuperHard(e);
-      const card = el("div", { class: superHard ? "review superhard" : mustReplace(e) ? "review sensitive" : "review" });
-      const label = el("div", { class: "label" });
-      label.appendChild(document.createTextNode(`${fmt(e.question_label)}  (${fmt(e.widget_type)})  `));
-      // The loud marker is flag-driven: conspicuous at ANY confidence.
-      if (superHard) label.appendChild(el("span", { class: "badge superhard", text: e.flag === "ai-closest-forced" ? "⚠ AI FORCED A CHOICE — VERIFY" : "⚠ LOW-CONFIDENCE AI — VERIFY" }));
-      if (sensitive) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ LEGALLY-LOADED — VERIFY" }));
-      if (needsAnswer(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ NEEDS YOUR ANSWER — REPLACE BEFORE SUBMIT" }));
-      if (isEeoGuess(e)) label.appendChild(el("span", { class: "badge sensitive", text: "⚠ AI-GUESSED DEMOGRAPHIC — VERIFY" }));
-      if (isAi) label.appendChild(el("span", { class: "badge ai-inferred", text: "AI-INFERRED" }));
-      card.appendChild(label);
-      const reason = el("div", { class: "reason" });
-      reason.appendChild(document.createTextNode(`reason: ${fmt(e.needs_review_reason)}  ·  status: ${fmt(e.fill_status)}  ·  value: `));
-      const rv = el("span", { text: fmt(e.current_value) });
-      reviewValueNodes[e.field_id] = rv; // kept fresh when the field is edited below
-      reason.appendChild(rv);
-      card.appendChild(reason);
-      // AI provenance — the flag (which AI path) + confidence, so the human sanity-checks HOW it answered.
-      if (isAi) card.appendChild(el("div", { class: "reason", text: `AI provenance: ${fmt(e.flag)}  ·  confidence: ${fmt(e.confidence)}` }));
-      if (e.detail) card.appendChild(el("div", { class: "detail", text: e.detail })); // the AI's RATIONALE (names its basis)
-      // TREE-AI recon: show the chosen category + the options the AI picked from (operator asked to surface it).
-      if (e.tree_structure && e.tree_structure.chosen) {
-        const ts = e.tree_structure, lv = Array.isArray(ts.leaves) ? ts.leaves : [];
-        card.appendChild(el("div", { class: "options", text: `tree recon — category «${fmt(ts.chosen)}» → ${lv.slice(0, 12).join(", ")}${lv.length > 12 ? ` … (${lv.length} options)` : ""}` }));
-      }
-      const opts = e.options || e.captured_options;
-      if (opts && opts.length) {
-        // Cap the flat-text dump (options can now be ~250 for plain dropdowns).
-        const shown = opts.slice(0, 15).join(", ") + (opts.length > 15 ? ` … (${opts.length} total)` : "");
-        card.appendChild(el("div", { class: "options", text: "options: " + shown }));
-      }
-      root.appendChild(card);
-    }
+  if (flagged.length && currentFilter !== "edited") {
+    root.appendChild(el("div", { class: "blab" }, [el("h2", { text: "Needs review" }), el("span", { class: "ct", text: `${flagged.length} to verify` }), el("span", { class: "rule" })]));
+    const tbl = el("div", { class: "tbl review" });
+    const grp = el("div", { class: "grp" }); const body = el("div", { class: "gbody" });
+    for (const e of flagged) body.appendChild(fieldRow(e, { review: true }));
+    grp.appendChild(body); tbl.appendChild(grp); root.appendChild(tbl);
   }
 
-  // ── ALL FIELDS table (choice fields editable) ─────────────────────────────
-  root.appendChild(el("h2", { text: "All fields" }));
-  const cols = ["field_index", "question_label", "widget_type", "canonical_field", "is_required", "current_value", "fill_status", "confidence", "match_tier"];
-  const table = el("table");
-  const head = el("tr");
-  for (const c of cols) head.appendChild(el("th", { text: c }));
-  table.appendChild(head);
-
-  for (const e of bundle.entries) {
-    const tr = el("tr", e.needs_review ? { class: "flagged" } : {});
-    if (editKindOf(e)) tr.classList.add("edited");
-    for (const c of cols) {
-      if (c === "current_value") {
-        tr.appendChild(valueCell(e, tr));
-      } else if (c === "confidence") {
-        const td = el("td");
-        td.appendChild(el("span", { class: "badge " + (e.confidence || "none"), text: fmt(e.confidence) }));
-        tr.appendChild(td);
-      } else if (c === "is_required") {
-        tr.appendChild(el("td", { text: e.is_required ? "yes" : "no" }));
-      } else {
-        tr.appendChild(el("td", { text: fmt(e[c]) }));
-      }
-    }
-    table.appendChild(tr);
-  }
-  root.appendChild(table);
+  // ── ALL FIELDS (grouped, collapsible) ──
+  root.appendChild(el("div", { class: "blab" }, [el("h2", { text: currentFilter === "all" ? "All fields" : currentFilter === "review" ? "Flagged fields" : "Edited fields" }), el("span", { class: "ct", text: `${live.length} total` }), el("span", { class: "rule" })]));
+  const host = el("div", { id: "field-list" }); root.appendChild(host); renderFieldList(host);
 };
+
+const filterPass = (e) => currentFilter === "review" ? !!e.needs_review : currentFilter === "edited" ? !!editKindOf(e) : true;
+const groupKeys = () => { const seen = new Set(), out = []; for (const e of (currentBundle ? currentBundle.entries : [])) { const k = e.page + "||" + sectionOf(e).key; if (!seen.has(k)) { seen.add(k); out.push(k); } } return out; };
+
+const renderFieldList = (mount) => {
+  mount.textContent = "";
+  const entries = currentBundle.entries;
+  const pageOrder = [], pages = {};
+  for (const e of entries) { if (!pages[e.page]) { pages[e.page] = []; pageOrder.push(e.page); } pages[e.page].push(e); }
+  const multiPage = pageOrder.length > 1;
+  let shown = false;
+
+  for (const pg of pageOrder) {
+    const order = [], byKey = {};
+    for (const e of pages[pg]) { const sec = sectionOf(e); if (!byKey[sec.key]) { byKey[sec.key] = { sec, items: [] }; order.push(sec.key); } byKey[sec.key].items.push(e); }
+    const tbl = el("div", { class: "tbl" });
+
+    for (const g of order.map((k) => byKey[k])) {
+      const key = pg + "||" + g.sec.key;
+      const repeating = g.sec.index != null;                       // base[idx] sections get per-entry headers + delete
+      const liveItems = g.items.filter((e) => !e.is_deleted);
+
+      // build the body first — a group is only shown if it ends up with content
+      const body = el("div", { class: "gbody" });
+      if (repeating) {
+        const idxOrder = [], byIdx = {};
+        for (const e of g.items) { const ix = sectionOf(e).index; if (!(ix in byIdx)) { byIdx[ix] = []; idxOrder.push(ix); } byIdx[ix].push(e); }
+        for (const ix of idxOrder) {
+          const items = byIdx[ix];
+          if (items.every((e) => e.is_deleted)) { if (currentFilter === "all") body.appendChild(deletedRow(g.sec, ix, pg)); continue; }
+          const vis = items.filter(filterPass);
+          if (!vis.length) continue;
+          body.appendChild(entryHead(g.sec, ix, pg));
+          for (const e of vis) body.appendChild(fieldRow(e));
+        }
+      } else {
+        for (const e of g.items.filter((e) => !e.is_deleted && filterPass(e))) body.appendChild(fieldRow(e));
+      }
+      if (!body.childNodes.length) continue;
+
+      const nFilled = liveItems.filter((e) => !e.needs_review && e.fill_status !== "skipped").length;
+      const nReview = liveItems.filter((e) => e.needs_review).length;
+      const nSkip = liveItems.filter((e) => e.fill_status === "skipped").length;
+      const dots = el("span", { class: "gdots" });
+      if (nReview) { dots.appendChild(el("span", { class: "pdot " + (liveItems.some((e) => e.needs_review && mustReplace(e)) ? "crit" : "warn") })); dots.appendChild(el("span", { class: "pdot-l", text: String(nReview) })); }
+      if (nFilled) { dots.appendChild(el("span", { class: "pdot ok" })); dots.appendChild(el("span", { class: "pdot-l", text: String(nFilled) })); }
+      if (nSkip) { dots.appendChild(el("span", { class: "pdot skip" })); dots.appendChild(el("span", { class: "pdot-l", text: String(nSkip) })); }
+
+      const isC = collapsed.has(key);
+      const visCount = liveItems.filter(filterPass).length;
+      const grp = el("div", { class: "grp" + (isC ? " collapsed" : "") });
+      const head = el("button", { class: "ghead", "aria-expanded": isC ? "false" : "true" }, [el("span", { class: "chev", text: "▾" }), el("span", { class: "gname", text: g.sec.label }), el("span", { class: "gcount", text: `(${visCount}${visCount !== liveItems.length ? " of " + liveItems.length : ""})` }), dots]);
+      head.addEventListener("click", () => { collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key); render(); });
+      grp.appendChild(head); grp.appendChild(body); tbl.appendChild(grp);
+    }
+    if (!tbl.childNodes.length) continue;
+    shown = true;
+    if (multiPage) mount.appendChild(el("div", { class: "pgcap", text: fmt(pg) }));
+    mount.appendChild(tbl);
+  }
+  if (!shown) mount.appendChild(el("div", { class: "empty", text: currentFilter === "review" ? "Nothing needs review." : "No edited fields yet." }));
+};
+
+const setFilter = (key) => { currentFilter = key; render(); };
+const jumpToField = (e) => {
+  const key = e.page + "||" + sectionOf(e).key; collapsed.delete(key);
+  if (currentFilter !== "all" && !filterPass(e)) currentFilter = "all";
+  render();
+  const row = fieldRowNodes.get(e.field_id);
+  if (row) { row.scrollIntoView({ behavior: "smooth", block: "center" }); row.animate([{ background: "#fff3cf" }, { background: "transparent" }], { duration: 1300, easing: "ease-out" }); }
+};
+const relTime = (iso) => { if (!iso) return "—"; const t = Date.parse(iso); if (isNaN(t)) return String(iso); const s = Math.round((Date.now() - t) / 1000); if (s < 45) return "just now"; if (s < 3600) return `${Math.round(s / 60)} min ago`; if (s < 86400) return `${Math.round(s / 3600)} h ago`; return new Date(t).toLocaleString(); };
 
 const load = () => {
   chrome.storage.local.get("reviewSummary", ({ reviewSummary }) => {
@@ -333,5 +384,4 @@ const load = () => {
     render();
   });
 };
-
 load();

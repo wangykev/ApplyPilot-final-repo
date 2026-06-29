@@ -186,6 +186,30 @@ async function awaitListStable(act, readFn, loc, budgets) {
   return "timeout";
 }
 
+// awaitSourceListStable: the SOURCE picker's INITIAL-open render gate — the source analog of awaitListStable.
+// Source's open view is the CHEVRON CATEGORY rows, NOT a leaf list (its leafCount stays 0 until a query filters
+// the tree to leaves), so awaitListStable's leaf/option count would always read 0 here. The "rendered" signal
+// is therefore the popup CONTENT: categories (the on-open state, via readTreeCategories) OR leaves (a tenant
+// that opens straight to a flat list). Wait until that content is present + stable across stableReads before
+// the first type, so the type never races the popup render (the source analog of the typeahead open-race).
+// SHORTER ceiling (taOpenCeilingMs); a timed-out gate PROCEEDS (never hang) — worst case == today (type after
+// the bare focus). readTreeCategories is substrate-guarded (older fakes/recon-only acts may omit it). Returns
+// "stable" | "timeout".
+async function awaitSourceListStable(act, loc, budgets) {
+  const deadline = Date.now() + budgets.taOpenCeilingMs;
+  let prev = null, stable = 0;
+  do {
+    let leaves = 0, cats = 0;
+    try { const s = await act.readSource(loc); leaves = (s && s.leafCount) || 0; } catch (e) { /* read race → treat as not-yet-rendered */ }
+    try { cats = act.readTreeCategories ? ((await act.readTreeCategories(loc)) || []).length : 0; } catch (e) { /* substrate without categories */ }
+    const count = leaves + cats;
+    if (count === prev) stable++; else { stable = 0; prev = count; }
+    if (count > 0 && stable >= budgets.stableReads - 1) return "stable";
+    await act.delay(budgets.taOpenIntervalMs);
+  } while (Date.now() < deadline);
+  return "timeout";
+}
+
 // TYPEAHEAD_SELF_VERIFY (operator step 5, OFF by default): when on, the keptLowerTier re-commit does a settle
 // + chip RE-READ before returning, so the handler is honest on its own. REDUNDANT with the end-of-fill M40
 // audit once the settle + affirmative-click re-commit holds — and it adds ~1.3s PER such re-commit. Leave OFF
@@ -1245,6 +1269,22 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
       await act.pressTab(); // BLUR before leaving: a prior candidate's no-match ARMED row-0 (e.g. "Accounting"); Tab abandons it so the next field's focus can't blur-commit the stray
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the search field — not actuating blind (no clear/type/Enter)", settle_trace: trace };
     }
+    // FIRST-OPEN RENDER GATE (the open-race fix): ensureSearchFocused above returns the moment the searchBox is
+    // merely visible+focused, but the freshly-opened OPTION LIST is still rendering. Typing into that mid-render
+    // state races the filter (the typed query can be dropped/misfiltered) AND the list's render can steal focus
+    // off the box. So on the first candidate of a freshly-opened widget, BLOCK until the open list renders +
+    // stabilizes (awaitListStable — the same gate the onCapture scrape uses), then RE-ASSERT focus (the render
+    // may have blurred it) before the clear/type. Skipped when:
+    //   • ci > 0 — the between-candidates awaitListTerminal already left a known terminal render state; and
+    //   • opts.onCapture — the pre-loop open+awaitListStable+scrape already rendered the list and left it open.
+    if (ci === 0 && !opts.onCapture) {
+      await awaitListStable(act, (l) => act.readTypeahead(l), loc, budgets);
+      if (!(await ensureSearchFocused())) {
+        step.note = "could not re-focus after the open list rendered — not actuating blind";
+        await act.pressTab(); // BLUR before leaving (lockstep with the focus-fail bail above)
+        return { status: "needs_review", after: null, verified: false, detail: "could not re-focus the search field after the open list rendered — not actuating blind", settle_trace: trace };
+      }
+    }
     // FOCUS-SAFE clear + type (structurally closed, same bail as the recommit): clearSearch is FOCUS-BLIND, and
     // a mid-type focus drop truncates the query → the filter-Enter then commits the armed listbox row (the
     // stray). So re-verify focus after the clear and ECHO-VERIFY the FULL candidate landed (pollSearchValue)
@@ -1586,6 +1626,22 @@ const fillSourceCdp = async (act, loc, candidates, budgets, opts) => {
       step.note = "could not focus source search field — not actuating blind";
       await act.pressTab(); // BLUR before leaving: a prior candidate may have ARMED a leaf — Tab abandons it (lockstep with typeahead)
       return { status: "needs_review", after: null, verified: false, detail: "could not focus the source search field — not actuating blind", settle_trace: trace };
+    }
+    // FIRST-OPEN RENDER GATE (lockstep with fillTypeaheadCdp's open-race fix, source variant): ensureFocused
+    // above returns the moment the searchBox is visible+focused, but the freshly-opened popup is still
+    // rendering. Typing into that mid-render state races the render (the typed query can be dropped/misfiltered)
+    // AND the render can steal focus off the box. Source's on-open view is the CHEVRON CATEGORY rows, not a leaf
+    // list (leafCount is 0 until a query filters to leaves) — so the "rendered" signal is the popup CONTENT:
+    // categories OR leaves (awaitSourceListStable), NOT the leaf count alone. Then RE-ASSERT focus (the render
+    // may have blurred the box) before the clear/type. Only the first candidate of the freshly-opened picker;
+    // ci>0 already passed through the between-candidates awaitListTerminal (a known terminal render state).
+    if (ci === 0) {
+      await awaitSourceListStable(act, loc, budgets);
+      if (!(await ensureFocused())) {
+        step.note = "could not re-focus after the source popup rendered — not actuating blind";
+        await act.pressTab(); // BLUR before leaving (lockstep with the focus-fail bail above)
+        return { status: "needs_review", after: null, verified: false, detail: "could not re-focus the source search field after the popup rendered — not actuating blind", settle_trace: trace };
+      }
     }
     // FOCUS-SAFE clear + type (structurally closed, lockstep with the typeahead): ECHO-VERIFY the FULL
     // candidate landed (pollSearchValue) BEFORE the filter-Enter; on a blur/partial, re-focus + re-clear +
@@ -3152,5 +3208,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback };
 }

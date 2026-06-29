@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeFallback } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1930,6 +1930,47 @@ test("source main loop (FAILURE-DIRECTION, lockstep): the post-type gate WAITS f
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "LinkedIn");
   assert.strictEqual(rec.settle_trace[1].outcome, "results", "cand-1 concluded on the 'Search Results' banner terminal, never the bannerless transient (lockstep)");
+});
+
+// ── source FIRST-OPEN render gate (awaitSourceListStable — the open-race fix, source variant) ──
+
+test("awaitSourceListStable: WAITS for the source popup to render — 'stable' only once the category rows appear", async () => {
+  // Source shows NO leaves on open (leafCount stays 0 until a query filters to leaves); the on-open content is
+  // the CHEVRON CATEGORY rows. Model categories that render on the 3rd read → the gate must keep polling until
+  // they're present + stable, never returning "stable" off the empty initial reads.
+  let catReads = 0;
+  const act = {
+    delay: async () => {},
+    readSource: async () => ({ leafCount: 0, searchBox: { visible: true } }), // never any leaves on open
+    readTreeCategories: async () => { catReads++; return catReads >= 3 ? ["Social Media", "Job Board"] : []; }
+  };
+  const r = await awaitSourceListStable(act, { wrapperSel: "[w]" }, T_BUDGETS);
+  assert.strictEqual(r, "stable");
+  assert.ok(catReads >= 4, "polled past the empty reads until the categories rendered AND held stable (never typed into an empty popup)");
+});
+
+test("awaitSourceListStable: nothing ever renders → 'timeout' (PROCEEDS, never hangs — worst case == today)", async () => {
+  const act = { delay: async () => {}, readSource: async () => ({ leafCount: 0 }), readTreeCategories: async () => [] };
+  assert.strictEqual(await awaitSourceListStable(act, { wrapperSel: "[w]" }, T_BUDGETS), "timeout");
+});
+
+test("awaitSourceListStable: a tenant that opens straight to LEAVES (no categories) also satisfies the gate", async () => {
+  const act = { delay: async () => {}, readSource: async () => ({ leafCount: 5, searchBox: { visible: true } }), readTreeCategories: async () => [] };
+  assert.strictEqual(await awaitSourceListStable(act, { wrapperSel: "[w]" }, T_BUDGETS), "stable");
+});
+
+test("source first-open render gate: the popup render is awaited (category content read) BEFORE the first type", async () => {
+  // Wired into fillSourceCdp: the gate reads the popup content, then re-asserts focus, then types — so the
+  // first deterministic search never lands in an unrendered popup. LinkedIn auto-commits (happy path unchanged).
+  const f = srcField({ treeCategories: ["Social Media", "Job Board"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } });
+  const act = makeFakeAct([f]);
+  const rec = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, ["LinkedIn"], T_BUDGETS);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "LinkedIn");
+  const firstCatRead = act.log.findIndex(([m]) => m === "readTreeCategories");
+  const firstType = act.log.findIndex(([m]) => m === "typeInSourceSearch");
+  assert.ok(firstCatRead >= 0, "the render gate read the popup content (categories)");
+  assert.ok(firstCatRead < firstType, "the render gate ran BEFORE the first type — no typing into an unrendered popup");
 });
 
 test("source: no candidate in its filtered set → needs_review", async () => {
