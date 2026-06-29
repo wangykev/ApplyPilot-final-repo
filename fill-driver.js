@@ -326,7 +326,13 @@ const DEFAULT_BUDGETS = {
   entryReconcileIntervalMs: 150,
   // M40 post-fill audit: one settle (NON-adaptive — the page's render is real wall-clock)
   // before the independent re-read pass, so a still-settling last field isn't false-flagged.
-  auditSettleMs: 600
+  auditSettleMs: 600,
+  // Cascade re-scan (M1): bound on the re-scan→fill→re-scan loop. Each round is ONE
+  // read-only act.scanPage() + a fill of only the NEW fields, so the loop adds NO fixed
+  // wait — it relies on the reveal latency (~5.6s, Magna recon) being ABSORBED by the
+  // fill work that already runs after the triggering field (so the post-fold scan sees
+  // the reveal already mounted). The cap is a runaway backstop (chained reveals are rare).
+  maxCascadeRounds: 3
 };
 
 // ── Verbatim M22 ports (background.js fillEngine — change in lockstep) ──────
@@ -2158,6 +2164,39 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         aiContext: { profile, jobContext } // Option B: inline AI rescue context for the section's typeaheads (FoS)
       }, budgets);
       if (out && Array.isArray(out.results)) results.push(...out.results);
+    }
+  }
+
+  // ── M1 CASCADE RE-SCAN-AFTER-CHANGE ── a committed value can REVEAL new fields (Magna
+  // recon 2026-06-29: changing Country revealed 2 "Cyrillic name" text fields ~5.6s later,
+  // and HID "State"). The single up-front scan misses them, so they never fill / never enter
+  // the bundle. Here we re-scan after the fold and fill any NEW flat field through the
+  // IDENTICAL deterministic→AI ladder by re-invoking drivePageFill with `onlyFieldNames`
+  // (the AI-4 targeted-refill path — NO duplicated fill logic). Each revealed record is
+  // tagged `cascadeRevealed` so the submit replay can force a second review.
+  // PERFORMANCE (the operator's constraint): BYTE-IDENTICAL when nothing is revealed — the
+  // only cost is ONE read-only act.scanPage() per round (no actuation, NO fixed wait). The
+  // ~5.6s reveal latency is absorbed by the fill work that already ran after the triggering
+  // field, so by here the reveal is usually already mounted; the loop re-scans after each
+  // fill round to catch a chained reveal, bounded by maxCascadeRounds. SKIPPED under `only`
+  // (a targeted re-fill never needs to cascade — same gate as the fold/audit above).
+  if (!only) {
+    const seen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+    for (let round = 0; round < budgets.maxCascadeRounds; round++) {
+      let reFields;
+      try { reFields = (await act.scanPage()).fields || []; } catch (e) { break; } // re-scan blip → stop (non-fatal)
+      const revealed = reFields.filter((f) => !seen.has(f.fieldName));
+      if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
+      const revealedNames = new Set(revealed.map((f) => f.fieldName));
+      revealed.forEach((f) => seen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
+      try {
+        const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames });
+        for (const r of (sub && sub.results) || []) {
+          r.cascadeRevealed = true; // provenance: appeared only AFTER a value committed → the submit gate forces a re-review
+          r.detail = (r.detail ? r.detail + " | " : "") + "REVEALED by an earlier field's value (cascade re-scan)";
+          results.push(r);
+        }
+      } catch (e) { /* a revealed-field fill threw → don't abort the whole page; next round / honest miss */ }
     }
   }
 

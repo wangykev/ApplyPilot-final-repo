@@ -330,6 +330,23 @@ document.getElementById("cdp-textarea-recon").addEventListener("click", () => {
   });
 });
 
+// CASCADE RECON (submit prereq): characterize fields REVEALED when a value changes.
+// OPERATOR-DRIVEN + READ-ONLY — keep the tab VISIBLE, then manually change ONE field
+// you expect to unfurl follow-ups. Findings land as [CASCADE-RECON] in the SW console.
+document.getElementById("cdp-cascade-recon").addEventListener("click", () => {
+  setStatus("Cascade recon armed — keep the tab VISIBLE. In a moment, manually change ONE field that should reveal new fields (e.g. previously-employed → Yes, or a Country dropdown). Watching ~60s. Findings → SW console [CASCADE-RECON].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_CASCADE_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have lost focus — SW console has it all
+    if (resp.ok === false) {
+      setStatus("Cascade recon failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.cascade === false) {
+      setStatus(`No field-set change detected (baseline ${resp.baseline_count} fields). Re-run and change a control that reveals follow-ups. See [CASCADE-RECON].`);
+    } else {
+      setStatus(`Cascade detected ~${resp.latency_ms}ms: ${resp.before_count}→${resp.after_count} fields, +${resp.added.length} revealed / -${resp.removed.length} hidden. See [CASCADE-RECON].`);
+    }
+  });
+});
+
 // WEBSITES FILL (M32b): the first repeating-section fill on the CDP path —
 // reconcile to N + fill each entry's url (date-free Websites). Run on My
 // Experience (page 2); minimize within 60s. Results land as [CDP-WEB] in the SW console.

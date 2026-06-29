@@ -4098,3 +4098,69 @@ test("aiTreeDrillFallback: the AI's CLEAN leaf containment-matches + commits the
   const clicked = act.log.find(([m]) => m === "clickSourceLeaf");
   assert.strictEqual(clicked[1], "Certified Information Systems Auditor (CISA) - Multiple Recognized Providers", "committed the FULL label");
 });
+
+// ── M1: cascade re-scan-after-change (revealed fields) ───────────────────────
+// drivePageFill re-scans after the fold and fills any NEW flat field through the
+// SAME deterministic→AI ladder (via the onlyFieldNames re-invoke), tagging it
+// cascadeRevealed. The fake's scanPage reads the `fields` array live, so pushing
+// to it between calls simulates a reveal (the ~5.6s-later mount, already absorbed).
+
+test("M1 cascade: a stable page (no reveal) adds ZERO cascade records — byte-identical fill", async () => {
+  const fields = [
+    { wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" },
+    { wrapperSel: "[w-ln]", fieldName: "legalName--lastName", widgetType: "text", value: "" }
+  ];
+  const out = await drivePageFill(makeFakeAct(fields), { personal_info: { first_name: "Ada", last_name: "Lovelace" } }, {}, {}, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.cascadeRevealed), "no cascadeRevealed records on a stable page");
+  assert.strictEqual(out.results.length, 2, "exactly the up-front fields — no spurious additions");
+});
+
+test("M1 cascade: a field REVEALED after a value commits is filled + tagged cascadeRevealed, never silent", async () => {
+  const fields = [{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }];
+  const cityField = { wrapperSel: "[w-city]", fieldName: "city", widgetType: "text", value: "", isRequired: true };
+  const act = makeFakeAct(fields);
+  const baseScan = act.scanPage;
+  let revealed = false;
+  act.scanPage = async () => {
+    // reveal `city` ONCE the first field has a value (the cascade is already mounted by post-fold time)
+    if (fields[0].value && !revealed) { fields.push(cityField); revealed = true; }
+    return baseScan();
+  };
+  const out = await drivePageFill(act, { personal_info: { first_name: "Ada", city: "London" } }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 3 });
+  const rec = out.results.find((r) => r.fieldName === "city");
+  assert.ok(rec, "the revealed field is recorded");
+  assert.strictEqual(rec.cascadeRevealed, true, "tagged cascadeRevealed (forces a re-review on submit)");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "London");
+  assert.strictEqual(out.results.filter((r) => r.fieldName === "city").length, 1, "filled exactly once (only-NEW-keys, no re-trigger)");
+});
+
+test("M1 cascade: a page that reveals a NEW field on every scan TERMINATES (round cap) and never re-fills a field", async () => {
+  const fields = [{ wrapperSel: "[w0]", fieldName: "legalName--firstName", widgetType: "text", value: "" }];
+  const act = makeFakeAct(fields);
+  const baseScan = act.scanPage;
+  let k = 0;
+  act.scanPage = async () => {
+    k++;
+    if (k >= 2) { const id = "rev" + k; if (!fields.some((f) => f.fieldName === id)) fields.push({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "text", value: "" }); }
+    return baseScan();
+  };
+  // completes at all ⇒ the loop terminated (a non-terminating loop would hang the test)
+  const out = await drivePageFill(act, { personal_info: { first_name: "Ada" } }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 2 });
+  assert.ok(out.results.some((r) => r.cascadeRevealed), "at least one reveal handled");
+  const names = out.results.map((r) => r.fieldName);
+  assert.strictEqual(new Set(names).size, names.length, "no field is filled twice — only-NEW-keys guarantees termination");
+});
+
+test("M1 cascade: SKIPPED under opts.onlyFieldNames (AI-4 targeted re-fill never cascades)", async () => {
+  const fields = [{ wrapperSel: "[w0]", fieldName: "legalName--firstName", widgetType: "text", value: "" }];
+  const act = makeFakeAct(fields);
+  const baseScan = act.scanPage;
+  act.scanPage = async () => {
+    if (fields[0].value && !fields.some((f) => f.fieldName === "city")) fields.push({ wrapperSel: "[w-city]", fieldName: "city", widgetType: "text", value: "" });
+    return baseScan();
+  };
+  const out = await drivePageFill(act, { personal_info: { first_name: "Ada", city: "London" } }, {}, {}, T_BUDGETS, { onlyFieldNames: new Set(["legalName--firstName"]) });
+  assert.ok(!out.results.some((r) => r.cascadeRevealed), "cascade block is gated off under onlyFieldNames");
+  assert.ok(!out.results.some((r) => r.fieldName === "city"), "the revealed field is NOT filled during a targeted re-fill");
+});

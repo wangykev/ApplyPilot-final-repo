@@ -91,6 +91,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP CASCADE RECON (submit prereq): characterize fields REVEALED when a value
+  // changes (previously-employed "Yes" follow-ups, a Country's local-name boxes, a
+  // "Yes/Other → please specify"). OPERATOR-DRIVEN + READ-ONLY — runs VISIBLE (no
+  // minimize): snapshot → operator changes ONE field by hand → diff. [CASCADE-RECON]
+  // in the SW console. No profile needed.
+  if (message.type === "RUN_CDP_CASCADE_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpCascadeRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL WEBSITES (M32b): the FIRST repeating-section fill on the CDP path —
   // reconcile the Websites section to N + fill each entry's url (date-free) while
   // HIDDEN. Proves driveRepeatingSectionCdp; dates are deferred (Websites has none).
@@ -1942,6 +1957,85 @@ async function runCdpCertSpecialtyRecon(tabId) {
     }
     LOG("recon complete — see the BEFORE/diff dumps above. Build (schema + nested fill) is a DEFERRED milestone; Attachments deferred.");
     return { ok: true, mounted: !!newFkit.length, specialtyIndex };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// CDP CASCADE RECON (submit-stage prerequisite): characterize what happens when a
+// field value change REVEALS new fields — the previously-employed "Yes" follow-ups,
+// a Country choice's local-name boxes, a "Yes/Other → please specify" text box. This
+// is the gap the submit replay must handle: a human edit in the summary can flip a
+// value the original fill never tried, unfurling fields with no approved answer.
+//
+// OPERATOR-DRIVEN + fully READ-ONLY: the bot NEVER actuates — it snapshots the field
+// set, the operator manually changes ONE field, and the harness polls until the set
+// settles, then dumps the added/removed fields + shape + the reveal latency. Runs
+// VISIBLE (NOT minimized) — the operator must see + interact with the form (M39:
+// visible work is fine; this only reads, so no throttle concern). [CASCADE-RECON].
+async function runCdpCascadeRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CASCADE-RECON]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. Keep the tab VISIBLE (do NOT minimize). Capturing the BASELINE field set now…");
+
+    const baseline = await cdpEval(cdpCascadeScan);
+    if (!baseline || !Array.isArray(baseline.fields)) { LOG("baseline scan failed."); return { ok: false, error: "scan-failed" }; }
+    const baseKeys = new Set(baseline.fields.map((f) => f.key));
+    LOG(`baseline: ${baseline.fieldCount} fields on ${baseline.url}`);
+    LOG("▶ NOW manually change ONE field on the form that you expect to reveal new fields (e.g. the 'have you previously been employed here?' question → Yes, or a Country dropdown). Watching for ~60s…");
+
+    // Poll until the field SET differs from baseline, then SETTLES (key-set stable across
+    // 2 consecutive reads — the new fields finished mounting). All SW wall-clock.
+    const WINDOW_MS = 60000, INTERVAL_MS = 500;
+    const t0 = Date.now();
+    let result = null, prevKeysStr = null, stable = 0;
+    while (Date.now() - t0 < WINDOW_MS) {
+      await cdpDelay(INTERVAL_MS);
+      let cur = null;
+      try { cur = await cdpEval(cdpCascadeScan); } catch (e) { continue; } // mid-render eval blip → keep polling
+      if (!cur || !Array.isArray(cur.fields)) continue;
+      const curKeys = new Set(cur.fields.map((f) => f.key));
+      const added = cur.fields.filter((f) => !baseKeys.has(f.key));
+      const removed = baseline.fields.filter((f) => !curKeys.has(f.key));
+      if (!added.length && !removed.length) { prevKeysStr = null; stable = 0; continue; } // no change yet
+      const keysStr = [...curKeys].sort().join("|");
+      if (keysStr === prevKeysStr) {
+        if (++stable >= 2) { result = { cur, added, removed, latencyMs: Date.now() - t0 }; break; } // settled
+      } else { prevKeysStr = keysStr; stable = 1; }
+    }
+
+    if (!result) {
+      LOG("⚠ no field-set change detected in the window. Either nothing was changed, or the change didn't add/remove a formField-* wrapper (some cascades only toggle a field's visibility/disabled state — re-run and try a different control). Read-only; nothing actuated.");
+      return { ok: true, cascade: false, baseline_count: baseline.fieldCount };
+    }
+
+    LOG(`✅ cascade detected ~${result.latencyMs}ms after baseline (${baseline.fieldCount} → ${result.cur.fieldCount} fields).`);
+    if (result.added.length) {
+      LOG(`REVEALED ${result.added.length} field(s) — full shape:`);
+      console.log("[ApplyPilot][CASCADE-RECON]", JSON.stringify(result.added, null, 2));
+      const req = result.added.filter((f) => f.isRequired).map((f) => f.fieldName);
+      LOG("revealed REQUIRED fields (these would BLOCK Save & Continue if left unfilled):", req.length ? JSON.stringify(req) : "(none)");
+      const inRepeat = result.added.filter((f) => f.fkitContainer);
+      if (inRepeat.length) LOG("⚠ some revealed fields are inside a repeating container (fkit):", JSON.stringify(inRepeat.map((f) => ({ field: f.fieldName, fkit: f.fkitContainer }))));
+    }
+    if (result.removed.length) {
+      LOG(`HIDDEN ${result.removed.length} field(s) (present at baseline, gone now):`);
+      console.log("[ApplyPilot][CASCADE-RECON]", JSON.stringify(result.removed.map((f) => ({ fieldName: f.fieldName, label: f.label })), null, 2));
+    }
+    LOG("recon complete — READ-ONLY, nothing actuated. Re-run to test another control.");
+    return {
+      ok: true, cascade: true, latency_ms: result.latencyMs,
+      before_count: baseline.fieldCount, after_count: result.cur.fieldCount,
+      added: result.added,
+      removed: result.removed.map((f) => ({ fieldName: f.fieldName, label: f.label }))
+    };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("recon aborted:", msg);

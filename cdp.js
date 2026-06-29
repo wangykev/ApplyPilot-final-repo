@@ -402,6 +402,71 @@ function cdpPageScan() {
   };
 }
 
+// SUBMIT cascade recon: READ-ONLY full-page field-set snapshot for detecting fields
+// REVEALED (or hidden) when a value changes — the "previously employed here? → Yes"
+// follow-ups, a Country choice's local-name boxes, a "Yes/Other → please specify" box.
+// Captures EVERY formField-* wrapper (flat AND inside a repeating entry — a cascade can
+// reveal either), each keyed by automation-id qualified with its enclosing data-fkit-id
+// so duplicated repeating ids stay distinct across the diff. The SW runner snapshots
+// twice (the operator changes ONE field by hand between them) and diffs the key sets to
+// isolate the added/removed fields + their widget shape + required flag. Self-contained
+// (cdpEval stringifies it — no shared helpers).
+function cdpCascadeScan() {
+  const classify = (w) => {
+    const fieldName = (w.getAttribute("data-automation-id") || "").slice("formField-".length);
+    if (fieldName === "source") return "hierarchical";
+    if (w.querySelector('input[type="file"]')) return "file_upload";
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => {
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
+    });
+    if (textLike.length === 1) return "text";
+    if (w.querySelector("textarea")) return "textarea";
+    return "unknown";
+  };
+  const labelOf = (w) => {
+    const legend = w.querySelector("legend");
+    if (legend && legend.textContent.trim()) return legend.textContent.trim().slice(0, 80);
+    for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 80); }
+    const ariaEl = w.matches("[aria-label]") ? w : w.querySelector("[aria-label]");
+    return ariaEl ? ariaEl.getAttribute("aria-label").trim().slice(0, 80) : null;
+  };
+  const requiredOf = (w) => {
+    for (const a of w.querySelectorAll("abbr")) {
+      const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || "");
+      if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true;
+    }
+    if (w.querySelector('[aria-required="true"], [data-required="true"]')) return true;
+    if (w.querySelector('[data-automation-id="requiredMarker"]')) return true;
+    const labelEl = w.querySelector("legend") || w.querySelector("label");
+    if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
+    return false;
+  };
+  const wrappers = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
+  return {
+    url: location.href,
+    fieldCount: wrappers.length,
+    fields: wrappers.map((w) => {
+      const id = w.getAttribute("data-automation-id");
+      const fkitEl = w.closest("[data-fkit-id]");
+      const fkit = fkitEl ? fkitEl.getAttribute("data-fkit-id") : null;
+      return {
+        automationId: id,
+        fieldName: id.slice("formField-".length),
+        fkitContainer: fkit,                 // null = flat (page-level); non-null = inside a repeating entry
+        key: (fkit ? fkit + " " : "") + id,  // stable diff key (distinguishes duplicated repeating ids)
+        widgetType: classify(w),
+        label: labelOf(w),
+        isRequired: requiredOf(w)
+      };
+    })
+  };
+}
+
 // M32 recon: READ-ONLY structure dump of the page's repeating sections (My
 // Experience). Enumerates the `--null` ENTRY containers grouped by section
 // prefix (NOT the `--startDate`/`--endDate` date wrappers that share the prefix
