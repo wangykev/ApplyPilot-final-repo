@@ -46,6 +46,39 @@ function meaningfulWorkExperience(arr) {
   return meaningfulEntries(arr, ["job_title", "company"]);
 }
 
+// A work_experience entry's recency rank for "most recent job first" ordering. Higher =
+// more recent. A currently-held job (currently_work_here:true) has no end date and is the
+// most recent → Infinity. Otherwise rank by the END date ("to"); if "to" is missing/the
+// "YYYY-MM" placeholder, fall back to the START date ("from") so an entry stored without an
+// end date still lands near its true recency instead of at the bottom; no parseable date at
+// all → -Infinity (last). Months are encoded as year*12+month for a total order.
+function workExperienceRecency(e) {
+  if (e && e.currently_work_here === true) return Infinity;
+  const enc = (d) => { const p = parseYearMonth(d); return p ? parseInt(p.year, 10) * 12 + parseInt(p.month, 10) : null; };
+  const end = enc(e && e.to);
+  if (end != null) return end;
+  const start = enc(e && e.from);
+  return start != null ? start : -Infinity;
+}
+
+// Sort work_experience entries most-recent-first (by end date; currently-held jobs first),
+// tie-broken by start date, then by original order so genuine ties stay stable. Pure → the
+// SW calls it in prepareProfile so the i-th filled form entry is the i-th most-recent job,
+// regardless of how the profile stored them. Non-array → returned as-is. Does not mutate.
+function sortWorkExperienceByRecency(arr) {
+  if (!Array.isArray(arr)) return arr;
+  const cmpDesc = (x, y) => (x === y ? 0 : x > y ? -1 : 1); // descending; Infinity-safe (unlike y-x)
+  const startEnc = (e) => { const p = parseYearMonth(e && e.from); return p ? parseInt(p.year, 10) * 12 + parseInt(p.month, 10) : -Infinity; };
+  return arr
+    .map((e, i) => ({ e, i }))
+    .sort((a, b) =>
+      cmpDesc(workExperienceRecency(a.e), workExperienceRecency(b.e)) ||
+      cmpDesc(startEnc(a.e), startEnc(b.e)) ||
+      (a.i - b.i)
+    )
+    .map((x) => x.e);
+}
+
 // Parse a profile year ("2021") into a 4-digit year string, or null. Rejects empty,
 // the "YYYY" placeholder, and non-4-digit values (used for Education's year-only date).
 function parseYear(s) {
@@ -315,5 +348,5 @@ function languageDeletionPlan(entries) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
 }

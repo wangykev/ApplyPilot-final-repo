@@ -559,7 +559,11 @@ function prepareProfile(profile) {
   if (!profile) return profile;
   const out = { ...profile };
   if (Array.isArray(profile.work_experience)) {
-    out.work_experience = meaningfulEntries(profile.work_experience, ["job_title", "company"]).map((e) => ({
+    // Most-recent job FIRST (sort by end date; currently-held jobs first), regardless of the
+    // profile's stored order — so the i-th filled form entry is the i-th most-recent job.
+    out.work_experience = sortWorkExperienceByRecency(
+      meaningfulEntries(profile.work_experience, ["job_title", "company"])
+    ).map((e) => ({
       ...e, fromParsed: parseYearMonth(e.from), toParsed: parseYearMonth(e.to), bulletsText: joinBullets(e.bullets)
     }));
   }

@@ -4,7 +4,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { meaningfulWorkExperience, meaningfulEntries, joinBullets, ensureHttps, isFluent } = require("../lib.js");
+const { meaningfulWorkExperience, meaningfulEntries, joinBullets, ensureHttps, isFluent, sortWorkExperienceByRecency, workExperienceRecency } = require("../lib.js");
 
 test("isFluent — true only for a 'fluent' value (string or in a tiered array)", () => {
   assert.strictEqual(isFluent("Fluent"), true);
@@ -99,4 +99,88 @@ test("joinBullets returns '' for empty / non-array / non-string items", () => {
   assert.strictEqual(joinBullets(null), "");
   assert.strictEqual(joinBullets("nope"), "");
   assert.strictEqual(joinBullets([null, 42, {}]), "");
+});
+
+// ── sortWorkExperienceByRecency — most-recent job first (by end date) ──────────
+const titles = (arr) => sortWorkExperienceByRecency(arr).map((e) => e.job_title);
+
+test("sorts by end date descending (most recent first)", () => {
+  const arr = [
+    { job_title: "Old", to: "2018-06" },
+    { job_title: "Newest", to: "2023-01" },
+    { job_title: "Middle", to: "2020-11" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["Newest", "Middle", "Old"]);
+});
+
+test("a currently-held job comes first (no end date = most recent)", () => {
+  const arr = [
+    { job_title: "Past", to: "2023-12" },
+    { job_title: "Current", currently_work_here: true, to: "" },
+    { job_title: "Older", to: "2019-03" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["Current", "Past", "Older"]);
+});
+
+test("currently_work_here wins even if a stale 'to' is stored", () => {
+  const arr = [
+    { job_title: "Recent", to: "2024-05" },
+    { job_title: "Current", currently_work_here: true, to: "2010-01" } // bad stored 'to' ignored
+  ];
+  assert.deepStrictEqual(titles(arr), ["Current", "Recent"]);
+});
+
+test("missing/placeholder end date falls back to start date (not dumped last)", () => {
+  const arr = [
+    { job_title: "EndedEarly", to: "2019-12" },
+    { job_title: "OpenStartedLater", from: "2021-02", to: "YYYY-MM" } // no real end → use start 2021
+  ];
+  assert.deepStrictEqual(titles(arr), ["OpenStartedLater", "EndedEarly"]);
+});
+
+test("entries with no parseable dates sort last, in original order (stable)", () => {
+  const arr = [
+    { job_title: "NoDatesA" },
+    { job_title: "Dated", to: "2020-01" },
+    { job_title: "NoDatesB" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["Dated", "NoDatesA", "NoDatesB"]);
+});
+
+test("two currently-held jobs tie-break by start date desc, then stable order", () => {
+  const arr = [
+    { job_title: "CurStartedEarlier", currently_work_here: true, from: "2015-01" },
+    { job_title: "CurStartedLater", currently_work_here: true, from: "2022-08" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["CurStartedLater", "CurStartedEarlier"]);
+});
+
+test("equal end dates keep original profile order (stable)", () => {
+  const arr = [
+    { job_title: "First", to: "2020-06" },
+    { job_title: "Second", to: "2020-06" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["First", "Second"]);
+});
+
+test("reorders without mutating the input array", () => {
+  const arr = [
+    { job_title: "Old", to: "2018-01" },
+    { job_title: "New", to: "2022-01" }
+  ];
+  const out = sortWorkExperienceByRecency(arr);
+  assert.deepStrictEqual(arr.map((e) => e.job_title), ["Old", "New"]); // input untouched
+  assert.deepStrictEqual(out.map((e) => e.job_title), ["New", "Old"]);
+});
+
+test("non-array input returned as-is", () => {
+  assert.strictEqual(sortWorkExperienceByRecency(null), null);
+  assert.strictEqual(sortWorkExperienceByRecency(undefined), undefined);
+});
+
+test("workExperienceRecency: currently-held = Infinity; by end then start; else -Infinity", () => {
+  assert.strictEqual(workExperienceRecency({ currently_work_here: true }), Infinity);
+  assert.strictEqual(workExperienceRecency({ to: "2020-03" }), 2020 * 12 + 3);
+  assert.strictEqual(workExperienceRecency({ from: "2019-07", to: "YYYY-MM" }), 2019 * 12 + 7);
+  assert.strictEqual(workExperienceRecency({}), -Infinity);
 });
