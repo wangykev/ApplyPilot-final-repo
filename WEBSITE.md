@@ -167,9 +167,9 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 Incremental, one focused change per milestone, a commit each (so we can bisect) — mirroring the
 extension's discipline.
 
-- **M1 — WEBSITE.md** *(in progress)*: this doc — scope, decisions, contracts, DB model, roadmap, log.
-- **M2 — Scaffold + landing** *(pending)*: `web/` Next.js + TS + Tailwind; flight-deck tokens + fonts; landing page with the signature fill-status hero.
-- **M3 — Auth + Supabase** *(pending)*: client/server setup, Google + email, migrations + RLS, protected `/app` shell.
+- **M1 — WEBSITE.md** *(done)*: this doc — scope, decisions, contracts, DB model, roadmap, log.
+- **M2 — Scaffold + landing** *(done, `5b031c8`)*: `web/` Next.js + TS + Tailwind; flight-deck tokens + fonts; landing page with the signature fill-status hero. Build green; desktop + mobile verified.
+- **M3 — Auth + Supabase** *(done)*: `@supabase/ssr` browser/server clients, session middleware (guards `/app/*`), Google + email/password login, `supabase/migrations/0001_init.sql` (full schema + RLS + private `resumes` storage bucket), protected `/app` instrument-rail shell + setup dashboard. Graceful "backend not connected" notice when unconfigured. **Dev-preview bypass** (`NEXT_PUBLIC_DEV_PREVIEW=1`, hard-gated to non-prod) to view the signed-in UI before Supabase is wired. Type-check + login/app render verified.
 - **M4 — Profile editor** *(pending)*: zod schema + full editor over schema v2.0 (raw-only), tiered-array inputs, save to `profiles`.
 - **M5 — Resume + AI parse** *(pending)*: Storage upload + `parse-resume` route (`lib/llm.ts` + `unpdf` + zod) → populate editor.
 - **M6 — AI config + job context** *(pending)*: `llmConfig`-parity settings + Test-connection; company + `how_did_you_hear`.
