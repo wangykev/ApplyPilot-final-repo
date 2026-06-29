@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-cockpit text-ink font-sans antialiased;
+    /* Faint instrument grid + a single amber horizon glow, fixed to the deck. */
+    background-image:
+      radial-gradient(120% 80% at 80% -10%, rgba(255, 182, 39, 0.10), transparent 55%),
+      radial-gradient(90% 60% at 0% 110%, rgba(54, 214, 160, 0.06), transparent 60%);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    @apply bg-amber/30 text-ink;
+  }
+
+  /* Visible keyboard focus — part of the quality floor. */
+  :focus-visible {
+    outline: 2px solid theme("colors.amber.DEFAULT");
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+}
+
+@layer components {
+  /* A micro-label in the instrument vernacular: mono, tracked-out, dim. */
+  .eyebrow {
+    @apply font-mono text-[11px] uppercase tracking-label text-ink-dim;
+  }
+
+  /* Instrument-bezel surface. */
+  .bezel {
+    @apply rounded-xl border border-hairline bg-panel shadow-bezel;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-5 py-2.5 text-sm font-medium
+      transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-amber text-cockpit hover:bg-amber-soft;
+  }
+  .btn-ghost {
+    @apply btn border border-hairline bg-transparent text-ink hover:border-ink-dim hover:bg-panel-raised;
+  }
+
+  .hairline-rule {
+    @apply h-px w-full bg-hairline;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  .grid-deck {
+    background-image: theme("backgroundImage.grid-faint");
+    background-size: 48px 48px;
+  }
+}
+
+/* Honor reduced-motion across the whole deck. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
