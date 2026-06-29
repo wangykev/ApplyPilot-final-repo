@@ -190,3 +190,46 @@ export function coerceProfile(raw: unknown): Profile {
   const parsed = profileSchema.safeParse(obj);
   return parsed.success ? parsed.data : emptyProfile();
 }
+
+/**
+ * Fill-the-blanks merge: keep everything the user already has; only take a value
+ * from `incoming` (e.g. an AI parse) where the base is empty. Non-destructive —
+ * a populated array or non-empty string is never overwritten. Used by
+ * "Apply parsed resume to my profile".
+ */
+export function mergeProfile(base: Profile, incoming: Profile): Profile {
+  const out = structuredClone(base);
+
+  // personal_info: per-field fill
+  for (const [k, v] of Object.entries(incoming.personal_info)) {
+    const cur = (out.personal_info as Record<string, unknown>)[k];
+    if (isEmpty(cur) && !isEmpty(v)) {
+      (out.personal_info as Record<string, unknown>)[k] = v;
+    }
+  }
+
+  // top-level arrays: take incoming only when base is empty
+  const arrayKeys = [
+    "websites",
+    "work_experience",
+    "education",
+    "skills",
+    "languages",
+    "certifications",
+    "employment_history_companies",
+  ] as const;
+  for (const k of arrayKeys) {
+    if ((out[k] as unknown[]).length === 0 && (incoming[k] as unknown[]).length > 0) {
+      (out as Record<string, unknown>)[k] = structuredClone(incoming[k]);
+    }
+  }
+
+  return out;
+}
+
+function isEmpty(v: unknown): boolean {
+  if (v == null) return true;
+  if (typeof v === "string") return v.trim() === "";
+  if (Array.isArray(v)) return v.length === 0;
+  return false;
+}
