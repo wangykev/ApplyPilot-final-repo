@@ -173,7 +173,7 @@ extension's discipline.
 - **M4 — Profile editor** *(done)*: `lib/profile-schema.ts` (zod schema v2.0 + `emptyProfile`/`coerceProfile`); reusable form primitives (`components/form/fields.tsx` — text/select/tri-bool/tag-list/tiered); full sectioned editor (personal info, websites, work experience, education, skills, languages, certifications, work auth, how-did-you-hear, employer history w/ safety note, self-id, screening defaults); raw-fields-only; `saveProfile` server action upserts `profiles.profile_json`. Type-check + full render verified. *(Deferred to a later pass: essay_drafts, story_bank, projects, long-tail application_questions — not on the extension's current fill path.)*
 - **M5 — Resume + AI parse** *(done)*: `lib/llm.ts` (faithful TS port of `llm.js`, never-throws, same `LLM_MODELS`); `lib/ai-config.ts` (`llmConfig`-parity); `lib/resume-prompt.ts` (extraction prompt + tolerant JSON parse); `mergeProfile` (fill-blanks). `POST /api/resume/upload` (PDF → Storage `resumes/<uid>/default-resume.pdf` + `resumes` row) and `POST /api/parse-resume` (`unpdf` text extract → user's LLM → raw profile JSON). Resume UI: drag-drop upload, "Parse with AI", found-summary, "Apply to my profile" (fill-blanks, `applyParsedProfile`), remove. Type-check + render verified. *(Live upload/parse needs the user's Supabase + AI key.)*
 - **M6 — AI config + job context** *(done)*: `/app/ai` — provider/model (from `LLM_MODELS`, default `gemini-3.1-flash-lite`)/key/enable toggle + server-side **Test connection** (`testLlm` round-trips a trivial prompt); saved to `profiles.ai_config`. `/app/job` — target company → `profiles.job_context_json`. Type-check + render verified.
-- **M7 — Extension wiring** *(pending)*: `manifest.json` + `background.js` `onMessageExternal`; Connect page; end-to-end sync; extension tests still green.
+- **M7 — Extension wiring** *(done)*: `manifest.json` gained `externally_connectable.matches` (`http://localhost/*`, `127.0.0.1`) + `http://localhost/*` host permission; `background.js` gained the `onMessageExternal` handler (`AP_PING`/`AP_SYNC_PROFILE`/`AP_SET_LLM`/`AP_SET_SESSION`/`AP_SYNC_RESUME`) writing the same `chrome.storage.local`/IndexedDB slots the popup seeds. Website: `lib/extension.ts` client bridge (`pingExtension`/`sendToExtension`, graceful when `chrome.runtime` absent), `getSyncBundle` server action (profile+defaults+jobContext+llmConfig+resume base64 + a freshly-minted ingest key), `/app/connect` (paste ID → check → sync, per-step status), and `POST /api/extension/report` (validates the ingest key via `api_keys`, inserts an `applications` row — the P2 tracker path, ready). Extension suite **325/325 green**; web production build green; bridge graceful-path verified. **Live website↔extension round-trip is the user's step** (load unpacked extension → copy ID → Sync) — needs the extension in the same Chrome profile.
 
 ## How to run (filled in as it's built)
 
@@ -186,3 +186,13 @@ npm run dev                  # http://localhost:3000
 
 Extension side: load the unpacked extension (`chrome://extensions` → Load unpacked → repo root),
 copy its ID, paste it on `/app/connect`, then **Sync to extension**.
+
+### Supabase setup (one-time)
+1. Create a Supabase project. Project Settings → API → copy the URL + anon key + service-role key into `web/.env.local`.
+2. Run `web/supabase/migrations/0001_init.sql` in the SQL editor (creates tables + RLS + the private `resumes` bucket).
+3. Auth → Providers → enable **Email** and **Google** (set the Google OAuth client + the `…/auth/callback` redirect).
+4. Remove `NEXT_PUBLIC_DEV_PREVIEW` from `.env.local` to enforce real auth.
+
+### Production deploy (when ready)
+- Deploy `web/` to Vercel; set the same env vars (with `NEXT_PUBLIC_SITE_URL` = the prod origin).
+- Add the prod origin to **both** the extension `manifest.json` `externally_connectable.matches` **and** `host_permissions`, then reload the extension. (Optional hardening: pin a stable extension id via a manifest `key`.)

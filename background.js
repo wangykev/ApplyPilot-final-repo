@@ -4,6 +4,101 @@
 // the stored resume's bytes here, then pass them as a string into the injection.
 importScripts("db.js", "lib.js", "llm.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); llm.js = multi-provider LLM adapter (callLLM); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
 
+// ============================================================================
+// EXTERNAL messages from ApplyPilot Web (the website → extension handoff).
+// Chrome only delivers onMessageExternal for origins in manifest
+// externally_connectable.matches, so reaching here already means a trusted
+// origin. This is the permanent website→extension contract (see WEBSITE.md):
+// the website WRITES profile/defaults/jobContext/llmConfig + the resume bytes
+// exactly into the same chrome.storage.local / IndexedDB slots the popup seeds,
+// so the fill engine reads them unchanged. The engine is agnostic to how they
+// got there. NOTHING here fills or submits — it only persists the handoff.
+// ============================================================================
+chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
+  const type = message && message.type;
+
+  // Detection + status: the website pings to confirm the extension is installed
+  // and reports what's already stored, so it can show "connected".
+  if (type === "AP_PING") {
+    (async () => {
+      let hasResume = false;
+      try { hasResume = !!(await getResume()); } catch (e) { /* ignore */ }
+      chrome.storage.local.get("profile", ({ profile }) => {
+        sendResponse({
+          ok: true,
+          app: "ApplyPilot",
+          version: chrome.runtime.getManifest().version,
+          hasProfile: !!profile,
+          hasResume
+        });
+      });
+    })();
+    return true;
+  }
+
+  // The handoff bundle: profile + defaults + jobContext (RAW fields only).
+  if (type === "AP_SYNC_PROFILE") {
+    const data = {};
+    if (message.profile !== undefined) data.profile = message.profile;
+    if (message.defaults !== undefined) data.defaults = message.defaults;
+    if (message.jobContext !== undefined) data.jobContext = message.jobContext;
+    if (Object.keys(data).length === 0) { sendResponse({ ok: false, error: "nothing to sync" }); return true; }
+    chrome.storage.local.set(data, () => {
+      const err = chrome.runtime.lastError;
+      sendResponse(err ? { ok: false, error: err.message } : { ok: true, keys: Object.keys(data) });
+    });
+    return true;
+  }
+
+  // AI config — same shape as the popup's llmConfig.
+  if (type === "AP_SET_LLM") {
+    if (!message.llmConfig || typeof message.llmConfig !== "object") {
+      sendResponse({ ok: false, error: "no llmConfig" }); return true;
+    }
+    chrome.storage.local.set({ llmConfig: message.llmConfig }, () => {
+      const err = chrome.runtime.lastError;
+      sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+    });
+    return true;
+  }
+
+  // Reporting credential for the extension→backend status path (built out in P2).
+  if (type === "AP_SET_SESSION") {
+    chrome.storage.local.set(
+      { apSession: { ingestUrl: message.ingestUrl || "", ingestKey: message.ingestKey || "" } },
+      () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+      }
+    );
+    return true;
+  }
+
+  // Resume bytes (base64 STRING — a File/Blob can't cross the message boundary),
+  // written to IndexedDB exactly like the popup's upload path.
+  if (type === "AP_SYNC_RESUME") {
+    (async () => {
+      try {
+        if (!message.base64) { sendResponse({ ok: false, error: "no base64" }); return; }
+        await saveResume({
+          filename: message.filename || "resume.pdf",
+          mime: message.mime || "application/pdf",
+          size: message.size || 0,
+          base64: message.base64,
+          savedAt: Date.now()
+        });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      }
+    })();
+    return true;
+  }
+
+  sendResponse({ ok: false, error: "unknown message type: " + type });
+  return true;
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
   // chrome.debugger INPUT can do to a HIDDEN tab — insertText vs per-char keys,
