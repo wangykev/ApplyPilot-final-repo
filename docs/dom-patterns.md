@@ -1851,3 +1851,52 @@ so the `cdp-fill-certifications` button isolate-tests cert AI (previously only t
 no-"Other" required category whose AI leaf isn't represented) is DELETED (Step 2.5). 300 tests (2 cert tree
 integration: confident→KEPT, forced-low→DELETED). LIVE-VERIFY pending (bogus cert name → drill → off-fold leaf
 committed via `clickTreeLeaf`, chip verified, M40 clean; real "CPP" still deterministic; AI-OFF byte-identical).
+
+## 2026-06-29 — Cert + source MERGED into one hierarchical-typeahead filler; source-AI commit hardening; required-empty fill
+
+**The widgets are the SAME (operator recon, supersedes the two earlier "slightly-wrong recons").** The
+Certification typeahead and "How did you hear about us?" are the identical Workday multiselect prompt: same
+selectors/structure/state attrs. Corrected DOM facts that drove the merge:
+- `searchBox.aria-controls` is **null on BOTH** — the aria-controls scoping branch was dead. The reliable
+  join/scope key is **`data-uxi-multiselect-id`** (on the searchBox AND every `promptLeafNode`).
+- Options = the page-wide visible **`[data-automation-id="promptOption"]`** (label = `data-automation-label` ||
+  textContent), chip-excluded via `selectedItemList`; selected-state = the `promptLeafNode`'s
+  `data-uxi-multiselectlistitem-isselected`. `role="option"` is the `menuItem` WRAPPER of `promptOption` (1:1).
+- The earlier "the chevron is a checkbox side-charm, NOT a category" reading was **WRONG** — `isCategory`'s svg
+  clause was restored. Cert + source DO have drillable CATEGORY rows on a no-match; **typing a category filters
+  to NOTHING** (typing finds LEAVES) → the AI's chosen category must be **CLICKED** (`expandCategory`/
+  `cdpSourceRowRect`), never typed.
+
+**One filler.** `cdpReadHierState` (the unified reader), one click-by-label FIRST-match commit (the matchCandidates
+exact tier resolves a duplicate label to its first index; `cdpSourceRowRect` clicks the first DOM node + scrolls
+off-fold in), and one type-commit tree drill `aiTreeDrillFallback` for source + cert + generic trees. Retired:
+`fillSourceCdp` (now a `fillTypeaheadCdp` alias), `aiTreeFallback` + its `clickTreeLeaf` commit, `tryInlineAiSource`,
+the `m.targetIndex===0` gate.
+
+**Source/cert AI-drill commit — the multi-result "no autocommit" bug.** After the AI types its chosen leaf,
+Workday autocommits ONLY a UNIQUE filtered match — a value like "Other" that filters to **"Search Results (2):
+Other / Others"** does NOT autocommit. The commit now: poll for the leaf's chip but EXIT the moment the results
+render with no chip (stable across `stableReads`, ~600ms — never the full 10s `commitCeilingMs`), then ESCALATE
+→ click the EXACT leaf (`clickSourceLeaf` matches by exact label → "Other", never "Others") → press Enter AGAIN
+(commits the top, which is always the exact match). EVERY rung gates on the committed chip normalize-EQUALS the
+AI's leaf, so a stray "Others" → `ai-commit-failed` (never a false fill). Skip the whole re-commit (+ Tab-close)
+when the chip already equals the leaf.
+
+**AI prompts: pass the STATED answer, not the whole profile.** `statedAnswerBlock(candidates, profile)` — when the
+field HAS a stated answer (the candidates the walk tried), the AI gets ONLY that + the options and is told to MATCH
+it (typo-tolerant: "Otherrr"→"Other"); the whole profile is sent ONLY when there is no stated answer (e.g. EEO).
+This both saves tokens AND stops the AI overriding the stated answer by inferring an unrelated profile fact (the
+"Otherrr → Carnegie Mellon" bug: it picked the applicant's school instead of their stated "Other").
+
+**Fix 2 (scrape timing).** FLAT typeaheads scrape options ONCE at the START (`makeStartCapture` → the review page
++ the flat AI; no scrape after the deterministic fill fails); TREES are NOT start-scraped (the `readTreeCategories`
+detect is a cheap read, no scroll → a successful tree fill pays no wasted scroll; the drill self-scrapes only on a
+no-match).
+
+**Required-EMPTY typeahead AI-fill (operator rule: a required field MUST get a value — the review page corrects it).**
+`aiEligible` excludes typeaheads (they fill via their own inline path) and `producedNothing` doesn't cover
+mapped-but-empty, so a REQUIRED empty typeahead/FoS was left `skipped` → blocks Save & Continue. Now (AI on) the
+dispatch runs the unified filler with NO candidates → the inline AI has no stated answer → infers from the profile
+and FORCES a pick (required never declines) + flags. Flat loop + `fillEntryCdp`. AI OFF / OPTIONAL → still `skipped`.
+
+315 unit tests; live-verified on Magna. Committed `ad1b34c` (merge) + the follow-ups.

@@ -2097,6 +2097,22 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
     }
 
+    // ── Required-EMPTY TYPEAHEAD AI fill ── a REQUIRED typeahead with no profile value is SKIPPED above, but a
+    // blank required field BLOCKS Save & Continue (the operator: a required field MUST get a value, even a wrong
+    // one — the review page corrects it). aiEligible excludes typeaheads (they fill via their OWN inline path, so
+    // the producedNothing block above didn't touch them) → so this is the typeahead analog of the dropdown AI-1
+    // post-pass. Run the unified filler with NO candidates → its inline AI has no STATED answer → infers from the
+    // profile and FORCES a pick (a required field never declines: ai-closest-forced / ai-choice-other / the tree
+    // drill) + flags filled_review. AI OFF → stays skipped (can't infer) → escalated to needs_review below.
+    if (act.aiEnabled && f.isRequired && record.status === "skipped" && f.widgetType === "typeahead") {
+      try {
+        const cap = makeStartCapture(act, loc);
+        Object.assign(record, await fillTypeaheadCdp(act, loc, [], budgets,
+          { onCapture: cap.onCapture, ai: { profile, jobContext, fieldName: f.fieldName, label: f.label, isRequired: true } }));
+        const ro = cap.reviewOptions(); if (ro && ro.length) record.options = ro;
+      } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI required-empty typeahead error: " + String((e && e.message) || e); }
+    }
+
     // ── AI-3 MANDATORY-EEO inference ── now ONLY the mapped-but-empty REQUIRED EEO dropdown corner: an
     // unmapped EEO field already filled via the generic INFER block above (EEO is no longer excluded), so
     // its status is filled_review (not `skipped`) and this won't fire. A MAPPED-but-empty required EEO
@@ -2381,6 +2397,20 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       }
     } catch (e) {
       rec.status = "error"; rec.detail = String(e);
+    }
+    // Required-EMPTY TYPEAHEAD AI fill (section analog of the flat-loop block): a REQUIRED section typeahead with
+    // no profile value (e.g. an Education entry's fieldOfStudy) is SKIPPED above, but a blank required field BLOCKS
+    // Save & Continue. When AI is on, run the unified filler with NO candidates → the inline AI infers from the
+    // profile (no stated answer) + FORCES a pick + flags. AI OFF → stays skipped. (NOT the deleteOnNoMatch cert
+    // case — that path deletes an unfillable entry; this only fires for status `skipped`, i.e. no value to try.)
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && f.widget === "typeahead") {
+      try {
+        const loc2 = { wrapperSel: rec.auditLoc };
+        const cap = makeStartCapture(act, loc2);
+        Object.assign(rec, await fillTypeaheadCdp(act, loc2, [], budgets,
+          { onCapture: cap.onCapture, ai: { profile: aiCtx.profile, jobContext: aiCtx.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: true } }));
+        const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI required-empty typeahead error: " + String((e && e.message) || e); }
     }
     recs.push(rec);
     await act.delay(budgets.interFieldMs);

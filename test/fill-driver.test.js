@@ -1670,6 +1670,48 @@ test("Fix 2: makeStartCapture — FLAT scrapes once (review options); a TREE ret
   assert.ok(!tree.log.some(([m]) => m === "scrapeTaOptions"), "tree → no scrapeTaOptions (no wasted scroll on a successful fill)");
 });
 
+test("required-empty typeahead (flat): AI ON → infers from the profile + FORCES a pick (filled_review), never left skipped to block Next", async () => {
+  // A REQUIRED typeahead with NO profile value is skipped by resolve(); a blank required field blocks Save &
+  // Continue, so the AI must produce a best-guess. With no STATED answer it infers from the profile + forces a pick.
+  const field = taField({ isRequired: true, scrapeOptions: ["Accounting", "Biology", "Other"], filterMap: { "Biology": { autoCommit: "Biology" } } });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Biology","represented":true}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS); // NO profile value → resolve skips → required-empty AI fill
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled_review", "a required empty typeahead is AI-filled, not left skipped");
+  assert.strictEqual(rec.after, "Biology");
+  assert.match(rec.flag, /^ai-/);
+});
+
+test("required-empty typeahead (flat): AI OFF → stays skipped, ZERO actuation (can't infer — left for the operator)", async () => {
+  const field = taField({ isRequired: true, scrapeOptions: ["Accounting", "Biology"] });
+  const act = makeFakeAct([field], { aiEnabled: false });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "skipped");
+  assert.ok(!act.log.some(([m]) => m === "openHier"), "AI off → no actuation");
+});
+
+test("required-empty typeahead: OPTIONAL empty typeahead is NOT AI-filled — stays skipped (only required fields are forced)", async () => {
+  const field = taField({ isRequired: false, scrapeOptions: ["Accounting", "Biology"] });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Biology","represented":true}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "skipped", "an OPTIONAL empty field doesn't block Next → no forced AI guess");
+});
+
+test("required-empty typeahead (section / FoS): AI ON → infers + forces a pick (filled_review), never left skipped", async () => {
+  // The operator's real case: an Education entry's REQUIRED fieldOfStudy has no profile value → resolve skips it →
+  // the section analog of the flat block AI-fills it (infer from profile + force a pick) rather than leaving it
+  // blank to block Save & Continue.
+  const eduEntry = (fkit) => ({ fkit, fields: [{ fieldName: "fieldOfStudy", widgetType: "typeahead", isRequired: true, chips: [], scrapeOptions: ["Accounting", "Biology", "Other"], filterMap: { "Biology": { autoCommit: "Biology" } } }] });
+  const fieldMap = [{ field: "fieldOfStudy", widget: "typeahead", key: "fos", path: "field_of_study" }];
+  const items = [{}]; // no fos value → resolve skips → required-empty AI fill
+  const state = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Biology","represented":true}', newEntry: (i) => eduEntry("education-new" + i), entries: [eduEntry("education-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-", items, fieldMap, deleteOnNoMatch: false, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
+  const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
+  assert.strictEqual(fos.status, "filled_review", "a required empty section typeahead is AI-filled, not skipped");
+  assert.strictEqual(fos.after, "Biology");
+});
+
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
   // Total commit failure: the Enter no-ops AND the click fallback is ignored.
   const act = makeFakeAct([taField({
@@ -2464,6 +2506,7 @@ function makeFakeRepeatAct(state) {
     // type → pressEnter → clickSourceLeaf fallback). readSource exposes searchBox.value (for the echo poll) + chips.
     readTreeCategories: async (loc) => { const f = byLoc(loc); if (!f || !f.tree) return []; return f._treeExpanded ? [] : f.tree.categories.slice(); },
     scrapeSourceRows: async (loc) => { log.push(["scrapeSourceRows", loc.wrapperSel]); const f = byLoc(loc); if (!f || !f.tree) return { ok: false }; return f._treeExpanded ? { ok: true, options: (f.tree.leaves[f._treeExpanded] || []).slice(), banner: f._treeExpanded, atBottom: true } : { ok: true, options: f.tree.categories.slice(), banner: "No matches found", atBottom: true }; },
+    scrapeTaOptions: async (loc) => { log.push(["scrapeTaOptions", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.scrapeFails) return { ok: false }; const options = (f.scrapeOptions || []).slice(); return { ok: true, options, count: options.length, atBottom: true }; },
     expandCategory: async (loc, label) => { log.push(["expandCategory", label]); const f = byLoc(loc); if (!f || !f.tree || !f.tree.categories.includes(label)) return false; f._treeExpanded = label; focusedTa = f; return true; },
     readTreeLeaves: async (loc) => { const f = byLoc(loc); if (!f || !f.tree || !f._treeExpanded) return []; return (f.tree.leaves[f._treeExpanded] || []).slice(); },
     focusSourceSearch: async (loc) => { log.push(["focusSourceSearch"]); const f = byLoc(loc); focusedTa = f; if (f && !f.focusUnconfirmable) f._focusedSb = true; return true; },
