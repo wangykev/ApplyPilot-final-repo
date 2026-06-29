@@ -2085,13 +2085,15 @@ function makeFakeRepeatAct(state) {
   let scanCount = 0;     // M37: a field with `appearsAtScan: N` is OMITTED until the Nth
                          // repeatingScan — models a field that REMOUNTS (WE endDate after
                          // unchecking currentlyWorkHere) so the waitForPresence poll is testable.
+  let _llmIdx = 0;       // tree-AI: state.ai may be a SEQUENCE [categoryReply, leafReply] consumed in order.
   return {
     log,
     // delete-vs-AI defer: driveRepeatingSectionCdp reads act.aiEnabled. Defaults OFF (existing tests
     // unchanged → aiWillRescue false → delete behavior identical).
     aiEnabled: !!state.aiEnabled,
-    // Option B inline AI: the LLM seam (canned reply from state.ai), for the inline-rescue repeating tests.
-    llm: async (req) => { log.push(["llm", req && req.user]); const a = state.ai; if (a === undefined || a === null) return { ok: false, error: "no canned reply" }; return typeof a === "string" ? { ok: true, text: a } : a; },
+    // Option B inline AI: the LLM seam. state.ai is a single reply (string/object) OR a SEQUENCE (array)
+    // consumed in order — the latter for the cert tree drill's two prompts (category, then leaf).
+    llm: async (req) => { log.push(["llm", req && req.user]); const a = Array.isArray(state.ai) ? state.ai[Math.min(_llmIdx++, state.ai.length - 1)] : state.ai; if (a === undefined || a === null) return { ok: false, error: "no canned reply" }; return typeof a === "string" ? { ok: true, text: a } : a; },
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     entryCount: async () => state.entries.length,
@@ -2215,7 +2217,15 @@ function makeFakeRepeatAct(state) {
           else if (fm.filtered) { ta._banner = false; ta._filtered = true; ta._texts = fm.filtered.slice(); ta._resultsBanner = ta._texts.length > 0; }
         }
       } else if (!ta.enterCommitFails && (ta._texts || []).length && !ta._banner) { ta.chips = [ta._texts[0]]; ta._open = false; }
-    }
+    },
+    // ── tree picker (cert) seams ── a field carries `tree: { categories:[], leaves:{cat:[full…]} }`. NO `tree`
+    // ⇒ readTreeCategories returns [] ⇒ tryInlineAi routes FLAT (every non-tree test byte-identical). Drill sets
+    // `_treeExpanded`; clickTreeLeaf commits a chip; readSource exposes chips for aiTreeFallback's commit-verify.
+    readTreeCategories: async (loc) => { const f = byLoc(loc); if (!f || !f.tree) return []; return f._treeExpanded ? [] : f.tree.categories.slice(); },
+    expandCategory: async (loc, label) => { log.push(["expandCategory", label]); const f = byLoc(loc); if (!f || !f.tree || !f.tree.categories.includes(label)) return false; f._treeExpanded = label; return true; },
+    readTreeLeaves: async (loc) => { const f = byLoc(loc); if (!f || !f.tree || !f._treeExpanded) return []; return (f.tree.leaves[f._treeExpanded] || []).slice(); },
+    clickTreeLeaf: async (loc, label) => { log.push(["clickTreeLeaf", label]); const f = byLoc(loc); if (!f || !f.tree || !f._treeExpanded || !(f.tree.leaves[f._treeExpanded] || []).includes(label)) return false; f.chips = [label]; f._open = false; return true; },
+    readSource: async (loc) => { const f = byLoc(loc); return { chips: (f && f.chips) ? f.chips.slice() : [] }; }
   };
 }
 
@@ -3489,15 +3499,63 @@ test("inline AI (repeating): a FoS no-match in Education is rescued INLINE on th
   assert.ok(!act.log.some(([m]) => m === "pressTab"), "Option B: committed on the OPEN field — no Tab-exit");
 });
 
-test("inline AI (repeating): a CERTIFICATION typeahead is NOT AI-rescued (cert = tree, excluded by section name)", async () => {
+// Cert tree shape shared by the cert tree-AI integration tests (one category with leaves + "Other",
+// one single-leaf category with NO "Other" → the forced-required branch).
+const CERT_TREE_FIELD = {
+  "Multiple Recognized Providers": ["Certified Payroll Professional (CPP) - Multiple Recognized Providers", "Other - Multiple Recognized Providers"],
+  "Workday": ["Workday Pro - Workday"]
+};
+
+test("inline AI (repeating): a CERTIFICATION tree no-match DRILLS → commits the leaf via clickTreeLeaf (ai-choice) → entry KEPT", async () => {
+  // Cert is a TREE: a bogus name no-matches (banner); tryInlineAi reads the category rows on the still-open
+  // field → routes to aiTreeFallback (Prompt 1 category → drill → Prompt 2 leaf) → commits via the
+  // viewport-aware clickTreeLeaf. A confident ai-choice in a deleteOnNoMatch section is KEPT (Step 2.5).
+  const tree = { categories: ["Multiple Recognized Providers", "Workday"], leaves: CERT_TREE_FIELD };
+  const certEntry = (fkit) => ({ fkit, fields: [{ fieldName: "certification", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Bogus Cert XYZ": { banner: true } }, tree }] });
+  const fieldMap = [{ field: "certification", widget: "typeahead", key: "cert", path: "cert" }];
+  const items = [{ cert: ["Bogus Cert XYZ"] }];
+  const state = { prefix: "certification-", addable: true, deletable: true, aiEnabled: true,
+    ai: ['{"choice":"Multiple Recognized Providers","confidence":"High"}', '{"choice":"Certified Payroll Professional (CPP)","represented":true,"confidence":"High"}'],
+    newEntry: (i) => certEntry("certification-new" + i), entries: [certEntry("certification-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", items, fieldMap, deleteOnNoMatch: true, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
+  const cert = out.results.find((r) => r.fieldName === "certification[0].certification");
+  assert.strictEqual(cert.status, "filled_review");
+  assert.strictEqual(cert.flag, "ai-choice");
+  assert.strictEqual(cert.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers", "committed the FULL suffixed leaf");
+  assert.ok(act.log.some(([m]) => m === "expandCategory"), "drilled the category");
+  assert.ok(act.log.some(([m]) => m === "clickTreeLeaf"), "committed via the viewport-aware leaf click (not clickSourceLeaf)");
+  assert.strictEqual(state.entries.length, 1, "confident ai-choice → entry KEPT");
+});
+
+test("inline AI (repeating): a CERTIFICATION tree no-match with NO 'Other' + unrepresented leaf → ai-closest-forced → entry DELETED", async () => {
+  // Chosen category "Workday" has a single leaf + NO "Other"; the AI's leaf isn't represented → forced nearest
+  // (ai-closest-forced, never blank on required) → unconfident → a deleteOnNoMatch section DELETES it (Step 2.5).
+  const tree = { categories: ["Workday"], leaves: { "Workday": ["Workday Pro - Workday"] } };
+  const certEntry = (fkit) => ({ fkit, fields: [{ fieldName: "certification", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Bogus Cert XYZ": { banner: true } }, tree }] });
+  const fieldMap = [{ field: "certification", widget: "typeahead", key: "cert", path: "cert" }];
+  const items = [{ cert: ["Bogus Cert XYZ"] }];
+  const state = { prefix: "certification-", addable: true, deletable: true, aiEnabled: true,
+    ai: ['{"choice":"Workday"}', '{"choice":"Nope Not Here","represented":false,"confidence":"Low"}'],
+    newEntry: (i) => certEntry("certification-new" + i), entries: [certEntry("certification-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  await driveRepeatingSectionCdp(act, { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", items, fieldMap, deleteOnNoMatch: true, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
+  assert.ok(act.log.some(([m]) => m === "expandCategory") && act.log.some(([m]) => m === "clickTreeLeaf"), "the tree AI drilled + forced a pick");
+  assert.strictEqual(state.entries.length, 0, "ai-closest-forced (unconfident) → entry DELETED");
+});
+
+test("inline AI (repeating): a cert typeahead with NO tree categories + no captured options → flat path, no LLM, genuine no-match → deleted", async () => {
+  // The honest negative (was misleadingly titled "excluded by section name" — there is NO such exclusion). A
+  // banner no-match with NO `tree` and no captured options: readTreeCategories→[] → flat fallback has nothing
+  // to evaluate → returns null → NO LLM. deleteOnNoMatch → the entry is deleted on the genuine no-match.
   const certEntry = (fkit) => ({ fkit, fields: [{ fieldName: "certification", widgetType: "typeahead", isRequired: true, chips: [], filterMap: { "Zzz": { banner: true } } }] });
   const fieldMap = [{ field: "certification", widget: "typeahead", key: "cert", path: "cert" }];
   const items = [{ cert: ["Zzz"] }];
   const state = { prefix: "certification-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Anything","represented":true}', newEntry: (i) => certEntry("certification-new" + i), entries: [certEntry("certification-0--null")] };
   const act = makeFakeRepeatAct(state);
   await driveRepeatingSectionCdp(act, { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", items, fieldMap, deleteOnNoMatch: true, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
-  assert.ok(!act.log.some(([m]) => m === "llm"), "cert is excluded from the inline AI (section name) — no LLM call");
-  assert.strictEqual(state.entries.length, 0, "cert entry deleted on genuine no-match (NOT AI-rescued)");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "no tree categories + no captured options → flat fallback has nothing to evaluate → no LLM");
+  assert.strictEqual(state.entries.length, 0, "genuine no-match (no rescue) + deleteOnNoMatch → entry deleted");
 });
 
 test("Step 2.5 delete-unconfident: a deleteOnNoMatch section KEEPS a confident AI pick, DELETES an unconfident one (+ AI-OFF still deletes on genuine no-match)", async () => {
@@ -3551,7 +3609,7 @@ test("runAiTypeaheadPass (the shared helper): no-op when AI OFF; rescues a no-ma
 
 // ── AI fallback for TREE pickers (cert) — two-prompt drill (Step 2 of the tree-AI milestone) ───────────
 // A fake act with the tree-drill substrate (readTreeCategories / expandCategory / readTreeLeaves /
-// clickSourceLeaf / readSource). `ai` is a SEQUENCE of LLM replies [categoryReply, leafReply].
+// clickTreeLeaf / readSource). `ai` is a SEQUENCE of LLM replies [categoryReply, leafReply].
 function makeFakeTreeAct(tree, opts) {
   const o = opts || {};
   const replies = Array.isArray(o.ai) ? o.ai : [o.ai];
@@ -3574,8 +3632,8 @@ function makeFakeTreeAct(tree, opts) {
       expanded = label; log.push(["expand", label]); return true;
     },
     readTreeLeaves: async () => (expanded ? (tree.leaves[expanded] || []).slice() : tree.categories.slice()),
-    clickSourceLeaf: async (label) => {
-      log.push(["clickSourceLeaf", label]);
+    clickTreeLeaf: async (loc, label) => {
+      log.push(["clickTreeLeaf", label]);
       if (!expanded || !(tree.leaves[expanded] || []).includes(label)) return false;
       committed = label; return true;
     },
@@ -3616,7 +3674,7 @@ test("aiTreeFallback: category + leaf represented → drills + commits the leaf 
   assert.strictEqual(out.tree_structure.chosen, "Multiple Recognized Providers");
   assert.ok(out.tree_structure.leaves.includes("Certified Payroll Professional (CPP)"), "tree_structure carries the CLEAN (suffix-stripped) leaves");
   assert.ok(act.log.some(([m]) => m === "expand"), "drilled the category");
-  assert.ok(act.log.some(([m]) => m === "clickSourceLeaf"), "committed via a leaf CLICK (no blind typing)");
+  assert.ok(act.log.some(([m]) => m === "clickTreeLeaf"), "committed via a viewport-aware leaf CLICK (no blind typing)");
 });
 
 test("aiTreeFallback: leaf NOT represented + 'Other' present → commits Other (ai-choice-other)", async () => {
@@ -3663,6 +3721,6 @@ test("aiTreeFallback: suffix round-trip — the CLEAN leaf the AI picks restores
   ] });
   const out = await aiTreeFallback(act, { wrapperSel: "[w]" }, { auditLoc: "[w]", isRequired: true, label: "Certification" }, {}, {}, T_BUDGETS);
   assert.strictEqual(out.after, "Certified Information Systems Auditor (CISA) - Multiple Recognized Providers");
-  const clicked = act.log.find(([m]) => m === "clickSourceLeaf");
+  const clicked = act.log.find(([m]) => m === "clickTreeLeaf");
   assert.strictEqual(clicked[1], "Certified Information Systems Auditor (CISA) - Multiple Recognized Providers", "clicked the FULL label, not the clean one");
 });

@@ -3598,10 +3598,12 @@ async function runCdpFillCertifications(tabId, profile) {
     const items = Array.isArray(prepared.certifications) ? prepared.certifications : [];
     LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful cert(s).`);
 
-    const act = makeCdpActuation();
+    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
+    LOG("AI cert tree fallback:", act.aiEnabled ? "ON (a certification no-match → two-prompt category→leaf TREE drill, INLINE on the open field)" : "OFF (enable the AI toggle + set a provider/model/key in the popup to test the cert tree drill)");
     const out = await driveRepeatingSectionCdp(act, {
       name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
-      items, fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true
+      items, fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true,
+      aiContext: { profile: prepared, jobContext: {} }
     }, DEFAULT_BUDGETS);
 
     LOG("page:", out.url);

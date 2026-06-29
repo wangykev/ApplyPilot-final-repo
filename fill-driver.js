@@ -2012,7 +2012,7 @@ const aiTypeaheadFallback = async (act, rec, profile, jobContext, budgets) => {
 
 // TWO-PROMPT AI for a TREE picker (cert). Called from tryInlineAi when the OPEN no-matched field shows
 // CATEGORY rows. Drill to SEE the real options (no blind typing): Prompt 1 picks a CATEGORY → expand it →
-// poll for the leaves → Prompt 2 picks a LEAF (the flat decision tree) → commit via clickSourceLeaf (NOT
+// poll for the leaves → Prompt 2 picks a LEAF (the flat decision tree) → commit via clickTreeLeaf (NOT
 // typing; leaves carry the " - <Category>" suffix, stripped for the prompt, restored for the commit).
 // Records rec.tree_structure (categories + the chosen category's leaves) for the summary. ALWAYS
 // filled_review on a commit. Returns null if no categories (not actually a tree → caller falls back).
@@ -2057,10 +2057,11 @@ const aiTreeFallback = async (act, loc, rec, profile, jobContext, budgets) => {
   const realLeaves = cleanLeaves.filter((o) => !isOtherOption(o));
   const otherLeaf = cleanLeaves.find(isOtherOption);
 
-  // commit a leaf via clickSourceLeaf (NOT typing) + verify the chip.
+  // commit a leaf via clickTreeLeaf (viewport-aware: scrolls an off-fold leaf into the clickable viewport; NOT
+  // typing) + verify the chip.
   const commitLeaf = async (cleanPick, flag, confidence, detail) => {
     const full = cleanToFull.get(cleanPick) || cleanPick;
-    const clicked = await act.clickSourceLeaf(full);
+    const clicked = await act.clickTreeLeaf(loc, full);
     if (!clicked) return { status: "needs_review", after: null, verified: false, flag: "ai-commit-failed", confidence, detail: detail + " — leaf click failed (\"" + full + "\")", tree_structure, options: cleanLeaves, auditLoc: loc.wrapperSel };
     await act.delayFull(budgets.commitIntervalMs);
     const st = await act.readSource(loc);

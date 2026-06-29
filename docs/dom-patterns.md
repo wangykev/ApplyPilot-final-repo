@@ -1817,3 +1817,37 @@ category "Website / Digital" drilled (`promptLeafNode` rect `cy:328` in viewport
 leaf enumerated → Prompt 2 → typed commit. Isolated harness: popup "Source AI (isolated)" (`RUN_CDP_SOURCE_AI_DEBUG`,
 `runCdpSourceAiDebug` in background.js — candidates = `how_did_you_hear.preferred` with the fallback dropped to
 FORCE the no-match). 298 tests.
+
+## 2026-06-28 — Cert tree-drill AI: the leaf commit shares the below-the-fold viewport bug (clickTreeLeaf)
+
+**Context.** Certification on Magna is a TREE (chevron CATEGORY rows on open; drill a category to reach its
+leaves) — the same shape as the source picker. The cert two-prompt drill (`aiTreeFallback`, fill-driver.js) was
+already built + unit-tested AND already wired live: `tryInlineAi` routes a cert no-match to it via the structural
+`readTreeCategories(loc)>0` check, and `fillEntryCdp` passes `opts.ai` for EVERY section typeahead. (The old
+"cert excluded by section name" claim was wrong — there is NO live section-name exclusion; the `aiTypeaheadEligible`
+name-belt only gates the test-only `runAiTypeaheadPass`, and the stale test passed only because a bannerless
+no-match leaves the FLAT fallback nothing to evaluate.)
+
+**The one real bug — the leaf commit was viewport-blind.** `aiTreeFallback` commits a drilled leaf by CLICKING it
+(unlike source, which TYPES — a drilled source "Other" is a category chevron that would re-drill). The commit went
+through `act.clickSourceLeaf` → `cdpSourceLeafProbe`: a SINGLE read + one `scrollIntoView` + an immediate
+`getBoundingClientRect` → `cdpClickAt`. That is the EXACT below-the-fold bug fixed for the category click on
+2026-06-28: CDP `Input.dispatchMouseEvent` clicks at VIEWPORT coords, so a leaf in a long drilled-category list
+that renders past `innerHeight` gets a click into dead space.
+
+**Fix — `act.clickTreeLeaf(loc,label)`** (cdp.js, next to `expandCategory`): reuses the viewport-aware
+`cdpSourceRowRect` (scroll the leaf's `promptLeafNode` into the clickable viewport, settle, re-query,
+`document.elementFromPoint`-validate, then trusted-click its fresh center) — identical mechanism to the category
+drill. Leaves and categories are BOTH `promptLeafNode`-wrapped `promptOption`s (clicking a leaf commits, a category
+drills), and the FULL `" - <Category>"`-suffixed leaf label round-trips (`cdpSourceRowRect.matchPO` matches the
+same `data-automation-label||textContent` that `readTreeLeaves` reads). `aiTreeFallback.commitLeaf` now calls
+`clickTreeLeaf`; `clickSourceLeaf` (the rare SOURCE fallback) is left untouched — cert-scoped, zero source blast.
+`readTreeLeaves` still does NOT scroll (fine for Magna's fully-rendered category leaves; a huge virtualized leaf
+list is a future scroll-scrape — only the CLICK was viewport-sensitive, and that's what this fixes).
+
+**Harness + delete-vs-AI.** `runCdpFillCertifications` (background.js) now threads `getLlmConfig()` + `aiContext`
+so the `cdp-fill-certifications` button isolate-tests cert AI (previously only the full-page fill did). In a
+`deleteOnNoMatch` section, a confident `ai-choice` cert pick is KEPT and an unconfident `ai-closest-forced` (a
+no-"Other" required category whose AI leaf isn't represented) is DELETED (Step 2.5). 300 tests (2 cert tree
+integration: confident→KEPT, forced-low→DELETED). LIVE-VERIFY pending (bogus cert name → drill → off-fold leaf
+committed via `clickTreeLeaf`, chip verified, M40 clean; real "CPP" still deterministic; AI-OFF byte-identical).

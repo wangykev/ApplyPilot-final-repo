@@ -1748,6 +1748,19 @@ function makeCdpActuation(llmConfig) {
       await cdpClickAt(rr.rect.cx, rr.rect.cy);
       return true;
     },
+    // Commit a drilled tree LEAF by label — the viewport-safe sibling of clickSourceLeaf (which does a single
+    // scrollIntoView + immediate rect → MISSES a leaf rendered below the viewport fold; CDP clicks at viewport
+    // coords, the category-click bug fixed 2026-06-28). Reuses cdpSourceRowRect: scroll the leaf's promptLeafNode
+    // into the clickable viewport, settle, re-query, elementFromPoint-validate, then trusted-click its fresh
+    // center. Identical mechanism to expandCategory (leaves + categories are both promptLeafNode-wrapped
+    // promptOptions; clicking a LEAF commits, a CATEGORY drills). The caller passes the FULL " - <Category>"
+    // suffixed label (matchPO matches it). `loc` is accepted for symmetry; cdpSourceRowRect is document-wide.
+    clickTreeLeaf: async (loc, label) => {
+      const rr = await cdpEval(cdpSourceRowRect, label);
+      if (!rr || !rr.found || !rr.rect || rr.rect.w <= 0) return false;
+      await cdpClickAt(rr.rect.cx, rr.rect.cy);
+      return true;
+    },
     // READ-ONLY recon for the source-AI debug harness — see cdpSourceRowProbe / cdpSourceRowRect.
     sourceRowProbe: async (label) => cdpEval(cdpSourceRowProbe, label),
     sourceRowRect: async (label) => cdpEval(cdpSourceRowRect, label),
