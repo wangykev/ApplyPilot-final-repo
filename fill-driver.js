@@ -2868,7 +2868,7 @@ async function captureChoiceOptions(act, results, budgets) {
 // review fields). `field_id` is PAGE-QUALIFIED for global uniqueness across the
 // accumulated multi-page bundle (the viewer keys reviewValueNodes on field_id).
 // ============================================================================
-const REVIEW_SCHEMA_VERSION = "1.0";
+const REVIEW_SCHEMA_VERSION = "1.1"; // 1.1 (Plan 2): + page_number/page_label, is_approved/approved_at. The viewer tolerates 1.0 (missing fields default).
 
 function summarizeEntries(entries) {
   return {
@@ -2960,6 +2960,10 @@ function buildReviewBundle(results, meta) {
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,
       edit_kind: null,
+      is_approved: false,                // Plan 2: explicit human sign-off (flagged fields); the viewer toggles it
+      approved_at: null,
+      page_number: m.pageNumber != null ? m.pageNumber : null, // the walk's 1..N ordinal (display order/caption); null = single-page/unknown
+      page_label: m.pageLabel != null ? m.pageLabel : null,     // friendly caption ("Page N"); null → viewer derives from page_number/page key
       confidence,
       confidence_source,
       needs_review,
@@ -2978,6 +2982,8 @@ function buildReviewBundle(results, meta) {
   return Object.assign({
     schema_version: REVIEW_SCHEMA_VERSION,
     page: m.page != null ? m.page : null,
+    page_number: m.pageNumber != null ? m.pageNumber : null,
+    page_label: m.pageLabel != null ? m.pageLabel : null,
     url: m.url != null ? m.url : null,
     tenant: m.tenant != null ? m.tenant : null,
     captured_at: m.capturedAt != null ? m.capturedAt : null

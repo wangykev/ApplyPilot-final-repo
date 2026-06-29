@@ -688,6 +688,11 @@ async function runWalk(tabId, profile, defaults, jobContext) {
   let pagesFilled = 0;
   let stoppedReason = "max-pages";
 
+  // Plan 2: clear the accumulated summary ONCE at walk START (a fresh application starts clean),
+  // then ACCUMULATE per page (was overwrite-per-page → page 1 was lost, the "My-Experience under
+  // page 1" bug). The field-set page key + page_number now keep the pages distinct + ordered.
+  await new Promise((resolve) => chrome.storage.local.remove("reviewSummary", resolve));
+
   for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
     console.log(`[ApplyPilot] ── Walk: filling page ${pageNum}/${MAX_PAGES} ──`);
     const frameResult = await injectFill(tabId, profile, defaults, jobContext);
@@ -702,7 +707,14 @@ async function runWalk(tabId, profile, defaults, jobContext) {
     // clicking Next (so the resume is attached before the page advances).
     const attach = await attachResumeForPage(tabId, frameResult);
     if (attach) console.log(`[ApplyPilot] Walk: page ${pageNum} resume attach:`, attach);
-    await persistBundle(frameResult.bundle); // overwrite-per-page (decided; see persistBundle)
+    // Stamp the page ordinal (the SW knows it; the engine doesn't) onto the bundle for display
+    // order/caption, then ACCUMULATE (keeps prior pages + viewer edits verbatim).
+    if (frameResult.bundle) {
+      frameResult.bundle.page_number = pageNum;
+      frameResult.bundle.page_label = "Page " + pageNum;
+      for (const e of frameResult.bundle.entries || []) { e.page_number = pageNum; e.page_label = "Page " + pageNum; }
+    }
+    await persistAccumulated(frameResult.bundle);
     pagesFilled++;
 
     const nav = frameResult.nav || {};
@@ -2091,6 +2103,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // on a same-pathname SPA). Computed BEFORE the fill (a field-revealing fill could change
   // the field-set). NOT cdpPageSig (full url incl. query).
   const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
+  // Plan 2: the walk passes its 1..N ordinal so the bundle carries a stable page_number (display
+  // order) + a friendly page_label; single-page fills (no ordinal) leave them null (viewer derives).
+  const pageNumber = (opts && opts.pageNumber != null) ? opts.pageNumber : null;
+  const pageLabel = pageNumber != null ? ("Page " + pageNumber) : null;
   // Operator input-lock: install BEFORE any actuation (idempotent — re-creates the overlay on a
   // fresh page after a nav, so the walk re-protects each page). The 4 CDP input primitives gate
   // on the counter it sets; the caller removes it in its finally (alongside cdpDetach).
@@ -2172,7 +2188,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 
   // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-  const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString() });
   await persistAccumulated(bundle);
   return { out, bundle, auditFlags, pageKey };
 }
@@ -2180,9 +2196,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 // AI-4: rebuild + re-persist the page bundle from the CURRENT out.results (after remediation
 // mutates them) — reuses the SAME pageKey so the accumulation merge replaces this page (no
 // duplicate). Keeps the persisted review bundle an honest audit trail of what AI-4 changed.
-async function repersistPageBundle(out, pageKey) {
+async function repersistPageBundle(out, pageKey, pageNumber) {
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-  const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  const pageLabel = (pageNumber != null) ? ("Page " + pageNumber) : null;
+  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber: pageNumber != null ? pageNumber : null, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString() });
   await persistAccumulated(bundle);
   return bundle;
 }
@@ -2318,11 +2335,11 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       }
     }
 
-    if (!didSomething) { await repersistPageBundle(out, pageKey); return { advanced: false, reason: "no-action", attempts: attempt, actions }; }
+    if (!didSomething) { await repersistPageBundle(out, pageKey, page); return { advanced: false, reason: "no-action", attempts: attempt, actions }; }
 
     // Record the remediation trail into the persisted bundle BEFORE the re-advance (so it's kept
     // whether or not this attempt advances).
-    await repersistPageBundle(out, pageKey);
+    await repersistPageBundle(out, pageKey, page);
 
     // ── re-Save & Continue (GUARDED — refuses on the review marker) + wait. ──
     const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
@@ -3817,7 +3834,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
+      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length });
 
       // ── (c.1) Required-upload guard (walk prereq 1, hold #1): a file_upload that didn't
@@ -5335,7 +5352,7 @@ async function fillEngine(profile, defaults, jobContext) {
   //    The engine computes the bundle and RETURNS it; the service worker writes it
   //    to chrome.storage. The injected function never touches storage itself.
   // ============================================================
-  const SCHEMA_VERSION = "1.0";
+  const SCHEMA_VERSION = "1.1"; // Plan 2 lockstep with fill-driver REVIEW_SCHEMA_VERSION (page-qualified field_id, page_label, is_approved)
 
   // Page-container automation-id (e.g. "applyFlowMyInfoPage"); URL-path fallback.
   const pageEl =
@@ -5344,6 +5361,13 @@ async function fillEngine(profile, defaults, jobContext) {
   const pageId = pageEl
     ? pageEl.getAttribute("data-automation-id")
     : (location.pathname.split("/").filter(Boolean).pop() || location.pathname);
+  // Plan 2: a STABLE page key for accumulation + a page-qualified field_id. The M31 lesson —
+  // pageId (applyFlowPage) is SHARED across pages on some tenants (LiveRamp), so the formField
+  // SET is the load-bearing distinguisher. Mirrors cdpPageKey (pathname | sorted field names).
+  // This is why "My-Experience showed under page 1": the old page=pageId collapsed pages.
+  const pageKey = (location.pathname || pageId) + "|" + wrappers
+    .map((w) => (w.getAttribute("data-automation-id") || "").slice("formField-".length))
+    .filter(Boolean).sort().join(",");
 
   // Mechanical outcome, decoupled from the review flag.
   //   filled/filled_review → filled · needs_review → not_filled · skipped → skipped · error → error
@@ -5399,8 +5423,10 @@ async function fillEngine(profile, defaults, jobContext) {
     // The value actually filled (selected option text for choice widgets), only when filled.
     const current_value = fill_status === "filled" && rec.after != null ? rec.after : null;
     return {
-      field_id: "formField-" + rec.fieldName,
-      page: pageId,
+      field_id: pageKey + "::formField-" + rec.fieldName, // PAGE-QUALIFIED (Plan 2) — globally unique across the accumulated bundle
+      page: pageKey,                    // the STABLE merge key (field-set), NOT pageId (shared across pages)
+      page_number: null,                // stamped by runWalk (the SW knows the 1..N ordinal; the engine doesn't)
+      page_label: pageId,               // friendly caption (e.g. "applyFlowMyInfoPage") until runWalk stamps "Page N"
       field_index: index,
       question_label: rec.label != null ? rec.label : null,
       widget_type: rec.widgetType,
@@ -5410,6 +5436,8 @@ async function fillEngine(profile, defaults, jobContext) {
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,                 // human changed the effective value (set by the summary editor)
       edit_kind: null,                  // provenance for replay: override | filled_blank | cleared | null
+      is_approved: false,               // Plan 2: explicit human sign-off (flagged fields)
+      approved_at: null,
       confidence,
       confidence_source,
       needs_review,
@@ -5427,7 +5455,9 @@ async function fillEngine(profile, defaults, jobContext) {
   const entries = results.map((rec, i) => buildEntry(rec, i));
   const bundle = {
     schema_version: SCHEMA_VERSION,
-    page: pageId,
+    page: pageKey,           // the stable merge key (runWalk stamps page_number/page_label per page)
+    page_number: null,
+    page_label: pageId,      // friendly until runWalk stamps "Page N"
     url: location.href,
     tenant: location.hostname,
     captured_at: new Date().toISOString(),

@@ -43,7 +43,22 @@ const el = (tag, props = {}, children = []) => {
 const fmt = (v) => (v == null || v === "" ? "—" : String(v));
 const norm = (v) => (v == null ? "" : String(v));
 const autofilledOf = (e) => (e.original_ai_value != null ? e.original_ai_value : e.current_value);
-const editKindOf = (e) => { const o = norm(e.original_ai_value), c = norm(e.current_value); if (o === c) return null; if (o === "") return "filled_blank"; if (c === "") return "cleared"; return "override"; };
+// Friendly page caption from a bundle/page (Plan 2): page_label wins; an "accumulated (N pages)"
+// envelope shows as-is; otherwise a cdpPageKey ("pathname|field,field,…") or the page-engine
+// field-set key collapses to its last path segment, never the raw composite string.
+const cleanPageName = (b) => {
+  if (!b) return "—";
+  if (b.page_label) return b.page_label;
+  const p = b.page;
+  if (typeof p === "string") {
+    if (/^accumulated/.test(p)) return p;
+    const seg = (p.split("|")[0] || p).split("/").filter(Boolean).pop();
+    if (seg) return seg;
+  }
+  return fmt(p);
+};
+// editKindOf / checkedOf / tokenFor / effectiveValue / approvalEnvelope / requiresApproval live in
+// summary-lib.js (loaded BEFORE this script — globals here, requireable in tests). Do NOT redeclare.
 const PARTIAL_NOTE = "Options the search surfaced — not the full list. Edit on the form for other values.";
 const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle });
 
@@ -80,23 +95,28 @@ const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) ||
 const addRefresher = (id, fn) => { if (!fieldRefreshers.has(id)) fieldRefreshers.set(id, new Set()); fieldRefreshers.get(id).add(fn); };
 // Shared write-back (M14): current_value ← pick (null = cleared), edit_kind/is_edited recomputed,
 // original_ai_value preserved, persisted, then EVERY editor for this field refreshed (sync).
+// Plan 2: a VALUE edit RESETS approval (a stale approval must never ride a changed value into
+// replay — the field re-enters the review pile), and the header approval strip is refreshed.
 const commit = (entry, val) => {
   entry.current_value = val === "" || val == null ? null : val;
   entry.edit_kind = editKindOf(entry); entry.is_edited = entry.edit_kind !== null;
+  if (entry.is_approved) { entry.is_approved = false; entry.approved_at = null; }
   persist();
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
+  updateApprovalUI();
 };
 
-// Checkbox value helpers — a toggle commits a token in the SAME family as the bot's value,
-// so flipping back to the original state reads as "not edited", not a false override.
-const checkedOf = (v) => v === true || /^(checked|true|yes|1|on)$/i.test(norm(v));
-const tokenFor = (orig, want) => {
-  if (typeof orig === "boolean") return want;
-  const fam = [["Checked", "Unchecked"], ["True", "False"], ["Yes", "No"], ["1", "0"], ["On", "Off"]];
-  const s = norm(orig).trim();
-  for (const [c, u] of fam) { if (s.toLowerCase() === c.toLowerCase()) return want ? s : u; if (s.toLowerCase() === u.toLowerCase()) return want ? c : s; }
-  return want ? "Checked" : "Unchecked";
+// Plan 2: per-field approval toggle. Sets is_approved + approved_at, persists, refreshes the
+// field's rows (the toggle + row tint) and the header strip — in place, no full re-render.
+const setApproved = (entry, on) => {
+  entry.is_approved = !!on; entry.approved_at = on ? new Date().toISOString() : null;
+  persist();
+  for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
+  updateApprovalUI();
 };
+// Reassigned each render() to recompute the envelope + repaint the header strip / submit button
+// without a full re-render. A no-op before the first render.
+let updateApprovalUI = () => {};
 
 // A 13px trash glyph (SVG via createElementNS — el() is textContent-only by design).
 const svgTrash = () => {
@@ -173,6 +193,7 @@ function buildEditor(entry) {
   if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) return Object.assign(combobox(entry.tree_structure.leaves), { partial: true });
   if (wt === "dropdown" && entry.options && entry.options.length) return selectFrom(entry.options);
   if (wt === "radio" && entry.options && entry.options.length) return selectFrom(entry.options);
+  if (wt === "radio") return Object.assign(textInput("input"), { partial: true }); // options not captured → free text + the partial note (don't silently degrade to a bare box)
   if (wt === "checkbox") {
     const cb = el("input", { class: "editor-check", type: "checkbox" });
     cb.checked = checkedOf(entry.current_value);
@@ -217,6 +238,14 @@ const fieldRow = (e, opts = {}) => {
   if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
+  // Plan 2: an Approve toggle on every FLAGGED row (needs_review) — the explicit human sign-off
+  // the future SUBMIT gate reads. Un-flagged fields are approved-by-default → no toggle.
+  let apBtn = null;
+  if (requiresApproval(e)) {
+    apBtn = el("button", { class: "apbtn" });
+    apBtn.addEventListener("click", () => setApproved(e, !e.is_approved));
+    val.appendChild(el("div", { class: "approve" }, [apBtn]));
+  }
   row.appendChild(val);
 
   const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence].filter(Boolean).join("  ·  ");
@@ -239,8 +268,11 @@ const fieldRow = (e, opts = {}) => {
     const kind = editKindOf(e);
     afref.textContent = "";
     if (kind) { afref.appendChild(document.createTextNode("autofilled: ")); afref.appendChild(el("b", { text: fmt(autofilledOf(e)) })); }
-    row.classList.toggle("f-crit", !!(e.needs_review && mustReplace(e)));
-    row.classList.toggle("f-warn", !!(e.needs_review && !mustReplace(e)));
+    if (apBtn) { apBtn.classList.toggle("on", !!e.is_approved); apBtn.textContent = e.is_approved ? "✓ Approved" : "Approve"; }
+    const approved = !!(e.needs_review && e.is_approved); // an approved flagged row reads green, not warn/crit
+    row.classList.toggle("f-approved", approved);
+    row.classList.toggle("f-crit", !approved && !!(e.needs_review && mustReplace(e)));
+    row.classList.toggle("f-warn", !approved && !!(e.needs_review && !mustReplace(e)));
     row.classList.toggle("f-edit", !e.needs_review && !!kind);
   };
   addRefresher(e.field_id, refresh); refresh();
@@ -263,7 +295,7 @@ const render = () => {
     el("div", { class: "brand" }, [
       el("div", { class: "logo", "aria-hidden": "true", text: "✈" }),
       el("div", { class: "title", text: "Review your application" }),
-      el("div", { class: "meta" }, [document.createTextNode(fmt(bundle.page)), el("span", { class: "d", text: "·" }), document.createTextNode(fmt(bundle.tenant)), el("span", { class: "d", text: "·" }), document.createTextNode(relTime(bundle.captured_at))]),
+      el("div", { class: "meta" }, [document.createTextNode(cleanPageName(bundle)), el("span", { class: "d", text: "·" }), document.createTextNode(fmt(bundle.tenant)), el("span", { class: "d", text: "·" }), document.createTextNode(relTime(bundle.captured_at))]),
     ]),
     el("div", { class: "toolbar" }, [
       el("button", { class: "tbtn", text: "Expand all", onclick: () => { collapsed.clear(); render(); } }),
@@ -281,6 +313,45 @@ const render = () => {
   if (liveCounts.error) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(liveCounts.error) })); info.appendChild(document.createTextNode(" error")); }
   if (removed) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(removed) })); info.appendChild(document.createTextNode(" removed")); }
   bar.appendChild(info); root.appendChild(bar);
+
+  // ── approval strip (Plan 2) — progress over the FLAGGED fields + "Approve all reviewed" +
+  // a disabled-until-submit_ready "Approve & continue to submit" button that does NOT submit
+  // (SUBMIT/replay is Plan 1). Un-flagged fields are approved-by-default (not counted here). ──
+  const apbar = el("div", { class: "apbar" });
+  const apProg = el("div", { class: "ap-prog" });
+  const apTrack = el("div", { class: "ap-track" }, [el("div", { class: "ap-fill" })]);
+  const apFill = apTrack.firstChild;
+  const apAll = el("button", { class: "apbtn-all", text: "Approve all reviewed" });
+  const submitBtn = el("button", { class: "submit-btn", text: "Approve & continue to submit" });
+  const submitNote = el("div", { class: "submit-note" });
+  apAll.addEventListener("click", () => {
+    const at = new Date().toISOString();
+    for (const e of currentBundle.entries.filter(requiresApproval)) { e.is_approved = true; e.approved_at = at; }
+    persist();
+    for (const e of currentBundle.entries.filter(requiresApproval)) for (const fn of fieldRefreshers.get(e.field_id) || []) fn();
+    updateApprovalUI();
+  });
+  submitBtn.addEventListener("click", () => { /* SUBMIT/strict-replay is Plan 1 — intentionally inert here */ });
+  apbar.appendChild(apProg); apbar.appendChild(apTrack); apbar.appendChild(apAll); apbar.appendChild(submitBtn);
+  root.appendChild(apbar); root.appendChild(submitNote);
+
+  updateApprovalUI = () => {
+    const ap = approvalEnvelope(currentBundle.entries);
+    currentBundle.approval = ap; // kept in the in-memory bundle; persisted on the next write (toggle/edit/all)
+    const total = ap.to_approve_count, done = ap.approved_count;
+    apProg.textContent = "";
+    if (total === 0) { apProg.appendChild(el("b", { text: "Nothing flagged" })); apProg.appendChild(document.createTextNode(" — all fields approved by default")); }
+    else { apProg.appendChild(el("b", { text: `${done} / ${total}` })); apProg.appendChild(document.createTextNode(" flagged fields approved")); }
+    apFill.style.width = (total === 0 ? 100 : Math.round((done / total) * 100)) + "%";
+    apAll.disabled = total === 0 || done === total;
+    submitBtn.disabled = !ap.submit_ready;
+    submitNote.textContent = ap.submit_ready
+      ? "Ready to submit — but SUBMIT isn’t built yet (Plan 1). Your approvals are saved."
+      : ap.unreplaced_placeholders
+        ? `Replace ${ap.unreplaced_placeholders} AI placeholder${ap.unreplaced_placeholders > 1 ? "s" : ""} on the form, then approve the remaining flagged fields.`
+        : `Approve the ${ap.pending_count} remaining flagged field${ap.pending_count === 1 ? "" : "s"} to continue.`;
+  };
+  updateApprovalUI();
 
   // ── SUBMIT-BLOCKED banner (a REQUIRED field still holds an AI placeholder) ──
   const blocked = live.filter(needsAnswer);
@@ -309,11 +380,18 @@ const render = () => {
 const filterPass = (e) => currentFilter === "review" ? !!e.needs_review : currentFilter === "edited" ? !!editKindOf(e) : true;
 const groupKeys = () => { const seen = new Set(), out = []; for (const e of (currentBundle ? currentBundle.entries : [])) { const k = e.page + "||" + sectionOf(e).key; if (!seen.has(k)) { seen.add(k); out.push(k); } } return out; };
 
+const pageNumOf = (items) => { const e = items.find((x) => x.page_number != null); return e ? e.page_number : null; };
+const pageCaptionOf = (items, pg) => { const e = items.find((x) => x.page_label != null); if (e) return e.page_label; const n = pageNumOf(items); if (n != null) return "Page " + n; return cleanPageName({ page: pg }); };
+
 const renderFieldList = (mount) => {
   mount.textContent = "";
   const entries = currentBundle.entries;
   const pageOrder = [], pages = {};
   for (const e of entries) { if (!pages[e.page]) { pages[e.page] = []; pageOrder.push(e.page); } pages[e.page].push(e); }
+  // Plan 2: order pages by page_number (the walk's ordinal) when present, else keep first-
+  // appearance. sort() is stable → pages without an ordinal hold their insertion order. Fixes the
+  // re-run reordering (accumulateBundle appends a re-written page last; the ordinal restores order).
+  pageOrder.sort((a, b) => { const na = pageNumOf(pages[a]), nb = pageNumOf(pages[b]); if (na != null && nb != null) return na - nb; if (na != null) return -1; if (nb != null) return 1; return 0; });
   const multiPage = pageOrder.length > 1;
   let shown = false;
 
@@ -362,7 +440,7 @@ const renderFieldList = (mount) => {
     }
     if (!tbl.childNodes.length) continue;
     shown = true;
-    if (multiPage) mount.appendChild(el("div", { class: "pgcap", text: fmt(pg) }));
+    if (multiPage) mount.appendChild(el("div", { class: "pgcap", text: pageCaptionOf(pages[pg], pg) }));
     mount.appendChild(tbl);
   }
   if (!shown) mount.appendChild(el("div", { class: "empty", text: currentFilter === "review" ? "Nothing needs review." : "No edited fields yet." }));

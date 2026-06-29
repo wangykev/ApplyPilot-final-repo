@@ -137,6 +137,28 @@
       .ta-opt.sel { font-weight: 650; background: var(--accent-weak); color: var(--accent-ink); }
       .ta-clear { font-style: italic; color: var(--muted); border-bottom: 1px solid var(--line); }
 
+      /* approval (Plan 2) — per-flagged-row Approve toggle + the header progress strip + the
+         disabled-until-ready submit button. Un-flagged fields are approved-by-default (no toggle). */
+      .approve { margin-top: 3px; display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+      .apbtn { appearance: none; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-2); border-radius: 999px; padding: 1px 9px; cursor: pointer; font-size: 11px; font-weight: 560; display: inline-flex; align-items: center; gap: 4px; }
+      .apbtn:hover { border-color: var(--ok); color: var(--ok); }
+      .apbtn.on { background: #e7f4ec; border-color: #bfe3cd; color: var(--ok); }
+      .apbtn.on:hover { border-color: var(--crit); color: var(--crit); }
+      .row.f-approved { box-shadow: inset 3px 0 0 var(--ok); background: #f3faf5; }
+      .row.f-approved .lab { color: var(--ink-2); }
+
+      .apbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; margin-bottom: 11px; }
+      .apbar .ap-prog { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+      .apbar .ap-prog b { color: var(--ink); font-weight: 700; }
+      .apbar .ap-track { flex: 1; min-width: 80px; height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+      .apbar .ap-fill { height: 100%; background: var(--ok); transition: width .2s; }
+      .apbtn-all { appearance: none; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-2); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px; font-weight: 560; }
+      .apbtn-all:hover:not(:disabled) { border-color: var(--ok); color: var(--ok); }
+      .apbtn-all:disabled { opacity: .5; cursor: default; }
+      .submit-btn { appearance: none; border: none; border-radius: 6px; padding: 5px 14px; font-size: 12.5px; font-weight: 640; cursor: pointer; background: var(--accent); color: #fff; }
+      .submit-btn:disabled { background: var(--line-strong); color: var(--surface); cursor: default; }
+      .submit-note { font-size: 11px; color: var(--muted); }
+
       .empty { color: var(--muted); font-size: 13px; padding: 44px 0; text-align: center; }
 
       @media (max-width: 600px) {
@@ -148,6 +170,7 @@
   </head>
   <body>
     <div class="app"><div id="root"></div></div>
+    <script src="summary-lib.js"></script>
     <script src="summary.js"></script>
   </body>
 </html>

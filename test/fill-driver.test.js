@@ -3080,7 +3080,7 @@ test("M38 Part 2 buildReviewBundle: CDP results → viewer-schema entries (secti
   const b = buildReviewBundle(results, { page: "P2", url: "https://x.wd3.myworkdaysite.com/apply", tenant: "x.wd3.myworkdaysite.com", capturedAt: "2026-06-19T00:00:00Z" });
   assert.ok(!b.entries.some((e) => e.widget_type === "section"), "section recs filtered out");
   assert.strictEqual(b.entries.length, 5);
-  assert.strictEqual(b.schema_version, "1.0");
+  assert.strictEqual(b.schema_version, "1.1");
   assert.strictEqual(b.page, "P2");
   assert.strictEqual(b.tenant, "x.wd3.myworkdaysite.com");
   assert.strictEqual(b.captured_at, "2026-06-19T00:00:00Z");
@@ -3139,6 +3139,41 @@ test("M38 Part 2 accumulateBundle: a viewer EDIT on a prior page SURVIVES the ne
   assert.strictEqual(survived.current_value, "Masters");
   assert.strictEqual(survived.edit_kind, "override");
   assert.strictEqual(survived.is_edited, true);
+});
+
+// ── Plan 2: page_number/page_label threading + is_approved default + approval survival ──
+test("Plan 2 buildReviewBundle: page_number/page_label threaded onto every entry + the envelope; schema 1.1", () => {
+  const rec = [{ fieldName: "degree", widgetType: "dropdown", status: "filled", after: "Bachelors", label: "Degree" }];
+  const b = buildReviewBundle(rec, { page: "P2", pageNumber: 2, pageLabel: "Page 2" });
+  assert.strictEqual(b.schema_version, "1.1");
+  assert.strictEqual(b.page_number, 2);
+  assert.strictEqual(b.page_label, "Page 2");
+  assert.strictEqual(b.entries[0].page_number, 2);
+  assert.strictEqual(b.entries[0].page_label, "Page 2");
+});
+
+test("Plan 2 buildReviewBundle: page_number/page_label DEFAULT to null when not threaded (single-page)", () => {
+  const b = buildReviewBundle([{ fieldName: "x", widgetType: "text", status: "filled", after: "y", label: "X" }], { page: "P1" });
+  assert.strictEqual(b.entries[0].page_number, null);
+  assert.strictEqual(b.entries[0].page_label, null);
+  assert.strictEqual(b.page_number, null);
+});
+
+test("Plan 2 buildReviewBundle: every entry defaults is_approved=false / approved_at=null", () => {
+  const b = buildReviewBundle([{ fieldName: "src", widgetType: "dropdown", status: "needs_review", label: "Source", detail: "no match" }], { page: "P1" });
+  assert.strictEqual(b.entries[0].is_approved, false);
+  assert.strictEqual(b.entries[0].approved_at, null);
+});
+
+test("Plan 2 accumulateBundle: a prior page's is_approved SURVIVES the next page's persist", () => {
+  let acc = accumulateBundle([], buildReviewBundle([{ fieldName: "src", widgetType: "dropdown", status: "needs_review", label: "Source", detail: "no match" }], { page: "P1", pageNumber: 1 }));
+  const flagged = acc.entries.find((e) => e.page === "P1");
+  flagged.is_approved = true; flagged.approved_at = "2026-06-29T00:00:00Z"; // viewer approves it
+  acc = accumulateBundle(acc.entries, buildReviewBundle([{ fieldName: "lang", widgetType: "dropdown", status: "filled", after: "English", label: "Language" }], { page: "P2", pageNumber: 2 }));
+  const survived = acc.entries.find((e) => e.page === "P1");
+  assert.strictEqual(survived.is_approved, true);          // approval not clobbered by the next page
+  assert.strictEqual(survived.approved_at, "2026-06-29T00:00:00Z");
+  assert.strictEqual(survived.page_number, 1);             // ordinal preserved verbatim
 });
 
 // ── M40 post-fill page AUDIT — re-read the live DOM + reconcile vs recorded ──
