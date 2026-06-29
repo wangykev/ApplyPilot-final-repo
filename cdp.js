@@ -1064,7 +1064,9 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
     return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
   };
-  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); // 2 frames: let the virtualizer render
+  // 2 frames let the virtualizer render. rAF is fast when VISIBLE but FREEZES on a hidden tab, so race a
+  // setTimeout fallback (throttled to ~1Hz when hidden) — without it this scroll loop would HANG when hidden.
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
   const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
@@ -1099,7 +1101,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
 // ("No matches found" on the fallback; the CLICKED CATEGORY NAME once drilled — the drill-confirmation signal).
 // Mirrors cdpScrapeTaOptions's scroll loop; resets scrollTop to 0 at the end so early rows are mounted for a
 // subsequent category click. Async — awaited via cdpEval.
-async function cdpScrapeSourceRows(wrapperSel) {
+async function cdpScrapeSourceRows(wrapperSel, debug) {
   const isVisible = (el) => {
     if (!el || !el.getBoundingClientRect) return false;
     const r = el.getBoundingClientRect();
@@ -1122,8 +1124,14 @@ async function cdpScrapeSourceRows(wrapperSel) {
     }
     return null;
   };
-  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  // rAF paces the virtualizer's paint when VISIBLE (fast); a hidden tab FREEZES rAF, so race a setTimeout
+  // (throttled to ~1Hz when hidden) — without the fallback this scroll loop would HANG on a hidden tab.
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Per-step settle. DEFAULT (debug OFF) = full speed: rAF only — proven sufficient for a virtualized list by
+  // the FoS scrape (cdpScrapeTaOptions, rAF-only). The extra guaranteed ~120ms/step is DEBUG-ONLY, so the
+  // operator can WATCH the scroll when "Debug: log keystrokes" is checked (cdpAttach → setInputTrace).
+  const stepSettle = async () => { await frame(); if (debug) await sleep(120); };
   const seen = new Map(); // label → order (first-seen, de-dupe within ONE view)
   const collect = () => { for (const o of curOpts()) { const t = leafLabel(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
@@ -1131,15 +1139,15 @@ async function cdpScrapeSourceRows(wrapperSel) {
   const MAX_STEPS = 40;
   collect();
   if (sc) {
-    // SLOW, OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window
-    // (overlap, no row skipped) and wait a real ~120ms per step so every window's rows render before collect().
+    // OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window (overlap,
+    // no row skipped). Pacing is via stepSettle (rAF; +120ms only in debug; hidden-safe setTimeout fallback).
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    sc.scrollTop = 0; await frame(); await sleep(120); collect();
+    sc.scrollTop = 0; await stepSettle(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
       sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
-      await frame(); await sleep(120); collect();
+      await stepSettle(); collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
@@ -1224,7 +1232,9 @@ async function cdpSourceRowRect(label) {
     }
     return null;
   };
-  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  // rAF is fast when VISIBLE but FREEZES on a hidden tab, so race a setTimeout fallback (throttled to ~1Hz
+  // when hidden) — without it this scroll-to-find/click loop would HANG when hidden.
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // Is the leaf's center inside the CLICKABLE viewport AND not occluded? CDP's Input.dispatchMouseEvent uses
   // VIEWPORT coords, so a row with cy > innerHeight is unclickable even when it's mounted + "visible" + inside
@@ -1826,7 +1836,7 @@ function makeCdpActuation(llmConfig) {
     // enumerate EVERY category (on open) and EVERY leaf (after a drill), so the AI never picks from a
     // partial, on-screen-only list. Read-only (scrolls + reads; resets scrollTop to 0).
     scrapeSourceRows: async (loc) => {
-      const r = await cdpEval(cdpScrapeSourceRows, loc.wrapperSel);
+      const r = await cdpEval(cdpScrapeSourceRows, loc.wrapperSel, inputTraceEnabled);
       console.log("[ApplyPilot][CDP-SRC-SCRAPE]", loc.wrapperSel, r && r.ok ? (r.options.length + " options, banner=" + JSON.stringify(r.banner) + (r.atBottom ? " (bottom)" : "")) : "FAILED");
       return r;
     },
