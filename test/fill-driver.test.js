@@ -4384,3 +4384,40 @@ test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips
   assert.deepStrictEqual(results.map((r) => r.field).sort(), ["country", "legalName--firstName"]);
   assert.ok(results.every((r) => r.status === "filled"));
 });
+
+// ── dropdown tier-keep: CLOSE the opened list (the degree→"Associates" stray fix) ────────────
+// The tier-aware keep path OPENS the dropdown to check for a higher tier. If it just Escapes and
+// returns, the portaled list (which overlaps the NEXT field) can linger and the next field's
+// open-click lands on a stale option (live: Field-of-Study clicked the degree list's "Associates"
+// while the record falsely said "Bachelors"). Fix: confirm the dropdown is CLOSED + re-read.
+
+test("dropdown tier-keep: the opened list is CLOSE-CONFIRMED before returning (no lingering list)", async () => {
+  const f = ddField({ triggerText: "United States of America", options: [{ text: "Select One", disabled: true }, { text: "United States of America" }, { text: "Uruguay" }] });
+  const act = makeFakeAct([f]);
+  const out = await drivePageFill(act, { personal_info: { country: ["Canada", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "dropdown-prefilled-better-tier-unavailable");
+  assert.strictEqual(rec.after, "United States of America");
+  assert.strictEqual(f.open, false, "dropdown CLOSED before returning — the next field can't hit a lingering list");
+  assert.ok(act.log.some(([m]) => m === "pressEscape"), "closed via Escape");
+});
+
+test("dropdown tier-keep: a value that STRAYS during the close → needs_review/dropdown-prefilled-stray (never a false verified-keep)", async () => {
+  const f = ddField({ triggerText: "United States of America", strayValueOnEscape: "Uruguay", options: [{ text: "Select One", disabled: true }, { text: "United States of America" }, { text: "Uruguay" }] });
+  const act = makeFakeAct([f]);
+  const out = await drivePageFill(act, { personal_info: { country: ["Canada", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "dropdown-prefilled-stray");
+  assert.strictEqual(rec.after, "Uruguay", "surfaces the live truth, not a false 'kept United States, verified'");
+});
+
+test("dropdown tier-keep: a slow-closing list is RE-ESCAPED until closed (not a single fire-and-return Escape)", async () => {
+  const f = ddField({ triggerText: "United States of America", escapeWontClose: true, options: [{ text: "Select One", disabled: true }, { text: "United States of America" }, { text: "Uruguay" }] });
+  const act = makeFakeAct([f]);
+  const out = await drivePageFill(act, { personal_info: { country: ["Canada", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const escapes = act.log.filter(([m]) => m === "pressEscape").length;
+  assert.ok(escapes >= 2, `re-escaped a slow-closing list (saw ${escapes})`);
+  assert.strictEqual(out.results[0].after, "United States of America", "value intact (escapeWontClose doesn't change it)");
+});

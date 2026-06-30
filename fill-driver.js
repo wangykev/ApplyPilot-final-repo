@@ -934,6 +934,25 @@ const parseRemediation = (text) => {
   return { action: "none", reason: String(obj.reason || (action ? "unknown action: " + action : "no action")).trim() };
 };
 
+// Close an OPENED dropdown and CONFIRM it's gone (aria-expanded → false) before returning. The
+// portaled option list OVERLAPS the next field, so a lingering list lets the NEXT field's open-click
+// land on a stale option — the live degree→"Associates" stray (the Field-of-Study box sits exactly
+// over the degree list's "Associates"). pressEscape alone fires-and-returns, racing the close at
+// fast (M39) pacing; here we poll readDropdownState until closed, re-Escaping each round (real-time
+// delayFull — the listbox closes at the page's pace), bounded by iterations so a stuck list can't
+// spin. Returns true iff confirmed closed. Used by the tier-aware KEEP path (which opens the list to
+// check for a higher tier) and the genuine-no-match path — both opened the list, both must close it.
+async function closeDropdownConfirmed(act, loc, budgets) {
+  const maxTries = (budgets.openRetries || 3) + 1;
+  let st = await act.readDropdownState(loc);
+  for (let i = 0; i < maxTries && st && st.ariaExpanded === "true"; i++) {
+    await act.pressEscape();
+    await act.delayFull(budgets.commitIntervalMs);
+    st = await act.readDropdownState(loc);
+  }
+  return !(st && st.ariaExpanded === "true");
+}
+
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
 // VERIFIED Enter (recon: a coordinate click on an out-of-view option dismisses
 // the popup — the Uruguay failure; Enter on a verified highlight commits).
@@ -1024,13 +1043,22 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts);
   if (m.targetIndex === -1) {
-    await act.pressEscape();
-    // Overwrite-upgrade miss (preTierIndex>0): we opened to upgrade a lower-tier pre-fill,
-    // but the dropdown offers NONE of the higher-priority tiers → the pre-fill IS the best
-    // the form has → KEEP it (filled, not needs_review — it's a valid lower-tier candidate).
-    // Escape only closed the listbox; the selection is unchanged, so `before` still holds.
-    // (Typeahead parity: prefilled-better-tier-unavailable.)
+    // CLOSE-CONFIRMED before returning: the open list OVERLAPS the next field, so a lingering
+    // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
+    // box sits over the degree list's "Associates"). Both the tier-keep and the genuine no-match
+    // opened the list, so both must confirm it's gone (not a fire-and-return Escape).
+    await closeDropdownConfirmed(act, loc, budgets);
+    // Overwrite-upgrade miss (preTierIndex>0): the dropdown offers NONE of the higher-priority
+    // tiers → the pre-fill IS the best the form has → KEEP it (filled, not needs_review — it's a
+    // valid lower-tier candidate). (Typeahead parity: prefilled-better-tier-unavailable.)
     if (preTierIndex > 0) {
+      // Honesty re-read: if the value strayed during the open/close window, surface the live
+      // truth — NEVER report a false "kept <pre-fill>, verified" (the degree→"Associates" lesson).
+      const back = await act.readDropdownState(loc);
+      const liveAfter = back && back.triggerText != null ? back.triggerText : before;
+      if (norm(liveAfter) !== norm(before)) {
+        return { status: "needs_review", after: liveAfter, matchTier: "pre-filled", flag: "dropdown-prefilled-stray", detail: `pre-fill "${before}" STRAYED to "${liveAfter}" during the tier check — review`, options: enabledTexts };
+      }
       return { status: "filled", after: before, verified: true, matchTier: "pre-filled", flag: "dropdown-prefilled-better-tier-unavailable", confidence: "high", detail: `kept pre-fill "${before}" — no higher-priority tier offered by the dropdown`, options: enabledTexts };
     }
     // GENUINE no-match: the option list RENDERED but no candidate is among it — i.e. this
