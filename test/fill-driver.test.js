@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -4279,4 +4279,87 @@ test("M1 cascade: SKIPPED under opts.onlyFieldNames (AI-4 targeted re-fill never
   const out = await drivePageFill(act, { personal_info: { first_name: "Ada", city: "London" } }, {}, {}, T_BUDGETS, { onlyFieldNames: new Set(["legalName--firstName"]) });
   assert.ok(!out.results.some((r) => r.cascadeRevealed), "cascade block is gated off under onlyFieldNames");
   assert.ok(!out.results.some((r) => r.fieldName === "city"), "the revealed field is NOT filled during a targeted re-fill");
+});
+
+// ── M2: replayField — the strict-replay SUBMIT atom (flat fields) ────────────
+// Replays one human-approved bundle entry onto a fresh live form; selector comes from the
+// PERSISTED field_id (flat) — exact, not a guess. Repeating/file_upload/deleted are deferred/skipped;
+// a live no-match → needs_review (STOP, never guess); cleared → blank.
+
+test("deriveFlatWrapperSel: field_id (page-qualified OR bare) → the exact automation-id selector", () => {
+  assert.strictEqual(deriveFlatWrapperSel({ field_id: "P1::formField-country" }), '[data-automation-id="formField-country"]');
+  assert.strictEqual(deriveFlatWrapperSel({ field_id: "formField-country" }), '[data-automation-id="formField-country"]');
+});
+
+test("isRepeatingEntry: canonical_field with [idx] is repeating; a flat path is not", () => {
+  assert.strictEqual(isRepeatingEntry({ canonical_field: "workExperience[0].job_title" }), true);
+  assert.strictEqual(isRepeatingEntry({ canonical_field: "personal_info.first_name" }), false);
+  assert.strictEqual(isRepeatingEntry({ canonical_field: null }), false);
+});
+
+test("replayField: a flat TEXT entry replays current_value at the recorded selector", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", widget_type: "text", current_value: "Kevin", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(r.after, "Kevin");
+  assert.strictEqual(f.value, "Kevin", "filled the box the recorded field_id points at");
+});
+
+test("replayField: a flat DROPDOWN entry replays the approved value as a single candidate", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }, { text: "United States of America" }] };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-country", canonical_field: "personal_info.country", widget_type: "dropdown", current_value: "United States of America", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(r.after, "United States of America");
+});
+
+test("replayField (STRICT): an approved value with NO live match → needs_review, never guesses", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }, { text: "United States of America" }] };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-country", canonical_field: "personal_info.country", widget_type: "dropdown", current_value: "Atlantis", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "needs_review", "a value the live form no longer offers HALTS this field");
+});
+
+test("replayField: a CLEARED text entry leaves the field blank (verify-blank, no value typed)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "stale" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", widget_type: "text", current_value: null, edit_kind: "cleared" }, T_BUDGETS);
+  assert.strictEqual(r.replay, "cleared");
+  assert.strictEqual(f.value, "", "the box is emptied, not refilled");
+});
+
+test("replayField: a REPEATING-section field is DEFERRED (skipped, zero actuation — M3 replays it positionally)", async () => {
+  const act = makeFakeAct([]);
+  const r = await replayField(act, { field_id: "P2::formField-jobTitle", canonical_field: "workExperience[0].job_title", widget_type: "text", current_value: "Engineer" }, T_BUDGETS);
+  assert.strictEqual(r.status, "skipped");
+  assert.strictEqual(r.flag, "replay-repeating-deferred");
+  assert.strictEqual(act.log.length, 0, "a deferred repeating field is never actuated by the flat atom");
+});
+
+test("replayField: is_deleted and file_upload are skipped (handled elsewhere), zero actuation", async () => {
+  const act = makeFakeAct([]);
+  const del = await replayField(act, { field_id: "P2::formField-jobTitle", canonical_field: "workExperience[1].job_title", widget_type: "text", current_value: "X", is_deleted: true }, T_BUDGETS);
+  assert.strictEqual(del.flag, "replay-deleted");
+  const up = await replayField(act, { field_id: "P2::formField-resume", canonical_field: null, widget_type: "file_upload", current_value: null }, T_BUDGETS);
+  assert.strictEqual(up.flag, "replay-file-deferred");
+  assert.strictEqual(act.log.length, 0, "neither touches the form");
+});
+
+test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {
+  const fn = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "" };
+  const cty = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }] };
+  const act = makeFakeAct([fn, cty]);
+  const entries = [
+    { field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", widget_type: "text", current_value: "Kevin" },
+    { field_id: "P1::formField-country", canonical_field: "personal_info.country", widget_type: "dropdown", current_value: "Canada" },
+    { field_id: "P2::formField-jobTitle", canonical_field: "workExperience[0].job_title", widget_type: "text", current_value: "Eng" }, // repeating → skip
+    { field_id: "P2::formField-resume", canonical_field: null, widget_type: "file_upload", current_value: null },                    // file_upload → skip
+    { field_id: "P1::formField-ssn", canonical_field: "personal_info.ssn", widget_type: "text", current_value: "x" }                  // not present → skip
+  ];
+  const present = new Set(["legalName--firstName", "country"]); // the live page scan
+  const results = await replayFlatFields(act, entries, present, T_BUDGETS);
+  assert.strictEqual(results.length, 2, "only the 2 present flat fields are replayed");
+  assert.deepStrictEqual(results.map((r) => r.field).sort(), ["country", "legalName--firstName"]);
+  assert.ok(results.every((r) => r.status === "filled"));
 });

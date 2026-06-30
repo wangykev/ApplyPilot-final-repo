@@ -106,6 +106,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // M2 SUBMIT replay (DRY): replay the SAVED approved review-summary bundle onto the current
+  // page (flat fields only) — NO Next, NO Submit. Uses the bundle, not the profile. [CDP-REPLAY].
+  if (message.type === "RUN_CDP_REPLAY_PAGE") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpReplayPage(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL WEBSITES (M32b): the FIRST repeating-section fill on the CDP path —
   // reconcile the Websites section to N + fill each entry's url (date-free) while
   // HIDDEN. Proves driveRepeatingSectionCdp; dates are deferred (Websites has none).
@@ -2497,6 +2509,45 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — stuck-lock is the worst operator failure
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// M2 (strict-replay SUBMIT — dry harness). Replays the SAVED, human-approved reviewSummary
+// bundle onto the CURRENT live page — FLAT fields only (repeating deferred to M3). NO Next,
+// NO Submit. The operator loads the same page they filled (fresh/blank) and watches the
+// approved values re-populate; a value the form no longer offers HALTS that field
+// (needs_review), never guesses. Reads the bundle from storage (NOT the profile — that's the
+// whole point of replay). [CDP-REPLAY] in the SW console.
+async function runCdpReplayPage(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      LOG('no reviewSummary bundle in storage — fill a page first (this dry-replays the saved approved values). "View last summary" to confirm one exists.');
+      return { ok: false, error: "no-bundle" };
+    }
+    LOG("DRY REPLAY (flat fields only) — replaying the SAVED approved bundle onto THIS live page. NO Next, NO Submit. Keep the tab VISIBLE to watch; an approved value the form no longer offers will HALT that field (needs_review), never guess.");
+    const scan = await cdpEval(cdpPageScan);
+    const present = new Set(((scan && scan.fields) || []).map((f) => f.fieldName));
+    const act = makeCdpActuation(await getLlmConfig());
+    await installInputLock(); // operator-protection during actuation (same as the fill)
+    const results = await replayFlatFields(act, bundle.entries, present, DEFAULT_BUDGETS);
+    const nr = results.filter((r) => r.status === "needs_review" || r.status === "error");
+    LOG(`replayed ${results.length} flat field(s) present on this page; ${nr.length} need review/failed.`);
+    if (nr.length) { LOG("NEEDS REVIEW / FAILED:"); nr.forEach((r) => LOG(`    • ${r.field} [${r.widgetType}] ${r.status} — ${r.detail || ""}`)); }
+    try { console.table(results.map((r) => ({ field: r.field, type: r.widgetType, status: r.status, after: r.after, verified: r.verified, detail: r.detail }))); } catch (e) { results.forEach((r) => LOG(JSON.stringify(r))); }
+    LOG("dry replay complete — NOTHING submitted, no page advance. (Repeating-section fields are DEFERRED to the M3 walk.)");
+    return { ok: true, replayed: results.length, needs_review: nr.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("replay aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await removeInputLock(); // BEFORE detach
     await cdpDetach();
   }
 }

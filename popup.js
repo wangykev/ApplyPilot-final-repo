@@ -347,6 +347,22 @@ document.getElementById("cdp-cascade-recon").addEventListener("click", () => {
   });
 });
 
+// M2 SUBMIT replay (DRY): replay the SAVED approved review-summary bundle onto the current
+// page (FLAT fields only), NO Next/Submit. Load the same page you filled (fresh). [CDP-REPLAY].
+document.getElementById("cdp-replay-page").addEventListener("click", () => {
+  setStatus("Dry replay (flat) — replaying the SAVED approved bundle onto THIS page. Keep the tab VISIBLE. NO submit. Findings → SW console [CDP-REPLAY].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REPLAY_PAGE" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have lost focus — SW console has it all
+    if (resp.ok === false && resp.error === "no-bundle") {
+      setStatus('No saved summary to replay — fill a page first, then dry-replay it. ("View last summary" to confirm one exists.)');
+    } else if (resp.ok === false) {
+      setStatus("Replay failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Dry replay done — ${resp.replayed} flat field(s) replayed, ${resp.needs_review} need review. NO submit. See [CDP-REPLAY].`);
+    }
+  });
+});
+
 // WEBSITES FILL (M32b): the first repeating-section fill on the CDP path —
 // reconcile to N + fill each entry's url (date-free Websites). Run on My
 // Experience (page 2); minimize within 60s. Results land as [CDP-WEB] in the SW console.

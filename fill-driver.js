@@ -2832,6 +2832,95 @@ async function auditRefillEntry(act, e, b) {
   }
 }
 
+// ── M2 (strict-replay SUBMIT — the atom) ─────────────────────────────────────
+// replayField: replay ONE human-approved review-summary bundle entry onto a FRESH live form
+// (the submit walk M3 calls this per field; M4 adds the Submit click + gate). Generalizes
+// auditRefillEntry, but the selector is taken from the PERSISTED entry — a submit replay is a
+// fresh session, so there's no same-session auditLoc to reuse.
+//
+// FLAT FIELDS ONLY (this cut): a flat field's `field_id` is `<page>::formField-<name>`, and the
+// `formField-<name>` automation-id is UNIQUE + STABLE across page loads, so the selector is EXACT
+// (not a guess — we recorded it). REPEATING-section fields (canonical_field carries `[idx]`) are
+// DEFERRED: their automation-ids duplicate across entries and the entry containers are re-created
+// on a fresh form, so they replay POSITIONALLY via the section reconcile (M3), never by a recorded
+// selector. file_upload is DEFERRED too (the SW's attachResumeForPage re-attaches the résumé, same
+// as the fill path). The value is the approved `current_value`, passed as a SINGLE candidate → it
+// still clears the match ladder → a live no-match returns needs_review from the handler (STOP,
+// never guess — the "strict" in strict-replay). edit_kind "cleared" → leave/verify blank;
+// is_deleted → skip (the section reconcile drops a removed entry). Mirrors Plan-2 effectiveValue
+// (value=current_value, kind=edit_kind, deleted=is_deleted) without importing the viewer module.
+function isRepeatingEntry(entry) {
+  // sectionOf (summary.js) keys on `name[idx]` in canonical_field; the same signal marks a
+  // repeating-section field here (workExperience[0].job_title, education[1].degree, …).
+  return /^[A-Za-z_]+\s*\[\d+\]/.test(String((entry && entry.canonical_field) || ""));
+}
+function deriveFlatWrapperSel(entry) {
+  // field_id = `<page>::formField-<name>` (or just `formField-<name>` single-page). The tail after
+  // the LAST "::" is the automation-id — unique + stable for a FLAT field → an exact selector.
+  const id = String((entry && entry.field_id) || "");
+  const automationId = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+  return automationId ? '[data-automation-id="' + automationId + '"]' : null;
+}
+async function replayField(act, entry, budgets) {
+  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
+  const widget = entry && entry.widget_type;
+  if (!entry || !widget || widget === "section") return { status: "skipped", detail: "no widget / section op (not replayable)" };
+  if (entry.is_deleted) return { status: "skipped", flag: "replay-deleted", detail: "deleted entry — dropped by the section reconcile, not replayed" };
+  if (isRepeatingEntry(entry)) return { status: "skipped", flag: "replay-repeating-deferred", detail: "repeating-section field — replayed positionally by the section reconcile (M3), not by a recorded selector" };
+  if (widget === "file_upload") return { status: "skipped", flag: "replay-file-deferred", detail: "résumé re-attach handled by the SW attachResumeForPage step, not replayField" };
+
+  const sel = deriveFlatWrapperSel(entry);
+  if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
+  const loc = { wrapperSel: sel };
+  const value = entry.current_value;
+  const cleared = entry.edit_kind === "cleared" || value == null || value === "";
+
+  // CLEARED (human emptied it): leave blank. A fresh submit form starts blank, so this is a
+  // verify-blank, not a destructive clear (choice widgets default to their placeholder).
+  if (cleared) {
+    if (widget === "text" || widget === "textarea") {
+      return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, widget === "textarea" ? "textarea" : "input"));
+    }
+    return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
+  }
+
+  // NORMAL: replay the approved value through the SAME per-widget handler (single candidate → match ladder).
+  switch (widget) {
+    case "text": return await fillTextCdp(act, loc, value, b, "input");
+    case "textarea": return await fillTextCdp(act, loc, value, b, "textarea");
+    case "dropdown": return await fillDropdownCdp(act, loc, [value], b);
+    case "typeahead": case "hierarchical": return await fillTypeaheadCdp(act, loc, [value], b);
+    case "radio": return await fillRadioCdp(act, loc, [value], b);
+    case "checkbox": return await fillCheckboxCdp(act, loc, value === true || /^(true|yes)$/i.test(String(value)), b);
+    case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(value)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
+    default: return { status: "needs_review", detail: "replay: unsupported widget " + widget };
+  }
+}
+// replayFlatFields: the DRY-replay orchestrator (the M2 harness + a unit seam). Replays each FLAT,
+// PRESENT, re-fillable bundle entry on the live page via replayField; skips repeating (deferred),
+// file_upload, deleted, and any field NOT present in `presentFieldNames` (so it scopes to the
+// current page). NO Next/Submit — the caller stays in control. Returns the per-field results.
+async function replayFlatFields(act, entries, presentFieldNames, budgets) {
+  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
+  const present = presentFieldNames instanceof Set ? presentFieldNames : new Set(presentFieldNames || []);
+  const fieldNameOf = (entry) => {
+    const id = String((entry && entry.field_id) || "");
+    const auto = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return auto.indexOf("formField-") === 0 ? auto.slice("formField-".length) : auto;
+  };
+  const results = [];
+  for (const entry of entries || []) {
+    if (!entry || entry.widget_type === "section" || entry.widget_type === "file_upload") continue;
+    if (entry.is_deleted || isRepeatingEntry(entry)) continue;       // deferred / dropped
+    const fname = fieldNameOf(entry);
+    if (!present.has(fname)) continue;                                // not on THIS live page
+    const r = await replayField(act, entry, b);
+    results.push(Object.assign({ field: fname, widgetType: entry.widget_type }, r));
+    await act.delay(b.interFieldMs);
+  }
+  return results;
+}
+
 // reconcileAudit: re-read each entry's live value + classify match / mismatch / unverifiable.
 // One settle first (delayFull — the page's render takes real wall-clock; the foreground
 // speedup must not shorten it). Pure verdict list; the caller (inline or SW) acts on it.
@@ -3146,5 +3235,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
