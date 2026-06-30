@@ -2664,7 +2664,13 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
       rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
       flag: "section-stub", verified: null, after: null,
-      detail: "no meaningful " + name + " entries to fill — the section is on the form but empty"
+      detail: "no meaningful " + name + " entries to fill — the section is on the form but empty",
+      // 2b: the field SHAPE (from the fieldMap) so the review viewer can build a NEW entry for this
+      // EMPTY section (no existing entry to clone from). options/isRequired are unknown without a
+      // mounted entry → the viewer's editors degrade to text boxes (the form stays source of truth).
+      section_field_shape: (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({
+        recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path
+      }))
     });
     return finalize(url);
   }
@@ -3246,6 +3252,7 @@ function buildReviewBundle(results, meta) {
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
+      section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
       character_count: null
     };
   });
@@ -3266,7 +3273,11 @@ function buildReviewBundle(results, meta) {
 // rebuild), append this page's, recompute the envelope. PURE — the SW does the I/O.
 function accumulateBundle(priorEntries, pageBundle) {
   const pageKey = pageBundle.page;
-  const kept = (priorEntries || []).filter((e) => e.page !== pageKey); // other pages, verbatim (edits intact)
+  // Keep OTHER pages verbatim (edits intact) AND this page's OPERATOR-ADDED entries (2b — they
+  // aren't in the engine's freshly-built page bundle, so a re-fill would otherwise drop them; the
+  // future section-reconcile CREATEs them on the form). Their index sits beyond the fresh fill's
+  // (nextIndexFor = max+1 at add time), so no collision with the rebuilt entries.
+  const kept = (priorEntries || []).filter((e) => e.page !== pageKey || e.is_added);
   const entries = kept.concat(pageBundle.entries || []);
   const pages = Array.from(new Set(entries.map((e) => e.page).filter((p) => p != null))).sort();
   return Object.assign({

@@ -2720,6 +2720,28 @@ test("section_stub flows through buildReviewBundle as a needs_review category (F
   assert.strictEqual(e.current_value, null);
 });
 
+test("section_stub carries section_field_shape into the bundle (2b: viewer builds a new entry)", () => {
+  const recs = [{ fieldName: "website", label: "Website — section present, no entries",
+    widgetType: "section_stub", isRequired: false, mappedPath: "website._stub",
+    status: "skipped", flag: "section-stub", after: null, detail: "empty",
+    section_field_shape: [{ recName: "url", widget_type: "text", path: "url" }] }];
+  const bundle = buildReviewBundle(recs, { page: "p2" });
+  assert.deepStrictEqual(bundle.entries[0].section_field_shape, [{ recName: "url", widget_type: "text", path: "url" }]);
+});
+
+test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {
+  const added = { page: "p2", field_id: "p2::formField-website[4].url", canonical_field: "website[4].url", is_added: true, current_value: "https://added.example", fill_status: "not_filled", needs_review: true };
+  const otherPage = { page: "p1", field_id: "p1::formField-personal_info.first_name", canonical_field: "personal_info.first_name", fill_status: "filled" };
+  const prior = [otherPage, added,
+    { page: "p2", field_id: "p2::formField-website[0].url", canonical_field: "website[0].url", fill_status: "filled" }]; // a normal p2 entry (NOT added)
+  const freshP2 = { page: "p2", schema_version: "1.1", entries: [
+    { page: "p2", field_id: "p2::formField-website[0].url", canonical_field: "website[0].url", fill_status: "filled" }] };
+  const merged = accumulateBundle(prior, freshP2);
+  assert.ok(merged.entries.some((e) => e.is_added && e.canonical_field === "website[4].url"), "added entry preserved");
+  assert.ok(merged.entries.some((e) => e.page === "p1"), "other page kept verbatim");
+  assert.strictEqual(merged.entries.filter((e) => e.canonical_field === "website[0].url").length, 1, "non-added p2 entry replaced, not duplicated");
+});
+
 // M36 — the M32b "date is DEFERRED / zero-actuation" invariant is INVERTED: the date branch
 // now FILLS via fillDateCompositeCdp. The flip asserts the segments were ACTUALLY WRITTEN
 // (per-segment typeDigits happened + the fake's segment values changed) — not merely

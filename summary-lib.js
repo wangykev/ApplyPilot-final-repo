@@ -13,6 +13,10 @@ const sumNorm = (v) => (v == null ? "" : String(v));
 // Edit provenance for the later strict-replay SUBMIT (Plan 1): compare the bot's pick
 // (original_ai_value) against the current (possibly human-edited) value. null = unedited.
 function editKindOf(e) {
+  // 2b: an OPERATOR-ADDED entry keeps STICKY "added_entry" provenance — a value edit must NOT
+  // flip it to override/filled_blank, so the strict-replay knows the whole entry is new (it must
+  // be CREATED on the form, not matched to an existing one). Checked before the value compare.
+  if (e && e.is_added) return "added_entry";
   const o = sumNorm(e.original_ai_value), c = sumNorm(e.current_value);
   if (o === c) return null;
   if (o === "") return "filled_blank";
@@ -94,6 +98,54 @@ function visibleEntryItems(items) {
   return list;
 }
 
+// Build the field records for an OPERATOR-ADDED repeating-section entry (2b — the inverse of the
+// soft-delete). `shape` is [{recName, path, widget_type, is_required, label?, options?,
+// captured_options?, tree_structure?}] (the viewer derives it from an existing entry of the same
+// section, or — for an empty section — from the stub's engine-emitted section_field_shape). Each
+// record mirrors buildReviewBundle's entry shape PLUS the additive `is_added`/`added_at` markers
+// and a sticky edit_kind "added_entry". field_id / canonical_field use the SAME
+// "<sectionKey>[<index>].<rec>" format the fill engine emits, so the viewer groups the new entry
+// correctly AND the future strict-replay's isRepeatingEntry recognizes it (CREATE on the form via
+// the section reconcile, never replay as a flat field). PURE → unit-tested (the viewer passes
+// `at` since this stays Date-free).
+function newEntryRecords(shape, meta) {
+  const m = meta || {};
+  const fpfx = (m.page != null ? m.page + "::" : "") + "formField-" + m.sectionKey + "[" + m.index + "].";
+  const cpfx = m.sectionKey + "[" + m.index + "].";
+  return (shape || []).map((s) => ({
+    field_id: fpfx + s.recName,
+    page: m.page != null ? m.page : null,
+    field_index: null,
+    question_label: s.label != null ? s.label : s.recName,
+    widget_type: s.widget_type,
+    canonical_field: cpfx + (s.path != null ? s.path : s.recName),
+    is_required: !!s.is_required,
+    current_value: null,
+    original_ai_value: null,
+    is_edited: true,
+    edit_kind: "added_entry",
+    is_added: true,
+    added_at: m.at != null ? m.at : null,
+    is_approved: false,
+    approved_at: null,
+    page_number: m.pageNumber != null ? m.pageNumber : null,
+    page_label: m.pageLabel != null ? m.pageLabel : null,
+    confidence: "none",
+    confidence_source: "added",
+    needs_review: true,
+    needs_review_reason: "added_entry",
+    fill_status: "not_filled",
+    fill_error: null,
+    detail: "added by you in review — fill it in, then approve",
+    match_tier: null,
+    flag: "added-entry",
+    options: Array.isArray(s.options) ? s.options : null,
+    captured_options: Array.isArray(s.captured_options) ? s.captured_options : null,
+    tree_structure: (s.tree_structure && typeof s.tree_structure === "object") ? s.tree_structure : null,
+    character_count: null
+  }));
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords };
 }

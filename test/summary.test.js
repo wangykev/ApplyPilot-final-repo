@@ -4,7 +4,45 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
+
+// ── 2b: operator-added repeating-section entries ──
+test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
+  assert.strictEqual(editKindOf({ is_added: true, original_ai_value: null, current_value: null }), "added_entry");
+  // a value edit must NOT flip it to filled_blank/override — replay needs to know the entry is NEW
+  assert.strictEqual(editKindOf({ is_added: true, original_ai_value: null, current_value: "Acme Inc" }), "added_entry");
+  assert.strictEqual(editKindOf({ is_added: true, original_ai_value: "x", current_value: "y" }), "added_entry");
+});
+test("newEntryRecords: builds engine-format field_id/canonical, is_added, sticky edit_kind, flagged", () => {
+  const shape = [
+    { recName: "url", path: "url", widget_type: "text", is_required: true, label: "URL*" },
+    { recName: "kind", path: "kind", widget_type: "dropdown", is_required: false, label: "Type", options: ["Personal", "Work"] },
+  ];
+  const recs = newEntryRecords(shape, { page: "p2", pageNumber: 2, pageLabel: "Page 2", sectionKey: "website", index: 4, at: "2026-06-30T00:00:00Z" });
+  assert.strictEqual(recs.length, 2);
+  const [a, b] = recs;
+  assert.strictEqual(a.field_id, "p2::formField-website[4].url");      // engine field_id format
+  assert.strictEqual(a.canonical_field, "website[4].url");             // groups under "website", index 4
+  assert.strictEqual(a.is_added, true);
+  assert.strictEqual(a.added_at, "2026-06-30T00:00:00Z");
+  assert.strictEqual(a.edit_kind, "added_entry");
+  assert.strictEqual(a.needs_review, true);                            // unverified by construction → must be approved
+  assert.strictEqual(a.needs_review_reason, "added_entry");
+  assert.strictEqual(a.flag, "added-entry");
+  assert.strictEqual(a.current_value, null);
+  assert.strictEqual(a.fill_status, "not_filled");
+  assert.strictEqual(a.page_number, 2);
+  assert.deepStrictEqual(b.options, ["Personal", "Work"]);             // options carried for the editor
+  assert.strictEqual(b.question_label, "Type");
+  // an added entry's field requires approval (blocks submit_ready until the operator approves)
+  assert.strictEqual(requiresApproval(a), true);
+});
+test("newEntryRecords: missing label falls back to recName; flat page meta tolerated", () => {
+  const recs = newEntryRecords([{ recName: "school_or_university", widget_type: "text" }], { sectionKey: "education", index: 0 });
+  assert.strictEqual(recs[0].field_id, "formField-education[0].school_or_university"); // no page prefix when page null
+  assert.strictEqual(recs[0].canonical_field, "education[0].school_or_university");     // path defaults to recName
+  assert.strictEqual(recs[0].question_label, "school_or_university");
+});
 
 // ── editKindOf — the replay provenance ──
 test("editKindOf: unedited → null (original === current)", () => {

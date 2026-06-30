@@ -136,10 +136,54 @@ const svgTrash = () => {
 // is_deleted (skips the entry on submit) — nothing is removed from the bundle here.
 const entryFieldsOf = (page, key, index) => currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key && sectionOf(e).index === index);
 const setEntryDeleted = (page, key, index, del) => { for (const e of entryFieldsOf(page, key, index)) e.is_deleted = del; persist(); render(); };
+
+// 2b — ADD a repeating-section entry from review (the inverse of the soft-delete). The field
+// SHAPE comes from the highest-index EXISTING entry of the section (real widget_type / options /
+// required from the actual fill), or — for an EMPTY section — the stub's engine-emitted
+// section_field_shape (options unknown → the editor degrades to a text box + the form stays the
+// source of truth). A flat section returns [] (not addable, no button).
+const _stripEntryPrefix = (s, key) => String(s || "").replace(new RegExp("^" + key + "\\[\\d+\\]\\."), "");
+const sectionShapeFor = (page, key) => {
+  const ents = currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key);
+  const indexed = ents.filter((e) => sectionOf(e).index != null && !e.is_deleted);
+  if (indexed.length) {
+    const maxIx = Math.max(...indexed.map((e) => sectionOf(e).index));
+    return indexed.filter((e) => sectionOf(e).index === maxIx).map((e) => ({
+      recName: _stripEntryPrefix(String(e.field_id).replace(/^.*formField-/, ""), key),
+      path: _stripEntryPrefix(e.canonical_field, key),
+      widget_type: e.widget_type, is_required: e.is_required, label: e.question_label,
+      options: e.options, captured_options: e.captured_options, tree_structure: e.tree_structure
+    }));
+  }
+  const stub = ents.find((e) => e.widget_type === "section_stub" && Array.isArray(e.section_field_shape) && e.section_field_shape.length);
+  if (stub) return stub.section_field_shape.map((s) => ({ recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required, label: s.label != null ? s.label : s.recName, options: null, captured_options: null, tree_structure: null }));
+  return [];
+};
+const nextIndexFor = (page, key) => {
+  const idxs = currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key).map((e) => sectionOf(e).index).filter((i) => i != null);
+  return idxs.length ? Math.max(...idxs) + 1 : 0; // include soft-deleted so a new index never collides
+};
+const addEntry = (page, key) => {
+  const shape = sectionShapeFor(page, key);
+  if (!shape.length) return;
+  const sample = currentBundle.entries.find((e) => e.page === page); // borrow page_number/label
+  const recs = newEntryRecords(shape, { page, pageNumber: sample ? sample.page_number : null, pageLabel: sample ? sample.page_label : null, sectionKey: key, index: nextIndexFor(page, key), at: new Date().toISOString() });
+  currentBundle.entries.push(...recs);
+  persist(); render();
+  if (recs[0]) jumpToField(recs[0]);
+};
+// An operator-added entry never existed on the form, so its trash HARD-removes it (there's no
+// soft-delete state to preserve), unlike a form-derived entry (reversible soft-delete the replay
+// still honors).
+const removeAddedEntry = (page, key, index) => {
+  currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === page && sectionOf(e).key === key && sectionOf(e).index === index && e.is_added));
+  persist(); render();
+};
 const entryHead = (sec, ix, page) => {
-  const h = el("div", { class: "ehead" }, [el("span", { class: "et", text: `Entry ${ix + 1}` })]);
-  const del = el("button", { class: "del", title: "Delete this entry" }, [svgTrash(), el("span", { text: "Delete" })]);
-  del.addEventListener("click", () => setEntryDeleted(page, sec.key, ix, true));
+  const added = entryFieldsOf(page, sec.key, ix).some((e) => e.is_added);
+  const h = el("div", { class: "ehead" }, [el("span", { class: "et", text: `Entry ${ix + 1}${added ? " · added" : ""}` })]);
+  const del = el("button", { class: "del", title: added ? "Remove this added entry" : "Delete this entry" }, [svgTrash(), el("span", { text: added ? "Remove" : "Delete" })]);
+  del.addEventListener("click", () => added ? removeAddedEntry(page, sec.key, ix) : setEntryDeleted(page, sec.key, ix, true));
   h.appendChild(del);
   return h;
 };
@@ -410,14 +454,17 @@ const renderFieldList = (mount) => {
 
     for (const g of order.map((k) => byKey[k])) {
       const key = pg + "||" + g.sec.key;
-      const repeating = g.sec.index != null;                       // base[idx] sections get per-entry headers + delete
-      const liveItems = g.items.filter((e) => !e.is_deleted);
+      // 2b: a section with real INDEXED entries SUPPRESSES its stub (it's no longer "empty");
+      // a stub-only or flat section renders its items normally.
+      const realItems = g.items.filter((e) => e.widget_type !== "section_stub");
+      const repeating = realItems.some((e) => sectionOf(e).index != null);  // base[idx] entries → per-entry headers + delete
+      const liveItems = (repeating ? realItems : g.items).filter((e) => !e.is_deleted);
 
       // build the body first — a group is only shown if it ends up with content
       const body = el("div", { class: "gbody" });
       if (repeating) {
         const idxOrder = [], byIdx = {};
-        for (const e of g.items) { const ix = sectionOf(e).index; if (!(ix in byIdx)) { byIdx[ix] = []; idxOrder.push(ix); } byIdx[ix].push(e); }
+        for (const e of realItems) { const ix = sectionOf(e).index; if (ix == null) continue; if (!(ix in byIdx)) { byIdx[ix] = []; idxOrder.push(ix); } byIdx[ix].push(e); }
         for (const ix of idxOrder) {
           const items = byIdx[ix];
           if (items.every((e) => e.is_deleted)) { if (currentFilter === "all") body.appendChild(deletedRow(g.sec, ix, pg)); continue; }
@@ -429,6 +476,13 @@ const renderFieldList = (mount) => {
         }
       } else {
         for (const e of g.items.filter((e) => !e.is_deleted && filterPass(e))) body.appendChild(fieldRow(e));
+      }
+      // 2b: "+ Add entry" for an addable repeating section (clones an existing entry's shape, or a
+      // stub's engine shape for an empty section). Only in the "all" view — keeps review/edited clean.
+      if (currentFilter === "all" && sectionShapeFor(pg, g.sec.key).length) {
+        const addBtn = el("button", { class: "add-entry", text: "+ Add entry" });
+        addBtn.addEventListener("click", () => addEntry(pg, g.sec.key));
+        body.appendChild(addBtn);
       }
       if (!body.childNodes.length) continue;
 
