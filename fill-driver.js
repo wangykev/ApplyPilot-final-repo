@@ -2106,16 +2106,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     //  • CANONICALIZE (AI-3): a MAPPED dropdown whose STATED profile value didn't match the option
     //    vocab → map the KNOWN value to an option. NEVER infers; keeps its own ai-canonicalized flag.
     //  • INFER (AI-1/AI-2): an unmapped/unanswerable field with NO known value → the AI decides.
-    //    aiEligible-gated (NEVER the employer-match radio / file_upload). EEO is now INCLUDED (the
-    //    operator retracted the exclusion) → an AI-inferred demographic is re-tagged ai-eeo-guess so the
+    //    aiEligible-gated (NEVER the employer-match radio / file_upload), AND ONLY for REQUIRED
+    //    fields (operator rule): an OPTIONAL unmapped dropdown/text/textarea — incl. the cascade-
+    //    revealed Local Name fields and OPTIONAL EEO — fills DETERMINISTICALLY only and is left
+    //    BLANK on a miss (no LLM call). A blank optional field doesn't block Save & Continue, so
+    //    there's no reason to guess it. EEO is now INCLUDED for REQUIRED fields (the operator
+    //    retracted the exclusion) → an AI-inferred demographic is re-tagged ai-eeo-guess so the
     //    viewer still shows the loud "AI-GUESSED DEMOGRAPHIC — VERIFY" badge. dropdown→aiFillField,
     //    text/textarea→aiFillText. ALWAYS filled_review, never silent.
     if (act.aiEnabled && producedNothing(record)) {
       const canonicalize = !!mappedPath && record.resolved != null && record.genuineNoMatch === true && f.widgetType === "dropdown";
       try {
         let aiRes = null;
-        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers)
-        else if (aiEligible(f)) {
+        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
+        else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
             ? await aiFillField(act, loc, f, profile, jobContext, budgets)
             : await aiFillText(act, loc, f, profile, jobContext, budgets);
@@ -2221,6 +2225,36 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           results.push(r);
         }
       } catch (e) { /* a revealed-field fill threw → don't abort the whole page; next round / honest miss */ }
+    }
+  }
+
+  // ── CASCADE-REMOVED reconciliation ── a field present in the UP-FRONT scan but now GONE
+  // from the DOM (DELETED by an earlier field's value — e.g. Country=Afghanistan removes the
+  // dependent "State" dropdown, docs/dom-patterns.md 2026-06-03) records a MISLEADING
+  // needs_review ("options did not render") because fillDropdownCdp reached a trigger that no
+  // longer exists. Reclassify such a field status:"removed" so it DROPS from the summary /
+  // counts / review entirely (it's deleted, not an error). DOM-ABSENCE is the reliable signal
+  // (not the render-failure detail): a still-present failed field (genuine no-match / transient
+  // render flake) is left untouched + flagged. filled/filled_review are EXCLUDED here — a
+  // filled-THEN-removed field is the M40 audit's audit-unverifiable job. Runs BEFORE the audit
+  // so a removed field never reaches it. SKIPPED under `only` (a targeted re-fill never cascades).
+  if (!only) {
+    const upFront = new Set(scan.fields.map((f) => f.fieldName));
+    const candidates = results.filter((r) => upFront.has(r.fieldName) && (r.status === "needs_review" || r.status === "error" || r.status === "skipped"));
+    if (candidates.length) {
+      let present = null;
+      try { present = new Set(((await act.scanPage()).fields || []).map((f) => f.fieldName)); } catch (e) { present = null; }
+      // GUARD: only relabel if the rescan returned a NON-EMPTY field list — a transient empty/
+      // failed scan must NEVER mass-relabel live fields as removed.
+      if (present && present.size > 0) {
+        for (const r of candidates) {
+          if (!present.has(r.fieldName)) {
+            r.status = "removed";
+            r.flag = "cascade-removed";
+            r.detail = (r.detail ? r.detail + " | " : "") + "field deleted by an earlier field's value — treated as deleted (dropped from review)";
+          }
+        }
+      }
     }
   }
 
@@ -3040,7 +3074,7 @@ function buildReviewBundle(results, meta) {
     else reason = "low_confidence";
     return { needs_review: true, needs_review_reason: reason };
   };
-  const fieldRecs = (results || []).filter((r) => r.widgetType !== "section"); // .add/.delete/.removed are ops
+  const fieldRecs = (results || []).filter((r) => r.widgetType !== "section" && r.status !== "removed"); // .add/.delete/.removed are ops; status "removed" = a field DELETED by a cascade (drop from summary/counts/review)
   const entries = fieldRecs.map((rec, index) => {
     const fill_status = mapFillStatus(rec.status);
     const { confidence, confidence_source } = deriveConfidence(rec);

@@ -890,12 +890,15 @@ test("AI-2: generated answer → filled_review + ai-text + the prose typed (NEVE
   assert.ok(act.log.some(([m]) => m === "typeText"), "the answer was typed into the field");
 });
 
-test("AI-2: OPTIONAL field the AI SKIPs → needs_review BLANK (ai-text-skip), no fill", async () => {
-  const act = makeFakeAct([aiText({ isRequired: false })], { aiEnabled: true, ai: '{"skip":true,"reason":"asks for a specific ID not in the profile"}' });
+test("AI-2: an OPTIONAL field gets NO AI fallback — deterministic skip, BLANK, no LLM (operator rule)", async () => {
+  // Operator rule: only REQUIRED fields get an AI fallback. An OPTIONAL unmapped field stays at
+  // its deterministic result and is left BLANK — a blank optional doesn't block Save & Continue,
+  // so there's no reason to spend an LLM call guessing it.
+  const act = makeFakeAct([aiText({ isRequired: false })], { aiEnabled: true, ai: '{"answer":"should not be used"}' });
   const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-text-skip");
-  assert.strictEqual(rec.after, null, "optional → blank is safe (doesn't halt the walk)");
+  assert.strictEqual(rec.status, "skipped", "optional unmapped → deterministic skip (no AI)");
+  assert.strictEqual(rec.after, null, "left BLANK");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "the LLM is NEVER consulted for an optional field");
 });
 
 test("AI-2 PRINCIPLE: a REQUIRED field the AI SKIPs → conspicuous placeholder, never blank (walk reaches review; submit hard-blocks)", async () => {
@@ -910,7 +913,7 @@ test("AI-2 PRINCIPLE: a REQUIRED field the AI SKIPs → conspicuous placeholder,
   assert.strictEqual(unreplacedPlaceholders(entries).length, 1, "the bundle entry is detected as an unreplaced placeholder (submit-blocked)");
 });
 
-test("AI-2: generation OFF (empty autofill_rules) ⇒ act.llm NEVER called; required → placeholder, optional → skip", async () => {
+test("AI-2: generation OFF (empty autofill_rules) ⇒ act.llm NEVER called; required → placeholder, optional → blank", async () => {
   const GEN_OFF = { autofill_rules: { generation_allowed_only_for: [] } };
   const reqAct = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: '{"answer":"should not be used"}' });
   const reqRec = (await drivePageFill(reqAct, GEN_OFF, {}, {}, T_BUDGETS)).results[0];
@@ -918,7 +921,8 @@ test("AI-2: generation OFF (empty autofill_rules) ⇒ act.llm NEVER called; requ
   assert.strictEqual(reqRec.flag, "ai-text-needs-answer", "required still gets a placeholder (walk advances)");
   const optAct = makeFakeAct([aiText({ isRequired: false })], { aiEnabled: true, ai: '{"answer":"x"}' });
   const optRec = (await drivePageFill(optAct, GEN_OFF, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(optRec.flag, "ai-text-skip");
+  assert.ok(!optAct.log.some(([m]) => m === "llm"), "optional → never consults the LLM (no AI fallback)");
+  assert.strictEqual(optRec.status, "skipped");
   assert.strictEqual(optRec.after, null);
 });
 
@@ -1002,21 +1006,20 @@ test("AI-3 CANONICALIZATION: AI can't map the stated value to any option → nee
   assert.strictEqual(rec.after, null);
 });
 
-test("EEO retraction: an UNMAPPED EEO field is now AI-FILLED like any field (optional + required) → ai-eeo-guess badge", async () => {
-  // OPTIONAL unmapped EEO → the AI fills it now (the exclusion was retracted; always-guess commits).
-  const opt = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: false })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
-  const optRec = (await drivePageFill(opt, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.ok(opt.log.some(([m]) => m === "llm"), "EEO is no longer excluded — the AI fills it");
-  assert.strictEqual(optRec.status, "filled_review");
-  assert.strictEqual(optRec.flag, "ai-eeo-guess", "an AI-filled demographic gets the verify badge");
-  assert.strictEqual(optRec.after, "Male");
-  // REQUIRED unmapped EEO → same generic inference path, same badge.
+test("EEO retraction + optional gate: a REQUIRED unmapped EEO field is AI-FILLED (ai-eeo-guess); an OPTIONAL one is left BLANK (no LLM)", async () => {
+  // REQUIRED unmapped EEO → the generic inference fills it + the loud demographic verify badge.
   const req = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: true })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
   const reqRec = (await drivePageFill(req, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.ok(req.log.some(([m]) => m === "llm"));
-  assert.strictEqual(reqRec.flag, "ai-eeo-guess");
+  assert.ok(req.log.some(([m]) => m === "llm"), "required EEO is AI-filled (the exclusion is retracted)");
+  assert.strictEqual(reqRec.flag, "ai-eeo-guess", "an AI-filled demographic gets the verify badge");
   assert.strictEqual(reqRec.after, "Male");
   assert.strictEqual(reqRec.status, "filled_review");
+  // OPTIONAL unmapped EEO → NO AI (optional = deterministic-only) → left blank, no LLM ("blank optional EEO too").
+  const opt = makeFakeAct([genderField({ fieldName: "genderIdentity", label: "Gender identity", isRequired: false })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"High"}' });
+  const optRec = (await drivePageFill(opt, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!opt.log.some(([m]) => m === "llm"), "optional EEO is NOT AI-guessed");
+  assert.strictEqual(optRec.status, "skipped");
+  assert.strictEqual(optRec.after, null);
 });
 
 test("AI-3 EEO inference (mapped-but-empty required → the confidence-gated path): high-conf commits (ai-eeo-guess); low-conf/decline → neutral (eeo_declined)", async () => {
@@ -1043,14 +1046,61 @@ test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays determi
   assert.strictEqual(out.results[0].status, "skipped", "stays the deterministic skipped (no mapping)");
 });
 
-test("EEO retraction: an UNMAPPED OPTIONAL EEO dropdown IS now AI-inferred (the 'never touch EEO' rule was removed) → ai-eeo-guess", async () => {
-  // aiDd's fieldName "screen_q" is unmapped; the gender LABEL makes it EEO. Previously skipped (no LLM);
-  // now the generic inference fills it and re-tags the demographic badge.
+test("optional gate: an UNMAPPED OPTIONAL EEO dropdown gets NO AI — left blank, no LLM ('blank optional EEO too')", async () => {
+  // aiDd's fieldName "screen_q" is unmapped; the gender LABEL makes it EEO. Optional + EEO → still
+  // NO AI (the optional rule is uniform, including EEO): deterministic skip, blank, no LLM call.
   const act = makeFakeAct([aiDd({ label: "What is your gender?", isRequired: false })], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.ok(act.log.some(([m]) => m === "llm"), "EEO is no longer excluded from inference");
-  assert.strictEqual(rec.status, "filled_review");
-  assert.strictEqual(rec.flag, "ai-eeo-guess", "demographic verify badge kept");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "optional EEO → never consults the LLM");
+  assert.strictEqual(rec.status, "skipped");
+  assert.strictEqual(rec.after, null);
+});
+
+test("optional gate (regression): REQUIRED unmapped fields still AI-fill; OPTIONAL ones never call the LLM (text + dropdown)", async () => {
+  // REQUIRED unmapped text → AI generates (filled_review / ai-text).
+  const reqT = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: '{"answer":"I admire the robotics mission."}' });
+  const reqTRec = (await drivePageFill(reqT, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(reqTRec.status, "filled_review"); assert.strictEqual(reqTRec.flag, "ai-text");
+  // REQUIRED unmapped dropdown → AI chooses (filled_review, LLM consulted).
+  const reqD = makeFakeAct([aiDd({ isRequired: true })], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const reqDRec = (await drivePageFill(reqD, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(reqD.log.some(([m]) => m === "llm")); assert.strictEqual(reqDRec.status, "filled_review");
+  // OPTIONAL unmapped TEXT — the cascade-revealed Local-Name regression (firstNameLocal) → NO AI, blank.
+  const optT = makeFakeAct([aiText({ fieldName: "legalName--firstNameLocal", label: "Cyrillic Given Name", isRequired: false })], { aiEnabled: true, ai: '{"answer":"Kevin"}' });
+  const optTRec = (await drivePageFill(optT, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!optT.log.some(([m]) => m === "llm"), "optional revealed Local-name text → no LLM (the firstNameLocal regression)");
+  assert.strictEqual(optTRec.status, "skipped"); assert.strictEqual(optTRec.after, null);
+  // OPTIONAL unmapped dropdown → NO AI, blank.
+  const optD = makeFakeAct([aiDd({ isRequired: false })], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const optDRec = (await drivePageFill(optD, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!optD.log.some(([m]) => m === "llm"), "optional dropdown → no LLM");
+  assert.strictEqual(optDRec.status, "skipped"); assert.strictEqual(optDRec.after, null);
+});
+
+test("cascade-removed: a field DELETED from the DOM after fills → status 'removed', dropped from the bundle / counts / review", async () => {
+  // countryRegion ("State") fails — its trigger was deleted by an earlier value (Country=Afghanistan);
+  // neverRenders models the gone trigger → needs_review "options did not render". The post-fill rescan
+  // no longer lists countryRegion → reclassify "removed" so it leaves the summary entirely (not an error).
+  const fields = [
+    { wrapperSel: "[w-city]", fieldName: "city", widgetType: "text", label: "City", value: "" },
+    ddField({ wrapperSel: "[w-state]", fieldName: "countryRegion", label: "State", neverRenders: true })
+  ];
+  const act = makeFakeAct(fields, {});
+  const baseScan = act.scanPage;
+  let n = 0;
+  act.scanPage = async () => {
+    n++; // call 1 = the up-front scan (countryRegion present); later scans omit it (it was deleted)
+    if (n >= 2) return { url: "fake://page", repeatingFieldCount: 0, fields: fields.filter((f) => f.fieldName !== "countryRegion").map((f) => ({ wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType, label: f.label || f.fieldName, isRequired: !!f.isRequired })) };
+    return baseScan();
+  };
+  const out = await drivePageFill(act, { personal_info: { city: "Tallahassee", state_province: ["California"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "countryRegion");
+  assert.strictEqual(rec.status, "removed", "DOM-absent failed field → removed (deleted by a cascade)");
+  assert.strictEqual(rec.flag, "cascade-removed");
+  assert.ok(!out.needsReview.some((r) => r.fieldName === "countryRegion"), "removed field is NOT in needs-review");
+  const bundle = buildReviewBundle(out.results, { page: "p1" });
+  assert.ok(!bundle.entries.some((e) => /countryRegion/.test(e.field_id || "")), "removed field is excluded from the bundle");
+  assert.ok(bundle.entries.some((e) => /city/.test(e.field_id || "")), "a present field stays in the bundle (sanity)");
 });
 
 test("AI INVARIANT: prev-worker / file_upload / radio never AI-eligible; dropdown + text/textarea ARE — and EEO is NOW eligible (rule retracted)", () => {
