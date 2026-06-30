@@ -175,6 +175,19 @@ extension's discipline.
 - **M6 — AI config + job context** *(done)*: `/app/ai` — provider/model (from `LLM_MODELS`, default `gemini-3.1-flash-lite`)/key/enable toggle + server-side **Test connection** (`testLlm` round-trips a trivial prompt); saved to `profiles.ai_config`. `/app/job` — target company → `profiles.job_context_json`. Type-check + render verified.
 - **M7 — Extension wiring** *(done)*: `manifest.json` gained `externally_connectable.matches` (`http://localhost/*`, `127.0.0.1`) + `http://localhost/*` host permission; `background.js` gained the `onMessageExternal` handler (`AP_PING`/`AP_SYNC_PROFILE`/`AP_SET_LLM`/`AP_SET_SESSION`/`AP_SYNC_RESUME`) writing the same `chrome.storage.local`/IndexedDB slots the popup seeds. Website: `lib/extension.ts` client bridge (`pingExtension`/`sendToExtension`, graceful when `chrome.runtime` absent), `getSyncBundle` server action (profile+defaults+jobContext+llmConfig+resume base64 + a freshly-minted ingest key), `/app/connect` (paste ID → check → sync, per-step status), and `POST /api/extension/report` (validates the ingest key via `api_keys`, inserts an `applications` row — the P2 tracker path, ready). Extension suite **325/325 green**; web production build green; bridge graceful-path verified. **Live website↔extension round-trip is the user's step** (load unpacked extension → copy ID → Sync) — needs the extension in the same Chrome profile.
 
+## Design directions (under review)
+
+Three landing-page directions to choose from at **`/designs`** (a switcher flips between them).
+The winner's design system propagates to the whole app.
+- **Flight deck** (`/designs/flight-deck`) — the current dark/amber instrument-panel identity.
+- **Spec sheet** (`/designs/spec-sheet`) — light editorial-precision; cool paper, Archivo display,
+  hairline rules, indigo accent, a "Fig. 1" datasheet figure.
+- **Console** (`/designs/console`) — minimal monospace; near-black, JetBrains Mono, monochrome with
+  status-color accents, a live terminal fill-session hero.
+
+Landing components live in `web/components/landings/`; routes under `web/app/designs/`. Each new
+direction is self-contained (literal hex + its own font) so it doesn't touch the flight-deck tokens.
+
 ## How to run (filled in as it's built)
 
 ```

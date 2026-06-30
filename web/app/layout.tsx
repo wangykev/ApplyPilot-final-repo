@@ -1,6 +1,26 @@
 import type { Metadata } from "next";
-import { Space_Grotesk, IBM_Plex_Sans, IBM_Plex_Mono } from "next/font/google";
+import {
+  Space_Grotesk,
+  IBM_Plex_Sans,
+  IBM_Plex_Mono,
+  Archivo,
+  JetBrains_Mono,
+} from "next/font/google";
 import "./globals.css";
+
+// Extra families used only by the alternate design directions under /designs.
+const archivo = Archivo({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700", "800"],
+  variable: "--font-archivo",
+  display: "swap",
+});
+const jbMono = JetBrains_Mono({
+  subsets: ["latin"],
+  weight: ["400", "500", "700"],
+  variable: "--font-jb-mono",
+  display: "swap",
+});
 
 const display = Space_Grotesk({
   subsets: ["latin"],
@@ -36,7 +56,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${display.variable} ${sans.variable} ${mono.variable}`}
+      className={`${display.variable} ${sans.variable} ${mono.variable} ${archivo.variable} ${jbMono.variable}`}
     >
       <body>{children}</body>
     </html>
