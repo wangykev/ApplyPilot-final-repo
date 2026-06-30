@@ -341,6 +341,8 @@ const FIELD_MAP = {
   "legalName--firstName": "personal_info.first_name",
   "legalName--lastName": "personal_info.last_name",
   "preferredCheck": "personal_info.has_preferred_name", // "I have a preferred name" checkbox — true CHECKS it (reveals the preferred first/last fields, a cascade)
+  "preferredName--firstName": "personal_info.preferred_first_name", // revealed by preferredCheck; cascade re-scan fills it
+  "preferredName--lastName": "personal_info.preferred_last_name",   // revealed by preferredCheck
   "addressLine1": "personal_info.address_line_1",
   "city": "personal_info.city",
   "postalCode": "personal_info.postal_code",

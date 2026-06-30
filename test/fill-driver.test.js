@@ -1001,6 +1001,20 @@ test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it (revea
   assert.strictEqual(offF.checked, false, "mapped + false → box unchecked");
 });
 
+test("FIELD_MAP: revealed preferred-name fields fill DETERMINISTICALLY from the profile (mapped → no AI even though optional)", async () => {
+  const fields = [
+    { wrapperSel: "[w-pfn]", fieldName: "preferredName--firstName", widgetType: "text", isRequired: false, label: "Preferred First Name", value: "" },
+    { wrapperSel: "[w-pln]", fieldName: "preferredName--lastName", widgetType: "text", isRequired: false, label: "Preferred Last Name", value: "" }
+  ];
+  const act = makeFakeAct(fields, { aiEnabled: true, ai: '{"answer":"SHOULD NOT BE USED"}' });
+  const out = await drivePageFill(act, { personal_info: { preferred_first_name: "John", preferred_last_name: "Doe" } }, {}, {}, T_BUDGETS);
+  const fn = out.results.find((r) => r.fieldName === "preferredName--firstName");
+  const ln = out.results.find((r) => r.fieldName === "preferredName--lastName");
+  assert.strictEqual(fn.status, "filled"); assert.strictEqual(fn.after, "John");
+  assert.strictEqual(ln.status, "filled"); assert.strictEqual(ln.after, "Doe");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "a MAPPED optional field fills deterministically — the optional gate only blocks AI for UNMAPPED fields");
+});
+
 test("AI-3 CANONICALIZATION: stated 'Male' vs a form's odd vocab → AI maps the KNOWN value (filled_review/ai-canonicalized)", async () => {
   const act = makeFakeAct([genderField({ options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }, { text: "Nonbinary" }] })], { aiEnabled: true, ai: '{"choice":"Man","confidence":"High"}' });
   const rec = (await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS)).results[0];
