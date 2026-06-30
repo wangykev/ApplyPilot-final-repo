@@ -191,6 +191,7 @@ function buildEditor(entry) {
     return { node: wrap, set: (v) => { inp.value = v == null ? "" : String(v); } };
   };
   if (wt === "file_upload") return null;
+  if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
   // TREE-AI (cert): the recon captured the chosen category's leaves → a searchable editor over them
   // (partial — only that category, not the whole tree). Checked before widget_type (cert is mis-tagged typeahead).
   if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) return Object.assign(combobox(entry.tree_structure.leaves), { partial: true });

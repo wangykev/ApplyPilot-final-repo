@@ -2580,7 +2580,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const finalize = (url) => {
     const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
     const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
-    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section").length;
+    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub").length;
     return { url, repeatingFieldCount, results, counts, needsReview };
   };
 
@@ -2623,7 +2623,21 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   }
 
   if (N === 0) {
-    results.push(sectionRec("", name, "skipped", "no meaningful " + name + " entries to fill"));
+    // SECTION STUB (Feature A) — drivePageFill only drives a section that's PRESENT on the page, so
+    // reaching N===0 means the section is on the form but had no profile data → it stays EMPTY.
+    // Emit a `section_stub` (a non-fillable category card) so the empty section SURFACES in review
+    // (the operator can SEE it + — 2b — add an entry), instead of being silently dropped. The
+    // "section_stub" widgetType PASSES buildReviewBundle's section filter (it drops only "section"
+    // ops); canonical "<name>._stub" groups it under its section in the viewer; flag "section-stub"
+    // → a gentle needs_review via deriveReview. (Page-engine twin is a deferred follow-on — CDP-first.)
+    const humanName = name.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+    results.push({
+      fieldName: name, label: humanName + " — section present, no entries",
+      widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
+      rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+      flag: "section-stub", verified: null, after: null,
+      detail: "no meaningful " + name + " entries to fill — the section is on the form but empty"
+    });
     return finalize(url);
   }
 
@@ -3046,6 +3060,10 @@ function buildReviewBundle(results, meta) {
     return { confidence: band, confidence_source: source };
   };
   const deriveReview = (rec) => {
+    // SECTION STUB (Feature A): a present-but-empty repeating section → a gentle review item so the
+    // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
+    // "skipped", which would otherwise early-return needs_review:false).
+    if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
     const required = !!rec.isRequired;
     const flaggedBase = rec.status === "needs_review" || rec.status === "filled_review" || rec.status === "error";
     const escalated = rec.status === "skipped" && required;
