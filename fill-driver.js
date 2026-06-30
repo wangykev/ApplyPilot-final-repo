@@ -942,17 +942,31 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const pre = await act.readDropdownState(loc);
   const before = pre ? pre.triggerText : null;
 
-  // KEEP guard (M27 Commit C): if the trigger already shows a value that
-  // EXACT-matches a candidate, keep it with ZERO actuation — skip re-opening a
-  // cold 200+ option list. Symmetry with the typeahead/source pre-filled KEEP;
-  // exact-only (a containment/fuzzy trigger still goes through the verified
-  // re-select), and the "Select One" placeholder matches nothing so empty
-  // dropdowns fall through to the normal fill.
+  // TIER-AWARE KEEP guard (M36.1 parity for dropdowns — was priority-BLIND in M27.C,
+  // which kept the pre-fill if it matched ANY candidate, so a LOWER-tier pre-fill blocked
+  // the higher-priority choice; e.g. country ["Afghanistan","United States of America",
+  // "United States"] left on "United States of America" was kept instead of upgrading to
+  // tier-0 "Afghanistan"). Compute which TIER the pre-fill exact-matches (candidates are
+  // most-specific first):
+  //   preTierIndex === 0  → the dropdown already shows the TOP candidate → KEEP, ZERO
+  //                         actuation (the common case — preserves the M27.C win of never
+  //                         re-opening a cold 200+ list when nothing better is wanted).
+  //   preTierIndex  >  0  → the form shows a lower-priority value than the profile prefers
+  //                         → open + overwrite to the HIGHEST higher-priority tier the
+  //                         dropdown offers (candidates.slice(0, preTierIndex)); if none is
+  //                         offered, the pre-fill is the best available → keep it (the
+  //                         no-match branch below). Re-opens the cold list ONLY when an
+  //                         actual priority upgrade is possible.
+  //   preTierIndex === -1 → no exact match (incl. the "Select One" placeholder) → walk the
+  //                         FULL candidate list, as before.
+  let overwriteCandidates = candidates;
+  let preTierIndex = -1;
   if (before) {
-    const k = apMatch.matchCandidates(candidates, [before]);
-    if (k.targetIndex !== -1 && k.matchTier === "exact-normalized") {
-      return { status: "filled", after: before, verified: true, matchTier: "pre-filled", flag: "dropdown-prefilled-kept", confidence: "high", detail: "dropdown already shows a matching value — kept (no actuation)" };
+    preTierIndex = candidates.findIndex((c) => norm(c) === norm(before));
+    if (preTierIndex === 0) {
+      return { status: "filled", after: before, verified: true, matchTier: "pre-filled", flag: "dropdown-prefilled-kept", confidence: "high", detail: "dropdown already shows the top candidate — kept (no actuation)" };
     }
+    if (preTierIndex > 0) overwriteCandidates = candidates.slice(0, preTierIndex); // upgrade target = strictly higher-priority tiers only
   }
 
   // Open with a bounded, aria-expanded-GATED retry (M29 "retry the actuation until
@@ -1005,9 +1019,17 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   }
 
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
-  const m = apMatch.matchCandidates(candidates, enabledTexts);
+  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts);
   if (m.targetIndex === -1) {
     await act.pressEscape();
+    // Overwrite-upgrade miss (preTierIndex>0): we opened to upgrade a lower-tier pre-fill,
+    // but the dropdown offers NONE of the higher-priority tiers → the pre-fill IS the best
+    // the form has → KEEP it (filled, not needs_review — it's a valid lower-tier candidate).
+    // Escape only closed the listbox; the selection is unchanged, so `before` still holds.
+    // (Typeahead parity: prefilled-better-tier-unavailable.)
+    if (preTierIndex > 0) {
+      return { status: "filled", after: before, verified: true, matchTier: "pre-filled", flag: "dropdown-prefilled-better-tier-unavailable", confidence: "high", detail: `kept pre-fill "${before}" — no higher-priority tier offered by the dropdown`, options: enabledTexts };
+    }
     // GENUINE no-match: the option list RENDERED but no candidate is among it — i.e. this
     // value isn't offered (the only delete-worthy case for deleteOnNoMatch, M38 Bug B1).
     // The other needs_review/error returns (options-didn't-render / couldn't-open /
@@ -1079,7 +1101,9 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     if (re && re.optionCount > 0) res = await commitByClick();
   }
   if (res.ok) {
-    return { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };
+    const out = { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };
+    if (preTierIndex > 0) { out.flag = "dropdown-overwrite-success"; out.detail = `overwrote pre-fill "${before}" → "${res.after}" (higher-priority tier); text-click-commit${idxCanary}`; }
+    return out;
   }
   await act.pressEscape();
   return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")`, after: res.after, options: enabledTexts, matchTier: m.matchTier };

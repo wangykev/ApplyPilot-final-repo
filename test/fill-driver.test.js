@@ -695,6 +695,43 @@ test("dropdown: trigger already matches a candidate → filled / dropdown-prefil
   assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a matching dropdown is not re-opened");
 });
 
+// ── dropdown TIER-AWARE pre-filled guard (M36.1 parity; the priority-blind bug) ──
+// Reported: country ["Afghanistan","United States of America","United States"] (tier 0 first)
+// left on tier-1 "United States of America" was KEPT instead of upgrading to tier-0.
+
+test("dropdown TIER-AWARE: a tier>0 pre-fill is OVERWRITTEN to the highest tier the form offers", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }, { text: "United States" }];
+  const act = makeFakeAct([ddField({ triggerText: "United States of America", options: opts })]);
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America", "United States"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Afghanistan", "upgraded to the tier-0 candidate (the reported bug)");
+  assert.strictEqual(rec.flag, "dropdown-overwrite-success");
+  assert.ok(act.log.some(([m]) => m === "openDropdown"), "must open to overwrite");
+  assert.ok(act.log.some(([m]) => m === "clickDropdownOptionByText"), "committed the higher tier by text-click");
+});
+
+test("dropdown TIER-AWARE: a tier>0 pre-fill with NO higher tier offered is KEPT (better-tier-unavailable)", async () => {
+  // tier-0 "Afghanistan" is NOT among the offered options (DD_OPTIONS: Canada/US of A/Uruguay)
+  // → the pre-fill is the best the form has → keep it, do NOT downgrade to needs_review.
+  const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "United States of America", "kept — best available tier");
+  assert.strictEqual(rec.flag, "dropdown-prefilled-better-tier-unavailable");
+  assert.ok(act.log.some(([m]) => m === "openDropdown"), "opened to check for a higher tier");
+});
+
+test("dropdown TIER-AWARE: a tier-0 pre-fill is KEPT with ZERO actuation (no re-open)", async () => {
+  const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
+  const out = await drivePageFill(act, { personal_info: { country: ["United States of America", "United States", "Canada"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "dropdown-prefilled-kept");
+  assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a tier-0 pre-fill must never re-open the list");
+});
+
 test("dropdown: 'Select One' placeholder does NOT trigger keep — falls through to the verified fill", async () => {
   const act = makeFakeAct([ddField()]); // default triggerText "Select One"
   const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
