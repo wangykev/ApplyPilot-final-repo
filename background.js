@@ -4737,6 +4737,7 @@ async function fillEngine(profile, defaults, jobContext) {
   const FIELD_MAP = {
     "legalName--firstName": "personal_info.first_name",
     "legalName--lastName": "personal_info.last_name",
+    "preferredCheck": "personal_info.has_preferred_name", // "I have a preferred name" checkbox — true CHECKS it (reveals the preferred first/last fields, a cascade)
     "addressLine1": "personal_info.address_line_1",
     "city": "personal_info.city",
     "postalCode": "personal_info.postal_code",

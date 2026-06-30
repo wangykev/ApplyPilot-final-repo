@@ -988,6 +988,19 @@ test("AI-3: a REQUIRED consent AUTO-CHECKS silently (filled, NOT flagged) even w
   assert.ok(!a1.log.concat(a2.log).some(([m]) => m === "llm"), "consents never involve the LLM");
 });
 
+test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it (reveals the preferred-name fields); false leaves it unchecked", async () => {
+  const prefField = (flags) => Object.assign({ wrapperSel: "[w-pref]", fieldName: "preferredCheck", widgetType: "checkbox", isRequired: false, label: "I have a preferred name", inputId: "pc-1" }, flags || {});
+  // has_preferred_name:true → the optional checkbox reconciles to CHECKED (which reveals the preferred first/last fields on the live page → the cascade re-scan then fills them once mapped).
+  const onF = prefField({ checked: false });
+  const onRec = (await drivePageFill(makeFakeAct([onF]), { personal_info: { has_preferred_name: true } }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(onRec.status, "filled");
+  assert.strictEqual(onF.checked, true, "mapped + true → box checked");
+  // has_preferred_name:false → reconciles to UNCHECKED (no reveal). Mapped, so not 'skipped: no mapping' anymore.
+  const offF = prefField({ checked: true });
+  await drivePageFill(makeFakeAct([offF]), { personal_info: { has_preferred_name: false } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(offF.checked, false, "mapped + false → box unchecked");
+});
+
 test("AI-3 CANONICALIZATION: stated 'Male' vs a form's odd vocab → AI maps the KNOWN value (filled_review/ai-canonicalized)", async () => {
   const act = makeFakeAct([genderField({ options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }, { text: "Nonbinary" }] })], { aiEnabled: true, ai: '{"choice":"Man","confidence":"High"}' });
   const rec = (await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS)).results[0];
@@ -1201,8 +1214,10 @@ test("checkbox: reconciles false→true and true→false, verified by checked re
   assert.strictEqual(recOff.after, "false");
 });
 
-test("checkbox: unmapped (preferredCheck) → skipped with zero actuation", async () => {
-  const act = makeFakeAct([{ wrapperSel: "[w-pref]", fieldName: "preferredCheck", widgetType: "checkbox", label: "I have a preferred name", inputId: "p-1", checked: false }]);
+test("checkbox: an UNMAPPED optional checkbox → skipped with zero actuation", async () => {
+  // (preferredCheck is now MAPPED to has_preferred_name — see the FIELD_MAP test above; this
+  // pins the unmapped-optional-checkbox behavior with a still-unmapped field.)
+  const act = makeFakeAct([{ wrapperSel: "[w-opt]", fieldName: "marketingOptIn", widgetType: "checkbox", label: "Send me updates", inputId: "m-1", checked: false }]);
   const out = await drivePageFill(act, nameProfile, {}, {}, T_BUDGETS);
   assert.strictEqual(out.results[0].status, "skipped");
   assert.strictEqual(out.results[0].detail, "no mapping");
