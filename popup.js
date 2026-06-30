@@ -305,9 +305,11 @@ document.getElementById("cdp-generic-section-recon").addEventListener("click", (
     } else if (resp.ok === false) {
       setStatus("Generic-section recon failed: " + resp.error + " — see the service worker console.");
     } else {
-      const bases = (resp.scan && resp.scan.detectedBases) || [];
-      const extra = (resp.parity && resp.parity.unknownBases) || [];
-      setStatus(`Generic recon done — detected: ${bases.join(", ") || "none"}${extra.length ? "; NEW/unmapped: " + extra.join(", ") : "; all known"}. Paste the [GENERIC-SECTIONS] summary from the SW console.`);
+      const p = resp.parity || {};
+      const mounted = (p.mountedKnown || []).join(", ") || "none";
+      const unmounted = (p.unmountedKnown || []).join(", ") || "none";
+      const novel = (p.unknownMountedBases || []).concat(p.unknownUnmountedHeadings || []);
+      setStatus(`Generic recon done — mounted: ${mounted}; present-but-unmounted: ${unmounted}${novel.length ? "; NEW/unmapped: " + novel.join(", ") : "; no unknown sections"}. Paste the [GENERIC-SECTIONS] summary from the SW console.`);
     }
   });
 });
