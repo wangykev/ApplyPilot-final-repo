@@ -2226,6 +2226,34 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
   }
 
+  // m3a: surface UNKNOWN repeating sections (present on the form but NOT in PAGE_SECTIONS) as review
+  // STUBS carrying the backend identifier (container_prefix + heading + the detected field shape when
+  // it has entries), so ANY repeating section shows up in review + is fillable via add-entry. The bot
+  // has NO mapping to auto-fill an unknown section, so it NEVER actuates one here (no value fill, no
+  // add/delete) — the stub is needs_review and the values are the operator's (or a future fill-back
+  // session's, which reads container_prefix/the field automation-ids). An EMPTY unknown section shows
+  // its identifier; its fields are TBD until an entry exists (m3b reveal-by-add). Skipped under `only`.
+  if (!only && rscan && rscan.sections) {
+    const knownPrefixes = new Set(PAGE_SECTIONS.map((s) => s.containerPrefix));
+    for (const prefix of Object.keys(rscan.sections)) {
+      if (knownPrefixes.has(prefix)) continue; // a known section — handled by the loop above
+      const sec = rscan.sections[prefix];
+      const base = prefix.replace(/-$/, "");
+      const human = base.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+      const entryFields = (sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
+      const n = (sec.entries || []).length;
+      results.push({
+        fieldName: base, label: (sec.heading || human) + " — section present (unmapped)",
+        widgetType: "section_stub", isRequired: false, mappedPath: base + "._stub",
+        rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+        flag: "section-stub", verified: null, after: null,
+        detail: "unmapped repeating section detected on the form (" + n + " entr" + (n === 1 ? "y" : "ies") + ") — the bot has no mapping to auto-fill it; add/fill entries here",
+        section_field_shape: entryFields.map((f) => ({ recName: f.fieldName, widget_type: f.widgetType, path: f.fieldName, label: f.label, is_required: f.isRequired })),
+        container_prefix: prefix, section_heading: sec.heading || null, section_known: false
+      });
+    }
+  }
+
   // 2c: capture the DETECTED field shape (LIVE form, not the hardcoded *_MAP) for each present+
   // mounted section → the review's add-entry builds new entries from DOM-detected fields, and the
   // bundle CACHES the shapes (so a section EMPTY on a later run still adds from a detected shape).
@@ -2687,7 +2715,8 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       // mounted entry → the viewer's editors degrade to text boxes (the form stays source of truth).
       section_field_shape: (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({
         recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path
-      }))
+      })),
+      container_prefix: containerPrefix, section_known: true // m3a: uniform backend identifier
     });
     return finalize(url);
   }
@@ -3179,11 +3208,17 @@ function summarizeEntries(entries) {
 function detectSectionShapes(scan) {
   const shapes = {};
   if (!scan || !scan.sections) return shapes;
-  for (const sec of PAGE_SECTIONS) {
-    const s = scan.sections[sec.containerPrefix];
+  // m3a: iterate EVERY section the scan found (known + unknown), not just PAGE_SECTIONS. Key by the
+  // registry name for a known section, else the discovered base (= the viewer's section key for an
+  // unknown section). A present-but-empty section has no entry to read → no shape (m3b reveal-by-add).
+  const knownByPrefix = {};
+  for (const sec of PAGE_SECTIONS) knownByPrefix[sec.containerPrefix] = sec.name;
+  for (const prefix of Object.keys(scan.sections)) {
+    const s = scan.sections[prefix];
     const fields = s && Array.isArray(s.entries) && s.entries[0] && Array.isArray(s.entries[0].fields) ? s.entries[0].fields : null;
     if (!fields || !fields.length) continue;
-    shapes[sec.name] = fields.map((f) => ({
+    const name = knownByPrefix[prefix] || prefix.replace(/-$/, "");
+    shapes[name] = fields.map((f) => ({
       recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType,
       label: f.label != null ? f.label : f.fieldName, is_required: !!f.isRequired
     }));
@@ -3291,6 +3326,9 @@ function buildReviewBundle(results, meta) {
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
+      container_prefix: rec.container_prefix != null ? rec.container_prefix : null, // m3a: backend identifier (fkit prefix) for a future fill-back session
+      section_heading: rec.section_heading != null ? rec.section_heading : null,    // m3a: section heading / Add anchor
+      section_known: rec.section_known != null ? !!rec.section_known : null,        // m3a: false = unmapped/unknown section
       character_count: null
     };
   });

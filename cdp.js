@@ -381,9 +381,18 @@ function cdpPageScan() {
     if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
     return false;
   };
-  const isRepeating = (w) => !!(w.closest('[data-fkit-id^="workExperience-"]') || w.closest('[data-fkit-id^="education-"]')
-    || w.closest('[data-fkit-id^="webAddress-"]') || w.closest('[data-fkit-id^="language-"]')
-    || w.closest('[data-fkit-id^="certification-"]'));
+  // m3a: a field is "repeating" if ANY ancestor data-fkit-id is an INDEXED entry (or its
+  // sub-wrapper) — the "-<digits>--" infix. Generic (was a hardcoded 5-prefix list) so an UNKNOWN
+  // repeating section's fields don't leak into the flat scan; still flat for "phoneNumber--null"
+  // (no -<digits>-- infix). LOCKSTEP idea with lib.js parseRepeatingFkit.
+  const isRepeating = (w) => {
+    let el = w.closest("[data-fkit-id]");
+    while (el) {
+      if (/-\d+--/.test(el.getAttribute("data-fkit-id") || "")) return true;
+      el = el.parentElement ? el.parentElement.closest("[data-fkit-id]") : null;
+    }
+    return false;
+  };
   const all = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
   const wrappers = all.filter((w) => !isRepeating(w));
   return {
@@ -535,13 +544,22 @@ function cdpRepeatingScan() {
     }
     return null;
   };
-  const PREFIXES = ["workExperience-", "education-", "webAddress-", "language-", "certification-"];
+  // m3a: DISCOVER the repeating-section prefixes from the indexed entry containers (was a hardcoded
+  // 5-prefix list) → ANY repeating section is detected, known or not. "<base>-<N>--null" → prefix
+  // "<base>-"; the -<digits>--null anchor excludes the date sub-wrappers AND non-section
+  // "<name>--null" (e.g. phoneNumber--null). LOCKSTEP regex with lib.js parseRepeatingFkit.
+  const PREFIXES = Array.from(new Set(
+    Array.from(document.querySelectorAll('[data-fkit-id$="--null"]'))
+      .map((e) => { const m = /^(.+?)-(\d+)--null$/.exec(e.getAttribute("data-fkit-id") || ""); return m ? m[1] + "-" : null; })
+      .filter(Boolean)
+  ));
   const sections = {};
   for (const prefix of PREFIXES) {
     const entries = Array.from(document.querySelectorAll('[data-fkit-id^="' + prefix + '"][data-fkit-id$="--null"]'));
     if (!entries.length) continue;
     sections[prefix] = {
       entryCount: entries.length,
+      heading: nearestHeading(entries[0]), // m3a: per-section heading (backend identifier + Add anchor)
       entries: entries.map((e) => {
         const fkit = e.getAttribute("data-fkit-id");
         // "Delete" button: climb up to 6 ancestors, find a <button> whose text is "Delete".

@@ -104,6 +104,7 @@ function makeFakeAct(fields, opts) {
         label: f.label || f.fieldName, isRequired: !!f.isRequired
       }))
     }),
+    repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
 
     // text
     readTextValue: async (loc) => {
@@ -2751,6 +2752,52 @@ test("buildReviewBundle carries section_shapes onto the bundle (2c); defaults to
   const shapes = { website: [{ recName: "url", path: "url", widget_type: "text", label: "URL", is_required: true }] };
   assert.deepStrictEqual(buildReviewBundle([], { page: "p2", sectionShapes: shapes }).section_shapes, shapes);
   assert.deepStrictEqual(buildReviewBundle([], { page: "p2" }).section_shapes, {});
+});
+
+// ── m3a: generic detection of UNKNOWN repeating sections ──
+test("detectSectionShapes: an UNKNOWN section is captured, keyed by its base (m3a)", () => {
+  const scan = { sections: {
+    "publication-": { entries: [{ fields: [
+      { fieldName: "title", widgetType: "text", label: "Title*", isRequired: true },
+      { fieldName: "journal", widgetType: "text", label: "Journal", isRequired: false },
+    ] }] },
+  } };
+  const shapes = detectSectionShapes(scan);
+  assert.ok(shapes.publication, "keyed by the discovered base (no PAGE_SECTIONS entry)");
+  assert.strictEqual(shapes.publication.length, 2);
+  assert.strictEqual(shapes.publication[0].recName, "title"); // recName = DOM automation-id suffix
+});
+
+test("buildReviewBundle carries the backend identifier (container_prefix/heading/known) for a section_stub (m3a)", () => {
+  const recs = [{ fieldName: "publication", label: "Publications — section present (unmapped)",
+    widgetType: "section_stub", isRequired: false, mappedPath: "publication._stub",
+    status: "skipped", flag: "section-stub", after: null, detail: "unmapped section",
+    section_field_shape: [{ recName: "title", widget_type: "text", path: "title" }],
+    container_prefix: "publication-", section_heading: "Publications", section_known: false }];
+  const e = buildReviewBundle(recs, { page: "p2" }).entries[0];
+  assert.strictEqual(e.container_prefix, "publication-");
+  assert.strictEqual(e.section_heading, "Publications");
+  assert.strictEqual(e.section_known, false);
+  assert.strictEqual(e.widget_type, "section_stub");
+});
+
+test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the backend identifier (m3a)", async () => {
+  const rscan = { url: "fake://p2", addButtons: [], sections: {
+    "publication-": { entryCount: 1, heading: "Publications", entries: [{ fields: [
+      { fieldName: "title", widgetType: "text", label: "Title*", isRequired: true },
+      { fieldName: "year", widgetType: "text", label: "Year", isRequired: false },
+    ] }] },
+  } };
+  const out = await drivePageFill(makeFakeAct([], { rscan }), {}, {}, {}, T_BUDGETS);
+  const stub = out.results.find((r) => r.fieldName === "publication");
+  assert.ok(stub, "an unknown section is surfaced");
+  assert.strictEqual(stub.widgetType, "section_stub");
+  assert.strictEqual(stub.flag, "section-stub");
+  assert.strictEqual(stub.container_prefix, "publication-"); // backend identifier for a future fill-back
+  assert.strictEqual(stub.section_known, false);
+  assert.strictEqual(stub.section_field_shape.length, 2);    // detected field shape (it has entries)
+  // and the detected shape is cached on the returned bundle shapes (add-entry uses it)
+  assert.ok(out.sectionShapes.publication && out.sectionShapes.publication.length === 2);
 });
 
 test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {
