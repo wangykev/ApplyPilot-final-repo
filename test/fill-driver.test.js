@@ -2688,7 +2688,7 @@ test("repeating fill: each entry gets ITS OWN url (routing; live proves uniquene
   assert.ok(urls.every((r) => r.status === "filled" && r.verified === true));
 });
 
-test("repeating N===0: deletes phantom entries, records a single skipped section", async () => {
+test("repeating N===0: deletes phantom entries, records a section STUB (Feature A)", async () => {
   const state = webState({ entries: [webEntry("webAddress-1--null"), webEntry("webAddress-2--null")] });
   const { out, state: s } = await runWeb(state, []);
   assert.strictEqual(s.entries.length, 0);
@@ -2696,7 +2696,28 @@ test("repeating N===0: deletes phantom entries, records a single skipped section
   const skip = out.results.find((r) => r.fieldName === "website");
   assert.strictEqual(skip.status, "skipped");
   assert.match(skip.detail, /no meaningful website entries/);
+  // Feature A: a present-but-empty section is now a section_stub (surfaces in review), not a
+  // silently-filtered "section" op. canonical "<name>._stub" groups it under its section.
+  assert.strictEqual(skip.widgetType, "section_stub");
+  assert.strictEqual(skip.flag, "section-stub");
+  assert.strictEqual(skip.mappedPath, "website._stub");
   assert.ok(!out.results.some((r) => /\.url$/.test(r.fieldName)));
+});
+
+test("section_stub flows through buildReviewBundle as a needs_review category (Feature A)", () => {
+  const recs = [{ fieldName: "certification", label: "Certification — section present, no entries",
+    widgetType: "section_stub", isRequired: false, mappedPath: "certification._stub",
+    status: "skipped", flag: "section-stub", after: null,
+    detail: "no meaningful certification entries to fill — the section is on the form but empty" }];
+  const bundle = buildReviewBundle(recs, { page: "p1" });
+  assert.strictEqual(bundle.entries.length, 1); // KEPT (unlike the .add/.delete "section" ops, which are filtered)
+  const e = bundle.entries[0];
+  assert.strictEqual(e.widget_type, "section_stub");
+  assert.strictEqual(e.canonical_field, "certification._stub");
+  assert.strictEqual(e.needs_review, true);
+  assert.strictEqual(e.needs_review_reason, "section_unfilled");
+  assert.strictEqual(e.fill_status, "skipped");
+  assert.strictEqual(e.current_value, null);
 });
 
 // M36 — the M32b "date is DEFERRED / zero-actuation" invariant is INVERTED: the date branch

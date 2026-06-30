@@ -42,6 +42,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // probe failure is a STOP-and-surface known-blocker, not a quiet fallback).
   // Run on My Experience (page 2); MINIMIZE within 60s (the date probe actuates).
   // [REPEAT-RECON] in the SW console. No profile needed.
+  // GENERIC-SECTION RECON (Sections milestone 1): READ-ONLY proof that enumerate-and-group on
+  // data-fkit-id detects the right repeating sections (no live fill-path change, no actuation →
+  // runs VISIBLE, no minimize). [GENERIC-SECTIONS] in the SW console.
+  if (message.type === "RUN_CDP_GENERIC_SECTION_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpGenericSectionRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   if (message.type === "RUN_CDP_REPEAT_RECON") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
@@ -1630,6 +1643,74 @@ async function runCdpQuestionsRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("questions recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// GENERIC-DETECTION RECON (Sections milestone 1) — READ-ONLY. Attaches, runs cdpGenericRepeatingScan
+// (enumerate-and-group on data-fkit-id, NO actuation, tab can stay visible), logs a parity report vs
+// the hardcoded catalog + the false-positive-guard evidence + per-section "required" signals, detaches.
+// This does NOT touch the live fill path (cdpRepeatingScan/drivePageFill are unchanged) — it's the
+// before-we-generalize verification step. Run on My Experience (page 2) or any repeating-section page.
+async function runCdpGenericSectionRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][GENERIC-SECTIONS]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached (READ-ONLY scan — no actuation, tab can stay VISIBLE). Scanning…");
+    const scan = await cdpEval(cdpGenericRepeatingScan);
+    if (!scan) { LOG("scan failed (no result)."); return { ok: false, error: "scan-failed" }; }
+    LOG("url:", scan.url);
+    LOG("KNOWN catalog prefixes:", JSON.stringify(scan.knownPrefixes));
+    LOG("GENERIC-detected bases:", JSON.stringify(scan.detectedBases));
+    if (!scan.detected.length) {
+      LOG("⚠ NO repeating-section entry containers detected — open My Experience (page 2) and re-run.");
+      return { ok: false, error: "no-sections", scan };
+    }
+    // (a) parity vs the hardcoded catalog, CROSS-REFERENCED with the Add buttons.
+    // enumerate-and-group on "--null" only finds sections with ≥1 MOUNTED entry; a 0-entry
+    // ("create-first") section has NO --null container yet but IS present via its Add button +
+    // heading (the signal drivePageFill already uses for presence). So combine BOTH for the full
+    // picture: MOUNTED (detected) + PRESENT-BUT-UNMOUNTED (heading match, structure unknown until
+    // an entry mounts — we do NOT auto-mount) + truly ABSENT.
+    const HEADING_RE = { workExperience: /work experience/i, education: /education/i, webAddress: /websites?|web ?address/i, language: /languages?/i, certification: /certifications?/i };
+    const headings = (scan.addButtons || []).map((b) => (b && b.nearestHeading) || "");
+    const headingHits = (base) => HEADING_RE[base] && headings.some((h) => HEADING_RE[base].test(h));
+    const knownBases = scan.knownPrefixes.map((p) => p.slice(0, -1));
+    const mountedKnown = knownBases.filter((b) => scan.detectedBases.indexOf(b) !== -1);
+    const unmountedKnown = knownBases.filter((b) => scan.detectedBases.indexOf(b) === -1 && headingHits(b));
+    const absentKnown = knownBases.filter((b) => scan.detectedBases.indexOf(b) === -1 && !headingHits(b));
+    // Add-button headings matching NO known section = a present-but-unmounted UNKNOWN section
+    // (we'd only know its heading; its fkit prefix + field shape need an entry mounted to read).
+    const unknownUnmountedHeadings = headings.filter((h) => h && !knownBases.some((b) => HEADING_RE[b] && HEADING_RE[b].test(h)));
+    LOG("PARITY vs catalog (mounted + present-but-unmounted + absent):");
+    LOG("  • MOUNTED (≥1 entry, fully detected):", JSON.stringify(mountedKnown));
+    LOG("  • PRESENT-BUT-UNMOUNTED (0 entries; Add+heading present; shape unknown until mounted — we do NOT auto-mount):", JSON.stringify(unmountedKnown));
+    LOG("  • ABSENT (no entry, no Add button):", JSON.stringify(absentKnown));
+    LOG("  • NEW/unmapped MOUNTED bases:", JSON.stringify(scan.unknownBases));
+    LOG("  • NEW/unmapped UNMOUNTED (Add-button heading matches no known section):", JSON.stringify(unknownUnmountedHeadings));
+    // (b) false-positive-guard evidence (phoneNumber--null & the date wrappers must be here, NOT as sections)
+    LOG("EXCLUDED '<name>--null' containers (expect phoneNumber--null here on page 1; the regex did NOT treat them as sections):",
+        JSON.stringify(scan.excludedNullContainers));
+    // (c) per-section detail + the section-level required SIGNAL (the open unknown for safe-delete)
+    for (const d of scan.detected) {
+      LOG(`── ${d.base} (${d.isKnown ? "KNOWN" : "⚠ NEW/unmapped"}) — entries ${d.entryCount} ${JSON.stringify(d.indices)}`
+          + ` | heading ${JSON.stringify(d.headingText)} | requiredSignals ${JSON.stringify(d.requiredSignals)}`);
+      console.log("[ApplyPilot][GENERIC-SECTIONS]", d.base, "fieldShape:", JSON.stringify(d.fieldShape, null, 2));
+    }
+    LOG("add-buttons (section anchors — nearest heading):", JSON.stringify(scan.addButtons));
+    LOG("done — READ-ONLY, nothing actuated. CHECK: MOUNTED + PRESENT-BUT-UNMOUNTED should account for"
+        + " every section on the page; NEW/unmapped (mounted or unmounted) should be [] on Magna; and any"
+        + " non-section '<name>--null' (phoneNumber--null on page 1) should be in the EXCLUDED list.");
+    return { ok: true, scan, parity: { mountedKnown, unmountedKnown, absentKnown, unknownMountedBases: scan.unknownBases, unknownUnmountedHeadings } };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("generic-section recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

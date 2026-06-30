@@ -41,6 +41,22 @@ function meaningfulEntries(arr, keys) {
   return Array.isArray(arr) ? arr.filter((e) => e && ks.some((k) => nonEmpty(e[k]))) : [];
 }
 
+// Parse a Workday repeating-section ENTRY container's data-fkit-id into its section base +
+// entry index — the GENERIC replacement for the hardcoded prefix catalog. Shape is
+// "<base>-<N>--null" (N = Workday's internal, non-sequential index). Returns { base, index }
+// or null. The "-<digits>--null" anchor is load-bearing in BOTH exclusion directions:
+//   (a) it drops the date sub-wrappers that share the prefix ("workExperience-3--startDate"/
+//       "--endDate" → no "--null" → null), and
+//   (b) it drops the lone "<name>--null" containers that are NOT repeating entries (e.g. the
+//       page-1 "phoneNumber--null" → no "-<digits>-" index segment → null).
+// LOCKSTEP: cdp.js's cdpGenericRepeatingScan inlines this EXACT regex (it's stringified for
+// cdpEval and can't require this module). Change both together.
+function parseRepeatingFkit(fkitId) {
+  const m = /^(.+?)-(\d+)--null$/.exec(String(fkitId == null ? "" : fkitId).trim());
+  if (!m) return null;
+  return { base: m[1], index: parseInt(m[2], 10) };
+}
+
 // Convenience wrapper for work_experience (entries with a job title or company).
 function meaningfulWorkExperience(arr) {
   return meaningfulEntries(arr, ["job_title", "company"]);
@@ -348,5 +364,5 @@ function languageDeletionPlan(entries) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
 }
