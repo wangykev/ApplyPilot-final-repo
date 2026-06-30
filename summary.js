@@ -146,6 +146,27 @@ const _stripEntryPrefix = (s, key) => String(s || "").replace(new RegExp("^" + k
 const sectionShapeFor = (page, key) => {
   const ents = currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key);
   const indexed = ents.filter((e) => sectionOf(e).index != null && !e.is_deleted);
+  // existing entry fields keyed by recName/path — so a DETECTED field can borrow the captured
+  // options (the scan reads the field SET, not the option lists).
+  const existingByRec = {};
+  for (const e of indexed) {
+    const r = _stripEntryPrefix(String(e.field_id).replace(/^.*formField-/, ""), key);
+    const p = _stripEntryPrefix(e.canonical_field, key);
+    if (r) existingByRec[r] = e; if (p && !(p in existingByRec)) existingByRec[p] = e;
+  }
+  const enrich = (s) => {
+    const ex = existingByRec[s.recName] || existingByRec[s.path];
+    return { recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required,
+      label: s.label != null ? s.label : s.recName,
+      options: ex ? ex.options : (s.options || null), captured_options: ex ? ex.captured_options : (s.captured_options || null),
+      tree_structure: ex ? ex.tree_structure : (s.tree_structure || null) };
+  };
+  // (1) 2c: the DOM-DETECTED shape (the field SET read from the live form during the fill, cached
+  // on the bundle — covers a section even when EMPTY this run if it was populated before), enriched
+  // with any options captured for those fields. This is what makes add-entry NOT hardcoded.
+  const detected = currentBundle.section_shapes && currentBundle.section_shapes[key];
+  if (Array.isArray(detected) && detected.length) return detected.map(enrich);
+  // (2) clone from an existing entry (no detected shape — e.g. an older bundle without section_shapes)
   if (indexed.length) {
     const maxIx = Math.max(...indexed.map((e) => sectionOf(e).index));
     return indexed.filter((e) => sectionOf(e).index === maxIx).map((e) => ({
@@ -155,6 +176,7 @@ const sectionShapeFor = (page, key) => {
       options: e.options, captured_options: e.captured_options, tree_structure: e.tree_structure
     }));
   }
+  // (3) cold fallback: the stub's map-derived shape (an empty section never yet seen populated)
   const stub = ents.find((e) => e.widget_type === "section_stub" && Array.isArray(e.section_field_shape) && e.section_field_shape.length);
   if (stub) return stub.section_field_shape.map((s) => ({ recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required, label: s.label != null ? s.label : s.recName, options: null, captured_options: null, tree_structure: null }));
   return [];

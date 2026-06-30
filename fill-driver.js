@@ -2226,6 +2226,23 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
   }
 
+  // 2c: capture the DETECTED field shape (LIVE form, not the hardcoded *_MAP) for each present+
+  // mounted section → the review's add-entry builds new entries from DOM-detected fields, and the
+  // bundle CACHES the shapes (so a section EMPTY on a later run still adds from a detected shape).
+  // Cost: AT MOST one reused repeating-scan per page, and ONLY when a present section was create-
+  // first (empty at the pre-loop scan but mounted after filling); zero actuation; skipped under `only`.
+  let sectionShapes = {};
+  if (!only && rscan) {
+    const needRescan = PAGE_SECTIONS.some((sec) => {
+      if (rscan.sections && rscan.sections[sec.containerPrefix]) return false; // already mounted at the pre-loop scan
+      const re = new RegExp(sec.headingRegex, "i");
+      return Array.isArray(rscan.addButtons) && rscan.addButtons.some((b) => re.test((b && b.nearestHeading) || ""));
+    });
+    let shapeScan = rscan;
+    if (needRescan) { try { shapeScan = await act.repeatingScan(); } catch (e) { shapeScan = rscan; } }
+    sectionShapes = detectSectionShapes(shapeScan);
+  }
+
   // ── M1 CASCADE RE-SCAN-AFTER-CHANGE ── a committed value can REVEAL new fields (Magna
   // recon 2026-06-29: changing Country revealed 2 "Cyrillic name" text fields ~5.6s later,
   // and HID "State"). The single up-front scan misses them, so they never fill / never enter
@@ -2322,7 +2339,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const sessionWarning = (srcRec && srcRec.status === "needs_review" && srcRec.optionsLoaded === false)
     ? "Likely session expired — the \"How did you hear about us?\" options never loaded (server fetch failed). Refresh, log in, and reopen the form, then retry."
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries };
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes };
 }
 
 // ============================================================================
@@ -3153,6 +3170,27 @@ function summarizeEntries(entries) {
 
 // Build a SINGLE-page review bundle from drivePageFill's results. `meta = { page, url,
 // tenant, capturedAt }` — the SW stamps capturedAt + the PRE-fill cdpPageSig as `page`.
+// 2c: DETECT a section's field shape from a live repeating-scan (the m1 per-entry read) — the
+// field SET comes from the FORM, not the hardcoded *_MAP. Keyed by the PAGE_SECTIONS `name` (=
+// the review viewer's section key). Only sections with ≥1 MOUNTED entry yield a shape (an empty
+// section has nothing to read — it reuses a shape CACHED from a run where it WAS populated, or the
+// map as a cold fallback). recName/path = the DOM automation-id suffix (the real selector, best for
+// replay); label/required come from the DOM too. Pure (no I/O) → unit-tested.
+function detectSectionShapes(scan) {
+  const shapes = {};
+  if (!scan || !scan.sections) return shapes;
+  for (const sec of PAGE_SECTIONS) {
+    const s = scan.sections[sec.containerPrefix];
+    const fields = s && Array.isArray(s.entries) && s.entries[0] && Array.isArray(s.entries[0].fields) ? s.entries[0].fields : null;
+    if (!fields || !fields.length) continue;
+    shapes[sec.name] = fields.map((f) => ({
+      recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType,
+      label: f.label != null ? f.label : f.fieldName, is_required: !!f.isRequired
+    }));
+  }
+  return shapes;
+}
+
 function buildReviewBundle(results, meta) {
   const m = meta || {};
   const mapFillStatus = (status) => {
@@ -3263,7 +3301,8 @@ function buildReviewBundle(results, meta) {
     page_label: m.pageLabel != null ? m.pageLabel : null,
     url: m.url != null ? m.url : null,
     tenant: m.tenant != null ? m.tenant : null,
-    captured_at: m.capturedAt != null ? m.capturedAt : null
+    captured_at: m.capturedAt != null ? m.capturedAt : null,
+    section_shapes: (m.sectionShapes && typeof m.sectionShapes === "object") ? m.sectionShapes : {} // 2c: DOM-detected per-section field shapes for the review's add-entry
   }, summarizeEntries(entries), { entries });
 }
 
@@ -3292,5 +3331,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

@@ -687,6 +687,10 @@ function persistAccumulated(pageBundle) {
     chrome.storage.local.get("reviewSummary", ({ reviewSummary }) => {
       const prior = (reviewSummary && Array.isArray(reviewSummary.entries)) ? reviewSummary.entries : [];
       const bundle = accumulateBundle(prior, pageBundle);
+      // 2c: section_shapes = a CACHE of DOM-detected field shapes (by section name) carried on the
+      // bundle, so the review's add-entry uses detected fields even for a section EMPTY this run
+      // (seen on a PRIOR run). Merge prior ∪ this page (this page wins). "Clear summary" resets it.
+      bundle.section_shapes = Object.assign({}, (reviewSummary && reviewSummary.section_shapes) || {}, pageBundle.section_shapes || {});
       chrome.storage.local.set({ reviewSummary: bundle }, () => {
         console.log(`[ApplyPilot] Summary saved (accumulated) — page "${pageBundle.page}": +${pageBundle.total} field(s); total ${bundle.total} across ${bundle.entries.length ? new Set(bundle.entries.map((e) => e.page)).size : 0} page(s), ${bundle.needs_review_count} need review. "View last summary".`);
         resolve();
@@ -2375,7 +2379,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 
   // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
   await persistAccumulated(bundle);
   return { out, bundle, auditFlags, pageKey };
 }
@@ -2386,7 +2390,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 async function repersistPageBundle(out, pageKey, pageNumber) {
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
   const pageLabel = (pageNumber != null) ? ("Page " + pageNumber) : null;
-  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber: pageNumber != null ? pageNumber : null, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber: pageNumber != null ? pageNumber : null, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
   await persistAccumulated(bundle);
   return bundle;
 }

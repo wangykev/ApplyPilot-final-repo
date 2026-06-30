@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2727,6 +2727,30 @@ test("section_stub carries section_field_shape into the bundle (2b: viewer build
     section_field_shape: [{ recName: "url", widget_type: "text", path: "url" }] }];
   const bundle = buildReviewBundle(recs, { page: "p2" });
   assert.deepStrictEqual(bundle.entries[0].section_field_shape, [{ recName: "url", widget_type: "text", path: "url" }]);
+});
+
+test("detectSectionShapes: reads the field SET from a live scan, keyed by section NAME (2c)", () => {
+  const scan = { sections: {
+    "certification-": { entries: [{ fields: [
+      { fieldName: "certification", widgetType: "typeahead", label: "Certification*", isRequired: true },
+      { fieldName: "certificationNumber", widgetType: "text", label: "Number", isRequired: false },
+    ] }] },
+    "education-": { entries: [] }, // present but no fields → ignored
+  } };
+  const shapes = detectSectionShapes(scan);
+  assert.ok(shapes.certification, "keyed by the PAGE_SECTIONS name, not the container prefix");
+  assert.strictEqual(shapes.certification.length, 2);
+  assert.deepStrictEqual(shapes.certification[0], { recName: "certification", path: "certification", widget_type: "typeahead", label: "Certification*", is_required: true });
+  assert.ok(!("education" in shapes), "a present-but-empty section yields no shape (nothing to read)");
+});
+test("detectSectionShapes: empty/missing scan → {}", () => {
+  assert.deepStrictEqual(detectSectionShapes(null), {});
+  assert.deepStrictEqual(detectSectionShapes({}), {});
+});
+test("buildReviewBundle carries section_shapes onto the bundle (2c); defaults to {}", () => {
+  const shapes = { website: [{ recName: "url", path: "url", widget_type: "text", label: "URL", is_required: true }] };
+  assert.deepStrictEqual(buildReviewBundle([], { page: "p2", sectionShapes: shapes }).section_shapes, shapes);
+  assert.deepStrictEqual(buildReviewBundle([], { page: "p2" }).section_shapes, {});
 });
 
 test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {
