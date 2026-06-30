@@ -42,6 +42,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // probe failure is a STOP-and-surface known-blocker, not a quiet fallback).
   // Run on My Experience (page 2); MINIMIZE within 60s (the date probe actuates).
   // [REPEAT-RECON] in the SW console. No profile needed.
+  // GENERIC-SECTION RECON (Sections milestone 1): READ-ONLY proof that enumerate-and-group on
+  // data-fkit-id detects the right repeating sections (no live fill-path change, no actuation →
+  // runs VISIBLE, no minimize). [GENERIC-SECTIONS] in the SW console.
+  if (message.type === "RUN_CDP_GENERIC_SECTION_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpGenericSectionRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   if (message.type === "RUN_CDP_REPEAT_RECON") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
@@ -1618,6 +1631,56 @@ async function runCdpQuestionsRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("questions recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// GENERIC-DETECTION RECON (Sections milestone 1) — READ-ONLY. Attaches, runs cdpGenericRepeatingScan
+// (enumerate-and-group on data-fkit-id, NO actuation, tab can stay visible), logs a parity report vs
+// the hardcoded catalog + the false-positive-guard evidence + per-section "required" signals, detaches.
+// This does NOT touch the live fill path (cdpRepeatingScan/drivePageFill are unchanged) — it's the
+// before-we-generalize verification step. Run on My Experience (page 2) or any repeating-section page.
+async function runCdpGenericSectionRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][GENERIC-SECTIONS]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed:" + attached.error };
+    }
+    LOG("attached (READ-ONLY scan — no actuation, tab can stay VISIBLE). Scanning…");
+    const scan = await cdpEval(cdpGenericRepeatingScan);
+    if (!scan) { LOG("scan failed (no result)."); return { ok: false, error: "scan-failed" }; }
+    LOG("url:", scan.url);
+    LOG("KNOWN catalog prefixes:", JSON.stringify(scan.knownPrefixes));
+    LOG("GENERIC-detected bases:", JSON.stringify(scan.detectedBases));
+    if (!scan.detected.length) {
+      LOG("⚠ NO repeating-section entry containers detected — open My Experience (page 2) and re-run.");
+      return { ok: false, error: "no-sections", scan };
+    }
+    // (a) parity vs the hardcoded catalog
+    const knownBases = scan.knownPrefixes.map((p) => p.slice(0, -1));
+    const missing = knownBases.filter((b) => scan.detectedBases.indexOf(b) === -1);
+    LOG("PARITY vs catalog → NEW/unmapped bases:", JSON.stringify(scan.unknownBases),
+        "| known-but-not-on-this-page:", JSON.stringify(missing));
+    // (b) false-positive-guard evidence (phoneNumber--null & the date wrappers must be here, NOT as sections)
+    LOG("EXCLUDED '<name>--null' containers (expect phoneNumber--null here on page 1; the regex did NOT treat them as sections):",
+        JSON.stringify(scan.excludedNullContainers));
+    // (c) per-section detail + the section-level required SIGNAL (the open unknown for safe-delete)
+    for (const d of scan.detected) {
+      LOG(`── ${d.base} (${d.isKnown ? "KNOWN" : "⚠ NEW/unmapped"}) — entries ${d.entryCount} ${JSON.stringify(d.indices)}`
+          + ` | heading ${JSON.stringify(d.headingText)} | requiredSignals ${JSON.stringify(d.requiredSignals)}`);
+      console.log("[ApplyPilot][GENERIC-SECTIONS]", d.base, "fieldShape:", JSON.stringify(d.fieldShape, null, 2));
+    }
+    LOG("add-buttons (section anchors — nearest heading):", JSON.stringify(scan.addButtons));
+    LOG("done — READ-ONLY, nothing actuated. CHECK: detectedBases should equal the known catalog on Magna"
+        + " (no NEW bases, no missing), AND phoneNumber--null should be in the EXCLUDED list.");
+    return { ok: true, scan, parity: { unknownBases: scan.unknownBases, missingKnownBases: missing } };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("generic-section recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

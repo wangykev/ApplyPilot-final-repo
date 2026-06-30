@@ -574,6 +574,111 @@ function cdpRepeatingScan() {
   return { url: location.href, sectionsPresent: Object.keys(sections), sections, addButtons };
 }
 
+// GENERIC-DETECTION RECON (Sections milestone 1): READ-ONLY proof that enumerate-and-group on
+// data-fkit-id detects repeating sections WITHOUT the hardcoded 5-prefix catalog. Self-contained
+// (cdpEval stringifies it — can't share helpers with cdpRepeatingScan). Unlike cdpRepeatingScan
+// (which looks up known PREFIXES) this enumerates EVERY "<base>-<N>--null" entry container and
+// groups by base, so a brand-new tenant section surfaces too. Emits, for the operator to verify
+// against reality: (a) detectedBases vs the known catalog (extras = new/unmapped, missing = known
+// but not on this page); (b) the EXCLUDED "<name>--null" list — proof the regex didn't over-match
+// (phoneNumber--null and the date sub-wrappers must NOT appear as sections); (c) a section-level
+// "required" SIGNAL per section (heading-asterisk + a required field in the first entry) — the
+// open unknown for the safe-delete decision (no proven signal exists yet; this gathers evidence).
+// NOTHING is actuated. LOCKSTEP: the parseFkit regex == lib.js parseRepeatingFkit.
+function cdpGenericRepeatingScan() {
+  const labelOf = (w) => {
+    const legend = w.querySelector("legend");
+    if (legend && legend.textContent.trim()) return legend.textContent.trim().slice(0, 60);
+    for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); }
+    return null;
+  };
+  const classify = (w) => {
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => {
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
+    });
+    if (textLike.length === 1) return "text";
+    return "unknown";
+  };
+  const isHashed = (fieldName) => /[0-9a-f]{8}/i.test(fieldName) || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(fieldName);
+  const dateSegsOf = (w) => Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]'))
+    .map((s) => s.getAttribute("data-automation-id")).filter(Boolean);
+  const requiredFieldOf = (w) => {
+    for (const a of w.querySelectorAll("abbr")) {
+      const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || "");
+      if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true;
+    }
+    if (w.querySelector('[aria-required="true"], [data-required="true"]')) return true;
+    const labelEl = w.querySelector("legend") || w.querySelector("label");
+    if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
+    return false;
+  };
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 60); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 60); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  // LOCKSTEP with lib.js parseRepeatingFkit — same regex.
+  const parseFkit = (id) => { const m = /^(.+?)-(\d+)--null$/.exec(id || ""); return m ? { base: m[1], index: parseInt(m[2], 10) } : null; };
+
+  const KNOWN = ["workExperience", "education", "webAddress", "language", "certification"];
+  const groups = {};
+  const excluded = []; // "<name>--null" that did NOT parse as an entry (false-positive guard evidence)
+  for (const e of Array.from(document.querySelectorAll('[data-fkit-id$="--null"]'))) {
+    const id = e.getAttribute("data-fkit-id");
+    const p = parseFkit(id);
+    if (!p) { excluded.push(id); continue; }
+    const g = (groups[p.base] = groups[p.base] || { base: p.base, indices: [], firstEntryEl: null });
+    g.indices.push(p.index);
+    if (g.firstEntryEl == null) g.firstEntryEl = e;
+  }
+
+  const detected = Object.keys(groups).map((base) => {
+    const g = groups[base];
+    const e0 = g.firstEntryEl;
+    const headingText = nearestHeading(e0);
+    const fields = e0 ? Array.from(e0.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
+      const fid = w.getAttribute("data-automation-id");
+      const fn = fid.slice("formField-".length);
+      return { fieldName: fn, widgetType: classify(w), label: labelOf(w), isRequired: requiredFieldOf(w), hashedId: isHashed(fn), dateSegments: dateSegsOf(w) };
+    }) : [];
+    return {
+      base, prefix: base + "-",
+      isKnown: KNOWN.indexOf(base) !== -1,
+      entryCount: g.indices.length,
+      indices: g.indices.slice().sort((a, b) => a - b),
+      headingText,
+      requiredSignals: { headingAsterisk: !!(headingText && /\*\s*$/.test(headingText)), anyRequiredFieldInFirstEntry: fields.some((f) => f.isRequired) },
+      fieldShape: fields
+    };
+  });
+
+  return {
+    url: location.href,
+    knownPrefixes: KNOWN.map((b) => b + "-"),
+    detected,
+    detectedBases: detected.map((d) => d.base),
+    unknownBases: detected.filter((d) => !d.isKnown).map((d) => d.base),
+    excludedNullContainers: excluded,
+    addButtons: Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
+      .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), nearestHeading: nearestHeading(b) }))
+  };
+}
+
 // M36.2 — read-only structure dump of the Certifications entries, for the NESTED
 // Specialties sub-section recon. Per cert entry (`certification-N--null`): ALL
 // descendant `data-fkit-id`s (raw — a mounted specialty's container surfaces here,

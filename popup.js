@@ -293,6 +293,25 @@ document.getElementById("cdp-repeat-recon").addEventListener("click", () => {
   });
 });
 
+// GENERIC-SECTION RECON (Sections milestone 1): read-only proof that enumerate-and-group on
+// data-fkit-id detects the right repeating sections — no live fill-path change, no actuation,
+// so no minimize. Output is [GENERIC-SECTIONS] in the SW console.
+document.getElementById("cdp-generic-section-recon").addEventListener("click", () => {
+  setStatus("Generic-section recon… open a repeating-section page (My Experience, page 2). READ-ONLY — no minimize. Findings land in the SW console as [GENERIC-SECTIONS].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_GENERIC_SECTION_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have closed — SW console has it all
+    if (resp.ok === false && resp.error === "no-sections") {
+      setStatus("No repeating sections detected — open My Experience (page 2) and re-run.");
+    } else if (resp.ok === false) {
+      setStatus("Generic-section recon failed: " + resp.error + " — see the service worker console.");
+    } else {
+      const bases = (resp.scan && resp.scan.detectedBases) || [];
+      const extra = (resp.parity && resp.parity.unknownBases) || [];
+      setStatus(`Generic recon done — detected: ${bases.join(", ") || "none"}${extra.length ? "; NEW/unmapped: " + extra.join(", ") : "; all known"}. Paste the [GENERIC-SECTIONS] summary from the SW console.`);
+    }
+  });
+});
+
 // CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the nested Specialties
 // sub-section inside a Certification entry. Run on My Experience (page 2); minimize
 // within 60s. Findings land as [CERT-SPECIALTY-RECON] in the SW console.
