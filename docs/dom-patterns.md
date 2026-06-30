@@ -254,8 +254,13 @@ Driven for the first time in M11. `fillSource` reported `opener: "BUTTON"`,
 the earlier "same searchBox container as countryPhoneCode" note was wrong.
 
 ### Two previously-uncatalogued fields identified (via the new `label` column)
-- `preferredCheck` → label **"I have a preferred name"** — a checkbox
-  (would map to `personal_info.has_preferred_name`). Currently `skipped (no mapping)`.
+- `preferredCheck` → label **"I have a preferred name"** — a checkbox, **now MAPPED to
+  `personal_info.has_preferred_name`** (2026-06-30). Checking it (`has_preferred_name:true`)
+  is a **CASCADE**: it reveals `formField-preferredName--firstName` +
+  `formField-preferredName--lastName`, which the M1 cascade re-scan then fills (those two are
+  mapped to `personal_info.preferred_first_name`/`preferred_last_name`). Live-verified on
+  Magna page 1 → "John"/"Doe" filled deterministically (mapped ⇒ no AI). The reveal mounts a
+  few seconds after the box is checked (same latency class as the Country→Local-Name cascade).
 - `regionSubdivision1` → label **"County"** — a conditional text field (not a
   state subdivision as the name suggests). Currently `skipped (no mapping)`.
 
