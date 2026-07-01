@@ -2508,11 +2508,7 @@ const WORK_EXPERIENCE_MAP = [
 const PAGE_SECTIONS = [
   { name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-", itemsKey: "work_experience", fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false },
   { name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education", fieldMap: EDUCATION_MAP, deleteOnNoMatch: false },
-  // ⚠ TEMP (testing the unknown-section path on Magna — REVERT after): certification is removed from
-  // the KNOWN catalog so it's detected as an UNMAPPED section (shows under its real "Certifications"
-  // heading + add-entry). Add ≥1 cert entry on the form first so the section has an entry container
-  // to detect (an empty create-first section has no container → m3a can't see it yet).
-  // { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true },
+  { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true },
   { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
   { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
 ];
