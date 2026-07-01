@@ -80,6 +80,20 @@ const sectionOf = (e) => {
   return { key: "_other", label: "Other Fields", index: null };
 };
 
+// NESTED sub-section classifier (cert ▸ Specialties). sectionOf groups by the FIRST base[idx], so a
+// nested field/stub lands under its PARENT entry; nestedInfoOf then tells the per-entry renderer
+// whether an item is the parent's OWN field (null) or belongs to a nested sub-section:
+//   "<parent>[p].<child>[c].<field>" → { kind:"field", childBase, childIndex, field }
+//   "<parent>[p].<child>._stub"      → { kind:"stub",  childBase }
+const nestedInfoOf = (e) => {
+  const cf = e.canonical_field || "";
+  let m = cf.match(/^[A-Za-z_]+\[\d+\]\.([A-Za-z_]+)\[(\d+)\]\.(.+)$/);
+  if (m) return { kind: "field", childBase: m[1], childIndex: +m[2], field: m[3] };
+  m = cf.match(/^[A-Za-z_]+\[\d+\]\.([A-Za-z_]+)\._stub$/);
+  if (m) return { kind: "stub", childBase: m[1], childIndex: null, field: null };
+  return null; // the parent entry's own field (or a flat field)
+};
+
 // Review-card prominence predicates (UNCHANGED from the original viewer): prominence keys
 // off the FLAG, never confidence — a high-confidence reasoning-from-absence answer
 // (criminal→"No") must still be the most conspicuous, not buried.
@@ -203,6 +217,64 @@ const removeAddedEntry = (page, key, index) => {
   currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === page && sectionOf(e).key === key && sectionOf(e).index === index && e.is_added));
   persist(); render();
 };
+
+// ── NESTED sub-section (cert ▸ Specialties) — Milestone C ──────────────────────────────────────
+// The next CHILD index for a parent entry's nested sub-section (canonical
+// "<parentKey>[<parentIx>].<childBase>[<n>].…"). Includes soft-deleted so an index never collides.
+const nextNestedIndexFor = (page, parentKey, parentIx, childBase) => {
+  const re = new RegExp("^" + parentKey + "\\[" + parentIx + "\\]\\." + childBase + "\\[(\\d+)\\]");
+  const idxs = currentBundle.entries.filter((e) => e.page === page)
+    .map((e) => { const m = String(e.canonical_field || "").match(re); return m ? +m[1] : null; })
+    .filter((i) => i != null);
+  return idxs.length ? Math.max(...idxs) + 1 : 0;
+};
+// ADD a nested child entry from review — mirrors addEntry but scoped INSIDE a parent entry. The
+// shape rides the nested stub (section_field_shape, reveal-by-add-discovered). Records carry the
+// session-scoped container_prefix + nested_parent/nested_child_base (the backend identifier a
+// future fill-back session reads). newEntryRecords does the rest (added_entry provenance).
+const addNestedEntry = (page, parentKey, parentIx, childBase, stubEntry) => {
+  const shape = (stubEntry.section_field_shape || []).map((s) => ({
+    recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type,
+    is_required: !!s.is_required, label: s.label != null ? s.label : s.recName,
+    options: null, captured_options: null, tree_structure: null, date_order: s.date_order || null
+  }));
+  if (!shape.length) return;
+  const sample = currentBundle.entries.find((e) => e.page === page);
+  const ci = nextNestedIndexFor(page, parentKey, parentIx, childBase);
+  const recs = newEntryRecords(shape, { page, pageNumber: sample ? sample.page_number : null,
+    pageLabel: sample ? sample.page_label : null, sectionKey: parentKey + "[" + parentIx + "]." + childBase, index: ci, at: new Date().toISOString() });
+  recs.forEach((r) => { r.container_prefix = stubEntry.container_prefix || null; r.nested_child_base = childBase; r.nested_parent = stubEntry.nested_parent || { base: parentKey, index: parentIx }; });
+  currentBundle.entries.push(...recs);
+  persist(); render();
+  if (recs[0]) jumpToField(recs[0]);
+};
+// Render a nested sub-section as a sub-card WITHIN a parent entry: the stub's heading + note, each
+// existing child entry's fields (grouped by child index), and — in the "all" view — a "+ Add" that
+// builds child records from the stub's shape. `bucket` = [{ e, ni }] for this (parentIx, childBase).
+const renderNestedSub = (pg, parentSec, parentIx, childBase, bucket) => {
+  const stub = (bucket.find((x) => x.ni.kind === "stub") || {}).e;
+  const fieldItems = bucket.filter((x) => x.ni.kind === "field");
+  const card = el("div", { class: "nsub" });
+  const label = (stub && stub.question_label) || (humanize(childBase) + " (0)");
+  card.appendChild(el("div", { class: "nsub-head" }, [el("span", { class: "nsub-name", text: label })]));
+  if (stub && stub.detail) card.appendChild(el("div", { class: "nsub-note", text: stub.detail }));
+  const byCi = {}, ciOrder = [];
+  for (const x of fieldItems) { const ci = x.ni.childIndex; if (!(ci in byCi)) { byCi[ci] = []; ciOrder.push(ci); } byCi[ci].push(x.e); }
+  ciOrder.sort((a, b) => a - b);
+  for (const ci of ciOrder) {
+    const added = byCi[ci].some((e) => e.is_added);
+    const eh = el("div", { class: "nsub-eh" }, [el("span", { text: humanize(childBase).replace(/s$/, "") + " " + (ci + 1) + (added ? " · added" : "") })]);
+    if (added) { const rm = el("button", { class: "tier-rm", text: "Remove" }); rm.addEventListener("click", () => { currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === pg && e.is_added && new RegExp("^" + parentSec.key + "\\[" + parentIx + "\\]\\." + childBase + "\\[" + ci + "\\]").test(String(e.canonical_field || "")))); persist(); render(); }); eh.appendChild(rm); }
+    card.appendChild(eh);
+    for (const e of byCi[ci]) card.appendChild(fieldRow(e));
+  }
+  if (currentFilter === "all" && stub && Array.isArray(stub.section_field_shape) && stub.section_field_shape.length) {
+    const add = el("button", { class: "add-entry", text: "+ Add " + humanize(childBase).replace(/s$/, "").toLowerCase() });
+    add.addEventListener("click", () => addNestedEntry(pg, parentSec.key, parentIx, childBase, stub));
+    card.appendChild(add);
+  }
+  return card;
+};
 const entryHead = (sec, ix, page) => {
   const added = entryFieldsOf(page, sec.key, ix).some((e) => e.is_added);
   const h = el("div", { class: "ehead" }, [el("span", { class: "et", text: `Entry ${ix + 1}${added ? " · added" : ""}` })]);
@@ -319,6 +391,7 @@ function buildEditor(entry) {
   };
   if (wt === "file_upload") return null;
   if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
+  if (wt === "nested_section_stub") return null; // nested sub-section header → rendered by renderNestedSub, never a field row
   // TREE-AI (cert): the recon captured the chosen category's leaves → a searchable editor over them
   // (partial — only that category, not the whole tree). Checked before widget_type (cert is mis-tagged typeahead).
   if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) return Object.assign(combobox(entry.tree_structure.leaves), { partial: true });
@@ -559,7 +632,13 @@ const renderFieldList = (mount) => {
           const vis = visibleEntryItems(items).filter(filterPass);
           if (!vis.length) continue;
           body.appendChild(entryHead(g.sec, ix, pg));
-          for (const e of vis) body.appendChild(fieldRow(e));
+          // Milestone C: split the parent entry's OWN fields from NESTED sub-sections (cert ▸
+          // Specialties). Own fields render as rows; each nested sub-section renders as a sub-card.
+          const own = vis.filter((e) => !nestedInfoOf(e));
+          for (const e of own) body.appendChild(fieldRow(e));
+          const nestedByChild = {}, childOrder = [];
+          for (const e of vis) { const ni = nestedInfoOf(e); if (!ni) continue; if (!(ni.childBase in nestedByChild)) { nestedByChild[ni.childBase] = []; childOrder.push(ni.childBase); } nestedByChild[ni.childBase].push({ e, ni }); }
+          for (const cb of childOrder) body.appendChild(renderNestedSub(pg, g.sec, ix, cb, nestedByChild[cb]));
         }
       } else {
         for (const e of g.items.filter((e) => !e.is_deleted && filterPass(e))) body.appendChild(fieldRow(e));
