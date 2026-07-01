@@ -2209,6 +2209,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // is the PREPARED profile (the SW prepareProfile's it), so profile[itemsKey] carries the
   // annotated arrays. Driven in registry order.
   let rscan = null;
+  const runNestedShapes = {}; // nested sub-section shapes recon'd DURING the section fills (parentBase__childBase) — reused by the post-fold nested emit so it never re-probes; persisted to section_shapes for next-run cache
+  const cachedShapesIn = (opts && opts.cachedShapes) || {};
   try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
   if (!only && rscan && (rscan.sections || rscan.addButtons)) {
     for (const sec of PAGE_SECTIONS) {
@@ -2220,9 +2222,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const out = await driveRepeatingSectionCdp(act, {
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
         items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
-        aiContext: { profile, jobContext } // Option B: inline AI rescue context for the section's typeaheads (FoS)
+        aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
+        cachedShapes: cachedShapesIn // cross-run nested-shape cache → captureNestedShapes skips the probe on a hit
       }, budgets);
       if (out && Array.isArray(out.results)) results.push(...out.results);
+      if (out && out.nestedShapes) Object.assign(runNestedShapes, out.nestedShapes); // recon'd during the fill → reuse below
     }
   }
 
@@ -2270,6 +2274,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     if (needRescan) { try { shapeScan = await act.repeatingScan(); } catch (e) { shapeScan = rscan; } }
     sectionShapes = detectSectionShapes(shapeScan);
   }
+  Object.assign(sectionShapes, runNestedShapes); // nested sub-section shapes recon'd during the fill → persisted for next-run cache (survives a deleted parent)
 
   // m3b: EMPTY unknown sections — present via an Add button + heading but with NO entry container
   // (so m3a's container loop can't see them). REVEAL-BY-ADD: mount one entry → detect its fields +
@@ -2383,14 +2388,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       for (const key of Object.keys(nestedContainers)) {
         const nc = nestedContainers[key];
         if (!(nc.parentBase in ordinalOf)) continue; // no real parent entry → nothing to attach a stub to
-        let shape = Array.isArray(cachedShapes[key]) ? cachedShapes[key] : null;
+        // PREFER the shape recon'd DURING the section fill (runNestedShapes — captured while the parent
+        // existed, before any delete sweep), then the cross-run cache; only reveal-by-add if neither has
+        // it (an unknown section not driven by driveRepeatingSectionCdp). No double-probe for a known section.
+        let shape = (Array.isArray(runNestedShapes[key]) && runNestedShapes[key].length) ? runNestedShapes[key]
+          : (Array.isArray(cachedShapes[key]) && cachedShapes[key].length) ? cachedShapes[key] : null;
         if (!shape) {
           const escaped = String(nc.heading).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const parentFkit = nc.parentBase + "-" + nc.firstParentIndex + "--null";
           const revealed = await revealNestedShape(act, parentFkit, nc.parentBase, nc.childBase, escaped, budgets);
-          if (revealed && revealed.shape.length) { shape = revealed.shape; sectionShapes[key] = shape; } // persist → cache next run
+          if (revealed && revealed.shape.length) shape = revealed.shape;
         }
         if (!shape || !shape.length) continue; // couldn't discover the shape → don't emit a shapeless stub
+        sectionShapes[key] = shape; // persist → next-run cross-run cache
         for (const fkitIdx of (nscan.parentOrder[nc.parentBase] || [])) {
           const pOrd = ordinalOf[nc.parentBase][fkitIdx];
           if (pOrd == null) continue;
@@ -2815,13 +2825,47 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   };
   const stubShape = () => (detectedShape && detectedShape.length) ? detectedShape
     : (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({ recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path, date_order: f.widget === "year" ? ["year"] : null }));
+  // NESTED sub-sections (cert ▸ Specialties) — recon'd DURING this fill by captureNestedShapes()
+  // (entries still exist), BEFORE the delete sweep. A bogus-value cert is removed by deleteOnNoMatch,
+  // taking its Specialties with it — post-fold recon would be too late. Capturing here lets an
+  // emptied section's stub STILL carry the sub-section shapes (the operator adds a parent back and its
+  // sub-section shows). GENERIC — parentBase/childBase come from the fkit, no hardcoded names.
+  const parentBase = containerPrefix.replace(/-$/, "");
+  const cachedNested = (section.cachedShapes && typeof section.cachedShapes === "object") ? section.cachedShapes : {};
+  const nestedShapes = {};       // childBase → reveal-discovered field shape (carries date_order)
+  let nestedHasAttachments = false;
   const makeSectionStub = (label, detail) => ({
     fieldName: name, label, widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
     rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
     flag: "section-stub", verified: null, after: null, detail,
     section_field_shape: stubShape(),
-    container_prefix: containerPrefix, section_known: true
+    container_prefix: containerPrefix, section_known: true,
+    nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null // sub-section shapes → viewer shows them on an added-back parent
   });
+  const captureNestedShapes = async () => {
+    if (!(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return;
+    let nscan = null;
+    try { nscan = await act.nestedScan(); } catch (e) { return; }
+    if (!nscan) return;
+    const esc = parentBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("^" + esc + "-(\\d+)--([A-Za-z][A-Za-z0-9_]*)$"); // an inside Add's enclosingFkit "<parentBase>-<idx>--<childBase>"
+    const containers = {}; // childBase → { fkitIndex, heading }
+    for (const b of (nscan.addButtons || [])) {
+      const m = re.exec((b && b.enclosingFkit) || "");
+      if (!m || m[2] === "null") continue;
+      if (!(m[2] in containers)) containers[m[2]] = { fkitIndex: parseInt(m[1], 10), heading: (b && b.heading) || m[2] };
+    }
+    nestedHasAttachments = (nscan.nestedAttachments || []).some((a) => a && a.parentBase === parentBase);
+    for (const childBase of Object.keys(containers)) {
+      const key = parentBase + "__" + childBase;
+      if (Array.isArray(cachedNested[key]) && cachedNested[key].length) { nestedShapes[childBase] = cachedNested[key]; continue; } // cross-run cache hit → NO probe
+      const c = containers[childBase];
+      const parentFkit = parentBase + "-" + c.fkitIndex + "--null";
+      const escaped = String(c.heading).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const revealed = await revealNestedShape(act, parentFkit, parentBase, childBase, escaped, budgets);
+      if (revealed && revealed.shape.length) nestedShapes[childBase] = revealed.shape;
+    }
+  };
 
   // Poll the entry count off-loop until it moves in the wanted direction or a
   // ceiling (port of the in-tree 4s/150ms reconcile poll; SW-paced via act.delay).
@@ -2839,7 +2883,9 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
     const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
     const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub").length;
-    return { url, repeatingFieldCount, results, counts, needsReview };
+    const nestedShapesKeyed = {}; // parentBase__childBase → shape (recon'd during THIS fill) → drivePageFill caches + reuses (no re-probe)
+    for (const cb of Object.keys(nestedShapes)) nestedShapesKeyed[parentBase + "__" + cb] = nestedShapes[cb];
+    return { url, repeatingFieldCount, results, counts, needsReview, nestedShapes: nestedShapesKeyed };
   };
 
   const initial = await act.repeatingScan();
@@ -2926,6 +2972,11 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       || aiUnconfident;                                                                       // an unconfident AI pick (optional section only — sweep-gated)
     perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
   }
+
+  // Recon this section's NESTED sub-sections NOW — while entries exist, BEFORE the delete sweep (a
+  // no-match cert is about to be removed with its Specialties). Captured shapes ride makeSectionStub
+  // + are returned for drivePageFill to reuse (no post-fold re-probe) and cache across runs.
+  await captureNestedShapes();
 
   // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose REQUIRED
   // pick GENUINELY didn't match (the value isn't offered) would block Next, so delete it.
@@ -3677,6 +3728,7 @@ function buildReviewBundle(results, meta) {
       nested_path: Array.isArray(rec.nested_path) ? rec.nested_path : null, // nested: locate-now fkit level path (raw indices) for the fill-back; the ordinal canonical_field is the durable identity
       nested_parent: (rec.nested_parent && typeof rec.nested_parent === "object") ? rec.nested_parent : null, // nested-section stub: { base, index } — the parent entry the sub-section belongs to (viewer sub-grouping)
       nested_child_base: rec.nested_child_base != null ? rec.nested_child_base : null,                         // nested-section stub: the child base (e.g. "specialties") for the add-entry
+      nested_shapes: (rec.nested_shapes && typeof rec.nested_shapes === "object") ? rec.nested_shapes : null,  // removed/empty section stub: { childBase → shape } recon'd during the fill → the viewer shows the sub-section on an added-back parent
       character_count: null
     };
   });

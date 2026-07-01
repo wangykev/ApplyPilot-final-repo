@@ -206,7 +206,39 @@ const addEntry = (page, key) => {
   const shape = sectionShapeFor(page, key);
   if (!shape.length) return;
   const sample = currentBundle.entries.find((e) => e.page === page); // borrow page_number/label
-  const recs = newEntryRecords(shape, { page, pageNumber: sample ? sample.page_number : null, pageLabel: sample ? sample.page_label : null, sectionKey: key, index: nextIndexFor(page, key), at: new Date().toISOString() });
+  const newIx = nextIndexFor(page, key);
+  const recs = newEntryRecords(shape, { page, pageNumber: sample ? sample.page_number : null, pageLabel: sample ? sample.page_label : null, sectionKey: key, index: newIx, at: new Date().toISOString() });
+  // If this section has recon'd NESTED sub-sections (cert ▸ Specialties — the shapes ride the
+  // section stub's nested_shapes, captured DURING the fill so they survive a deleted parent), attach a
+  // nested-section stub to the newly-added parent so its sub-section shows + is addable here too.
+  const nsStub = currentBundle.entries.find((e) => e.page === page && sectionOf(e).key === key && e.widget_type === "section_stub" && e.nested_shapes && typeof e.nested_shapes === "object");
+  const nestedShapes = nsStub ? nsStub.nested_shapes : null;
+  if (nestedShapes) {
+    for (const childBase of Object.keys(nestedShapes)) {
+      const shp = nestedShapes[childBase];
+      if (!Array.isArray(shp) || !shp.length) continue;
+      const human = humanize(childBase);
+      recs.push({
+        field_id: (page != null ? page + "::" : "") + "formField-" + key + "[" + newIx + "]." + childBase + "._stub",
+        page: page != null ? page : null, field_index: null,
+        question_label: human + " (0)", widget_type: "nested_section_stub",
+        canonical_field: key + "[" + newIx + "]." + childBase + "._stub",
+        is_required: false, current_value: null, original_ai_value: null,
+        is_edited: false, edit_kind: null, is_added: true, added_at: new Date().toISOString(),
+        is_approved: false, approved_at: null,
+        page_number: sample ? sample.page_number : null, page_label: sample ? sample.page_label : null,
+        confidence: "none", confidence_source: "added",
+        needs_review: true, needs_review_reason: "nested_section",
+        fill_status: "not_filled", fill_error: null,
+        detail: "nested repeating sub-section (" + key + " ▸ " + childBase + ") — add or verify entries here",
+        match_tier: null, flag: "nested-section-stub",
+        section_field_shape: shp.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null })),
+        container_prefix: key + "-<idx>--" + childBase + "-",
+        nested_parent: { base: key, index: newIx }, nested_child_base: childBase, section_known: false,
+        options: null, captured_options: null, tree_structure: null, date_order: null, tiers: null, character_count: null
+      });
+    }
+  }
   currentBundle.entries.push(...recs);
   persist(); render();
   if (recs[0]) jumpToField(recs[0]);

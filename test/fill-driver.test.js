@@ -3169,6 +3169,40 @@ test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletio
   assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented editor");
 });
 
+test("nested recon happens DURING the fill (before the delete sweep) → an emptied cert's stub carries nested_shapes", async () => {
+  // The operator's case: a bogus cert → deleteOnNoMatch removes the whole section. The nested
+  // Specialties shape must be recon'd WHILE the cert still exists (before deletion), then ride the
+  // removed-section stub so the operator can add a cert back and see its Specialties. (Post-fold
+  // recon would be too late — the cert is already gone.)
+  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "certification", label: "Certification*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "PMP" }] }] });
+  const state = webState({ prefix: "certification-", entries: [mk("certification-287--null")] });
+  const fieldMap = [{ field: "certification", widget: "dropdown", key: "cert", path: "certification" }];
+  const act = makeFakeRepeatAct(state);
+  // wire the nested substrate onto the fake: a Specialties sub-section under certification-287,
+  // revealed by mount (children grows on Add, shrinks on Delete — proves the probe cleans up).
+  let children = [], nextIdx = 9;
+  act.nestedScan = async () => ({
+    parentOrder: { certification: state.entries.map((e) => parseInt((e.fkit.match(/-(\d+)--null/) || [])[1], 10)) },
+    addButtons: state.entries.length ? [{ text: "Add", heading: "Specialties", enclosingFkit: "certification-287--specialties" }] : [],
+    nestedAttachments: [],
+    nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
+      entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: SPECIALTY_FIELDS })) }] : [],
+  });
+  act.clickNestedAdd = async () => { children.push(nextIdx++); return { ok: true }; };
+  act.clickNestedDelete = async (pf, base, idx) => { children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; };
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ cert: "Zzz-bogus" }], fieldMap, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  assert.strictEqual(await act.entryCount("certification-"), 0, "bogus cert deleted → section empty");
+  assert.deepStrictEqual(children, [], "the nested reveal probe was cleaned up (no leftover)");
+  const stub = out.results.find((r) => r.widgetType === "section_stub");
+  assert.ok(stub && stub.nested_shapes && Array.isArray(stub.nested_shapes.specialties), "the emptied cert's stub carries the nested Specialties shape (recon'd BEFORE deletion)");
+  assert.strictEqual(stub.nested_shapes.specialties[0].recName, "specialtyParent");
+  assert.deepStrictEqual(stub.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
+  assert.ok(out.nestedShapes && Array.isArray(out.nestedShapes["certification__specialties"]), "returned keyed parentBase__childBase for drivePageFill's cache");
+});
+
 test("M38 Bug B1: a required pick failing TRANSIENTLY (options didn't render) is KEPT + needs_review, NOT deleted", async () => {
   // The live English/Chinese loss: the language dropdown didn't render deep in a long fold
   // → deleteOnNoMatch deleted VALID data. Now a transient/infra failure (NOT a genuine
