@@ -314,6 +314,24 @@ document.getElementById("cdp-generic-section-recon").addEventListener("click", (
   });
 });
 
+// GENERIC NESTED-SECTION RECON: read-only dump of repeating-sections-inside-repeating-entries (cert →
+// Specialties + Attachments) via the multi-level data-fkit-id parse. Add a specialty + attachment first.
+document.getElementById("cdp-generic-nested-recon").addEventListener("click", () => {
+  setStatus("Nested-section recon… on page 2, ADD ≥1 specialty + an attachment to a cert entry FIRST, then this dumps the nested structure. READ-ONLY — no minimize. Findings: [NESTED-RECON] in the SW console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_GENERIC_NESTED_RECON" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have closed — SW console has it all
+    if (resp.ok === false && resp.error === "no-nested") {
+      setStatus("No nested sections detected — add a specialty (and attachment) to a cert entry on the form, then re-run.");
+    } else if (resp.ok === false) {
+      setStatus("Nested recon failed: " + resp.error + " — see the service worker console.");
+    } else {
+      const ns = (resp.scan && resp.scan.nestedSections) || [];
+      const names = ns.map((s) => s.parentBase + "▸" + s.childBase).join(", ");
+      setStatus(`Nested recon done — depth ${resp.scan.maxDepth}; nested: ${names || "none"}; ${(resp.scan.fileUploads || []).length} attachment input(s). Paste the [NESTED-RECON] summary from the SW console.`);
+    }
+  });
+});
+
 // CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the nested Specialties
 // sub-section inside a Certification entry. Run on My Experience (page 2); minimize
 // within 60s. Findings land as [CERT-SPECIALTY-RECON] in the SW console.

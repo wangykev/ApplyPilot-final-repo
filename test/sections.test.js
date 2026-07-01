@@ -7,7 +7,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { parseRepeatingFkit } = require("../lib.js");
+const { parseRepeatingFkit, parseNestedFkit } = require("../lib.js");
 
 test("parseRepeatingFkit parses a real entry container → { base, index }", () => {
   assert.deepStrictEqual(parseRepeatingFkit("workExperience-3--null"), { base: "workExperience", index: 3 });
@@ -45,4 +45,24 @@ test("parseRepeatingFkit returns null for junk / non-fkit input", () => {
   assert.strictEqual(parseRepeatingFkit(null), null);
   assert.strictEqual(parseRepeatingFkit(undefined), null);
   assert.strictEqual(parseRepeatingFkit("formField-jobTitle"), null);
+});
+
+// parseNestedFkit — the multi-level parser behind NESTED repeating-section detection (cert →
+// specialties). Splits on "--"; each non-last segment is "<base>-<idx>"; the last is the field.
+test("parseNestedFkit parses a NESTED entry (parent ▸ child) — any depth", () => {
+  assert.deepStrictEqual(parseNestedFkit("certification-54--specialties-5--specialtyParent"),
+    { levels: [{ base: "certification", index: 54 }, { base: "specialties", index: 5 }], field: "specialtyParent" });
+  // 3 levels deep
+  assert.deepStrictEqual(parseNestedFkit("a-1--b-2--c-3--someField"),
+    { levels: [{ base: "a", index: 1 }, { base: "b", index: 2 }, { base: "c", index: 3 }], field: "someField" });
+});
+test("parseNestedFkit: a top-level entry/field is depth 1 (levels.length === 1)", () => {
+  assert.strictEqual(parseNestedFkit("certification-0--null").levels.length, 1);
+  assert.strictEqual(parseNestedFkit("workExperience-3--startDate").levels.length, 1);
+});
+test("parseNestedFkit EXCLUDES non-repeating fkits (a level that isn't <base>-<idx>)", () => {
+  assert.strictEqual(parseNestedFkit("phoneNumber--null"), null); // "phoneNumber" has no -<idx>
+  assert.strictEqual(parseNestedFkit("formField-jobTitle"), null); // no "--"
+  assert.strictEqual(parseNestedFkit(""), null);
+  assert.strictEqual(parseNestedFkit(null), null);
 });

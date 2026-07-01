@@ -697,6 +697,73 @@ function cdpGenericRepeatingScan() {
   };
 }
 
+// GENERIC NESTED-SECTION RECON (read-only): detect repeating sections NESTED inside repeating entries
+// (cert → Specialties + Attachments) WITHOUT hardcoding names, for ANY depth. The generic key: a
+// data-fkit-id is a "--"-joined path of "<base>-<idx>" levels + a trailing field (or "null" = an
+// entry container). "certification-54--specialties-5--specialtyParent" → parent certification[54] →
+// nested specialties[5] → field specialtyParent (depth 2). Dumps, per nested section: parent▸child,
+// entry count, a representative entry's fields (widget/label/required/dates/entry-scoped wrapperSel),
+// the container-prefix pattern, PLUS file-upload (attachment) inputs + Add buttons scoped INSIDE a
+// repeating entry (the per-entry nested Add anchors). NO actuation — pure read.
+function cdpGenericNestedScan() {
+  const labelOf = (w) => { const lg = w.querySelector("legend"); if (lg && lg.textContent.trim()) return lg.textContent.trim().slice(0, 60); for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); } return null; };
+  const classify = (w) => {
+    if (w.querySelector('input[type="file"]')) return "file_upload";
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => { const t = (el.getAttribute("type") || "").toLowerCase(); return t === "" || ["text", "email", "tel", "number", "url"].includes(t); });
+    if (textLike.length === 1) return "text";
+    return "unknown";
+  };
+  const isHashed = (fn) => /[0-9a-f]{8}/i.test(fn) || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(fn);
+  const dateSegsOf = (w) => Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]')).map((s) => s.getAttribute("data-automation-id")).filter(Boolean);
+  const requiredOf = (w) => { for (const a of w.querySelectorAll("abbr")) { const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || ""); if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true; } if (w.querySelector('[aria-required="true"],[data-required="true"]')) return true; const le = w.querySelector("legend") || w.querySelector("label"); if (le && /\*\s*$/.test((le.textContent || "").trim())) return true; return false; };
+  const nearestHeading = (el) => { let p = el; for (let i = 0; i < 12 && p; i++) { let s = p.previousElementSibling; while (s) { if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 60); } const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]'); if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 60); } s = s.previousElementSibling; } p = p.parentElement; } return null; };
+  // Parse a fkit into { levels: [{base,idx}...], field }. "--"-joined; each non-last segment is
+  // "<base>-<idx>"; the last is the field ("null" = the level's entry container). Handles ANY depth.
+  const parseFkit = (id) => {
+    const parts = String(id || "").split("--");
+    if (parts.length < 2) return null;
+    const field = parts[parts.length - 1];
+    const levels = [];
+    for (let i = 0; i < parts.length - 1; i++) { const m = /^(.+)-(\d+)$/.exec(parts[i]); if (!m) return null; levels.push({ base: m[1], idx: parseInt(m[2], 10) }); }
+    return { levels, field };
+  };
+  let maxDepth = 0;
+  const nested = {}; // "parent ▸ child" → { parentBase, childBase, depth, entries: { idxpath → {path, fields[]} } }
+  for (const el of Array.from(document.querySelectorAll("[data-fkit-id]"))) {
+    const p = parseFkit(el.getAttribute("data-fkit-id"));
+    if (!p) continue;
+    if (p.levels.length > maxDepth) maxDepth = p.levels.length;
+    if (p.levels.length < 2) continue; // NESTED only (depth ≥ 2)
+    const parent = p.levels[0], child = p.levels[p.levels.length - 1];
+    const key = parent.base + " ▸ " + child.base;
+    const g = (nested[key] = nested[key] || { parentBase: parent.base, childBase: child.base, depth: p.levels.length, entries: {} });
+    const ek = p.levels.map((l) => l.idx).join("|");
+    const ent = (g.entries[ek] = g.entries[ek] || { path: p.levels.map((l) => l.base + "[" + l.idx + "]").join(" / "), fields: [] });
+    if (p.field && p.field !== "null") {
+      const id = el.getAttribute("data-fkit-id");
+      const ff = el.querySelector('[data-automation-id="formField-' + p.field + '"]') || el;
+      ent.fields.push({ field: p.field, widgetType: classify(ff), label: labelOf(ff), isRequired: requiredOf(ff), hashedId: isHashed(p.field), dateSegments: dateSegsOf(ff), wrapperSel: '[data-fkit-id="' + id + '"] [data-automation-id="formField-' + p.field + '"]' });
+    }
+  }
+  const nestedSections = Object.keys(nested).map((k) => {
+    const g = nested[k]; const eks = Object.keys(g.entries); const rep = g.entries[eks[0]];
+    return { parentBase: g.parentBase, childBase: g.childBase, depth: g.depth, containerPattern: g.parentBase + "-<N>--" + g.childBase + "-<M>--<field>", entryCount: eks.length, samplePath: rep ? rep.path : null, sampleFields: rep ? rep.fields : [] };
+  });
+  const enclosing = (el) => { const f = el.closest("[data-fkit-id]"); return f ? f.getAttribute("data-fkit-id") : null; };
+  const fileUploads = Array.from(document.querySelectorAll('input[type="file"], [data-automation-id="select-files"], [data-automation-id^="file-upload"]'))
+    .map((el) => ({ automationId: el.getAttribute("data-automation-id") || el.type, heading: nearestHeading(el), enclosingFkit: enclosing(el) }))
+    .filter((u) => u.enclosingFkit); // only file inputs INSIDE a repeating entry (nested attachments)
+  const addButtons = Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
+    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), heading: nearestHeading(b), enclosingFkit: enclosing(b) }))
+    .filter((a) => a.enclosingFkit); // Add buttons INSIDE a repeating entry = nested-section Add anchors
+  return { url: location.href, maxDepth, nestedSections, fileUploads, addButtons };
+}
+
 // M36.2 — read-only structure dump of the Certifications entries, for the NESTED
 // Specialties sub-section recon. Per cert entry (`certification-N--null`): ALL
 // descendant `data-fkit-id`s (raw — a mounted specialty's container surfaces here,

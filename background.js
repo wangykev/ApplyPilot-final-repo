@@ -55,6 +55,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // GENERIC NESTED-SECTION RECON: READ-ONLY dump of repeating-sections-inside-repeating-entries
+  // (cert → Specialties + Attachments) via the multi-level data-fkit-id parse — for ANY depth,
+  // no hardcoded names. Add ≥1 specialty + an attachment on the form first. [NESTED-RECON].
+  if (message.type === "RUN_CDP_GENERIC_NESTED_RECON") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpGenericNestedRecon(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   if (message.type === "RUN_CDP_REPEAT_RECON") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
@@ -1647,6 +1660,40 @@ async function runCdpQuestionsRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("questions recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// GENERIC NESTED-SECTION RECON — READ-ONLY. Dumps repeating-sections-inside-repeating-entries (cert
+// → Specialties + Attachments) via cdpGenericNestedScan's multi-level data-fkit-id parse (any depth,
+// no hardcoded names). No actuation — run on page 2 AFTER manually adding ≥1 specialty + an attachment
+// to a cert entry (an empty nested section has no field nodes to detect). [NESTED-RECON] in the SW console.
+async function runCdpGenericNestedRecon(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][NESTED-RECON]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached (READ-ONLY — no actuation, tab can stay VISIBLE). Add ≥1 specialty + an attachment to a cert entry on the form FIRST, then this dumps the nested structure. Scanning…");
+    const scan = await cdpEval(cdpGenericNestedScan);
+    if (!scan) { LOG("scan failed (no result)."); return { ok: false, error: "scan-failed" }; }
+    LOG("url:", scan.url, "| max fkit nesting depth:", scan.maxDepth);
+    if (!scan.nestedSections.length) {
+      LOG("⚠ NO nested repeating sections detected. Open a cert entry, click Add under Specialties (and add an Attachment), then re-run — an empty nested section has no field nodes to detect.");
+      return { ok: false, error: "no-nested", scan };
+    }
+    for (const ns of scan.nestedSections) {
+      LOG(`── NESTED: ${ns.parentBase} ▸ ${ns.childBase} (depth ${ns.depth}) — ${ns.entryCount} entr(y/ies) | container pattern: ${ns.containerPattern}`);
+      console.log("[ApplyPilot][NESTED-RECON]", ns.parentBase + "▸" + ns.childBase, "sample entry:", ns.samplePath, "\nfields:", JSON.stringify(ns.sampleFields, null, 2));
+    }
+    LOG("ATTACHMENTS (file inputs inside a repeating entry):", JSON.stringify(scan.fileUploads, null, 2));
+    LOG("NESTED Add buttons (Add scoped inside a repeating entry — per-entry nested Add anchors):", JSON.stringify(scan.addButtons, null, 2));
+    LOG("done — READ-ONLY. Generic key: fkit split on '--' → <base>-<idx> levels + a trailing field; depth ≥ 2 = a nested repeating section (no hardcoded names).");
+    return { ok: true, scan };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("nested recon aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();

@@ -57,6 +57,26 @@ function parseRepeatingFkit(fkitId) {
   return { base: m[1], index: parseInt(m[2], 10) };
 }
 
+// Parse a data-fkit-id into its full NESTED repeating PATH — a "--"-joined sequence of "<base>-<idx>"
+// levels + a trailing field ("null" = the deepest level's entry container). Generic for ANY depth: it's
+// the basis for detecting repeating-sections-inside-repeating-entries (cert → specialties →
+// "certification-54--specialties-5--specialtyParent" = [{certification,54},{specialties,5}], field
+// "specialtyParent"). Returns { levels:[{base,index}], field } or null (not a repeating fkit — e.g. a
+// lone "phoneNumber--null", whose first segment isn't "<base>-<idx>"). levels.length === depth; depth ≥ 2
+// = NESTED. LOCKSTEP: cdp.js cdpGenericNestedScan inlines this same split-on-"--" + /^(.+)-(\d+)$/ parse.
+function parseNestedFkit(fkitId) {
+  const parts = String(fkitId == null ? "" : fkitId).trim().split("--");
+  if (parts.length < 2) return null;
+  const field = parts[parts.length - 1];
+  const levels = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    const m = /^(.+)-(\d+)$/.exec(parts[i]);
+    if (!m) return null;
+    levels.push({ base: m[1], index: parseInt(m[2], 10) });
+  }
+  return { levels, field };
+}
+
 // Convenience wrapper for work_experience (entries with a job title or company).
 function meaningfulWorkExperience(arr) {
   return meaningfulEntries(arr, ["job_title", "company"]);
@@ -364,5 +384,5 @@ function languageDeletionPlan(entries) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
 }
