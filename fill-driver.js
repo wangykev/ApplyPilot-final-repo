@@ -3242,7 +3242,11 @@ async function reconcileAudit(act, entries, budgets, opts) {
 // apply the verdicts back to the results in place (a mismatch downgrades to needs_review).
 function auditEntriesFromResults(results) {
   return (results || [])
-    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc)
+    // Audit only fields the BOT actuated. An "already-filled" record (an UNKNOWN section's existing
+    // entry, surfaced read-only) was never touched by the bot — there's nothing to reconcile, and
+    // auditing it MIS-reconciles (e.g. a checkbox re-read returns a boolean vs the "Yes" expected →
+    // the inline re-fill toggles it OFF — the live "fluent checkbox unchecked" bug). Skip it.
+    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc && r.flag !== "already-filled")
     .map((r) => ({ key: r.fieldName, widgetType: r.widgetType, auditLoc: r.auditLoc, auditTag: r.auditTag || null, expected: r.after }));
 }
 function applyAuditVerdicts(results, verdicts) {

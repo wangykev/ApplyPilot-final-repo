@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, PAGE_SECTIONS, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2833,6 +2833,19 @@ test("driveRepeatingSectionCdp: NO section.nested → no nested emit (WE/Educati
 test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested config", () => {
   assert.strictEqual(PAGE_SECTIONS.find((s) => s.name === "certification").nested, CERT_NESTED);
   assert.strictEqual(PAGE_SECTIONS.filter((s) => s.nested).length, 1);
+});
+
+test("audit: 'already-filled' surfaced records are NOT audited (the fluent-checkbox uncheck bug)", () => {
+  // The M40 audit is the LAST thing on the page. An "already-filled" record (unknown-section existing
+  // entry, surfaced read-only) must be SKIPPED — auditing a checkbox whose expected is "Yes" vs a
+  // boolean re-read mismatches → the inline re-fill toggles it OFF. A truly bot-filled field IS audited.
+  const results = [
+    { fieldName: "language[0].fluent", widgetType: "checkbox", status: "filled_review", flag: "already-filled", after: "Yes", auditLoc: "SEL" },
+    { fieldName: "country", widgetType: "dropdown", status: "filled_review", flag: "autocommit-containment", after: "United States", auditLoc: "SEL2" },
+  ];
+  const entries = auditEntriesFromResults(results);
+  assert.ok(!entries.some((e) => e.key === "language[0].fluent"), "already-filled is NOT audited (bot never touched it)");
+  assert.ok(entries.some((e) => e.key === "country"), "a genuinely bot-filled field IS still audited");
 });
 
 test("generic UNKNOWN section: existing entries surface as 'already-filled' (values + recon'd dropdown options)", async () => {
