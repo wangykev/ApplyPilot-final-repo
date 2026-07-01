@@ -2852,26 +2852,27 @@ test("generic UNKNOWN section: existing entries surface as 'already-filled' (val
   // A repeating section not in PAGE_SECTIONS (here "language-") with an existing entry. The bot has no
   // mapping, so it never fills it — but the entry must SHOW in review with its current value, flagged
   // "already on the form, not ApplyPilot-filled", and its dropdown options recon'd so the summary can edit it.
-  const langField = { wrapperSel: "L0", fieldName: "language", widgetType: "dropdown", label: "Language*", isRequired: false,
-    options: [{ text: "Select One", disabled: true }, { text: "English" }, { text: "Spanish" }], triggerText: "English" };
+  // use a prefix NOT in PAGE_SECTIONS ("publication-") so it's genuinely unknown (Languages is known again).
+  const catField = { wrapperSel: "C0", fieldName: "category", widgetType: "dropdown", label: "Category*", isRequired: false,
+    options: [{ text: "Select One", disabled: true }, { text: "Alpha" }, { text: "Beta" }], triggerText: "Alpha" };
   const rscan = { url: "fake://p2", addButtons: [], sections: {
-    "language-": { entryCount: 1, heading: "Languages", entries: [{ fields: [
-      { fieldName: "language", widgetType: "dropdown", label: "Language*", isRequired: true, value: "English", wrapperSel: "L0" }
+    "publication-": { entryCount: 1, heading: "Publications", entries: [{ fields: [
+      { fieldName: "category", widgetType: "dropdown", label: "Category*", isRequired: true, value: "Alpha", wrapperSel: "C0" }
     ] }] }
   } };
-  const out = await drivePageFill(makeFakeAct([langField], { rscan }), {}, {}, {}, T_BUDGETS);
-  const rec = out.results.find((r) => r.fieldName === "language[0].language");
+  const out = await drivePageFill(makeFakeAct([catField], { rscan }), {}, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "publication[0].category");
   assert.ok(rec, "existing entry field surfaced");
   assert.strictEqual(rec.flag, "already-filled");
   assert.strictEqual(rec.status, "filled_review", "surfaced for review (not silently trusted, not bot-filled)");
-  assert.strictEqual(rec.after, "English", "current value read from the form");
+  assert.strictEqual(rec.after, "Alpha", "current value read from the form");
   assert.match(rec.detail, /not filled by ApplyPilot/i);
-  assert.ok(Array.isArray(rec.options) && rec.options.includes("English") && rec.options.includes("Spanish"), "dropdown options recon'd → editable in the summary");
-  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "language[0].language");
-  assert.ok(be && be.needs_review && be.current_value === "English", "in the bundle: needs_review + current_value = the existing value");
-  const stub = out.results.find((r) => r.widgetType === "section_stub" && r.fieldName === "language");
-  assert.ok(stub && stub.section_heading === "Languages", "section stub under the REAL DOM heading");
-  assert.ok(stub.section_field_shape.some((s) => Array.isArray(s.options) && s.options.includes("English")), "stub shape carries recon'd options for add-entry");
+  assert.ok(Array.isArray(rec.options) && rec.options.includes("Alpha") && rec.options.includes("Beta"), "dropdown options recon'd → editable in the summary");
+  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "publication[0].category");
+  assert.ok(be && be.needs_review && be.current_value === "Alpha", "in the bundle: needs_review + current_value = the existing value");
+  const stub = out.results.find((r) => r.widgetType === "section_stub" && r.fieldName === "publication");
+  assert.ok(stub && stub.section_heading === "Publications", "section stub under the REAL DOM heading");
+  assert.ok(stub.section_field_shape.some((s) => Array.isArray(s.options) && s.options.includes("Alpha")), "stub shape carries recon'd options for add-entry");
 });
 
 test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the backend identifier (m3a)", async () => {
