@@ -103,8 +103,14 @@
       .nsub-name { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--muted); }
       .nsub-note { font-size: 10.5px; color: var(--muted-2); margin: 2px 0 4px; }
       .nsub-eh { display: flex; align-items: center; gap: 8px; padding: 4px 0 1px; }
-      .nsub-eh span { font-size: 9.5px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted-2); }
+      /* only the ENTRY-LABEL span — NOT the delete button's inner span (which would inherit
+         uppercase/bold and read "REMOVE"). Direct-child selector keeps the button normal. */
+      .nsub-eh > span { font-size: 9.5px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted-2); }
       .nsub .add-entry { margin: 4px 0 2px 0; }
+      .file-attach { display: flex; align-items: center; gap: 8px; }
+      .file-btn { appearance: none; border: 1px solid var(--line); background: var(--surface-2); color: var(--accent); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 11px; font-weight: 560; }
+      .file-btn:hover { border-color: var(--accent); }
+      .file-status { font-size: 11px; color: var(--muted); }
       .date-seg { display: inline-flex; align-items: center; gap: 2px; }
       /* input.date-part (0,0,1,1) beats .editor's width:100% (0,0,1,0) regardless of source order —
          without this the later .editor rule wins and the boxes stay full-width. */
@@ -199,6 +205,7 @@
   </head>
   <body>
     <div class="app"><div id="root"></div></div>
+    <script src="db.js"></script>
     <script src="summary-lib.js"></script>
     <script src="summary.js"></script>
   </body>

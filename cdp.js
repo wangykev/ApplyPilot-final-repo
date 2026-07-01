@@ -781,7 +781,24 @@ function cdpGenericNestedScan() {
     seenAtt[u.enclosingFkit] = 1;
     nestedAttachments.push({ parentBase: am[1], parentIndex: parseInt(am[2], 10), enclosingFkit: u.enclosingFkit, heading: u.heading });
   }
-  return { url: location.href, maxDepth, nestedSections, parentOrder, nestedAttachments, fileUploads, addButtons };
+  // NESTED sub-section CONTAINERS — the ROBUST detector (empty OR not). A fkit
+  // "<parentBase>-<idx>--<childBase>" node that is NOT a field wrapper (has no
+  // formField-<childBase> descendant) and NOT an attachment area (no input[type=file]) is a repeating
+  // sub-section container (e.g. certification-287--specialties). Found even when EMPTY (no
+  // --<childBase>-<M>-- entries yet) and REGARDLESS of where its "Add" button sits (the addButtons
+  // enclosingFkit is often the parent's --null, which the fill can't key off). GENERIC — no names.
+  const nestedContainers = []; const seenNC = {};
+  for (const el of Array.from(document.querySelectorAll("[data-fkit-id]"))) {
+    const id = el.getAttribute("data-fkit-id") || "";
+    const m = /^(.+?)-(\d+)--([A-Za-z][A-Za-z0-9_]*)$/.exec(id);
+    if (!m || m[3] === "null" || seenNC[id]) continue;
+    const childBase = m[3];
+    if (el.querySelector('[data-automation-id="formField-' + childBase + '"]')) continue; // a FIELD wrapper (wraps its own formField) — not a sub-section
+    if (el.querySelector('input[type="file"]')) continue;                                  // an ATTACHMENT area — handled by nestedAttachments
+    seenNC[id] = 1;
+    nestedContainers.push({ parentBase: m[1], parentIndex: parseInt(m[2], 10), childBase, fkit: id, heading: nearestHeading(el) });
+  }
+  return { url: location.href, maxDepth, nestedSections, parentOrder, nestedAttachments, nestedContainers, fileUploads, addButtons };
 }
 
 // M36.2 — read-only structure dump of the Certifications entries, for the NESTED

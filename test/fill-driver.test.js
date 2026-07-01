@@ -3207,7 +3207,11 @@ test("nested recon happens DURING the fill (before the delete sweep) → an empt
   let children = [], nextIdx = 9;
   act.nestedScan = async () => ({
     parentOrder: { certification: state.entries.map((e) => parseInt((e.fkit.match(/-(\d+)--null/) || [])[1], 10)) },
-    addButtons: state.entries.length ? [{ text: "Add", heading: "Specialties", enclosingFkit: "certification-287--specialties" }] : [],
+    // the ROBUST detector: the sub-section CONTAINER fkit node (found even when empty). The Add's
+    // enclosingFkit here is the parent's --null (the real-world case that broke the old addButtons
+    // detection) → detection MUST come from nestedContainers, not the Add.
+    nestedContainers: state.entries.length ? [{ parentBase: "certification", parentIndex: 287, childBase: "specialties", fkit: "certification-287--specialties", heading: "Specialties" }] : [],
+    addButtons: state.entries.length ? [{ text: "Add", heading: "Specialties", enclosingFkit: "certification-287--null" }] : [],
     nestedAttachments: [],
     nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
       entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: SPECIALTY_FIELDS })) }] : [],

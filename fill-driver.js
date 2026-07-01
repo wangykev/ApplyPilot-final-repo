@@ -2848,23 +2848,34 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     let nscan = null;
     try { nscan = await act.nestedScan(); } catch (e) { return; }
     if (!nscan) return;
-    const esc = parentBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp("^" + esc + "-(\\d+)--([A-Za-z][A-Za-z0-9_]*)$"); // an inside Add's enclosingFkit "<parentBase>-<idx>--<childBase>"
     const containers = {}; // childBase → { fkitIndex, heading }
+    // PRIMARY: the robust fkit-node container detector (empty OR not, regardless of the Add's position).
+    for (const nc of (nscan.nestedContainers || [])) {
+      if (nc.parentBase !== parentBase) continue;
+      if (!(nc.childBase in containers)) containers[nc.childBase] = { fkitIndex: nc.parentIndex, heading: nc.heading || nc.childBase };
+    }
+    // FALLBACK: parse an inside Add's enclosingFkit "<parentBase>-<idx>--<childBase>" (older scans).
+    const esc = parentBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("^" + esc + "-(\\d+)--([A-Za-z][A-Za-z0-9_]*)$");
     for (const b of (nscan.addButtons || [])) {
       const m = re.exec((b && b.enclosingFkit) || "");
-      if (!m || m[2] === "null") continue;
-      if (!(m[2] in containers)) containers[m[2]] = { fkitIndex: parseInt(m[1], 10), heading: (b && b.heading) || m[2] };
+      if (!m || m[2] === "null" || (m[2] in containers)) continue;
+      containers[m[2]] = { fkitIndex: parseInt(m[1], 10), heading: (b && b.heading) || m[2] };
     }
     nestedHasAttachments = (nscan.nestedAttachments || []).some((a) => a && a.parentBase === parentBase);
-    for (const childBase of Object.keys(containers)) {
+    const cbKeys = Object.keys(containers);
+    if (cbKeys.length || nestedHasAttachments) console.log("[ApplyPilot][nested]", name, "→ sub-sections", JSON.stringify(cbKeys), "| attachments:", nestedHasAttachments);
+    for (const childBase of cbKeys) {
       const key = parentBase + "__" + childBase;
-      if (Array.isArray(cachedNested[key]) && cachedNested[key].length) { nestedShapes[childBase] = cachedNested[key]; continue; } // cross-run cache hit → NO probe
+      if (Array.isArray(cachedNested[key]) && cachedNested[key].length) { nestedShapes[childBase] = cachedNested[key]; console.log("[ApplyPilot][nested]", childBase, "shape from cache (no probe)"); continue; } // cross-run cache hit → NO probe
       const c = containers[childBase];
       const parentFkit = parentBase + "-" + c.fkitIndex + "--null";
-      const escaped = String(c.heading).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const revealed = await revealNestedShape(act, parentFkit, parentBase, childBase, escaped, budgets);
-      if (revealed && revealed.shape.length) nestedShapes[childBase] = revealed.shape;
+      // Match the Add by a child-base STEM (strip the plural) — robust vs the Add's exact heading/position.
+      const stem = String(childBase).replace(/ies$/i, "").replace(/s$/i, "").slice(0, 8) || childBase;
+      console.log("[ApplyPilot][nested] reveal-by-add probing", childBase, "in", parentFkit, "(Add heading ~/" + stem + "/i)");
+      const revealed = await revealNestedShape(act, parentFkit, parentBase, childBase, stem, budgets);
+      if (revealed && revealed.shape.length) { nestedShapes[childBase] = revealed.shape; console.log("[ApplyPilot][nested] reveal OK", childBase, "→", JSON.stringify(revealed.shape.map((s) => s.recName + ":" + s.widget_type + (s.options ? "(" + s.options.length + " opts)" : "")))); }
+      else console.log("[ApplyPilot][nested] reveal FAILED for", childBase, "— mount didn't register or no Add matched /" + stem + "/i (paste the NESTED recon addButtons)");
     }
   };
 

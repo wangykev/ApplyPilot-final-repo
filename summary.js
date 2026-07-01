@@ -137,6 +137,13 @@ const setApproved = (entry, on) => {
 let updateApprovalUI = () => {};
 
 // A 13px trash glyph (SVG via createElementNS — el() is textContent-only by design).
+// Read a picked File → base64 (strip the "data:...;base64," prefix) for IndexedDB storage (db.js).
+const fileToBase64 = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => { const s = String(r.result || ""); resolve(s.slice(s.indexOf(",") + 1)); };
+  r.onerror = () => reject(r.error);
+  r.readAsDataURL(file);
+});
 const svgTrash = () => {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
@@ -438,7 +445,28 @@ function buildEditor(entry) {
     render();
     return { node: wrap, set: () => {}, tier: true };
   };
-  if (wt === "file_upload") return null;
+  if (wt === "file_upload") {
+    // A per-entry attachment the FORM offers (detected, flag "nested-attachment") → a real "Choose
+    // file…" picker; the chosen file is stored (base64 in IndexedDB, keyed per field) so a future
+    // fill-back attaches it, and current_value = the filename (marks it provided). The top-level
+    // resume / Documents stay display-only here (that's uploaded via the popup).
+    if (entry.flag !== "nested-attachment") return null;
+    const wrap = el("div", { class: "file-attach" });
+    const status = el("span", { class: "file-status", text: cur ? ("✓ " + cur) : "no file chosen" });
+    const inp = el("input", { type: "file" }); inp.style.display = "none";
+    const btn = el("button", { class: "file-btn", text: "Choose file…" });
+    btn.addEventListener("click", () => inp.click());
+    inp.addEventListener("change", async () => {
+      const f = inp.files && inp.files[0]; if (!f) return;
+      try {
+        const base64 = await fileToBase64(f);
+        if (typeof saveResume === "function") await saveResume({ key: "attachment:" + entry.canonical_field, filename: f.name, mime: f.type, size: f.size, base64, savedAt: new Date().toISOString() });
+      } catch (e) { /* storage best-effort — the filename still records the intent */ }
+      onCommit(f.name); status.textContent = "✓ " + f.name;
+    });
+    wrap.appendChild(btn); wrap.appendChild(status); wrap.appendChild(inp);
+    return { node: wrap, set: (v) => { status.textContent = v ? ("✓ " + v) : "no file chosen"; } };
+  }
   if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
   if (wt === "nested_section_stub") return null; // nested sub-section header → rendered by renderNestedSub, never a field row
   // TREE-AI (cert): the recon captured the chosen category's leaves → a searchable editor over them
