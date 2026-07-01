@@ -1905,3 +1905,15 @@ dispatch runs the unified filler with NO candidates → the inline AI has no sta
 and FORCES a pick (required never declines) + flags. Flat loop + `fillEntryCdp`. AI OFF / OPTIONAL → still `skipped`.
 
 315 unit tests; live-verified on Magna. Committed `ad1b34c` (merge) + the follow-ups.
+
+**2026-07-01 — Workday PLATFORM maintenance page (`community.workday.com/maintenance-page`) — observed, + a start-of-fill wiring gap to close.**
+A CDP page-recon (`RUN_CDP_PAGE_RECON`) landed on `https://community.workday.com/maintenance-page?d=3&s=1&e=1&o=`. **Note the HOST: `community.workday.com`** (the Workday platform), NOT the tenant's `*.myworkdayjobs.com` — a whole-platform outage, not a tenant page. Observed:
+- title & H2 = `"Workday is currently unavailable."`; `readyState: complete`; **httpStatus(nav) = 200** (status is useless — same lesson as the 2026-06-27 planned-maintenance page; a maintenance page is NOT 503).
+- **0 form fields, 0 distinct automation-ids**, no password field.
+- MARKERS `{apology:true, maintenance:true, workdayAdmin:true, noForm:true, login:false, sessionExpired:false, vpsError:false}`.
+- body: *"…We are experiencing a service interruption. Your service will be restored as quickly as possible. We apologize for the inconvenience. If you are a Workday customer and require additional assistance please contact the Workday Administrator within your organization. Otherwise, please check back later. © 2026 Workday, Inc."*
+
+This is a **TRANSIENT retry-later** state (like the 2026-06-27 planned-maintenance page), **NOT a dead session** — no re-login. `isWorkdayMaintenance(state)` (lib.js) ALREADY detects it (its `/workday is currently unavailable/i` branch + the `maintenancePresent` marker; unit-tested in `test/session.test.js`).
+
+**Gap (why the operator saw "some random error"):** `isWorkdayMaintenance` is wired ONLY into the WALK transition — `cdpWaitNextPage` / `runCdpWalk` (background.js ~4047/4118) — so it catches maintenance that appears *mid-walk*. It is NOT checked at the **START** of `runCdpFillPage` / `runCdpWalk` / the single-widget + section harnesses. So STARTING a fill on an already-maintenance page (0 form fields) runs the fill logic against an empty page → downstream errors instead of a clean halt.
+**TODO (future handler):** at the start of every CDP entry point (`runCdpFillPage`, `runCdpWalk`, the section/single-widget harnesses), read the identity/session state ONCE (`cdpReadSessionState`) and, if `isWorkdayMaintenance(state)`, **HALT immediately with a clear "Workday is under maintenance — retry later" status (zero actuation)** — the same treatment the walk already gives a mid-transition maintenance page. (Also consider: the recon is read-only and already surfaces this; the fill path just needs the same up-front gate before it touches the DOM.)
