@@ -11,6 +11,7 @@ import {
   Cable,
   ListChecks,
   Activity,
+  BarChart3,
   LogOut,
 } from "lucide-react";
 import { LogoMark } from "@/components/Logo";
@@ -23,12 +24,11 @@ const PRIMARY = [
   { href: "/app/job", label: "Job context", icon: Briefcase },
   { href: "/app/ai", label: "AI", icon: Sparkles },
   { href: "/app/connect", label: "Connect", icon: Cable },
+  { href: "/app/queue", label: "Queue", icon: ListChecks },
+  { href: "/app/tracker", label: "Tracker", icon: Activity },
 ];
 
-const SOON = [
-  { label: "Queue", icon: ListChecks },
-  { label: "Tracker", icon: Activity },
-];
+const SOON = [{ label: "Analytics", icon: BarChart3 }];
 
 export function Sidebar({ email }: { email: string }) {
   const pathname = usePathname();

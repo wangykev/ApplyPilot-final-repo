@@ -1,5 +1,14 @@
 import Link from "next/link";
-import { FileText, IdCard, Briefcase, Sparkles, Cable, ArrowRight } from "lucide-react";
+import {
+  FileText,
+  IdCard,
+  Sparkles,
+  Cable,
+  ListChecks,
+  Activity,
+  BarChart3,
+  ArrowRight,
+} from "lucide-react";
 import { PageHeader } from "@/components/app/PageHeader";
 
 const SETUP = [
@@ -63,18 +72,36 @@ export default function OverviewPage() {
         ))}
       </div>
 
-      <div className="rounded-xl border border-dashed border-hairline p-6">
-        <div className="flex items-center gap-2">
-          <Briefcase className="h-4 w-4 text-ink-faint" strokeWidth={1.75} />
-          <span className="font-mono text-[11px] uppercase tracking-label text-ink-faint">
-            Coming soon
+      <div>
+        <p className="eyebrow">Run &amp; track</p>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <Link href="/app/queue" className="group bezel flex flex-col p-6 transition-colors hover:border-amber/40">
+            <ListChecks className="h-5 w-5 text-amber" strokeWidth={1.75} />
+            <h2 className="mt-4 font-display text-lg font-medium">Job queue</h2>
+            <p className="mt-2 flex-1 text-sm leading-relaxed text-ink-dim">
+              Line up Workday links and let the extension work through them, one fill → review at a time.
+            </p>
+            <span className="mt-4 inline-flex items-center gap-1.5 text-sm text-ink-dim transition-colors group-hover:text-amber">
+              Open <ArrowRight className="h-3.5 w-3.5" />
+            </span>
+          </Link>
+          <Link href="/app/tracker" className="group bezel flex flex-col p-6 transition-colors hover:border-amber/40">
+            <Activity className="h-5 w-5 text-amber" strokeWidth={1.75} />
+            <h2 className="mt-4 font-display text-lg font-medium">Tracker</h2>
+            <p className="mt-2 flex-1 text-sm leading-relaxed text-ink-dim">
+              Every application in one place — status, needs-review count, and your pipeline stage.
+            </p>
+            <span className="mt-4 inline-flex items-center gap-1.5 text-sm text-ink-dim transition-colors group-hover:text-amber">
+              Open <ArrowRight className="h-3.5 w-3.5" />
+            </span>
+          </Link>
+        </div>
+        <div className="mt-4 flex items-center gap-2 rounded-xl border border-dashed border-hairline px-6 py-4">
+          <BarChart3 className="h-4 w-4 text-ink-faint" strokeWidth={1.75} />
+          <span className="text-sm text-ink-dim">
+            Analytics — response rates and pipeline charts — is coming next.
           </span>
         </div>
-        <p className="mt-3 max-w-2xl text-sm leading-relaxed text-ink-dim">
-          A job queue and an application tracker land next: paste Workday links, watch the extension
-          work through them, and see every application — queued, filled, needs-review, submitted — in
-          one place.
-        </p>
       </div>
     </div>
   );

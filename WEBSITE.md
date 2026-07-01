@@ -153,8 +153,8 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 
 ## Roadmap (phased — architected now, built per phase)
 
-- **v1 (in progress)** — auth · resume upload + AI parse · profile editor · job context · AI config · **extension auto-sync**. The core "upload your resume and feed the extension" loop.
-- **P2** — Tracker + Queue: applications dashboard (status lights), pasted-URL queue, extension→backend report POST, queue pull endpoint.
+- **v1 (done)** — auth · resume upload + AI parse · profile editor · job context · AI config · **extension auto-sync**. The core "upload your resume and feed the extension" loop.
+- **P2 (done)** — Tracker + Queue: `/app/queue` (paste Workday URLs → `queue_items`, manage) + `GET /api/extension/queue` (ingest-key pull); `/app/tracker` (applications list, stats strip, status lights, pipeline-stage select, filters) fed by `POST /api/extension/report`. Queue + Tracker promoted to live sidebar nav; dashboard updated; Analytics now the "coming soon" item. A hard-gated `DEV_PREVIEW` sample dataset makes both demoable pre-Supabase.
 - **P3** — Hosted review summaries: React port of `summary.js` over the `reviewSummary` schema; extension pushes the bundle; edits write back.
 - **P4** — Analytics dashboard + pipeline stages + reminders.
 - **P5** — AI-tailored resume variants + cover letter generation.
