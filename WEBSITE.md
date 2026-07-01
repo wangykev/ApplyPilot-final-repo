@@ -177,16 +177,23 @@ extension's discipline.
 
 ## Design directions (under review)
 
-Three landing-page directions to choose from at **`/designs`** (a switcher flips between them).
-The winner's design system propagates to the whole app.
-- **Flight deck** (`/designs/flight-deck`) — the current dark/amber instrument-panel identity.
-- **Spec sheet** (`/designs/spec-sheet`) — light editorial-precision; cool paper, Archivo display,
-  hairline rules, indigo accent, a "Fig. 1" datasheet figure.
-- **Console** (`/designs/console`) — minimal monospace; near-black, JetBrains Mono, monochrome with
-  status-color accents, a live terminal fill-session hero.
+Operator chose the **flight-deck** direction (dark + amber instrument panel). The set is now four
+variations on that DNA — same dark cockpit palette + amber "needs-review" accent, differing in
+typeface, layout, and logo. Compare at **`/designs`** (a switcher flips between them); the winner's
+system propagates to the whole app.
+- **Flight deck** (`/designs/flight-deck`) — the original: Space Grotesk, two-column hero with the
+  live fill-status panel, heading-indicator dial logo.
+- **Avionics** (`/designs/avionics`) — HUD: squared uppercase Chakra Petch, centered reticle-framed
+  layout, top status strip, attitude-indicator logo.
+- **Radar** (`/designs/radar`) — control tower: Sora, an animated radar-scope hero (blips = fields,
+  teal verified / amber review), concentric-rings logo.
+- **Cluster** (`/designs/cluster`) — dashboard: heavy Archivo, a bento grid of instrument tiles
+  (accuracy gauge, counters, field readout, submit-lock), grid-cell logo.
 
-Landing components live in `web/components/landings/`; routes under `web/app/designs/`. Each new
-direction is self-contained (literal hex + its own font) so it doesn't touch the flight-deck tokens.
+Landing components live in `web/components/landings/` (`*Landing.tsx` + `DesignSwitcher`); routes
+under `web/app/designs/`. The variants reuse the flight-deck Tailwind tokens and vary the display
+font via `--font-chakra` / `--font-sora` / `--font-archivo` (added in `app/layout.tsx`). *(The earlier
+light "spec-sheet" and mono "console" explorations were set aside once flight-deck was chosen.)*
 
 ## How to run (filled in as it's built)
 

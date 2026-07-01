@@ -4,21 +4,28 @@ import {
   IBM_Plex_Sans,
   IBM_Plex_Mono,
   Archivo,
-  JetBrains_Mono,
+  Chakra_Petch,
+  Sora,
 } from "next/font/google";
 import "./globals.css";
 
-// Extra families used only by the alternate design directions under /designs.
+// Extra display families used only by the flight-deck design variants under /designs.
 const archivo = Archivo({
   subsets: ["latin"],
   weight: ["400", "500", "600", "700", "800"],
   variable: "--font-archivo",
   display: "swap",
 });
-const jbMono = JetBrains_Mono({
+const chakra = Chakra_Petch({
   subsets: ["latin"],
-  weight: ["400", "500", "700"],
-  variable: "--font-jb-mono",
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-chakra",
+  display: "swap",
+});
+const sora = Sora({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700", "800"],
+  variable: "--font-sora",
   display: "swap",
 });
 
@@ -56,7 +63,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${display.variable} ${sans.variable} ${mono.variable} ${archivo.variable} ${jbMono.variable}`}
+      className={`${display.variable} ${sans.variable} ${mono.variable} ${archivo.variable} ${chakra.variable} ${sora.variable}`}
     >
       <body>{children}</body>
     </html>

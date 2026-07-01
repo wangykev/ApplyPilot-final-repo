@@ -1,11 +1,12 @@
 import Link from "next/link";
 
-export type DesignKey = "flight-deck" | "spec-sheet" | "console";
+export type DesignKey = "flight-deck" | "avionics" | "radar" | "cluster";
 
 export const DESIGNS: { key: DesignKey; label: string; href: string }[] = [
   { key: "flight-deck", label: "Flight deck", href: "/designs/flight-deck" },
-  { key: "spec-sheet", label: "Spec sheet", href: "/designs/spec-sheet" },
-  { key: "console", label: "Console", href: "/designs/console" },
+  { key: "avionics", label: "Avionics", href: "/designs/avionics" },
+  { key: "radar", label: "Radar", href: "/designs/radar" },
+  { key: "cluster", label: "Cluster", href: "/designs/cluster" },
 ];
 
 /** A neutral floating switcher so you can flip between the three directions.

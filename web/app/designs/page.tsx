@@ -8,26 +8,38 @@ const OPTIONS = [
   {
     href: "/designs/flight-deck",
     name: "Flight deck",
-    tag: "Dark · instrument panel",
-    desc: "Night cockpit. Amber 'needs-review' warning light, teal verified, a live fill-status panel. The autopilot/safety theme, literal.",
-    swatches: ["#0A0E14", "#FFB627", "#36D6A0", "#E6EDF5"],
+    tag: "The original · Space Grotesk",
+    desc: "The baseline you liked: two-column hero with the live fill-status instrument panel, heading-indicator dial logo.",
     font: "var(--font-display)",
+    accent: "#FFB627",
+    preview: "Aa",
   },
   {
-    href: "/designs/spec-sheet",
-    name: "Spec sheet",
-    tag: "Light · editorial precision",
-    desc: "ApplyPilot as a precision instrument's datasheet. Cool paper, heavy Archivo display, hairline rules, a single indigo accent, a labeled 'Fig. 1' figure.",
-    swatches: ["#F4F5F2", "#15171C", "#2B3CE0", "#0E7A52"],
+    href: "/designs/avionics",
+    name: "Avionics",
+    tag: "HUD · Chakra Petch",
+    desc: "Heads-up display. Squared, uppercase type; a centered layout framed by reticle brackets; a top status strip; an attitude-indicator logo.",
+    font: "var(--font-chakra)",
+    accent: "#5BD2FF",
+    preview: "AA",
+  },
+  {
+    href: "/designs/radar",
+    name: "Radar",
+    tag: "Control tower · Sora",
+    desc: "A live radar scope sweeps over every field it touches — verified in teal, flagged in amber. Rounded geometric type, concentric-rings logo.",
+    font: "var(--font-sora)",
+    accent: "#36D6A0",
+    preview: "Aa",
+  },
+  {
+    href: "/designs/cluster",
+    name: "Cluster",
+    tag: "Dashboard · Archivo",
+    desc: "A dense cockpit instrument cluster: a bento grid of tiles — accuracy gauge, counters, field readout, submit-lock. Heavy industrial type, grid-cell logo.",
     font: "var(--font-archivo)",
-  },
-  {
-    href: "/designs/console",
-    name: "Console",
-    tag: "Minimal · monospace",
-    desc: "A calm developer tool. Near-black, monochrome, JetBrains Mono throughout. The hero is a live terminal session of a fill run.",
-    swatches: ["#0A0A0B", "#E6E6E1", "#58C18E", "#E0A93B"],
-    font: "var(--font-jb-mono)",
+    accent: "#FFB627",
+    preview: "Aa",
   },
 ];
 
@@ -43,46 +55,40 @@ export default function DesignsGallery() {
         </div>
 
         <div className="mt-14">
-          <p className="eyebrow">Choose a direction</p>
+          <p className="eyebrow">Flight-deck family</p>
           <h1 className="mt-4 max-w-2xl font-display text-4xl font-semibold tracking-tight text-balance">
-            Three designs. Pick the one that feels right.
+            Four takes on the cockpit.
           </h1>
           <p className="mt-4 max-w-2xl leading-relaxed text-ink-dim">
-            Each is a complete landing page for the same product. Open any one, then use the switcher
-            at the top to flip between them. Tell me which wins and I&apos;ll apply it across the whole
-            app.
+            All share the dark instrument DNA and the amber &ldquo;needs-review&rdquo; accent you
+            liked — they differ in typeface, layout, and logo. Open any one, then use the switcher at
+            the top to flip between them. Tell me which wins and I&apos;ll apply it across the app.
           </p>
         </div>
 
-        <div className="mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="mt-12 grid gap-5 sm:grid-cols-2">
           {OPTIONS.map((o) => (
             <Link
               key={o.href}
               href={o.href}
               className="group bezel flex flex-col overflow-hidden transition-colors hover:border-amber/40"
             >
-              {/* palette band, doubling as a tiny preview of the design's mood */}
-              <div className="flex h-28 items-end" style={{ background: o.swatches[0] }}>
+              <div className="flex h-28 items-end bg-cockpit">
                 <div
-                  className="px-5 pb-4 text-2xl font-semibold"
-                  style={{ fontFamily: o.font, color: o.swatches[1] }}
+                  className="px-5 pb-4 text-3xl font-semibold text-ink"
+                  style={{ fontFamily: o.font }}
                 >
-                  Aa
-                  <span style={{ color: o.swatches[2] }}>.</span>
+                  {o.preview}
+                  <span style={{ color: o.accent }}>.</span>
                 </div>
               </div>
               <div className="flex flex-1 flex-col p-5">
                 <div className="flex items-center justify-between">
                   <h2 className="font-display text-lg font-medium text-ink">{o.name}</h2>
-                  <div className="flex gap-1">
-                    {o.swatches.map((s) => (
-                      <span
-                        key={s}
-                        className="h-3 w-3 rounded-full ring-1 ring-inset ring-white/10"
-                        style={{ background: s }}
-                      />
-                    ))}
-                  </div>
+                  <span
+                    className="h-3 w-3 rounded-full ring-1 ring-inset ring-white/10"
+                    style={{ background: o.accent }}
+                  />
                 </div>
                 <p className="mt-1 font-mono text-[10px] uppercase tracking-label text-ink-faint">
                   {o.tag}
