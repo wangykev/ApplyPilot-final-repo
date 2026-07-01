@@ -2998,6 +2998,36 @@ test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candid
   assert.ok(removed.every((r) => r.status === "skipped" && /entry deleted/.test(r.detail)));
 });
 
+test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a stub (recon + note), not vanished", async () => {
+  // Operator bug: when deleteOnNoMatch deletes the LAST entry the whole section disappeared from
+  // review (the "removed" recs are widgetType "section" → filtered from the bundle). Now the
+  // section stays VISIBLE as a section_stub with a "removed — no match" note, so the operator can
+  // still ADD an entry (the field-shape rides the stub) or verify.
+  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Alpha" }, { text: "Beta" }] }] });
+  const state = webState({ prefix: "certification-", entries: [mk("certification-1--null")] });
+  const fieldMap = [{ field: "x", widget: "dropdown", key: "x", path: "x" }];
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ x: "Zzz-nomatch" }], fieldMap, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  assert.strictEqual(await act.entryCount("certification-"), 0, "the only entry was deleted");
+  const stub = out.results.find((r) => r.widgetType === "section_stub");
+  assert.ok(stub, "the emptied deleteOnNoMatch section still surfaces as a section_stub");
+  assert.strictEqual(stub.fieldName, "certification");
+  assert.strictEqual(stub.flag, "section-stub");
+  assert.strictEqual(stub.container_prefix, "certification-"); // backend identifier for the future add-fill
+  assert.ok(Array.isArray(stub.section_field_shape) && stub.section_field_shape.length, "carries the field shape so add-entry works");
+  assert.match(stub.detail, /removed/i);
+  assert.match(stub.detail, /no option matched/i);
+  // ...and it must SURVIVE into the bundle (the "appear in review" requirement): the section_stub
+  // passes buildReviewBundle's filter while the "removed" recs (widgetType "section") are dropped.
+  const entries = buildReviewBundle(out.results, {}).entries;
+  assert.ok(entries.some((e) => e.widget_type === "section_stub" && /certification/.test(e.field_id || "")),
+    "the section_stub reaches the bundle → shows on the review page");
+  assert.ok(!entries.some((e) => /\.removed$/.test(e.field_id || "")), "the raw 'removed' ops do NOT show");
+});
+
 test("M38 Bug B1: a required pick failing TRANSIENTLY (options didn't render) is KEPT + needs_review, NOT deleted", async () => {
   // The live English/Chinese loss: the language dropdown didn't render deep in a long fold
   // → deleteOnNoMatch deleted VALID data. Now a transient/infra failure (NOT a genuine

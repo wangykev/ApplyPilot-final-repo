@@ -2738,6 +2738,17 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     confidence: null, flag: null, verified: null, after: null, detail
   });
 
+  // A section STUB — makes an EMPTY or FULLY-DELETED section still APPEAR in review + be addable.
+  // Carries the field shape (from the map) so add-entry can build a new entry; flag "section-stub".
+  const humanName = name.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+  const makeSectionStub = (label, detail) => ({
+    fieldName: name, label, widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
+    rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+    flag: "section-stub", verified: null, after: null, detail,
+    section_field_shape: (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({ recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path })),
+    container_prefix: containerPrefix, section_known: true
+  });
+
   // Poll the entry count off-loop until it moves in the wanted direction or a
   // ceiling (port of the in-tree 4s/150ms reconcile poll; SW-paced via act.delay).
   const pollCount = async (before, rose) => {
@@ -2803,21 +2814,10 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // "section_stub" widgetType PASSES buildReviewBundle's section filter (it drops only "section"
     // ops); canonical "<name>._stub" groups it under its section in the viewer; flag "section-stub"
     // → a gentle needs_review via deriveReview. (Page-engine twin is a deferred follow-on — CDP-first.)
-    const humanName = name.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
-    results.push({
-      fieldName: name, label: humanName + " — section present, no entries",
-      widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
-      rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
-      flag: "section-stub", verified: null, after: null,
-      detail: "no meaningful " + name + " entries to fill — the section is on the form but empty",
-      // 2b: the field SHAPE (from the fieldMap) so the review viewer can build a NEW entry for this
-      // EMPTY section (no existing entry to clone from). options/isRequired are unknown without a
-      // mounted entry → the viewer's editors degrade to text boxes (the form stays source of truth).
-      section_field_shape: (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({
-        recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path
-      })),
-      container_prefix: containerPrefix, section_known: true // m3a: uniform backend identifier
-    });
+    // SECTION STUB (Feature A) — the section is present but had no profile data → EMPTY. Surface a
+    // stub (carries the field shape so add-entry works) instead of dropping it silently.
+    results.push(makeSectionStub(humanName + " — section present, no entries",
+      "no meaningful " + name + " entries to fill — the section is on the form but empty"));
     return finalize(url);
   }
 
@@ -2858,6 +2858,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   // Sweep high→low so lower indices stay valid. OFF for Websites (text always fills if present).
   // A transient/infra pick failure is NOT deletable (kept + surfaced — Bug B1).
   if (deleteOnNoMatch) {
+    let removed = 0;
     for (let k = perEntry.length - 1; k >= 0; k--) {
       if (!perEntry[k].deletable) continue; // ok entries AND transient-fail entries are KEPT
       const before = await act.entryCount(containerPrefix);
@@ -2865,10 +2866,18 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       if (!clicked || !clicked.ok) continue; // can't delete — leave it (surfaces in review)
       const after = await pollCount(before, false);
       if (after < before) {
+        removed++;
         perEntry[k].recs = [sectionRec("[" + perEntry[k].idx + "].removed", name + " entry removed",
           "skipped", "a required pick didn't match an option → entry deleted (optional section)")];
       }
       await act.delay(budgets.interFieldMs);
+    }
+    // If deletion EMPTIED the section, it would VANISH from review (the removed recs are widgetType
+    // "section" → filtered out of the bundle). Keep the CATEGORY visible + addable, with a "removed —
+    // no match" note, so the operator can still add/verify (the recon's field shape rides the stub).
+    if (removed > 0 && (await act.entryCount(containerPrefix)) === 0) {
+      results.push(makeSectionStub(humanName + " — no entries (removed)",
+        removed + " entr" + (removed === 1 ? "y was" : "ies were") + " removed — no option matched what you entered. Add or verify here."));
     }
   }
 
