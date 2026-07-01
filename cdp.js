@@ -794,7 +794,8 @@ function cdpGenericNestedScan() {
     if (!m || m[3] === "null" || seenNC[id]) continue;
     const childBase = m[3];
     if (el.querySelector('[data-automation-id="formField-' + childBase + '"]')) continue; // a FIELD wrapper (wraps its own formField) — not a sub-section
-    if (el.querySelector('input[type="file"]')) continue;                                  // an ATTACHMENT area — handled by nestedAttachments
+    if (el.querySelector('input[type="file"]')) continue;                                  // an ATTACHMENT area (file input present) — handled by nestedAttachments
+    if (seenAtt[id] || /attachment/i.test(childBase)) continue;                             // …or the file input renders lazily (not present at scan) → exclude by fkit/name so it never becomes a bogus sub-section "box"
     seenNC[id] = 1;
     nestedContainers.push({ parentBase: m[1], parentIndex: parseInt(m[2], 10), childBase, fkit: id, heading: nearestHeading(el) });
   }

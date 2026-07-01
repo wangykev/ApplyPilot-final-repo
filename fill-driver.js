@@ -2211,6 +2211,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   let rscan = null;
   const runNestedShapes = {}; // nested sub-section shapes recon'd DURING the section fills (parentBase__childBase) — reused by the post-fold nested emit so it never re-probes; persisted to section_shapes for next-run cache
   const cachedShapesIn = (opts && opts.cachedShapes) || {};
+  // ONE up-front nested scan → which sections HAVE a nested sub-section (parentBase → [containers])
+  // + which have a per-entry attach field. Passed into each section so captureNestedShapes does NOT
+  // run its own page-wide nestedScan per section (the ~5s-per-section cost — a nestedScan is O(fkit
+  // nodes × querySelectors)). A section with NO nested container then does ZERO scanning.
+  let nscanUp = null;
+  try { if (!only && act.nestedScan) nscanUp = await act.nestedScan(); } catch (e) { /* no nested substrate → none */ }
+  const nestedByBase = {}, attachBases = {};
+  if (nscanUp) {
+    const push = (pb, c) => { const a = (nestedByBase[pb] = nestedByBase[pb] || []); if (!a.some((x) => x.childBase === c.childBase)) a.push(c); };
+    for (const nc of (nscanUp.nestedContainers || [])) push(nc.parentBase, nc);
+    for (const b of (nscanUp.addButtons || [])) { const m = /^(.+?)-(\d+)--([A-Za-z][A-Za-z0-9_]*)$/.exec((b && b.enclosingFkit) || ""); if (m && m[3] !== "null" && !/attachment/i.test(m[3])) push(m[1], { parentBase: m[1], parentIndex: parseInt(m[2], 10), childBase: m[3], heading: (b && b.heading) || m[3] }); }
+    for (const a of (nscanUp.nestedAttachments || [])) attachBases[a.parentBase] = true;
+  }
   try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
   if (!only && rscan && (rscan.sections || rscan.addButtons)) {
     for (const sec of PAGE_SECTIONS) {
@@ -2218,12 +2231,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const re = new RegExp(sec.headingRegex, "i");
       const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((b) => re.test((b && b.nearestHeading) || ""));
       if (!hasContainer && !hasAdd) continue; // section not on this page
+      const secBase = sec.containerPrefix.replace(/-$/, "");
       const items = Array.isArray(profile[sec.itemsKey]) ? profile[sec.itemsKey] : [];
       const out = await driveRepeatingSectionCdp(act, {
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
         items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
         aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
-        cachedShapes: cachedShapesIn // cross-run nested-shape cache → captureNestedShapes skips the probe on a hit
+        cachedShapes: cachedShapesIn, // cross-run nested-shape cache → captureNestedShapes skips the probe on a hit
+        nestedContainers: nestedByBase[secBase] || [], // up-front detection → NO per-section nestedScan
+        nestedAttachmentsPresent: !!attachBases[secBase]
       }, budgets);
       if (out && Array.isArray(out.results)) results.push(...out.results);
       if (out && out.nestedShapes) Object.assign(runNestedShapes, out.nestedShapes); // recon'd during the fill → reuse below
@@ -2845,37 +2861,45 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   });
   const captureNestedShapes = async () => {
     if (!(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return;
-    let nscan = null;
-    try { nscan = await act.nestedScan(); } catch (e) { return; }
-    if (!nscan) return;
-    const containers = {}; // childBase → { fkitIndex, heading }
-    // PRIMARY: the robust fkit-node container detector (empty OR not, regardless of the Add's position).
-    for (const nc of (nscan.nestedContainers || [])) {
-      if (nc.parentBase !== parentBase) continue;
-      if (!(nc.childBase in containers)) containers[nc.childBase] = { fkitIndex: nc.parentIndex, heading: nc.heading || nc.childBase };
+    // DETECTION comes from drivePageFill's ONE up-front scan (section.nestedContainers) → a section
+    // with no nested sub-section does ZERO scanning here (the ~5s-per-section fix). The cert-button
+    // direct path (no provided list) falls back to one nestedScan.
+    const containers = {}; // childBase → heading
+    const provided = Array.isArray(section.nestedContainers) ? section.nestedContainers : null;
+    let attachPresent = !!section.nestedAttachmentsPresent;
+    if (provided) {
+      for (const nc of provided) { if (nc.parentBase === parentBase && !(nc.childBase in containers)) containers[nc.childBase] = nc.heading || nc.childBase; }
+    } else {
+      let nscan = null; try { nscan = await act.nestedScan(); } catch (e) { return; }
+      if (!nscan) return;
+      for (const nc of (nscan.nestedContainers || [])) { if (nc.parentBase === parentBase && !(nc.childBase in containers)) containers[nc.childBase] = nc.heading || nc.childBase; }
+      const esc = parentBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp("^" + esc + "-(\\d+)--([A-Za-z][A-Za-z0-9_]*)$");
+      for (const b of (nscan.addButtons || [])) { const m = re.exec((b && b.enclosingFkit) || ""); if (m && m[2] !== "null" && !/attachment/i.test(m[2]) && !(m[2] in containers)) containers[m[2]] = (b && b.heading) || m[2]; }
+      attachPresent = (nscan.nestedAttachments || []).some((a) => a && a.parentBase === parentBase);
     }
-    // FALLBACK: parse an inside Add's enclosingFkit "<parentBase>-<idx>--<childBase>" (older scans).
-    const esc = parentBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp("^" + esc + "-(\\d+)--([A-Za-z][A-Za-z0-9_]*)$");
-    for (const b of (nscan.addButtons || [])) {
-      const m = re.exec((b && b.enclosingFkit) || "");
-      if (!m || m[2] === "null" || (m[2] in containers)) continue;
-      containers[m[2]] = { fkitIndex: parseInt(m[1], 10), heading: (b && b.heading) || m[2] };
-    }
-    nestedHasAttachments = (nscan.nestedAttachments || []).some((a) => a && a.parentBase === parentBase);
+    nestedHasAttachments = attachPresent;
     const cbKeys = Object.keys(containers);
-    if (cbKeys.length || nestedHasAttachments) console.log("[ApplyPilot][nested]", name, "→ sub-sections", JSON.stringify(cbKeys), "| attachments:", nestedHasAttachments);
+    if (!cbKeys.length && !nestedHasAttachments) return; // nothing nested → no scan, no reveal (fast section)
+    console.log("[ApplyPilot][nested]", name, "→ sub-sections", JSON.stringify(cbKeys), "| attachments:", nestedHasAttachments);
+    // Only when a reveal is actually needed (an uncached childBase), do ONE nestedScan to get a CURRENT
+    // parent fkit (indices are non-sequential; the up-front one may be stale after reconcile). Cert only.
+    let parentFkitIdx = null;
+    if (cbKeys.some((cb) => !(Array.isArray(cachedNested[parentBase + "__" + cb]) && cachedNested[parentBase + "__" + cb].length))) {
+      let cur = null; try { cur = await act.nestedScan(); } catch (e) {}
+      const order = cur && cur.parentOrder ? cur.parentOrder[parentBase] : null;
+      parentFkitIdx = (order && order.length) ? order[0] : null;
+    }
     for (const childBase of cbKeys) {
       const key = parentBase + "__" + childBase;
-      if (Array.isArray(cachedNested[key]) && cachedNested[key].length) { nestedShapes[childBase] = cachedNested[key]; console.log("[ApplyPilot][nested]", childBase, "shape from cache (no probe)"); continue; } // cross-run cache hit → NO probe
-      const c = containers[childBase];
-      const parentFkit = parentBase + "-" + c.fkitIndex + "--null";
-      // Match the Add by a child-base STEM (strip the plural) — robust vs the Add's exact heading/position.
-      const stem = String(childBase).replace(/ies$/i, "").replace(/s$/i, "").slice(0, 8) || childBase;
+      if (Array.isArray(cachedNested[key]) && cachedNested[key].length) { nestedShapes[childBase] = cachedNested[key]; console.log("[ApplyPilot][nested]", childBase, "shape from cache (no probe)"); continue; }
+      if (parentFkitIdx == null) { console.log("[ApplyPilot][nested] no parent entry to probe", childBase); continue; }
+      const parentFkit = parentBase + "-" + parentFkitIdx + "--null";
+      const stem = String(childBase).replace(/ies$/i, "").replace(/s$/i, "").slice(0, 8) || childBase; // match the Add by a child-base STEM, not its heading/position
       console.log("[ApplyPilot][nested] reveal-by-add probing", childBase, "in", parentFkit, "(Add heading ~/" + stem + "/i)");
       const revealed = await revealNestedShape(act, parentFkit, parentBase, childBase, stem, budgets);
       if (revealed && revealed.shape.length) { nestedShapes[childBase] = revealed.shape; console.log("[ApplyPilot][nested] reveal OK", childBase, "→", JSON.stringify(revealed.shape.map((s) => s.recName + ":" + s.widget_type + (s.options ? "(" + s.options.length + " opts)" : "")))); }
-      else console.log("[ApplyPilot][nested] reveal FAILED for", childBase, "— mount didn't register or no Add matched /" + stem + "/i (paste the NESTED recon addButtons)");
+      else console.log("[ApplyPilot][nested] reveal FAILED for", childBase, "— mount didn't register or no Add matched /" + stem + "/i");
     }
   };
 
@@ -3599,6 +3623,7 @@ async function revealNestedShape(act, parentFkit, parentBase, childBase, heading
     try {
       if (f.widgetType === "typeahead") {
         const cap = await captureTypeaheadOptions(act, loc, budgets); // tree → {hierarchical}; flat → {options}
+        console.log("[ApplyPilot][nested] scanned typeahead", f.field, "→", cap ? (cap.widget_type + " / " + ((cap.options || []).length) + " options") : "null (open failed)");
         if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; }
       } else if (f.widgetType === "dropdown") {
         const opts = await captureDropdownOptions(act, loc, budgets);
