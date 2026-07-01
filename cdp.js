@@ -570,16 +570,30 @@ function cdpRepeatingScan() {
           const b = Array.from(p.querySelectorAll("button")).find((x) => /^delete$/i.test((x.textContent || "").trim()));
           if (b) { del = b; break; }
         }
+        // The field's CURRENT value (for surfacing an already-filled UNKNOWN section in review): the
+        // selected dropdown text / typeahead chip / text-input value / checkbox state / date display.
+        const valueOf = (wr, wt) => {
+          try {
+            if (wt === "dropdown") { const b = wr.querySelector('button[aria-haspopup="listbox"]'); return b ? (b.textContent || "").trim() : null; }
+            if (wt === "typeahead") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
+            if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
+            if (wt === "date") { const segs = Array.from(wr.querySelectorAll('[data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter(Boolean); return segs.length ? segs.join("/") : null; }
+            if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
+            const inp = wr.querySelector('input, textarea'); return inp ? (inp.value || null) : null;
+          } catch (e) { return null; }
+        };
         const fields = Array.from(e.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
           const id = w.getAttribute("data-automation-id");
           const fieldName = id.slice("formField-".length);
+          const wt = classify(w);
           return {
             fieldName, automationId: id,
-            widgetType: classify(w),
+            widgetType: wt,
             label: labelOf(w),
             isRequired: requiredOf(w),
             hashedId: isHashed(fieldName),
             dateSegments: dateSegsOf(w),
+            value: valueOf(w, wt),
             wrapperSel: '[data-fkit-id="' + fkit + '"] [data-automation-id="' + id + '"]'
           };
         });

@@ -2241,15 +2241,50 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const sec = rscan.sections[prefix];
       const base = prefix.replace(/-$/, "");
       const human = base.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
-      const entryFields = (sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
-      const n = (sec.entries || []).length;
+      const entries = sec.entries || [];
+      const n = entries.length;
+      // (1) RECON the SHAPE from entries[0] — OPEN+SCRAPE each dropdown/typeahead's options so the
+      //     summary shows real dropdowns/comboboxes (not bare text boxes); dates carry segment order.
+      const shape = [];
+      for (const f of ((entries[0] && entries[0].fields) || [])) {
+        const s = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
+        const loc = { wrapperSel: f.wrapperSel };
+        try {
+          if (f.widgetType === "dropdown") { const o = await captureDropdownOptions(act, loc, budgets); if (o && o.length) s.options = o; }
+          else if (f.widgetType === "typeahead") { const cap = await captureTypeaheadOptions(act, loc, budgets); if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; } }
+          else if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; }
+        } catch (e) { /* non-fatal — stays its base widget */ }
+        shape.push(s);
+      }
+      const shapeByRec = {}; for (const s of shape) shapeByRec[s.recName] = s;
+      // (2) SURFACE each EXISTING entry's fields with their CURRENT value, flagged "already on the form,
+      //     NOT filled by ApplyPilot" (the bot has no mapping for an unknown section → it never touches
+      //     these; the operator verifies). Editable (options/date_order from the recon'd shape).
+      for (let i = 0; i < n; i++) {
+        for (const f of ((entries[i] && entries[i].fields) || [])) {
+          const shp = shapeByRec[f.fieldName] || {};
+          const v = f.value;
+          const hasVal = v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
+          results.push({
+            fieldName: base + "[" + i + "]." + f.fieldName, label: f.label || f.fieldName,
+            widgetType: shp.widget_type || f.widgetType, isRequired: !!f.isRequired,
+            mappedPath: base + "[" + i + "]." + f.fieldName,
+            rawValue: null, resolved: null,
+            status: "filled_review", matchTier: null, confidence: null, flag: "already-filled",
+            verified: null, after: hasVal ? (v === true ? "Yes" : String(v)) : null,
+            detail: hasVal ? "already on the form — NOT filled by ApplyPilot; verify" : "on the form, empty — not filled by ApplyPilot; verify/fill",
+            options: shp.options || null, date_order: shp.date_order || null, auditLoc: f.wrapperSel
+          });
+        }
+      }
+      // (3) the section STUB — add-entry + the "already there" note (shape carries recon'd options).
       results.push({
         fieldName: base, label: sec.heading || human, // the REAL section name (DOM heading), not "unmapped section"
         widgetType: "section_stub", isRequired: false, mappedPath: base + "._stub",
         rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
         flag: "section-stub", verified: null, after: null,
-        detail: "This repeating section isn't auto-filled by the bot (" + n + " entr" + (n === 1 ? "y" : "ies") + " on the form) — add or verify its entries here.",
-        section_field_shape: entryFields.map((f) => { const o = { recName: f.fieldName, widget_type: f.widgetType, path: f.fieldName, label: f.label, is_required: f.isRequired }; if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; } return o; }), // carry the recon'd date order → segmented date editor
+        detail: "This repeating section isn't auto-filled by ApplyPilot (" + n + " entr" + (n === 1 ? "y" : "ies") + " already on the form) — add or verify entries here.",
+        section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path, label: s.label, is_required: s.is_required, date_order: s.date_order || null, options: s.options || null })),
         container_prefix: prefix, section_heading: sec.heading || null, section_known: false
       });
     }
@@ -3505,6 +3540,7 @@ function buildReviewBundle(results, meta) {
     // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
     // "skipped", which would otherwise early-return needs_review:false).
     if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
+    if (rec.flag === "already-filled") return { needs_review: true, needs_review_reason: "already_on_form" }; // a field of an UNKNOWN section already on the form — bot didn't fill it; operator verifies
     if (rec.flag === "nested-unfilled") return { needs_review: true, needs_review_reason: "nested_section" }; // a nested repeating field (cert → specialty) — operator fills/verifies
     if (rec.flag === "nested-section-stub") return { needs_review: true, needs_review_reason: "nested_section" }; // an EMPTY nested sub-section (reveal-by-add) — operator adds/verifies entries
     if (rec.flag === "nested-attachment") return { needs_review: true, needs_review_reason: "nested_attachment" }; // a per-entry attachment — upload on the form
