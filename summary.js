@@ -518,8 +518,12 @@ const renderFieldList = (mount) => {
 
       const isC = collapsed.has(key);
       const visCount = liveItems.filter(filterPass).length;
+      // m3a: an UNKNOWN section shows under its REAL DOM heading (section_heading, carried on its
+      // stub) — e.g. "Volunteer Experience" — not the fkit-base camelCase, and never "unmapped".
+      const hd = g.items.find((e) => e.section_heading);
+      const groupLabel = (hd && hd.section_heading) || g.sec.label;
       const grp = el("div", { class: "grp" + (isC ? " collapsed" : "") });
-      const head = el("button", { class: "ghead", "aria-expanded": isC ? "false" : "true" }, [el("span", { class: "chev", text: "▾" }), el("span", { class: "gname", text: g.sec.label }), el("span", { class: "gcount", text: `(${visCount}${visCount !== liveItems.length ? " of " + liveItems.length : ""})` }), dots]);
+      const head = el("button", { class: "ghead", "aria-expanded": isC ? "false" : "true" }, [el("span", { class: "chev", text: "▾" }), el("span", { class: "gname", text: groupLabel }), el("span", { class: "gcount", text: `(${visCount}${visCount !== liveItems.length ? " of " + liveItems.length : ""})` }), dots]);
       head.addEventListener("click", () => { collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key); render(); });
       grp.appendChild(head); grp.appendChild(body); tbl.appendChild(grp);
     }

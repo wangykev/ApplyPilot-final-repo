@@ -2795,6 +2795,8 @@ test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the bac
   assert.strictEqual(stub.flag, "section-stub");
   assert.strictEqual(stub.container_prefix, "publication-"); // backend identifier for a future fill-back
   assert.strictEqual(stub.section_known, false);
+  assert.strictEqual(stub.section_heading, "Publications");  // the REAL DOM heading (identifier + display)
+  assert.strictEqual(stub.label, "Publications");            // shows under its real name, NOT "unmapped section"
   assert.strictEqual(stub.section_field_shape.length, 2);    // detected field shape (it has entries)
   // and the detected shape is cached on the returned bundle shapes (add-entry uses it)
   assert.ok(out.sectionShapes.publication && out.sectionShapes.publication.length === 2);

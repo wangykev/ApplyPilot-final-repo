@@ -2243,11 +2243,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const entryFields = (sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
       const n = (sec.entries || []).length;
       results.push({
-        fieldName: base, label: (sec.heading || human) + " — section present (unmapped)",
+        fieldName: base, label: sec.heading || human, // the REAL section name (DOM heading), not "unmapped section"
         widgetType: "section_stub", isRequired: false, mappedPath: base + "._stub",
         rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
         flag: "section-stub", verified: null, after: null,
-        detail: "unmapped repeating section detected on the form (" + n + " entr" + (n === 1 ? "y" : "ies") + ") — the bot has no mapping to auto-fill it; add/fill entries here",
+        detail: "This repeating section isn't auto-filled by the bot (" + n + " entr" + (n === 1 ? "y" : "ies") + " on the form) — add or verify its entries here.",
         section_field_shape: entryFields.map((f) => ({ recName: f.fieldName, widget_type: f.widgetType, path: f.fieldName, label: f.label, is_required: f.isRequired })),
         container_prefix: prefix, section_heading: sec.heading || null, section_known: false
       });
