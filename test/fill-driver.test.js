@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2800,6 +2800,36 @@ test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the bac
   assert.strictEqual(stub.section_field_shape.length, 2);    // detected field shape (it has entries)
   // and the detected shape is cached on the returned bundle shapes (add-entry uses it)
   assert.ok(out.sectionShapes.publication && out.sectionShapes.publication.length === 2);
+});
+
+test("revealUnknownSection: mounts an entry, reads the shape, deletes it (m3b reveal-by-add)", async () => {
+  let mounted = false;
+  const fake = {
+    log: [],
+    delay: async () => {},
+    repeatingScan: async () => ({ addButtons: [], sections: mounted ? {
+      "publication-": { entryCount: 1, heading: "Publications", entries: [{ fields: [
+        { fieldName: "title", widgetType: "text", label: "Title*", isRequired: true },
+        { fieldName: "year", widgetType: "text", label: "Year", isRequired: false },
+      ] }] }
+    } : {} }),
+    clickSectionAdd: async (re) => { fake.log.push(["add", re]); mounted = true; return { ok: true }; },
+    clickDeleteEntry: async (p, i) => { fake.log.push(["del", p, i]); mounted = false; return { ok: true }; },
+  };
+  const r = await revealUnknownSection(fake, "Publications", T_BUDGETS);
+  assert.ok(r);
+  assert.strictEqual(r.base, "publication");
+  assert.strictEqual(r.prefix, "publication-");
+  assert.strictEqual(r.shape.length, 2);
+  assert.strictEqual(r.shape[0].recName, "title"); // DOM automation-id suffix
+  assert.ok(fake.log.some((l) => l[0] === "add"), "clicked the section's Add button");
+  assert.ok(fake.log.some((l) => l[0] === "del"), "deleted the mounted entry (cleanup)");
+  assert.strictEqual(mounted, false, "form left as found (0 entries)");
+});
+
+test("revealUnknownSection: null if the entry never mounts (Add refused)", async () => {
+  const fake = { delay: async () => {}, repeatingScan: async () => ({ sections: {}, addButtons: [] }), clickSectionAdd: async () => ({ ok: false }), clickDeleteEntry: async () => ({ ok: true }) };
+  assert.strictEqual(await revealUnknownSection(fake, "Publications", T_BUDGETS), null);
 });
 
 test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {

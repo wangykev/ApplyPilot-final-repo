@@ -2303,7 +2303,17 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // on the counter it sets; the caller removes it in its finally (alongside cdpDetach).
   // opts.skipLock = the NO-LOCK baseline for the oracle-equal verification (lock-off vs lock-on).
   if (!(opts && opts.skipLock)) await installInputLock();
-  const out = await drivePageFill(act, prepared, defaults, jobContext);
+  // m3b: pass the prior run's DETECTED section shapes as the reveal-by-add cache so mounting an
+  // entry to discover an EMPTY unknown section's fields fires at most once per bundle-lifetime
+  // (not every fill — the "fast, especially hidden" constraint). headingToBase lets the pre-mount
+  // cache check work for an empty section (base unknown until mounted → matched by heading).
+  const priorSum = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+  const cachedShapes = (priorSum && priorSum.section_shapes) || {};
+  const headingToBase = {};
+  for (const e of ((priorSum && priorSum.entries) || [])) {
+    if (e && e.widget_type === "section_stub" && e.section_heading && typeof e.canonical_field === "string") headingToBase[e.section_heading] = e.canonical_field.replace(/\._stub$/, "");
+  }
+  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
 
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report

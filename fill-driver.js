@@ -2271,6 +2271,49 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     sectionShapes = detectSectionShapes(shapeScan);
   }
 
+  // m3b: EMPTY unknown sections — present via an Add button + heading but with NO entry container
+  // (so m3a's container loop can't see them). REVEAL-BY-ADD: mount one entry → detect its fields +
+  // fkit prefix → delete it → emit the stub. The ONLY place m3 actuates an unknown section (the
+  // operator opted into this one-time mount+delete). CACHED across runs via opts.cachedShapes (by
+  // base) + opts.headingToBase (an empty section's base is unknown pre-mount, so it's matched by
+  // heading) → fires once per bundle-lifetime, not every fill (the "fast, especially hidden"
+  // constraint); "Clear summary" resets. Skipped under `only`.
+  if (!only && rscan && Array.isArray(rscan.addButtons)) {
+    const knownRes = PAGE_SECTIONS.map((s) => new RegExp(s.headingRegex, "i"));
+    const containerHeadings = new Set(Object.keys(rscan.sections || {}).map((p) => (rscan.sections[p] && rscan.sections[p].heading) || "").filter(Boolean));
+    const cachedShapes = (opts && opts.cachedShapes) || {};
+    const headingToBase = (opts && opts.headingToBase) || {};
+    const seen = new Set();
+    for (const b of rscan.addButtons) {
+      const heading = (b && b.nearestHeading) || "";
+      if (!heading || seen.has(heading)) continue;
+      if (knownRes.some((re) => re.test(heading))) continue;   // a known section's Add button
+      if (containerHeadings.has(heading)) continue;             // already surfaced by m3a (it has entries)
+      seen.add(heading);
+      let base, prefix, shape;
+      const cb = headingToBase[heading];
+      const cachedShape = cb && Array.isArray(cachedShapes[cb]) ? cachedShapes[cb] : null;
+      if (cachedShape && cachedShape.length) {
+        base = cb; prefix = cb + "-"; shape = cachedShape; // cache hit → NO actuation (once per bundle-lifetime)
+      } else {
+        const revealed = await revealUnknownSection(act, heading, budgets);
+        if (!revealed) continue; // couldn't mount → can't surface a container-less empty section
+        base = revealed.base; prefix = revealed.prefix; shape = revealed.shape;
+        sectionShapes[base] = shape; // persist onto the bundle so the next run is a cache hit
+      }
+      const human = base.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+      results.push({
+        fieldName: base, label: heading || human, // the REAL section name (DOM heading)
+        widgetType: "section_stub", isRequired: false, mappedPath: base + "._stub",
+        rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+        flag: "section-stub", verified: null, after: null,
+        detail: "This repeating section isn't auto-filled by the bot (empty on the form) — add or verify its entries here.",
+        section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required })),
+        container_prefix: prefix, section_heading: heading || null, section_known: false
+      });
+    }
+  }
+
   // ── M1 CASCADE RE-SCAN-AFTER-CHANGE ── a committed value can REVEAL new fields (Magna
   // recon 2026-06-29: changing Country revealed 2 "Cyrillic name" text fields ~5.6s later,
   // and HID "State"). The single up-front scan misses them, so they never fill / never enter
@@ -3203,6 +3246,34 @@ function summarizeEntries(entries) {
 
 // Build a SINGLE-page review bundle from drivePageFill's results. `meta = { page, url,
 // tenant, capturedAt }` — the SW stamps capturedAt + the PRE-fill cdpPageSig as `page`.
+// m3b: REVEAL-BY-ADD — an EMPTY unknown section is present only via its Add button + heading (no
+// entry container to read), so mount ONE entry, detect its field shape + the now-known fkit prefix,
+// then DELETE it (leave the form as found). Returns { prefix, base, heading, shape } or null if it
+// couldn't mount. Uses the proven clickSectionAdd / repeatingScan / clickDeleteEntry primitives.
+async function revealUnknownSection(act, heading, budgets) {
+  const escaped = String(heading).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const before = await act.repeatingScan();
+  const beforePrefixes = new Set(Object.keys((before && before.sections) || {}));
+  const clicked = await act.clickSectionAdd(escaped);
+  if (!clicked || !clicked.ok) return null;
+  const newOf = (scan) => Object.keys((scan && scan.sections) || {}).find((p) => !beforePrefixes.has(p));
+  let scan = await act.repeatingScan();
+  let newPrefix = newOf(scan);
+  const deadline = Date.now() + (budgets.entryReconcileCeilingMs || 4000);
+  while (!newPrefix && Date.now() < deadline) {
+    await act.delay(budgets.entryReconcileIntervalMs || 150);
+    scan = await act.repeatingScan();
+    newPrefix = newOf(scan);
+  }
+  if (!newPrefix) return null; // mount didn't register → can't reveal a container-less section
+  const sec = scan.sections[newPrefix];
+  const fields = (sec && sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
+  const shape = fields.map((f) => ({ recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired }));
+  // clean up — delete the entry we mounted so the form is left as we found it (0 entries)
+  try { await act.clickDeleteEntry(newPrefix, (sec.entries || []).length - 1); } catch (e) { /* best-effort */ }
+  return { prefix: newPrefix, base: newPrefix.replace(/-$/, ""), heading: (sec && sec.heading) || heading || null, shape };
+}
+
 // 2c: DETECT a section's field shape from a live repeating-scan (the m1 per-entry read) — the
 // field SET comes from the FORM, not the hardcoded *_MAP. Keyed by the PAGE_SECTIONS `name` (=
 // the review viewer's section key). Only sections with ≥1 MOUNTED entry yield a shape (an empty
@@ -3373,5 +3444,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
