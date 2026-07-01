@@ -743,7 +743,7 @@ function cdpGenericNestedScan() {
     const key = parent.base + " ▸ " + child.base;
     const g = (nested[key] = nested[key] || { parentBase: parent.base, childBase: child.base, depth: p.levels.length, entries: {} });
     const ek = p.levels.map((l) => l.idx).join("|");
-    const ent = (g.entries[ek] = g.entries[ek] || { path: p.levels.map((l) => l.base + "[" + l.idx + "]").join(" / "), fields: [] });
+    const ent = (g.entries[ek] = g.entries[ek] || { path: p.levels.map((l) => l.base + "[" + l.idx + "]").join(" / "), levels: p.levels.map((l) => ({ base: l.base, index: l.idx })), fields: [] });
     if (p.field && p.field !== "null") {
       const id = el.getAttribute("data-fkit-id");
       const ff = el.querySelector('[data-automation-id="formField-' + p.field + '"]') || el;
@@ -751,8 +751,9 @@ function cdpGenericNestedScan() {
     }
   }
   const nestedSections = Object.keys(nested).map((k) => {
-    const g = nested[k]; const eks = Object.keys(g.entries); const rep = g.entries[eks[0]];
-    return { parentBase: g.parentBase, childBase: g.childBase, depth: g.depth, containerPattern: g.parentBase + "-<N>--" + g.childBase + "-<M>--<field>", entryCount: eks.length, samplePath: rep ? rep.path : null, sampleFields: rep ? rep.fields : [] };
+    const g = nested[k]; const eks = Object.keys(g.entries);
+    // ALL entries (each { levels:[{base,index}], fields:[...] }) — the fill needs every entry, not a sample.
+    return { parentBase: g.parentBase, childBase: g.childBase, depth: g.depth, containerPattern: g.parentBase + "-<N>--" + g.childBase + "-<M>--<field>", entryCount: eks.length, entries: eks.map((ek) => g.entries[ek]) };
   });
   const enclosing = (el) => { const f = el.closest("[data-fkit-id]"); return f ? f.getAttribute("data-fkit-id") : null; };
   const fileUploads = Array.from(document.querySelectorAll('input[type="file"], [data-automation-id="select-files"], [data-automation-id^="file-upload"]'))
@@ -761,7 +762,26 @@ function cdpGenericNestedScan() {
   const addButtons = Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
     .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), heading: nearestHeading(b), enclosingFkit: enclosing(b) }))
     .filter((a) => a.enclosingFkit); // Add buttons INSIDE a repeating entry = nested-section Add anchors
-  return { url: location.href, maxDepth, nestedSections, fileUploads, addButtons };
+  // Parent-entry ORDER per base (--null containers in DOM order) — from the SAME snapshot as the nested
+  // fields, so the fill maps a nested field's parent fkit index → the parent's sequential ordinal (fkit
+  // indices are non-contiguous / non-zero, e.g. certification-173). Robust vs a separate repeatingScan.
+  const parentOrder = {};
+  for (const el of Array.from(document.querySelectorAll('[data-fkit-id$="--null"]'))) {
+    const m = /^(.+?)-(\d+)--null$/.exec(el.getAttribute("data-fkit-id") || "");
+    if (m) (parentOrder[m[1]] = parentOrder[m[1]] || []).push(parseInt(m[2], 10));
+  }
+  // Per-ENTRY attachment areas (deduped by enclosingFkit), pre-parsed "<base>-<idx>--attachments" so the
+  // fill needs no fkit parsing. Excludes the top-level resume ("resumeAttachments--attachments" → no
+  // -<idx> → no match).
+  const nestedAttachments = []; const seenAtt = {};
+  for (const u of fileUploads) {
+    if (seenAtt[u.enclosingFkit]) continue;
+    const am = /^(.+?)-(\d+)--attachments$/.exec(u.enclosingFkit || "");
+    if (!am) continue;
+    seenAtt[u.enclosingFkit] = 1;
+    nestedAttachments.push({ parentBase: am[1], parentIndex: parseInt(am[2], 10), enclosingFkit: u.enclosingFkit, heading: u.heading });
+  }
+  return { url: location.href, maxDepth, nestedSections, parentOrder, nestedAttachments, fileUploads, addButtons };
 }
 
 // M36.2 — read-only structure dump of the Certifications entries, for the NESTED
@@ -2188,6 +2208,7 @@ function makeCdpActuation(llmConfig) {
     // Substrate for driveRepeatingSectionCdp. The brain stays substrate-agnostic:
     // these return data / {ok}, never rects, so the test fake just flips counts.
     repeatingScan: () => cdpEval(cdpRepeatingScan),
+    nestedScan: () => cdpEval(cdpGenericNestedScan), // nested repeating sections (cert → specialties) + parentOrder + attachments
     entryCount: (prefix) => cdpEval(cdpEntryCount, prefix),
     // Click a section's Add button (headingRegexSource is a STRING — RegExp can't
     // cross the eval boundary). scrollIntoView + viewport rect + M29 retry, then click.

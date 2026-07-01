@@ -2314,6 +2314,62 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
   }
 
+  // ── NESTED repeating sections (repeating-inside-repeating, e.g. cert → Specialties + Attachments) ──
+  // Phase 1: SURFACE each nested field UNDER its parent entry in review (the existing sectionOf reads the
+  // FIRST base[idx], so "certification[0].specialties[0].specialtyParent" groups under Certifications →
+  // Entry 1 — flattened labeled rows, no viewer recursion). The bot has NO mapping → needs_review; the
+  // operator fills/verifies (specialtyParent → tier editor; dates → segmented). GENERIC: parentBase/
+  // childBase/fields all come from cdpGenericNestedScan's fkit parse (no hardcoded names). parentOrder
+  // (SAME scan) maps a nested field's NON-CONTIGUOUS fkit parent index → the fill's sequential ordinal so
+  // it lands under the RIGHT parent entry. Reveal-by-add for an EMPTY nested section = deferred (Phase 2:
+  // per-parent-scoped Add via the --<child>-<M>-- path). Skipped under `only`.
+  if (!only && act.nestedScan) {
+    let nscan = null;
+    try { nscan = await act.nestedScan(); } catch (e) { /* no nested substrate (flat-only fake) → skip */ }
+    if (nscan && (nscan.nestedSections || nscan.nestedAttachments)) {
+      const ordinalOf = {}; // base → { fkitIndex → sequential ordinal } (from the same scan)
+      for (const b of Object.keys(nscan.parentOrder || {})) { ordinalOf[b] = {}; nscan.parentOrder[b].forEach((ix, i) => { ordinalOf[b][ix] = i; }); }
+      const human = (s) => String(s).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+      for (const ns of (nscan.nestedSections || [])) {
+        if (!(ns.parentBase in ordinalOf)) continue; // parentBase isn't a real parent in THIS scan → skip (guard)
+        const childOrd = {}; let next = 0;
+        for (const ent of (ns.entries || [])) {
+          if (!ent.levels || ent.levels.length < 2) continue;
+          const par = ent.levels[0], ch = ent.levels[ent.levels.length - 1];
+          const pOrd = ordinalOf[ns.parentBase][par.index];
+          if (pOrd == null) continue; // parent entry not present on this page
+          if (!(ch.index in childOrd)) childOrd[ch.index] = next++; // fkit child index → sequential ordinal
+          const cbase = par.base + "[" + pOrd + "]." + ch.base + "[" + childOrd[ch.index] + "]";
+          for (const f of (ent.fields || [])) {
+            results.push({
+              fieldName: cbase + "." + f.field,
+              label: human(ch.base) + " " + (childOrd[ch.index] + 1) + " — " + (f.label || f.field),
+              widgetType: f.widgetType, isRequired: !!f.isRequired, mappedPath: cbase + "." + f.field,
+              rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+              flag: "nested-unfilled", verified: null, after: null,
+              detail: "nested repeating section (" + ns.parentBase + " ▸ " + ns.childBase + ") — the bot has no mapping; fill/verify here",
+              date_order: (f.widgetType === "date") ? dateOrderOf(f.dateSegments) : undefined,
+              nested_path: ent.levels, // locate-now (raw fkit indices, session-scoped); the ordinal canonical is the durable identity
+              auditLoc: f.wrapperSel
+            });
+          }
+        }
+      }
+      for (const at of (nscan.nestedAttachments || [])) {
+        const pOrd = (ordinalOf[at.parentBase] || {})[at.parentIndex];
+        if (pOrd == null) continue;
+        results.push({
+          fieldName: at.parentBase + "[" + pOrd + "].attachments", label: "Attachments",
+          widgetType: "file_upload", isRequired: false, mappedPath: at.parentBase + "[" + pOrd + "].attachments",
+          rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+          flag: "nested-attachment", verified: null, after: null,
+          detail: "per-entry attachments — upload on the form (the bot can't attach a per-entry file)",
+          nested_path: [{ base: at.parentBase, index: at.parentIndex }]
+        });
+      }
+    }
+  }
+
   // ── M1 CASCADE RE-SCAN-AFTER-CHANGE ── a committed value can REVEAL new fields (Magna
   // recon 2026-06-29: changing Country revealed 2 "Cyrillic name" text fields ~5.6s later,
   // and HID "State"). The single up-front scan misses them, so they never fill / never enter
@@ -3401,6 +3457,8 @@ function buildReviewBundle(results, meta) {
     // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
     // "skipped", which would otherwise early-return needs_review:false).
     if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
+    if (rec.flag === "nested-unfilled") return { needs_review: true, needs_review_reason: "nested_section" }; // a nested repeating field (cert → specialty) — operator fills/verifies
+    if (rec.flag === "nested-attachment") return { needs_review: true, needs_review_reason: "nested_attachment" }; // a per-entry attachment — upload on the form
     const required = !!rec.isRequired;
     const flaggedBase = rec.status === "needs_review" || rec.status === "filled_review" || rec.status === "error";
     const escalated = rec.status === "skipped" && required;
@@ -3472,6 +3530,7 @@ function buildReviewBundle(results, meta) {
       section_known: rec.section_known != null ? !!rec.section_known : null,        // m3a: false = unmapped/unknown section
       tiers: null, // m3c: ordered candidate list the review's tier editor fills for a hierarchical field (profile-shaped → portable)
       date_order: Array.isArray(rec.date_order) ? rec.date_order : null, // m3c: segment order → the summary's segmented date editor
+      nested_path: Array.isArray(rec.nested_path) ? rec.nested_path : null, // nested: locate-now fkit level path (raw indices) for the fill-back; the ordinal canonical_field is the durable identity
       character_count: null
     };
   });

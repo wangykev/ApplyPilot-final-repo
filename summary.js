@@ -331,7 +331,7 @@ function buildEditor(entry) {
     cb.addEventListener("change", () => onCommit(tokenFor(entry.original_ai_value, cb.checked)));
     return { node: cb, set: (v) => { cb.checked = checkedOf(v); } };
   }
-  if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return Object.assign(textInput("input"), { partial: co.length > 0 }); }
+  if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return tierEditor(); } // no options recon'd (e.g. a NESTED specialty typeahead) → tier editor, not a bare box
   if (wt === "hierarchical") return tierEditor(); // tree field → the user supplies ordered tier candidates
   if (wt === "date") return dateEditor(entry.date_order);
   if (wt === "textarea") return textInput("textarea");

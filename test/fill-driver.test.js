@@ -105,6 +105,7 @@ function makeFakeAct(fields, opts) {
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
+    nestedScan: async () => o.nestedScan || null, // nested: o.nestedScan models cdpGenericNestedScan; default null = no nested substrate
 
     // text
     readTextValue: async (loc) => {
@@ -2786,6 +2787,37 @@ test("buildReviewBundle carries the backend identifier (container_prefix/heading
   assert.strictEqual(e.section_heading, "Publications");
   assert.strictEqual(e.section_known, false);
   assert.strictEqual(e.widget_type, "section_stub");
+});
+
+test("drivePageFill surfaces NESTED section fields + attachment under the parent entry (nested)", async () => {
+  const nestedScan = {
+    parentOrder: { certification: [173] }, // non-contiguous fkit index 173 → ordinal 0
+    nestedSections: [{
+      parentBase: "certification", childBase: "specialties",
+      entries: [{
+        levels: [{ base: "certification", index: 173 }, { base: "specialties", index: 5 }],
+        fields: [
+          { field: "specialtyParent", widgetType: "typeahead", label: "Specialty*", isRequired: true, wrapperSel: "SEL_SP" },
+          { field: "startDate", widgetType: "date", label: "Start Date", isRequired: false, dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"], wrapperSel: "SEL_SD" },
+        ],
+      }],
+    }],
+    nestedAttachments: [{ parentBase: "certification", parentIndex: 173, enclosingFkit: "certification-173--attachments", heading: "Attachments" }],
+  };
+  const out = await drivePageFill(makeFakeAct([], { rscan: { addButtons: [], sections: {} }, nestedScan }), {}, {}, {}, T_BUDGETS);
+  const sp = out.results.find((r) => r.fieldName === "certification[0].specialties[0].specialtyParent");
+  assert.ok(sp, "nested field surfaced");
+  assert.strictEqual(sp.mappedPath, "certification[0].specialties[0].specialtyParent"); // ordinals (173→0, 5→0) → groups under Certifications Entry 1
+  assert.strictEqual(sp.widgetType, "typeahead");
+  assert.strictEqual(sp.flag, "nested-unfilled");
+  assert.deepStrictEqual(sp.nested_path, [{ base: "certification", index: 173 }, { base: "specialties", index: 5 }]); // locate-now raw fkit
+  const sd = out.results.find((r) => r.fieldName === "certification[0].specialties[0].startDate");
+  assert.deepStrictEqual(sd.date_order, ["month", "day", "year"]); // segmented date editor
+  const att = out.results.find((r) => r.fieldName === "certification[0].attachments");
+  assert.ok(att && att.widgetType === "file_upload" && att.flag === "nested-attachment", "per-entry attachment surfaced");
+  // carried onto the bundle entry (backend identifier for the fill-back); groups under "certification"
+  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties[0].specialtyParent");
+  assert.ok(be && Array.isArray(be.nested_path) && be.needs_review, "nested field in the bundle w/ nested_path + needs_review");
 });
 
 test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the backend identifier (m3a)", async () => {
