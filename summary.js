@@ -264,14 +264,22 @@ function buildEditor(entry) {
   const dateEditor = (order) => {
     const segs = (Array.isArray(order) && order.length) ? order : null;
     if (!segs) { const inp = el("input", { class: "editor", type: "text", placeholder: "date" }); inp.value = cur == null ? "" : String(cur); inp.addEventListener("change", () => onCommit(inp.value)); return { node: inp, set: (v) => { inp.value = v == null ? "" : String(v); } }; }
-    const ph = { month: "MM", day: "DD", year: "YYYY" };
+    const meta = { month: { ph: "MM", max: 2 }, day: { ph: "DD", max: 2 }, year: { ph: "YYYY", max: 4 } };
     const inputs = {}, wrap = el("div", { class: "date-seg" });
     const combine = () => { const vals = segs.map((s) => (inputs[s].value || "").trim()); onCommit(vals.every((v) => v === "") ? "" : vals.join("/")); };
     const parts0 = String(cur == null ? "" : cur).split("/");
     segs.forEach((s, i) => {
       if (i) wrap.appendChild(el("span", { class: "date-sep", text: "/" }));
-      const inp = el("input", { class: "editor date-part", type: "text", inputmode: "numeric", placeholder: ph[s] || s, maxlength: s === "year" ? "4" : "2" });
-      inp.value = parts0[i] || ""; inp.addEventListener("change", combine); inputs[s] = inp; wrap.appendChild(inp);
+      const m = meta[s] || { ph: s, max: 4 };
+      const inp = el("input", { class: "editor date-part" + (s === "year" ? " yr" : ""), type: "text", inputmode: "numeric", placeholder: m.ph, maxlength: String(m.max) });
+      inp.value = parts0[i] || "";
+      inp.addEventListener("input", () => {
+        const digits = inp.value.replace(/\D/g, "").slice(0, m.max); // digits only
+        if (digits !== inp.value) inp.value = digits;
+        if (digits.length >= m.max && i < segs.length - 1) { const nxt = inputs[segs[i + 1]]; if (nxt) { nxt.focus(); nxt.select(); } } // auto-advance when full
+      });
+      inp.addEventListener("change", combine);
+      inputs[s] = inp; wrap.appendChild(inp);
     });
     return { node: wrap, set: (v) => { const p = String(v == null ? "" : v).split("/"); segs.forEach((s, i) => { if (inputs[s]) inputs[s].value = p[i] || ""; }); } };
   };
