@@ -2832,6 +2832,32 @@ test("revealUnknownSection: null if the entry never mounts (Add refused)", async
   assert.strictEqual(await revealUnknownSection(fake, "Publications", T_BUDGETS), null);
 });
 
+test("revealUnknownSection: recons a TREE typeahead's categories + retags it hierarchical (m3c)", async () => {
+  let mounted = false;
+  const fake = {
+    delay: async () => {}, delayFull: async () => {},
+    repeatingScan: async () => ({ addButtons: [], sections: mounted ? {
+      "certification-": { entryCount: 1, heading: "Certifications", entries: [{ fields: [
+        { fieldName: "certification", widgetType: "typeahead", label: "Certification*", isRequired: true, wrapperSel: "SEL_CERT" },
+        { fieldName: "certificationNumber", widgetType: "text", label: "Number", isRequired: false, wrapperSel: "SEL_NUM" },
+      ] }] }
+    } : {} }),
+    clickSectionAdd: async () => { mounted = true; return { ok: true }; },
+    clickDeleteEntry: async () => { mounted = false; return { ok: true }; },
+    isTreePicker: async () => true,                                          // cert is a TREE
+    readHier: async () => ({ searchBox: { visible: true, focused: true } }),
+    scrapeTaOptions: async () => ({ ok: true, options: ["Accounting", "IT", "Healthcare"] }), // categories on open
+    pressTab: async () => {},
+  };
+  const r = await revealUnknownSection(fake, "Certifications", T_BUDGETS);
+  assert.ok(r);
+  const cert = r.shape.find((s) => s.recName === "certification");
+  assert.strictEqual(cert.widget_type, "hierarchical");                     // retagged (tree) → categories note in the summary
+  assert.deepStrictEqual(cert.options, ["Accounting", "IT", "Healthcare"]);  // the recon'd categories
+  const num = r.shape.find((s) => s.recName === "certificationNumber");
+  assert.strictEqual(num.widget_type, "text"); assert.ok(!num.options);      // a text field: no option recon
+});
+
 test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {
   const added = { page: "p2", field_id: "p2::formField-website[4].url", canonical_field: "website[4].url", is_added: true, current_value: "https://added.example", fill_status: "not_filled", needs_review: true };
   const otherPage = { page: "p1", field_id: "p1::formField-personal_info.first_name", canonical_field: "personal_info.first_name", fill_status: "filled" };

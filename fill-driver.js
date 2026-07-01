@@ -3268,7 +3268,28 @@ async function revealUnknownSection(act, heading, budgets) {
   if (!newPrefix) return null; // mount didn't register → can't reveal a container-less section
   const sec = scan.sections[newPrefix];
   const fields = (sec && sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
-  const shape = fields.map((f) => ({ recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired }));
+  // Recon each CHOICE field's options while the entry is mounted (reuses the proven capture fns) so
+  // the summary can render real widgets, not text boxes: dropdown → all options; typeahead → all
+  // options; a TREE typeahead → its top-level CATEGORIES only (re-tagged widget_type "hierarchical"
+  // → the summary shows a "these are categories, not the final options" note). text/date/checkbox
+  // carry no options — the summary renders them by widget_type (date → a date picker). Non-fatal.
+  const shape = [];
+  for (const f of fields) {
+    const s = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
+    const loc = { wrapperSel: f.wrapperSel };
+    try {
+      if (f.widgetType === "dropdown") {
+        const opts = await captureDropdownOptions(act, loc, budgets);
+        if (opts && opts.length) s.options = opts;
+      } else if (f.widgetType === "typeahead") {
+        const isTree = act.isTreePicker ? await act.isTreePicker(loc) : false;
+        const opts = await captureFieldOptions(act, loc, budgets); // tree → categories; flat → all options
+        if (opts && opts.length) s.options = opts;
+        if (isTree) s.widget_type = "hierarchical"; // summary shows the categories + a "not the final options" note
+      }
+    } catch (e) { /* non-fatal — the field stays a text box in the summary */ }
+    shape.push(s);
+  }
   // clean up — delete the entry we mounted so the form is left as we found it (0 entries)
   try { await act.clickDeleteEntry(newPrefix, (sec.entries || []).length - 1); } catch (e) { /* best-effort */ }
   return { prefix: newPrefix, base: newPrefix.replace(/-$/, ""), heading: (sec && sec.heading) || heading || null, shape };

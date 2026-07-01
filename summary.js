@@ -60,6 +60,7 @@ const cleanPageName = (b) => {
 // editKindOf / checkedOf / tokenFor / effectiveValue / approvalEnvelope / requiresApproval live in
 // summary-lib.js (loaded BEFORE this script — globals here, requireable in tests). Do NOT redeclare.
 const PARTIAL_NOTE = "Options the search surfaced — not the full list. Edit on the form for other values.";
+const CATEGORY_NOTE = "These are the form's top-level categories, not the final options — pick the closest, then refine on the form if needed.";
 const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle });
 
 // Section grouping. Keys = the REAL canonical-field prefixes the fill engine emits
@@ -256,6 +257,19 @@ function buildEditor(entry) {
     inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; }, 150));
     return { node: wrap, set: (v) => { inp.value = v == null ? "" : String(v); } };
   };
+  // a real date picker (was a plain text box). Pre-fill accepts M/D/Y or YYYY-MM-DD; commits YYYY-MM-DD.
+  const dateEditor = () => {
+    const toISO = (v) => {
+      const s = String(v == null ? "" : v).trim(); if (!s) return "";
+      let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s); if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+      m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s); if (m) return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+      return "";
+    };
+    const inp = el("input", { class: "editor", type: "date" });
+    inp.value = toISO(cur);
+    inp.addEventListener("change", () => onCommit(inp.value));
+    return { node: inp, set: (v) => { inp.value = toISO(v); } };
+  };
   if (wt === "file_upload") return null;
   if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
   // TREE-AI (cert): the recon captured the chosen category's leaves → a searchable editor over them
@@ -271,7 +285,8 @@ function buildEditor(entry) {
     return { node: cb, set: (v) => { cb.checked = checkedOf(v); } };
   }
   if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return Object.assign(textInput("input"), { partial: co.length > 0 }); }
-  if (wt === "hierarchical") { const opts = entry.options || entry.captured_options || []; if (opts.length > 2) return Object.assign(selectFrom(opts), { partial: true }); return Object.assign(textInput("input"), { partial: opts.length > 0 }); }
+  if (wt === "hierarchical") { const opts = entry.options || entry.captured_options || []; if (opts.length > 2) return Object.assign(selectFrom(opts), { category: true }); return Object.assign(textInput("input"), { category: opts.length > 0 }); }
+  if (wt === "date") return dateEditor();
   if (wt === "textarea") return textInput("textarea");
   return textInput("input"); // text / date / unknown
 }
@@ -318,6 +333,7 @@ const fieldRow = (e, opts = {}) => {
   }
   val.appendChild(line);
   if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
+  if (ed && ed.category) val.appendChild(el("div", { class: "partial-note", text: CATEGORY_NOTE }));
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
   row.appendChild(val);
