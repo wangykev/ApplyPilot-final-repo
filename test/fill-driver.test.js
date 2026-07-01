@@ -2845,6 +2845,14 @@ function makeNestedRevealAct(o) {
     nestedScan: async () => scan(),
     clickNestedAdd: async (pf, re) => { log.push(["add", pf, re]); if (o.addFails) return { ok: false }; children.push(nextIdx++); return { ok: true }; },
     clickNestedDelete: async (pf, base, idx) => { log.push(["del", pf, base, idx]); if (o.deleteFails) return { ok: false }; children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
+    // typeahead option-scan seams (point 1): captureTypeaheadOptions opens the specialty typeahead and
+    // either scrapes a FLAT option list (o.taOptions) or detects a hierarchical TREE (o.taCategories).
+    openHier: async () => true,
+    readHier: async () => ({ searchBox: { present: true, visible: true, focused: false, value: "" }, chips: [], leaves: [], leafCount: 0 }),
+    readTreeCategories: async () => (o.taCategories || []).slice(),
+    focusHierSearch: async () => true,
+    scrapeTaOptions: async () => ({ ok: true, options: (o.taOptions || []).slice() }),
+    pressTab: async () => {},
     _children: () => children.slice()
   };
 }
@@ -2871,6 +2879,22 @@ test("revealNestedShape: a mount that never registers → null (no shape invente
   const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, addFails: true });
   const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
   assert.strictEqual(revealed, null);
+});
+
+test("revealNestedShape: a FLAT specialty typeahead → scans ALL options (combobox), NOT the tier editor (point 1)", async () => {
+  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, taOptions: ["Cardiology", "Neurology", "Oncology"] });
+  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
+  const sp = revealed.shape.find((s) => s.recName === "specialtyParent");
+  assert.strictEqual(sp.widget_type, "typeahead", "flat → stays typeahead (combobox), not hierarchical");
+  assert.deepStrictEqual(sp.options, ["Cardiology", "Neurology", "Oncology"], "all options scanned → the summary shows a combobox");
+});
+
+test("revealNestedShape: a HIERARCHICAL TREE specialty typeahead → tagged hierarchical (tier editor), no option list (point 1)", async () => {
+  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, taCategories: ["Medical", "Legal", "Trade"] });
+  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
+  const sp = revealed.shape.find((s) => s.recName === "specialtyParent");
+  assert.strictEqual(sp.widget_type, "hierarchical", "tree → hierarchical → the summary shows the tier editor (values to try)");
+  assert.ok(!sp.options, "a tree has no flat option list");
 });
 
 test("drivePageFill: EMPTY nested sub-section → reveal-by-add → a nested_section_stub per parent entry (Milestone B)", async () => {

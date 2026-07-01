@@ -211,33 +211,43 @@ const addEntry = (page, key) => {
   // If this section has recon'd NESTED sub-sections (cert ▸ Specialties — the shapes ride the
   // section stub's nested_shapes, captured DURING the fill so they survive a deleted parent), attach a
   // nested-section stub to the newly-added parent so its sub-section shows + is addable here too.
-  const nsStub = currentBundle.entries.find((e) => e.page === page && sectionOf(e).key === key && e.widget_type === "section_stub" && e.nested_shapes && typeof e.nested_shapes === "object");
+  const nsStub = currentBundle.entries.find((e) => e.page === page && sectionOf(e).key === key && e.widget_type === "section_stub" && (e.nested_shapes || e.nested_attachments));
+  const baseRec = () => ({ // shared skeleton for an added nested item
+    page: page != null ? page : null, field_index: null,
+    is_required: false, current_value: null, original_ai_value: null,
+    is_edited: false, edit_kind: null, is_added: true, added_at: new Date().toISOString(),
+    is_approved: false, approved_at: null,
+    page_number: sample ? sample.page_number : null, page_label: sample ? sample.page_label : null,
+    confidence: "none", confidence_source: "added", fill_status: "not_filled", fill_error: null,
+    match_tier: null, options: null, captured_options: null, tree_structure: null, date_order: null, tiers: null, character_count: null
+  });
   const nestedShapes = nsStub ? nsStub.nested_shapes : null;
   if (nestedShapes) {
     for (const childBase of Object.keys(nestedShapes)) {
       const shp = nestedShapes[childBase];
       if (!Array.isArray(shp) || !shp.length) continue;
-      const human = humanize(childBase);
-      recs.push({
+      recs.push(Object.assign(baseRec(), {
         field_id: (page != null ? page + "::" : "") + "formField-" + key + "[" + newIx + "]." + childBase + "._stub",
-        page: page != null ? page : null, field_index: null,
-        question_label: human + " (0)", widget_type: "nested_section_stub",
+        question_label: humanize(childBase) + " (0)", widget_type: "nested_section_stub",
         canonical_field: key + "[" + newIx + "]." + childBase + "._stub",
-        is_required: false, current_value: null, original_ai_value: null,
-        is_edited: false, edit_kind: null, is_added: true, added_at: new Date().toISOString(),
-        is_approved: false, approved_at: null,
-        page_number: sample ? sample.page_number : null, page_label: sample ? sample.page_label : null,
-        confidence: "none", confidence_source: "added",
         needs_review: true, needs_review_reason: "nested_section",
-        fill_status: "not_filled", fill_error: null,
         detail: "nested repeating sub-section (" + key + " ▸ " + childBase + ") — add or verify entries here",
-        match_tier: null, flag: "nested-section-stub",
-        section_field_shape: shp.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null })),
+        flag: "nested-section-stub",
+        section_field_shape: shp.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null, options: Array.isArray(s.options) ? s.options : null })),
         container_prefix: key + "-<idx>--" + childBase + "-",
-        nested_parent: { base: key, index: newIx }, nested_child_base: childBase, section_known: false,
-        options: null, captured_options: null, tree_structure: null, date_order: null, tiers: null, character_count: null
-      });
+        nested_parent: { base: key, index: newIx }, nested_child_base: childBase, section_known: false
+      }));
     }
+  }
+  // detected per-entry attachment field (only when the form actually has one — never hardcoded)
+  if (nsStub && nsStub.nested_attachments) {
+    recs.push(Object.assign(baseRec(), {
+      field_id: (page != null ? page + "::" : "") + "formField-" + key + "[" + newIx + "].attachments",
+      question_label: "Attachments", widget_type: "file_upload",
+      canonical_field: key + "[" + newIx + "].attachments",
+      needs_review: true, needs_review_reason: "nested_attachment",
+      detail: "per-entry attachments — upload on the form", flag: "nested-attachment"
+    }));
   }
   currentBundle.entries.push(...recs);
   persist(); render();
@@ -269,7 +279,8 @@ const addNestedEntry = (page, parentKey, parentIx, childBase, stubEntry) => {
   const shape = (stubEntry.section_field_shape || []).map((s) => ({
     recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type,
     is_required: !!s.is_required, label: s.label != null ? s.label : s.recName,
-    options: null, captured_options: null, tree_structure: null, date_order: s.date_order || null
+    options: Array.isArray(s.options) ? s.options : null, // scanned flat-typeahead options → combobox (tree → hierarchical → tier editor)
+    captured_options: null, tree_structure: null, date_order: s.date_order || null
   }));
   if (!shape.length) return;
   const sample = currentBundle.entries.find((e) => e.page === page);
@@ -291,18 +302,23 @@ const renderNestedSub = (pg, parentSec, parentIx, childBase, bucket) => {
   const label = (stub && stub.question_label) || (humanize(childBase) + " (0)");
   card.appendChild(el("div", { class: "nsub-head" }, [el("span", { class: "nsub-name", text: label })]));
   if (stub && stub.detail) card.appendChild(el("div", { class: "nsub-note", text: stub.detail }));
+  const singular = humanize(childBase).replace(/ies$/i, "y").replace(/s$/, ""); // "Specialties" → "Specialty", "Attachments" → "Attachment"
   const byCi = {}, ciOrder = [];
   for (const x of fieldItems) { const ci = x.ni.childIndex; if (!(ci in byCi)) { byCi[ci] = []; ciOrder.push(ci); } byCi[ci].push(x.e); }
   ciOrder.sort((a, b) => a - b);
   for (const ci of ciOrder) {
     const added = byCi[ci].some((e) => e.is_added);
-    const eh = el("div", { class: "nsub-eh" }, [el("span", { text: humanize(childBase).replace(/s$/, "") + " " + (ci + 1) + (added ? " · added" : "") })]);
-    if (added) { const rm = el("button", { class: "tier-rm", text: "Remove" }); rm.addEventListener("click", () => { currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === pg && e.is_added && new RegExp("^" + parentSec.key + "\\[" + parentIx + "\\]\\." + childBase + "\\[" + ci + "\\]").test(String(e.canonical_field || "")))); persist(); render(); }); eh.appendChild(rm); }
+    const eh = el("div", { class: "nsub-eh" }, [el("span", { text: singular + " " + (ci + 1) + (added ? " · added" : "") })]);
+    if (added) { // same trash-icon Delete button as a top-level entry (was a bare "Remove" text button)
+      const rm = el("button", { class: "del", title: "Remove this added " + singular }, [svgTrash(), el("span", { text: "Remove" })]);
+      rm.addEventListener("click", () => { currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === pg && e.is_added && new RegExp("^" + parentSec.key + "\\[" + parentIx + "\\]\\." + childBase + "\\[" + ci + "\\]").test(String(e.canonical_field || "")))); persist(); render(); });
+      eh.appendChild(rm);
+    }
     card.appendChild(eh);
     for (const e of byCi[ci]) card.appendChild(fieldRow(e));
   }
   if (currentFilter === "all" && stub && Array.isArray(stub.section_field_shape) && stub.section_field_shape.length) {
-    const add = el("button", { class: "add-entry", text: "+ Add " + humanize(childBase).replace(/s$/, "").toLowerCase() });
+    const add = el("button", { class: "add-entry", text: "+ Add " + singular.toLowerCase() });
     add.addEventListener("click", () => addNestedEntry(pg, parentSec.key, parentIx, childBase, stub));
     card.appendChild(add);
   }

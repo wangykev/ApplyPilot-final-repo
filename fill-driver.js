@@ -2413,7 +2413,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
             rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
             flag: "nested-section-stub", verified: null, after: null,
             detail: "nested repeating sub-section (" + nc.parentBase + " ▸ " + nc.childBase + ") — the bot has no mapping; add or verify entries here",
-            section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null })),
+            section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null, options: Array.isArray(s.options) ? s.options : null })), // carry scanned flat-typeahead options → combobox (tree → widget_type "hierarchical" → tier editor)
             container_prefix: nc.parentBase + "-" + fkitIdx + "--" + nc.childBase + "-", // session-scoped nested backend identifier
             nested_parent: { base: nc.parentBase, index: pOrd }, nested_child_base: nc.childBase, section_known: false
           });
@@ -2424,7 +2424,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         const pOrd = (ordinalOf[at.parentBase] || {})[at.parentIndex];
         if (pOrd == null) continue;
         results.push({
-          fieldName: at.parentBase + "[" + pOrd + "].attachments", label: "Attachments",
+          fieldName: at.parentBase + "[" + pOrd + "].attachments", label: at.heading || "Attachments", // DETECTED heading, not hardcoded
           widgetType: "file_upload", isRequired: false, mappedPath: at.parentBase + "[" + pOrd + "].attachments",
           rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
           flag: "nested-attachment", verified: null, after: null,
@@ -2840,7 +2840,8 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     flag: "section-stub", verified: null, after: null, detail,
     section_field_shape: stubShape(),
     container_prefix: containerPrefix, section_known: true,
-    nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null // sub-section shapes → viewer shows them on an added-back parent
+    nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null, // sub-section shapes → viewer shows them on an added-back parent
+    nested_attachments: nestedHasAttachments || null // the form has a per-entry attach field (DETECTED, not hardcoded) → the viewer offers attachments on an added-back parent
   });
   const captureNestedShapes = async () => {
     if (!(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return;
@@ -3576,13 +3577,27 @@ async function revealNestedShape(act, parentFkit, parentBase, childBase, heading
   }
   if (newIdx == null) return null; // mount didn't register → can't reveal the shape
   const fields = fieldsFor(scan, newIdx);
-  // build the shape from the DOM (no option capture here — a specialty typeahead → the review's tier
-  // editor per the operator's tier system; dates carry their segment order for the segmented editor).
-  const shape = fields.map((f) => {
+  // Build the shape from the DOM WHILE the probe is mounted — recon each choice field's options so the
+  // summary shows real widgets: a FLAT typeahead → scan ALL its options (a combobox, NOT the tier
+  // editor); a hierarchical TREE typeahead → tag "hierarchical" (the tier editor — operator supplies
+  // candidates, since a tree has no flat list); dropdown → all options; date → its segment order.
+  const shape = [];
+  for (const f of fields) {
     const s = { recName: f.field, path: f.field, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
-    if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; }
-    return s;
-  });
+    const loc = { wrapperSel: f.wrapperSel };
+    try {
+      if (f.widgetType === "typeahead") {
+        const cap = await captureTypeaheadOptions(act, loc, budgets); // tree → {hierarchical}; flat → {options}
+        if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; }
+      } else if (f.widgetType === "dropdown") {
+        const opts = await captureDropdownOptions(act, loc, budgets);
+        if (opts && opts.length) s.options = opts;
+      } else if (f.widgetType === "date") {
+        const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord;
+      }
+    } catch (e) { /* non-fatal — the field keeps its base widget in the summary */ }
+    shape.push(s);
+  }
   // clean up — DELETE the probe (Milestone-A substrate). Best-effort; the recon proved it works.
   try { await act.clickNestedDelete(parentFkit, childBase, newIdx); } catch (e) { /* best-effort */ }
   return { childIndex: newIdx, shape };
@@ -3729,6 +3744,7 @@ function buildReviewBundle(results, meta) {
       nested_parent: (rec.nested_parent && typeof rec.nested_parent === "object") ? rec.nested_parent : null, // nested-section stub: { base, index } — the parent entry the sub-section belongs to (viewer sub-grouping)
       nested_child_base: rec.nested_child_base != null ? rec.nested_child_base : null,                         // nested-section stub: the child base (e.g. "specialties") for the add-entry
       nested_shapes: (rec.nested_shapes && typeof rec.nested_shapes === "object") ? rec.nested_shapes : null,  // removed/empty section stub: { childBase → shape } recon'd during the fill → the viewer shows the sub-section on an added-back parent
+      nested_attachments: rec.nested_attachments != null ? !!rec.nested_attachments : null,                    // section stub: the form has a per-entry attach field → the viewer offers attachments on an added-back parent
       character_count: null
     };
   });
