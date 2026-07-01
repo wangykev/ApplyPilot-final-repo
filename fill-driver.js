@@ -2271,7 +2271,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
             mappedPath: base + "[" + i + "]." + f.fieldName,
             rawValue: null, resolved: null,
             status: "filled_review", matchTier: null, confidence: null, flag: "already-filled",
-            verified: null, after: hasVal ? (v === true ? "Yes" : String(v)) : null,
+            // String(v) matches the bot's checkbox convention (fillCheckboxCdp → String(checked) =
+            // "true"/"false") + the viewer's checkedOf/tokenFor; a checkbox reads back boolean true → "true".
+            verified: null, after: hasVal ? String(v) : null,
             detail: hasVal ? "already on the form — NOT filled by ApplyPilot; verify" : "on the form, empty — not filled by ApplyPilot; verify/fill",
             options: shp.options || null, date_order: shp.date_order || null, auditLoc: f.wrapperSel
           });
