@@ -2084,15 +2084,26 @@ async function runCdpCertSpecialtyRecon(tabId) {
       }, null, 2));
     }
 
-    // ── (4) RESTORE — HONEST (auto-restore NOT wired for the nested shape) ─────
-    // The specialty entry is NOT a `--null` container (it's the --specialties-<M>--
-    // field-fkit set), so clickDeleteEntry (which keys on --null entries) can't remove
-    // it — and a proper per-cert-entry nested Delete belongs to the DEFERRED fill
-    // milestone, not a half-built one here. So we do NOT auto-delete the mounted
-    // specialty; we log it loudly. ⚠ The operator removes the leftover manually before
-    // the WE / full-page work (a stale empty specialty would confuse a full-page rescan).
-    if (newFkit.length) {
-      LOG("⚠ LEFTOVER — this recon MOUNTED an empty specialty (" + newFkit.join(", ") + ") and does NOT auto-remove it (the nested Delete is part of the deferred fill milestone). REMOVE IT MANUALLY: on the form, click Delete on the empty specialty under the cert's 'Specialties' — before running WE / a full-page fill.");
+    // ── (4) DELETE the mounted probe specialty — PROVE the nested Delete cleans up ────
+    // The specialty entry is NOT a `--null` container (it's the --specialties-<M>-- field-
+    // fkit set), so clickDeleteEntry can't reach it. The NEW scoped clickNestedDelete
+    // (climb from a specialty field to the smallest Delete-bearing ancestor, guarded against
+    // the parent's own Delete) removes it. Verifying cleanup here RESOLVES the M36.2 leftover
+    // and proves the substrate that reveal-by-add (auto mount→scan→delete) depends on.
+    if (newFkit.length && specialtyIndex != null) {
+      LOG("deleting the mounted probe specialty (M=" + specialtyIndex + ") via the scoped nested Delete…");
+      const del = await act.clickNestedDelete(before.fkit, "specialties", specialtyIndex);
+      if (!del.ok) {
+        LOG("⚠ nested Delete NOT found (no scoped 'Delete' button for the specialty, or the parent-guard refused). LEFTOVER remains — remove it MANUALLY. This is the substrate gap to close before reveal-by-add can auto-clean.");
+      } else {
+        const goneScan = await scanUntil((s) => { const c0 = s && s.certEntries[0]; return c0 && !c0.nestedFkitIds.some((id) => newFkit.includes(id)); }, 6000);
+        const c0 = goneScan && goneScan.certEntries[0];
+        const stillThere = !!(c0 && c0.nestedFkitIds.some((id) => newFkit.includes(id)));
+        if (stillThere) LOG("⚠ clicked the nested Delete but the specialty fkit(s) are STILL present — cleanup FAILED, remove manually (check the Delete anchor).");
+        else LOG("✅ nested Delete WORKS — probe specialty removed, NO leftover. (M36.2 leftover RESOLVED; reveal-by-add can auto-clean.)");
+      }
+    } else if (newFkit.length) {
+      LOG("⚠ mounted a specialty but could not parse its index — not auto-deleting; remove the leftover manually.");
     }
     if (addedCert) {
       LOG("removing the cert entry we added for the recon (a --null entry, deletable)…");

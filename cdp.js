@@ -925,6 +925,69 @@ function cdpDeleteEntryRect(prefix, index) {
            cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
+// NESTED-section Add — the "Add" button INSIDE a SPECIFIC parent entry (scoped by the parent's
+// fkit), matched by its nearest-heading regex (e.g. "Specialties" inside a certification-N--null
+// entry). Unlike cdpSectionAddRect (page-wide, grabs the FIRST match), this scopes to ONE parent so
+// reveal-by-add mounts into a KNOWN entry (and can delete from the same). scrollIntoView + rect.
+function cdpNestedAddRect(parentFkit, regexSource) {
+  const re = new RegExp(regexSource, "i");
+  const entry = document.querySelector('[data-fkit-id="' + parentFkit + '"]');
+  if (!entry) return null;
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  const btn = Array.from(entry.querySelectorAll('[data-automation-id="add-button"]')).find((b) => re.test(nearestHeading(b) || ""));
+  if (!btn) return null;
+  if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = btn.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
+// NESTED-ENTRY Delete — a nested entry (cert Specialty) has NO `--null` container (it's the SET of
+// `<parent>--<child>-<M>--<field>` fkit nodes), so cdpDeleteEntryRect can't find it. Locate a field
+// of the child entry, climb to the SMALLEST ancestor holding a <button>Delete</button>, and GUARD
+// that the ancestor does NOT also span the PARENT's own direct fields (`<parent>--X` where X is not
+// this child) — else we've climbed to the parent entry and its Delete would nuke the whole parent.
+// Fully generic (no hardcoded parent/child names). Returns null (safe no-op) if no scoped Delete.
+function cdpNestedDeleteRect(parentFkit, childBase, childIndex) {
+  const base = String(parentFkit).replace(/--null$/, "");                // e.g. certification-N
+  const specPrefix = base + "--" + childBase + "-" + childIndex + "--";   // certification-N--specialties-M--
+  const field = document.querySelector('[data-fkit-id^="' + specPrefix + '"]');
+  if (!field) return null;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // a PARENT-direct fkit = "<base>--X" where X does NOT begin "<childBase>-<digits>" (the parent's
+  // OWN field, or `--null`) — its presence in an ancestor means we've climbed past the child entry.
+  const parentDirectRe = new RegExp("^" + esc(base) + "--(?!" + esc(childBase) + "-\\d)");
+  const parentEntry = document.querySelector('[data-fkit-id="' + parentFkit + '"]');
+  let p = field, btn = null;
+  for (let i = 0; i < 8 && p; i++) {
+    p = p.parentElement;
+    if (!p) break;
+    if (parentEntry && p === parentEntry) break; // reached the parent entry → its Delete is the PARENT's
+    const spansParent = Array.from(p.querySelectorAll("[data-fkit-id]")).some((n) => parentDirectRe.test(n.getAttribute("data-fkit-id") || ""));
+    if (spansParent) break; // this ancestor covers the parent's own fields → too big, refuse
+    const b = Array.from(p.querySelectorAll("button")).find((x) => /^delete$/i.test((x.textContent || "").trim()));
+    if (b) { btn = b; break; }
+  }
+  if (!btn) return null;
+  if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = btn.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
 // M30 session-expiry recon read: a READ-ONLY static snapshot to classify whether
 // the page is a live apply form vs a logged-out / expired / error state. No clicks.
 // Run once on a VALID form and once LOGGED-OUT/stale to find the discriminator.
@@ -2222,6 +2285,21 @@ function makeCdpActuation(llmConfig) {
     // any index for delete-on-no-match). Same scroll + viewport-rect + retry mechanics.
     clickDeleteEntry: async (prefix, index) => {
       const rect = await cdpEvalRectReady(cdpDeleteEntryRect, prefix, index);
+      if (!rect) return { ok: false };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { ok: true };
+    },
+    // ── nested repeating sections (reveal-by-add: cert ▸ Specialties) ──
+    // Add scoped INSIDE a specific parent entry (parentFkit = "<base>-<N>--null"); Delete a nested
+    // child entry that has NO --null container. Same scroll + viewport-rect + M29 retry mechanics.
+    clickNestedAdd: async (parentFkit, headingRegexSource) => {
+      const rect = await cdpEvalRectReady(cdpNestedAddRect, parentFkit, headingRegexSource);
+      if (!rect) return { ok: false };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { ok: true };
+    },
+    clickNestedDelete: async (parentFkit, childBase, childIndex) => {
+      const rect = await cdpEvalRectReady(cdpNestedDeleteRect, parentFkit, childBase, childIndex);
       if (!rect) return { ok: false };
       await cdpClickAt(rect.cx, rect.cy);
       return { ok: true };
