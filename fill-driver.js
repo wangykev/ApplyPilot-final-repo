@@ -2573,10 +2573,7 @@ const PAGE_SECTIONS = [
   { name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-", itemsKey: "work_experience", fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false },
   { name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education", fieldMap: EDUCATION_MAP, deleteOnNoMatch: false },
   { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true, nested: CERT_NESTED },
-  // TEMP TEST (restore after): Languages removed from the catalog so it falls through to the GENERIC
-  // unknown-section path (m3a detected-shape stub / m3b reveal-by-add) — to verify generic top-level
-  // detection recons it correctly. RESTORE this line to re-enable profile-driven Languages fill:
-  // { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
+  { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
   { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
 ];
 
