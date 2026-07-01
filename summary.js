@@ -295,23 +295,26 @@ function buildEditor(entry) {
   //       options; if NONE match → DELETE the repeating entry + a "none of the tiers matched" note (this
   //       is exactly the existing deleteOnNoMatch behavior — reuse it).
   const tierEditor = () => {
+    // seed the list from an existing bot value (shown as tier 1) — display only; doesn't mark edited.
+    if (!Array.isArray(entry.tiers)) entry.tiers = (entry.current_value != null && entry.current_value !== "") ? [entry.current_value] : [];
     const wrap = el("div", { class: "tier-ed" }), list = el("div", { class: "tier-list" });
-    const sync = () => {
-      const vals = Array.from(list.querySelectorAll("input.tier-val")).map((i) => i.value.trim()).filter((v) => v !== "");
-      entry.tiers = vals;
-      commit(entry, vals.length ? vals[0] : ""); // top tier → current_value (edit_kind + approval reset via commit)
+    const persist = () => commit(entry, (entry.tiers && entry.tiers.length) ? entry.tiers[0] : ""); // top tier → current_value
+    const render = () => {
+      list.textContent = "";
+      (entry.tiers || []).forEach((t, i) => {
+        const rm = el("button", { class: "tier-rm", title: "remove", text: "×" });
+        rm.addEventListener("click", () => { entry.tiers.splice(i, 1); persist(); render(); });
+        list.appendChild(el("div", { class: "tier-item" }, [el("span", { class: "tier-n", text: (i + 1) + "." }), el("span", { class: "tier-t", text: String(t) }), rm]));
+      });
     };
-    const addRow = (val) => {
-      const row = el("div", { class: "tier-row" });
-      const inp = el("input", { class: "editor tier-val", type: "text", placeholder: "candidate value" });
-      inp.value = val == null ? "" : String(val); inp.addEventListener("change", sync);
-      const rm = el("button", { class: "tier-rm", title: "remove", text: "×" }); rm.addEventListener("click", () => { row.remove(); sync(); });
-      row.appendChild(inp); row.appendChild(rm); list.appendChild(row);
-    };
-    const seed = (Array.isArray(entry.tiers) && entry.tiers.length) ? entry.tiers : [entry.current_value].filter((v) => v != null && v !== "");
-    (seed.length ? seed : [""]).forEach(addRow);
-    const add = el("button", { class: "tier-add", text: "+ add tier" }); add.addEventListener("click", () => addRow(""));
-    wrap.appendChild(list); wrap.appendChild(add);
+    const inp = el("input", { class: "editor tier-in", type: "text", placeholder: "value to try" });
+    const addVal = () => { const v = inp.value.trim(); if (!v) return; entry.tiers = (entry.tiers || []).concat(v); inp.value = ""; persist(); render(); inp.focus(); };
+    inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); addVal(); } });
+    const btn = el("button", { class: "tier-try", text: "Try this next" });
+    btn.addEventListener("click", addVal);
+    wrap.appendChild(el("div", { class: "tier-add-row" }, [inp, btn]));
+    wrap.appendChild(list);
+    render();
     return { node: wrap, set: () => {}, tier: true };
   };
   if (wt === "file_upload") return null;
@@ -401,7 +404,9 @@ const fieldRow = (e, opts = {}) => {
     if (ed && ed.set) ed.set(e.current_value);
     const kind = editKindOf(e);
     afref.textContent = "";
-    if (kind) { afref.appendChild(document.createTextNode("autofilled: ")); afref.appendChild(el("b", { text: fmt(autofilledOf(e)) })); }
+    // "autofilled: X" only when the BOT actually had a value (original_ai_value non-empty). A user-
+    // entered value on a bot-blank field (tiers, filled_blank, added entry) was NOT autofilled → no line.
+    if (kind && String(e.original_ai_value == null ? "" : e.original_ai_value) !== "") { afref.appendChild(document.createTextNode("autofilled: ")); afref.appendChild(el("b", { text: fmt(e.original_ai_value) })); }
     if (apBtn) { apBtn.classList.toggle("on", !!e.is_approved); apBtn.textContent = e.is_approved ? "✓ Approved" : "Approve"; }
     const approved = !!(e.needs_review && e.is_approved); // an approved flagged row reads green, not warn/crit
     row.classList.toggle("f-approved", approved);

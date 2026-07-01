@@ -2730,6 +2730,13 @@ test("section_stub carries section_field_shape into the bundle (2b: viewer build
   assert.deepStrictEqual(bundle.entries[0].section_field_shape, [{ recName: "url", widget_type: "text", path: "url" }]);
 });
 
+test("buildReviewBundle carries date_order onto a date entry (m3c — segmented editor for all dates)", () => {
+  const recs = [{ fieldName: "workExperience[0].startDate", widgetType: "date", isRequired: true, mappedPath: "workExperience[0].from", status: "filled", after: "5/2025", date_order: ["month", "year"] }];
+  const e = buildReviewBundle(recs, { page: "p2" }).entries[0];
+  assert.deepStrictEqual(e.date_order, ["month", "year"]); // → the summary renders MM/YYYY, not a text box
+  assert.strictEqual(e.widget_type, "date");
+});
+
 test("detectSectionShapes: reads the field SET from a live scan, keyed by section NAME (2c)", () => {
   const scan = { sections: {
     "certification-": { entries: [{ fields: [

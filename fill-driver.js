@@ -2602,6 +2602,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     const loc = { wrapperSel: fd.wrapperSel };
     rec.auditLoc = fd.wrapperSel; // M40: retain the entry-scoped locator for the post-fill audit re-read
     rec.auditTag = f.widget === "textarea" ? "textarea" : undefined;
+    if (f.widget === "year" || f.widget === "date") { const ord = dateOrderOf(fd.dateSegments); if (ord.length) rec.date_order = ord; } // m3c: form's segment order → the summary's segmented date editor (all date fields, not just revealed ones)
     // FoS Round 3: tag so the END-OF-PAGE option-capture pass can find this record (captureKey groups
     // same-vocabulary fields across entries → one scrape). Captured at end-of-page, NOT inline — an
     // inline scrape races the field's post-commit settle (empty scrape) / corrupts the commit.
@@ -3474,6 +3475,7 @@ function buildReviewBundle(results, meta) {
       section_heading: rec.section_heading != null ? rec.section_heading : null,    // m3a: section heading / Add anchor
       section_known: rec.section_known != null ? !!rec.section_known : null,        // m3a: false = unmapped/unknown section
       tiers: null, // m3c: ordered candidate list the review's tier editor fills for a hierarchical field (profile-shaped → portable)
+      date_order: Array.isArray(rec.date_order) ? rec.date_order : null, // m3c: segment order → the summary's segmented date editor
       character_count: null
     };
   });
