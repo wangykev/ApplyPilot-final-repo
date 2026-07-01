@@ -142,6 +142,8 @@ function newEntryRecords(shape, meta) {
     options: Array.isArray(s.options) ? s.options : null,
     captured_options: Array.isArray(s.captured_options) ? s.captured_options : null,
     tree_structure: (s.tree_structure && typeof s.tree_structure === "object") ? s.tree_structure : null,
+    date_order: Array.isArray(s.date_order) ? s.date_order : null, // m3c: date-segment order for the segmented date editor
+    tiers: null, // m3c: ordered candidate list for a hierarchical/tree field — filled by the review's tier editor
     character_count: null
   }));
 }

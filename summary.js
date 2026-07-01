@@ -60,7 +60,7 @@ const cleanPageName = (b) => {
 // editKindOf / checkedOf / tokenFor / effectiveValue / approvalEnvelope / requiresApproval live in
 // summary-lib.js (loaded BEFORE this script — globals here, requireable in tests). Do NOT redeclare.
 const PARTIAL_NOTE = "Options the search surfaced — not the full list. Edit on the form for other values.";
-const CATEGORY_NOTE = "These are the form's top-level categories, not the final options — pick the closest, then refine on the form if needed.";
+const TIER_NOTE = "Add candidate values, most specific first. On submit the fill tries each in order and uses the first that matches this field's options on the form.";
 const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle });
 
 // Section grouping. Keys = the REAL canonical-field prefixes the fill engine emits
@@ -160,7 +160,8 @@ const sectionShapeFor = (page, key) => {
     return { recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required,
       label: s.label != null ? s.label : s.recName,
       options: ex ? ex.options : (s.options || null), captured_options: ex ? ex.captured_options : (s.captured_options || null),
-      tree_structure: ex ? ex.tree_structure : (s.tree_structure || null) };
+      tree_structure: ex ? ex.tree_structure : (s.tree_structure || null),
+      date_order: s.date_order || (ex ? ex.date_order : null) }; // m3c: segment order for the date editor
   };
   // (1) 2c: the DOM-DETECTED shape (the field SET read from the live form during the fill, cached
   // on the bundle — covers a section even when EMPTY this run if it was populated before), enriched
@@ -179,7 +180,7 @@ const sectionShapeFor = (page, key) => {
   }
   // (3) cold fallback: the stub's map-derived shape (an empty section never yet seen populated)
   const stub = ents.find((e) => e.widget_type === "section_stub" && Array.isArray(e.section_field_shape) && e.section_field_shape.length);
-  if (stub) return stub.section_field_shape.map((s) => ({ recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required, label: s.label != null ? s.label : s.recName, options: null, captured_options: null, tree_structure: null }));
+  if (stub) return stub.section_field_shape.map((s) => ({ recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required, label: s.label != null ? s.label : s.recName, options: null, captured_options: null, tree_structure: null, date_order: s.date_order || null }));
   return [];
 };
 const nextIndexFor = (page, key) => {
@@ -257,18 +258,46 @@ function buildEditor(entry) {
     inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; }, 150));
     return { node: wrap, set: (v) => { inp.value = v == null ? "" : String(v); } };
   };
-  // a real date picker (was a plain text box). Pre-fill accepts M/D/Y or YYYY-MM-DD; commits YYYY-MM-DD.
-  const dateEditor = () => {
-    const toISO = (v) => {
-      const s = String(v == null ? "" : v).trim(); if (!s) return "";
-      let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s); if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
-      m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s); if (m) return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
-      return "";
+  // Segmented date inputs in the FORM's order + granularity (year-only / M-Y / M-D-Y, from the recon'd
+  // date_order) — NOT a browser <input type=date> (which shows the locale order → the dd/mm-vs-mm/dd
+  // bug). No recon'd order → a plain text box (don't guess). Commits "<a>/<b>/<c>" in the form's order.
+  const dateEditor = (order) => {
+    const segs = (Array.isArray(order) && order.length) ? order : null;
+    if (!segs) { const inp = el("input", { class: "editor", type: "text", placeholder: "date" }); inp.value = cur == null ? "" : String(cur); inp.addEventListener("change", () => onCommit(inp.value)); return { node: inp, set: (v) => { inp.value = v == null ? "" : String(v); } }; }
+    const ph = { month: "MM", day: "DD", year: "YYYY" };
+    const inputs = {}, wrap = el("div", { class: "date-seg" });
+    const combine = () => { const vals = segs.map((s) => (inputs[s].value || "").trim()); onCommit(vals.every((v) => v === "") ? "" : vals.join("/")); };
+    const parts0 = String(cur == null ? "" : cur).split("/");
+    segs.forEach((s, i) => {
+      if (i) wrap.appendChild(el("span", { class: "date-sep", text: "/" }));
+      const inp = el("input", { class: "editor date-part", type: "text", inputmode: "numeric", placeholder: ph[s] || s, maxlength: s === "year" ? "4" : "2" });
+      inp.value = parts0[i] || ""; inp.addEventListener("change", combine); inputs[s] = inp; wrap.appendChild(inp);
+    });
+    return { node: wrap, set: (v) => { const p = String(v == null ? "" : v).split("/"); segs.forEach((s, i) => { if (inputs[s]) inputs[s].value = p[i] || ""; }); } };
+  };
+  // TIER editor (hierarchical / tree fields, e.g. certification): the user supplies an ORDERED list of
+  // candidate values (most specific first). Stored as entry.tiers; the fill/replay tries each in order
+  // (the matchCandidates ladder) against the live options. current_value tracks the TOP tier (so
+  // approval / effectiveValue / edit-provenance keep working via the shared commit()).
+  const tierEditor = () => {
+    const wrap = el("div", { class: "tier-ed" }), list = el("div", { class: "tier-list" });
+    const sync = () => {
+      const vals = Array.from(list.querySelectorAll("input.tier-val")).map((i) => i.value.trim()).filter((v) => v !== "");
+      entry.tiers = vals;
+      commit(entry, vals.length ? vals[0] : ""); // top tier → current_value (edit_kind + approval reset via commit)
     };
-    const inp = el("input", { class: "editor", type: "date" });
-    inp.value = toISO(cur);
-    inp.addEventListener("change", () => onCommit(inp.value));
-    return { node: inp, set: (v) => { inp.value = toISO(v); } };
+    const addRow = (val) => {
+      const row = el("div", { class: "tier-row" });
+      const inp = el("input", { class: "editor tier-val", type: "text", placeholder: "candidate value" });
+      inp.value = val == null ? "" : String(val); inp.addEventListener("change", sync);
+      const rm = el("button", { class: "tier-rm", title: "remove", text: "×" }); rm.addEventListener("click", () => { row.remove(); sync(); });
+      row.appendChild(inp); row.appendChild(rm); list.appendChild(row);
+    };
+    const seed = (Array.isArray(entry.tiers) && entry.tiers.length) ? entry.tiers : [entry.current_value].filter((v) => v != null && v !== "");
+    (seed.length ? seed : [""]).forEach(addRow);
+    const add = el("button", { class: "tier-add", text: "+ add tier" }); add.addEventListener("click", () => addRow(""));
+    wrap.appendChild(list); wrap.appendChild(add);
+    return { node: wrap, set: () => {}, tier: true };
   };
   if (wt === "file_upload") return null;
   if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
@@ -285,8 +314,8 @@ function buildEditor(entry) {
     return { node: cb, set: (v) => { cb.checked = checkedOf(v); } };
   }
   if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return Object.assign(textInput("input"), { partial: co.length > 0 }); }
-  if (wt === "hierarchical") { const opts = entry.options || entry.captured_options || []; if (opts.length > 2) return Object.assign(selectFrom(opts), { category: true }); return Object.assign(textInput("input"), { category: opts.length > 0 }); }
-  if (wt === "date") return dateEditor();
+  if (wt === "hierarchical") return tierEditor(); // tree field → the user supplies ordered tier candidates
+  if (wt === "date") return dateEditor(entry.date_order);
   if (wt === "textarea") return textInput("textarea");
   return textInput("input"); // text / date / unknown
 }
@@ -333,7 +362,7 @@ const fieldRow = (e, opts = {}) => {
   }
   val.appendChild(line);
   if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
-  if (ed && ed.category) val.appendChild(el("div", { class: "partial-note", text: CATEGORY_NOTE }));
+  if (ed && ed.tier) val.appendChild(el("div", { class: "partial-note", text: TIER_NOTE }));
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
   row.appendChild(val);

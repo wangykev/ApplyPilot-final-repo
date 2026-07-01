@@ -3246,6 +3246,51 @@ function summarizeEntries(entries) {
 
 // Build a SINGLE-page review bundle from drivePageFill's results. `meta = { page, url,
 // tenant, capturedAt }` — the SW stamps capturedAt + the PRE-fill cdpPageSig as `page`.
+// m3c: classify a typeahead for the summary — TREE-AWARE. A TREE picker (cert/source) has CATEGORY
+// rows (readTreeCategories non-empty) → tag widget_type "hierarchical" WITHOUT an option list (the
+// summary shows a TIER editor — the user supplies ordered candidates; scraping categories/leaves is
+// not useful). A FLAT typeahead (Field of Study) → all options via the proven captureFieldOptions
+// (role=option scrape) → a searchable combobox. ONE open cycle.
+async function captureTypeaheadOptions(act, loc, budgets) {
+  if (!act || !act.openHier) return null;
+  try {
+    await act.openHier(loc);
+    let st = null; const t0 = Date.now();
+    while (Date.now() - t0 < (budgets.taOpenCeilingMs || 20000)) {
+      await act.delayFull(budgets.taOpenIntervalMs || 300);
+      st = act.readHier ? await act.readHier(loc) : null;
+      if (st && st.searchBox && st.searchBox.visible) break;
+    }
+    let cats = [];
+    if (act.readTreeCategories) { try { cats = await act.readTreeCategories(loc); } catch (e) {} }
+    if (Array.isArray(cats) && cats.length) { // TREE → just tag hierarchical (categories aren't useful
+      if (act.pressTab) await act.pressTab();  // in the summary; the user supplies tier candidates instead)
+      await act.delayFull(budgets.reopenSettleMs || 300);
+      return { widget_type: "hierarchical" };
+    }
+    // FLAT → focus the searchBox so the full list renders, then scrape role=option
+    if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused && act.focusHierSearch) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); }
+    let opts = [];
+    if (act.scrapeTaOptions) { const sc = await act.scrapeTaOptions(loc); if (sc && sc.ok && Array.isArray(sc.options)) opts = sc.options.slice(); }
+    if (act.pressTab) await act.pressTab();
+    await act.delayFull(budgets.reopenSettleMs || 300);
+    return { widget_type: "typeahead", options: opts };
+  } catch (e) { return null; }
+}
+
+// m3c: the form's date-segment ORDER + granularity from a field's dateSegments (["dateSectionMonth-
+// input","dateSectionDay-input","dateSectionYear-input"] → ["month","day","year"]; M/Y → ["month",
+// "year"]; year-only → ["year"]). The summary renders segmented inputs in THIS order (matches the
+// form's mm/dd/yyyy — a browser <input type=date> would show the locale order instead).
+function dateOrderOf(segs) {
+  const order = [];
+  for (const seg of (Array.isArray(segs) ? segs : [])) {
+    const m = /dateSection(Month|Day|Year)/i.exec(String(seg));
+    if (m) { const p = m[1].toLowerCase(); if (!order.includes(p)) order.push(p); }
+  }
+  return order;
+}
+
 // m3b: REVEAL-BY-ADD — an EMPTY unknown section is present only via its Add button + heading (no
 // entry container to read), so mount ONE entry, detect its field shape + the now-known fkit prefix,
 // then DELETE it (leave the form as found). Returns { prefix, base, heading, shape } or null if it
@@ -3282,10 +3327,11 @@ async function revealUnknownSection(act, heading, budgets) {
         const opts = await captureDropdownOptions(act, loc, budgets);
         if (opts && opts.length) s.options = opts;
       } else if (f.widgetType === "typeahead") {
-        const isTree = act.isTreePicker ? await act.isTreePicker(loc) : false;
-        const opts = await captureFieldOptions(act, loc, budgets); // tree → categories; flat → all options
-        if (opts && opts.length) s.options = opts;
-        if (isTree) s.widget_type = "hierarchical"; // summary shows the categories + a "not the final options" note
+        const cap = await captureTypeaheadOptions(act, loc, budgets); // tree → categories (retag hierarchical); flat → all options
+        if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; }
+      } else if (f.widgetType === "date") {
+        const ord = dateOrderOf(f.dateSegments); // the form's segment order → summary renders segmented inputs, not a locale date picker
+        if (ord.length) s.date_order = ord;
       }
     } catch (e) { /* non-fatal — the field stays a text box in the summary */ }
     shape.push(s);
@@ -3314,10 +3360,12 @@ function detectSectionShapes(scan) {
     const fields = s && Array.isArray(s.entries) && s.entries[0] && Array.isArray(s.entries[0].fields) ? s.entries[0].fields : null;
     if (!fields || !fields.length) continue;
     const name = knownByPrefix[prefix] || prefix.replace(/-$/, "");
-    shapes[name] = fields.map((f) => ({
-      recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType,
-      label: f.label != null ? f.label : f.fieldName, is_required: !!f.isRequired
-    }));
+    shapes[name] = fields.map((f) => {
+      const s = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType,
+        label: f.label != null ? f.label : f.fieldName, is_required: !!f.isRequired };
+      if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; } // m3c: segment order for the summary date editor
+      return s;
+    });
   }
   return shapes;
 }

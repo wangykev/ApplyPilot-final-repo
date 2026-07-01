@@ -97,6 +97,16 @@
       .edel s { color: var(--muted-2); }
       .add-entry { appearance: none; margin: 4px 10px 8px 28px; border: 1px dashed var(--line); background: var(--surface-2); color: var(--accent); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 11px; font-weight: 560; }
       .add-entry:hover { border-color: var(--accent); }
+      .date-seg { display: flex; align-items: center; gap: 3px; }
+      .date-part { width: 3.4em; text-align: center; }
+      .date-part[maxlength="4"] { width: 4.4em; }
+      .date-sep { color: var(--muted-2); }
+      .tier-ed { display: flex; flex-direction: column; gap: 4px; }
+      .tier-row { display: flex; align-items: center; gap: 5px; }
+      .tier-val { flex: 1; }
+      .tier-rm { appearance: none; border: 1px solid var(--line); background: var(--surface-2); color: var(--muted); border-radius: 5px; width: 22px; height: 22px; cursor: pointer; line-height: 1; padding: 0; font-size: 14px; }
+      .tier-rm:hover { border-color: var(--accent); color: var(--accent); }
+      .tier-add { align-self: flex-start; appearance: none; border: 1px dashed var(--line); background: var(--surface-2); color: var(--accent); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 11px; font-weight: 560; }
 
       /* rows */
       .row { display: grid; grid-template-columns: minmax(120px, .82fr) minmax(210px, 1.5fr) 16px; gap: 2px 12px; padding: 3px 10px 3px 28px; border-top: 1px solid var(--line); align-items: center; }

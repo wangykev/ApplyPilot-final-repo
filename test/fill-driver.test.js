@@ -2832,7 +2832,7 @@ test("revealUnknownSection: null if the entry never mounts (Add refused)", async
   assert.strictEqual(await revealUnknownSection(fake, "Publications", T_BUDGETS), null);
 });
 
-test("revealUnknownSection: recons a TREE typeahead's categories + retags it hierarchical (m3c)", async () => {
+test("revealUnknownSection: TREE typeahead → tagged hierarchical (no option list); date → date_order (m3c)", async () => {
   let mounted = false;
   const fake = {
     delay: async () => {}, delayFull: async () => {},
@@ -2840,22 +2840,25 @@ test("revealUnknownSection: recons a TREE typeahead's categories + retags it hie
       "certification-": { entryCount: 1, heading: "Certifications", entries: [{ fields: [
         { fieldName: "certification", widgetType: "typeahead", label: "Certification*", isRequired: true, wrapperSel: "SEL_CERT" },
         { fieldName: "certificationNumber", widgetType: "text", label: "Number", isRequired: false, wrapperSel: "SEL_NUM" },
+        { fieldName: "issuedDate", widgetType: "date", label: "Issued", isRequired: false, wrapperSel: "SEL_DATE", dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"] },
       ] }] }
     } : {} }),
     clickSectionAdd: async () => { mounted = true; return { ok: true }; },
     clickDeleteEntry: async () => { mounted = false; return { ok: true }; },
-    isTreePicker: async () => true,                                          // cert is a TREE
+    openHier: async () => true,
     readHier: async () => ({ searchBox: { visible: true, focused: true } }),
-    scrapeTaOptions: async () => ({ ok: true, options: ["Accounting", "IT", "Healthcare"] }), // categories on open
+    readTreeCategories: async () => ["Accounting", "IT", "Healthcare"], // categories exist → it's a TREE
     pressTab: async () => {},
   };
   const r = await revealUnknownSection(fake, "Certifications", T_BUDGETS);
   assert.ok(r);
   const cert = r.shape.find((s) => s.recName === "certification");
-  assert.strictEqual(cert.widget_type, "hierarchical");                     // retagged (tree) → categories note in the summary
-  assert.deepStrictEqual(cert.options, ["Accounting", "IT", "Healthcare"]);  // the recon'd categories
+  assert.strictEqual(cert.widget_type, "hierarchical");                     // retagged (tree) → the summary shows a TIER editor
+  assert.ok(!cert.options, "no option list stored for a tree (categories aren't useful — tiers instead)");
+  const date = r.shape.find((s) => s.recName === "issuedDate");
+  assert.deepStrictEqual(date.date_order, ["month", "day", "year"]);        // form's segment order → segmented date editor
   const num = r.shape.find((s) => s.recName === "certificationNumber");
-  assert.strictEqual(num.widget_type, "text"); assert.ok(!num.options);      // a text field: no option recon
+  assert.strictEqual(num.widget_type, "text"); assert.ok(!num.options);     // a text field: no recon
 });
 
 test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {
