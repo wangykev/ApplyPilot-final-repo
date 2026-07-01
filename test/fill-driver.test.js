@@ -3144,6 +3144,31 @@ test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a
   assert.ok(!entries.some((e) => /\.removed$/.test(e.field_id || "")), "the raw 'removed' ops do NOT show");
 });
 
+test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletion) → segmented date editor, not a text box", async () => {
+  // The date regression: an emptied section's stub built its shape from the fieldMap (no date_order)
+  // → the summary rendered a plain text box. Now the shape is captured from the LIVE entries BEFORE
+  // the delete sweep, so date fields keep their segment order.
+  const mk = (fkit) => ({ fkit, fields: [
+    { fieldName: "x", label: "X*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Alpha" }] },
+    { fieldName: "d", label: "Issued Date", widgetType: "date", isRequired: false, segments: { Year: { value: "" } } },
+  ] });
+  const state = webState({ prefix: "certification-", entries: [mk("certification-1--null")] });
+  const fieldMap = [
+    { field: "x", widget: "dropdown", key: "x", path: "x" },
+    { field: "d", widget: "date", key: "dParsed", path: "issued_date" },
+  ];
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ x: "Zzz-nomatch", dParsed: "2024" }], fieldMap, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  const stub = out.results.find((r) => r.widgetType === "section_stub");
+  assert.ok(stub, "emptied section still stubbed");
+  const dShape = stub.section_field_shape.find((s) => s.recName === "d");
+  assert.ok(dShape, "the date field is in the stub shape");
+  assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented editor");
+});
+
 test("M38 Bug B1: a required pick failing TRANSIENTLY (options didn't render) is KEPT + needs_review, NOT deleted", async () => {
   // The live English/Chinese loss: the language dropdown didn't render deep in a long fold
   // → deleteOnNoMatch deleted VALID data. Now a transient/infra failure (NOT a genuine

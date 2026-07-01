@@ -2248,7 +2248,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
         flag: "section-stub", verified: null, after: null,
         detail: "This repeating section isn't auto-filled by the bot (" + n + " entr" + (n === 1 ? "y" : "ies") + " on the form) — add or verify its entries here.",
-        section_field_shape: entryFields.map((f) => ({ recName: f.fieldName, widget_type: f.widgetType, path: f.fieldName, label: f.label, is_required: f.isRequired })),
+        section_field_shape: entryFields.map((f) => { const o = { recName: f.fieldName, widget_type: f.widgetType, path: f.fieldName, label: f.label, is_required: f.isRequired }; if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; } return o; }), // carry the recon'd date order → segmented date editor
         container_prefix: prefix, section_heading: sec.heading || null, section_known: false
       });
     }
@@ -2308,7 +2308,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
         flag: "section-stub", verified: null, after: null,
         detail: "This repeating section isn't auto-filled by the bot (empty on the form) — add or verify its entries here.",
-        section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required })),
+        section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null })), // revealUnknownSection already computed date_order — don't drop it
         container_prefix: prefix, section_heading: heading || null, section_known: false
       });
     }
@@ -2794,13 +2794,32 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   });
 
   // A section STUB — makes an EMPTY or FULLY-DELETED section still APPEAR in review + be addable.
-  // Carries the field shape (from the map) so add-entry can build a new entry; flag "section-stub".
+  // Carries the field shape so add-entry can build a new entry; flag "section-stub". The shape
+  // prefers the LIVE detected fields (captured before any delete sweep → carries the recon'd
+  // date_order so the summary renders segmented MM/DD/YYYY, not a plain text box); it falls back to
+  // the map only for a section that was NEVER populated (year → ["year"]; M/Y-vs-M/D/Y is unknown
+  // without a live scan, so a bare date stays a text box — "don't guess").
   const humanName = name.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+  let detectedShape = null; // filled by captureDetectedShape() from the live entries BEFORE deletion
+  const captureDetectedShape = async () => {
+    try {
+      const s = await act.repeatingScan();
+      const sec = s && s.sections ? s.sections[containerPrefix] : null;
+      const fields = sec && sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields) ? sec.entries[0].fields : null;
+      if (fields && fields.length) detectedShape = fields.map((f) => {
+        const o = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
+        if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; }
+        return o;
+      });
+    } catch (e) { /* best-effort — the map fallback still applies */ }
+  };
+  const stubShape = () => (detectedShape && detectedShape.length) ? detectedShape
+    : (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({ recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path, date_order: f.widget === "year" ? ["year"] : null }));
   const makeSectionStub = (label, detail) => ({
     fieldName: name, label, widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
     rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
     flag: "section-stub", verified: null, after: null, detail,
-    section_field_shape: (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({ recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path })),
+    section_field_shape: stubShape(),
     container_prefix: containerPrefix, section_known: true
   });
 
@@ -2913,6 +2932,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   // Sweep high→low so lower indices stay valid. OFF for Websites (text always fills if present).
   // A transient/infra pick failure is NOT deletable (kept + surfaced — Bug B1).
   if (deleteOnNoMatch) {
+    await captureDetectedShape(); // BEFORE deleting — so an emptied section's stub keeps the recon'd date_order (segmented date editor, not a text box)
     let removed = 0;
     for (let k = perEntry.length - 1; k >= 0; k--) {
       if (!perEntry[k].deletable) continue; // ok entries AND transient-fail entries are KEPT

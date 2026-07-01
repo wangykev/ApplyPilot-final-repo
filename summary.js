@@ -189,7 +189,8 @@ const sectionShapeFor = (page, key) => {
       recName: _stripEntryPrefix(String(e.field_id).replace(/^.*formField-/, ""), key),
       path: _stripEntryPrefix(e.canonical_field, key),
       widget_type: e.widget_type, is_required: e.is_required, label: e.question_label,
-      options: e.options, captured_options: e.captured_options, tree_structure: e.tree_structure
+      options: e.options, captured_options: e.captured_options, tree_structure: e.tree_structure,
+      date_order: e.date_order || null // carry the recon'd segment order → segmented date editor, not a text box
     }));
   }
   // (3) cold fallback: the stub's map-derived shape (an empty section never yet seen populated)
