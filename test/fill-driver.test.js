@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, revealNestedShape, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, PAGE_SECTIONS, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -105,9 +105,9 @@ function makeFakeAct(fields, opts) {
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
-    nestedScan: async () => (typeof o.nestedScan === "function" ? o.nestedScan() : (o.nestedScan || null)), // nested: object OR a fn (dynamic reveal-by-add: scan changes after add/delete); default null
-    // nested reveal-by-add substrate (Milestone A/B) — present only when a test wires them; a missing
-    // method makes revealNestedShape bail (existing tests: no clickNested* → nested reveal is a no-op).
+    // nestedScan/clickNestedAdd/clickNestedDelete remain as inert seams for the CDP recon harness only
+    // (the FILL no longer scans nested — cert ▸ Specialties is HARDCODED via section.nested).
+    nestedScan: async () => (typeof o.nestedScan === "function" ? o.nestedScan() : (o.nestedScan || null)),
     clickNestedAdd: o.clickNestedAdd,
     clickNestedDelete: o.clickNestedDelete,
 
@@ -2793,171 +2793,46 @@ test("buildReviewBundle carries the backend identifier (container_prefix/heading
   assert.strictEqual(e.widget_type, "section_stub");
 });
 
-test("drivePageFill surfaces NESTED section fields + attachment under the parent entry (nested)", async () => {
-  const nestedScan = {
-    parentOrder: { certification: [173] }, // non-contiguous fkit index 173 → ordinal 0
-    nestedSections: [{
-      parentBase: "certification", childBase: "specialties",
-      entries: [{
-        levels: [{ base: "certification", index: 173 }, { base: "specialties", index: 5 }],
-        fields: [
-          { field: "specialtyParent", widgetType: "typeahead", label: "Specialty*", isRequired: true, wrapperSel: "SEL_SP" },
-          { field: "startDate", widgetType: "date", label: "Start Date", isRequired: false, dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"], wrapperSel: "SEL_SD" },
-        ],
-      }],
-    }],
-    nestedAttachments: [{ parentBase: "certification", parentIndex: 173, enclosingFkit: "certification-173--attachments", heading: "Attachments" }],
-  };
-  const out = await drivePageFill(makeFakeAct([], { rscan: { addButtons: [], sections: {} }, nestedScan }), {}, {}, {}, T_BUDGETS);
-  const sp = out.results.find((r) => r.fieldName === "certification[0].specialties[0].specialtyParent");
-  assert.ok(sp, "nested field surfaced");
-  assert.strictEqual(sp.mappedPath, "certification[0].specialties[0].specialtyParent"); // ordinals (173→0, 5→0) → groups under Certifications Entry 1
-  assert.strictEqual(sp.widgetType, "typeahead");
-  assert.strictEqual(sp.flag, "nested-unfilled");
-  assert.deepStrictEqual(sp.nested_path, [{ base: "certification", index: 173 }, { base: "specialties", index: 5 }]); // locate-now raw fkit
-  const sd = out.results.find((r) => r.fieldName === "certification[0].specialties[0].startDate");
-  assert.deepStrictEqual(sd.date_order, ["month", "day", "year"]); // segmented date editor
-  const att = out.results.find((r) => r.fieldName === "certification[0].attachments");
-  assert.ok(att && att.widgetType === "file_upload" && att.flag === "nested-attachment", "per-entry attachment surfaced");
-  // carried onto the bundle entry (backend identifier for the fill-back); groups under "certification"
-  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties[0].specialtyParent");
-  assert.ok(be && Array.isArray(be.nested_path) && be.needs_review, "nested field in the bundle w/ nested_path + needs_review");
-});
-
-// ── Nested reveal-by-add (Milestone A/B) ──────────────────────────────────────────────────────
-// A stateful fake for the nested reveal substrate: nestedScan reflects the mounted children;
-// clickNestedAdd mounts a child (exposing childFields), clickNestedDelete removes it. Models the
-// EMPTY-then-probe-then-clean sequence reveal-by-add depends on.
-function makeNestedRevealAct(o) {
-  const pb = o.parentBase || "certification", pi = o.parentIndex || 287, cb = o.childBase || "specialties";
-  let children = (o.startChildren || []).slice();
-  let nextIdx = o.startIndex || 9;
-  const log = [];
-  const scan = () => ({
-    parentOrder: { [pb]: (o.parentIndices || [pi]) },
-    addButtons: [{ text: "Add", heading: o.heading || "Specialties", enclosingFkit: pb + "-" + pi + "--" + cb }],
-    nestedAttachments: o.attachments ? [{ parentBase: pb, parentIndex: pi, enclosingFkit: pb + "-" + pi + "--attachments", heading: "Attachments" }] : [],
-    nestedSections: children.length ? [{ parentBase: pb, childBase: cb,
-      entries: children.map((ci) => ({ levels: [{ base: pb, index: pi }, { base: cb, index: ci }], fields: o.childFields })) }] : []
-  });
-  return {
-    log, delay: async () => {}, delayFull: async () => {},
-    nestedScan: async () => scan(),
-    clickNestedAdd: async (pf, re) => { log.push(["add", pf, re]); if (o.addFails) return { ok: false }; children.push(nextIdx++); return { ok: true }; },
-    clickNestedDelete: async (pf, base, idx) => { log.push(["del", pf, base, idx]); if (o.deleteFails) return { ok: false }; children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
-    // typeahead option-scan seams (point 1): captureTypeaheadOptions opens the specialty typeahead and
-    // either scrapes a FLAT option list (o.taOptions) or detects a hierarchical TREE (o.taCategories).
-    openHier: async () => true,
-    readHier: async () => ({ searchBox: { present: true, visible: true, focused: false, value: "" }, chips: [], leaves: [], leafCount: 0 }),
-    readTreeCategories: async () => (o.taCategories || []).slice(),
-    focusHierSearch: async () => true,
-    scrapeTaOptions: async () => ({ ok: true, options: (o.taOptions || []).slice() }),
-    pressTab: async () => {},
-    _children: () => children.slice()
-  };
-}
-
-const SPECIALTY_FIELDS = [
-  { field: "specialtyParent", widgetType: "typeahead", label: "Specialty*", isRequired: true, dateSegments: [], wrapperSel: "SP" },
-  { field: "startDate", widgetType: "date", label: "Start Date", isRequired: false, dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"], wrapperSel: "SD" },
-  { field: "endDate", widgetType: "date", label: "End Date", isRequired: false, dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"], wrapperSel: "ED" },
-];
-
-test("revealNestedShape: mounts a probe → reads the child shape → DELETES the probe (no leftover)", async () => {
-  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS });
-  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
-  assert.ok(revealed, "reveal returned a shape");
-  assert.strictEqual(revealed.shape.length, 3);
-  assert.strictEqual(revealed.shape[0].recName, "specialtyParent");
-  assert.strictEqual(revealed.shape[0].widget_type, "typeahead");
-  assert.deepStrictEqual(revealed.shape[1].date_order, ["month", "day", "year"], "date field carries its segment order");
-  assert.deepStrictEqual(act._children(), [], "probe DELETED — no leftover (M36.2 resolved)");
-  assert.ok(act.log.some(([m]) => m === "add") && act.log.some(([m]) => m === "del"), "mount + delete both happened");
-});
-
-test("revealNestedShape: a mount that never registers → null (no shape invented)", async () => {
-  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, addFails: true });
-  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
-  assert.strictEqual(revealed, null);
-});
-
-test("revealNestedShape: a FLAT specialty typeahead → scans ALL options (combobox), NOT the tier editor (point 1)", async () => {
-  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, taOptions: ["Cardiology", "Neurology", "Oncology"] });
-  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
-  const sp = revealed.shape.find((s) => s.recName === "specialtyParent");
-  assert.strictEqual(sp.widget_type, "typeahead", "flat → stays typeahead (combobox), not hierarchical");
-  assert.deepStrictEqual(sp.options, ["Cardiology", "Neurology", "Oncology"], "all options scanned → the summary shows a combobox");
-});
-
-test("revealNestedShape: a HIERARCHICAL TREE specialty typeahead → tagged hierarchical (tier editor), no option list (point 1)", async () => {
-  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, taCategories: ["Medical", "Legal", "Trade"] });
-  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
-  const sp = revealed.shape.find((s) => s.recName === "specialtyParent");
-  assert.strictEqual(sp.widget_type, "hierarchical", "tree → hierarchical → the summary shows the tier editor (values to try)");
-  assert.ok(!sp.options, "a tree has no flat option list");
-});
-
-test("drivePageFill: EMPTY nested sub-section → reveal-by-add → a nested_section_stub per parent entry (Milestone B)", async () => {
-  // two cert entries (fkit 287, 401), an EMPTY Specialties sub-section (no child entries) betrayed only
-  // by its inside Add button. reveal-by-add discovers the shape; a stub is emitted per parent entry.
-  let children = [];
-  let nextIdx = 9;
-  const nestedScan = () => ({
-    parentOrder: { certification: [287, 401] },
-    addButtons: [
-      { text: "Add", heading: "Specialties", enclosingFkit: "certification-287--specialties" },
-      { text: "Add", heading: "Specialties", enclosingFkit: "certification-401--specialties" },
-    ],
-    nestedAttachments: [],
-    nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
-      entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: SPECIALTY_FIELDS })) }] : [],
-  });
-  const act = makeFakeAct([], {
-    rscan: { addButtons: [], sections: {} },
-    nestedScan,
-    clickNestedAdd: async () => { children.push(nextIdx++); return { ok: true }; },
-    clickNestedDelete: async (pf, base, idx) => { children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
-  });
-  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
-  const stubs = out.results.filter((r) => r.widgetType === "nested_section_stub");
-  assert.strictEqual(stubs.length, 2, "one stub per parent entry (both certs)");
-  const s0 = stubs.find((r) => r.fieldName === "certification[0].specialties._stub");
-  const s1 = stubs.find((r) => r.fieldName === "certification[1].specialties._stub");
-  assert.ok(s0 && s1, "stubs for BOTH parent ordinals (287→0, 401→1)");
-  assert.strictEqual(s0.flag, "nested-section-stub");
-  assert.strictEqual(s0.container_prefix, "certification-287--specialties-", "session-scoped nested backend identifier (parent 287)");
-  assert.strictEqual(s1.container_prefix, "certification-401--specialties-", "parent 401");
-  assert.deepStrictEqual(s0.nested_parent, { base: "certification", index: 0 });
-  assert.strictEqual(s0.nested_child_base, "specialties");
-  assert.strictEqual(s0.section_field_shape.length, 3, "carries the reveal-discovered field shape");
-  assert.deepStrictEqual(act._children ? act._children() : children, [], "probe cleaned up — no leftover after the fill");
-  // and it reaches the bundle as a reviewable, addable item
-  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties._stub");
-  assert.ok(be && be.widget_type === "nested_section_stub" && be.needs_review, "nested stub in the bundle + flagged for review");
-  assert.strictEqual(be.container_prefix, "certification-287--specialties-");
-  assert.deepStrictEqual(be.nested_parent, { base: "certification", index: 0 });
-});
-
-test("drivePageFill: nested reveal uses a CACHED shape (no re-probe) when parentBase__childBase is cached", async () => {
-  let addCalls = 0;
-  const nestedScan = () => ({
-    parentOrder: { certification: [287] },
-    addButtons: [{ text: "Add", heading: "Specialties", enclosingFkit: "certification-287--specialties" }],
-    nestedAttachments: [], nestedSections: [],
-  });
-  const act = makeFakeAct([], {
-    rscan: { addButtons: [], sections: {} }, nestedScan,
-    clickNestedAdd: async () => { addCalls++; return { ok: true }; },
-    clickNestedDelete: async () => ({ ok: true }),
-  });
-  const cachedShapes = { "certification__specialties": [
-    { recName: "specialtyParent", widget_type: "typeahead", path: "specialtyParent", label: "Specialty*", is_required: true },
-    { recName: "startDate", widget_type: "date", path: "startDate", label: "Start Date", is_required: false, date_order: ["month", "day", "year"] },
-  ] };
-  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { cachedShapes });
-  assert.strictEqual(addCalls, 0, "cache HIT → no mount/probe (once-per-bundle-lifetime)");
+// ── Nested sub-sections — HARDCODED per section (cert ▸ Specialties + Attachments) ──────────────
+// The generic reveal-by-add SCANNER was removed (Certifications is the only observed Workday nested
+// section). section.nested (CERT_NESTED) drives a per-surviving-entry emit inside driveRepeatingSectionCdp.
+test("driveRepeatingSectionCdp: section.nested → a Specialties stub + Attachments per SURVIVING entry (hardcoded)", async () => {
+  const entry = { fkit: "certification-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] };
+  const state = webState({ prefix: "certification-", entries: [entry] });
+  const out = await driveRepeatingSectionCdp(makeFakeRepeatAct(state), {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ url: "x" }], fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }],
+    deleteOnNoMatch: false, nested: CERT_NESTED
+  }, T_BUDGETS);
   const stub = out.results.find((r) => r.fieldName === "certification[0].specialties._stub");
-  assert.ok(stub && stub.section_field_shape.length === 2, "stub uses the cached shape");
+  assert.ok(stub && stub.widgetType === "nested_section_stub", "Specialties sub-section stub per surviving entry");
+  assert.strictEqual(stub.flag, "nested-section-stub");
+  assert.strictEqual(stub.container_prefix, "certification-<idx>--specialties-", "nested backend identifier");
+  assert.deepStrictEqual(stub.nested_parent, { base: "certification", index: 0 });
+  assert.strictEqual(stub.nested_child_base, "specialties");
+  assert.strictEqual(stub.section_field_shape.length, 3, "hardcoded shape: specialtyParent + start/end dates");
+  assert.strictEqual(stub.section_field_shape[0].recName, "specialtyParent");
+  assert.strictEqual(stub.section_field_shape[0].widget_type, "typeahead");
+  assert.deepStrictEqual(stub.section_field_shape[1].date_order, ["month", "day", "year"], "date segment order from the config");
+  const att = out.results.find((r) => r.fieldName === "certification[0].attachments");
+  assert.ok(att && att.widgetType === "file_upload" && att.flag === "nested-attachment", "Attachments row (config attachments:true)");
+  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties._stub");
+  assert.ok(be && be.widget_type === "nested_section_stub" && be.needs_review, "nested stub reaches the bundle");
+});
+
+test("driveRepeatingSectionCdp: NO section.nested → no nested emit (WE/Education/Websites/Languages)", async () => {
+  const entry = { fkit: "education-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] };
+  const state = webState({ prefix: "education-", entries: [entry] });
+  const out = await driveRepeatingSectionCdp(makeFakeRepeatAct(state), {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ url: "x" }], fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }], deleteOnNoMatch: false
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.widgetType === "nested_section_stub" || r.flag === "nested-attachment"), "no nested emit without a config");
+});
+
+test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested config", () => {
+  assert.strictEqual(PAGE_SECTIONS.find((s) => s.name === "certification").nested, CERT_NESTED);
+  assert.strictEqual(PAGE_SECTIONS.filter((s) => s.nested).length, 1);
 });
 
 test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the backend identifier (m3a)", async () => {
@@ -3193,42 +3068,25 @@ test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletio
   assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented editor");
 });
 
-test("nested recon happens DURING the fill (before the delete sweep) → an emptied cert's stub carries nested_shapes", async () => {
-  // The operator's case: a bogus cert → deleteOnNoMatch removes the whole section. The nested
-  // Specialties shape must be recon'd WHILE the cert still exists (before deletion), then ride the
-  // removed-section stub so the operator can add a cert back and see its Specialties. (Post-fold
-  // recon would be too late — the cert is already gone.)
+test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_shapes (add-back shows Specialties)", async () => {
+  // A bogus cert → deleteOnNoMatch removes the whole section. Because the nested shape is HARDCODED
+  // (section.nested), it survives the deletion + rides the removed-section stub so the operator can
+  // add a cert back and see its Specialties (+ attachments).
   const mk = (fkit) => ({ fkit, fields: [{ fieldName: "certification", label: "Certification*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "PMP" }] }] });
   const state = webState({ prefix: "certification-", entries: [mk("certification-287--null")] });
   const fieldMap = [{ field: "certification", widget: "dropdown", key: "cert", path: "certification" }];
   const act = makeFakeRepeatAct(state);
-  // wire the nested substrate onto the fake: a Specialties sub-section under certification-287,
-  // revealed by mount (children grows on Add, shrinks on Delete — proves the probe cleans up).
-  let children = [], nextIdx = 9;
-  act.nestedScan = async () => ({
-    parentOrder: { certification: state.entries.map((e) => parseInt((e.fkit.match(/-(\d+)--null/) || [])[1], 10)) },
-    // the ROBUST detector: the sub-section CONTAINER fkit node (found even when empty). The Add's
-    // enclosingFkit here is the parent's --null (the real-world case that broke the old addButtons
-    // detection) → detection MUST come from nestedContainers, not the Add.
-    nestedContainers: state.entries.length ? [{ parentBase: "certification", parentIndex: 287, childBase: "specialties", fkit: "certification-287--specialties", heading: "Specialties" }] : [],
-    addButtons: state.entries.length ? [{ text: "Add", heading: "Specialties", enclosingFkit: "certification-287--null" }] : [],
-    nestedAttachments: [],
-    nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
-      entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: SPECIALTY_FIELDS })) }] : [],
-  });
-  act.clickNestedAdd = async () => { children.push(nextIdx++); return { ok: true }; };
-  act.clickNestedDelete = async (pf, base, idx) => { children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; };
   const out = await driveRepeatingSectionCdp(act, {
     name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
-    items: [{ cert: "Zzz-bogus" }], fieldMap, deleteOnNoMatch: true
+    items: [{ cert: "Zzz-bogus" }], fieldMap, deleteOnNoMatch: true, nested: CERT_NESTED
   }, T_BUDGETS);
   assert.strictEqual(await act.entryCount("certification-"), 0, "bogus cert deleted → section empty");
-  assert.deepStrictEqual(children, [], "the nested reveal probe was cleaned up (no leftover)");
   const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub && stub.nested_shapes && Array.isArray(stub.nested_shapes.specialties), "the emptied cert's stub carries the nested Specialties shape (recon'd BEFORE deletion)");
+  assert.ok(stub && stub.nested_shapes && Array.isArray(stub.nested_shapes.specialties), "the emptied cert's stub carries the hardcoded Specialties shape");
   assert.strictEqual(stub.nested_shapes.specialties[0].recName, "specialtyParent");
   assert.deepStrictEqual(stub.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
-  assert.ok(out.nestedShapes && Array.isArray(out.nestedShapes["certification__specialties"]), "returned keyed parentBase__childBase for drivePageFill's cache");
+  assert.strictEqual(stub.nested_attachments, true, "the stub knows the section has attachments (add-back offers a picker)");
+  assert.ok(!out.results.some((r) => r.widgetType === "nested_section_stub"), "a deleted cert → NO per-entry nested stub");
 });
 
 test("M38 Bug B1: a required pick failing TRANSIENTLY (options didn't render) is KEPT + needs_review, NOT deleted", async () => {

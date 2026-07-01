@@ -2209,21 +2209,6 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // is the PREPARED profile (the SW prepareProfile's it), so profile[itemsKey] carries the
   // annotated arrays. Driven in registry order.
   let rscan = null;
-  const runNestedShapes = {}; // nested sub-section shapes recon'd DURING the section fills (parentBase__childBase) — reused by the post-fold nested emit so it never re-probes; persisted to section_shapes for next-run cache
-  const cachedShapesIn = (opts && opts.cachedShapes) || {};
-  // ONE up-front nested scan → which sections HAVE a nested sub-section (parentBase → [containers])
-  // + which have a per-entry attach field. Passed into each section so captureNestedShapes does NOT
-  // run its own page-wide nestedScan per section (the ~5s-per-section cost — a nestedScan is O(fkit
-  // nodes × querySelectors)). A section with NO nested container then does ZERO scanning.
-  let nscanUp = null;
-  try { if (!only && act.nestedScan) nscanUp = await act.nestedScan(); } catch (e) { /* no nested substrate → none */ }
-  const nestedByBase = {}, attachBases = {};
-  if (nscanUp) {
-    const push = (pb, c) => { const a = (nestedByBase[pb] = nestedByBase[pb] || []); if (!a.some((x) => x.childBase === c.childBase)) a.push(c); };
-    for (const nc of (nscanUp.nestedContainers || [])) push(nc.parentBase, nc);
-    for (const b of (nscanUp.addButtons || [])) { const m = /^(.+?)-(\d+)--([A-Za-z][A-Za-z0-9_]*)$/.exec((b && b.enclosingFkit) || ""); if (m && m[3] !== "null" && !/attachment/i.test(m[3])) push(m[1], { parentBase: m[1], parentIndex: parseInt(m[2], 10), childBase: m[3], heading: (b && b.heading) || m[3] }); }
-    for (const a of (nscanUp.nestedAttachments || [])) attachBases[a.parentBase] = true;
-  }
   try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
   if (!only && rscan && (rscan.sections || rscan.addButtons)) {
     for (const sec of PAGE_SECTIONS) {
@@ -2231,18 +2216,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const re = new RegExp(sec.headingRegex, "i");
       const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((b) => re.test((b && b.nearestHeading) || ""));
       if (!hasContainer && !hasAdd) continue; // section not on this page
-      const secBase = sec.containerPrefix.replace(/-$/, "");
       const items = Array.isArray(profile[sec.itemsKey]) ? profile[sec.itemsKey] : [];
       const out = await driveRepeatingSectionCdp(act, {
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
         items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
         aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
-        cachedShapes: cachedShapesIn, // cross-run nested-shape cache → captureNestedShapes skips the probe on a hit
-        nestedContainers: nestedByBase[secBase] || [], // up-front detection → NO per-section nestedScan
-        nestedAttachmentsPresent: !!attachBases[secBase]
+        nested: sec.nested || null           // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
       }, budgets);
       if (out && Array.isArray(out.results)) results.push(...out.results);
-      if (out && out.nestedShapes) Object.assign(runNestedShapes, out.nestedShapes); // recon'd during the fill → reuse below
     }
   }
 
@@ -2290,7 +2271,6 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     if (needRescan) { try { shapeScan = await act.repeatingScan(); } catch (e) { shapeScan = rscan; } }
     sectionShapes = detectSectionShapes(shapeScan);
   }
-  Object.assign(sectionShapes, runNestedShapes); // nested sub-section shapes recon'd during the fill → persisted for next-run cache (survives a deleted parent)
 
   // m3b: EMPTY unknown sections — present via an Add button + heading but with NO entry container
   // (so m3a's container loop can't see them). REVEAL-BY-ADD: mount one entry → detect its fields +
@@ -2335,121 +2315,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
   }
 
-  // ── NESTED repeating sections (repeating-inside-repeating, e.g. cert → Specialties + Attachments) ──
-  // Phase 1: SURFACE each nested field UNDER its parent entry in review (the existing sectionOf reads the
-  // FIRST base[idx], so "certification[0].specialties[0].specialtyParent" groups under Certifications →
-  // Entry 1 — flattened labeled rows, no viewer recursion). The bot has NO mapping → needs_review; the
-  // operator fills/verifies (specialtyParent → tier editor; dates → segmented). GENERIC: parentBase/
-  // childBase/fields all come from cdpGenericNestedScan's fkit parse (no hardcoded names). parentOrder
-  // (SAME scan) maps a nested field's NON-CONTIGUOUS fkit parent index → the fill's sequential ordinal so
-  // it lands under the RIGHT parent entry. Reveal-by-add for an EMPTY nested section = deferred (Phase 2:
-  // per-parent-scoped Add via the --<child>-<M>-- path). Skipped under `only`.
-  if (!only && act.nestedScan) {
-    let nscan = null;
-    try { nscan = await act.nestedScan(); } catch (e) { /* no nested substrate (flat-only fake) → skip */ }
-    if (nscan && (nscan.nestedSections || nscan.nestedAttachments || nscan.addButtons)) {
-      const ordinalOf = {}; // base → { fkitIndex → sequential ordinal } (from the same scan)
-      for (const b of Object.keys(nscan.parentOrder || {})) { ordinalOf[b] = {}; nscan.parentOrder[b].forEach((ix, i) => { ordinalOf[b][ix] = i; }); }
-      const human = (s) => String(s).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
-
-      // Phase 1: SURFACE each EXISTING nested entry's fields as flat labeled rows under the parent entry
-      // (sectionOf reads the FIRST base[idx] → they group under Certifications ▸ Entry N).
-      for (const ns of (nscan.nestedSections || [])) {
-        if (!(ns.parentBase in ordinalOf)) continue; // parentBase isn't a real parent in THIS scan → skip (guard)
-        const childOrd = {}; let next = 0;
-        for (const ent of (ns.entries || [])) {
-          if (!ent.levels || ent.levels.length < 2) continue;
-          const par = ent.levels[0], ch = ent.levels[ent.levels.length - 1];
-          const pOrd = ordinalOf[ns.parentBase][par.index];
-          if (pOrd == null) continue; // parent entry not present on this page
-          if (!(ch.index in childOrd)) childOrd[ch.index] = next++; // fkit child index → sequential ordinal
-          const cbase = par.base + "[" + pOrd + "]." + ch.base + "[" + childOrd[ch.index] + "]";
-          for (const f of (ent.fields || [])) {
-            results.push({
-              fieldName: cbase + "." + f.field,
-              label: human(ch.base) + " " + (childOrd[ch.index] + 1) + " — " + (f.label || f.field),
-              widgetType: f.widgetType, isRequired: !!f.isRequired, mappedPath: cbase + "." + f.field,
-              rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
-              flag: "nested-unfilled", verified: null, after: null,
-              detail: "nested repeating section (" + ns.parentBase + " ▸ " + ns.childBase + ") — the bot has no mapping; fill/verify here",
-              date_order: (f.widgetType === "date") ? dateOrderOf(f.dateSegments) : undefined,
-              nested_path: ent.levels, // locate-now (raw fkit indices, session-scoped); the ordinal canonical is the durable identity
-              auditLoc: f.wrapperSel
-            });
-          }
-        }
-      }
-
-      // Phase 2 (reveal-by-add): SURFACE each nested SUB-SECTION as an addable stub per parent entry —
-      // EVEN WHEN EMPTY. An empty nested section has no field nodes, but its inside "Add" button betrays
-      // it (nscan.addButtons carries enclosingFkit "<parentBase>-<idx>--<childBase>"). Discover the field
-      // shape ONCE via reveal-by-add (mount a probe → read → delete, Milestone A), CACHED by
-      // parentBase__childBase so it fires once per bundle-lifetime, not every fill.
-      const cachedShapes = (opts && opts.cachedShapes) || {};
-      const nestedContainers = {};
-      for (const b of (nscan.addButtons || [])) {
-        const m = /^(.+?)-(\d+)--([A-Za-z][A-Za-z0-9_]*)$/.exec((b && b.enclosingFkit) || "");
-        if (!m || m[3] === "null") continue;
-        const key = m[1] + "__" + m[3];
-        if (!(key in nestedContainers)) nestedContainers[key] = { parentBase: m[1], childBase: m[3], firstParentIndex: parseInt(m[2], 10), heading: (b && b.heading) || m[3] };
-      }
-      const countChildren = (parentBase, childBase, fkitIdx) => {
-        let n = 0;
-        for (const ns of (nscan.nestedSections || [])) {
-          if (ns.parentBase !== parentBase || ns.childBase !== childBase) continue;
-          for (const ent of (ns.entries || [])) { const lv = ent.levels || []; if (lv.length >= 2 && lv[0].index === fkitIdx) n++; }
-        }
-        return n;
-      };
-      for (const key of Object.keys(nestedContainers)) {
-        const nc = nestedContainers[key];
-        if (!(nc.parentBase in ordinalOf)) continue; // no real parent entry → nothing to attach a stub to
-        // PREFER the shape recon'd DURING the section fill (runNestedShapes — captured while the parent
-        // existed, before any delete sweep), then the cross-run cache; only reveal-by-add if neither has
-        // it (an unknown section not driven by driveRepeatingSectionCdp). No double-probe for a known section.
-        let shape = (Array.isArray(runNestedShapes[key]) && runNestedShapes[key].length) ? runNestedShapes[key]
-          : (Array.isArray(cachedShapes[key]) && cachedShapes[key].length) ? cachedShapes[key] : null;
-        if (!shape) {
-          const escaped = String(nc.heading).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          const parentFkit = nc.parentBase + "-" + nc.firstParentIndex + "--null";
-          const revealed = await revealNestedShape(act, parentFkit, nc.parentBase, nc.childBase, escaped, budgets);
-          if (revealed && revealed.shape.length) shape = revealed.shape;
-        }
-        if (!shape || !shape.length) continue; // couldn't discover the shape → don't emit a shapeless stub
-        sectionShapes[key] = shape; // persist → next-run cross-run cache
-        for (const fkitIdx of (nscan.parentOrder[nc.parentBase] || [])) {
-          const pOrd = ordinalOf[nc.parentBase][fkitIdx];
-          if (pOrd == null) continue;
-          const n = countChildren(nc.parentBase, nc.childBase, fkitIdx);
-          results.push({
-            fieldName: nc.parentBase + "[" + pOrd + "]." + nc.childBase + "._stub",
-            label: human(nc.childBase) + " (" + n + ")",
-            widgetType: "nested_section_stub", isRequired: false,
-            mappedPath: nc.parentBase + "[" + pOrd + "]." + nc.childBase + "._stub",
-            rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
-            flag: "nested-section-stub", verified: null, after: null,
-            detail: "nested repeating sub-section (" + nc.parentBase + " ▸ " + nc.childBase + ") — the bot has no mapping; add or verify entries here",
-            section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null, options: Array.isArray(s.options) ? s.options : null })), // carry scanned flat-typeahead options → combobox (tree → widget_type "hierarchical" → tier editor)
-            container_prefix: nc.parentBase + "-" + fkitIdx + "--" + nc.childBase + "-", // session-scoped nested backend identifier
-            nested_parent: { base: nc.parentBase, index: pOrd }, nested_child_base: nc.childBase, section_known: false
-          });
-        }
-      }
-
-      for (const at of (nscan.nestedAttachments || [])) {
-        const pOrd = (ordinalOf[at.parentBase] || {})[at.parentIndex];
-        if (pOrd == null) continue;
-        results.push({
-          fieldName: at.parentBase + "[" + pOrd + "].attachments", label: at.heading || "Attachments", // DETECTED heading, not hardcoded
-          widgetType: "file_upload", isRequired: false, mappedPath: at.parentBase + "[" + pOrd + "].attachments",
-          rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
-          flag: "nested-attachment", verified: null, after: null,
-          detail: "per-entry attachments — upload on the form (the bot can't attach a per-entry file)",
-          nested_path: [{ base: at.parentBase, index: at.parentIndex }]
-        });
-      }
-    }
-  }
+  // (Nested repeating sub-sections — cert ▸ Specialties + Attachments — are emitted per SURVIVING
+  // parent entry INSIDE driveRepeatingSectionCdp from the HARDCODED section.nested config, DURING the
+  // fill. No generic post-fold nested scan/reveal here — Certifications is the only observed nested
+  // section; a new tenant with a different one gets its own config entry.)
 
   // ── M1 CASCADE RE-SCAN-AFTER-CHANGE ── a committed value can REVEAL new fields (Magna
   // recon 2026-06-29: changing Country revealed 2 "Cyrillic name" text fields ~5.6s later,
@@ -2642,10 +2511,26 @@ const WORK_EXPERIENCE_MAP = [
 // (work_experience/education/languages/certifications/websites). Registry order = fill
 // order; sections are independent + entry-scoped (any cross-section effect is caught by
 // the oracle comparison, not relied upon).
+// HARDCODED nested sub-section config for Certifications (the only Workday section with repeating-
+// inside-repeating we've observed — see the Specialty recon 2026-06-18). No generic nested scanner:
+// the shape is a constant, so it surfaces in review + is addable even for a cert deleteOnNoMatch
+// removes, at zero scan cost. specialtyParent is a typeahead with no captured options → the summary's
+// tier editor ("values to try"); a new tenant with a different nested section gets its own config.
+const CERT_NESTED = {
+  subSections: [
+    { childBase: "specialties", heading: "Specialties", fields: [
+      { recName: "specialtyParent", widget_type: "typeahead", label: "Specialty", is_required: true },
+      { recName: "startDate", widget_type: "date", label: "Start Date", is_required: false, date_order: ["month", "day", "year"] },
+      { recName: "endDate", widget_type: "date", label: "End Date", is_required: false, date_order: ["month", "day", "year"] }
+    ] }
+  ],
+  attachments: true
+};
+
 const PAGE_SECTIONS = [
   { name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-", itemsKey: "work_experience", fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false },
   { name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education", fieldMap: EDUCATION_MAP, deleteOnNoMatch: false },
-  { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true },
+  { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true, nested: CERT_NESTED },
   { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
   { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
 ];
@@ -2841,67 +2726,31 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   };
   const stubShape = () => (detectedShape && detectedShape.length) ? detectedShape
     : (Array.isArray(fieldMap) ? fieldMap : []).map((f) => ({ recName: f.name || f.field, widget_type: f.widget === "year" ? "date" : f.widget, path: f.path, date_order: f.widget === "year" ? ["year"] : null }));
-  // NESTED sub-sections (cert ▸ Specialties) — recon'd DURING this fill by captureNestedShapes()
-  // (entries still exist), BEFORE the delete sweep. A bogus-value cert is removed by deleteOnNoMatch,
-  // taking its Specialties with it — post-fold recon would be too late. Capturing here lets an
-  // emptied section's stub STILL carry the sub-section shapes (the operator adds a parent back and its
-  // sub-section shows). GENERIC — parentBase/childBase come from the fkit, no hardcoded names.
-  const parentBase = containerPrefix.replace(/-$/, "");
-  const cachedNested = (section.cachedShapes && typeof section.cachedShapes === "object") ? section.cachedShapes : {};
-  const nestedShapes = {};       // childBase → reveal-discovered field shape (carries date_order)
+  // NESTED sub-sections (cert ▸ Specialties + Attachments) are HARDCODED per section (section.nested)
+  // — Certifications is the only Workday section with repeating-inside-repeating we've observed, so
+  // there's no generic nested SCANNER / reveal-by-add (removed by design). The shape is a CONSTANT, so
+  // it's available even for a cert that deleteOnNoMatch removes (it rides makeSectionStub for add-back),
+  // and there's zero per-section scan cost. A new tenant with a different nested section gets its own
+  // config entry (or we revisit a generic scanner then).
+  const nested = section.nested || null;
+  const nestedShapes = {}; // childBase → field shape (from the config)
   let nestedHasAttachments = false;
+  if (nested) {
+    for (const ss of (nested.subSections || [])) {
+      nestedShapes[ss.childBase] = (ss.fields || []).map((f) => ({ recName: f.recName, path: f.recName, widget_type: f.widget_type, label: f.label != null ? f.label : f.recName, is_required: !!f.is_required, date_order: f.date_order || null }));
+    }
+    nestedHasAttachments = !!nested.attachments;
+  }
   const makeSectionStub = (label, detail) => ({
     fieldName: name, label, widgetType: "section_stub", isRequired: false, mappedPath: name + "._stub",
     rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
     flag: "section-stub", verified: null, after: null, detail,
     section_field_shape: stubShape(),
     container_prefix: containerPrefix, section_known: true,
-    nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null, // sub-section shapes → viewer shows them on an added-back parent
-    nested_attachments: nestedHasAttachments || null // the form has a per-entry attach field (DETECTED, not hardcoded) → the viewer offers attachments on an added-back parent
+    nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null, // hardcoded sub-section shapes → viewer shows them on an added-back parent
+    nested_attachments: nestedHasAttachments || null                       // the section has a per-entry attach field → the viewer offers a file picker
   });
-  const captureNestedShapes = async () => {
-    if (!(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return;
-    // DETECTION comes from drivePageFill's ONE up-front scan (section.nestedContainers) → a section
-    // with no nested sub-section does ZERO scanning here (the ~5s-per-section fix). The cert-button
-    // direct path (no provided list) falls back to one nestedScan.
-    const containers = {}; // childBase → heading
-    const provided = Array.isArray(section.nestedContainers) ? section.nestedContainers : null;
-    let attachPresent = !!section.nestedAttachmentsPresent;
-    if (provided) {
-      for (const nc of provided) { if (nc.parentBase === parentBase && !(nc.childBase in containers)) containers[nc.childBase] = nc.heading || nc.childBase; }
-    } else {
-      let nscan = null; try { nscan = await act.nestedScan(); } catch (e) { return; }
-      if (!nscan) return;
-      for (const nc of (nscan.nestedContainers || [])) { if (nc.parentBase === parentBase && !(nc.childBase in containers)) containers[nc.childBase] = nc.heading || nc.childBase; }
-      const esc = parentBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp("^" + esc + "-(\\d+)--([A-Za-z][A-Za-z0-9_]*)$");
-      for (const b of (nscan.addButtons || [])) { const m = re.exec((b && b.enclosingFkit) || ""); if (m && m[2] !== "null" && !/attachment/i.test(m[2]) && !(m[2] in containers)) containers[m[2]] = (b && b.heading) || m[2]; }
-      attachPresent = (nscan.nestedAttachments || []).some((a) => a && a.parentBase === parentBase);
-    }
-    nestedHasAttachments = attachPresent;
-    const cbKeys = Object.keys(containers);
-    if (!cbKeys.length && !nestedHasAttachments) return; // nothing nested → no scan, no reveal (fast section)
-    console.log("[ApplyPilot][nested]", name, "→ sub-sections", JSON.stringify(cbKeys), "| attachments:", nestedHasAttachments);
-    // Only when a reveal is actually needed (an uncached childBase), do ONE nestedScan to get a CURRENT
-    // parent fkit (indices are non-sequential; the up-front one may be stale after reconcile). Cert only.
-    let parentFkitIdx = null;
-    if (cbKeys.some((cb) => !(Array.isArray(cachedNested[parentBase + "__" + cb]) && cachedNested[parentBase + "__" + cb].length))) {
-      let cur = null; try { cur = await act.nestedScan(); } catch (e) {}
-      const order = cur && cur.parentOrder ? cur.parentOrder[parentBase] : null;
-      parentFkitIdx = (order && order.length) ? order[0] : null;
-    }
-    for (const childBase of cbKeys) {
-      const key = parentBase + "__" + childBase;
-      if (Array.isArray(cachedNested[key]) && cachedNested[key].length) { nestedShapes[childBase] = cachedNested[key]; console.log("[ApplyPilot][nested]", childBase, "shape from cache (no probe)"); continue; }
-      if (parentFkitIdx == null) { console.log("[ApplyPilot][nested] no parent entry to probe", childBase); continue; }
-      const parentFkit = parentBase + "-" + parentFkitIdx + "--null";
-      const stem = String(childBase).replace(/ies$/i, "").replace(/s$/i, "").slice(0, 8) || childBase; // match the Add by a child-base STEM, not its heading/position
-      console.log("[ApplyPilot][nested] reveal-by-add probing", childBase, "in", parentFkit, "(Add heading ~/" + stem + "/i)");
-      const revealed = await revealNestedShape(act, parentFkit, parentBase, childBase, stem, budgets);
-      if (revealed && revealed.shape.length) { nestedShapes[childBase] = revealed.shape; console.log("[ApplyPilot][nested] reveal OK", childBase, "→", JSON.stringify(revealed.shape.map((s) => s.recName + ":" + s.widget_type + (s.options ? "(" + s.options.length + " opts)" : "")))); }
-      else console.log("[ApplyPilot][nested] reveal FAILED for", childBase, "— mount didn't register or no Add matched /" + stem + "/i");
-    }
-  };
+  const humanChild = (s) => String(s).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
 
   // Poll the entry count off-loop until it moves in the wanted direction or a
   // ceiling (port of the in-tree 4s/150ms reconcile poll; SW-paced via act.delay).
@@ -2919,9 +2768,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
     const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
     const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub").length;
-    const nestedShapesKeyed = {}; // parentBase__childBase → shape (recon'd during THIS fill) → drivePageFill caches + reuses (no re-probe)
-    for (const cb of Object.keys(nestedShapes)) nestedShapesKeyed[parentBase + "__" + cb] = nestedShapes[cb];
-    return { url, repeatingFieldCount, results, counts, needsReview, nestedShapes: nestedShapesKeyed };
+    return { url, repeatingFieldCount, results, counts, needsReview };
   };
 
   const initial = await act.repeatingScan();
@@ -3009,11 +2856,6 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
   }
 
-  // Recon this section's NESTED sub-sections NOW — while entries exist, BEFORE the delete sweep (a
-  // no-match cert is about to be removed with its Specialties). Captured shapes ride makeSectionStub
-  // + are returned for drivePageFill to reuse (no post-fold re-probe) and cache across runs.
-  await captureNestedShapes();
-
   // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose REQUIRED
   // pick GENUINELY didn't match (the value isn't offered) would block Next, so delete it.
   // Sweep high→low so lower indices stay valid. OFF for Websites (text always fills if present).
@@ -3029,6 +2871,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       const after = await pollCount(before, false);
       if (after < before) {
         removed++;
+        perEntry[k].wasDeleted = true; // so the nested emit below skips this entry's sub-sections
         perEntry[k].recs = [sectionRec("[" + perEntry[k].idx + "].removed", name + " entry removed",
           "skipped", "a required pick didn't match an option → entry deleted (optional section)")];
       }
@@ -3044,6 +2887,36 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   }
 
   for (const e of perEntry) results.push(...e.recs);
+
+  // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments) per SURVIVING entry. No scan —
+  // the shape is section.nested (a constant). A fully-deleted section carries them on its stub above.
+  if (nested) {
+    for (const e of perEntry) {
+      if (e.wasDeleted) continue; // a deleted parent takes its sub-sections with it
+      const i = e.idx;
+      for (const childBase of Object.keys(nestedShapes)) {
+        results.push({
+          fieldName: name + "[" + i + "]." + childBase + "._stub", label: humanChild(childBase),
+          widgetType: "nested_section_stub", isRequired: false, mappedPath: name + "[" + i + "]." + childBase + "._stub",
+          rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+          flag: "nested-section-stub", verified: null, after: null,
+          detail: "nested repeating sub-section (" + name + " ▸ " + childBase + ") — add or verify entries here",
+          section_field_shape: nestedShapes[childBase],
+          container_prefix: name + "-<idx>--" + childBase + "-", // nested backend identifier (idx resolved at fill-back)
+          nested_parent: { base: name, index: i }, nested_child_base: childBase, section_known: false
+        });
+      }
+      if (nestedHasAttachments) {
+        results.push({
+          fieldName: name + "[" + i + "].attachments", label: "Attachments",
+          widgetType: "file_upload", isRequired: false, mappedPath: name + "[" + i + "].attachments",
+          rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+          flag: "nested-attachment", verified: null, after: null,
+          detail: "per-entry attachments — upload on the form", nested_path: [{ base: name, index: i }]
+        });
+      }
+    }
+  }
   return finalize(url);
 }
 
@@ -3565,79 +3438,6 @@ async function revealUnknownSection(act, heading, budgets) {
   return { prefix: newPrefix, base: newPrefix.replace(/-$/, ""), heading: (sec && sec.heading) || heading || null, shape };
 }
 
-// Reveal-by-add for an EMPTY *nested* sub-section (cert ▸ Specialties): an empty nested section has
-// NO field nodes to read (only its inside "Add" button betrays it), so — like revealUnknownSection —
-// MOUNT a probe entry into a SPECIFIC parent entry, read the new child fields (the shape) via
-// nestedScan, then DELETE the probe (the Milestone-A scoped clickNestedDelete, proven to leave no
-// leftover). Returns { childIndex, shape } or null. Mutates the form transiently; the caller CACHES
-// the shape (by parentBase__childBase) so this fires once per bundle-lifetime, not every fill.
-// GENERIC — no hardcoded parent/child names (parentBase/childBase come from the fkit).
-async function revealNestedShape(act, parentFkit, parentBase, childBase, headingRegexSource, budgets) {
-  if (!(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return null;
-  const pIdx = (String(parentFkit).match(/-(\d+)--null$/) || [])[1]; // the parent's fkit index (e.g. "287")
-  if (pIdx == null) return null;
-  // child indices of THIS parent's childBase sub-section, from a nested scan
-  const childIdxs = (scan) => {
-    const out = new Set();
-    for (const ns of ((scan && scan.nestedSections) || [])) {
-      if (ns.parentBase !== parentBase || ns.childBase !== childBase) continue;
-      for (const ent of (ns.entries || [])) {
-        const lv = ent.levels || [];
-        if (lv.length >= 2 && String(lv[0].index) === String(pIdx)) out.add(String(lv[lv.length - 1].index));
-      }
-    }
-    return out;
-  };
-  const fieldsFor = (scan, cIdx) => {
-    for (const ns of ((scan && scan.nestedSections) || [])) {
-      if (ns.parentBase !== parentBase || ns.childBase !== childBase) continue;
-      for (const ent of (ns.entries || [])) {
-        const lv = ent.levels || [];
-        if (lv.length >= 2 && String(lv[0].index) === String(pIdx) && String(lv[lv.length - 1].index) === String(cIdx)) return ent.fields || [];
-      }
-    }
-    return [];
-  };
-  const before = childIdxs(await act.nestedScan());
-  const add = await act.clickNestedAdd(parentFkit, headingRegexSource);
-  if (!add || !add.ok) return null;
-  // poll until a NEW child index appears under this parent (mount registers on the throttled page loop)
-  let scan = await act.nestedScan();
-  let newIdx = [...childIdxs(scan)].find((i) => !before.has(i));
-  const deadline = Date.now() + (budgets.entryReconcileCeilingMs || 4000);
-  while (newIdx == null && Date.now() < deadline) {
-    await act.delay(budgets.entryReconcileIntervalMs || 150);
-    scan = await act.nestedScan();
-    newIdx = [...childIdxs(scan)].find((i) => !before.has(i));
-  }
-  if (newIdx == null) return null; // mount didn't register → can't reveal the shape
-  const fields = fieldsFor(scan, newIdx);
-  // Build the shape from the DOM WHILE the probe is mounted — recon each choice field's options so the
-  // summary shows real widgets: a FLAT typeahead → scan ALL its options (a combobox, NOT the tier
-  // editor); a hierarchical TREE typeahead → tag "hierarchical" (the tier editor — operator supplies
-  // candidates, since a tree has no flat list); dropdown → all options; date → its segment order.
-  const shape = [];
-  for (const f of fields) {
-    const s = { recName: f.field, path: f.field, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
-    const loc = { wrapperSel: f.wrapperSel };
-    try {
-      if (f.widgetType === "typeahead") {
-        const cap = await captureTypeaheadOptions(act, loc, budgets); // tree → {hierarchical}; flat → {options}
-        console.log("[ApplyPilot][nested] scanned typeahead", f.field, "→", cap ? (cap.widget_type + " / " + ((cap.options || []).length) + " options") : "null (open failed)");
-        if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; }
-      } else if (f.widgetType === "dropdown") {
-        const opts = await captureDropdownOptions(act, loc, budgets);
-        if (opts && opts.length) s.options = opts;
-      } else if (f.widgetType === "date") {
-        const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord;
-      }
-    } catch (e) { /* non-fatal — the field keeps its base widget in the summary */ }
-    shape.push(s);
-  }
-  // clean up — DELETE the probe (Milestone-A substrate). Best-effort; the recon proved it works.
-  try { await act.clickNestedDelete(parentFkit, childBase, newIdx); } catch (e) { /* best-effort */ }
-  return { childIndex: newIdx, shape };
-}
 
 // 2c: DETECT a section's field shape from a live repeating-scan (the m1 per-entry read) — the
 // field SET comes from the FORM, not the hardcoded *_MAP. Keyed by the PAGE_SECTIONS `name` (=
@@ -3821,5 +3621,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, revealNestedShape, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
