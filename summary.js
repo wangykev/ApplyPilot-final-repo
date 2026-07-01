@@ -275,10 +275,17 @@ function buildEditor(entry) {
     });
     return { node: wrap, set: (v) => { const p = String(v == null ? "" : v).split("/"); segs.forEach((s, i) => { if (inputs[s]) inputs[s].value = p[i] || ""; }); } };
   };
-  // TIER editor (hierarchical / tree fields, e.g. certification): the user supplies an ORDERED list of
-  // candidate values (most specific first). Stored as entry.tiers; the fill/replay tries each in order
-  // (the matchCandidates ladder) against the live options. current_value tracks the TOP tier (so
-  // approval / effectiveValue / edit-provenance keep working via the shared commit()).
+  // TIER editor (hierarchical / tree fields, e.g. certification): the operator supplies an ORDERED list
+  // of candidate values (most specific first) — the SAME shape the profile's tiered fields use, so it
+  // PORTS cleanly. Stored as entry.tiers; current_value tracks the TOP tier (approval / effectiveValue /
+  // edit-provenance keep working via the shared commit()).
+  // FUTURE FILL-BACK CONTRACT — two paths, per the operator's choice (the "add to profile" choice UI is
+  // a LATER feature; this session only produces entry.tiers):
+  //   (A) to-profile: write entry.tiers into the (newly-added) profile field — resolve() already consumes
+  //       an array as its candidate list, so the mapped typeahead fills, with the AI fallback on a no-match.
+  //   (B) application-only (default): the replay tries entry.tiers via matchCandidates against the live
+  //       options; if NONE match → DELETE the repeating entry + a "none of the tiers matched" note (this
+  //       is exactly the existing deleteOnNoMatch behavior — reuse it).
   const tierEditor = () => {
     const wrap = el("div", { class: "tier-ed" }), list = el("div", { class: "tier-list" });
     const sync = () => {

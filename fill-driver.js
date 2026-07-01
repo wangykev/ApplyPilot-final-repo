@@ -3473,6 +3473,7 @@ function buildReviewBundle(results, meta) {
       container_prefix: rec.container_prefix != null ? rec.container_prefix : null, // m3a: backend identifier (fkit prefix) for a future fill-back session
       section_heading: rec.section_heading != null ? rec.section_heading : null,    // m3a: section heading / Add anchor
       section_known: rec.section_known != null ? !!rec.section_known : null,        // m3a: false = unmapped/unknown section
+      tiers: null, // m3c: ordered candidate list the review's tier editor fills for a hierarchical field (profile-shaped → portable)
       character_count: null
     };
   });
