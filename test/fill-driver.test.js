@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, revealNestedShape, reconcileAudit, auditDateSegments, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -105,7 +105,11 @@ function makeFakeAct(fields, opts) {
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
-    nestedScan: async () => o.nestedScan || null, // nested: o.nestedScan models cdpGenericNestedScan; default null = no nested substrate
+    nestedScan: async () => (typeof o.nestedScan === "function" ? o.nestedScan() : (o.nestedScan || null)), // nested: object OR a fn (dynamic reveal-by-add: scan changes after add/delete); default null
+    // nested reveal-by-add substrate (Milestone A/B) — present only when a test wires them; a missing
+    // method makes revealNestedShape bail (existing tests: no clickNested* → nested reveal is a no-op).
+    clickNestedAdd: o.clickNestedAdd,
+    clickNestedDelete: o.clickNestedDelete,
 
     // text
     readTextValue: async (loc) => {
@@ -2818,6 +2822,118 @@ test("drivePageFill surfaces NESTED section fields + attachment under the parent
   // carried onto the bundle entry (backend identifier for the fill-back); groups under "certification"
   const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties[0].specialtyParent");
   assert.ok(be && Array.isArray(be.nested_path) && be.needs_review, "nested field in the bundle w/ nested_path + needs_review");
+});
+
+// ── Nested reveal-by-add (Milestone A/B) ──────────────────────────────────────────────────────
+// A stateful fake for the nested reveal substrate: nestedScan reflects the mounted children;
+// clickNestedAdd mounts a child (exposing childFields), clickNestedDelete removes it. Models the
+// EMPTY-then-probe-then-clean sequence reveal-by-add depends on.
+function makeNestedRevealAct(o) {
+  const pb = o.parentBase || "certification", pi = o.parentIndex || 287, cb = o.childBase || "specialties";
+  let children = (o.startChildren || []).slice();
+  let nextIdx = o.startIndex || 9;
+  const log = [];
+  const scan = () => ({
+    parentOrder: { [pb]: (o.parentIndices || [pi]) },
+    addButtons: [{ text: "Add", heading: o.heading || "Specialties", enclosingFkit: pb + "-" + pi + "--" + cb }],
+    nestedAttachments: o.attachments ? [{ parentBase: pb, parentIndex: pi, enclosingFkit: pb + "-" + pi + "--attachments", heading: "Attachments" }] : [],
+    nestedSections: children.length ? [{ parentBase: pb, childBase: cb,
+      entries: children.map((ci) => ({ levels: [{ base: pb, index: pi }, { base: cb, index: ci }], fields: o.childFields })) }] : []
+  });
+  return {
+    log, delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async (pf, re) => { log.push(["add", pf, re]); if (o.addFails) return { ok: false }; children.push(nextIdx++); return { ok: true }; },
+    clickNestedDelete: async (pf, base, idx) => { log.push(["del", pf, base, idx]); if (o.deleteFails) return { ok: false }; children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
+    _children: () => children.slice()
+  };
+}
+
+const SPECIALTY_FIELDS = [
+  { field: "specialtyParent", widgetType: "typeahead", label: "Specialty*", isRequired: true, dateSegments: [], wrapperSel: "SP" },
+  { field: "startDate", widgetType: "date", label: "Start Date", isRequired: false, dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"], wrapperSel: "SD" },
+  { field: "endDate", widgetType: "date", label: "End Date", isRequired: false, dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"], wrapperSel: "ED" },
+];
+
+test("revealNestedShape: mounts a probe → reads the child shape → DELETES the probe (no leftover)", async () => {
+  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS });
+  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
+  assert.ok(revealed, "reveal returned a shape");
+  assert.strictEqual(revealed.shape.length, 3);
+  assert.strictEqual(revealed.shape[0].recName, "specialtyParent");
+  assert.strictEqual(revealed.shape[0].widget_type, "typeahead");
+  assert.deepStrictEqual(revealed.shape[1].date_order, ["month", "day", "year"], "date field carries its segment order");
+  assert.deepStrictEqual(act._children(), [], "probe DELETED — no leftover (M36.2 resolved)");
+  assert.ok(act.log.some(([m]) => m === "add") && act.log.some(([m]) => m === "del"), "mount + delete both happened");
+});
+
+test("revealNestedShape: a mount that never registers → null (no shape invented)", async () => {
+  const act = makeNestedRevealAct({ childFields: SPECIALTY_FIELDS, addFails: true });
+  const revealed = await revealNestedShape(act, "certification-287--null", "certification", "specialties", "Specialties", T_BUDGETS);
+  assert.strictEqual(revealed, null);
+});
+
+test("drivePageFill: EMPTY nested sub-section → reveal-by-add → a nested_section_stub per parent entry (Milestone B)", async () => {
+  // two cert entries (fkit 287, 401), an EMPTY Specialties sub-section (no child entries) betrayed only
+  // by its inside Add button. reveal-by-add discovers the shape; a stub is emitted per parent entry.
+  let children = [];
+  let nextIdx = 9;
+  const nestedScan = () => ({
+    parentOrder: { certification: [287, 401] },
+    addButtons: [
+      { text: "Add", heading: "Specialties", enclosingFkit: "certification-287--specialties" },
+      { text: "Add", heading: "Specialties", enclosingFkit: "certification-401--specialties" },
+    ],
+    nestedAttachments: [],
+    nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
+      entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: SPECIALTY_FIELDS })) }] : [],
+  });
+  const act = makeFakeAct([], {
+    rscan: { addButtons: [], sections: {} },
+    nestedScan,
+    clickNestedAdd: async () => { children.push(nextIdx++); return { ok: true }; },
+    clickNestedDelete: async (pf, base, idx) => { children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
+  });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const stubs = out.results.filter((r) => r.widgetType === "nested_section_stub");
+  assert.strictEqual(stubs.length, 2, "one stub per parent entry (both certs)");
+  const s0 = stubs.find((r) => r.fieldName === "certification[0].specialties._stub");
+  const s1 = stubs.find((r) => r.fieldName === "certification[1].specialties._stub");
+  assert.ok(s0 && s1, "stubs for BOTH parent ordinals (287→0, 401→1)");
+  assert.strictEqual(s0.flag, "nested-section-stub");
+  assert.strictEqual(s0.container_prefix, "certification-287--specialties-", "session-scoped nested backend identifier (parent 287)");
+  assert.strictEqual(s1.container_prefix, "certification-401--specialties-", "parent 401");
+  assert.deepStrictEqual(s0.nested_parent, { base: "certification", index: 0 });
+  assert.strictEqual(s0.nested_child_base, "specialties");
+  assert.strictEqual(s0.section_field_shape.length, 3, "carries the reveal-discovered field shape");
+  assert.deepStrictEqual(act._children ? act._children() : children, [], "probe cleaned up — no leftover after the fill");
+  // and it reaches the bundle as a reviewable, addable item
+  const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties._stub");
+  assert.ok(be && be.widget_type === "nested_section_stub" && be.needs_review, "nested stub in the bundle + flagged for review");
+  assert.strictEqual(be.container_prefix, "certification-287--specialties-");
+  assert.deepStrictEqual(be.nested_parent, { base: "certification", index: 0 });
+});
+
+test("drivePageFill: nested reveal uses a CACHED shape (no re-probe) when parentBase__childBase is cached", async () => {
+  let addCalls = 0;
+  const nestedScan = () => ({
+    parentOrder: { certification: [287] },
+    addButtons: [{ text: "Add", heading: "Specialties", enclosingFkit: "certification-287--specialties" }],
+    nestedAttachments: [], nestedSections: [],
+  });
+  const act = makeFakeAct([], {
+    rscan: { addButtons: [], sections: {} }, nestedScan,
+    clickNestedAdd: async () => { addCalls++; return { ok: true }; },
+    clickNestedDelete: async () => ({ ok: true }),
+  });
+  const cachedShapes = { "certification__specialties": [
+    { recName: "specialtyParent", widget_type: "typeahead", path: "specialtyParent", label: "Specialty*", is_required: true },
+    { recName: "startDate", widget_type: "date", path: "startDate", label: "Start Date", is_required: false, date_order: ["month", "day", "year"] },
+  ] };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { cachedShapes });
+  assert.strictEqual(addCalls, 0, "cache HIT → no mount/probe (once-per-bundle-lifetime)");
+  const stub = out.results.find((r) => r.fieldName === "certification[0].specialties._stub");
+  assert.ok(stub && stub.section_field_shape.length === 2, "stub uses the cached shape");
 });
 
 test("drivePageFill surfaces an UNKNOWN repeating section as a stub with the backend identifier (m3a)", async () => {
