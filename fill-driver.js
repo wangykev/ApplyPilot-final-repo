@@ -3400,16 +3400,24 @@ function summarizeEntries(entries) {
 async function captureTypeaheadOptions(act, loc, budgets) {
   if (!act || !act.openHier) return null;
   try {
-    await act.openHier(loc);
     let st = null; const t0 = Date.now();
-    while (Date.now() - t0 < (budgets.taOpenCeilingMs || 20000)) {
+    const ceiling = budgets.taOpenCeilingMs || 20000;
+    await act.openHier(loc);
+    while (Date.now() - t0 < ceiling) {
       await act.delayFull(budgets.taOpenIntervalMs || 300);
       st = act.readHier ? await act.readHier(loc) : null;
       if (st && st.searchBox && st.searchBox.visible) break;
+      // RE-OPEN: a FRESHLY-MOUNTED typeahead's first open-click can no-op (React still rendering the
+      // new entry) → the box never opens → we'd scrape nothing → tier-editor fallback. Retry the open
+      // (only while NOT visible, so we never toggle-close a box that just opened).
+      if (act.openHier) await act.openHier(loc);
     }
+    const opened = !!(st && st.searchBox && st.searchBox.visible);
+    if (!opened) { console.log("[ApplyPilot][ta-recon] NEVER OPENED after " + Math.round((Date.now() - t0) / 1000) + "s:", loc.wrapperSel, "→ no options (tier editor)"); return { widget_type: "typeahead", options: [] }; }
     let cats = [];
     if (act.readTreeCategories) { try { cats = await act.readTreeCategories(loc); } catch (e) {} }
     if (Array.isArray(cats) && cats.length) { // TREE → just tag hierarchical (categories aren't useful
+      console.log("[ApplyPilot][ta-recon] TREE (" + cats.length + " categories) → hierarchical/tier editor:", loc.wrapperSel);
       if (act.pressTab) await act.pressTab();  // in the summary; the user supplies tier candidates instead)
       await act.delayFull(budgets.reopenSettleMs || 300);
       return { widget_type: "hierarchical" };
@@ -3418,6 +3426,7 @@ async function captureTypeaheadOptions(act, loc, budgets) {
     if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused && act.focusHierSearch) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); }
     let opts = [];
     if (act.scrapeTaOptions) { const sc = await act.scrapeTaOptions(loc); if (sc && sc.ok && Array.isArray(sc.options)) opts = sc.options.slice(); }
+    console.log("[ApplyPilot][ta-recon] FLAT →", opts.length, "options:", loc.wrapperSel);
     if (act.pressTab) await act.pressTab();
     await act.delayFull(budgets.reopenSettleMs || 300);
     return { widget_type: "typeahead", options: opts };
@@ -3471,6 +3480,8 @@ async function revealUnknownSection(act, heading, budgets) {
   }
   const sec = scan.sections[newPrefix];
   const fields = (sec && sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
+  console.log("[ApplyPilot][m3b] revealed '" + heading + "' → " + newPrefix + " (" + fields.length + " fields) — reconning options…");
+  if (act.delayFull) await act.delayFull(budgets.reopenSettleMs || 300); // let the freshly-mounted entry become interactive before opening its widgets
   // Recon each CHOICE field's options while the entry is mounted (reuses the proven capture fns) so
   // the summary can render real widgets, not text boxes: dropdown → all options; typeahead → all
   // options; a TREE typeahead → its top-level CATEGORIES only (re-tagged widget_type "hierarchical"
