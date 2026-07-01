@@ -2316,16 +2316,21 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // constraint); "Clear summary" resets. Skipped under `only`.
   if (!only && rscan && Array.isArray(rscan.addButtons)) {
     const knownRes = PAGE_SECTIONS.map((s) => new RegExp(s.headingRegex, "i"));
-    const containerHeadings = new Set(Object.keys(rscan.sections || {}).map((p) => (rscan.sections[p] && rscan.sections[p].heading) || "").filter(Boolean));
+    const norm = (h) => String(h || "").trim().toLowerCase().replace(/\s+/g, " ");
+    // headings of sections m3a ALREADY surfaced (they have entries) — normalized so a case/whitespace
+    // difference between the Add's nearestHeading and the section heading doesn't slip an already-
+    // present section into reveal-by-add. (The revealUnknownSection self-clean is the hard backstop.)
+    const containerHeadings = new Set(Object.keys(rscan.sections || {}).map((p) => norm((rscan.sections[p] && rscan.sections[p].heading) || "")).filter(Boolean));
     const cachedShapes = (opts && opts.cachedShapes) || {};
     const headingToBase = (opts && opts.headingToBase) || {};
     const seen = new Set();
     for (const b of rscan.addButtons) {
       const heading = (b && b.nearestHeading) || "";
-      if (!heading || seen.has(heading)) continue;
+      const hn = norm(heading);
+      if (!heading || seen.has(hn)) continue;
       if (knownRes.some((re) => re.test(heading))) continue;   // a known section's Add button
-      if (containerHeadings.has(heading)) continue;             // already surfaced by m3a (it has entries)
-      seen.add(heading);
+      if (containerHeadings.has(hn)) continue;                 // already surfaced by m3a (it has entries)
+      seen.add(hn);
       let base, prefix, shape;
       const cb = headingToBase[heading];
       const cachedShape = cb && Array.isArray(cachedShapes[cb]) ? cachedShapes[cb] : null;
@@ -3434,18 +3439,30 @@ async function revealUnknownSection(act, heading, budgets) {
   const escaped = String(heading).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const before = await act.repeatingScan();
   const beforePrefixes = new Set(Object.keys((before && before.sections) || {}));
+  const beforeCounts = {}; // per-prefix entry count BEFORE the add — so we can tell a NEW section from a grown existing one
+  for (const p of beforePrefixes) beforeCounts[p] = ((before.sections[p] && before.sections[p].entries) || []).length;
   const clicked = await act.clickSectionAdd(escaped);
   if (!clicked || !clicked.ok) return null;
   const newOf = (scan) => Object.keys((scan && scan.sections) || {}).find((p) => !beforePrefixes.has(p));
+  // an EXISTING prefix whose count GREW — the "Add" belonged to a section that ALREADY HAS entries
+  // (m3a's territory), NOT an empty unknown section. We must NOT surface a duplicate, and we MUST
+  // delete the entry we just accidentally added (else a leftover empty entry — the live Languages bug).
+  const grownOf = (scan) => Object.keys((scan && scan.sections) || {}).find((p) => beforePrefixes.has(p) && (((scan.sections[p] && scan.sections[p].entries) || []).length > (beforeCounts[p] || 0)));
   let scan = await act.repeatingScan();
-  let newPrefix = newOf(scan);
+  let newPrefix = newOf(scan), grown = grownOf(scan);
   const deadline = Date.now() + (budgets.entryReconcileCeilingMs || 4000);
-  while (!newPrefix && Date.now() < deadline) {
+  while (!newPrefix && !grown && Date.now() < deadline) {
     await act.delay(budgets.entryReconcileIntervalMs || 150);
     scan = await act.repeatingScan();
-    newPrefix = newOf(scan);
+    newPrefix = newOf(scan); grown = grownOf(scan);
   }
-  if (!newPrefix) return null; // mount didn't register → can't reveal a container-less section
+  if (!newPrefix) {
+    if (grown) {
+      console.log("[ApplyPilot][m3b] '" + heading + "' Add grew EXISTING section " + grown + " (has entries → m3a's job) — deleting the accidental entry, not surfacing a duplicate");
+      try { await act.clickDeleteEntry(grown, (((scan.sections[grown] && scan.sections[grown].entries) || []).length) - 1); } catch (e) { /* best-effort */ }
+    }
+    return null; // not an empty unknown section → don't reveal (m3a already surfaced it)
+  }
   const sec = scan.sections[newPrefix];
   const fields = (sec && sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields)) ? sec.entries[0].fields : [];
   // Recon each CHOICE field's options while the entry is mounted (reuses the proven capture fns) so

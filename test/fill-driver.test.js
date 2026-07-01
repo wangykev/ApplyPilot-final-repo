@@ -2912,6 +2912,26 @@ test("revealUnknownSection: null if the entry never mounts (Add refused)", async
   assert.strictEqual(await revealUnknownSection(fake, "Publications", T_BUDGETS), null);
 });
 
+test("revealUnknownSection: Add GREW an existing section (has entries) → null + deletes the accidental entry (no leftover)", async () => {
+  // The live Languages bug: m3b tried to reveal "Languages", but it ALREADY has entries. clickSectionAdd
+  // grows the existing "language-" section (NO new prefix) → must return null AND delete the entry it
+  // just added (else a leftover empty entry, + the stray mount perturbs entry 1).
+  let count = 1;
+  const mk = () => ({ fields: [{ fieldName: "language", widgetType: "dropdown", label: "Language*", isRequired: true }] });
+  const fake = {
+    log: [], delay: async () => {},
+    repeatingScan: async () => ({ addButtons: [], sections: {
+      "language-": { entryCount: count, heading: "Languages", entries: Array.from({ length: count }, mk) }
+    } }),
+    clickSectionAdd: async (re) => { fake.log.push(["add", re]); count += 1; return { ok: true }; },
+    clickDeleteEntry: async (p, i) => { fake.log.push(["del", p, i]); if (p === "language-") count = Math.max(0, count - 1); return { ok: true }; },
+  };
+  const r = await revealUnknownSection(fake, "Languages", T_BUDGETS);
+  assert.strictEqual(r, null, "not an empty unknown section → no reveal");
+  assert.strictEqual(count, 1, "the accidentally-added entry was deleted — no leftover");
+  assert.ok(fake.log.some((l) => l[0] === "del" && l[1] === "language-"), "deleted from the grown section (trailing)");
+});
+
 test("revealUnknownSection: TREE typeahead → tagged hierarchical (no option list); date → date_order (m3c)", async () => {
   let mounted = false;
   const fake = {
