@@ -2975,6 +2975,34 @@ test("revealUnknownSection: TREE typeahead → tagged hierarchical (no option li
   assert.strictEqual(num.widget_type, "text"); assert.ok(!num.options);     // a text field: no recon
 });
 
+test("revealUnknownSection: FLAT typeahead → scans its OPTIONS into the shape (empty section → combobox, not a tier box)", async () => {
+  // The empty-Education bug: revealUnknownSection recon'd the fieldOfStudy typeahead, but the m3b stub
+  // DROPPED the options → the summary showed a tier editor. This pins that the recon PRODUCES options
+  // (a flat typeahead → widget_type stays "typeahead" + options); the m3b stub now carries them
+  // (options: s.options || null, line ~2354 — the same fix as the m3a stub at ~2289).
+  let mounted = false;
+  const fake = {
+    delay: async () => {}, delayFull: async () => {},
+    repeatingScan: async () => ({ addButtons: [], sections: mounted ? {
+      "education-": { entryCount: 1, heading: "Education", entries: [{ fields: [
+        { fieldName: "fieldOfStudy", widgetType: "typeahead", label: "Field of Study", isRequired: false, wrapperSel: "SEL_FOS" },
+      ] }] }
+    } : {} }),
+    clickSectionAdd: async () => { mounted = true; return { ok: true }; },
+    clickDeleteEntry: async () => { mounted = false; return { ok: true }; },
+    openHier: async () => true,
+    readHier: async () => ({ searchBox: { visible: true, focused: true } }),
+    readTreeCategories: async () => [], // NO categories → a FLAT typeahead
+    focusHierSearch: async () => true,
+    scrapeTaOptions: async () => ({ ok: true, options: ["Physics", "Chemistry", "Biology"] }),
+    pressTab: async () => {},
+  };
+  const r = await revealUnknownSection(fake, "Education", T_BUDGETS);
+  const fos = r.shape.find((s) => s.recName === "fieldOfStudy");
+  assert.strictEqual(fos.widget_type, "typeahead", "flat → stays typeahead (combobox), not hierarchical");
+  assert.deepStrictEqual(fos.options, ["Physics", "Chemistry", "Biology"], "options scanned into the shape → summary combobox");
+});
+
 test("accumulateBundle PRESERVES this page's operator-added entries across a re-fill (2b)", () => {
   const added = { page: "p2", field_id: "p2::formField-website[4].url", canonical_field: "website[4].url", is_added: true, current_value: "https://added.example", fill_status: "not_filled", needs_review: true };
   const otherPage = { page: "p1", field_id: "p1::formField-personal_info.first_name", canonical_field: "personal_info.first_name", fill_status: "filled" };

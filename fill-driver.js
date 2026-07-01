@@ -2351,7 +2351,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
         flag: "section-stub", verified: null, after: null,
         detail: "This repeating section isn't auto-filled by the bot (empty on the form) — add or verify its entries here.",
-        section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null })), // revealUnknownSection already computed date_order — don't drop it
+        section_field_shape: shape.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null, options: s.options || null })), // carry BOTH date_order AND the recon'd options — revealUnknownSection computed them; a flat typeahead → combobox, a tree → widget_type "hierarchical" → tier editor
         container_prefix: prefix, section_heading: heading || null, section_known: false
       });
     }
