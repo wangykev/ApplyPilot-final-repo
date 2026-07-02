@@ -3129,8 +3129,22 @@ async function sweepAlreadyFilled(act, results) {
         if (fd.widgetType === "file_upload" || nestedFields.has(fd.fieldName)) continue;
         const fm = (sec.fieldMap || []).find((m) => m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName);
         if (fm) {
-          const rec = results.find((r) => r.fieldName === sec.name + "[" + i + "]." + (fm.name || fm.field));
+          const key = sec.name + "[" + i + "]." + (fm.name || fm.field);
+          const rec = results.find((r) => r.fieldName === key && r.status !== "removed");
           if (rec && rec.status === "skipped" && !rec.flag && hasLiveValue(fd.value)) flip(rec, fd.value, fd.wrapperSel);
+          else if (!rec && hasLiveValue(fd.value)) {
+            // a LIVE value no record vouches for — a surviving row whose records were dropped
+            // (index shift after a remediation delete) or an operator-added extra entry. The
+            // summary is the page's source of truth → surface it as already-filled.
+            results.push({
+              fieldName: key, label: fd.label || fm.field, widgetType: fd.widgetType, isRequired: !!fd.isRequired,
+              mappedPath: key, rawValue: null, resolved: null,
+              status: "filled_review", matchTier: null, confidence: null, flag: "already-filled",
+              verified: null, after: String(fd.value),
+              detail: "on the form but not vouched for by this run's records — verify",
+              auditLoc: fd.wrapperSel || null
+            });
+          }
         } else if (hasLiveValue(fd.value)) {
           // an UNMAPPED field inside a KNOWN section holding a value — the "not mapped" edge case
           results.push({
@@ -3155,6 +3169,76 @@ async function sweepAlreadyFilled(act, results) {
     const live = await readLiveValueByWidget(act, rec.widgetType, { wrapperSel: rec.auditLoc });
     if (hasLiveValue(live)) flip(rec, live, rec.auditLoc);
   }
+}
+
+// ── PRE-ADVANCE TRUTH RECON (operator rule 2026-07-02) ── run after AI-4 remediation actions,
+// right BEFORE every re-Save&Continue click: the persisted summary must show EXACTLY what is on
+// the page at the moment it advances (the latest recon overrides earlier persists — the accumulate
+// merge replaces this page's entries). READ-ONLY. Rules:
+//  • a record whose field/row is GONE from the fresh scans → status "removed" (drops from the
+//    bundle — remediation deletes rows deliberately; the console log keeps the trail)
+//  • a surviving section row whose scanned LIVE value differs from what the record claims (an
+//    index shift after a mid-list delete) → after = the live value, needs_review/"recon-mismatch"
+//  • nested records (probed auditLoc) → existence-checked via act.selExists (gone → removed)
+//  • then sweepAlreadyFilled — anything on the page no record vouches for is captured/flagged
+//    (incl. a surviving row whose own records were dropped: re-added as already-filled)
+// NOT called on the main walk's FIRST advance: there the end-of-fill audit+sweep (which preserve
+// the M40 audit-unverifiable safety flags) ARE the recon — nothing runs between them and the click.
+async function reconPageTruth(act, results) {
+  let flat = null, rscan = null;
+  try { flat = await act.scanPage(); } catch (e) { flat = null; }
+  try { rscan = await act.repeatingScan(); } catch (e) { rscan = null; }
+  const flatNames = new Set(((flat && flat.fields) || []).map((f) => f.fieldName));
+  const sections = (rscan && rscan.sections) || {};
+  const norm = apMatch.normalize;
+  const markRemoved = (r, why) => { r.status = "removed"; r.flag = "recon-removed"; r.detail = (r.detail ? r.detail + " | " : "") + why; };
+  for (const r of results) {
+    if (r.status === "removed" || r.widgetType === "section" || r.widgetType === "remediation" || r.widgetType === "file_upload") continue;
+    if (r.widgetType === "section_stub" || r.widgetType === "nested_section_stub") continue;
+    // nested (cert ▸ specialties): the probed auditLoc is the existence key (Tier-1.5 deletes rows)
+    if (r.nested_child_base) {
+      if (r.auditLoc && act.selExists) {
+        let there = true; try { there = !!(await act.selExists(r.auditLoc)); } catch (e) { there = true; }
+        if (!there) markRemoved(r, "nested row no longer on the page at advance-time — dropped from review");
+      }
+      continue;
+    }
+    const m = /^([A-Za-z]\w*)\[(\d+)\]\./.exec(r.fieldName);
+    if (m) {
+      if (!rscan) continue; // scan failed → never mass-remove (the cascade-removed guard)
+      const sec = PAGE_SECTIONS.find((x) => x.name === m[1]);
+      if (!sec) continue; // unknown-section records (m3a) — not ours to reconcile
+      const s = sections[sec.containerPrefix];
+      const entries = (s && s.entries) || []; // an emptied section is legitimately absent from the scan
+      const i = parseInt(m[2], 10);
+      if (i >= entries.length) { markRemoved(r, "row no longer on the page at advance-time (deleted) — dropped from review"); continue; }
+      // survivor row: the record must claim the LIVE value (a mid-list delete shifts later rows
+      // onto earlier ordinals — the record would otherwise show the DELETED row's value)
+      if (r.status === "filled" || r.status === "filled_review") {
+        const recName = r.fieldName.slice(r.fieldName.indexOf("].") + 2);
+        const fm = (sec.fieldMap || []).find((x) => (x.name || x.field) === recName);
+        const fields = (entries[i] && entries[i].fields) || [];
+        const fd = fm ? (fm.labelRegex ? fields.find((x) => fm.labelRegex.test(x.label || "")) : fields.find((x) => x.fieldName === fm.field)) : null;
+        if (fd && r.after != null) {
+          if (hasLiveValue(fd.value) && norm(String(fd.value)) !== norm(String(r.after))) {
+            r.after = String(fd.value);
+            r.status = "needs_review"; r.flag = "recon-mismatch";
+            r.detail = (r.detail ? r.detail + " | " : "") + "live value changed before advance (post-remediation shift?) — verify";
+          } else if (!hasLiveValue(fd.value)) {
+            r.status = "needs_review"; r.flag = "recon-mismatch";
+            r.detail = (r.detail ? r.detail + " | " : "") + "field is EMPTY on the page at advance-time — verify";
+          }
+        }
+      }
+      continue;
+    }
+    // flat record: field gone from the fresh flat scan → removed (guard: non-empty scan only)
+    if (flat && flatNames.size > 0 && !flatNames.has(r.fieldName)) {
+      markRemoved(r, "field no longer on the page at advance-time — dropped from review");
+    }
+  }
+  // finally: capture anything on the page that no record vouches for
+  try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness — never abort */ }
 }
 
 async function driveRepeatingSectionCdp(act, section, budgetsIn) {
@@ -4065,7 +4149,13 @@ function buildReviewBundle(results, meta) {
     else reason = "low_confidence";
     return { needs_review: true, needs_review_reason: reason };
   };
-  const fieldRecs = (results || []).filter((r) => r.widgetType !== "section" && r.status !== "removed"); // .add/.delete/.removed are ops; status "removed" = a field DELETED by a cascade (drop from summary/counts/review)
+  // .add/.delete/.removed are ops; status "removed" = a field DELETED by a cascade / gone at
+  // advance-time (drop from summary/counts/review). widgetType "remediation" = AI-4's synthetic
+  // action rows ("Duplicate-language workaround", "Removed empty repeating row(s)") — operator rule
+  // 2026-07-02: the summary shows EXACTLY what is on the page right before it advances, so the
+  // synthetic rows stay OUT of the bundle (the console log keeps the remediation trail;
+  // reconPageTruth refreshes the real rows to live state before each re-advance).
+  const fieldRecs = (results || []).filter((r) => r.widgetType !== "section" && r.widgetType !== "remediation" && r.status !== "removed");
   const entries = fieldRecs.map((rec, index) => {
     const fill_status = mapFillStatus(rec.status);
     const { confidence, confidence_source } = deriveConfidence(rec);
@@ -4150,5 +4240,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

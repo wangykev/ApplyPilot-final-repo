@@ -2408,6 +2408,9 @@ function makeCdpActuation(llmConfig) {
     // Probe the live fkit ↔ formField relationship for a nested field and return the SINGLE
     // suffix-composable wrapper selector that actually resolves (null = nothing found — honest).
     nestedFieldSel: (fkit, field) => cdpEval(cdpNestedFieldSel, fkit, field),
+    // Does a selector resolve on the live page? (reconPageTruth's nested-row existence check —
+    // a Tier-1.5 deleted specialty row's probed auditLoc stops resolving.)
+    selExists: (sel) => cdpEval(function (s) { return !!document.querySelector(s); }, sel),
 
     // ── date composite segments (M34) ──
     // A date `-input` (role=spinbutton) is 0-box — can't be coordinate-clicked. Focus

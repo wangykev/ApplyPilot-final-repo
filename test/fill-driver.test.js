@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -3303,6 +3303,82 @@ test("audit: 'already-filled-match' records are NOT audited either (bot never ac
     { fieldName: "b", widgetType: "text", status: "filled", auditLoc: "L2", after: "Y", flag: null },
   ]);
   assert.deepStrictEqual(entries.map((e) => e.key), ["b"], "only the bot-actuated record is audited");
+});
+
+// ── PRE-ADVANCE TRUTH RECON (before every re-Save&Continue: summary = exactly what's on the page) ──
+test("reconPageTruth: deleted rows drop, the survivor shows the LIVE value, synthetic remediation rows never reach the bundle", async () => {
+  // The Tier-0 dup-language shape: 2 filled language records; remediation deleted entry 0 →
+  // ONE live entry ("Chinese") remains. The persisted summary must show exactly that: one
+  // language row with the live value (flagged to verify — index shift), the other dropped,
+  // and NO "Duplicate-language workaround" row.
+  const results = [
+    { fieldName: "language[0].language", label: "Language", widgetType: "dropdown", isRequired: false,
+      mappedPath: "languages[0].language", rawValue: "English", resolved: "English",
+      status: "filled", matchTier: null, confidence: null, flag: null, verified: true, after: "English", detail: null, auditLoc: "L0" },
+    { fieldName: "language[1].language", label: "Language", widgetType: "dropdown", isRequired: false,
+      mappedPath: "languages[1].language", rawValue: "Chinese", resolved: "Chinese",
+      status: "filled", matchTier: null, confidence: null, flag: null, verified: true, after: "Chinese", detail: null, auditLoc: "L1" },
+    { fieldName: "language.duplicate-fix", label: "Duplicate-language workaround", widgetType: "remediation",
+      status: "needs_review", flag: "ai-remediation", after: null, detail: "AI-4 hardcoded fix" },
+  ];
+  const rscan = { sections: { "language-": { entries: [{ fields: [
+    { fieldName: "language", label: "Language", widgetType: "dropdown", isRequired: false, value: "Chinese", wrapperSel: "LIVE0" },
+  ] }] } } };
+  const act = { scanPage: async () => ({ fields: [] }), repeatingScan: async () => rscan };
+  await reconPageTruth(act, results);
+  const r0 = results.find((r) => r.fieldName === "language[0].language");
+  assert.strictEqual(r0.status, "needs_review", "the survivor's record refreshed + flagged (index shift)");
+  assert.strictEqual(r0.flag, "recon-mismatch");
+  assert.strictEqual(r0.after, "Chinese", "the LIVE value, not the deleted row's");
+  const r1 = results.find((r) => r.fieldName === "language[1].language");
+  assert.strictEqual(r1.status, "removed", "the deleted row's record drops");
+  assert.strictEqual(r1.flag, "recon-removed");
+  const bundle = buildReviewBundle(results, { page: "p" });
+  assert.ok(!bundle.entries.some((e) => e.widget_type === "remediation"), "synthetic remediation rows NEVER reach the bundle");
+  assert.ok(!bundle.entries.some((e) => e.canonical_field === "languages[1].language"), "removed row not in the bundle");
+  assert.strictEqual(bundle.entries.filter((e) => /language\[\d+\]\.language/.test(e.field_id)).length, 1, "exactly the ONE live row");
+});
+
+test("reconPageTruth: an emptied section drops ALL its records; a failed repeatingScan never mass-removes", async () => {
+  const mk = () => [{ fieldName: "language[0].language", label: "Language", widgetType: "dropdown", isRequired: false,
+    mappedPath: "languages[0].language", rawValue: "English", resolved: "English",
+    status: "filled", flag: null, verified: true, after: "English", detail: null, auditLoc: "L0" }];
+  // (a) section emptied (absent from the scan) → the record drops
+  const emptied = mk();
+  await reconPageTruth({ scanPage: async () => ({ fields: [] }), repeatingScan: async () => ({ sections: {} }) }, emptied);
+  assert.strictEqual(emptied[0].status, "removed", "phantom-dup delete-all → the record drops");
+  // (b) repeatingScan THROWS → guard: keep everything (never mass-remove on a transient scan failure)
+  const guarded = mk();
+  await reconPageTruth({ scanPage: async () => ({ fields: [] }), repeatingScan: async () => { throw new Error("boom"); } }, guarded);
+  assert.strictEqual(guarded[0].status, "filled", "scan failure → records untouched");
+});
+
+test("reconPageTruth: a deleted NESTED row (probed auditLoc stops resolving) drops; no selExists seam → kept", async () => {
+  const mk = () => [{ fieldName: "certification[0].specialties[0].specialtyParent", label: "specialtyParent", widgetType: "typeahead",
+    isRequired: false, mappedPath: "certification[0].specialties[0].specialtyParent", rawValue: "Other", resolved: ["Other"],
+    status: "filled_review", flag: "ai-choice", verified: true, after: "Other", detail: null,
+    auditLoc: "PROBED-sp", nested_parent: { base: "certification", index: 0 }, nested_child_base: "specialties" }];
+  const base = { scanPage: async () => ({ fields: [] }), repeatingScan: async () => null };
+  const gone = mk();
+  await reconPageTruth(Object.assign({ selExists: async () => false }, base), gone);
+  assert.strictEqual(gone[0].status, "removed", "Tier-1.5-deleted specialty row drops from the summary");
+  const kept = mk();
+  await reconPageTruth(base, kept); // no selExists seam (minimal fake) → never guess, keep
+  assert.strictEqual(kept[0].status, "filled_review", "no existence seam → record kept as-is");
+});
+
+test("sweep: a LIVE mapped value whose records were dropped is RE-ADDED as already-filled (the survivor row)", async () => {
+  const results = [{ fieldName: "language[0].language", label: "Language", widgetType: "dropdown", isRequired: false,
+    mappedPath: "languages[0].language", rawValue: "English", resolved: "English",
+    status: "removed", flag: "recon-removed", verified: null, after: "English", detail: "row deleted" }];
+  const rscan = { sections: { "language-": { entries: [{ fields: [
+    { fieldName: "language", label: "Language", widgetType: "dropdown", isRequired: false, value: "Chinese", wrapperSel: "LIVE0" },
+  ] }] } } };
+  await sweepAlreadyFilled({ scanPage: async () => ({ fields: [] }), repeatingScan: async () => rscan }, results);
+  const added = results.find((r) => r.fieldName === "language[0].language" && r.status !== "removed");
+  assert.ok(added, "the live row re-added (its own record was dropped)");
+  assert.strictEqual(added.flag, "already-filled");
+  assert.strictEqual(added.after, "Chinese");
 });
 
 test("audit: 'already-filled' surfaced records are NOT audited (the fluent-checkbox uncheck bug)", () => {

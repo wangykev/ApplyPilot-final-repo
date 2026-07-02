@@ -2695,10 +2695,19 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       }
     }
 
-    if (!didSomething) { await repersistPageBundle(out, pageKey, page); return { advanced: false, reason: "no-action", attempts: attempt, actions }; }
+    if (!didSomething) {
+      // hand the state to the operator with a TRUTHFUL summary (no click follows, same rule)
+      try { await reconPageTruth(act, out.results); } catch (e) { /* read-only — persist regardless */ }
+      await repersistPageBundle(out, pageKey, page);
+      return { advanced: false, reason: "no-action", attempts: attempt, actions };
+    }
 
-    // Record the remediation trail into the persisted bundle BEFORE the re-advance (so it's kept
-    // whether or not this attempt advances).
+    // ── PRE-ADVANCE TRUTH RECON (operator rule 2026-07-02): before EVERY re-Save&Continue, re-recon
+    // the live page and re-persist — the summary shows EXACTLY what is on the page at this click
+    // (deleted rows drop, shifted/changed values refresh, unvouched values surface as already-filled;
+    // the synthetic "remediation" rows never reach the bundle — buildReviewBundle filters them). The
+    // latest persist OVERRIDES this page's earlier ones (accumulate merges on the page key). ──
+    try { await reconPageTruth(act, out.results); } catch (e) { LOG("  pre-advance recon failed (persisting records as-is):", String((e && e.message) || e)); }
     await repersistPageBundle(out, pageKey, page);
 
     // ── re-Save & Continue (GUARDED — refuses on the review marker) + wait. ──
