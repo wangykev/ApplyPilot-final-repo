@@ -2487,6 +2487,12 @@ function makeFakeRepeatAct(state) {
                          // repeatingScan — models a field that REMOUNTS (WE endDate after
                          // unchecking currentlyWorkHere) so the waitForPresence poll is testable.
   let _llmIdx = 0;       // tree-AI: state.ai may be a SEQUENCE [categoryReply, leafReply] consumed in order.
+  // Nested (cert ▸ Specialties) seams — INERT unless state.nestedEnabled. parentOrder maps the section
+  // name → surviving parent fkit indices (one per entry, idx = 700+ordinal); children tracked in _nkids
+  // keyed by that fkit index. Off ⇒ nestedScan returns empty ⇒ the wire's pIdx is null ⇒ no fill call
+  // (every existing nested test — stub-only emit — byte-identical).
+  let _nkids = {}, _nnext = 900;
+  const _secName = state.prefix ? state.prefix.replace(/-$/, "") : "certification";
   return {
     log,
     // delete-vs-AI defer: driveRepeatingSectionCdp reads act.aiEnabled. Defaults OFF (existing tests
@@ -2540,6 +2546,21 @@ function makeFakeRepeatAct(state) {
       state.entries.splice(index, 1);
       return { ok: true };
     },
+    // nested (cert ▸ Specialties) — see the _nkids note above.
+    nestedScan: async () => {
+      if (!state.nestedEnabled) return { parentOrder: {}, nestedSections: [] };
+      const order = state.entries.map((_, i) => 700 + i);
+      const nestedSections = [];
+      order.forEach((pIdx) => {
+        const kids = _nkids[pIdx] || [];
+        if (kids.length) nestedSections.push({ parentBase: _secName, childBase: "specialties",
+          entries: kids.map((ci) => ({ levels: [{ base: _secName, index: pIdx }, { base: "specialties", index: ci }], fields: [] })) });
+      });
+      const parentOrder = {}; parentOrder[_secName] = order;
+      return { parentOrder, nestedSections };
+    },
+    clickNestedAdd: async (pf, stem) => { log.push(["clickNestedAdd", pf, stem]); const m = /-(\d+)--/.exec(pf || ""); const pIdx = m ? +m[1] : 700; (_nkids[pIdx] = _nkids[pIdx] || []).push(_nnext++); return { ok: true }; },
+    clickNestedDelete: async (pf, base, idx) => { log.push(["clickNestedDelete", pf, idx]); const m = /-(\d+)--/.exec(pf || ""); const pIdx = m ? +m[1] : 700; _nkids[pIdx] = (_nkids[pIdx] || []).filter((c) => String(c) !== String(idx)); return { ok: true }; },
     // text
     readTextValue: async (loc) => { const f = byLoc(loc); return f ? { value: f.value || "", focused: focusedText === f } : null; },
     focusText: async (loc) => { log.push(["focusText", loc.wrapperSel]); const f = byLoc(loc); if (!f || f.noFocus) return null; focusedText = f; focusedSeg = null; return "cdp-click"; },
@@ -2818,6 +2839,36 @@ test("driveRepeatingSectionCdp: section.nested → a Specialties stub + Attachme
   assert.ok(att && att.widgetType === "file_upload" && att.flag === "nested-attachment", "Attachments row (config attachments:true)");
   const be = buildReviewBundle(out.results, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties._stub");
   assert.ok(be && be.widget_type === "nested_section_stub" && be.needs_review, "nested stub reaches the bundle");
+});
+
+test("driveRepeatingSectionCdp: section.nested + item.specialties → FILLS the nested specialtyParent (record beside the stub)", async () => {
+  // The wire: a surviving cert entry whose profile item has specialties → fillNestedSpecialtiesCdp runs
+  // (reconcile + fill), its records flow into results ALONGSIDE the addable stub. (The typeahead can't
+  // commit in the fake — the point is the wire INVOKED the fill + emitted the nested canonical record.)
+  const entry = { fkit: "certification-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] };
+  const state = webState({ prefix: "certification-", entries: [entry], nestedEnabled: true });
+  const out = await driveRepeatingSectionCdp(makeFakeRepeatAct(state), {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ url: "x", specialties: [{ specialty: "otherrrr" }] }],
+    fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }],
+    deleteOnNoMatch: false, nested: CERT_NESTED
+  }, T_BUDGETS);
+  const sp = out.results.find((r) => r.fieldName === "certification[0].specialties[0].specialtyParent");
+  assert.ok(sp && sp.widgetType === "typeahead", "nested specialtyParent record emitted (fill invoked)");
+  assert.deepStrictEqual(sp.nested_parent, { base: "certification", index: 0 });
+  assert.ok(out.results.some((r) => r.fieldName === "certification[0].specialties._stub"), "the addable stub STILL emits (add more)");
+});
+
+test("driveRepeatingSectionCdp: section.nested + NO item.specialties → stub only (no nested fill record)", async () => {
+  const entry = { fkit: "certification-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] };
+  const state = webState({ prefix: "certification-", entries: [entry], nestedEnabled: true });
+  const out = await driveRepeatingSectionCdp(makeFakeRepeatAct(state), {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ url: "x" }], fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }],
+    deleteOnNoMatch: false, nested: CERT_NESTED
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => /specialties\[\d+\]/.test(r.fieldName)), "no nested fill record without profile specialties");
+  assert.ok(out.results.some((r) => r.fieldName === "certification[0].specialties._stub"), "stub present");
 });
 
 test("driveRepeatingSectionCdp: NO section.nested → no nested emit (WE/Education/Websites/Languages)", async () => {

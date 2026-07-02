@@ -2442,6 +2442,35 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   }
 
+  // ── TEST-ONLY (attach_resume) — REMOVE with the profile test data ─────────────────────────────
+  // Attach the SAME stored résumé to a cert's Attachments field. DATA-DRIVEN, not a permanent tie:
+  // gated on profile certifications[i].attach_resume (test data). Remove that field ⇒ no attach — the
+  // résumé is NEVER hard-wired to cert attachments. Scoped to each such cert's "…--attachments" area.
+  try {
+    const certsWithAttach = (prepared.certifications || []).filter((c) => c && c.attach_resume).length;
+    if (certsWithAttach) {
+      let resumeRec = null; try { resumeRec = await getResume(); } catch (e) { /* none */ }
+      if (!resumeRec || !resumeRec.base64) { LOG("[TEST attach_resume] no résumé stored — skipped."); }
+      else {
+        const attFkids = (await cdpEval(() => Array.from(document.querySelectorAll('[data-fkit-id^="certification-"][data-fkit-id$="--attachments"]')).map((e) => e.getAttribute("data-fkit-id")))) || [];
+        const lockOn = !(opts && opts.skipLock);
+        for (let k = 0; k < Math.min(certsWithAttach, attFkids.length); k++) {
+          const sectionSel = '[data-fkit-id="' + attFkids[k] + '"]';
+          if (lockOn) { try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* ignore */ } }
+          let ar = null;
+          try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf", sectionSel); }
+          catch (e) { ar = { attached: false, detail: String((e && e.message) || e) }; }
+          finally { if (lockOn) { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } } }
+          LOG("[TEST attach_resume] " + attFkids[k] + ":", ar && ar.attached ? ("attached \"" + (ar.fileName || resumeRec.filename) + "\"") : ("FAILED — " + ((ar && ar.detail) || "no confirmation")));
+          if (ar && ar.attached) {
+            const rec = out.results.find((r) => r.flag === "nested-attachment" && r.fieldName === ("certification[" + k + "].attachments"));
+            if (rec) { rec.status = "filled"; rec.verified = true; rec.after = ar.fileName || resumeRec.filename || null; rec.detail = "TEST résumé attached (attach_resume — remove the profile flag to un-tie)"; }
+          }
+        }
+      }
+    }
+  } catch (e) { LOG("[TEST attach_resume] error:", String((e && e.message) || e)); }
+
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
   // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations
   // (out.audit) so the standalone "re-audit" can re-read the live page later. Overwrite-per-
@@ -5881,7 +5910,7 @@ function probePage() {
 //   3. GATE on file-upload-successful specifically — file-upload-item also renders
 //      mid-upload / on error, so the row alone is not a confident success.
 // ============================================================================
-async function attachResume(base64, filename, mime) {
+async function attachResume(base64, filename, mime, sectionSel) {
   if (!base64) return { attached: false, detail: "no resume bytes passed (empty base64)" };
 
   // Re-resolve EVERYTHING fresh from the document on each read. Workday REPLACES the
@@ -5891,7 +5920,9 @@ async function attachResume(base64, filename, mime) {
   // attachments only cleared 2). These closures re-query each call → immune to the
   // subtree being swapped out. (The section's wrapper automation-id is the empty
   // "formField-", so we anchor on the stable data-fkit-id.)
-  const findSection = () => document.querySelector('[data-fkit-id="resumeAttachments--attachments"]') || document;
+  // sectionSel scopes the attach to a specific attachment area (e.g. a cert's "…--attachments"); default
+  // = the top-level résumé area. Passed as a plain string across the injection boundary (never a node).
+  const findSection = () => document.querySelector(sectionSel || '[data-fkit-id="resumeAttachments--attachments"]') || document;
   const countItems = () => findSection().querySelectorAll('[data-automation-id="file-upload-item"]').length;
   const firstDelete = () => findSection().querySelector('[data-automation-id="delete-file"]');
   const findInput = () =>
