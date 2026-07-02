@@ -2046,6 +2046,24 @@ test("M36.1 typeahead k>0: nothing higher offered → RE-COMMIT the kept pre-fil
   assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "Other"], "searched the higher tier (miss) THEN re-committed its own tier (the fix)");
 });
 
+test("INVARIANT: keptLowerTier (k>0) NEVER goes to the AI — deterministic keep even with AI ON (zero LLM calls)", async () => {
+  // Live 2026-07-02: FoS pre-filled "Electrical Engineering" (tier 1 of the profile list) + a
+  // tier-0-only upgrade no-match handed the exit to the inline AI, which re-picked the SAME value
+  // and re-flagged it ai-choice/filled_review. The kept chip EXACT-matches a lower PROFILE tier —
+  // a STATED value, nothing to rescue: the deterministic keep must win and act.llm must never fire.
+  const field = taField({
+    chips: ["Other"],
+    filterMap: { "Electrical and Computer Engineering": { banner: true }, "Other": { autoCommit: "Other" } }
+  });
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Other","represented":true,"confidence":"High"}' });
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering"]), {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable", "deterministic keep — not an AI record");
+  assert.strictEqual(rec.after, "Other");
+  assert.ok(!act.log.some((l) => l[0] === "llm"), "act.llm NEVER called on a keptLowerTier exit");
+});
+
 test("M36.1 typeahead k===-1: a mismatched pre-fill walks the FULL list (down to the last tier) — unchanged from M27", async () => {
   // Pre-fill matches NO candidate → genuine mismatch → full overwrite walk; only the
   // LAST tier is offered, and it commits — proving the full list is in scope (unlike

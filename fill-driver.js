@@ -1544,7 +1544,14 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // we never deleted it): rest the field clean ({chips:[original], query:""}) and
   // flag overwrite-nomatch-original-kept (future-AI candidate).
   if (isOverwrite) {
-    const aiR = await tryInlineAi();
+    // keptLowerTier (preTierIndex > 0) NEVER goes to the AI: the kept chip EXACT-matches a lower
+    // PROFILE tier — a STATED value, there is nothing to rescue. Without this gate the AI re-picked
+    // the very value the field already held and re-flagged it ai-choice/filled_review (live
+    // 2026-07-02: FoS pre-filled "Electrical Engineering" = tier 1; the tier-0-only upgrade walk
+    // no-matched → AI). The deterministic keep below (recommitFn → filled/
+    // prefilled-better-tier-unavailable) is the correct outcome. The AI rescue exists for the
+    // MISMATCHED pre-fill (preTierIndex === -1), where the kept chip is NOT a profile value.
+    const aiR = preTierIndex > 0 ? null : await tryInlineAi();
     // Return the AI's record ONLY when it carries a real outcome (a commit, or an honest non-null
     // after). A FAILED rescue (needs_review, after:null) must NOT mask the kept original — the live
     // "summary showed nothing while the page held 'Other'" bug: the field still holds the

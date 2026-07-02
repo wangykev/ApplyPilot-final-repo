@@ -2063,3 +2063,11 @@ ai-* flag drives review reasons + the delete-sweep), else the kept-chip record w
 failure appended. And the PROACTIVE nested deleteOnNoMatch: a nested row whose required pick ends
 BLANK on a definitive negative is deleted at fill time (value-holders/transients never; the
 sub-section stub notes the removal).
+- **Follow-up (same day) — keptLowerTier must never reach the inline AI.** With FoS PRE-FILLED
+  "Electrical Engineering" (tier 1 of the profile's 4-tier list), the M36.1 guard walks only tier 0
+  ("Electrical and Computer Engineering") → genuine no-match → the overwrite exit handed the field
+  to `tryInlineAi`, which re-picked the SAME value and re-flagged it `ai-choice`/`filled_review`.
+  The kept chip EXACT-matches a lower PROFILE tier — a STATED value with nothing to rescue; the AI
+  rescue exists for the MISMATCHED pre-fill (`preTierIndex === -1`) only. Fix: the overwrite
+  no-match exit gates the AI on `preTierIndex <= 0` → the deterministic keep (recommit →
+  `filled`/`prefilled-better-tier-unavailable`) wins, zero LLM calls (invariant unit-pinned).
