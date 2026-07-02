@@ -2425,15 +2425,8 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // upload empty blocks Save & Continue). NOTE: attachResume's attached:true is the engine's
   // claim; the FORM accepting it (Save & Continue advances) is the form's truth — the walk's
   // advance is the decisive proof, not this record.
-  // Exclude nested-attachment records (a cert's per-entry Attachments — its own in-section path);
-  // with DOM-order interleaving a section can fill BEFORE the flat Documents field, so the first
-  // file_upload record is no longer guaranteed to be the top-level one.
-  const uploadRec = out.results.find((r) => r.widgetType === "file_upload" && r.flag !== "nested-attachment");
-  if (uploadRec && uploadRec.status === "filled") {
-    // already attached IN PAGE ORDER by the flat loop (act.attachStoredResume) — this post-pass is
-    // now only the fallback for acts without the seam.
-    LOG(`resume: attached in page order ("${uploadRec.after}").`);
-  } else if (uploadRec) {
+  const uploadRec = out.results.find((r) => r.widgetType === "file_upload");
+  if (uploadRec) {
     let resumeRec = null;
     try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
     if (!resumeRec || !resumeRec.base64) {

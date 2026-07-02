@@ -415,16 +415,13 @@ function cdpPageScan() {
     fields: wrappers.map((w) => {
       const id = w.getAttribute("data-automation-id");
       const wt = classify(w);
-      let docY = null; // page position (same-scan viewport-relative top) — the DOM-order interleave key
-      try { docY = Math.round(w.getBoundingClientRect().top); } catch (e) { /* rect-less → no interleave */ }
       return {
         wrapperSel: '[data-automation-id="' + id + '"]',
         fieldName: id.slice("formField-".length),
         widgetType: wt,
         label: labelOf(w),
         isRequired: requiredOf(w),
-        value: valueOf(w, wt),
-        docY
+        value: valueOf(w, wt)
       };
     })
   };

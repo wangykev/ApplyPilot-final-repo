@@ -102,8 +102,7 @@ function makeFakeAct(fields, opts) {
       fields: fields.map((f) => ({
         wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType,
         label: f.label || f.fieldName, isRequired: !!f.isRequired,
-        value: f.liveValue !== undefined ? f.liveValue : null, // already-filled sweep: the field's CURRENT live value
-        docY: f.docY !== undefined ? f.docY : null // DOM-order interleave key (null = no interleave, today's order)
+        value: f.liveValue !== undefined ? f.liveValue : null // already-filled sweep: the field's CURRENT live value
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
@@ -2511,8 +2510,7 @@ function makeFakeRepeatAct(state) {
       url: "fake://page", repeatingFieldCount: 0,
       fields: (state.flatFields || []).map((f) => ({
         fieldName: f.fieldName, label: f.label || f.fieldName, widgetType: f.widgetType,
-        isRequired: !!f.isRequired, wrapperSel: f.wrapperSel,
-        docY: f.docY !== undefined ? f.docY : null // DOM-order interleave key (null = today's flat-then-sections order)
+        isRequired: !!f.isRequired, wrapperSel: f.wrapperSel
       }))
     }),
     repeatingScan: async () => {
@@ -4262,49 +4260,6 @@ test("M38 fold: a section present ONLY via an Add-button heading (create-first) 
   assert.ok(act.log.some(([m]) => m === "clickSectionAdd"), "create-first Add fired (presence via heading)");
   const url = out.results.find((r) => r.fieldName === "website[0].url");
   assert.ok(url && url.after === "https://k.example", "create-first section filled");
-});
-
-test("DOM-order interleave: a section ABOVE a flat field drives BEFORE it; one BELOW drives after (page order, not flat-then-sections)", async () => {
-  // The operator's live case: Application Documents (a flat file_upload) sits ABOVE Websites, but
-  // Websites filled first — flat fields all ran before any section. Now each flat field's docY vs
-  // the section's Add-button rect decides: flatTop(y=50) → Websites(add y=200) → upload(y=400).
-  const state = {
-    prefix: "webAddress-", addable: true, deletable: true, newEntry: (i) => webEntry("webAddress-new" + i, ""),
-    entries: [webEntry("webAddress-0--null", "")],
-    addButtons: [{ text: "Add Another", nearestHeading: "Websites", rect: { cx: 5, cy: 200 } }],
-    flatFields: [
-      { fieldName: "legalName--firstName", widgetType: "text", value: "", wrapperSel: "[flat-first]", docY: 50 },
-      { fieldName: "uploadDocs", widgetType: "file_upload", wrapperSel: "[flat-upload]", docY: 400 },
-    ]
-  };
-  const act = makeFakeRepeatAct(state);
-  const order = [];
-  act.attachStoredResume = async (sel) => { order.push("attach:" + sel); return { attached: true, fileName: "resume.pdf" }; };
-  const origFocus = act.focusText;
-  act.focusText = async (loc) => { order.push("focus:" + loc.wrapperSel); return origFocus(loc); };
-  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" }, websites: [{ url: "https://k.example" }] }, {}, {}, T_BUDGETS);
-  const iFlat = order.findIndex((s) => s === "focus:[flat-first]");
-  const iSite = order.findIndex((s) => /webAddress-0--null/.test(s));
-  const iUp = order.findIndex((s) => s === "attach:[flat-upload]");
-  assert.ok(iFlat !== -1 && iSite !== -1 && iUp !== -1, "all three actuated: " + JSON.stringify(order));
-  assert.ok(iFlat < iSite, "the flat field ABOVE the section fills first");
-  assert.ok(iSite < iUp, "the section fills BEFORE the flat upload BELOW it (Websites before Documents ⇔ their page order)");
-  // and the upload record is FILLED by the in-loop attach (no end-of-page post-pass needed)
-  const upRec = out.results.find((r) => r.fieldName === "uploadDocs");
-  assert.strictEqual(upRec.status, "filled");
-  assert.strictEqual(upRec.after, "resume.pdf");
-});
-
-test("DOM-order interleave: no docY / no rects (page engine, old fakes) → today's flat-then-sections order; no seam → upload stays skipped", async () => {
-  const state = {
-    prefix: "webAddress-", addable: true, deletable: true, newEntry: (i) => webEntry("webAddress-new" + i, ""),
-    entries: [webEntry("webAddress-0--null", "")],
-    flatFields: [{ fieldName: "uploadDocs", widgetType: "file_upload", wrapperSel: "[flat-upload]" }] // no docY
-  };
-  const act = makeFakeRepeatAct(state); // no attachStoredResume seam
-  const out = await drivePageFill(act, { websites: [{ url: "https://k.example" }] }, {}, {}, T_BUDGETS);
-  assert.strictEqual(out.results.find((r) => r.fieldName === "uploadDocs").status, "skipped", "no seam → the skip (post-pass fallback handles it)");
-  assert.ok(out.results.some((r) => r.fieldName === "website[0].url"), "sections still drive (after the flat loop)");
 });
 
 // ── M38 Part 2: the CDP review-summary bundle + write-per-page accumulation ──────────
