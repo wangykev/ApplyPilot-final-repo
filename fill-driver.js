@@ -3422,11 +3422,23 @@ async function captureTypeaheadOptions(act, loc, budgets) {
       await act.delayFull(budgets.reopenSettleMs || 300);
       return { widget_type: "hierarchical" };
     }
-    // FLAT → focus the searchBox so the full list renders, then scrape role=option
-    if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused && act.focusHierSearch) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); }
+    // FLAT → focus so the full list renders, then scrape [role=option]. A FRESHLY-MOUNTED typeahead's
+    // list is server-populated a BEAT AFTER open, so an immediate scrape sees 0 (the live empty-Education
+    // FoS bug). POLL scrapeTaOptions until it returns options — re-opening/re-focusing to keep the box
+    // alive — up to the recon ceiling. Still 0 at the ceiling = genuinely empty on open (server-search-
+    // only, needs a typed query) → tier-editor fallback, honestly.
     let opts = [];
-    if (act.scrapeTaOptions) { const sc = await act.scrapeTaOptions(loc); if (sc && sc.ok && Array.isArray(sc.options)) opts = sc.options.slice(); }
-    console.log("[ApplyPilot][ta-recon] FLAT →", opts.length, "options:", loc.wrapperSel);
+    const scCeiling = Math.min(budgets.taOpenCeilingMs || 20000, 8000);
+    const t2 = Date.now();
+    while (act.scrapeTaOptions && Date.now() - t2 < scCeiling) {
+      const s2 = act.readHier ? await act.readHier(loc) : st;
+      if (!(s2 && s2.searchBox && s2.searchBox.visible)) { if (act.openHier) await act.openHier(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); continue; } // box closed → re-open
+      if (s2.searchBox && !s2.searchBox.focused && act.focusHierSearch) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); }
+      const sc = await act.scrapeTaOptions(loc);
+      if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { opts = sc.options.slice(); break; }
+      await act.delayFull(budgets.taOpenIntervalMs || 300);
+    }
+    console.log("[ApplyPilot][ta-recon] FLAT →", opts.length, "options after " + (Math.round((Date.now() - t2) / 100) / 10) + "s:", loc.wrapperSel);
     if (act.pressTab) await act.pressTab();
     await act.delayFull(budgets.reopenSettleMs || 300);
     return { widget_type: "typeahead", options: opts };
