@@ -2350,6 +2350,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const heading = (b && b.nearestHeading) || "";
       const hn = norm(heading);
       if (!heading || seen.has(hn)) continue;
+      // an Add button INSIDE a repeating entry is a NESTED sub-section's (cert ▸ Specialties —
+      // owned by its parent section's nested config), never a top-level unknown section. Clicking
+      // it here mounted a phantom EMPTY specialty row that revealUnknownSection could not see
+      // (specialties have no --null container → no new prefix, parent count unchanged) nor delete.
+      if (b.insideEntry) continue;
       if (knownRes.some((re) => re.test(heading))) continue;   // a known section's Add button
       if (containerHeadings.has(hn)) continue;                 // already surfaced by m3a (it has entries)
       seen.add(hn);
@@ -3992,6 +3997,23 @@ async function revealUnknownSection(act, heading, budgets) {
   const beforePrefixes = new Set(Object.keys((before && before.sections) || {}));
   const beforeCounts = {}; // per-prefix entry count BEFORE the add — so we can tell a NEW section from a grown existing one
   for (const p of beforePrefixes) beforeCounts[p] = ((before.sections[p] && before.sections[p].entries) || []).length;
+  // NESTED snapshot (mis-click insurance): clickSectionAdd anchors page-wide by heading, so it can
+  // land on a NESTED sub-section's Add — which mounts a row INVISIBLE to the prefix/grown detection
+  // (no --null container, parent count unchanged). Snapshot the nested entries so the dead-end
+  // below can find + delete what the click actually mounted (never a leftover phantom row).
+  const nestedKeys = async () => {
+    if (!act.nestedScan) return null;
+    let ns = null; try { ns = await act.nestedScan(); } catch (e) { return null; }
+    const keys = new Set();
+    for (const g of ((ns && ns.nestedSections) || [])) {
+      for (const ent of (g.entries || [])) {
+        const lv = ent.levels || [];
+        if (lv.length >= 2) keys.add(lv[0].base + "|" + lv[0].index + "|" + lv[lv.length - 1].base + "|" + lv[lv.length - 1].index);
+      }
+    }
+    return keys;
+  };
+  const nestedBefore = await nestedKeys();
   const clicked = await act.clickSectionAdd(escaped);
   if (!clicked || !clicked.ok) return null;
   const newOf = (scan) => Object.keys((scan && scan.sections) || {}).find((p) => !beforePrefixes.has(p));
@@ -4011,6 +4033,16 @@ async function revealUnknownSection(act, heading, budgets) {
     if (grown) {
       console.log("[ApplyPilot][m3b] '" + heading + "' Add grew EXISTING section " + grown + " (has entries → m3a's job) — deleting the accidental entry, not surfacing a duplicate");
       try { await act.clickDeleteEntry(grown, (((scan.sections[grown] && scan.sections[grown].entries) || []).length) - 1); } catch (e) { /* best-effort */ }
+    } else if (nestedBefore && act.clickNestedDelete) {
+      // no new prefix AND nothing grew — did the click mount a NESTED row (invisible to both
+      // checks)? Diff the nested entries and delete what appeared (the phantom-specialty backstop).
+      const nestedAfter = await nestedKeys();
+      for (const k of (nestedAfter || new Set())) {
+        if (nestedBefore.has(k)) continue;
+        const [pBase, pIdx, cBase, cIdx] = k.split("|");
+        console.log("[ApplyPilot][m3b] '" + heading + "' Add mounted a NESTED " + pBase + "[" + pIdx + "] ▸ " + cBase + " row (not a top-level section) — deleting the accidental row");
+        try { await act.clickNestedDelete(pBase + "-" + pIdx + "--null", cBase, isNaN(+cIdx) ? cIdx : +cIdx); } catch (e) { /* best-effort */ }
+      }
     }
     return null; // not an empty unknown section → don't reveal (m3a already surfaced it)
   }

@@ -3492,6 +3492,50 @@ test("revealUnknownSection: Add GREW an existing section (has entries) → null 
   assert.ok(fake.log.some((l) => l[0] === "del" && l[1] === "language-"), "deleted from the grown section (trailing)");
 });
 
+test("m3b: an Add button INSIDE a repeating entry (nested Specialties) is SKIPPED — never revealed, no phantom mount", async () => {
+  // The phantom-specialty bug: the cert entry's nested "Specialties" Add showed up in the page-wide
+  // addButtons with an unknown heading → m3b clicked it → mounted an empty specialty row it could
+  // neither see (no --null container, cert count unchanged) nor delete. Fix: insideEntry buttons
+  // (any ancestor fkit with the -<digits>-- infix) are a nested sub-section's — skip them.
+  const mkRscan = (inside) => ({ url: "fake://p2", sections: {}, addButtons: [
+    { text: "Add", nearestHeading: "Specialties", insideEntry: inside, rect: { cx: 1, cy: 1 } },
+  ] });
+  // insideEntry: true → NEVER clicked, no stub
+  const calls = [];
+  const act = makeFakeAct([], { rscan: mkRscan(true) });
+  act.clickSectionAdd = async (h) => { calls.push(h); return { ok: false }; };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.deepStrictEqual(calls, [], "the nested Add was never clicked");
+  assert.ok(!out.results.some((r) => r.widgetType === "section_stub" && /specialt/i.test(r.label || "")), "no bogus top-level 'Specialties' stub");
+  // control — insideEntry: false (a genuine top-level unknown Add) → the reveal path DOES fire
+  const calls2 = [];
+  const act2 = makeFakeAct([], { rscan: mkRscan(false) });
+  act2.clickSectionAdd = async (h) => { calls2.push(h); return { ok: false }; }; // refuse → reveal null, but the CLICK proves the path ran
+  await drivePageFill(act2, {}, {}, {}, T_BUDGETS);
+  assert.strictEqual(calls2.length, 1, "a top-level unknown Add still goes through reveal-by-add");
+});
+
+test("revealUnknownSection: a mis-click that mounts a NESTED row (no new/grown prefix) → deleted via clickNestedDelete, returns null", async () => {
+  // Backstop: clickSectionAdd anchors page-wide by heading, so it can land on a nested Add. The
+  // mount is INVISIBLE to the prefix/grown detection — the nestedScan diff finds + deletes it.
+  let nestedRows = [5]; // one pre-existing specialty (must NOT be touched)
+  const fake = {
+    log: [], delay: async () => {},
+    repeatingScan: async () => ({ addButtons: [], sections: {
+      "certification-": { entryCount: 1, heading: "Certifications", entries: [{ fields: [] }] } // static — never grows
+    } }),
+    nestedScan: async () => ({ parentOrder: { certification: [172] }, nestedSections: [{ parentBase: "certification", childBase: "specialties",
+      entries: nestedRows.map((ci) => ({ levels: [{ base: "certification", index: 172 }, { base: "specialties", index: ci }], fields: [] })) }] }),
+    clickSectionAdd: async () => { nestedRows.push(9); return { ok: true }; }, // the mis-click mounts a nested row
+    clickNestedDelete: async (pf, base, idx) => { fake.log.push(["ndel", pf, base, idx]); nestedRows = nestedRows.filter((c) => String(c) !== String(idx)); return { ok: true }; },
+    clickDeleteEntry: async () => { fake.log.push(["del-top"]); return { ok: true }; },
+  };
+  const r = await revealUnknownSection(fake, "Specialties", T_BUDGETS);
+  assert.strictEqual(r, null, "not a top-level section → no reveal");
+  assert.deepStrictEqual(fake.log, [["ndel", "certification-172--null", "specialties", 9]], "exactly the mounted nested row deleted (scoped to the right parent)");
+  assert.deepStrictEqual(nestedRows, [5], "the pre-existing specialty untouched — no leftover phantom");
+});
+
 test("revealUnknownSection: TREE typeahead → tagged hierarchical (no option list); date → date_order (m3c)", async () => {
   let mounted = false;
   const fake = {

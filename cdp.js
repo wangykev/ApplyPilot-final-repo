@@ -617,8 +617,21 @@ function cdpRepeatingScan() {
       })
     };
   }
+  // insideEntry: the Add button sits INSIDE a repeating entry (any ancestor fkit with the
+  // "-<digits>--" infix — the cdpPageScan isRepeating idiom, inlined LOCKSTEP: page fns are
+  // stringified separately). Such a button is a NESTED sub-section's Add (cert ▸ Specialties)
+  // owned by its parent section's nested config — NEVER a top-level section's (the m3b
+  // reveal-by-add must skip it: clicking it mounted the phantom empty specialty row).
+  const insideEntry = (b) => {
+    let el = b.closest("[data-fkit-id]");
+    while (el) {
+      if (/-\d+--/.test(el.getAttribute("data-fkit-id") || "")) return true;
+      el = el.parentElement ? el.parentElement.closest("[data-fkit-id]") : null;
+    }
+    return false;
+  };
   const addButtons = Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
-    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), rect: rectOf(b), nearestHeading: nearestHeading(b) }));
+    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), rect: rectOf(b), nearestHeading: nearestHeading(b), insideEntry: insideEntry(b) }));
   return { url: location.href, sectionsPresent: Object.keys(sections), sections, addButtons };
 }
 
