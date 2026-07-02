@@ -2985,7 +2985,9 @@ test("sectionsInDomOrder: sections drive in PAGE order (Add-button document orde
   ];
   const ordered = sectionsInDomOrder(PAGE_SECTIONS, adds).map((s) => s.name);
   assert.deepStrictEqual(ordered.slice(0, 3), ["language", "certification", "workExperience"], "DOM (Add-button) order wins");
-  assert.deepStrictEqual(ordered.slice(3), ["education", "website"], "unmatched sections keep registry order at the tail");
+  // registry-independent tail: whatever sections the registry holds beyond the three matched, in registry order
+  const expectedTail = PAGE_SECTIONS.map((s) => s.name).filter((n) => !["language", "certification", "workExperience"].includes(n));
+  assert.deepStrictEqual(ordered.slice(3), expectedTail, "unmatched sections keep registry order at the tail");
   assert.deepStrictEqual(sectionsInDomOrder(PAGE_SECTIONS, []).map((s) => s.name), PAGE_SECTIONS.map((s) => s.name), "no Add buttons → registry order (today's behavior)");
 });
 
@@ -3095,7 +3097,8 @@ test("AI-4 sectionsFromErrorNames: nested 'Specialty' → certification; label/r
   assert.deepStrictEqual(sectionsFromErrorNames(["Specialty"]), ["certification"], "nested sub-section field label (the live miss)");
   assert.deepStrictEqual(sectionsFromErrorNames(["Specialty ()"]), ["certification"], "empty-parens variant (blank template slot)");
   assert.deepStrictEqual(sectionsFromErrorNames(["Reading Proficiency"]), ["language"], "fieldMap labelRegex route");
-  assert.deepStrictEqual(sectionsFromErrorNames(["Field Of Study"]), ["education"], "camelCase field split to words");
+  if (PAGE_SECTIONS.some((s) => s.name === "education")) // registry-dependent (education TEMP-pulled for the generic-recon regression — self-heals on restore)
+    assert.deepStrictEqual(sectionsFromErrorNames(["Field Of Study"]), ["education"], "camelCase field split to words");
   assert.deepStrictEqual(sectionsFromErrorNames(["Job Title"]), ["workExperience"]);
   assert.deepStrictEqual(sectionsFromErrorNames(["Frobnicator"]), [], "unknown name anchors nothing");
   assert.deepStrictEqual(sectionsFromErrorNames([]), []);
@@ -3359,13 +3362,15 @@ test("sweep: a live value that MATCHES the profile's own value → already-fille
 });
 
 test("sweep: KNOWN sections — mapped-but-skipped field flips; an UNMAPPED section field with a value gets a NEW record; nested child fields excluded", async () => {
-  const results = [{ fieldName: "education[0].gradeAverage", label: "GPA", widgetType: "text", isRequired: false,
-    mappedPath: "education[0].gpa", rawValue: null, resolved: null,
+  // Uses the WEBSITE section (registry-independent of the education TEMP toggle): url is the mapped
+  // field (WEBSITE_MAP), "notes" the unmapped extra; cert's specialtyParent pins the nested exclusion.
+  const results = [{ fieldName: "website[0].url", label: "URL", widgetType: "text", isRequired: false,
+    mappedPath: "websites[0].url", rawValue: null, resolved: null,
     status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: "empty value" }];
   const rscan = { sections: {
-    "education-": { entries: [{ fields: [
-      { fieldName: "gradeAverage", label: "Overall Result (GPA)", widgetType: "text", isRequired: false, value: "3.9", wrapperSel: "G0" },
-      { fieldName: "honors", label: "Honors", widgetType: "text", isRequired: false, value: "Magna Cum Laude", wrapperSel: "H0" },
+    "webAddress-": { entries: [{ fields: [
+      { fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "https://k.example", wrapperSel: "U0" },
+      { fieldName: "notes", label: "Notes", widgetType: "text", isRequired: false, value: "portfolio site", wrapperSel: "N0" },
     ] }] },
     "certification-": { entries: [{ fields: [
       { fieldName: "specialtyParent", label: "Specialty", widgetType: "typeahead", isRequired: false, value: "Other", wrapperSel: "S0" },
@@ -3373,14 +3378,14 @@ test("sweep: KNOWN sections — mapped-but-skipped field flips; an UNMAPPED sect
   } };
   const act = { scanPage: async () => ({ fields: [] }), repeatingScan: async () => rscan };
   await sweepAlreadyFilled(act, results);
-  const gpa = results.find((r) => r.fieldName === "education[0].gradeAverage");
-  assert.strictEqual(gpa.status, "filled_review", "mapped-but-skipped section field with a live value → flipped");
-  assert.strictEqual(gpa.flag, "already-filled");
-  assert.strictEqual(gpa.after, "3.9");
-  const honors = results.find((r) => r.fieldName === "education[0].honors");
-  assert.ok(honors, "an unmapped KNOWN-section field with a value → NEW already-filled record (the 'not mapped' edge case)");
-  assert.strictEqual(honors.flag, "already-filled");
-  assert.strictEqual(honors.after, "Magna Cum Laude");
+  const url = results.find((r) => r.fieldName === "website[0].url");
+  assert.strictEqual(url.status, "filled_review", "mapped-but-skipped section field with a live value → flipped");
+  assert.strictEqual(url.flag, "already-filled");
+  assert.strictEqual(url.after, "https://k.example");
+  const notes = results.find((r) => r.fieldName === "website[0].notes");
+  assert.ok(notes, "an unmapped KNOWN-section field with a value → NEW already-filled record (the 'not mapped' edge case)");
+  assert.strictEqual(notes.flag, "already-filled");
+  assert.strictEqual(notes.after, "portfolio site");
   assert.ok(!results.some((r) => /specialtyParent/.test(r.fieldName)), "nested child fields (cert ▸ specialties) are EXCLUDED — reconciled + audited via their own records");
 });
 

@@ -2594,7 +2594,10 @@ const CERT_NESTED = {
 
 const PAGE_SECTIONS = [
   { name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-", itemsKey: "work_experience", fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false },
-  { name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education", fieldMap: EDUCATION_MAP, deleteOnNoMatch: false },
+  // ⚠ TEMP-REGRESSION (operator, 2026-07-02): Education pulled from the registry so the m3a/m3b
+  // GENERIC-section path recons it (already-filled surfacing / reveal-by-add / stub with real
+  // widgets) — it will NOT auto-fill while this line is commented. RESTORE after the live check.
+  // { name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education", fieldMap: EDUCATION_MAP, deleteOnNoMatch: false },
   { name: "certification", headingRegex: "certifications?", containerPrefix: "certification-", itemsKey: "certifications", fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true, nested: CERT_NESTED },
   { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
   { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
