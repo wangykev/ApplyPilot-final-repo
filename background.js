@@ -2425,7 +2425,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // upload empty blocks Save & Continue). NOTE: attachResume's attached:true is the engine's
   // claim; the FORM accepting it (Save & Continue advances) is the form's truth — the walk's
   // advance is the decisive proof, not this record.
-  const uploadRec = out.results.find((r) => r.widgetType === "file_upload");
+  // Exclude nested-attachment records (a cert's per-entry Attachments — its own in-section attach
+  // path): on a page with no top-level upload, the bare find() would grab a cert's record and
+  // patch the résumé onto the WRONG field.
+  const uploadRec = out.results.find((r) => r.widgetType === "file_upload" && r.flag !== "nested-attachment");
   if (uploadRec) {
     let resumeRec = null;
     try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
