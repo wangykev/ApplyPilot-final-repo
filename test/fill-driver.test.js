@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2845,6 +2845,39 @@ test("generic UNKNOWN section: empty OPTIONAL field stays empty (not flagged); e
   const bundle = buildReviewBundle(out.results, { page: "p2" });
   assert.strictEqual(bundle.entries.find((e) => e.canonical_field === "publication[0].note").needs_review, false, "empty optional NOT flagged (won't require approval)");
   assert.strictEqual(bundle.entries.find((e) => e.canonical_field === "publication[0].title").needs_review, true, "empty required flagged");
+});
+
+test("fillNestedSpecialtiesCdp: reconciles UP to N (mounts) + nested canonical records + skips absent dates", async () => {
+  // Fills a cert's Specialties: mount to N, fill each child's fields at the nested fkit selector. Here
+  // the typeahead can't open in the fake (→ its record is flagged, not asserted); the point is the
+  // reconcile + the nested canonical + date-skip. The AI typo-fix (otherrrr→Other) is live-verified.
+  let children = [], nextIdx = 5;
+  const scan = () => ({ parentOrder: { certification: [287] }, nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
+    entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: [] })) }] : [] });
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async () => { children.push(nextIdx++); return { ok: true }; },
+    clickNestedDelete: async (pf, base, idx) => { children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
+    // minimal typeahead seams → fillTypeaheadCdp returns cleanly (can't open) without throwing
+    openHier: async () => false, focusHierSearch: async () => false, readHier: async () => null,
+    readTreeCategories: async () => [], scrapeTaOptions: async () => ({ ok: false }), clearHierSearch: async () => {},
+    typeInHier: async () => {}, pressEnter: async () => {}, pressTab: async () => {}, isTreePicker: async () => false, readSource: async () => null,
+  };
+  const fieldMap = [
+    { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent" },
+    { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate" },
+    { field: "endDate", widget: "date", key: "endDateParsed", path: "endDate" },
+  ];
+  const recs = await fillNestedSpecialtiesCdp(act, { parentBase: "certification", pOrd: 0, pIdx: 287, childBase: "specialties",
+    headingStem: "specialt", fieldMap, items: [{ specialty: "otherrrr" }], budgets: T_BUDGETS });
+  assert.strictEqual(children.length, 1, "reconciled UP to N=1 (mounted one specialty)");
+  const sp = recs.find((r) => r.fieldName === "certification[0].specialties[0].specialtyParent");
+  assert.ok(sp && sp.widgetType === "typeahead", "specialtyParent record with the nested canonical");
+  assert.deepStrictEqual(sp.nested_parent, { base: "certification", index: 0 });
+  assert.strictEqual(sp.nested_child_base, "specialties");
+  assert.strictEqual(recs.find((r) => r.fieldName === "certification[0].specialties[0].startDate").status, "skipped", "no start date → skipped (never half-filled)");
+  assert.strictEqual(recs.find((r) => r.fieldName === "certification[0].specialties[0].endDate").status, "skipped", "no end date → skipped");
 });
 
 test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested config", () => {

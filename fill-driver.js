@@ -2565,11 +2565,20 @@ const WORK_EXPERIENCE_MAP = [
 // tier editor ("values to try"); a new tenant with a different nested section gets its own config.
 const CERT_NESTED = {
   subSections: [
-    { childBase: "specialties", heading: "Specialties", fields: [
-      { recName: "specialtyParent", widget_type: "typeahead", label: "Specialty", is_required: true },
-      { recName: "startDate", widget_type: "date", label: "Start Date", is_required: false, date_order: ["month", "day", "year"] },
-      { recName: "endDate", widget_type: "date", label: "End Date", is_required: false, date_order: ["month", "day", "year"] }
-    ] }
+    { childBase: "specialties", heading: "Specialties", headingStem: "specialt", itemsKey: "specialties",
+      // `fields` = the recon SHAPE (for the review stub/add-entry); `fieldMap` = the FILL map (profile →
+      // form) consumed by fillNestedSpecialtiesCdp. specialty → the specialtyParent typeahead (inline AI
+      // fixes a typo like "otherrrr" → "Other"); start/end dates are M/D/Y, SKIPPED when the profile omits them.
+      fields: [
+        { recName: "specialtyParent", widget_type: "typeahead", label: "Specialty", is_required: true },
+        { recName: "startDate", widget_type: "date", label: "Start Date", is_required: false, date_order: ["month", "day", "year"] },
+        { recName: "endDate", widget_type: "date", label: "End Date", is_required: false, date_order: ["month", "day", "year"] }
+      ],
+      fieldMap: [
+        { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent" },
+        { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate" },
+        { field: "endDate", widget: "date", key: "endDateParsed", path: "endDate" }
+      ] }
   ],
   attachments: true
 };
@@ -2735,6 +2744,87 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     }
     recs.push(rec);
     await act.delay(budgets.interFieldMs);
+  }
+  return recs;
+}
+
+// Fill ONE parent entry's NESTED repeating sub-section (cert ▸ Specialties) from the profile. Reconcile
+// the child entries to N (mount/delete via the scoped Milestone-A primitives), then fill each child's
+// mapped fields at "<parentBase>-<pIdx>--<childBase>-<cIdx>--<field>" — reusing resolve + the per-widget
+// CDP handlers (incl. the typeahead inline AI, so a typo like "otherrrr" → "Other"). pOrd = the parent's
+// DISPLAY ordinal (canonical records); pIdx = the parent's fkit index (DOM selectors). Records are
+// canonical "<parentBase>[<pOrd>].<childBase>[<j>].<path>" with nested_parent/nested_child_base so the
+// viewer groups them under the parent entry (summary.js nestedInfoOf / renderNestedSub).
+async function fillNestedSpecialtiesCdp(act, o) {
+  const { parentBase, pOrd, pIdx, childBase, headingStem, fieldMap, items, budgets, aiContext } = o;
+  const recs = [];
+  const N = Array.isArray(items) ? items.length : 0;
+  if (!N || !(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return recs;
+  const parentFkit = parentBase + "-" + pIdx + "--null";
+  const childIdxs = async () => { // sorted child fkit indices of THIS parent's childBase sub-section
+    let scan = null; try { scan = await act.nestedScan(); } catch (e) { return []; }
+    const out = [];
+    for (const ns of ((scan && scan.nestedSections) || [])) {
+      if (ns.parentBase !== parentBase || ns.childBase !== childBase) continue;
+      for (const ent of (ns.entries || [])) { const lv = ent.levels || []; if (lv.length >= 2 && String(lv[0].index) === String(pIdx)) out.push(lv[lv.length - 1].index); }
+    }
+    return out.sort((a, b) => a - b);
+  };
+  let cur = await childIdxs(), guard = 0;
+  while (cur.length < N && guard++ < N + 4) { // reconcile UP — mount specialties
+    const before = cur.length;
+    const add = await act.clickNestedAdd(parentFkit, headingStem);
+    if (!add || !add.ok) break;
+    const deadline = Date.now() + (budgets.entryReconcileCeilingMs || 4000);
+    while (Date.now() < deadline) { await act.delay(budgets.entryReconcileIntervalMs || 150); cur = await childIdxs(); if (cur.length > before) break; }
+    if (cur.length <= before) break; // mount didn't register — don't spin
+  }
+  guard = 0;
+  while (cur.length > N && guard++ < 12) { // reconcile DOWN — delete trailing extras
+    const before = cur.length;
+    const del = await act.clickNestedDelete(parentFkit, childBase, cur[cur.length - 1]);
+    if (!del || !del.ok) break;
+    const deadline = Date.now() + (budgets.entryReconcileCeilingMs || 4000);
+    while (Date.now() < deadline) { await act.delay(budgets.entryReconcileIntervalMs || 150); cur = await childIdxs(); if (cur.length < before) break; }
+    if (cur.length >= before) break;
+  }
+  for (let j = 0; j < Math.min(N, cur.length); j++) { // fill each child in order
+    const cIdx = cur[j], item = items[j] || {};
+    const canon = parentBase + "[" + pOrd + "]." + childBase + "[" + j + "].";
+    for (const f of fieldMap) {
+      const wrapperSel = '[data-fkit-id="' + parentBase + "-" + pIdx + "--" + childBase + "-" + cIdx + "--" + f.field + '"] [data-automation-id="formField-' + f.field + '"]';
+      const loc = { wrapperSel };
+      const rec = {
+        fieldName: canon + f.path, label: f.field, widgetType: f.widget === "year" ? "date" : f.widget,
+        isRequired: false, mappedPath: canon + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
+        resolved: null, status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+        auditLoc: wrapperSel, nested_parent: { base: parentBase, index: pOrd }, nested_child_base: childBase
+      };
+      try {
+        if (f.widget === "date" || f.widget === "year") {
+          const parsed = item[f.key];
+          if (!parsed) { rec.status = "skipped"; rec.detail = "no date"; }
+          else { rec.resolved = parsed; Object.assign(rec, await fillDateCompositeCdp(act, loc, parsed, budgets)); }
+        } else {
+          const r = resolve(item[f.key], f.widget);
+          if (r.skip) { rec.status = "skipped"; rec.detail = r.reason || "empty"; }
+          else {
+            const arg = r.value !== undefined ? r.value : r.candidates;
+            rec.resolved = arg;
+            if (f.widget === "typeahead") {
+              const cap = makeStartCapture(act, loc);
+              const aiForField = aiContext ? { profile: aiContext.profile, jobContext: aiContext.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: false } : undefined;
+              Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture: cap.onCapture, ai: aiForField }));
+              const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
+            } else if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
+            else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
+            else { rec.status = "skipped"; rec.detail = "no handler for " + f.widget; }
+          }
+        }
+      } catch (e) { rec.status = "error"; rec.detail = String(e); }
+      recs.push(rec);
+      await act.delay(budgets.interFieldMs);
+    }
   }
   return recs;
 }
@@ -2935,14 +3025,29 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
 
   for (const e of perEntry) results.push(...e.recs);
 
-  // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments) per SURVIVING entry. No scan —
-  // the shape is section.nested (a constant). A fully-deleted section carries them on its stub above.
+  // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments) per SURVIVING entry. The shape is
+  // section.nested (a constant). If the profile has items for a sub-section (e.g. certifications[i].
+  // specialties), FILL them (fillNestedSpecialtiesCdp — reconcile + fill via the typeahead inline AI);
+  // ALWAYS also emit the addable stub. A fully-deleted section carries the shape on its stub above.
   if (nested) {
-    for (const e of perEntry) {
-      if (e.wasDeleted) continue; // a deleted parent takes its sub-sections with it
-      const i = e.idx;
-      for (const childBase of Object.keys(nestedShapes)) {
-        results.push({
+    const survivors = perEntry.filter((e) => !e.wasDeleted);
+    let parentOrder = []; // surviving parent fkit indices (DOM order) → map the sj-th survivor to its fkit index
+    if (act.nestedScan && survivors.length) { try { const s = await act.nestedScan(); parentOrder = (s && s.parentOrder && s.parentOrder[name]) || []; } catch (e) { /* fill-back only needs it; stubs still emit */ } }
+    for (let sj = 0; sj < survivors.length; sj++) {
+      const i = survivors[sj].idx;                       // display ordinal (canonical + items index)
+      const pIdx = parentOrder[sj];                      // this parent's fkit index (DOM selectors)
+      const item = (items && items[i]) || {};
+      for (const ss of (nested.subSections || [])) {
+        const childBase = ss.childBase;
+        const childItems = (ss.itemsKey && Array.isArray(item[ss.itemsKey])) ? item[ss.itemsKey] : [];
+        if (childItems.length && pIdx != null && Array.isArray(ss.fieldMap) && act.clickNestedAdd) {
+          const filled = await fillNestedSpecialtiesCdp(act, {
+            parentBase: name, pOrd: i, pIdx, childBase, headingStem: ss.headingStem || childBase,
+            fieldMap: ss.fieldMap, items: childItems, budgets, aiContext: section.aiContext
+          });
+          results.push(...filled);
+        }
+        results.push({ // the addable stub (header + "+ Add") — always, so the operator can add more
           fieldName: name + "[" + i + "]." + childBase + "._stub", label: humanChild(childBase),
           widgetType: "nested_section_stub", isRequired: false, mappedPath: name + "[" + i + "]." + childBase + "._stub",
           rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
@@ -3711,5 +3816,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

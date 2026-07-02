@@ -636,7 +636,12 @@ function prepareProfile(profile) {
   }
   if (Array.isArray(profile.certifications)) {
     out.certifications = meaningfulEntries(profile.certifications, ["certification"]).map((e) => ({
-      ...e, issuedDateParsed: parseYearMonthDay(e.issued_date), expirationDateParsed: parseYearMonthDay(e.expiration_date)
+      ...e, issuedDateParsed: parseYearMonthDay(e.issued_date), expirationDateParsed: parseYearMonthDay(e.expiration_date),
+      // nested Specialties fill: parse each specialty's dates (the specialty value passes through). A
+      // specialty with no `specialty` value is dropped (nothing to fill the required specialtyParent with).
+      specialties: (Array.isArray(e.specialties) ? e.specialties : [])
+        .filter((s) => s && s.specialty != null && String(s.specialty).trim() !== "")
+        .map((s) => ({ ...s, startDateParsed: parseYearMonthDay(s.start_date), endDateParsed: parseYearMonthDay(s.end_date) }))
     }));
   }
   return out;
