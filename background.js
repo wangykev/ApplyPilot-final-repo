@@ -2376,6 +2376,22 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   for (const e of ((priorSum && priorSum.entries) || [])) {
     if (e && e.widget_type === "section_stub" && e.section_heading && typeof e.canonical_field === "string") headingToBase[e.section_heading] = e.canonical_field.replace(/\._stub$/, "");
   }
+  // act.attachStoredResume — the SW-built attach seam (I/O stays in the SW: read the résumé from
+  // IndexedDB, run the proven attachResume in-page scoped to sectionSel, under the input-lock's
+  // __apActing bump). Lets the fill attach files IN PAGE ORDER (the cert's Attachments fill inside
+  // the cert section — operator rule 2026-07-02) instead of an end-of-page post-pass.
+  if (!act.attachStoredResume) {
+    act.attachStoredResume = async (sectionSel) => {
+      let rec0 = null;
+      try { rec0 = await getResume(); } catch (e) { return { attached: false, detail: "resume store unavailable" }; }
+      if (!rec0 || !rec0.base64) return { attached: false, detail: "no resume stored (upload one in the popup)" };
+      const lockOn = !(opts && opts.skipLock);
+      if (lockOn) { try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* ignore */ } }
+      try { return (await cdpEval(attachResume, rec0.base64, rec0.filename || "resume.pdf", rec0.mime || "application/pdf", sectionSel || null)) || { attached: false, detail: "no result" }; }
+      catch (e) { return { attached: false, detail: String((e && e.message) || e) }; }
+      finally { if (lockOn) { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } } }
+    };
+  }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
 
   LOG("page:", out.url);
@@ -2442,34 +2458,8 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   }
 
-  // ── TEST-ONLY (attach_resume) — REMOVE with the profile test data ─────────────────────────────
-  // Attach the SAME stored résumé to a cert's Attachments field. DATA-DRIVEN, not a permanent tie:
-  // gated on profile certifications[i].attach_resume (test data). Remove that field ⇒ no attach — the
-  // résumé is NEVER hard-wired to cert attachments. Scoped to each such cert's "…--attachments" area.
-  try {
-    const certsWithAttach = (prepared.certifications || []).filter((c) => c && c.attach_resume).length;
-    if (certsWithAttach) {
-      let resumeRec = null; try { resumeRec = await getResume(); } catch (e) { /* none */ }
-      if (!resumeRec || !resumeRec.base64) { LOG("[TEST attach_resume] no résumé stored — skipped."); }
-      else {
-        const attFkids = (await cdpEval(() => Array.from(document.querySelectorAll('[data-fkit-id^="certification-"][data-fkit-id$="--attachments"]')).map((e) => e.getAttribute("data-fkit-id")))) || [];
-        const lockOn = !(opts && opts.skipLock);
-        for (let k = 0; k < Math.min(certsWithAttach, attFkids.length); k++) {
-          const sectionSel = '[data-fkit-id="' + attFkids[k] + '"]';
-          if (lockOn) { try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* ignore */ } }
-          let ar = null;
-          try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf", sectionSel); }
-          catch (e) { ar = { attached: false, detail: String((e && e.message) || e) }; }
-          finally { if (lockOn) { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } } }
-          LOG("[TEST attach_resume] " + attFkids[k] + ":", ar && ar.attached ? ("attached \"" + (ar.fileName || resumeRec.filename) + "\"") : ("FAILED — " + ((ar && ar.detail) || "no confirmation")));
-          if (ar && ar.attached) {
-            const rec = out.results.find((r) => r.flag === "nested-attachment" && r.fieldName === ("certification[" + k + "].attachments"));
-            if (rec) { rec.status = "filled"; rec.verified = true; rec.after = ar.fileName || resumeRec.filename || null; rec.detail = "TEST résumé attached (attach_resume — remove the profile flag to un-tie)"; }
-          }
-        }
-      }
-    }
-  } catch (e) { LOG("[TEST attach_resume] error:", String((e && e.message) || e)); }
+  // (The TEST attach_resume per-cert attach now happens IN SECTION ORDER inside the cert fill —
+  // driveRepeatingSectionCdp's nested-attachment emit via act.attachStoredResume — not here.)
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
   // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations

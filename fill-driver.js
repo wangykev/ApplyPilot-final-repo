@@ -2222,7 +2222,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   let rscan = null;
   try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
   if (!only && rscan && (rscan.sections || rscan.addButtons)) {
-    for (const sec of PAGE_SECTIONS) {
+    // FILL IN DOM ORDER (operator rule 2026-07-02): drive sections top-to-bottom as they appear on
+    // the PAGE (the human order), not registry order — detected from the scan, nothing hardcoded.
+    for (const sec of sectionsInDomOrder(PAGE_SECTIONS, rscan.addButtons)) {
       if (onlySec && !onlySec.has(sec.name)) continue; // Tier-1.5: only the error-named section(s)
       const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
       const re = new RegExp(sec.headingRegex, "i");
@@ -2795,7 +2797,29 @@ function todayYMD() {
 async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx) {
   const recs = [];
   const base = sectionName + "[" + idx + "].";
-  for (const f of fieldMap) {
+  // FILL IN DOM ORDER (operator rule 2026-07-02): iterate the ENTRY'S scanned fields top-to-bottom
+  // and fill each via its fieldMap entry — the human order the form lays out (Languages: language →
+  // "I am fluent" → the proficiencies), NOT config order. Map entries the scan didn't show (a
+  // remount-later field like WE endDate, a conditional) run AFTER, in config order — their
+  // waitForPresence/skipWhen semantics are unchanged (the per-field body below re-scans anyway).
+  // Detected from the live DOM each fill; a scan hiccup falls back to config order (today's
+  // behavior). NOTE the assumption a controlling checkbox precedes what it controls in the DOM
+  // (Workday lays "I currently work here" above the To date on every observed tenant) — the same
+  // top-to-bottom order a human fills in.
+  let orderedMap = fieldMap;
+  try {
+    const scan0 = await act.repeatingScan();
+    const ent0 = scan0 && scan0.sections && scan0.sections[prefix] && Array.isArray(scan0.sections[prefix].entries) ? scan0.sections[prefix].entries[idx] : null;
+    if (ent0 && Array.isArray(ent0.fields) && ent0.fields.length) {
+      const used = new Set(); const inDom = [];
+      for (const fd of ent0.fields) {
+        const fm = fieldMap.find((m) => !used.has(m) && (m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName));
+        if (fm) { used.add(fm); inDom.push(fm); }
+      }
+      if (inDom.length) orderedMap = inDom.concat(fieldMap.filter((m) => !used.has(m)));
+    }
+  } catch (e) { /* no scan → config order */ }
+  for (const f of orderedMap) {
     const recName = f.name || f.field;
     const findFd = (entry) => entry ? (f.labelRegex
       ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
@@ -3246,6 +3270,23 @@ async function reconPageTruth(act, results) {
   try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness — never abort */ }
 }
 
+// FILL IN DOM ORDER — order the section registry by each section's position ON THE PAGE. Every
+// repeating section's Add button sits AT the section ("Add" / "Add Another"), and the scan's
+// addButtons list is document-order — so the index of a section's (non-nested) Add button IS its
+// page position. A section with no matched Add keeps registry order, appended after the matched
+// ones (stable). Pure — unit-tested; nothing hardcoded (order comes from the live DOM each fill).
+function sectionsInDomOrder(sections, addButtons) {
+  const adds = Array.isArray(addButtons) ? addButtons : [];
+  const domIx = (sec) => {
+    const re = new RegExp(sec.headingRegex, "i");
+    const i = adds.findIndex((b) => b && !b.insideEntry && re.test((b.nearestHeading) || ""));
+    return i === -1 ? Infinity : i;
+  };
+  return sections.map((s, i) => ({ s, key: domIx(s), tie: i }))
+    .sort((a, b) => (a.key - b.key) || (a.tie - b.tie))
+    .map((x) => x.s);
+}
+
 async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
   const { name, headingRegex, containerPrefix, items, fieldMap, deleteOnNoMatch } = section;
@@ -3481,13 +3522,31 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
         });
       }
       if (nestedHasAttachments) {
-        results.push({
+        const attRec = {
           fieldName: name + "[" + i + "].attachments", label: "Attachments",
           widgetType: "file_upload", isRequired: false, mappedPath: name + "[" + i + "].attachments",
           rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
           flag: "nested-attachment", verified: null, after: null,
           detail: "per-entry attachments — upload on the form", nested_path: [{ base: name, index: i }]
-        });
+        };
+        // TEST-ONLY (attach_resume) — REMOVE with the profile test data. DATA-DRIVEN: the profile
+        // flag ties the stored résumé to THIS entry's Attachments, attached IN SECTION ORDER (the
+        // operator rule: attachments fill where they sit on the form — inside the cert entry, right
+        // after its Specialties — not in an end-of-page post-pass). Remove the flag ⇒ no attach.
+        // act.attachStoredResume is the SW-built seam (I/O stays in the SW; Node fakes lack it → skip).
+        if (item.attach_resume && act.attachStoredResume && pIdx != null) {
+          const sectionSel = '[data-fkit-id="' + name + "-" + pIdx + '--attachments"]';
+          let ar = null;
+          try { ar = await act.attachStoredResume(sectionSel); } catch (e) { ar = { attached: false, detail: String((e && e.message) || e) }; }
+          if (ar && ar.attached) {
+            attRec.status = "filled"; attRec.verified = true; attRec.after = ar.fileName || null;
+            attRec.detail = "TEST résumé attached in-section (attach_resume — remove the profile flag to un-tie)";
+          } else {
+            attRec.status = "needs_review";
+            attRec.detail = "attach_resume: attach failed — " + ((ar && ar.detail) || "no confirmation");
+          }
+        }
+        results.push(attRec);
       }
     }
   }
@@ -4272,5 +4331,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

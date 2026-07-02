@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2937,6 +2937,44 @@ test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested confi
   assert.strictEqual(PAGE_SECTIONS.filter((s) => s.nested).length, 1);
 });
 
+// ── FILL IN DOM ORDER (operator rule 2026-07-02) ────────────────────────────────────────────────
+test("sectionsInDomOrder: sections drive in PAGE order (Add-button document order), not registry order", () => {
+  const adds = [
+    { nearestHeading: "Specialties", insideEntry: true },  // a NESTED Add — ignored for ordering
+    { nearestHeading: "Languages", insideEntry: false },
+    { nearestHeading: "Certifications", insideEntry: false },
+    { nearestHeading: "Work Experience" },
+  ];
+  const ordered = sectionsInDomOrder(PAGE_SECTIONS, adds).map((s) => s.name);
+  assert.deepStrictEqual(ordered.slice(0, 3), ["language", "certification", "workExperience"], "DOM (Add-button) order wins");
+  assert.deepStrictEqual(ordered.slice(3), ["education", "website"], "unmatched sections keep registry order at the tail");
+  assert.deepStrictEqual(sectionsInDomOrder(PAGE_SECTIONS, []).map((s) => s.name), PAGE_SECTIONS.map((s) => s.name), "no Add buttons → registry order (today's behavior)");
+});
+
+test("cert attachment fills IN SECTION ORDER via act.attachStoredResume (TEST attach_resume, data-driven)", async () => {
+  // The résumé attaches DURING the cert section fill (right after its Specialties — the form's own
+  // order), scoped to THIS cert's attachments area via the runtime-scanned pIdx — not an
+  // end-of-page post-pass. No profile flag ⇒ the seam is never called (the un-tie guarantee).
+  const mkState = () => webState({ prefix: "certification-", nestedEnabled: true,
+    entries: [{ fkit: "certification-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] }] });
+  const sec = (items) => ({ name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items, fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }], deleteOnNoMatch: false, nested: CERT_NESTED });
+  const act = makeFakeRepeatAct(mkState());
+  const calls = [];
+  act.attachStoredResume = async (sel) => { calls.push(sel); return { attached: true, fileName: "resume.pdf" }; };
+  const out = await driveRepeatingSectionCdp(act, sec([{ url: "x", attach_resume: true }]), T_BUDGETS);
+  const att = out.results.find((r) => r.fieldName === "certification[0].attachments");
+  assert.strictEqual(att.status, "filled");
+  assert.strictEqual(att.after, "resume.pdf");
+  assert.deepStrictEqual(calls, ['[data-fkit-id="certification-700--attachments"]'], "scoped to THIS cert's attachments area (runtime pIdx)");
+  const act2 = makeFakeRepeatAct(mkState());
+  const calls2 = [];
+  act2.attachStoredResume = async (sel) => { calls2.push(sel); return { attached: true }; };
+  const out2 = await driveRepeatingSectionCdp(act2, sec([{ url: "x" }]), T_BUDGETS);
+  assert.deepStrictEqual(calls2, [], "no attach_resume flag → the seam is NEVER called");
+  assert.strictEqual(out2.results.find((r) => r.fieldName === "certification[0].attachments").status, "skipped", "stub unchanged");
+});
+
 test("fillNestedSpecialtiesCdp: N=0 reconciles DOWN — orphan empty specialty rows DELETED (they'd block Save & Continue)", async () => {
   // The 2026-07-01 live halt: recon-mounted EMPTY specialties + a profile with no specialties →
   // the old `!N` early-return never deleted them → "The field Specialty is required" blocked the
@@ -3993,6 +4031,32 @@ test("languages: Chinese per-skill → distinct proficiencies + 'I am fluent' le
   assert.strictEqual(nativeOf(state.entries[0]), false); // _allFluent:false → reconciled to unchecked
 });
 
+test("fillEntryCdp fills in the ENTRY'S DOM order — the fluent checkbox actuates at its page position (second)", async () => {
+  // Magna lays Languages out as: Language → "I am fluent" → the proficiencies. The fill follows the
+  // FORM's order (detected from the entry scan each fill), not LANGUAGE_MAP config order (checkbox
+  // last). Outcomes are unchanged — only the actuation order moves.
+  const fkit = "language-6--null";
+  const domEntry = { fkit, fields: [
+    { fieldName: "language", label: "Language*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: LANG_OPTS },
+    { fieldName: "native", label: "I am fluent in this language.", widgetType: "checkbox", isRequired: false, inputId: fkit + "-native", checked: false },
+    { fieldName: "5aaaedREAD", label: "Reading Proficiency*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: PROF_OPTS },
+    { fieldName: "5aaaedSPEAK", label: "Speaking Proficiency*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: PROF_OPTS },
+    { fieldName: "5aaaedWRITE", label: "Writing Proficiency*", widgetType: "dropdown", isRequired: true, triggerText: "Select One", options: PROF_OPTS },
+  ] };
+  const state = { prefix: "language-", addable: true, deletable: true, newEntry: (i) => langEntry("language-new" + i), entries: [domEntry] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "language", headingRegex: "languages?", containerPrefix: "language-",
+    items: [EN], fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true
+  }, T_BUDGETS);
+  const iCheck = act.log.findIndex((l) => l[0] === "clickCheckboxLabel");
+  const iRead = act.log.findIndex((l) => l[0] === "openDropdown" && /5aaaedREAD/.test(String(l[1])));
+  assert.ok(iCheck !== -1 && iRead !== -1, "both the checkbox and the reading dropdown actuated");
+  assert.ok(iCheck < iRead, "the fluent checkbox filled at its DOM position (before the proficiencies)");
+  assert.strictEqual(out.needsReview.length, 0, "outcomes unchanged — only the order moved");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "language[0].native").status, "filled");
+});
+
 test("languages: ENTRY-SCOPED resolve with DUPLICATE hashed ids — entries get their OWN values (not crossed)", async () => {
   const e6 = langEntry("language-6--null"); // both share fieldName "5aaaedREAD" etc. — fkit differs
   const e7 = langEntry("language-7--null");
@@ -4089,10 +4153,12 @@ test("M37 WE: currently_work_here=true → endDate SKIPPED (skipWhen), checkbox 
 
 test("M37 WE: endDate REMOUNTS (absent then present) — waitForPresence POLLS until present (vs error without it)", async () => {
   const mk = () => weState([{ fkit: "workExperience-0--null", fields: [
-    { fieldName: "endDate", label: "To", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } }, appearsAtScan: 3 }
+    // appearsAtScan 4: reconcile scan (1) + the DOM-ORDER pre-scan (2) + the first scanFd (3, absent)
+    // → present on the poll's re-scan (4). Models the remount landing AFTER the first lookup.
+    { fieldName: "endDate", label: "To", widgetType: "date", segments: { Month: { value: "" }, Year: { value: "" } }, appearsAtScan: 4 }
   ] }]);
   const item = { toParsed: { year: "2022", month: "06" } };
-  // WITHOUT waitForPresence: the first scanFd (scan 2) misses the not-yet-remounted endDate → error.
+  // WITHOUT waitForPresence: the first scanFd misses the not-yet-remounted endDate → error.
   const noWait = await driveRepeatingSectionCdp(makeFakeRepeatAct(mk()), {
     name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
     items: [item], fieldMap: [{ field: "endDate", widget: "date", key: "toParsed", path: "to" }], deleteOnNoMatch: false
