@@ -2588,8 +2588,9 @@ const CERT_NESTED = {
       ],
       fieldMap: [
         { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent" },
-        { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate" },
-        { field: "endDate", widget: "date", key: "endDateParsed", path: "endDate" }
+        // date_order → the record → the summary's SEGMENTED MM/DD/YYYY editor (not a text box)
+        { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate", date_order: ["month", "day", "year"] },
+        { field: "endDate", widget: "date", key: "endDateParsed", path: "endDate", date_order: ["month", "day", "year"] }
       ] }
   ],
   attachments: true
@@ -2826,6 +2827,7 @@ async function fillNestedSpecialtiesCdp(act, o) {
         fieldName: canon + f.path, label: f.field, widgetType: f.widget === "year" ? "date" : f.widget,
         isRequired: false, mappedPath: canon + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
         resolved: null, status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+        date_order: f.date_order || null, // → the summary's segmented date editor (bundle passes it through)
         auditLoc: wrapperSel, nested_parent: { base: parentBase, index: pOrd }, nested_child_base: childBase
       };
       try {
@@ -2850,6 +2852,37 @@ async function fillNestedSpecialtiesCdp(act, o) {
           }
         }
       } catch (e) { rec.status = "error"; rec.detail = String(e); }
+      // A SKIPPED nested field (no profile value) may still HOLD a value — operator-typed or
+      // pre-filled — and the review must inventory it (the already-filled convention). The
+      // page-wide sweep EXCLUDES nested fields, so the read lives here, on the probed selector.
+      // Read-only; a read failure keeps the honest skip.
+      if (rec.status === "skipped") {
+        try {
+          let live = null;
+          if (f.widget === "date" || f.widget === "year") {
+            const parts = [];
+            for (const seg of ["Month", "Day", "Year"]) {
+              const r = act.readDateSegment ? await act.readDateSegment(loc, seg) : null;
+              if (r && r.value != null && String(r.value).trim() !== "" && !isNaN(parseInt(r.value, 10))) parts.push(String(r.value));
+            }
+            live = parts.length ? parts.join("/") : null;
+          } else if (f.widget === "typeahead") {
+            const h = act.readHier ? await act.readHier(loc) : null;
+            live = h && h.chips && h.chips.length ? h.chips.join("; ") : null;
+          } else if (f.widget === "dropdown") {
+            const d = act.readDropdownState ? await act.readDropdownState(loc) : null;
+            live = d ? d.triggerText : null;
+          } else if (act.readTextValue) {
+            const t = await act.readTextValue(loc);
+            live = t ? t.value : null;
+          }
+          if (hasLiveValue(live)) {
+            rec.status = "filled_review"; rec.flag = "already-filled";
+            rec.after = String(live); rec.verified = null;
+            rec.detail = "already on the form — NOT filled by ApplyPilot; verify";
+          }
+        } catch (e) { /* keep the skip */ }
+      }
       recs.push(rec);
       await act.delay(budgets.interFieldMs);
     }

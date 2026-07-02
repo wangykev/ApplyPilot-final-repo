@@ -2982,6 +2982,49 @@ test("fillNestedSpecialtiesCdp: PROBES the wrapper selector (act.nestedFieldSel)
   assert.strictEqual(ed.status, "filled", "endDate FILLED too");
 });
 
+test("fillNestedSpecialtiesCdp: a manually-filled date the profile omits → surfaced already-filled + segmented date_order", async () => {
+  // The operator's live case: profile has ONLY a start date; they typed the END date on the form
+  // themselves. The end date must SHOW in review (already-filled, flagged) and BOTH date rows must
+  // carry date_order so the summary renders the segmented MM/DD/YYYY editor, not a text box.
+  const children = [7];
+  const scan = () => ({ parentOrder: { certification: [172] }, nestedSections: [{ parentBase: "certification", childBase: "specialties",
+    entries: children.map((ci) => ({ levels: [{ base: "certification", index: 172 }, { base: "specialties", index: ci }], fields: [] })) }] });
+  const probed = (fkit, field) => '[data-automation-id="formField-' + field + '"]:has([id="' + fkit + '"])';
+  const segs = {}; let focusedSeg = null;
+  // pre-seed the OPERATOR's manual end date on the form
+  segs[probed("certification-172--specialties-7--endDate", "endDate") + "|Month"] = "6";
+  segs[probed("certification-172--specialties-7--endDate", "endDate") + "|Day"] = "15";
+  segs[probed("certification-172--specialties-7--endDate", "endDate") + "|Year"] = "2025";
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async () => ({ ok: false }), clickNestedDelete: async () => ({ ok: false }),
+    nestedFieldSel: async (fkit, field) => probed(fkit, field),
+    openHier: async () => false, focusHierSearch: async () => false, readHier: async () => null,
+    readTreeCategories: async () => [], scrapeTaOptions: async () => ({ ok: false }), clearHierSearch: async () => {},
+    typeInHier: async () => {}, pressEnter: async () => {}, pressTab: async () => {}, isTreePicker: async () => false, readSource: async () => null,
+    focusDateSegment: async (loc, seg) => { focusedSeg = loc.wrapperSel + "|" + seg; return "triple-click-display"; },
+    readDateSegment: async (loc, seg) => ({ value: segs[loc.wrapperSel + "|" + seg] || "", focused: focusedSeg === loc.wrapperSel + "|" + seg }),
+    typeDigits: async (t) => { if (focusedSeg) segs[focusedSeg] = String(t); },
+    typeText: async (t) => { if (focusedSeg) segs[focusedSeg] = String(t); },
+  };
+  const recs = await fillNestedSpecialtiesCdp(act, { parentBase: "certification", pOrd: 0, pIdx: 172, childBase: "specialties",
+    headingStem: "specialt", fieldMap: CERT_NESTED.subSections[0].fieldMap, // the REAL config → its date_order flows
+    items: [{ specialty: "otherrrr", startDateParsed: { year: "2024", month: "02", day: "01" } }], budgets: T_BUDGETS });
+  const ed = recs.find((r) => r.fieldName === "certification[0].specialties[0].endDate");
+  assert.strictEqual(ed.status, "filled_review", "the manual end date SURFACES in review");
+  assert.strictEqual(ed.flag, "already-filled");
+  assert.strictEqual(ed.after, "6/15/2025");
+  assert.deepStrictEqual(ed.date_order, ["month", "day", "year"]);
+  const sd = recs.find((r) => r.fieldName === "certification[0].specialties[0].startDate");
+  assert.strictEqual(sd.status, "filled", "the profile start date still fills");
+  assert.deepStrictEqual(sd.date_order, ["month", "day", "year"], "filled date rows render segmented too");
+  const be = buildReviewBundle(recs, { page: "p2" }).entries.find((e) => e.canonical_field === "certification[0].specialties[0].endDate");
+  assert.deepStrictEqual(be.date_order, ["month", "day", "year"], "date_order survives into the bundle");
+  assert.strictEqual(be.needs_review, true, "flagged — the bot didn't fill it");
+  assert.strictEqual(be.current_value, "6/15/2025");
+});
+
 test("fillNestedSpecialtiesCdp: probe resolves NOTHING → honest error record, ZERO blind actuation", async () => {
   const scan = () => ({ parentOrder: { certification: [172] }, nestedSections: [{ parentBase: "certification", childBase: "specialties",
     entries: [{ levels: [{ base: "certification", index: 172 }, { base: "specialties", index: 3 }], fields: [] }] }] });
