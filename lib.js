@@ -340,6 +340,32 @@ function mappedFieldsFromErrors(errorTexts, scanFields, fieldMap) {
   return [...out];
 }
 
+// AI-4 error-sample PREPROCESS (the 2026-07-01 live Tier-0 miss): Workday's top error-summary
+// banner CONCATENATES every error into ONE element ("Error-SpecialtyThe field Specialty is
+// required…Error-LanguageDuplicate language entries are not allowed."), and the M31 diagnostic
+// read truncated each sample — so any error past the first ~2 was INVISIBLE to the remediation
+// tiers (the dup-language hardcode never fired on a banner that plainly contained its error).
+// Split each sample on the per-error "Error-" prefix into individual error texts; drop success
+// toasts (the [role=alert] selector catches "…successfully uploaded" — not errors, just noise
+// in the count/AI prompt); dedupe. Feed THIS to the tiers, never the raw samples.
+function expandErrorSamples(samples) {
+  const out = [];
+  const seen = new Set();
+  for (const s of (Array.isArray(samples) ? samples : [])) {
+    const t = String(s == null ? "" : s).trim();
+    if (!t) continue;
+    for (const piece of t.split(/(?=\bError-)/)) {
+      const p = piece.trim();
+      if (!p) continue;
+      if (/successfully uploaded/i.test(p) && !/\berror\b/i.test(p)) continue; // success toast, not an error
+      if (seen.has(p)) continue;
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
 // AI-4 Tier-0 trigger: the known Magna/Workday phantom "Duplicate language entries are not allowed"
 // bug. Scoped to LANGUAGES only (operator-confirmed) — other sections' duplicate errors may be real.
 function isDuplicateLanguageError(errorTexts) {
@@ -384,5 +410,5 @@ function languageDeletionPlan(entries) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
 }

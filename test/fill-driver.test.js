@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2492,7 +2492,7 @@ function makeFakeRepeatAct(state) {
   // name → surviving parent fkit indices (one per entry, idx = 700+ordinal); children tracked in _nkids
   // keyed by that fkit index. Off ⇒ nestedScan returns empty ⇒ the wire's pIdx is null ⇒ no fill call
   // (every existing nested test — stub-only emit — byte-identical).
-  let _nkids = {}, _nnext = 900;
+  let _nkids = state.nestedKids ? Object.assign({}, state.nestedKids) : {}, _nnext = 900; // nestedKids = PRE-SEEDED orphan children ({ pIdx: [childIdx…] })
   const _secName = state.prefix ? state.prefix.replace(/-$/, "") : "certification";
   return {
     log,
@@ -2935,6 +2935,73 @@ test("fillNestedSpecialtiesCdp: reconciles UP to N (mounts) + nested canonical r
 test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested config", () => {
   assert.strictEqual(PAGE_SECTIONS.find((s) => s.name === "certification").nested, CERT_NESTED);
   assert.strictEqual(PAGE_SECTIONS.filter((s) => s.nested).length, 1);
+});
+
+test("fillNestedSpecialtiesCdp: N=0 reconciles DOWN — orphan empty specialty rows DELETED (they'd block Save & Continue)", async () => {
+  // The 2026-07-01 live halt: recon-mounted EMPTY specialties + a profile with no specialties →
+  // the old `!N` early-return never deleted them → "The field Specialty is required" blocked the
+  // walk. N=0 must now reconcile down to 0 (same reconcile-to-exactly-N semantics as M21 top-level).
+  let children = [5, 9];
+  const scan = () => ({ parentOrder: { certification: [287] }, nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
+    entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: [] })) }] : [] });
+  const deletes = [];
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async () => { throw new Error("must NOT add at N=0"); },
+    clickNestedDelete: async (pf, base, idx) => { deletes.push(idx); children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; },
+  };
+  const recs = await fillNestedSpecialtiesCdp(act, { parentBase: "certification", pOrd: 0, pIdx: 287, childBase: "specialties",
+    headingStem: "specialt", fieldMap: CERT_NESTED.subSections[0].fieldMap, items: [], budgets: T_BUDGETS });
+  assert.strictEqual(children.length, 0, "reconciled DOWN to N=0 (orphans deleted)");
+  assert.deepStrictEqual(deletes, [9, 5], "trailing-first (highest child index deleted first)");
+  assert.deepStrictEqual(recs, [], "no fill records at N=0");
+});
+
+test("driveRepeatingSectionCdp wire: cert with NO profile specialties DELETES pre-existing orphan specialty rows", async () => {
+  const entry = { fkit: "certification-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] };
+  const state = webState({ prefix: "certification-", entries: [entry], nestedEnabled: true, nestedKids: { 700: [900, 901] } });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ url: "x" }], fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }],
+    deleteOnNoMatch: false, nested: CERT_NESTED
+  }, T_BUDGETS);
+  const after = await act.nestedScan();
+  assert.strictEqual((after.nestedSections || []).length, 0, "orphan specialties deleted (nested reconcile to 0)");
+  assert.strictEqual(act.log.filter((l) => l[0] === "clickNestedDelete").length, 2, "both orphans deleted");
+  assert.ok(out.results.some((r) => r.fieldName === "certification[0].specialties._stub"), "the addable stub still emits");
+});
+
+// ── AI-4 Tier-1.5 — section re-fill for section-named errors (drivePageFill onlySections) ────────
+test("AI-4 sectionsFromErrorNames: nested 'Specialty' → certification; label/regex/camelCase routes; unknown → none", () => {
+  assert.deepStrictEqual(sectionsFromErrorNames(["Specialty"]), ["certification"], "nested sub-section field label (the live miss)");
+  assert.deepStrictEqual(sectionsFromErrorNames(["Specialty ()"]), ["certification"], "empty-parens variant (blank template slot)");
+  assert.deepStrictEqual(sectionsFromErrorNames(["Reading Proficiency"]), ["language"], "fieldMap labelRegex route");
+  assert.deepStrictEqual(sectionsFromErrorNames(["Field Of Study"]), ["education"], "camelCase field split to words");
+  assert.deepStrictEqual(sectionsFromErrorNames(["Job Title"]), ["workExperience"]);
+  assert.deepStrictEqual(sectionsFromErrorNames(["Frobnicator"]), [], "unknown name anchors nothing");
+  assert.deepStrictEqual(sectionsFromErrorNames([]), []);
+  assert.deepStrictEqual(sectionsFromErrorNames([null, "ab"]), [], "null / too-short names never anchor a section re-run");
+});
+
+test("drivePageFill onlySections (AI-4 Tier-1.5): drives ONLY the named section — flat fields untouched", async () => {
+  const flat = { fieldName: "firstName", label: "First Name", widgetType: "text", isRequired: true, wrapperSel: "F0", value: "" };
+  const state = webState({ entries: [webEntry("webAddress-4--null", "")], flatFields: [flat] });
+  const act = makeFakeRepeatAct(state);
+  const out = await drivePageFill(act, { websites: [{ url: "https://a.example" }] }, {}, {}, T_BUDGETS, { onlySections: new Set(["website"]) });
+  const url = out.results.find((r) => r.fieldName === "website[0].url");
+  assert.ok(url && url.status === "filled", "the named section re-filled");
+  assert.ok(!out.results.some((r) => r.fieldName === "firstName"), "flat fields skipped entirely (no flat records)");
+  assert.ok(!act.log.some((l) => l[0] === "focusText" && l[1] === "F0"), "zero actuation on flat fields");
+});
+
+test("drivePageFill onlySections: a PRESENT section NOT named is untouched (zero actuation)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-4--null", "")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await drivePageFill(act, { websites: [{ url: "https://a.example" }] }, {}, {}, T_BUDGETS, { onlySections: new Set(["language"]) });
+  assert.strictEqual(out.results.length, 0, "nothing driven (websites present but not named)");
+  assert.ok(!act.log.some((l) => l[0] === "focusText"), "zero actuation on the un-named section");
 });
 
 test("fillNestedSpecialtiesCdp: PROBES the wrapper selector (act.nestedFieldSel) + fills dates from parsed profile values", async () => {
@@ -4124,7 +4191,36 @@ test("M40 audit: a clean drivePageFill run gets NO audit-* flags (no false flags
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan } = require("../lib.js");
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, expandErrorSamples } = require("../lib.js");
+
+// ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
+test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
+  const banner = "Error-SpecialtyThe field Specialty is required and must have a value.Error-LanguageDuplicate language entries are not allowed.";
+  assert.deepStrictEqual(expandErrorSamples([banner]), [
+    "Error-SpecialtyThe field Specialty is required and must have a value.",
+    "Error-LanguageDuplicate language entries are not allowed."
+  ]);
+});
+
+test("AI-4 expandErrorSamples: Tier-0 regression — dup-language DETECTED in a banner the old 120-char slice hid it in", () => {
+  // Live 2026-07-01: TWO specialty errors sat ahead of the language error in the one-element
+  // banner, pushing "Duplicate language…" past the old 120-char sample cut → Tier 0 never fired.
+  const banner = "Error-SpecialtyThe field Specialty () is required and must have a value.Error-SpecialtyThe field Specialty is required and must have a value.Error-LanguageDuplicate language entries are not allowed.";
+  assert.strictEqual(isDuplicateLanguageError([banner.slice(0, 120)]), false, "the OLD truncated sample hid the dup-language error");
+  assert.strictEqual(isDuplicateLanguageError(expandErrorSamples([banner])), true, "the expanded pieces expose it");
+  const named = expandErrorSamples([banner]).map(parseErrorFieldName).filter(Boolean);
+  assert.deepStrictEqual(named, ["Specialty ()", "Specialty"], "each split piece parses its own field name");
+});
+
+test("AI-4 expandErrorSamples: success toasts dropped, plain texts pass through, dedupe, empties skipped", () => {
+  assert.deepStrictEqual(expandErrorSamples([
+    "Kevin's Resume 2.pdf successfully uploaded",
+    "Kevin's Resume 2.pdf successfully uploaded",
+    "Some plain validation text",
+    "Some plain validation text",
+    "", null
+  ]), ["Some plain validation text"]);
+});
 const llmAct = (text) => ({ llm: async () => (text === undefined ? { ok: false, error: "no reply" } : (typeof text === "string" ? { ok: true, text } : text)) });
 
 test("AI-4 parseErrorFieldName: Magna '<…>' bracket form", () => {
