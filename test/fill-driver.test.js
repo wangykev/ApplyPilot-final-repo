@@ -2936,6 +2936,73 @@ test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested confi
   assert.strictEqual(PAGE_SECTIONS.filter((s) => s.nested).length, 1);
 });
 
+test("fillNestedSpecialtiesCdp: PROBES the wrapper selector (act.nestedFieldSel) + fills dates from parsed profile values", async () => {
+  // The composed descendant selector failed LIVE on Magna ("typeahead wrapper not found" — the fkit node
+  // does not wrap the formField), so the fill now PROBES the real relationship via the substrate. Here
+  // the probe returns a :has()-shaped selector and the date seams are keyed on it — proving the probed
+  // selector (not the legacy compose) is what drives the fill AND lands in auditLoc for the M40 audit.
+  const children = [7];
+  const scan = () => ({ parentOrder: { certification: [172] }, nestedSections: [{ parentBase: "certification", childBase: "specialties",
+    entries: children.map((ci) => ({ levels: [{ base: "certification", index: 172 }, { base: "specialties", index: ci }], fields: [] })) }] });
+  const probed = (fkit, field) => '[data-automation-id="formField-' + field + '"]:has([id="' + fkit + '"])';
+  const segStore = {}; let focusedSeg = null;
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async () => ({ ok: false }), clickNestedDelete: async () => ({ ok: false }),
+    nestedFieldSel: async (fkit, field) => probed(fkit, field),
+    // typeahead seams (specialtyParent can't open in the fake → flagged; not this test's point)
+    openHier: async () => false, focusHierSearch: async () => false, readHier: async () => null,
+    readTreeCategories: async () => [], scrapeTaOptions: async () => ({ ok: false }), clearHierSearch: async () => {},
+    typeInHier: async () => {}, pressEnter: async () => {}, pressTab: async () => {}, isTreePicker: async () => false, readSource: async () => null,
+    // date seams — keyed by the PROBED selector
+    focusDateSegment: async (loc, seg) => { focusedSeg = loc.wrapperSel + "|" + seg; return "triple-click-display"; },
+    readDateSegment: async (loc, seg) => ({ value: segStore[loc.wrapperSel + "|" + seg] || "", focused: focusedSeg === loc.wrapperSel + "|" + seg }),
+    typeDigits: async (text) => { if (focusedSeg) segStore[focusedSeg] = String(text); },
+    typeText: async (text) => { if (focusedSeg) segStore[focusedSeg] = String(text); },
+  };
+  const fieldMap = [
+    { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent" },
+    { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate" },
+    { field: "endDate", widget: "date", key: "endDateParsed", path: "endDate" },
+  ];
+  const recs = await fillNestedSpecialtiesCdp(act, { parentBase: "certification", pOrd: 0, pIdx: 172, childBase: "specialties",
+    headingStem: "specialt", fieldMap,
+    items: [{ specialty: "otherrrr", startDateParsed: { year: "2024", month: "02", day: "01" }, endDateParsed: { year: "2025", month: "08", day: "15" } }],
+    budgets: T_BUDGETS });
+  const sp = recs.find((r) => r.fieldName === "certification[0].specialties[0].specialtyParent");
+  assert.strictEqual(sp.auditLoc, probed("certification-172--specialties-7--specialtyParent", "specialtyParent"),
+    "the PROBED selector (not the composed descendant) is the loc + auditLoc");
+  const sd = recs.find((r) => r.fieldName === "certification[0].specialties[0].startDate");
+  assert.strictEqual(sd.status, "filled", "startDate FILLED from the parsed profile date");
+  assert.strictEqual(parseInt(segStore[probed("certification-172--specialties-7--startDate", "startDate") + "|Month"], 10), 2, "Month typed at the probed selector");
+  assert.strictEqual(parseInt(segStore[probed("certification-172--specialties-7--startDate", "startDate") + "|Year"], 10), 2024, "Year typed");
+  const ed = recs.find((r) => r.fieldName === "certification[0].specialties[0].endDate");
+  assert.strictEqual(ed.status, "filled", "endDate FILLED too");
+});
+
+test("fillNestedSpecialtiesCdp: probe resolves NOTHING → honest error record, ZERO blind actuation", async () => {
+  const scan = () => ({ parentOrder: { certification: [172] }, nestedSections: [{ parentBase: "certification", childBase: "specialties",
+    entries: [{ levels: [{ base: "certification", index: 172 }, { base: "specialties", index: 3 }], fields: [] }] }] });
+  const touched = [];
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async () => ({ ok: false }), clickNestedDelete: async () => ({ ok: false }),
+    nestedFieldSel: async () => null, // the tenant has NO resolvable relation — never actuate blind
+    openHier: async () => { touched.push("openHier"); return false; },
+    focusDateSegment: async () => { touched.push("focusDateSegment"); return null; },
+  };
+  const recs = await fillNestedSpecialtiesCdp(act, { parentBase: "certification", pOrd: 0, pIdx: 172, childBase: "specialties",
+    headingStem: "specialt", fieldMap: [
+      { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent" },
+      { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate" },
+    ],
+    items: [{ specialty: "x", startDateParsed: { year: "2024" } }], budgets: T_BUDGETS });
+  assert.ok(recs.every((r) => r.status === "error" && /wrapper not found/.test(r.detail)), "every field an HONEST error");
+  assert.deepStrictEqual(touched, [], "no handler ever actuated on an unresolved wrapper");
+});
+
 test("audit: 'already-filled' surfaced records are NOT audited (the fluent-checkbox uncheck bug)", () => {
   // The M40 audit is the LAST thing on the page. An "already-filled" record (unknown-section existing
   // entry, surfaced read-only) must be SKIPPED — auditing a checkbox whose expected is "Yes" vs a

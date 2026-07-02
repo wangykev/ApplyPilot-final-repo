@@ -1917,3 +1917,36 @@ This is a **TRANSIENT retry-later** state (like the 2026-06-27 planned-maintenan
 
 **Gap (why the operator saw "some random error"):** `isWorkdayMaintenance` is wired ONLY into the WALK transition — `cdpWaitNextPage` / `runCdpWalk` (background.js ~4047/4118) — so it catches maintenance that appears *mid-walk*. It is NOT checked at the **START** of `runCdpFillPage` / `runCdpWalk` / the single-widget + section harnesses. So STARTING a fill on an already-maintenance page (0 form fields) runs the fill logic against an empty page → downstream errors instead of a clean halt.
 **TODO (future handler):** at the start of every CDP entry point (`runCdpFillPage`, `runCdpWalk`, the section/single-widget harnesses), read the identity/session state ONCE (`cdpReadSessionState`) and, if `isWorkdayMaintenance(state)`, **HALT immediately with a clear "Workday is under maintenance — retry later" status (zero actuation)** — the same treatment the walk already gives a mid-transition maintenance page. (Also consider: the recon is read-only and already surfaces this; the fill path just needs the same up-front gate before it touches the DOM.)
+
+## 2026-07-01 — Magna wd3: nested specialty fkit node does NOT wrap the formField (the fill's selector fix)
+
+The first live run of the nested Specialties fill errored `"typeahead wrapper not found"` on
+`certification[0].specialties[0].specialtyParent`. The scan HAD found the child (fkit nodes
+`certification-<N>--specialties-<M>--<field>` exist — reconcile ran), so the failure isolates to the
+composed selector `[data-fkit-id="…--specialtyParent"] [data-automation-id="formField-specialtyParent"]`:
+**the fkit node is NOT an ancestor of the formField node on nested specialty fields** (unlike the top-level
+`--null` entry containers, which DO wrap their formFields — the WE/Education/Languages composed-selector
+pattern doesn't transfer). Operator devtools facts: the specialty widget is a Workday multiselect typeahead
+carrying **`data-uxi-widget-type="selectinput"`** (no `multiselect` marker node), and the search input's
+**`id` IS the fkit string** (`certification-172--specialties-{n}--specialtyParent`).
+
+- **Fix — probe the relationship, don't assume it** (`cdpNestedFieldSel`, cdp.js + `act.nestedFieldSel`;
+  `fillNestedSpecialtiesCdp` consumes it): at fill time, resolve the fkit node and return whichever SINGLE
+  suffix-composable selector actually works — fkit-wraps-formField → the classic descendant compose; same
+  node → the fkit selector alone; fkit INSIDE the formField (e.g. on the input) → `formField:has(fkit)`;
+  no `data-fkit-id` at all → key on the element **id** carrying the fkit string (`formField:has([id=…])`).
+  Null → an honest per-field `error` record, zero blind actuation (unit-pinned). NO comma-list selectors —
+  the substrate string-appends suffixes (`loc.wrapperSel + ' input…'`), so a selector list would bind the
+  suffix to only the last alternative.
+- **Portability rules held:** every fkit string is composed from runtime-scanned indices (`parentOrder`,
+  the nested-scan child enumeration) — audit confirmed zero hardcoded numeric fkit ids / element ids /
+  GUIDs in shipping code (Workday's `-<N>--` counters are per-application random).
+- **`cdpGenericNestedScan` classify + wrapperSel fixed in lockstep:** the scan's field `wrapperSel` now
+  records via the same relationship ladder (it previously composed the blind descendant selector), and its
+  typeahead rung now also matches `selectinput` (self-or-descendant) — a selectinput-only nested typeahead
+  no longer misclassifies as text/unknown.
+- **`cdpNestedDeleteRect` hardened for tenant variance:** the Delete finder now matches text
+  "Delete"/"Remove", aria-label/title/automation-id variants, AND **icon-only trash buttons**
+  (`svg[class*="trash"]`, e.g. `wd-icon-trash`) — the ancestor-scoping guard (never spanning the parent's
+  own fields) is what keeps an icon-only match safe. Top-level `cdpDeleteEntryRect` (panel-header text
+  "Delete") left as-is — live-proven on Magna/LiveRamp.

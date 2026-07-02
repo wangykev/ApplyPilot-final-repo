@@ -723,7 +723,10 @@ function cdpGenericNestedScan() {
   const labelOf = (w) => { const lg = w.querySelector("legend"); if (lg && lg.textContent.trim()) return lg.textContent.trim().slice(0, 60); for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); } return null; };
   const classify = (w) => {
     if (w.querySelector('input[type="file"]')) return "file_upload";
-    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    // nested typeaheads observed with ONLY the selectinput marker (Magna specialtyParent — no
+    // "multiselect" node); include both (self-or-descendant: the fkit node may BE the widget node)
+    const taSel = '[data-uxi-widget-type="multiselect"], [data-uxi-widget-type="selectinput"]';
+    if (w.querySelector(taSel) || (w.matches && w.matches(taSel))) return "typeahead";
     if (w.querySelector('input[type="radio"]')) return "radio";
     if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
@@ -760,8 +763,16 @@ function cdpGenericNestedScan() {
     const ent = (g.entries[ek] = g.entries[ek] || { path: p.levels.map((l) => l.base + "[" + l.idx + "]").join(" / "), levels: p.levels.map((l) => ({ base: l.base, index: l.idx })), fields: [] });
     if (p.field && p.field !== "null") {
       const id = el.getAttribute("data-fkit-id");
-      const ff = el.querySelector('[data-automation-id="formField-' + p.field + '"]') || el;
-      ent.fields.push({ field: p.field, widgetType: classify(ff), label: labelOf(ff), isRequired: requiredOf(ff), hashedId: isHashed(p.field), dateSegments: dateSegsOf(ff), wrapperSel: '[data-fkit-id="' + id + '"] [data-automation-id="formField-' + p.field + '"]' });
+      const ffSel = '[data-automation-id="formField-' + p.field + '"]';
+      // fkit ↔ formField relationship varies (Magna specialties: NOT ancestor→descendant) — probe it
+      // and record the selector that actually resolves (the cdpNestedFieldSel ladder, inlined: page
+      // fns are stringified separately and can't share helpers).
+      let ff = el, wrapperSel = '[data-fkit-id="' + id + '"]';
+      const desc = el.querySelector(ffSel);
+      if (desc) { ff = desc; wrapperSel = '[data-fkit-id="' + id + '"] ' + ffSel; }
+      else if (el.matches && el.matches(ffSel)) { /* same node — fkit selector alone */ }
+      else if (el.closest && el.closest(ffSel)) { ff = el.closest(ffSel); wrapperSel = ffSel + ':has([data-fkit-id="' + id + '"])'; }
+      ent.fields.push({ field: p.field, widgetType: classify(ff), label: labelOf(ff), isRequired: requiredOf(ff), hashedId: isHashed(p.field), dateSegments: dateSegsOf(ff), wrapperSel });
     }
   }
   const nestedSections = Object.keys(nested).map((k) => {
@@ -1010,7 +1021,13 @@ function cdpNestedDeleteRect(parentFkit, childBase, childIndex) {
     if (parentEntry && p === parentEntry) break; // reached the parent entry → its Delete is the PARENT's
     const spansParent = Array.from(p.querySelectorAll("[data-fkit-id]")).some((n) => parentDirectRe.test(n.getAttribute("data-fkit-id") || ""));
     if (spansParent) break; // this ancestor covers the parent's own fields → too big, refuse
-    const b = Array.from(p.querySelectorAll("button")).find((x) => /^delete$/i.test((x.textContent || "").trim()));
+    // Delete button shapes vary by tenant: text "Delete"/"Remove", aria-label/title-only, or ICON-ONLY
+    // (a trash svg, e.g. class "wd-icon-trash" — no text). Match all; the ancestor-scoping above (never
+    // spanning the parent's own fields) is what keeps an icon-only match safe.
+    const isDeleteBtn = (x) => /^(delete|remove)$/i.test((x.textContent || "").trim())
+      || /delete|remove|trash/i.test((x.getAttribute("aria-label") || "") + " " + (x.getAttribute("title") || "") + " " + (x.getAttribute("data-automation-id") || ""))
+      || !!x.querySelector('svg[class*="trash" i], [class*="icon-trash" i], [data-automation-id*="trash" i], [data-automation-id*="delete" i]');
+    const b = Array.from(p.querySelectorAll("button")).find(isDeleteBtn);
     if (b) { btn = b; break; }
   }
   if (!btn) return null;
@@ -1018,6 +1035,38 @@ function cdpNestedDeleteRect(parentFkit, childBase, childIndex) {
   const r = btn.getBoundingClientRect();
   return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
            cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
+// NESTED-FIELD wrapper selector — PROBE the live fkit ↔ formField relationship instead of assuming it.
+// The composed descendant selector ('[data-fkit-id="F"] [formField-X]') failed live on Magna specialties
+// ("typeahead wrapper not found"): the fkit node does NOT wrap the formField there. The relationship is
+// tenant-variable, so resolve it from the real DOM (Working principles: trace, don't guess) and return a
+// SINGLE suffix-composable selector (the substrate string-appends ' input…' etc. — no comma lists). The
+// resolved node must CONTAIN the field's inner controls. Rungs, most-specific first:
+//   1. fkit node wraps the formField → the classic descendant selector
+//   2. fkit node IS the formField (same node) → the fkit selector alone
+//   3. fkit node sits INSIDE the formField (e.g. on the input) → formField:has(fkit)
+//   4. fkit node exists but no formField div anywhere related → the fkit node itself (best effort)
+//   5. no data-fkit-id at all, but an element ID carries the fkit string (observed: the specialty INPUT's
+//      id is "certification-N--specialties-M--specialtyParent") → formField:has([id=…]) / the id node
+// Nothing hardcoded: F is composed at runtime from scanned indices; returns null (honest) when nothing
+// resolves — the caller records an error, never actuates blind.
+function cdpNestedFieldSel(fkit, field) {
+  const ffSel = '[data-automation-id="formField-' + field + '"]';
+  const fkSel = '[data-fkit-id="' + fkit + '"]';
+  const fk = document.querySelector(fkSel);
+  if (fk) {
+    if (fk.querySelector(ffSel)) return fkSel + " " + ffSel;
+    if (fk.matches && fk.matches(ffSel)) return fkSel;
+    if (fk.closest && fk.closest(ffSel)) return ffSel + ":has(" + fkSel + ")";
+    return fkSel;
+  }
+  const byId = document.querySelector('[id="' + fkit + '"]');
+  if (byId) {
+    if (byId.closest && byId.closest(ffSel)) return ffSel + ':has([id="' + fkit + '"])';
+    return '[id="' + fkit + '"]';
+  }
+  return null;
 }
 
 // M30 session-expiry recon read: a READ-ONLY static snapshot to classify whether
@@ -2336,6 +2385,9 @@ function makeCdpActuation(llmConfig) {
       await cdpClickAt(rect.cx, rect.cy);
       return { ok: true };
     },
+    // Probe the live fkit ↔ formField relationship for a nested field and return the SINGLE
+    // suffix-composable wrapper selector that actually resolves (null = nothing found — honest).
+    nestedFieldSel: (fkit, field) => cdpEval(cdpNestedFieldSel, fkit, field),
 
     // ── date composite segments (M34) ──
     // A date `-input` (role=spinbutton) is 0-box — can't be coordinate-clicked. Focus

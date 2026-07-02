@@ -2792,7 +2792,23 @@ async function fillNestedSpecialtiesCdp(act, o) {
     const cIdx = cur[j], item = items[j] || {};
     const canon = parentBase + "[" + pOrd + "]." + childBase + "[" + j + "].";
     for (const f of fieldMap) {
-      const wrapperSel = '[data-fkit-id="' + parentBase + "-" + pIdx + "--" + childBase + "-" + cIdx + "--" + f.field + '"] [data-automation-id="formField-' + f.field + '"]';
+      // The fkit ↔ formField relationship is TENANT-VARIABLE (the composed descendant selector failed
+      // live on Magna — the fkit node does not wrap the formField). PROBE the live DOM for the selector
+      // that actually resolves (act.nestedFieldSel — cdpNestedFieldSel's relationship ladder); the fkit
+      // string is composed entirely from runtime-scanned indices, never hardcoded. Fakes without the
+      // probe keep the legacy composed selector.
+      const childFkit = parentBase + "-" + pIdx + "--" + childBase + "-" + cIdx + "--" + f.field;
+      let wrapperSel = null;
+      if (act.nestedFieldSel) { try { wrapperSel = await act.nestedFieldSel(childFkit, f.field); } catch (e) { wrapperSel = null; } }
+      else wrapperSel = '[data-fkit-id="' + childFkit + '"] [data-automation-id="formField-' + f.field + '"]';
+      if (!wrapperSel) {
+        recs.push({ fieldName: canon + f.path, label: f.field, widgetType: f.widget === "year" ? "date" : f.widget,
+          isRequired: false, mappedPath: canon + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
+          resolved: null, status: "error", matchTier: null, confidence: null, flag: null, verified: null, after: null,
+          detail: "nested field wrapper not found (probed fkit + formField + id relations for " + childFkit + ")",
+          auditLoc: null, nested_parent: { base: parentBase, index: pOrd }, nested_child_base: childBase });
+        continue;
+      }
       const loc = { wrapperSel };
       const rec = {
         fieldName: canon + f.path, label: f.field, widgetType: f.widget === "year" ? "date" : f.widget,
