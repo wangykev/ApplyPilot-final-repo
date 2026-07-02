@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1509,54 +1509,44 @@ test("capture single-open: no onCapture → no scrape (4-arg callers / non-tagge
   assert.ok(!act.log.some(([m]) => m === "scrapeTaOptions"), "no scrape without onCapture");
 });
 
-// ── keptLowerTier RE-COMMIT: focus-safe re-type (the REAL FoS stray fix) ──────────────────────
-// cand-0's empty-results (0 options) DROPS searchBox focus; the re-commit (overwriteNoMatchResting→
-// recommitFn) must re-verify focus IMMEDIATELY before its re-type and NEVER pressEnter on a
-// partial/unfocused box (Enter commits the highlighted listbox row — the live "Healthcare" stray).
-// Field: pre-filled tier-1 "Other"; cand-0 "X" no-matches (0 options) → re-commit "Other".
-const reField = (flags) => taField(Object.assign({ chips: ["Other"], filterMap: { "X": { filtered: [] }, "Other": { autoCommit: "Other" } } }, flags || {}));
+// ── keptLowerTier resting: Tab-close, NO re-commit (operator speed rule 2026-07-02) ─────────────
+// The pre-fill IS the answer and is ALREADY committed — the walk-end just Tab-closes and verifies
+// the chip. The old re-type/Enter/affirmative-click re-commit is retired: Tab abandons any armed
+// row WITHOUT committing (the exit-redesign model, live-proven), so the re-commit was a wasted
+// ~4-round-trip sequence. The post-Tab chip read is the stray-backstop.
+// Field: pre-filled tier-1 "Other"; cand-0 "X" no-matches (0 options).
+const reField = (flags) => taField(Object.assign({ chips: ["Other"], filterMap: { "X": { filtered: [] } } }, flags || {}));
 
-test("keptLowerTier re-commit: empty-results drops focus → the re-commit RE-FOCUSES + lands the kept value", async () => {
+test("keptLowerTier: Tab-close keeps the chip — NO re-type, NO Enter, NO click after the walk", async () => {
+  // Even with the empty-results focus drop (the old re-commit's hard case) — irrelevant now,
+  // nothing is typed after the walk.
   const act = makeFakeAct([reField({ dropsFocusAfterEmpty: true })]);
-  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
-  const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled");
-  assert.strictEqual(rec.after, "Other");                          // recovered → committed the kept value, NO stray
-  assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.ok(act.log.some(([m]) => m === "focusHierSearch"), "the re-commit re-focused the dropped searchBox before re-typing");
-});
-
-test("keptLowerTier re-commit: focus UNRECOVERABLE → needs_review, NEVER pressEnter on the unfocused re-type (invariant)", async () => {
-  const act = makeFakeAct([reField({ dropsFocusAfterEmpty: true, focusUnrecoverableAfterEmpty: true })]);
-  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
-  const rec = out.results[0];
-  assert.strictEqual(rec.status, "needs_review");                  // couldn't hold focus → honest, no stray committed
-  assert.strictEqual(enters(act), 1, "only cand-0's filter-Enter — the re-commit NEVER pressed Enter on the unfocused box (which would commit the highlighted stray)");
-});
-
-// ── the operator's two re-commit guards (no disarm; affirmative click is the committing action) ──
-test("keptLowerTier re-commit: filter-Enter strays the chip (armed row-0) → the AFFIRMATIVE clickTaOption OVERWRITES it back to the kept value → filled", async () => {
-  // The settled re-type's filter-Enter commits the armed row-0 ("Accounting") while the "Other" list stays
-  // open — the affirmative clickTaOption("Other") is a real selection that OVERWRITES the stray (no disarm).
-  const act = makeFakeAct([reField({ filterMap: { "X": { filtered: [] }, "Other": { filtered: ["Other", "Other Technology"], strayChip: "Accounting" } } })]);
   const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "Other");
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.ok(act.log.some(([m, t]) => m === "clickHierLeaf" && t === "Other"), "the affirmative click overwrote the stray with the kept value");
+  assert.deepStrictEqual(taTypedQueries(act), ["X"], "ONLY the higher-tier candidate was ever typed — no re-commit re-type");
+  assert.strictEqual(enters(act), 1, "only cand-0's filter-Enter — the exit never pressed Enter");
+  assert.ok(!act.log.some(([m]) => m === "clickHierLeaf"), "no affirmative click — nothing to re-commit");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "closed via Tab");
 });
 
-test("keptLowerTier re-commit STRAY GUARD: a stray the click can't overwrite → needs_review with the HONEST live after (never silent, never [])", async () => {
-  // The filter-Enter commits a STRAY ("Accounting") and CLOSES the list, so clickTaOption("Other") can't reach
-  // the leaf. The chip is neither "Other" nor empty → must surface needs_review/overwrite-stray with the LIVE
-  // value (not a false "Other", not a [] that would hide "Accounting" from the record + the M40 audit).
-  const act = makeFakeAct([reField({ filterMap: { "X": { filtered: [] }, "Other": { autoCommit: "Accounting" } } })]);
-  const out = await drivePageFill(act, taProfile(["X", "Other"]), {}, {}, T_BUDGETS);
-  const rec = out.results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "overwrite-stray");
-  assert.strictEqual(rec.after, "Accounting");                     // HONEST live value, never a false "Other"
+// The stray-backstop and the vanished-chip honesty, unit-direct on the resting fn (the fake has no
+// hook to mutate chips ON the Tab itself).
+test("keptLowerTier resting STRAY-BACKSTOP: post-Tab chip differs → needs_review/overwrite-stray with the HONEST live after", async () => {
+  const act = { pressTab: async () => {} };
+  const rest = await overwriteNoMatchResting(act, { wrapperSel: "[w]" }, async () => ({ chips: ["Accounting"] }), ["Other"], [], null, T_BUDGETS, true);
+  assert.strictEqual(rest.status, "needs_review");
+  assert.strictEqual(rest.flag, "overwrite-stray");
+  assert.strictEqual(rest.after, "Accounting", "HONEST live value, never a false 'Other'");
+});
+
+test("keptLowerTier resting: post-Tab chip GONE → needs_review, never a false 'kept'", async () => {
+  const act = { pressTab: async () => {} };
+  const rest = await overwriteNoMatchResting(act, { wrapperSel: "[w]" }, async () => ({ chips: [] }), ["Other"], [], null, T_BUDGETS, true);
+  assert.strictEqual(rest.status, "needs_review");
+  assert.strictEqual(rest.after, null);
 });
 
 // ── awaitListTerminal: the terminal-state gate (banner or autocommit ONLY; bannerless = NOT terminal) ──
@@ -2027,23 +2017,23 @@ test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available,
   assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "Other"]);
 });
 
-test("M36.1 typeahead k>0: nothing higher offered → RE-COMMIT the kept pre-fill (prefilled-better-tier-unavailable)", async () => {
-  // Pre-fill = tier-1 "Other"; tier-0 NOT offered → "Other" is the best available. The fix
-  // AFFIRMATIVELY RE-COMMITS it (race-proof vs the armed-row-0 stray that the old dismiss-and-
-  // hope left): searches tier-0 (miss) THEN re-commits its own tier, ending filled/
-  // prefilled-better-tier-unavailable on a DELIBERATE commit (the fieldOfStudy "Accounting" fix).
+test("M36.1 typeahead k>0: nothing higher offered → KEEP the pre-fill, Tab-close (prefilled-better-tier-unavailable)", async () => {
+  // Pre-fill = tier-1 "Other"; tier-0 NOT offered → "Other" is the best available AND is ALREADY
+  // committed → Tab-close + chip verify, no re-commit (operator speed rule 2026-07-02; Tab abandons
+  // any armed row without committing — the exit-redesign model).
   const field = taField({
     chips: ["Other"],
-    filterMap: { "Electrical and Computer Engineering": { banner: true }, "Other": { autoCommit: "Other" } } // tier-0 not offered; the kept tier re-commits
+    filterMap: { "Electrical and Computer Engineering": { banner: true } } // tier-0 not offered
   });
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.strictEqual(rec.after, "Other", "the kept tier — re-committed");
-  assert.deepStrictEqual(field.chips, ["Other"], "ends on a DELIBERATE commit of Other (the affirmative re-commit)");
-  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering", "Other"], "searched the higher tier (miss) THEN re-committed its own tier (the fix)");
+  assert.strictEqual(rec.after, "Other", "the kept tier — untouched");
+  assert.deepStrictEqual(field.chips, ["Other"], "chip never re-typed or re-committed");
+  assert.deepStrictEqual(taTypedQueries(act), ["Electrical and Computer Engineering"], "ONLY the higher tier searched — no re-commit re-type");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "closed via Tab");
 });
 
 test("INVARIANT: keptLowerTier (k>0) NEVER goes to the AI — deterministic keep even with AI ON (zero LLM calls)", async () => {
@@ -2419,14 +2409,15 @@ test("M36.1 source k>0: upgrades to the HIGHEST offered tier (lockstep)", async 
   assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn"], "stopped at the highest offered; tier-1/own tier never searched");
 });
 
-test("M36.1 source k>0: nothing higher offered → RE-COMMIT the kept pre-fill (prefilled-better-tier-unavailable, lockstep)", async () => {
-  const field = srcField({ chips: ["Other"], filterMap: { LinkedIn: { banner: true }, "Other": { autoCommit: "Other" } } }); // tier-0 not offered; kept tier re-commits
+test("M36.1 source k>0: nothing higher offered → KEEP the pre-fill, Tab-close (prefilled-better-tier-unavailable, lockstep)", async () => {
+  const field = srcField({ chips: ["Other"], filterMap: { LinkedIn: { banner: true } } }); // tier-0 not offered
   const { rec, act } = await runSource(field, ["LinkedIn", "Other"]);
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "prefilled-better-tier-unavailable");
-  assert.strictEqual(rec.after, "Other", "the kept tier — re-committed");
-  assert.deepStrictEqual(field.chips, ["Other"], "ends on a DELIBERATE commit of Other (the affirmative re-commit)");
-  assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn", "Other"], "searched the higher tier (miss) THEN re-committed its own tier (the fix)");
+  assert.strictEqual(rec.after, "Other", "the kept tier — untouched");
+  assert.deepStrictEqual(field.chips, ["Other"], "chip never re-typed or re-committed");
+  assert.deepStrictEqual(srcTypedQueries(act), ["LinkedIn"], "ONLY the higher tier searched — no re-commit re-type (lockstep with typeahead)");
+  assert.ok(act.log.some(([m]) => m === "pressTab"), "closed via Tab (lockstep)");
 });
 
 test("source: containment auto-commit → filled_review + autocommit-containment (lockstep with typeahead)", async () => {

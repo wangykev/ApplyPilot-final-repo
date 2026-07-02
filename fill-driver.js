@@ -214,54 +214,23 @@ async function awaitSourceListStable(act, loc, budgets) {
   return "timeout";
 }
 
-// TYPEAHEAD_SELF_VERIFY (operator step 5, OFF by default): when on, the keptLowerTier re-commit does a settle
-// + chip RE-READ before returning, so the handler is honest on its own. REDUNDANT with the end-of-fill M40
-// audit once the settle + affirmative-click re-commit holds — and it adds ~1.3s PER such re-commit. Leave OFF
-// (M40 is the intended backstop); flip on only if M40 ever catches a re-commit the handler missed.
-const TYPEAHEAD_SELF_VERIFY = false;
-
-// overwriteNoMatchResting: the walk-end resting state under overwrite. Two paths:
+// overwriteNoMatchResting: the walk-end resting state under overwrite. BOTH paths exit via TAB —
+// the ONLY clean non-committing exit (refocus does NOT disarm; "" + Enter is a no-op — both
+// removed). Tab abandons any armed row WITHOUT committing it; the original chip is intact (we
+// never deleted it) and a committed chip SURVIVES the blur, so the post-Tab read is the truth.
 //   • keptLowerTier (M36.1) — the pre-fill EXACT-matched a LOWER candidate tier and no higher
-//     tier is offered → the pre-fill IS the best answer. RE-COMMIT it AFFIRMATIVELY (recommitFn:
-//     re-select the kept value via the caller's commit machinery) so the field ends on a
-//     DELIBERATE commit — the armed row becomes the correct value, RACE-PROOF (it does NOT
-//     depend on the disarm winning vs the next field's focus). Returns filled/
-//     `prefilled-better-tier-unavailable`; a re-commit that strays/fails → needs_review with the
-//     LIVE value (never a false "kept").
-//   • plain overwrite no-match (original NOT a candidate — can't re-type it) — the original chip
-//     is intact (never deleted). Exit via TAB — the ONLY clean non-committing exit (refocus does
-//     NOT disarm, "" + Enter is a no-op; both removed) — which abandons any armed row WITHOUT
-//     committing it, then rest clean. A chip that strayed despite the Tab → flagged
-//     (overwrite-stray), never a false keep.
-// Parametrized (readFn/ensureFocusedFn/recommitFn) to keep typeahead+source LOCKSTEP.
-async function overwriteNoMatchResting(act, loc, readFn, ensureFocusedFn, priorChips, trace, lastOptions, budgets, keptLowerTier, recommitFn) {
+//     tier is offered → the pre-fill IS the best answer AND is ALREADY correctly committed →
+//     Tab-close + chip VERIFY, no re-type/re-commit (operator speed rule 2026-07-02; the old
+//     affirmative re-commit was the pre-Tab-model stray fix — the Tab exit abandons the armed
+//     row, live-proven on this exact widget state, making the re-commit a wasted round-trip).
+//     Chip still == original → filled/`prefilled-better-tier-unavailable`; vanished → honest
+//     needs_review (never a false "kept").
+//   • plain overwrite no-match (original NOT a candidate) — same Tab exit, flagged
+//     overwrite-nomatch-original-kept (the AI-rescue candidate).
+// A chip that STRAYED despite the Tab → overwrite-stray on the LIVE value (both paths).
+async function overwriteNoMatchResting(act, loc, readFn, priorChips, trace, lastOptions, budgets, keptLowerTier) {
   const norm = apMatch.normalize;
   const original = priorChips.join("; ");
-
-  if (keptLowerTier && recommitFn) {
-    await ensureFocusedFn(); // recover focus (the no-match banner dropped it) before re-committing
-    let chips = priorChips;
-    try { chips = await recommitFn(original); } catch (e) { /* keep priorChips */ }
-    if (chips.length && chips.some((c) => norm(c) === norm(original))) {
-      return {
-        status: "filled", after: original, verified: true, matchTier: "pre-filled",
-        flag: "prefilled-better-tier-unavailable", confidence: "high",
-        detail: `kept pre-fill "${original}" — re-committed (no higher-priority tier offered by the form)`,
-        captured_options: lastOptions || undefined, settle_trace: trace
-      };
-    }
-    const after = chips.length ? chips.join("; ") : original;
-    return {
-      status: "needs_review", after, verified: false, matchTier: "pre-filled",
-      flag: "overwrite-stray", confidence: "none",
-      detail: `keptLowerTier re-commit did not land "${original}" (field shows "${after}") — review`,
-      captured_options: lastOptions || undefined, settle_trace: trace
-    };
-  }
-
-  // Plain overwrite no-match: Tab-blur — the ONLY clean non-committing exit (refocus does NOT
-  // disarm; "" + Enter is a no-op — both removed). Tab abandons any armed row WITHOUT committing it.
-  // The original chip is intact (never deleted); a chip that strayed despite the Tab is flagged.
   const tabbed = await tabBlurExit(act, loc, readFn);
   const endChips = tabbed == null ? priorChips : tabbed; // read error → keep priorChips (no false stray)
   const after = endChips.length ? endChips.join("; ") : original;
@@ -270,6 +239,24 @@ async function overwriteNoMatchResting(act, loc, readFn, ensureFocusedFn, priorC
       status: "needs_review", after, verified: false, flag: "overwrite-stray", confidence: "none",
       detail: `resting Tab-exit strayed to "${after}" (expected original "${original}") — review`,
       captured_options: lastOptions || undefined, settle_trace: trace, overwrite: { original, refilled: false }
+    };
+  }
+  if (keptLowerTier) {
+    if (endChips.length) {
+      return {
+        status: "filled", after: original, verified: true, matchTier: "pre-filled",
+        flag: "prefilled-better-tier-unavailable", confidence: "high",
+        detail: `kept pre-fill "${original}" (no higher-priority tier offered by the form) — Tab-closed, no re-commit`,
+        captured_options: lastOptions || undefined, settle_trace: trace
+      };
+    }
+    // chip GONE after the Tab (unobserved mode — committed chips survive blur) → honest review,
+    // never a false "kept".
+    return {
+      status: "needs_review", after: null, verified: false, matchTier: "pre-filled",
+      flag: "overwrite-stray", confidence: "none",
+      detail: `kept pre-fill "${original}" no longer present after the Tab-close (field empty) — review`,
+      captured_options: lastOptions || undefined, settle_trace: trace
     };
   }
   return {
@@ -323,7 +310,6 @@ const DEFAULT_BUDGETS = {
   taSettleIntervalMs: 400,
   taEmptyNoMatchMs: 8000,   // a filtered list that stays EMPTY (0 options, no banner) this long = no-match (CPP: avoids the 25s burn; above the ~5.6s cold-list latency). FAST path (sawChange+stable) usually fires sooner.
   taEnterCommitCeilingMs: 5000, // commit-Enter → chip, before the click fallback takes over
-  selfVerifyMs: 1300,      // OFF-by-default (TYPEAHEAD_SELF_VERIFY) post-commit settle before the honesty chip re-read; M40 is the real backstop
   // M32 repeating-section reconcile poll (Add/Delete → entry count moves). In-tree
   // budget is 4s/150ms; the page mounts the new/removed entry on its throttled loop.
   entryReconcileCeilingMs: 4000,
@@ -1312,9 +1298,9 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // the intended clearSearch + pollSearchValue). The scrape leaves the dropdown OPEN; the loop
   // re-focuses the already-open field. NO settle/type AFTER the scrape here. (The abandoned
   // capture-first put this INSIDE the loop with a settle + a 2nd re-assert between the re-assert and
-  // the type → the async blur landed in that gap → the keptLowerTier re-commit strayed. This puts the
-  // scrape entirely BEFORE the loop's single re-assert; the keptLowerTier re-commit path
-  // [overwriteNoMatchResting → recommitFn] is UNTOUCHED — byte-identical, no settle before its re-type.)
+  // the type → the async blur landed in that gap → the then-live keptLowerTier re-commit strayed.
+  // This puts the scrape entirely BEFORE the loop's single re-assert. (The re-commit itself was later
+  // retired — keptLowerTier now Tab-closes in overwriteNoMatchResting, 2026-07-02.)
   if (opts.onCapture) {
     await act.openHier(loc);
     await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
@@ -1548,7 +1534,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // PROFILE tier — a STATED value, there is nothing to rescue. Without this gate the AI re-picked
     // the very value the field already held and re-flagged it ai-choice/filled_review (live
     // 2026-07-02: FoS pre-filled "Electrical Engineering" = tier 1; the tier-0-only upgrade walk
-    // no-matched → AI). The deterministic keep below (recommitFn → filled/
+    // no-matched → AI). The deterministic keep below (Tab-close → filled/
     // prefilled-better-tier-unavailable) is the correct outcome. The AI rescue exists for the
     // MISMATCHED pre-fill (preTierIndex === -1), where the kept chip is NOT a profile value.
     const aiR = preTierIndex > 0 ? null : await tryInlineAi();
@@ -1558,53 +1544,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // previously-committed chip, and the resting honesty read below is what reports it. The AI's
     // failure detail is carried onto that record so the whole story survives.
     if (aiR && !(aiR.status === "needs_review" && aiR.after == null)) return aiR;
-    const rest = await overwriteNoMatchResting(act, loc, (l) => act.readHier(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
-      // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
-      async (value) => {
-        // STEP 1 — TERMINAL GATE (the keptLowerTier stray fix): the higher-tier no-match's empty-results render
-        // is throttle-LAGGED. Touching the box mid-render races the focus-drop (the "half-typed oth" + armed-row
-        // stray). awaitListTerminal BLOCKS until a CONFIRMED terminal (the "No matches found" banner / autocommit)
-        // before clearing — never a bannerless list. NO disarm: a clean full "Other" typed into a settled,
-        // focused box + step 4's affirmative click (a real selection that OVERWRITES any armed row-0) makes a
-        // disarm redundant — and polling an auto-highlight that never clears would burn to the ceiling.
-        await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
-        // STEPS 3-4 — FOCUS-SAFE re-type: clearSearch is FOCUS-BLIND (Ctrl+A to whatever has focus), so
-        // re-verify focus IMMEDIATELY before the type (the focus-blind clear is INSIDE the re-assert), and on a
-        // blur (focus not confirmed after the clear, OR a PARTIAL landed value) re-focus + re-clear + re-type
-        // (bounded). NEVER pressEnter on a partial/unfocused box — Enter commits the highlighted listbox row.
-        let landed = false;
-        for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
-          if (!(await ensureSearchFocused())) return []; // can't focus → no blind actuation (caller → needs_review)
-          await act.clearHierSearch();
-          await pollSearchValue(act, () => act.readHier(loc), "", budgets);
-          const fs = await act.readHier(loc);
-          if (!(fs && fs.searchBox && fs.searchBox.focused)) continue; // blur after the clear → re-loop (re-focus re-clears)
-          await act.typeInHier(value);
-          landed = await pollSearchValue(act, () => act.readHier(loc), value, budgets); // FULL value echoed in the FOCUSED box?
-          // landed === false → partial value (blur mid-type) → re-loop
-        }
-        if (!landed) return []; // never Enter on a partial/unfocused box → [] → overwriteNoMatchResting returns needs_review (honest, no stray)
-        // ORDERING GUARD: the only step between the settled re-type and the affirmative click is the
-        // filter-pressEnter — IN-PLACE (the box stays focused while the list filters), NOT a focus-leaving
-        // blur — then a read. So the affirmative click is reached blur-free and is the FINAL committing
-        // action, pre-empting any exit-blur-commit of an armed row.
-        await act.pressEnter(); await act.delayFull(budgets.commitIntervalMs);
-        let r = await act.readHier(loc);
-        if (!(r && (r.chips || []).some((c) => norm(c) === norm(value)))) {
-          // AFFIRMATIVE re-commit: a TRUSTED click on the resolved "value" leaf overwrites whatever the
-          // filter-Enter armed/committed (the proven recon recommitOther recovery). Can't truncate or stray.
-          try { await act.clickHierLeaf(loc, value); } catch (e) { /* leaf not clickable → STRAY GUARD below */ }
-          await act.delayFull(budgets.commitIntervalMs); r = await act.readHier(loc);
-        }
-        // STEP 5 (TYPEAHEAD_SELF_VERIFY, OFF) — settle + chip RE-READ before returning, so the record reflects
-        // the SETTLED chip rather than the momentary post-click read. Redundant with M40 once the above holds.
-        if (TYPEAHEAD_SELF_VERIFY) { await act.delayFull(budgets.selfVerifyMs || 1300); r = await act.readHier(loc); }
-        // STRAY GUARD: return the REAL post-click chips (never [] for a stray — that would hide the live
-        // value). overwriteNoMatchResting is the needs_review bail: chip == value → filled; empty →
-        // needs_review; anything else (a blur-stray the click didn't overwrite) → needs_review/overwrite-stray
-        // with the HONEST live `after`. Never a silent filled.
-        return r ? (r.chips || []) : [];
-      });
+    // keptLowerTier + plain no-match both rest via the SAME Tab-close inside overwriteNoMatchResting
+    // (the affirmative re-type/re-commit was retired 2026-07-02 — the value is already correctly
+    // committed; Tab abandons the armed row without committing, and the post-Tab chip read is the
+    // stray-backstop). ~4 fewer round-trips per keptLowerTier field.
+    const rest = await overwriteNoMatchResting(act, loc, (l) => act.readHier(l), priorChips, trace, lastFiltered, budgets, preTierIndex > 0);
     if (aiR) {
       // The page ended BLANK → the AI's failure record is the honest one (its ai-* flag drives the
       // review reason + the delete-sweep's unconfident-AI rule) — carry the resting detail along.
@@ -4416,5 +4360,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

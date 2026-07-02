@@ -2071,3 +2071,11 @@ sub-section stub notes the removal).
   rescue exists for the MISMATCHED pre-fill (`preTierIndex === -1`) only. Fix: the overwrite
   no-match exit gates the AI on `preTierIndex <= 0` → the deterministic keep (recommit →
   `filled`/`prefilled-better-tier-unavailable`) wins, zero LLM calls (invariant unit-pinned).
+- **Follow-up 2 (same day, operator speed rule) — the keptLowerTier re-commit is RETIRED; Tab-close
+  instead.** The affirmative re-type/Enter/click re-commit (the 2026-06-22 stray fix) predates the
+  Tab-blur exit model, which established (live-proven) that Tab abandons an armed row WITHOUT
+  committing. Since the kept chip is already correctly committed, the re-commit was a wasted ~4
+  round-trips per field. `overwriteNoMatchResting` now Tab-closes on BOTH paths; keptLowerTier just
+  VERIFIES the post-Tab chip: still == original → `filled`/`prefilled-better-tier-unavailable`;
+  differs → `overwrite-stray` with the honest live value; vanished → honest needs_review. The
+  recommitFn closure + TYPEAHEAD_SELF_VERIFY are deleted.
