@@ -2980,28 +2980,24 @@ test("sectionsInDomOrder: sections drive in PAGE order (Add-button document orde
   assert.deepStrictEqual(sectionsInDomOrder(PAGE_SECTIONS, []).map((s) => s.name), PAGE_SECTIONS.map((s) => s.name), "no Add buttons → registry order (today's behavior)");
 });
 
-test("cert attachment fills IN SECTION ORDER via act.attachStoredResume (TEST attach_resume, data-driven)", async () => {
-  // The résumé attaches DURING the cert section fill (right after its Specialties — the form's own
-  // order), scoped to THIS cert's attachments area via the runtime-scanned pIdx — not an
-  // end-of-page post-pass. No profile flag ⇒ the seam is never called (the un-tie guarantee).
-  const mkState = () => webState({ prefix: "certification-", nestedEnabled: true,
+test("cert attachments: the nested-attachment row is ALWAYS the untouched stub — nothing ever attaches the résumé to a cert", async () => {
+  // The TEST-ONLY attach_resume path (verified live 2026-07-02) was REMOVED with its test data: even
+  // a leftover profile flag + a seam on the act must be IGNORED — per-entry attachments are the
+  // operator's (the review picker / the form); the résumé only attaches to the top-level Documents field.
+  const state = webState({ prefix: "certification-", nestedEnabled: true,
     entries: [{ fkit: "certification-1--null", fields: [{ fieldName: "url", label: "URL", widgetType: "text", isRequired: false, value: "" }] }] });
-  const sec = (items) => ({ name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
-    items, fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }], deleteOnNoMatch: false, nested: CERT_NESTED });
-  const act = makeFakeRepeatAct(mkState());
+  const act = makeFakeRepeatAct(state);
   const calls = [];
   act.attachStoredResume = async (sel) => { calls.push(sel); return { attached: true, fileName: "resume.pdf" }; };
-  const out = await driveRepeatingSectionCdp(act, sec([{ url: "x", attach_resume: true }]), T_BUDGETS);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
+    items: [{ url: "x", attach_resume: true }], // a stale profile flag — must be inert
+    fieldMap: [{ field: "url", widget: "text", key: "url", path: "url" }], deleteOnNoMatch: false, nested: CERT_NESTED
+  }, T_BUDGETS);
+  assert.deepStrictEqual(calls, [], "no attach call, ever");
   const att = out.results.find((r) => r.fieldName === "certification[0].attachments");
-  assert.strictEqual(att.status, "filled");
-  assert.strictEqual(att.after, "resume.pdf");
-  assert.deepStrictEqual(calls, ['[data-fkit-id="certification-700--attachments"]'], "scoped to THIS cert's attachments area (runtime pIdx)");
-  const act2 = makeFakeRepeatAct(mkState());
-  const calls2 = [];
-  act2.attachStoredResume = async (sel) => { calls2.push(sel); return { attached: true }; };
-  const out2 = await driveRepeatingSectionCdp(act2, sec([{ url: "x" }]), T_BUDGETS);
-  assert.deepStrictEqual(calls2, [], "no attach_resume flag → the seam is NEVER called");
-  assert.strictEqual(out2.results.find((r) => r.fieldName === "certification[0].attachments").status, "skipped", "stub unchanged");
+  assert.strictEqual(att.status, "skipped", "the plain per-entry attachments stub");
+  assert.strictEqual(att.flag, "nested-attachment");
 });
 
 test("nested deleteOnNoMatch (proactive): a BLANK genuine-no-match specialty row is DELETED at fill time; a value-holder is KEPT; preserveExtras skips", async () => {

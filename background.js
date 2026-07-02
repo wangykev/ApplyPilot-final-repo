@@ -2376,22 +2376,9 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   for (const e of ((priorSum && priorSum.entries) || [])) {
     if (e && e.widget_type === "section_stub" && e.section_heading && typeof e.canonical_field === "string") headingToBase[e.section_heading] = e.canonical_field.replace(/\._stub$/, "");
   }
-  // act.attachStoredResume — the SW-built attach seam (I/O stays in the SW: read the résumé from
-  // IndexedDB, run the proven attachResume in-page scoped to sectionSel, under the input-lock's
-  // __apActing bump). Lets the fill attach files IN PAGE ORDER (the cert's Attachments fill inside
-  // the cert section — operator rule 2026-07-02) instead of an end-of-page post-pass.
-  if (!act.attachStoredResume) {
-    act.attachStoredResume = async (sectionSel) => {
-      let rec0 = null;
-      try { rec0 = await getResume(); } catch (e) { return { attached: false, detail: "resume store unavailable" }; }
-      if (!rec0 || !rec0.base64) return { attached: false, detail: "no resume stored (upload one in the popup)" };
-      const lockOn = !(opts && opts.skipLock);
-      if (lockOn) { try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* ignore */ } }
-      try { return (await cdpEval(attachResume, rec0.base64, rec0.filename || "resume.pdf", rec0.mime || "application/pdf", sectionSel || null)) || { attached: false, detail: "no result" }; }
-      catch (e) { return { attached: false, detail: String((e && e.message) || e) }; }
-      finally { if (lockOn) { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } } }
-    };
-  }
+  // (The act.attachStoredResume seam — the TEST-ONLY per-cert résumé attach — was verified live
+  // 2026-07-02 and then REMOVED with the profile test data. The résumé attaches ONLY to the
+  // top-level Documents field, via the post-fill step below.)
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
 
   LOG("page:", out.url);
@@ -2460,9 +2447,6 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       }
     }
   }
-
-  // (The TEST attach_resume per-cert attach now happens IN SECTION ORDER inside the cert fill —
-  // driveRepeatingSectionCdp's nested-attachment emit via act.attachStoredResume — not here.)
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
   // are in out.results/out.needsReview). Log the audit outcome + PERSIST the expectations

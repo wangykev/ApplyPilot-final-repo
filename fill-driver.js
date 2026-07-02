@@ -3593,31 +3593,16 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
         });
       }
       if (nestedHasAttachments) {
-        const attRec = {
+        // (The TEST-ONLY attach_resume per-cert résumé attach lived here — verified live 2026-07-02,
+        // then REMOVED with the test data. Per-entry attachments are the operator's, via the review
+        // picker / the form; the résumé only ever attaches to the top-level Documents field.)
+        results.push({
           fieldName: name + "[" + i + "].attachments", label: "Attachments",
           widgetType: "file_upload", isRequired: false, mappedPath: name + "[" + i + "].attachments",
           rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
           flag: "nested-attachment", verified: null, after: null,
           detail: "per-entry attachments — upload on the form", nested_path: [{ base: name, index: i }]
-        };
-        // TEST-ONLY (attach_resume) — REMOVE with the profile test data. DATA-DRIVEN: the profile
-        // flag ties the stored résumé to THIS entry's Attachments, attached IN SECTION ORDER (the
-        // operator rule: attachments fill where they sit on the form — inside the cert entry, right
-        // after its Specialties — not in an end-of-page post-pass). Remove the flag ⇒ no attach.
-        // act.attachStoredResume is the SW-built seam (I/O stays in the SW; Node fakes lack it → skip).
-        if (item.attach_resume && act.attachStoredResume && pIdx != null) {
-          const sectionSel = '[data-fkit-id="' + name + "-" + pIdx + '--attachments"]';
-          let ar = null;
-          try { ar = await act.attachStoredResume(sectionSel); } catch (e) { ar = { attached: false, detail: String((e && e.message) || e) }; }
-          if (ar && ar.attached) {
-            attRec.status = "filled"; attRec.verified = true; attRec.after = ar.fileName || null;
-            attRec.detail = "TEST résumé attached in-section (attach_resume — remove the profile flag to un-tie)";
-          } else {
-            attRec.status = "needs_review";
-            attRec.detail = "attach_resume: attach failed — " + ((ar && ar.detail) || "no confirmation");
-          }
-        }
-        results.push(attRec);
+        });
       }
     }
   }
