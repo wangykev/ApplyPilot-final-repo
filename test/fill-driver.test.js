@@ -3104,6 +3104,26 @@ test("sweep: KNOWN sections — mapped-but-skipped field flips; an UNMAPPED sect
   assert.ok(!results.some((r) => /specialtyParent/.test(r.fieldName)), "nested child fields (cert ▸ specialties) are EXCLUDED — reconciled + audited via their own records");
 });
 
+test("sweep: NESTED records re-read via their probed auditLoc at end-of-page (nested sub-section coverage)", async () => {
+  // The flat/section scans can't join nested records by ordinal — the sweep re-reads any
+  // still-skipped nested record through its probed selector, so a value committed to a nested
+  // field AFTER the section filled still lands in the review (source-of-truth ordering).
+  const results = [{ fieldName: "certification[0].specialties[0].endDate", label: "endDate", widgetType: "date",
+    isRequired: false, mappedPath: "certification[0].specialties[0].endDate", rawValue: null, resolved: null,
+    status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null,
+    detail: "no date", date_order: ["month", "day", "year"],
+    auditLoc: "PROBED-endDate", nested_parent: { base: "certification", index: 0 }, nested_child_base: "specialties" }];
+  const segs = { "PROBED-endDate|Month": "6", "PROBED-endDate|Day": "15", "PROBED-endDate|Year": "2025" };
+  const act = {
+    scanPage: async () => ({ fields: [] }), repeatingScan: async () => null,
+    readDateSegment: async (loc, seg) => ({ value: segs[loc.wrapperSel + "|" + seg] || "" }),
+  };
+  await sweepAlreadyFilled(act, results);
+  assert.strictEqual(results[0].status, "filled_review", "the late-committed nested value SURFACES");
+  assert.strictEqual(results[0].flag, "already-filled");
+  assert.strictEqual(results[0].after, "6/15/2025");
+});
+
 test("sweep: never clobbers an existing classification (flagged skip records untouched)", async () => {
   const results = [{ fieldName: "essayField", label: "Essay", widgetType: "textarea", isRequired: false,
     mappedPath: null, rawValue: null, resolved: null,

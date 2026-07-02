@@ -2434,14 +2434,6 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
   }
 
-  // ── ALREADY-FILLED sweep ── the review must inventory EVERYTHING the page holds: a `skipped`
-  // record whose field HOLDS a live value (Workday account pre-fill / operator / prior run) is
-  // surfaced with the value + flagged "already-filled" (needs_review) — or "already-filled-match"
-  // (no flag) when it equals the profile's own value. Unmapped KNOWN-section fields with values get
-  // NEW records. Read-only; runs BEFORE the audit snapshot (both flags are audit-excluded — the bot
-  // never actuated these, so the inline audit must never "re-fill" them: the fluent-checkbox lesson).
-  if (!only) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
-
   // ── AI TYPEAHEAD FALLBACK is now INLINE (Option B) ── a typeahead that GENUINELY no-matches hands the
   // captured option list + profile to the LLM and commits its pick ON THE OPEN FIELD right then, inside
   // fillTypeaheadCdp's no-match exit (gated on opts.ai — passed by the flat loop above + fillEntryCdp for
@@ -2463,6 +2455,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
   if (!only) await captureChoiceOptions(act, results, budgets);
   if (!only) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
+
+  // ── ALREADY-FILLED sweep — the LAST pass before the bundle (source-of-truth ordering) ── the
+  // review must inventory EVERYTHING the page holds at the moment Save & Continue is clicked: a
+  // `skipped` record whose field HOLDS a live value (Workday account pre-fill / operator / prior
+  // run) is surfaced with the value + flagged "already-filled" (needs_review) — or
+  // "already-filled-match" (no flag) when it equals the profile's own value. Unmapped KNOWN-section
+  // fields with values get NEW records; NESTED records re-read via their probed auditLoc. Read-only.
+  // Deliberately AFTER the option capture + M40 audit (both actuate: capture opens/closes lists,
+  // the audit can self-heal re-fill) so the captured values are the page's FINAL state — the two
+  // passes touch disjoint records (audit = bot-filled only; both already-filled flags audit-excluded,
+  // so nothing here is ever re-actuated: the fluent-checkbox lesson).
+  if (!only) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
@@ -2853,35 +2857,16 @@ async function fillNestedSpecialtiesCdp(act, o) {
         }
       } catch (e) { rec.status = "error"; rec.detail = String(e); }
       // A SKIPPED nested field (no profile value) may still HOLD a value — operator-typed or
-      // pre-filled — and the review must inventory it (the already-filled convention). The
-      // page-wide sweep EXCLUDES nested fields, so the read lives here, on the probed selector.
+      // pre-filled — and the review must inventory it (the already-filled convention). Fill-time
+      // read here on the probed selector; the sweep's nested pass re-reads at END-OF-PAGE too.
       // Read-only; a read failure keeps the honest skip.
       if (rec.status === "skipped") {
-        try {
-          let live = null;
-          if (f.widget === "date" || f.widget === "year") {
-            const parts = [];
-            for (const seg of ["Month", "Day", "Year"]) {
-              const r = act.readDateSegment ? await act.readDateSegment(loc, seg) : null;
-              if (r && r.value != null && String(r.value).trim() !== "" && !isNaN(parseInt(r.value, 10))) parts.push(String(r.value));
-            }
-            live = parts.length ? parts.join("/") : null;
-          } else if (f.widget === "typeahead") {
-            const h = act.readHier ? await act.readHier(loc) : null;
-            live = h && h.chips && h.chips.length ? h.chips.join("; ") : null;
-          } else if (f.widget === "dropdown") {
-            const d = act.readDropdownState ? await act.readDropdownState(loc) : null;
-            live = d ? d.triggerText : null;
-          } else if (act.readTextValue) {
-            const t = await act.readTextValue(loc);
-            live = t ? t.value : null;
-          }
-          if (hasLiveValue(live)) {
-            rec.status = "filled_review"; rec.flag = "already-filled";
-            rec.after = String(live); rec.verified = null;
-            rec.detail = "already on the form — NOT filled by ApplyPilot; verify";
-          }
-        } catch (e) { /* keep the skip */ }
+        const live = await readLiveValueByWidget(act, f.widget, loc);
+        if (hasLiveValue(live)) {
+          rec.status = "filled_review"; rec.flag = "already-filled";
+          rec.after = String(live); rec.verified = null;
+          rec.detail = "already on the form — NOT filled by ApplyPilot; verify";
+        }
       }
       recs.push(rec);
       await act.delay(budgets.interFieldMs);
@@ -2901,6 +2886,36 @@ async function fillNestedSpecialtiesCdp(act, o) {
 // reconciled to the profile + M40-audited via their own records. NOTE: scan entry i joins record
 // ordinal i (DOM order == fill ordinal); a mid-list deleteOnNoMatch delete could shift the join for
 // later entries — flag-only, never actuates, so the worst case is a mislabeled review flag.
+// Read ONE field's live value by widget type — READ-ONLY, keyed by a selector string re-resolved
+// fresh from the document. Used by the nested filler's skip-read and the sweep's nested pass.
+// Returns null when empty or unreadable (never throws).
+async function readLiveValueByWidget(act, widget, loc) {
+  try {
+    if (widget === "date" || widget === "year") {
+      const parts = [];
+      for (const seg of ["Month", "Day", "Year"]) {
+        const r = act.readDateSegment ? await act.readDateSegment(loc, seg) : null;
+        if (r && r.value != null && String(r.value).trim() !== "" && !isNaN(parseInt(r.value, 10))) parts.push(String(r.value));
+      }
+      return parts.length ? parts.join("/") : null;
+    }
+    if (widget === "typeahead" || widget === "hierarchical") {
+      const h = act.readHier ? await act.readHier(loc) : null;
+      return h && h.chips && h.chips.length ? h.chips.join("; ") : null;
+    }
+    if (widget === "dropdown") {
+      const d = act.readDropdownState ? await act.readDropdownState(loc) : null;
+      return d ? d.triggerText : null;
+    }
+    if (widget === "checkbox") {
+      const c = act.readCheckboxState ? await act.readCheckboxState(loc) : null;
+      return c && c.inputId != null ? !!c.checked : null;
+    }
+    const t = act.readTextValue ? await act.readTextValue(loc) : null;
+    return t ? t.value : null;
+  } catch (e) { return null; }
+}
+
 async function sweepAlreadyFilled(act, results) {
   const norm = apMatch.normalize;
   const matchesOwn = (rec, live) => {
@@ -2960,6 +2975,15 @@ async function sweepAlreadyFilled(act, results) {
         }
       }
     }
+  }
+  // NESTED records (cert ▸ specialties) — the scans above can't join them by ordinal (Workday's
+  // internal counters), but every nested record carries its PROBED auditLoc: re-read any STILL-
+  // skipped one at end-of-page so a value typed/committed after the section filled is never missed.
+  // (The nested filler already does a fill-time read — this is the end-of-page refresh.)
+  for (const rec of results) {
+    if (rec.status !== "skipped" || !rec.nested_child_base || !rec.auditLoc || rec.flag) continue;
+    const live = await readLiveValueByWidget(act, rec.widgetType, { wrapperSel: rec.auditLoc });
+    if (hasLiveValue(live)) flip(rec, live, rec.auditLoc);
   }
 }
 
