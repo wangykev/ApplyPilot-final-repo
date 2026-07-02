@@ -164,7 +164,10 @@
       .static { font-size: 12px; word-break: break-word; }
       .static.empty { color: var(--muted-2); font-style: italic; }
       .ta-wrap { position: relative; max-width: 340px; }
-      .ta-list { position: absolute; z-index: 30; left: 0; right: 0; top: 100%; margin-top: 2px; max-height: 210px; overflow-y: auto; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 6px; box-shadow: 0 6px 18px rgba(20,24,40,.12); }
+      /* position: FIXED (viewport-relative) so the list escapes the .tbl { overflow: hidden } that was
+         clipping it near the page/table bottom; left/width/top(or bottom) set by JS per open, flipping
+         upward when there's no room below. */
+      .ta-list { position: fixed; z-index: 40; max-height: 210px; overflow-y: auto; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 6px; box-shadow: 0 6px 18px rgba(20,24,40,.12); }
       .ta-opt { padding: 4px 9px; font-size: 12px; cursor: pointer; white-space: nowrap; }
       .ta-opt:hover { background: var(--accent-weak); }
       .ta-opt.sel { font-weight: 650; background: var(--accent-weak); color: var(--accent-ink); }

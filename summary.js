@@ -372,18 +372,28 @@ function buildEditor(entry) {
     inp.value = cur == null ? "" : String(cur);
     const box = el("div", { class: "ta-list", hidden: "" });
     wrap.appendChild(inp); wrap.appendChild(box);
+    // Fixed-position the list at the input's rect; flip UP when there isn't room below (so it's never
+    // cut off by the page/table bottom). Reposition on scroll while open.
+    const position = () => {
+      const r = inp.getBoundingClientRect();
+      box.style.left = r.left + "px"; box.style.width = r.width + "px";
+      const below = window.innerHeight - r.bottom;
+      if (below < 200 && r.top > below) { box.style.top = "auto"; box.style.bottom = (window.innerHeight - r.top + 2) + "px"; box.style.maxHeight = Math.max(120, Math.min(210, r.top - 12)) + "px"; }
+      else { box.style.bottom = "auto"; box.style.top = (r.bottom + 2) + "px"; box.style.maxHeight = Math.max(120, Math.min(210, below - 12)) + "px"; }
+    };
     const matches = () => { const q = inp.value.trim().toLowerCase(); return q === "" ? list.slice() : list.filter((o) => String(o).toLowerCase().includes(q)); };
     const pick = (v) => { onCommit(v); inp.value = entry.current_value == null ? "" : String(entry.current_value); if (v === "" || v == null) draw(true); else { box.hidden = true; box.textContent = ""; } };
     const draw = (all) => {
       box.textContent = "";
       const cr = el("div", { class: "ta-opt ta-clear", text: "— clear —" }); cr.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(""); }); box.appendChild(cr);
       for (const o of (all ? list.slice() : matches())) { const r = el("div", { class: String(o) === norm(entry.current_value) ? "ta-opt sel" : "ta-opt", text: String(o) }); r.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(String(o)); }); box.appendChild(r); }
-      box.hidden = false;
+      position(); box.hidden = false;
     };
-    inp.addEventListener("focus", () => { inp.select(); draw(true); });
+    const onScroll = () => { if (!box.hidden) position(); };
+    inp.addEventListener("focus", () => { inp.select(); window.addEventListener("scroll", onScroll, true); draw(true); });
     inp.addEventListener("input", () => draw(false));
     inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); const ms = matches(); if (ms.length) pick(String(ms[0])); } else if (ev.key === "Escape") box.hidden = true; });
-    inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; }, 150));
+    inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; window.removeEventListener("scroll", onScroll, true); }, 150));
     return { node: wrap, set: (v) => { inp.value = v == null ? "" : String(v); } };
   };
   // Segmented date inputs in the FORM's order + granularity (year-only / M-Y / M-D-Y, from the recon'd
