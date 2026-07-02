@@ -3832,8 +3832,18 @@ test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletio
 test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_shapes (add-back shows Specialties)", async () => {
   // A bogus cert → deleteOnNoMatch removes the whole section. Because the nested shape is HARDCODED
   // (section.nested), it survives the deletion + rides the removed-section stub so the operator can
-  // add a cert back and see its Specialties (+ attachments).
-  const mk = (fkit) => ({ fkit, fields: [{ fieldName: "certification", label: "Certification*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "PMP" }] }] });
+  // add a cert back and see its Specialties (+ attachments). The LIVE entry scan sees the nested
+  // child fields + the Attachments input INSIDE the cert container — the captured FLAT shape must
+  // EXCLUDE them (operator bug: an added-back entry showed Specialty/Start/End flat in the cert +
+  // TWO Attachments boxes — they render via nested_shapes / nested_attachments instead).
+  const mk = (fkit) => ({ fkit, fields: [
+    { fieldName: "certification", label: "Certification*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "PMP" }] },
+    { fieldName: "certificationNumber", label: "Certification Number", widgetType: "text", value: "" },
+    { fieldName: "specialtyParent", label: "Specialty*", widgetType: "typeahead", isRequired: true }, // nested — inside the container
+    { fieldName: "startDate", label: "Start Date", widgetType: "date" },                              // nested
+    { fieldName: "endDate", label: "End Date", widgetType: "date" },                                  // nested
+    { fieldName: "attachments", label: "Attachments", widgetType: "file_upload" },                    // per-entry attach input
+  ] });
   const state = webState({ prefix: "certification-", entries: [mk("certification-287--null")] });
   const fieldMap = [{ field: "certification", widget: "dropdown", key: "cert", path: "certification" }];
   const act = makeFakeRepeatAct(state);
@@ -3848,6 +3858,12 @@ test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_sha
   assert.deepStrictEqual(stub.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
   assert.strictEqual(stub.nested_attachments, true, "the stub knows the section has attachments (add-back offers a picker)");
   assert.ok(!out.results.some((r) => r.widgetType === "nested_section_stub"), "a deleted cert → NO per-entry nested stub");
+  const flatNames = stub.section_field_shape.map((s) => s.recName);
+  assert.ok(flatNames.includes("certification") && flatNames.includes("certificationNumber"), "the cert's OWN fields stay in the flat shape");
+  assert.ok(!flatNames.includes("specialtyParent") && !flatNames.includes("startDate") && !flatNames.includes("endDate"),
+    "nested child fields EXCLUDED from the flat shape — Specialty renders ONLY as the sub-section");
+  assert.ok(!stub.section_field_shape.some((s) => s.widget_type === "file_upload"),
+    "the per-entry Attachments input EXCLUDED — nested_attachments renders the single picker (no double box)");
 });
 
 test("M38 Bug B1: a required pick failing TRANSIENTLY (options didn't render) is KEPT + needs_review, NOT deleted", async () => {

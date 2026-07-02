@@ -3366,11 +3366,23 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       const s = await act.repeatingScan();
       const sec = s && s.sections ? s.sections[containerPrefix] : null;
       const fields = sec && sec.entries && sec.entries[0] && Array.isArray(sec.entries[0].fields) ? sec.entries[0].fields : null;
-      if (fields && fields.length) detectedShape = fields.map((f) => {
-        const o = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
-        if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; }
-        return o;
-      });
+      if (fields && fields.length) {
+        // The entry scan sees EVERYTHING inside the --null container — including NESTED child
+        // fields (specialtyParent/startDate/endDate live INSIDE the cert entry) and the per-entry
+        // Attachments file input. Those belong to nested_shapes / nested_attachments (the viewer
+        // renders them as the Specialties sub-card + the file picker) — leaking them into the FLAT
+        // shape DOUBLED them on an added-back entry (operator bug: "Specialty should only be a
+        // subsection, not part of the main section" + two Attachments boxes). WE's own
+        // startDate/endDate are unaffected — its exclusion set is empty (no nested config).
+        const nestedFieldNames = new Set([].concat(...(((section.nested || {}).subSections) || []).map((ss) => (ss.fieldMap || []).map((fm) => fm.field))));
+        const hasNestedAttach = !!(section.nested && section.nested.attachments);
+        const flat = fields.filter((f) => !nestedFieldNames.has(f.fieldName) && !(hasNestedAttach && f.widgetType === "file_upload"));
+        if (flat.length) detectedShape = flat.map((f) => {
+          const o = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
+          if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; }
+          return o;
+        });
+      }
     } catch (e) { /* best-effort — the map fallback still applies */ }
   };
   const stubShape = () => (detectedShape && detectedShape.length) ? detectedShape
