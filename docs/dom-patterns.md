@@ -2026,3 +2026,40 @@ stage the error). What the log showed, in order:
     reconcile-to-exactly-N is unchanged.
   - Tier 0 (dup-language hardcode) kept as the fast path — it live-verified this round (phantom
     mode deleted both languages correctly).
+
+## 2026-07-02 — Magna wd3: nested fields contaminate every PARENT-entry scan (three stacked bugs, one fact)
+
+The one DOM fact: **a cert's nested Specialties fields (`formField-specialtyParent`/`startDate`/`endDate`)
+and its per-entry Attachments input live INSIDE the cert `--null` container** — so ANY scan that
+enumerates a cert entry's `formField-*` descendants sees them as if they were the cert's own fields.
+Three separate consumers tripped over it:
+
+- **m3b reveal-by-add clicked the nested Specialties Add.** `cdpRepeatingScan.addButtons` is
+  page-wide; "Specialties" matches no PAGE_SECTIONS heading and has no `--null` container → it passed
+  every unknown-empty-section guard → reveal-by-add MOUNTED an empty specialty row it then could
+  neither detect (no new `--null` prefix; the cert count unchanged — the row is INSIDE the entry) nor
+  delete → a leftover phantom row on EVERY full-page fill (its required pick then blocked Save &
+  Continue until Tier-1.5 cleaned it). Fix: addButtons carry **`insideEntry`** (any ancestor fkit
+  with the `-<digits>--` infix — the cdpPageScan isRepeating idiom); m3b skips them;
+  `revealUnknownSection` diffs `nestedScan` around its Add and deletes whatever a mis-click mounts.
+- **The add-entry SHAPE leak.** `detectSectionShapes` runs on the PRE-FILL scan (the page's original
+  state) and persists `section_shapes` for the viewer's "+ Add entry"; `captureDetectedShape` feeds
+  the emptied-section stub. Both mapped `entries[0].fields` raw → with a specialty mounted at page
+  load the cert template showed Specialty*/Start/End FLAT plus a second Attachments row. Both now
+  exclude a known section's nested child field names (from its nested config), its attachments
+  input, and ANY field with an EMPTY fieldName. Timing was never the cure — by end-of-page the fill
+  itself mounts a specialty; the exclusion (config knowledge) is.
+- **The Attachments wrapper is `formField-` with an EMPTY suffix** (fieldName ""), and
+  `cdpRepeatingScan.classify` had NO `input[type=file]` rung → the attachments field typed "unknown"
+  and evaded every `file_upload` exclusion (→ a text-box "Attachments" row in review). classify now
+  has the file rung + the `selectinput` rung (the nested specialty typeahead carries NO "multiselect"
+  node — only `data-uxi-widget-type="selectinput"`), LOCKSTEP with cdpPageScan/cdpGenericNestedScan.
+  Empty-fieldName wrappers are additionally skipped by the sweep + the m3a already-filled emit.
+
+**Also settled this round (fill-driver, not DOM):** a FAILED inline-AI rescue (needs_review,
+after:null) must never pre-empt the resting honesty read — the live "summary showed nothing while
+the page held 'Other - OTH'" bug: the AI record wins only when the page is genuinely blank (its
+ai-* flag drives review reasons + the delete-sweep), else the kept-chip record wins with the AI
+failure appended. And the PROACTIVE nested deleteOnNoMatch: a nested row whose required pick ends
+BLANK on a definitive negative is deleted at fill time (value-holders/transients never; the
+sub-section stub notes the removal).
