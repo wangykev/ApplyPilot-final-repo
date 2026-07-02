@@ -2022,8 +2022,55 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const scan = await act.scanPage();
   const results = [];
 
+  // ── FILL IN DOM ORDER: flat fields and sections INTERLEAVED by page position ──
+  // (operator observation 2026-07-02: Websites filled before Application Documents even though
+  // Documents sits ABOVE it — flat fields all ran before any section.) Each flat field carries its
+  // docY (cdpPageScan) and every section's Add button carries its rect (document-order addButtons):
+  // a pending section drives the moment the flat loop reaches a field BELOW it; whatever remains
+  // drives after the loop, in DOM order. A scan without docY/rects (the page engine, older fakes)
+  // keeps today's flat-then-sections order — nothing hardcoded, order read from the live page.
+  let rscan = null;
+  try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
+  const adds = (rscan && Array.isArray(rscan.addButtons)) ? rscan.addButtons : [];
+  const anchorYOf = (sec) => {
+    const re = new RegExp(sec.headingRegex, "i");
+    const b = adds.find((x) => x && !x.insideEntry && re.test((x.nearestHeading) || ""));
+    return b && b.rect && typeof b.rect.cy === "number" ? b.rect.cy : Infinity;
+  };
+  const pendingSections = [];
+  if (!only && rscan && (rscan.sections || rscan.addButtons)) {
+    for (const sec of sectionsInDomOrder(PAGE_SECTIONS, rscan.addButtons)) {
+      if (onlySec && !onlySec.has(sec.name)) continue; // Tier-1.5: only the error-named section(s)
+      const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
+      const re = new RegExp(sec.headingRegex, "i");
+      const hasAdd = adds.some((b) => re.test((b && b.nearestHeading) || ""));
+      if (!hasContainer && !hasAdd) continue; // section not on this page
+      pendingSections.push({ sec, anchorY: anchorYOf(sec) });
+    }
+  }
+  const driveSec = async (sec) => {
+    const items = Array.isArray(profile[sec.itemsKey]) ? profile[sec.itemsKey] : [];
+    const out = await driveRepeatingSectionCdp(act, {
+      name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
+      items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
+      aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
+      nested: sec.nested || null,          // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
+      // AI-4 Tier-1.6 remediation re-fill: NEVER reconcile-DOWN (deleting entries beyond profile-N
+      // would wipe rows the operator added by hand — the 2026-07-02 complaint). Main fill: false.
+      preserveExtras: !!(opts && opts.preserveExtras)
+    }, budgets);
+    if (out && Array.isArray(out.results)) results.push(...out.results);
+  };
+  const driveSectionsAbove = async (docY) => {
+    while (pendingSections.length && typeof docY === "number" && pendingSections[0].anchorY < docY) {
+      await driveSec(pendingSections.shift().sec);
+    }
+  };
+  let resumeAttachedInline = false; // one résumé, one target — never spray every upload field
+
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
     if (only && !only.has(f.fieldName)) continue; // AI-4: re-fill only the targeted field(s)
+    await driveSectionsAbove(f.docY); // FILL IN DOM ORDER: sections sitting above this field go first
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
     const rawValue = mappedPath ? getByPath(profile, mappedPath) : undefined;
@@ -2088,8 +2135,25 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           record.detail = decision.detail;
         }
       } else if (f.widgetType === "file_upload") {
-        record.status = "skipped";
-        record.detail = "file upload — not attached by this harness (CDP milestone scope)";
+        // FILL IN DOM ORDER: attach the stored résumé AT the field's page position via the SW-built
+        // seam (was: recorded skipped here + attached in an end-of-page post-pass — Websites filled
+        // before Application Documents even though Documents sits above it). First file_upload only;
+        // an act without the seam (recon harnesses, page-engine fakes) keeps the skip.
+        if (act.attachStoredResume && !resumeAttachedInline) {
+          resumeAttachedInline = true;
+          let ar = null;
+          try { ar = await act.attachStoredResume(f.wrapperSel); } catch (e) { ar = { attached: false, detail: String((e && e.message) || e) }; }
+          if (ar && ar.attached) {
+            record.status = "filled"; record.verified = true; record.after = ar.fileName || null;
+            record.detail = "resume attached in page order" + (ar.confirmationVia ? " (" + ar.confirmationVia + ")" : "");
+          } else {
+            record.status = "needs_review";
+            record.detail = "resume attach failed — " + ((ar && ar.detail) || "no confirmation");
+          }
+        } else {
+          record.status = "skipped";
+          record.detail = "file upload — not attached by this harness (CDP milestone scope)";
+        }
       } else if (f.widgetType === "checkbox") {
         // AI-3 (operator-decided): a REQUIRED checkbox is a consent / acknowledgment → AUTO-CHECK it
         // (status `filled`, SILENT, NOT flagged) so the walk advances — UNLESS the profile EXPLICITLY
@@ -2209,40 +2273,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     await act.delay(budgets.interFieldMs);
   }
 
-  // M38 FOLD — after the flat fields, drive each repeating section PRESENT on this page
-  // (so ONE drivePageFill = a full page fill). One repeatingScan determines presence: a
-  // container with the section's prefix OR an Add button whose nearestHeading matches the
-  // headingRegex (the create-first case — Education can start 0 entries but its Add +
-  // heading are present). Absent sections are SKIPPED → a page with no repeating sections
-  // (page 1) behaves exactly as before (no spurious Add attempts). Section results concat
-  // into `results` (the counts/needsReview below cover them too); driveRepeatingSectionCdp
-  // handles reconcile-to-N (create-first / delete-extras / 0-items) per section. `profile`
-  // is the PREPARED profile (the SW prepareProfile's it), so profile[itemsKey] carries the
-  // annotated arrays. Driven in registry order.
-  let rscan = null;
-  try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
-  if (!only && rscan && (rscan.sections || rscan.addButtons)) {
-    // FILL IN DOM ORDER (operator rule 2026-07-02): drive sections top-to-bottom as they appear on
-    // the PAGE (the human order), not registry order — detected from the scan, nothing hardcoded.
-    for (const sec of sectionsInDomOrder(PAGE_SECTIONS, rscan.addButtons)) {
-      if (onlySec && !onlySec.has(sec.name)) continue; // Tier-1.5: only the error-named section(s)
-      const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
-      const re = new RegExp(sec.headingRegex, "i");
-      const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((b) => re.test((b && b.nearestHeading) || ""));
-      if (!hasContainer && !hasAdd) continue; // section not on this page
-      const items = Array.isArray(profile[sec.itemsKey]) ? profile[sec.itemsKey] : [];
-      const out = await driveRepeatingSectionCdp(act, {
-        name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
-        items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
-        aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
-        nested: sec.nested || null,          // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
-        // AI-4 Tier-1.6 remediation re-fill: NEVER reconcile-DOWN (deleting entries beyond profile-N
-        // would wipe rows the operator added by hand — the 2026-07-02 complaint). Main fill: false.
-        preserveExtras: !!(opts && opts.preserveExtras)
-      }, budgets);
-      if (out && Array.isArray(out.results)) results.push(...out.results);
-    }
-  }
+  // M38 FOLD — drive the sections that remain in the DOM-order queue (those BELOW the last flat
+  // field, or anchor-less ones). Sections ABOVE flat fields already drove inline (interleave above);
+  // presence/create-first/reconcile semantics all live in driveSec/driveRepeatingSectionCdp.
+  for (const p of pendingSections) await driveSec(p.sec);
+  pendingSections.length = 0;
 
   // m3a: surface UNKNOWN repeating sections (present on the form but NOT in PAGE_SECTIONS) as review
   // STUBS carrying the backend identifier (container_prefix + heading + the detected field shape when
@@ -3836,7 +3871,9 @@ function auditEntriesFromResults(results) {
     // entry, surfaced read-only) was never touched by the bot — there's nothing to reconcile, and
     // auditing it MIS-reconciles (e.g. a checkbox re-read returns a boolean vs the "Yes" expected →
     // the inline re-fill toggles it OFF — the live "fluent checkbox unchecked" bug). Skip it.
-    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc && r.flag !== "already-filled" && r.flag !== "already-filled-match")
+    // file_upload excluded: the attach verifies via its OWN confirmation row (file-upload-successful)
+    // and the input resets to 0 files post-upload — an audit re-read can only misreport it.
+    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc && r.widgetType !== "file_upload" && r.flag !== "already-filled" && r.flag !== "already-filled-match")
     .map((r) => ({ key: r.fieldName, widgetType: r.widgetType, auditLoc: r.auditLoc, auditTag: r.auditTag || null, expected: r.after }));
 }
 function applyAuditVerdicts(results, verdicts) {
