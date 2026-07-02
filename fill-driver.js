@@ -2265,16 +2265,21 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           const shp = shapeByRec[f.fieldName] || {};
           const v = f.value;
           const hasVal = v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
+          const isReq = !!f.isRequired;
+          // has a value → verify (filled_review); REQUIRED + empty → needs a value (needs_review);
+          // OPTIONAL + empty → fine to leave EMPTY → "skipped" (deriveReview won't flag it for approval).
+          const status = hasVal ? "filled_review" : (isReq ? "needs_review" : "skipped");
           results.push({
             fieldName: base + "[" + i + "]." + f.fieldName, label: f.label || f.fieldName,
-            widgetType: shp.widget_type || f.widgetType, isRequired: !!f.isRequired,
+            widgetType: shp.widget_type || f.widgetType, isRequired: isReq,
             mappedPath: base + "[" + i + "]." + f.fieldName,
             rawValue: null, resolved: null,
-            status: "filled_review", matchTier: null, confidence: null, flag: "already-filled",
+            status, matchTier: null, confidence: null, flag: "already-filled",
             // String(v) matches the bot's checkbox convention (fillCheckboxCdp → String(checked) =
             // "true"/"false") + the viewer's checkedOf/tokenFor; a checkbox reads back boolean true → "true".
             verified: null, after: hasVal ? String(v) : null,
-            detail: hasVal ? "already on the form — NOT filled by ApplyPilot; verify" : "on the form, empty — not filled by ApplyPilot; verify/fill",
+            detail: hasVal ? "already on the form — NOT filled by ApplyPilot; verify"
+              : isReq ? "required — on the form but EMPTY; needs a value" : "optional — on the form, empty; fine to leave",
             options: shp.options || null, date_order: shp.date_order || null, auditLoc: f.wrapperSel
           });
         }
@@ -3583,7 +3588,10 @@ function buildReviewBundle(results, meta) {
     // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
     // "skipped", which would otherwise early-return needs_review:false).
     if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
-    if (rec.flag === "already-filled") return { needs_review: true, needs_review_reason: "already_on_form" }; // a field of an UNKNOWN section already on the form — bot didn't fill it; operator verifies
+    if (rec.flag === "already-filled") { // a field of an UNKNOWN section already on the form — bot didn't fill it
+      if (rec.status === "skipped") return { needs_review: false, needs_review_reason: null }; // OPTIONAL + empty → fine to leave, no approval needed
+      return { needs_review: true, needs_review_reason: "already_on_form" }; // has a value (verify) OR required + empty (needs a value)
+    }
     if (rec.flag === "nested-unfilled") return { needs_review: true, needs_review_reason: "nested_section" }; // a nested repeating field (cert → specialty) — operator fills/verifies
     if (rec.flag === "nested-section-stub") return { needs_review: true, needs_review_reason: "nested_section" }; // an EMPTY nested sub-section (reveal-by-add) — operator adds/verifies entries
     if (rec.flag === "nested-attachment") return { needs_review: true, needs_review_reason: "nested_attachment" }; // a per-entry attachment — upload on the form

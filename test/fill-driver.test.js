@@ -2830,6 +2830,23 @@ test("driveRepeatingSectionCdp: NO section.nested → no nested emit (WE/Educati
   assert.ok(!out.results.some((r) => r.widgetType === "nested_section_stub" || r.flag === "nested-attachment"), "no nested emit without a config");
 });
 
+test("generic UNKNOWN section: empty OPTIONAL field stays empty (not flagged); empty REQUIRED needs a value", async () => {
+  const optField = { wrapperSel: "O0", fieldName: "note", widgetType: "text", label: "Note", isRequired: false };
+  const reqField = { wrapperSel: "R0", fieldName: "title", widgetType: "text", label: "Title*", isRequired: true };
+  const rscan = { url: "fake://p2", addButtons: [], sections: {
+    "publication-": { entryCount: 1, heading: "Publications", entries: [{ fields: [
+      { fieldName: "note", widgetType: "text", label: "Note", isRequired: false, value: null, wrapperSel: "O0" },
+      { fieldName: "title", widgetType: "text", label: "Title*", isRequired: true, value: null, wrapperSel: "R0" },
+    ] }] }
+  } };
+  const out = await drivePageFill(makeFakeAct([optField, reqField], { rscan }), {}, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "publication[0].note").status, "skipped", "empty OPTIONAL → skipped (fine to leave empty, no approval)");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "publication[0].title").status, "needs_review", "empty REQUIRED → needs a value");
+  const bundle = buildReviewBundle(out.results, { page: "p2" });
+  assert.strictEqual(bundle.entries.find((e) => e.canonical_field === "publication[0].note").needs_review, false, "empty optional NOT flagged (won't require approval)");
+  assert.strictEqual(bundle.entries.find((e) => e.canonical_field === "publication[0].title").needs_review, true, "empty required flagged");
+});
+
 test("PAGE_SECTIONS: exactly one section (Certifications) carries a nested config", () => {
   assert.strictEqual(PAGE_SECTIONS.find((s) => s.name === "certification").nested, CERT_NESTED);
   assert.strictEqual(PAGE_SECTIONS.filter((s) => s.nested).length, 1);

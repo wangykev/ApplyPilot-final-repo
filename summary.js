@@ -132,6 +132,18 @@ const setApproved = (entry, on) => {
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
   updateApprovalUI();
 };
+// Approve a whole SECTION at once (instead of per-field) — for already-filled / prefilled repeating
+// sections. A REQUIRED field that's still EMPTY is NOT approved (it needs a value first); everything
+// else (a field with a value, or an entry the operator left as-is) is approved. Empty OPTIONAL fields
+// aren't flagged at all (they can stay empty), so they don't appear here.
+const approveSection = (page, key) => {
+  const at = new Date().toISOString();
+  for (const e of currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key && requiresApproval(e))) {
+    if (e.is_required && (e.current_value == null || e.current_value === "")) continue; // required + empty → needs a value first
+    e.is_approved = true; e.approved_at = at;
+  }
+  persist(); render();
+};
 // Reassigned each render() to recompute the envelope + repaint the header strip / submit button
 // without a full re-render. A no-op before the first render.
 let updateApprovalUI = () => {};
@@ -461,21 +473,43 @@ function buildEditor(entry) {
     // fill-back attaches it, and current_value = the filename (marks it provided). The top-level
     // resume / Documents stay display-only here (that's uploaded via the popup).
     if (entry.flag !== "nested-attachment") return null;
+    // Workday attachment fields take MULTIPLE files → a multi-select picker. Each pick APPENDS to what's
+    // already chosen; all files are stored (base64 in IndexedDB, keyed per field) for a future fill-back,
+    // and current_value = the comma-joined filenames. A per-file "×" removes one.
     const wrap = el("div", { class: "file-attach" });
-    const status = el("span", { class: "file-status", text: cur ? ("✓ " + cur) : "no file chosen" });
-    const inp = el("input", { type: "file" }); inp.style.display = "none";
-    const btn = el("button", { class: "file-btn", text: "Choose file…" });
+    const list = el("div", { class: "file-list" });
+    const inp = el("input", { type: "file", multiple: "" }); inp.style.display = "none";
+    const btn = el("button", { class: "file-btn", text: "+ Add file(s)…" });
+    const names = () => String(entry.current_value == null ? "" : entry.current_value).split(",").map((s) => s.trim()).filter(Boolean);
+    const store = async (arr) => {
+      onCommit(arr.join(", "));
+      try { if (typeof saveResume === "function") await saveResume({ key: "attachment:" + entry.canonical_field, filenames: arr, savedAt: new Date().toISOString() }); } catch (e) { /* best-effort */ }
+      drawList();
+    };
+    const drawList = () => {
+      list.textContent = "";
+      const arr = names();
+      if (!arr.length) { list.appendChild(el("span", { class: "file-status", text: "no files chosen" })); return; }
+      arr.forEach((nm, i) => {
+        const chip = el("span", { class: "file-chip" }, [el("span", { text: "✓ " + nm }), el("button", { class: "file-x", title: "remove", text: "×" })]);
+        chip.lastChild.addEventListener("click", () => { const next = names(); next.splice(i, 1); store(next); });
+        list.appendChild(chip);
+      });
+    };
     btn.addEventListener("click", () => inp.click());
     inp.addEventListener("change", async () => {
-      const f = inp.files && inp.files[0]; if (!f) return;
+      const files = Array.from(inp.files || []); if (!files.length) return;
+      const merged = names();
       try {
-        const base64 = await fileToBase64(f);
-        if (typeof saveResume === "function") await saveResume({ key: "attachment:" + entry.canonical_field, filename: f.name, mime: f.type, size: f.size, base64, savedAt: new Date().toISOString() });
-      } catch (e) { /* storage best-effort — the filename still records the intent */ }
-      onCommit(f.name); status.textContent = "✓ " + f.name;
+        const blobs = [];
+        for (const f of files) { if (!merged.includes(f.name)) merged.push(f.name); blobs.push({ filename: f.name, mime: f.type, size: f.size, base64: await fileToBase64(f) }); }
+        if (typeof saveResume === "function") await saveResume({ key: "attachment:" + entry.canonical_field, filenames: merged, files: blobs, savedAt: new Date().toISOString() });
+      } catch (e) { /* best-effort — the filenames still record intent */ }
+      onCommit(merged.join(", ")); inp.value = ""; drawList();
     });
-    wrap.appendChild(btn); wrap.appendChild(status); wrap.appendChild(inp);
-    return { node: wrap, set: (v) => { status.textContent = v ? ("✓ " + v) : "no file chosen"; } };
+    wrap.appendChild(list); wrap.appendChild(btn); wrap.appendChild(inp);
+    drawList();
+    return { node: wrap, set: () => drawList() };
   }
   if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
   if (wt === "nested_section_stub") return null; // nested sub-section header → rendered by renderNestedSub, never a field row
@@ -736,6 +770,19 @@ const renderFieldList = (mount) => {
         const addBtn = el("button", { class: "add-entry", text: "+ Add entry" });
         addBtn.addEventListener("click", () => addEntry(pg, g.sec.key));
         body.appendChild(addBtn);
+      }
+      // Approve-by-SECTION: one button for all this section's flagged fields (instead of per-row).
+      // Shows for a REPEATING section with flagged fields; a required-empty field can't be approved
+      // (it's counted in the note), and empty OPTIONAL fields aren't flagged (they stay empty).
+      const secFlagged = g.items.filter((e) => !e.is_deleted && requiresApproval(e));
+      if (repeating && secFlagged.length) {
+        const pending = secFlagged.filter((e) => !e.is_approved);
+        const sb = el("button", { class: "sec-approve" + (pending.length ? "" : " done"), text: pending.length ? ("✓ Approve section (" + pending.length + ")") : "✓ Section approved" });
+        sb.disabled = pending.length === 0;
+        sb.addEventListener("click", () => approveSection(pg, g.sec.key));
+        body.appendChild(sb);
+        const blockedReq = secFlagged.filter((e) => e.is_required && (e.current_value == null || e.current_value === ""));
+        if (blockedReq.length) body.appendChild(el("div", { class: "sec-note", text: blockedReq.length + " required field(s) still need a value before this section can be fully approved" }));
       }
       if (!body.childNodes.length) continue;
 
