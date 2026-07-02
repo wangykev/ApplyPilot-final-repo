@@ -132,14 +132,16 @@ const setApproved = (entry, on) => {
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
   updateApprovalUI();
 };
+// A REQUIRED field with no value can't be approved (it would block Save & Continue on the form) — the
+// per-field button AND the section button both refuse it. Empty OPTIONAL fields aren't flagged at all.
+const isEmptyVal = (e) => e.current_value == null || e.current_value === "";
+const canApprove = (e) => !(e.is_required && isEmptyVal(e));
 // Approve a whole SECTION at once (instead of per-field) — for already-filled / prefilled repeating
-// sections. A REQUIRED field that's still EMPTY is NOT approved (it needs a value first); everything
-// else (a field with a value, or an entry the operator left as-is) is approved. Empty OPTIONAL fields
-// aren't flagged at all (they can stay empty), so they don't appear here.
+// sections. A required-empty field is skipped (needs a value first); everything else is approved.
 const approveSection = (page, key) => {
   const at = new Date().toISOString();
   for (const e of currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key && requiresApproval(e))) {
-    if (e.is_required && (e.current_value == null || e.current_value === "")) continue; // required + empty → needs a value first
+    if (!canApprove(e)) continue; // required + empty → needs a value first
     e.is_approved = true; e.approved_at = at;
   }
   persist(); render();
@@ -567,10 +569,23 @@ const fieldRow = (e, opts = {}) => {
   // an Approve toggle on every FLAGGED row (needs_review) — the explicit human sign-off the
   // future SUBMIT gate reads. Un-flagged fields are approved-by-default → no toggle.
   let apBtn = null;
+  let apNote = null;
   if (requiresApproval(e)) {
     apBtn = el("button", { class: "apbtn" });
-    apBtn.addEventListener("click", () => setApproved(e, !e.is_approved));
-    line.appendChild(apBtn);
+    apNote = el("span", { class: "approve-note", hidden: "" });
+    apBtn.addEventListener("click", () => {
+      // A required field with no value can't be approved — pop a note explaining WHY (instead of
+      // silently lighting green). Un-approving is always allowed.
+      if (!e.is_approved && !canApprove(e)) {
+        apNote.textContent = "Fill in this required field before approving.";
+        apNote.hidden = false;
+        clearTimeout(apNote._t); apNote._t = setTimeout(() => { apNote.hidden = true; }, 4000);
+        return;
+      }
+      if (apNote) apNote.hidden = true;
+      setApproved(e, !e.is_approved);
+    });
+    line.appendChild(apBtn); line.appendChild(apNote);
   }
   val.appendChild(line);
   if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
@@ -659,7 +674,9 @@ const render = () => {
   const submitNote = el("div", { class: "submit-note" });
   apAll.addEventListener("click", () => {
     const at = new Date().toISOString();
-    for (const e of currentBundle.entries.filter(requiresApproval)) { e.is_approved = true; e.approved_at = at; }
+    // skip required-empty fields — they can't be approved until they have a value (they stay flagged,
+    // so submit_ready stays false, which is correct: an empty required field would block the form).
+    for (const e of currentBundle.entries.filter((e) => requiresApproval(e) && canApprove(e))) { e.is_approved = true; e.approved_at = at; }
     persist();
     for (const e of currentBundle.entries.filter(requiresApproval)) for (const fn of fieldRefreshers.get(e.field_id) || []) fn();
     updateApprovalUI();
