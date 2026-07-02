@@ -1545,8 +1545,13 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // flag overwrite-nomatch-original-kept (future-AI candidate).
   if (isOverwrite) {
     const aiR = await tryInlineAi();
-    if (aiR) return aiR;
-    return await overwriteNoMatchResting(act, loc, (l) => act.readHier(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
+    // Return the AI's record ONLY when it carries a real outcome (a commit, or an honest non-null
+    // after). A FAILED rescue (needs_review, after:null) must NOT mask the kept original — the live
+    // "summary showed nothing while the page held 'Other'" bug: the field still holds the
+    // previously-committed chip, and the resting honesty read below is what reports it. The AI's
+    // failure detail is carried onto that record so the whole story survives.
+    if (aiR && !(aiR.status === "needs_review" && aiR.after == null)) return aiR;
+    const rest = await overwriteNoMatchResting(act, loc, (l) => act.readHier(l), ensureSearchFocused, priorChips, trace, lastFiltered, budgets, preTierIndex > 0,
       // recommitFn (TA): re-select `value` via the proven commit machinery → returns the chips.
       async (value) => {
         // STEP 1 — TERMINAL GATE (the keptLowerTier stray fix): the higher-tier no-match's empty-results render
@@ -1593,12 +1598,21 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
         // with the HONEST live `after`. Never a silent filled.
         return r ? (r.chips || []) : [];
       });
+    if (aiR) {
+      // The page ended BLANK → the AI's failure record is the honest one (its ai-* flag drives the
+      // review reason + the delete-sweep's unconfident-AI rule) — carry the resting detail along.
+      if (rest.after == null) { aiR.detail = (aiR.detail ? aiR.detail + " | " : "") + (rest.detail || "walk exhausted, field blank"); return aiR; }
+      // The page HOLDS a value (the kept original) → the resting record is the honest one.
+      rest.detail = (rest.detail ? rest.detail + " | " : "") + "AI rescue failed: " + (aiR.detail || aiR.flag || "no commit");
+    }
+    return rest;
   }
   // INLINE AI RESCUE (Option B) — empty-field genuine no-match: try the AI on the OPEN field BEFORE the
   // Tab-exit (same as the overwrite branch above). null ⇒ AI off / no context ⇒ the existing Tab honesty
-  // read runs unchanged.
+  // read runs unchanged. Same failed-rescue rule as the overwrite branch: a needs_review/after:null AI
+  // record must not pre-empt the honesty read (a late/stray chip would go unreported).
   const aiR = await tryInlineAi();
-  if (aiR) return aiR;
+  if (aiR && !(aiR.status === "needs_review" && aiR.after == null)) return aiR;
   // Empty-field honesty read: exit via TAB (the only clean non-committing exit — Escape kept
   // focus + the armed row so the next field's focus blur-committed the stray), then read the
   // resting chips so the record NEVER reports after:null when the page physically holds a value —
@@ -1608,8 +1622,14 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const endChips = await tabBlurExit(act, loc, (l) => act.readHier(l));
   const strayChip = endChips && endChips.length ? endChips.join("; ") : null;
   if (strayChip) {
-    return { status: "needs_review", after: strayChip, verified: false, detail: "uncommanded value on the field — review (no candidate matched; chip overwrite is a later milestone)", captured_options: lastFiltered || undefined, settle_trace: trace };
+    // The page HOLDS a value (a prior commit / late stray) → report IT — the "summary showed nothing
+    // while the page held 'Other'" bug: a failed AI record (after:null) must never mask a live chip.
+    const aiNote = aiR && (aiR.detail || aiR.flag) ? " | AI rescue failed: " + (aiR.detail || aiR.flag) : "";
+    return { status: "needs_review", after: strayChip, verified: false, detail: "uncommanded value on the field — review (no candidate matched; chip overwrite is a later milestone)" + aiNote, captured_options: lastFiltered || undefined, settle_trace: trace };
   }
+  // Page genuinely BLANK → a failed AI record is the honest one (its ai-* flag drives the review
+  // reason + the delete-sweep's unconfident-AI rule).
+  if (aiR) return aiR;
   // M38 Bug B1 — GENUINE no-match (for deleteOnNoMatch) ONLY if EVERY candidate gave a
   // definitive negative: a "No matches" banner, or filtered-but-absent (no match object).
   // A timeout (no fresh transition — transient) or a present-but-uncommitted candidate
