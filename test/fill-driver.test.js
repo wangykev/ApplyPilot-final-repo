@@ -2975,6 +2975,51 @@ test("cert attachment fills IN SECTION ORDER via act.attachStoredResume (TEST at
   assert.strictEqual(out2.results.find((r) => r.fieldName === "certification[0].attachments").status, "skipped", "stub unchanged");
 });
 
+test("nested deleteOnNoMatch (proactive): a BLANK genuine-no-match specialty row is DELETED at fill time; a value-holder is KEPT; preserveExtras skips", async () => {
+  // Operator rule 2026-07-02 — was: the blocked row waited for AI-4 Tier-1.5 at advance time.
+  // Mirrors the top-level rule + its safeties: genuine negatives only, value-holders never deleted.
+  const fieldMap = CERT_NESTED.subSections[0].fieldMap;
+  const mkAct = (fieldFlags) => {
+    const field = taField(Object.assign({ wrapperSel: "[w-specialtyParent]", fieldName: "specialtyParent", label: "Specialty*" }, fieldFlags));
+    const act = makeFakeAct([field]);
+    let children = [7];
+    act.nestedScan = async () => ({ parentOrder: { certification: [172] }, nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
+      entries: children.map((ci) => ({ levels: [{ base: "certification", index: 172 }, { base: "specialties", index: ci }], fields: [] })) }] : [] });
+    act.clickNestedAdd = async () => { children.push(9); return { ok: true }; };
+    act.clickNestedDelete = async (pf, base, idx) => { act.log.push(["ndel", pf, base, idx]); children = children.filter((c) => String(c) !== String(idx)); return { ok: true }; };
+    act.nestedFieldSel = async (fkit, fieldName) => "[w-" + fieldName + "]"; // dates resolve to unmatched sels → null reads → skipped
+    return act;
+  };
+  const o = (extra) => Object.assign({ parentBase: "certification", pOrd: 0, pIdx: 172, childBase: "specialties",
+    headingStem: "specialt", fieldMap, items: [{ specialty: "sdjkf" }], budgets: T_BUDGETS }, extra || {});
+  // (a) BLANK + genuine no-match (banner) → the row is DELETED + records removed + a note
+  const actA = mkAct({ chips: [], filterMap: { "sdjkf": { banner: true } } });
+  const recsA = await fillNestedSpecialtiesCdp(actA, o());
+  assert.ok(actA.log.some((l) => l[0] === "ndel" && String(l[3]) === "7"), "the blocked row deleted (right parent + fkit idx)");
+  assert.ok(recsA.filter((r) => /specialties\[0\]\.(specialtyParent|startDate|endDate)$/.test(r.fieldName)).every((r) => r.status === "removed"), "the row's records drop from the bundle");
+  assert.ok(recsA.some((r) => r.widgetType === "section" && r.flag === "nested-nomatch-removed"), "the removal note emitted (stub annotation feeds off it)");
+  // (b) the field HOLDS a value (kept original) → NEVER deleted, the kept chip reported
+  const actB = mkAct({ chips: ["Other - OTH"], filterMap: { "sdjkf": { banner: true } } });
+  const recsB = await fillNestedSpecialtiesCdp(actB, o());
+  assert.ok(!actB.log.some((l) => l[0] === "ndel"), "a value-holder is NEVER deleted (it doesn't block)");
+  assert.strictEqual(recsB.find((r) => /specialtyParent$/.test(r.fieldName)).after, "Other - OTH", "the kept original reported");
+  // (c) preserveExtras (remediation re-fill) → no deletion, ever
+  const actC = mkAct({ chips: [], filterMap: { "sdjkf": { banner: true } } });
+  await fillNestedSpecialtiesCdp(actC, o({ preserveExtras: true }));
+  assert.ok(!actC.log.some((l) => l[0] === "ndel"), "preserveExtras never deletes");
+});
+
+test("buildReviewBundle: a needs_review record's live `after` renders as current_value (the kept original shows IN the field)", () => {
+  const bundle = buildReviewBundle([{ fieldName: "certification[0].specialties[0].specialtyParent", label: "Specialty",
+    widgetType: "typeahead", isRequired: true, mappedPath: "certifications[0].specialties[0].specialty",
+    rawValue: "sdjkf", resolved: ["sdjkf"], status: "needs_review", matchTier: null, confidence: null,
+    flag: "overwrite-nomatch-original-kept", verified: false,
+    after: "Other - OTH", detail: 'no candidate matched — original pre-fill "Other - OTH" kept' }], { page: "p" });
+  const e = bundle.entries[0];
+  assert.strictEqual(e.current_value, "Other - OTH", "the live kept value shows in the editor, not an empty box");
+  assert.strictEqual(e.needs_review, true, "still flagged for review");
+});
+
 test("fillNestedSpecialtiesCdp: N=0 reconciles DOWN — orphan empty specialty rows DELETED (they'd block Save & Continue)", async () => {
   // The 2026-07-01 live halt: recon-mounted EMPTY specialties + a profile with no specialties →
   // the old `!N` early-return never deleted them → "The field Specialty is required" blocked the

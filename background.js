@@ -5829,7 +5829,9 @@ async function fillEngine(profile, defaults, jobContext) {
     const { confidence, confidence_source } = deriveConfidence(rec);
     const { needs_review, needs_review_reason } = deriveReview(rec);
     // The value actually filled (selected option text for choice widgets), only when filled.
-    const current_value = fill_status === "filled" && rec.after != null ? rec.after : null;
+    // LOCKSTEP ↔ fill-driver.js buildReviewBundle: `after` is only ever a LIVE page value → shows
+    // in the editor for ANY status (a needs_review kept-original renders in the field, not empty).
+    const current_value = rec.after != null ? rec.after : null;
     return {
       field_id: pageKey + "::formField-" + rec.fieldName, // PAGE-QUALIFIED (Plan 2) — globally unique across the accumulated bundle
       page: pageKey,                    // the STABLE merge key (field-set), NOT pageId (shared across pages)

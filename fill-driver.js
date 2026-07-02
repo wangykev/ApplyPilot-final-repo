@@ -2630,7 +2630,8 @@ const CERT_NESTED = {
         { recName: "endDate", widget_type: "date", label: "End Date", is_required: false, date_order: ["month", "day", "year"] }
       ],
       fieldMap: [
-        { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent" },
+        // required: the row's PICK (label "Specialty*") — drives the proactive nested deleteOnNoMatch
+        { field: "specialtyParent", widget: "typeahead", key: "specialty", path: "specialtyParent", required: true },
         // date_order → the record → the summary's SEGMENTED MM/DD/YYYY editor (not a text box)
         { field: "startDate", widget: "date", key: "startDateParsed", path: "startDate", date_order: ["month", "day", "year"] },
         { field: "endDate", widget: "date", key: "endDateParsed", path: "endDate", date_order: ["month", "day", "year"] }
@@ -3048,7 +3049,7 @@ async function fillNestedSpecialtiesCdp(act, o) {
       const loc = { wrapperSel };
       const rec = {
         fieldName: canon + f.path, label: f.field, widgetType: f.widget === "year" ? "date" : f.widget,
-        isRequired: false, mappedPath: canon + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
+        isRequired: !!f.required, mappedPath: canon + f.path, rawValue: item[f.key] === undefined ? null : item[f.key],
         resolved: null, status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
         date_order: f.date_order || null, // → the summary's segmented date editor (bundle passes it through)
         auditLoc: wrapperSel, nested_parent: { base: parentBase, index: pOrd }, nested_child_base: childBase
@@ -3089,6 +3090,39 @@ async function fillNestedSpecialtiesCdp(act, o) {
       }
       recs.push(rec);
       await act.delay(budgets.interFieldMs);
+    }
+  }
+  // ── PROACTIVE nested deleteOnNoMatch (operator rule 2026-07-02) ── a child row whose REQUIRED
+  // pick ended BLANK on a definitive negative — a deterministic GENUINE no-match (M38 B1) or a
+  // failed/unconfident AI rescue (ai-*) — would block Save & Continue, and a nested sub-section is
+  // optional → DELETE the row AT FILL TIME (was: left for AI-4 Tier-1.5 at advance time). A row
+  // HOLDING a value (kept original / AI commit — after non-null) is NEVER deleted (it doesn't
+  // block); a transient/infra failure (no genuineNoMatch tag, no ai- flag) is NEVER deleted (valid
+  // data — the B1 safety). preserveExtras (remediation re-fill) skips deletion entirely. Deleted
+  // rows' records → status "removed" (drop from the bundle) + ONE section-op note; the caller
+  // annotates the sub-section stub so the operator SEES it happened.
+  if (!o.preserveExtras && act.clickNestedDelete) {
+    for (let j = Math.min(N, cur.length) - 1; j >= 0; j--) { // bottom-up (indices stay valid)
+      const canon = parentBase + "[" + pOrd + "]." + childBase + "[" + j + "].";
+      const rowRecs = recs.filter((r) => r.fieldName.indexOf(canon) === 0);
+      const blocked = rowRecs.some((r) => r.isRequired && r.status === "needs_review" && r.after == null
+        && (r.genuineNoMatch === true || /^ai-/.test(String(r.flag || ""))));
+      if (!blocked) continue;
+      const before = (await childIdxs()).length;
+      const del = await act.clickNestedDelete(parentFkit, childBase, cur[j]);
+      if (!del || !del.ok) continue; // can't delete → keep the honest flags (surfaces in review)
+      let now = before;
+      const deadline = Date.now() + (budgets.entryReconcileCeilingMs || 4000);
+      while (Date.now() < deadline) { await act.delay(budgets.entryReconcileIntervalMs || 150); now = (await childIdxs()).length; if (now < before) break; }
+      if (now >= before) continue; // click didn't drop the count → keep (never lie "removed")
+      for (const r of rowRecs) { r.status = "removed"; r.flag = "nested-nomatch-removed"; }
+      recs.push({
+        fieldName: canon + "removed", label: childBase + " row removed", widgetType: "section",
+        isRequired: false, mappedPath: null, rawValue: null, resolved: null,
+        status: "skipped", matchTier: null, confidence: null, flag: "nested-nomatch-removed", verified: null, after: null,
+        detail: "required pick matched nothing (AI could not rescue) → row deleted (optional sub-section; a blank required pick would block Save & Continue)",
+        nested_parent: { base: parentBase, index: pOrd }, nested_child_base: childBase
+      });
     }
   }
   return recs;
@@ -3522,12 +3556,14 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
         const childItems = (ss.itemsKey && Array.isArray(item[ss.itemsKey])) ? item[ss.itemsKey] : [];
         // Runs even with ZERO childItems: fillNestedSpecialtiesCdp reconciles the live child rows
         // to N (incl. down to 0 — deleting orphan empty rows that would block Save & Continue).
+        let removedRows = 0;
         if (pIdx != null && Array.isArray(ss.fieldMap) && act.clickNestedAdd) {
           const filled = await fillNestedSpecialtiesCdp(act, {
             parentBase: name, pOrd: i, pIdx, childBase, headingStem: ss.headingStem || childBase,
             fieldMap: ss.fieldMap, items: childItems, budgets, aiContext: section.aiContext,
             preserveExtras: !!section.preserveExtras // remediation re-fill: never delete manual child rows
           });
+          removedRows = filled.filter((r) => r.widgetType === "section" && r.flag === "nested-nomatch-removed").length;
           results.push(...filled);
         }
         results.push({ // the addable stub (header + "+ Add") — always, so the operator can add more
@@ -3535,7 +3571,8 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
           widgetType: "nested_section_stub", isRequired: false, mappedPath: name + "[" + i + "]." + childBase + "._stub",
           rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
           flag: "nested-section-stub", verified: null, after: null,
-          detail: "nested repeating sub-section (" + name + " ▸ " + childBase + ") — add or verify entries here",
+          detail: "nested repeating sub-section (" + name + " ▸ " + childBase + ") — add or verify entries here"
+            + (removedRows ? ` — ${removedRows} row${removedRows === 1 ? "" : "s"} REMOVED (required pick matched nothing; re-add here if needed)` : ""),
           section_field_shape: nestedShapes[childBase],
           container_prefix: name + "-<idx>--" + childBase + "-", // nested backend identifier (idx resolved at fill-back)
           nested_parent: { base: name, index: i }, nested_child_base: childBase, section_known: false
@@ -4271,7 +4308,11 @@ function buildReviewBundle(results, meta) {
     const fill_status = mapFillStatus(rec.status);
     const { confidence, confidence_source } = deriveConfidence(rec);
     const { needs_review, needs_review_reason } = deriveReview(rec);
-    const current_value = fill_status === "filled" && rec.after != null ? rec.after : null;
+    // `after` is only ever a LIVE page value (fill verify / honesty reads / audit truth / the sweep)
+    // — so it shows in the editor for ANY status, not just filled: a needs_review kept-original
+    // ("Other - OTH" kept when 'sdjkf' matched nothing) renders IN THE FIELD with its note, not as
+    // an empty box (operator rule 2026-07-02). LOCKSTEP with the background.js buildEntry twin.
+    const current_value = rec.after != null ? rec.after : null;
     return {
       field_id: (m.page ? m.page + "::" : "") + "formField-" + rec.fieldName, // PAGE-QUALIFIED → unique in the accumulated bundle
       page: m.page != null ? m.page : null,

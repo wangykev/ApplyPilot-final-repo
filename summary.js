@@ -599,6 +599,12 @@ const fieldRow = (e, opts = {}) => {
   if (isPrePopulated(e)) val.appendChild(el("div", { class: "partial-note", text: e.flag === "already-filled-match"
     ? "Pre-populated — matches your profile; not filled by ApplyPilot."
     : "Pre-populated — not filled by ApplyPilot; verify it's what you want." }));
+  // A FLAGGED row's note shows in the PHYSICAL SECTION too, not just the review list (operator rule
+  // 2026-07-02: e.g. the kept-original "no candidate matched — 'Other - OTH' kept | AI rescue
+  // failed…" must be readable where the field lives). Pre-populated rows keep their friendlier line.
+  if (!opts.review && e.needs_review && e.detail && !isPrePopulated(e)) {
+    val.appendChild(el("div", { class: "partial-note", text: e.detail }));
+  }
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
   row.appendChild(val);
