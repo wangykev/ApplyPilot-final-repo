@@ -517,7 +517,12 @@ function cdpRepeatingScan() {
     return null;
   };
   const classify = (w) => {
-    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    // LOCKSTEP rungs with cdpPageScan/cdpGenericNestedScan: the file rung types a per-entry
+    // Attachments input file_upload (was "unknown" → the sweep/shape exclusions missed it → a
+    // text-box "Attachments" row in review); selectinput covers a typeahead whose widget node
+    // carries ONLY that marker (Magna's nested specialtyParent — no "multiselect" node).
+    if (w.querySelector('input[type="file"]')) return "file_upload";
+    if (w.querySelector('[data-uxi-widget-type="multiselect"], [data-uxi-widget-type="selectinput"]')) return "typeahead";
     if (w.querySelector('input[type="radio"]')) return "radio";
     if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";

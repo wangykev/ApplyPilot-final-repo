@@ -2299,6 +2299,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       //     these; the operator verifies). Editable (options/date_order from the recon'd shape).
       for (let i = 0; i < n; i++) {
         for (const f of ((entries[i] && entries[i].fields) || [])) {
+          if (!f.fieldName) continue; // "" = a bare wrapper (e.g. an attachments "formField-") — unusable row
           const shp = shapeByRec[f.fieldName] || {};
           const v = f.value;
           const hasVal = hasLiveValue(v);
@@ -3209,7 +3210,8 @@ async function sweepAlreadyFilled(act, results) {
     const nestedFields = new Set([].concat(...(((sec.nested || {}).subSections) || []).map((ss) => (ss.fieldMap || []).map((fm) => fm.field))));
     for (let i = 0; i < s.entries.length; i++) {
       for (const fd of ((s.entries[i] && s.entries[i].fields) || [])) {
-        if (fd.widgetType === "file_upload" || nestedFields.has(fd.fieldName)) continue;
+        // "" fieldName = the Attachments wrapper ("formField-" empty suffix) — never a sweep row
+        if (!fd.fieldName || fd.widgetType === "file_upload" || nestedFields.has(fd.fieldName)) continue;
         const fm = (sec.fieldMap || []).find((m) => m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName);
         if (fm) {
           const key = sec.name + "[" + i + "]." + (fm.name || fm.field);
@@ -4221,12 +4223,30 @@ function detectSectionShapes(scan) {
   // unknown section). A present-but-empty section has no entry to read → no shape (m3b reveal-by-add).
   const knownByPrefix = {};
   for (const sec of PAGE_SECTIONS) knownByPrefix[sec.containerPrefix] = sec.name;
+  // A KNOWN section's NESTED child fields + per-entry Attachments live INSIDE the entry container,
+  // so the entry scan sees them — but they belong to nested_shapes / nested_attachments (the viewer's
+  // Specialties sub-card + file picker), NOT the flat add-entry shape. This scan runs on the page's
+  // ORIGINAL state: a specialty mounted at page-load leaked Specialty*/Start/End + a text-box
+  // "Attachments" row into the cert's add-entry template (operator bug 2026-07-02). LOCKSTEP with
+  // captureDetectedShape's exclusion (driveRepeatingSectionCdp).
+  const nestedExcl = {};
+  for (const sec of PAGE_SECTIONS) {
+    nestedExcl[sec.containerPrefix] = {
+      names: new Set([].concat(...(((sec.nested || {}).subSections) || []).map((ss) => (ss.fieldMap || []).map((fm) => fm.field)))),
+      attach: !!(sec.nested && sec.nested.attachments)
+    };
+  }
   for (const prefix of Object.keys(scan.sections)) {
     const s = scan.sections[prefix];
     const fields = s && Array.isArray(s.entries) && s.entries[0] && Array.isArray(s.entries[0].fields) ? s.entries[0].fields : null;
     if (!fields || !fields.length) continue;
     const name = knownByPrefix[prefix] || prefix.replace(/-$/, "");
-    shapes[name] = fields.map((f) => {
+    const ex = nestedExcl[prefix] || { names: new Set(), attach: false };
+    // fieldName "" = the Attachments wrapper ("formField-" with an empty suffix) — an unusable
+    // recName in any shape (and the classifier can't type a bare file wrapper reliably) → always out.
+    const flat = fields.filter((f) => f.fieldName && !ex.names.has(f.fieldName) && !(ex.attach && f.widgetType === "file_upload"));
+    if (!flat.length) continue;
+    shapes[name] = flat.map((f) => {
       const s = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType,
         label: f.label != null ? f.label : f.fieldName, is_required: !!f.isRequired };
       if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; } // m3c: segment order for the summary date editor

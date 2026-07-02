@@ -2782,6 +2782,35 @@ test("detectSectionShapes: empty/missing scan → {}", () => {
   assert.deepStrictEqual(detectSectionShapes(null), {});
   assert.deepStrictEqual(detectSectionShapes({}), {});
 });
+test("detectSectionShapes: a MOUNTED specialty at page-load does NOT leak into the cert's add-entry shape (operator bug)", () => {
+  // The ORIGINAL-state scan sees the nested specialty fields + the Attachments input INSIDE the
+  // cert entry container. They belong to nested_shapes/nested_attachments — the flat add-entry
+  // shape must hold ONLY the cert's own fields (was: Specialty*/Start/End flat in the added entry
+  // + a text-box "Attachments" row alongside the real picker).
+  const scan = { sections: {
+    "certification-": { entries: [{ fields: [
+      { fieldName: "certification", widgetType: "typeahead", label: "Certification*", isRequired: true },
+      { fieldName: "certificationNumber", widgetType: "text", label: "Number", isRequired: false },
+      { fieldName: "issuedDate", widgetType: "date", label: "Issued Date", dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"] },
+      { fieldName: "expirationDate", widgetType: "date", label: "Expiration Date", dateSegments: ["dateSectionMonth-input", "dateSectionDay-input", "dateSectionYear-input"] },
+      { fieldName: "specialtyParent", widgetType: "typeahead", label: "Specialty*", isRequired: true }, // nested — mounted at load
+      { fieldName: "startDate", widgetType: "date", label: "Start Date" },                              // nested
+      { fieldName: "endDate", widgetType: "date", label: "End Date" },                                  // nested
+      { fieldName: "", widgetType: "unknown", label: "Attachments" },                                   // the attachments wrapper (empty fieldName)
+      { fieldName: "someUpload", widgetType: "file_upload", label: "Attachments" },                     // a typed file input
+    ] }] },
+    "publication-": { entries: [{ fields: [ // UNKNOWN section — no nested config, startDate is its OWN field
+      { fieldName: "title", widgetType: "text", label: "Title*", isRequired: true },
+      { fieldName: "startDate", widgetType: "date", label: "Published" },
+      { fieldName: "", widgetType: "unknown", label: "Files" }, // empty-name wrapper still excluded
+    ] }] },
+  } };
+  const shapes = detectSectionShapes(scan);
+  assert.deepStrictEqual(shapes.certification.map((s) => s.recName), ["certification", "certificationNumber", "issuedDate", "expirationDate"],
+    "the cert shape holds ONLY its own fields — nested + attachments excluded");
+  assert.deepStrictEqual(shapes["publication"].map((s) => s.recName), ["title", "startDate"],
+    "an unknown section keeps its OWN startDate (no nested config) — only the empty-name wrapper drops");
+});
 test("buildReviewBundle carries section_shapes onto the bundle (2c); defaults to {}", () => {
   const shapes = { website: [{ recName: "url", path: "url", widget_type: "text", label: "URL", is_required: true }] };
   assert.deepStrictEqual(buildReviewBundle([], { page: "p2", sectionShapes: shapes }).section_shapes, shapes);
