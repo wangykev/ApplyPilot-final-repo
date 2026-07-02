@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -101,7 +101,8 @@ function makeFakeAct(fields, opts) {
       repeatingFieldCount: 0,
       fields: fields.map((f) => ({
         wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType,
-        label: f.label || f.fieldName, isRequired: !!f.isRequired
+        label: f.label || f.fieldName, isRequired: !!f.isRequired,
+        value: f.liveValue !== undefined ? f.liveValue : null // already-filled sweep: the field's CURRENT live value
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
@@ -3001,6 +3002,81 @@ test("fillNestedSpecialtiesCdp: probe resolves NOTHING → honest error record, 
     items: [{ specialty: "x", startDateParsed: { year: "2024" } }], budgets: T_BUDGETS });
   assert.ok(recs.every((r) => r.status === "error" && /wrapper not found/.test(r.detail)), "every field an HONEST error");
   assert.deepStrictEqual(touched, [], "no handler ever actuated on an unresolved wrapper");
+});
+
+// ── ALREADY-FILLED sweep — the review inventories EVERYTHING the page holds ─────────────────────
+test("sweep (wire): an unmapped flat field HOLDING a value → filled_review/already-filled + flagged in the bundle; empty stays skipped", async () => {
+  const withVal = { wrapperSel: "X0", fieldName: "randomExtra", widgetType: "text", label: "Extra thing", isRequired: false, liveValue: "operator typed this" };
+  const empty = { wrapperSel: "X1", fieldName: "otherExtra", widgetType: "text", label: "Other", isRequired: false, liveValue: null };
+  const out = await drivePageFill(makeFakeAct([withVal, empty]), {}, {}, {}, T_BUDGETS);
+  const r = out.results.find((x) => x.fieldName === "randomExtra");
+  assert.strictEqual(r.status, "filled_review");
+  assert.strictEqual(r.flag, "already-filled");
+  assert.strictEqual(r.after, "operator typed this", "the LIVE value is captured into the record");
+  const e = out.results.find((x) => x.fieldName === "otherExtra");
+  assert.strictEqual(e.status, "skipped", "an EMPTY unmapped field stays skipped");
+  assert.strictEqual(e.flag, null);
+  const bundle = buildReviewBundle(out.results, { page: "p" });
+  assert.strictEqual(bundle.entries.find((x) => x.field_id.endsWith("formField-randomExtra")).needs_review, true, "flagged for review");
+  assert.strictEqual(bundle.entries.find((x) => x.field_id.endsWith("formField-randomExtra")).needs_review_reason, "already_on_form");
+  assert.strictEqual(bundle.entries.find((x) => x.field_id.endsWith("formField-otherExtra")).needs_review, false);
+});
+
+test("sweep: a live value that MATCHES the profile's own value → already-filled-match, NOT flagged (correct value, no review)", async () => {
+  const results = [{ fieldName: "phoneType", label: "Phone Type", widgetType: "dropdown", isRequired: false,
+    mappedPath: "personal_info.phone_type", rawValue: "Mobile", resolved: null,
+    status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: "options did not render earlier" }];
+  const act = { scanPage: async () => ({ fields: [{ fieldName: "phoneType", wrapperSel: "P0", value: "Mobile" }] }), repeatingScan: async () => null };
+  await sweepAlreadyFilled(act, results);
+  assert.strictEqual(results[0].status, "filled");
+  assert.strictEqual(results[0].flag, "already-filled-match");
+  assert.strictEqual(results[0].after, "Mobile");
+  const bundle = buildReviewBundle(results, { page: "p" });
+  assert.strictEqual(bundle.entries[0].needs_review, false, "matches the profile → recorded but NOT flagged");
+});
+
+test("sweep: KNOWN sections — mapped-but-skipped field flips; an UNMAPPED section field with a value gets a NEW record; nested child fields excluded", async () => {
+  const results = [{ fieldName: "education[0].gradeAverage", label: "GPA", widgetType: "text", isRequired: false,
+    mappedPath: "education[0].gpa", rawValue: null, resolved: null,
+    status: "skipped", matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: "empty value" }];
+  const rscan = { sections: {
+    "education-": { entries: [{ fields: [
+      { fieldName: "gradeAverage", label: "Overall Result (GPA)", widgetType: "text", isRequired: false, value: "3.9", wrapperSel: "G0" },
+      { fieldName: "honors", label: "Honors", widgetType: "text", isRequired: false, value: "Magna Cum Laude", wrapperSel: "H0" },
+    ] }] },
+    "certification-": { entries: [{ fields: [
+      { fieldName: "specialtyParent", label: "Specialty", widgetType: "typeahead", isRequired: false, value: "Other", wrapperSel: "S0" },
+    ] }] }
+  } };
+  const act = { scanPage: async () => ({ fields: [] }), repeatingScan: async () => rscan };
+  await sweepAlreadyFilled(act, results);
+  const gpa = results.find((r) => r.fieldName === "education[0].gradeAverage");
+  assert.strictEqual(gpa.status, "filled_review", "mapped-but-skipped section field with a live value → flipped");
+  assert.strictEqual(gpa.flag, "already-filled");
+  assert.strictEqual(gpa.after, "3.9");
+  const honors = results.find((r) => r.fieldName === "education[0].honors");
+  assert.ok(honors, "an unmapped KNOWN-section field with a value → NEW already-filled record (the 'not mapped' edge case)");
+  assert.strictEqual(honors.flag, "already-filled");
+  assert.strictEqual(honors.after, "Magna Cum Laude");
+  assert.ok(!results.some((r) => /specialtyParent/.test(r.fieldName)), "nested child fields (cert ▸ specialties) are EXCLUDED — reconciled + audited via their own records");
+});
+
+test("sweep: never clobbers an existing classification (flagged skip records untouched)", async () => {
+  const results = [{ fieldName: "essayField", label: "Essay", widgetType: "textarea", isRequired: false,
+    mappedPath: null, rawValue: null, resolved: null,
+    status: "skipped", matchTier: null, confidence: null, flag: "ai-text-skip", verified: null, after: null, detail: "AI declined (optional)" }];
+  const act = { scanPage: async () => ({ fields: [{ fieldName: "essayField", wrapperSel: "E0", value: "half-typed draft" }] }), repeatingScan: async () => null };
+  await sweepAlreadyFilled(act, results);
+  assert.strictEqual(results[0].flag, "ai-text-skip", "an already-classified skip keeps its provenance");
+  assert.strictEqual(results[0].status, "skipped");
+});
+
+test("audit: 'already-filled-match' records are NOT audited either (bot never actuated them)", () => {
+  const entries = auditEntriesFromResults([
+    { fieldName: "a", widgetType: "dropdown", status: "filled", auditLoc: "L1", after: "X", flag: "already-filled-match" },
+    { fieldName: "b", widgetType: "text", status: "filled", auditLoc: "L2", after: "Y", flag: null },
+  ]);
+  assert.deepStrictEqual(entries.map((e) => e.key), ["b"], "only the bot-actuated record is audited");
 });
 
 test("audit: 'already-filled' surfaced records are NOT audited (the fluent-checkbox uncheck bug)", () => {

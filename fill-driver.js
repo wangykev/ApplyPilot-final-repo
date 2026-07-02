@@ -53,6 +53,10 @@ function flagTierCategory(matchTier) {
   if (typeof matchTier === "string" && matchTier.indexOf("fuzzy") === 0) return "fuzzy";
   return "none";
 }
+// A scanned LIVE value counts as "filled": checkbox true, or any non-empty string that isn't the
+// dropdown placeholder. (false / "" / null / "Select One" = empty.) Shared by the unknown-section
+// already-filled surfacing (m3a) and the page-wide already-filled sweep.
+const hasLiveValue = (v) => v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
 function commitOutcome(overwrite, commitKind, matchTier) {
   const tier = flagTierCategory(matchTier);
   if (overwrite) {
@@ -2264,7 +2268,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         for (const f of ((entries[i] && entries[i].fields) || [])) {
           const shp = shapeByRec[f.fieldName] || {};
           const v = f.value;
-          const hasVal = v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
+          const hasVal = hasLiveValue(v);
           const isReq = !!f.isRequired;
           // has a value → verify (filled_review); REQUIRED + empty → needs a value (needs_review);
           // OPTIONAL + empty → fine to leave EMPTY → "skipped" (deriveReview won't flag it for approval).
@@ -2429,6 +2433,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       }
     }
   }
+
+  // ── ALREADY-FILLED sweep ── the review must inventory EVERYTHING the page holds: a `skipped`
+  // record whose field HOLDS a live value (Workday account pre-fill / operator / prior run) is
+  // surfaced with the value + flagged "already-filled" (needs_review) — or "already-filled-match"
+  // (no flag) when it equals the profile's own value. Unmapped KNOWN-section fields with values get
+  // NEW records. Read-only; runs BEFORE the audit snapshot (both flags are audit-excluded — the bot
+  // never actuated these, so the inline audit must never "re-fill" them: the fluent-checkbox lesson).
+  if (!only) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
 
   // ── AI TYPEAHEAD FALLBACK is now INLINE (Option B) ── a typeahead that GENUINELY no-matches hands the
   // captured option list + profile to the LLM and commits its pick ON THE OPEN FIELD right then, inside
@@ -2843,6 +2855,79 @@ async function fillNestedSpecialtiesCdp(act, o) {
     }
   }
   return recs;
+}
+
+// ── ALREADY-FILLED sweep ── the review summary must inventory EVERYTHING the page holds, not just
+// what the bot filled. A record that ended `skipped` (no mapping / not in profile) whose field HOLDS
+// a live value was filled by someone else (Workday account pre-fill, the operator, a prior run) —
+// surface the value + FLAG it ("already-filled" → needs_review, the m3a unknown-section convention
+// generalized to flat fields + KNOWN sections). If the live value normalize-matches the record's own
+// profile value it's correct → recorded, NOT flagged ("already-filled-match"). Fields a KNOWN
+// section's map doesn't cover (tenant extras) get NEW already-filled records. READ-ONLY (one flat
+// scan + one repeating scan, no actuation); nested child fields (cert ▸ specialties) are excluded —
+// reconciled to the profile + M40-audited via their own records. NOTE: scan entry i joins record
+// ordinal i (DOM order == fill ordinal); a mid-list deleteOnNoMatch delete could shift the join for
+// later entries — flag-only, never actuates, so the worst case is a mislabeled review flag.
+async function sweepAlreadyFilled(act, results) {
+  const norm = apMatch.normalize;
+  const matchesOwn = (rec, live) => {
+    const own = rec.resolved != null ? rec.resolved : rec.rawValue;
+    const cands = Array.isArray(own) ? own : (own != null ? [own] : []);
+    return cands.some((c) => typeof c === "string" && norm(c) && norm(c) === norm(String(live)));
+  };
+  const flip = (rec, live, wrapperSel) => {
+    if (matchesOwn(rec, live)) {
+      rec.status = "filled"; rec.flag = "already-filled-match";
+      rec.detail = "already on the form — matches the profile value (not re-typed)";
+    } else {
+      rec.status = "filled_review"; rec.flag = "already-filled";
+      rec.detail = "already on the form — NOT filled by ApplyPilot; verify";
+    }
+    rec.after = String(live); rec.verified = null;
+    if (!rec.auditLoc && wrapperSel) rec.auditLoc = wrapperSel;
+  };
+  // FLAT fields — records keyed by the bare DOM fieldName (no "[").
+  let flat = null; try { flat = await act.scanPage(); } catch (e) { flat = null; }
+  if (flat && Array.isArray(flat.fields)) {
+    const byName = {}; for (const f of flat.fields) byName[f.fieldName] = f;
+    for (const rec of results) {
+      if (rec.status !== "skipped" || rec.fieldName.indexOf("[") !== -1) continue;
+      if (rec.widgetType === "file_upload" || rec.widgetType === "unknown" || rec.widgetType === "section") continue;
+      if (rec.flag) continue; // already classified (ai-* skip, already-filled, …) — don't clobber provenance
+      const f = byName[rec.fieldName];
+      if (f && hasLiveValue(f.value)) flip(rec, f.value, f.wrapperSel);
+    }
+  }
+  // KNOWN repeating sections — join scan entries ↔ records via each section's fieldMap
+  // (field automation-id OR labelRegex, the fillEntryCdp findFd logic mirrored).
+  let rscan = null; try { rscan = await act.repeatingScan(); } catch (e) { rscan = null; }
+  const sections = (rscan && rscan.sections) || {};
+  for (const sec of PAGE_SECTIONS) {
+    const s = sections[sec.containerPrefix];
+    if (!s || !Array.isArray(s.entries)) continue;
+    const nestedFields = new Set([].concat(...(((sec.nested || {}).subSections) || []).map((ss) => (ss.fieldMap || []).map((fm) => fm.field))));
+    for (let i = 0; i < s.entries.length; i++) {
+      for (const fd of ((s.entries[i] && s.entries[i].fields) || [])) {
+        if (fd.widgetType === "file_upload" || nestedFields.has(fd.fieldName)) continue;
+        const fm = (sec.fieldMap || []).find((m) => m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName);
+        if (fm) {
+          const rec = results.find((r) => r.fieldName === sec.name + "[" + i + "]." + (fm.name || fm.field));
+          if (rec && rec.status === "skipped" && !rec.flag && hasLiveValue(fd.value)) flip(rec, fd.value, fd.wrapperSel);
+        } else if (hasLiveValue(fd.value)) {
+          // an UNMAPPED field inside a KNOWN section holding a value — the "not mapped" edge case
+          results.push({
+            fieldName: sec.name + "[" + i + "]." + fd.fieldName, label: fd.label || fd.fieldName,
+            widgetType: fd.widgetType, isRequired: !!fd.isRequired,
+            mappedPath: null, rawValue: null, resolved: null,
+            status: "filled_review", matchTier: null, confidence: null, flag: "already-filled",
+            verified: null, after: String(fd.value),
+            detail: "already on the form (unmapped section field) — NOT filled by ApplyPilot; verify",
+            auditLoc: fd.wrapperSel || null
+          });
+        }
+      }
+    }
+  }
 }
 
 async function driveRepeatingSectionCdp(act, section, budgetsIn) {
@@ -3371,7 +3456,7 @@ function auditEntriesFromResults(results) {
     // entry, surfaced read-only) was never touched by the bot — there's nothing to reconcile, and
     // auditing it MIS-reconciles (e.g. a checkbox re-read returns a boolean vs the "Yes" expected →
     // the inline re-fill toggles it OFF — the live "fluent checkbox unchecked" bug). Skip it.
-    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc && r.flag !== "already-filled")
+    .filter((r) => (r.status === "filled" || r.status === "filled_review") && r.auditLoc && r.flag !== "already-filled" && r.flag !== "already-filled-match")
     .map((r) => ({ key: r.fieldName, widgetType: r.widgetType, auditLoc: r.auditLoc, auditTag: r.auditTag || null, expected: r.after }));
 }
 function applyAuditVerdicts(results, verdicts) {
@@ -3709,10 +3794,11 @@ function buildReviewBundle(results, meta) {
     // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
     // "skipped", which would otherwise early-return needs_review:false).
     if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
-    if (rec.flag === "already-filled") { // a field of an UNKNOWN section already on the form — bot didn't fill it
+    if (rec.flag === "already-filled") { // a field already on the form — bot didn't fill it (unknown section OR the page-wide sweep)
       if (rec.status === "skipped") return { needs_review: false, needs_review_reason: null }; // OPTIONAL + empty → fine to leave, no approval needed
       return { needs_review: true, needs_review_reason: "already_on_form" }; // has a value (verify) OR required + empty (needs a value)
     }
+    if (rec.flag === "already-filled-match") return { needs_review: false, needs_review_reason: null }; // already on the form AND equals the profile value → correct, no flag
     if (rec.flag === "nested-unfilled") return { needs_review: true, needs_review_reason: "nested_section" }; // a nested repeating field (cert → specialty) — operator fills/verifies
     if (rec.flag === "nested-section-stub") return { needs_review: true, needs_review_reason: "nested_section" }; // an EMPTY nested sub-section (reveal-by-add) — operator adds/verifies entries
     if (rec.flag === "nested-attachment") return { needs_review: true, needs_review_reason: "nested_attachment" }; // a per-entry attachment — upload on the form
@@ -3832,5 +3918,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

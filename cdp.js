@@ -393,6 +393,20 @@ function cdpPageScan() {
     }
     return false;
   };
+  // The field's CURRENT live value (the already-filled sweep: the review must inventory everything
+  // the page holds, not just what the bot filled). LOCKSTEP with cdpRepeatingScan's valueOf. Empty
+  // date segments render their "MM"/"DD"/"YYYY" placeholder text → filtered (never counts as filled).
+  const valueOf = (wr, wt) => {
+    try {
+      if (wt === "dropdown") { const b = wr.querySelector('button[aria-haspopup="listbox"]'); return b ? (b.textContent || "").trim() : null; }
+      if (wt === "typeahead" || wt === "hierarchical") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
+      if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
+      if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
+      const segs = Array.from(wr.querySelectorAll('[data-automation-id^="dateSection"][data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t));
+      if (segs.length) return segs.join("/");
+      const inp = wr.querySelector("input, textarea"); return inp ? (inp.value || null) : null;
+    } catch (e) { return null; }
+  };
   const all = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
   const wrappers = all.filter((w) => !isRepeating(w));
   return {
@@ -400,12 +414,14 @@ function cdpPageScan() {
     repeatingFieldCount: all.length - wrappers.length,
     fields: wrappers.map((w) => {
       const id = w.getAttribute("data-automation-id");
+      const wt = classify(w);
       return {
         wrapperSel: '[data-automation-id="' + id + '"]',
         fieldName: id.slice("formField-".length),
-        widgetType: classify(w),
+        widgetType: wt,
         label: labelOf(w),
-        isRequired: requiredOf(w)
+        isRequired: requiredOf(w),
+        value: valueOf(w, wt)
       };
     })
   };
@@ -577,7 +593,7 @@ function cdpRepeatingScan() {
             if (wt === "dropdown") { const b = wr.querySelector('button[aria-haspopup="listbox"]'); return b ? (b.textContent || "").trim() : null; }
             if (wt === "typeahead") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
             if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
-            if (wt === "date") { const segs = Array.from(wr.querySelectorAll('[data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter(Boolean); return segs.length ? segs.join("/") : null; }
+            if (wt === "date") { const segs = Array.from(wr.querySelectorAll('[data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t)); return segs.length ? segs.join("/") : null; } // empty segments show "MM"/"DD"/"YYYY" placeholders — never count as filled
             if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
             const inp = wr.querySelector('input, textarea'); return inp ? (inp.value || null) : null;
           } catch (e) { return null; }
