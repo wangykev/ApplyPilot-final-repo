@@ -106,6 +106,9 @@ const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
 // the riskiest committed AI answers → loudest, rendered FIRST (≥ legally-loaded).
 const isSuperHard = (e) => e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
 const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
+// Pre-populated: the value was ALREADY on the form (Workday account pre-fill / operator / prior
+// run) — ApplyPilot recorded it but never filled it. "-match" = it equals the profile value (unflagged).
+const isPrePopulated = (e) => e.flag === "already-filled" || e.flag === "already-filled-match";
 
 const addRefresher = (id, fn) => { if (!fieldRefreshers.has(id)) fieldRefreshers.set(id, new Set()); fieldRefreshers.get(id).add(fn); };
 // Shared write-back (M14): current_value ← pick (null = cleared), edit_kind/is_edited recomputed,
@@ -555,6 +558,7 @@ const fieldRow = (e, opts = {}) => {
     else if (isEeoGuess(e)) lab.appendChild(el("span", { class: "lb eeo", text: "DEMOGRAPHIC" }));
     else if (needsAnswer(e)) lab.appendChild(el("span", { class: "lb crit", text: "NEEDS ANSWER" }));
     else if (isAiFlag(e) && !isSuperHard(e)) lab.appendChild(el("span", { class: "lb ai", text: "AI" }));
+    else if (isPrePopulated(e)) lab.appendChild(el("span", { class: "lb pre", text: "PRE-POPULATED" }));
   }
   lab.appendChild(document.createTextNode(fmt(e.question_label)));
   if (e.is_required) lab.appendChild(el("span", { class: "req", title: "required", text: "✱" }));
@@ -590,6 +594,11 @@ const fieldRow = (e, opts = {}) => {
   val.appendChild(line);
   if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
   if (ed && ed.tier) val.appendChild(el("div", { class: "partial-note", text: TIER_NOTE }));
+  // Pre-populated note on EVERY view (the review list shows detail too; the ALL-FIELDS list doesn't
+  // — this small line is the operator's cue that the value was already there, not ApplyPilot's).
+  if (isPrePopulated(e)) val.appendChild(el("div", { class: "partial-note", text: e.flag === "already-filled-match"
+    ? "Pre-populated — matches your profile; not filled by ApplyPilot."
+    : "Pre-populated — not filled by ApplyPilot; verify it's what you want." }));
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
   row.appendChild(val);
