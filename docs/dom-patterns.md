@@ -1950,3 +1950,42 @@ carrying **`data-uxi-widget-type="selectinput"`** (no `multiselect` marker node)
   (`svg[class*="trash"]`, e.g. `wd-icon-trash`) — the ancestor-scoping guard (never spanning the parent's
   own fields) is what keeps an icon-only match safe. Top-level `cdpDeleteEntryRect` (panel-header text
   "Delete") left as-is — live-proven on Magna/LiveRamp.
+
+## 2026-07-01 — Workday error banner CONCATENATES all errors into ONE element (AI-4 remediation blind spot)
+
+Live walk halt (Magna page 2, "Junior Full Stack Developer Coop"): Save & Continue blocked with a
+Specialty-required error + the dup-language error; AI-4 remediation returned `no-action` and dirty-halted.
+Three independent gaps lined up — the log is a keeper:
+
+- **The top error-summary banner is ONE element whose textContent concatenates EVERY error**, each
+  prefixed `Error-<FieldName>`:
+  `Error-SpecialtyThe field Specialty is required and must have a value.Error-LanguageDuplicate language entries are not allowed.`
+  The M31 `errorMarkers.samples` read sliced each element to 120 chars — fine as a diagnostic, but AI-4
+  later made samples DECISION inputs, so any error past the first ~2 in the banner was INVISIBLE to the
+  tiers. Live: two Specialty errors sat ahead of the language error → "Duplicate language entr…" fell past
+  the cut → the Tier-0 dup-language hardcode never fired on a page that plainly showed its error.
+  **Fix:** slice raised to 600 (cdp.js) + `expandErrorSamples` (lib.js) splits samples on the `Error-`
+  prefix into individual error texts before ANY tier/AI-prompt/no-progress comparison sees them.
+- **`[role="alert"]` catches success toasts too** — "Kevin's Resume 2.pdf successfully uploaded" counted
+  as 2 of the "4 errors" and fed noise into the AI prompt. `expandErrorSamples` drops
+  success-toast pieces (no "error" text + /successfully uploaded/). The fast-exit COUNT in
+  `cdpWaitNextPage` is unchanged (errors-present ⟺ won't-advance still holds — the toasts only appear
+  alongside real state).
+- **Nested section fields are invisible to the remediation executor.** Tier 2's AI correctly named
+  `specialtyParent`, but the refill executor looks fields up in the FLAT `act.scanPage()` — which
+  deliberately excludes every field inside an indexed fkit entry — so it logged "not on the page" and
+  skipped. Tier 1 (`mappedFieldsFromErrors`) is flat-FIELD_MAP-only by construction.
+  **Fix — Tier 1.5 section re-fill:** `sectionsFromErrorNames` (fill-driver.js) maps parsed error titles
+  to their OWNING `PAGE_SECTIONS` entry (heading regex / fieldMap labelRegex / camelCase field words /
+  nested sub-section field labels — "Specialty" → certification), and `remediatePageErrors` re-runs JUST
+  those sections via the new `drivePageFill({onlySections})` mode (flat loop skipped; reconcile-to-N +
+  re-fill incl. nested specialties; same targeted-mode skips as `onlyFieldNames`).
+- **Error-title quirk:** a blank nested template slot renders its error title with EMPTY parens —
+  "The field Specialty () is required…" (alongside a plain "Specialty" for another row).
+  `sectionsFromErrorNames` normalizes `()` away.
+- **Orphan empty specialties are now reconciled away at N=0:** `fillNestedSpecialtiesCdp`'s old `!N`
+  early-return meant a cert whose profile has NO specialties never deleted recon-mounted empty child rows
+  (an empty REQUIRED specialtyParent blocks Save & Continue — this walk's actual blocker). The call site
+  now always invokes the nested fill (childItems may be empty) and the reconcile-down loop runs at N=0 —
+  the same reconcile-to-exactly-N semantics as the M21 top-level sections. The runCdpWalk "clear orphan
+  specialties first" PREREQ log is retired.

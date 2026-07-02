@@ -2518,9 +2518,10 @@ function mergeRemediationRecord(out, rec) {
   if (i !== -1) out.results[i] = rec; else out.results.push(rec);
 }
 
-// AI-4 validation-error remediation loop (Tier 1 anchors → Tier 2 AI), bounded + halt-on-no-progress.
+// AI-4 validation-error remediation loop (Tier 0 dup-language → Tier 1 flat re-fill → Tier 1.5
+// section re-fill → Tier 2 AI), bounded + halt-on-no-progress.
 // Runs ONLY when the session is LIVE (the caller already excluded sessionDead) and Save & Continue
-// stayed put. GLOBAL shared cap across both tiers (REMEDIATION_MAX — Hold 1, "not 2+2"); halts the
+// stayed put. GLOBAL shared cap across ALL tiers (REMEDIATION_MAX — Hold 1, "not 2+2"); halts the
 // instant the error set is UNCHANGED after an action (no point re-firing the same fix). Every action
 // is recorded into out.results (flag ai-remediation) + the bundle re-persisted. NEVER submits — the
 // re-Save&Continue is the GUARDED clickPageNext (refuses on the review marker).
@@ -2528,7 +2529,10 @@ const REMEDIATION_MAX = 3;
 async function remediatePageErrors(act, profile, defaults, jobContext, out, pageKey, page, LOG) {
   const actions = [];
   let st = null; try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-  let prevErrors = (st && st.errorMarkers && st.errorMarkers.samples) || [];
+  // expandErrorSamples (lib.js): Workday's top banner concatenates EVERY error into one element —
+  // split into individual errors + drop success toasts, so no error hides from the tiers (the
+  // 2026-07-01 live Tier-0 dup-language miss was a truncated concatenated banner).
+  let prevErrors = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
   LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s). Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
 
   for (let attempt = 1; attempt <= REMEDIATION_MAX; attempt++) {
@@ -2580,6 +2584,29 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
           mergeRemediationRecord(out, r);
         }
         actions.push({ tier: 1, refilled: [...refill] });
+        didSomething = true;
+      }
+    }
+
+    // ── Tier 1.5 (DETERMINISTIC, no AI): the error names a REPEATING-SECTION field — the flat
+    //    FIELD_MAP/scan can't reach those (the 2026-07-01 live miss: "The field Specialty is
+    //    required" names the NESTED cert specialtyParent, excluded from the flat scan → Tier 2
+    //    correctly named it but had no executable action). Map the named titles to their OWNING
+    //    section(s) (sectionsFromErrorNames: headings / field labels / nested labels) and re-run
+    //    JUST those sections via drivePageFill({onlySections}) — reconcile-to-N + re-fill, incl.
+    //    nested specialties (whose reconcile now deletes orphan empty rows at N=0). ──
+    if (!didSomething) {
+      const named = prevErrors.map((t) => parseErrorFieldName(t)).filter(Boolean);
+      const secNames = sectionsFromErrorNames(named);
+      if (secNames.length) {
+        LOG(`  attempt ${attempt} (Tier 1.5, deterministic): error names section field(s) [${named.join(", ")}] → re-run section(s) [${secNames.join(", ")}] (no AI).`);
+        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames) });
+        for (const r of (rOut.results || [])) {
+          r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
+          r.detail = "AI-4 Tier-1.5 section re-fill — " + (r.detail || "");
+          mergeRemediationRecord(out, r);
+        }
+        actions.push({ tier: 1.5, sections: secNames, named });
         didSomething = true;
       }
     }
@@ -2644,7 +2671,7 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
 
     // ── not advanced → HALT on NO-PROGRESS (error set unchanged); else continue. ──
     let st2 = null; try { st2 = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-    const newErrors = (st2 && st2.errorMarkers && st2.errorMarkers.samples) || [];
+    const newErrors = expandErrorSamples((st2 && st2.errorMarkers && st2.errorMarkers.samples) || []);
     if (errorSetUnchanged(prevErrors, newErrors)) {
       LOG(`  remediation made NO PROGRESS (error set unchanged after the action) — halting.`);
       return { advanced: false, reason: "no-progress", attempts: attempt, actions, errors: newErrors };
@@ -4114,7 +4141,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   const reportPageErrors = async (pageOut) => {
     let st = null;
     try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-    const samples = (st && st.errorMarkers && st.errorMarkers.samples) || [];
+    // expanded: the top banner concatenates every error into one element — split so each
+    // error is its own bullet (and success toasts don't masquerade as errors).
+    const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
     if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
     if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
     if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
@@ -4132,7 +4161,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
-    LOG("PREREQ: clear any recon-mounted orphan cert Specialties first — an empty REQUIRED specialty blocks Save & Continue (a false nav-timeout halt at the cert page).");
+    LOG("note: orphan EMPTY cert Specialties are auto-reconciled during the cert fill (deleted when the profile has none) — no manual pre-clean needed; a blocked page also gets an AI-4 Tier-1.5 section re-fill.");
 
     // CLEAR the accumulated summary ONCE at walk START, OUTSIDE the loop (its own guard):
     // a fresh application starts clean. The loop only calls the ACCUMULATING persist — a

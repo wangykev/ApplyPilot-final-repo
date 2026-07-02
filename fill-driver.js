@@ -2008,14 +2008,21 @@ function makeStartCapture(act, loc) {
 // `opts.onlyFieldNames` (a Set) = AI-4 TARGETED RE-FILL: fill ONLY those flat fields through the
 // SAME per-field loop (byte-identical to the full fill — no parallel re-impl, no drift) and skip
 // the section fold + the inline audit (the remediation's Save & Continue retry is the verification).
+// `opts.onlySections` (a Set of PAGE_SECTIONS names) = AI-4 Tier-1.5 SECTION RE-FILL: skip the flat
+// loop entirely and drive ONLY the named repeating sections through the SAME fold (reconcile-to-N +
+// re-fill, incl. nested specialties) — for errors naming section fields the flat FIELD_MAP can't
+// reach (the live nested-Specialty miss, 2026-07-01). Same targeted-mode skips as onlyFieldNames
+// (no unknown-section stubs / cascade / sweep / inline audit — the Save & Continue retry verifies).
 // Default (no opts) = the full page fill, unchanged.
 async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
   const only = opts && opts.onlyFieldNames ? opts.onlyFieldNames : null; // AI-4 targeted re-fill
+  const onlySec = opts && opts.onlySections ? opts.onlySections : null;  // AI-4 Tier-1.5 section re-fill
+  const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
   const scan = await act.scanPage();
   const results = [];
 
-  for (const f of scan.fields) {
+  for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
     if (only && !only.has(f.fieldName)) continue; // AI-4: re-fill only the targeted field(s)
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
@@ -2216,6 +2223,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   try { if (!only) rscan = await act.repeatingScan(); } catch (e) { /* no repeating substrate (flat-only fake) → skip */ }
   if (!only && rscan && (rscan.sections || rscan.addButtons)) {
     for (const sec of PAGE_SECTIONS) {
+      if (onlySec && !onlySec.has(sec.name)) continue; // Tier-1.5: only the error-named section(s)
       const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
       const re = new RegExp(sec.headingRegex, "i");
       const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((b) => re.test((b && b.nearestHeading) || ""));
@@ -2238,7 +2246,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // add/delete) — the stub is needs_review and the values are the operator's (or a future fill-back
   // session's, which reads container_prefix/the field automation-ids). An EMPTY unknown section shows
   // its identifier; its fields are TBD until an entry exists (m3b reveal-by-add). Skipped under `only`.
-  if (!only && rscan && rscan.sections) {
+  if (!targeted && rscan && rscan.sections) {
     const knownPrefixes = new Set(PAGE_SECTIONS.map((s) => s.containerPrefix));
     for (const prefix of Object.keys(rscan.sections)) {
       if (knownPrefixes.has(prefix)) continue; // a known section — handled by the loop above
@@ -2307,7 +2315,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Cost: AT MOST one reused repeating-scan per page, and ONLY when a present section was create-
   // first (empty at the pre-loop scan but mounted after filling); zero actuation; skipped under `only`.
   let sectionShapes = {};
-  if (!only && rscan) {
+  if (!targeted && rscan) {
     const needRescan = PAGE_SECTIONS.some((sec) => {
       if (rscan.sections && rscan.sections[sec.containerPrefix]) return false; // already mounted at the pre-loop scan
       const re = new RegExp(sec.headingRegex, "i");
@@ -2325,7 +2333,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // base) + opts.headingToBase (an empty section's base is unknown pre-mount, so it's matched by
   // heading) → fires once per bundle-lifetime, not every fill (the "fast, especially hidden"
   // constraint); "Clear summary" resets. Skipped under `only`.
-  if (!only && rscan && Array.isArray(rscan.addButtons)) {
+  if (!targeted && rscan && Array.isArray(rscan.addButtons)) {
     const knownRes = PAGE_SECTIONS.map((s) => new RegExp(s.headingRegex, "i"));
     const norm = (h) => String(h || "").trim().toLowerCase().replace(/\s+/g, " ");
     // headings of sections m3a ALREADY surfaced (they have entries) — normalized so a case/whitespace
@@ -2384,7 +2392,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // field, so by here the reveal is usually already mounted; the loop re-scans after each
   // fill round to catch a chained reveal, bounded by maxCascadeRounds. SKIPPED under `only`
   // (a targeted re-fill never needs to cascade — same gate as the fold/audit above).
-  if (!only) {
+  if (!targeted) {
     const seen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
       let reFields;
@@ -2414,7 +2422,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // render flake) is left untouched + flagged. filled/filled_review are EXCLUDED here — a
   // filled-THEN-removed field is the M40 audit's audit-unverifiable job. Runs BEFORE the audit
   // so a removed field never reaches it. SKIPPED under `only` (a targeted re-fill never cascades).
-  if (!only) {
+  if (!targeted) {
     const upFront = new Set(scan.fields.map((f) => f.fieldName));
     const candidates = results.filter((r) => upFront.has(r.fieldName) && (r.status === "needs_review" || r.status === "error" || r.status === "skipped"));
     if (candidates.length) {
@@ -2440,7 +2448,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // (no flag) when it equals the profile's own value. Unmapped KNOWN-section fields with values get
   // NEW records. Read-only; runs BEFORE the audit snapshot (both flags are audit-excluded — the bot
   // never actuated these, so the inline audit must never "re-fill" them: the fluent-checkbox lesson).
-  if (!only) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
+  if (!targeted) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
 
   // ── AI TYPEAHEAD FALLBACK is now INLINE (Option B) ── a typeahead that GENUINELY no-matches hands the
   // captured option list + profile to the LLM and commits its pick ON THE OPEN FIELD right then, inside
@@ -2457,12 +2465,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // `auditEntries` (expected = the value just filled, BEFORE any mutation) is returned for the SW
   // to persist (the standalone re-audit). Flag-only — never auto-refills.
   // (AI-4 targeted re-fill skips the inline audit — the remediation's Save & Continue retry verifies.)
-  const auditEntries = only ? [] : auditEntriesFromResults(results);
+  const auditEntries = targeted ? [] : auditEntriesFromResults(results);
   // Summary editability: scrape the full option list for choice fields that lack one (tagged FoS
   // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
-  if (!only) await captureChoiceOptions(act, results, budgets);
-  if (!only) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
+  if (!targeted) await captureChoiceOptions(act, results, budgets);
+  if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
@@ -2602,6 +2610,47 @@ const PAGE_SECTIONS = [
   { name: "language", headingRegex: "languages?", containerPrefix: "language-", itemsKey: "languages", fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true },
   { name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-", itemsKey: "websites", fieldMap: WEBSITE_MAP, deleteOnNoMatch: false }
 ];
+
+// AI-4 Tier-1.5 (DETERMINISTIC, no AI): which KNOWN repeating sections do these error-named field
+// titles belong to? Tier-1's flat FIELD_MAP can't reach section fields — the live miss (2026-07-01)
+// was "The field Specialty is required" naming the NESTED cert specialtyParent, which is neither in
+// the flat scan (isRepeating excludes fkit-entry fields) nor in FIELD_MAP, so remediation had no
+// executable action. This maps the parsed titles to their OWNING section(s) so remediatePageErrors
+// can re-run JUST those sections via drivePageFill({onlySections}) — reconcile-to-N + re-fill.
+// A name hits a section when it matches the section heading, a fieldMap labelRegex, a camelCase
+// field name split to words ("specialtyParent" → "specialty parent"), or a nested sub-section's
+// human field label ("Specialty"). Bidirectional containment after normalization (mirrors
+// mappedFieldsFromErrors' loose-but-harmless rule: a section re-fill is idempotent — reconcile +
+// re-filling correct values is a no-op-shaped write, and every record is flagged for review).
+// `names` = parseErrorFieldName outputs; returns PAGE_SECTIONS `name`s, registry order.
+function sectionsFromErrorNames(names) {
+  const norm = (s) => String(s == null ? "" : s).toLowerCase()
+    .replace(/\(\s*\)/g, " ")                 // "Specialty ()" → "Specialty" (empty parens = a blank template slot)
+    .replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
+  const words = (s) => norm(String(s || "").replace(/([a-z])([A-Z])/g, "$1 $2"));
+  const contains = (a, b) => !!(a && b && (a === b || a.includes(b) || b.includes(a)));
+  const nList = (Array.isArray(names) ? names : []).map(norm).filter((n) => n && n.length >= 3); // <3 chars = too generic to anchor a section re-run
+  if (!nList.length) return [];
+  const out = [];
+  for (const sec of PAGE_SECTIONS) {
+    const headRe = new RegExp(sec.headingRegex, "i");
+    const corpus = [];
+    const regexes = [];
+    for (const f of (sec.fieldMap || [])) {
+      if (f.field) corpus.push(words(f.field));
+      if (f.labelRegex) regexes.push(f.labelRegex);
+    }
+    for (const ss of ((sec.nested && sec.nested.subSections) || [])) {
+      if (ss.heading) corpus.push(norm(ss.heading));
+      for (const rf of (ss.fields || [])) if (rf.label) corpus.push(norm(rf.label));
+      for (const f of (ss.fieldMap || [])) if (f.field) corpus.push(words(f.field));
+    }
+    if (nList.some((n) => headRe.test(n) || regexes.some((re) => re.test(n)) || corpus.some((c) => contains(c, n)))) {
+      out.push(sec.name);
+    }
+  }
+  return out;
+}
 
 // Today's date as a {month, day, year} composite — the WE "currently_work_here but the required
 // To box didn't disappear" fallback (a blank required field would block Save & Continue). SW/Node
@@ -2771,7 +2820,10 @@ async function fillNestedSpecialtiesCdp(act, o) {
   const { parentBase, pOrd, pIdx, childBase, headingStem, fieldMap, items, budgets, aiContext } = o;
   const recs = [];
   const N = Array.isArray(items) ? items.length : 0;
-  if (!N || !(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return recs;
+  // N=0 does NOT early-return: reconcile DOWN still runs, deleting orphan empty child rows (e.g.
+  // the recon-mounted empty Specialties — an empty REQUIRED specialtyParent blocks Save & Continue,
+  // the 2026-07-01 live halt). Same reconcile-to-exactly-N semantics as the top-level sections (M21).
+  if (!(act.nestedScan && act.clickNestedAdd && act.clickNestedDelete)) return recs;
   const parentFkit = parentBase + "-" + pIdx + "--null";
   const childIdxs = async () => { // sorted child fkit indices of THIS parent's childBase sub-section
     let scan = null; try { scan = await act.nestedScan(); } catch (e) { return []; }
@@ -3141,7 +3193,9 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
       for (const ss of (nested.subSections || [])) {
         const childBase = ss.childBase;
         const childItems = (ss.itemsKey && Array.isArray(item[ss.itemsKey])) ? item[ss.itemsKey] : [];
-        if (childItems.length && pIdx != null && Array.isArray(ss.fieldMap) && act.clickNestedAdd) {
+        // Runs even with ZERO childItems: fillNestedSpecialtiesCdp reconciles the live child rows
+        // to N (incl. down to 0 — deleting orphan empty rows that would block Save & Continue).
+        if (pIdx != null && Array.isArray(ss.fieldMap) && act.clickNestedAdd) {
           const filled = await fillNestedSpecialtiesCdp(act, {
             parentBase: name, pOrd: i, pIdx, childBase, headingStem: ss.headingStem || childBase,
             fieldMap: ss.fieldMap, items: childItems, budgets, aiContext: section.aiContext
@@ -3918,5 +3972,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

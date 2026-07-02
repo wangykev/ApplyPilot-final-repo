@@ -1123,8 +1123,12 @@ function cdpReadSessionState() {
     // state, NOT a dead session (recon 2026-06-27). isWorkdayMaintenance keys off this (+ title/bodyText).
     maintenancePresent: /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(bodyText),
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
-    // M31: error-element detail for the validation-vs-VPS recon diff
-    errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 120)).filter(Boolean) },
+    // M31: error-element detail for the validation-vs-VPS recon diff. Samples are now DECISION
+    // INPUTS (the AI-4 tiers key off them via lib.js expandErrorSamples), not just diagnostics —
+    // and Workday's top summary banner concatenates EVERY error into ONE element, so the old
+    // 120-char slice silently dropped errors past the first ~2 (the 2026-07-01 live Tier-0
+    // dup-language miss). 600 chars ≈ 8 concatenated errors; expandErrorSamples splits them SW-side.
+    errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 600)).filter(Boolean) },
     bodyTextSample: bodyText.slice(0, 500).replace(/\s+/g, " ").trim()
   };
 }
