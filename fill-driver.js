@@ -2233,7 +2233,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
         items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
         aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
-        nested: sec.nested || null           // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
+        nested: sec.nested || null,          // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
+        // AI-4 Tier-1.6 remediation re-fill: NEVER reconcile-DOWN (deleting entries beyond profile-N
+        // would wipe rows the operator added by hand — the 2026-07-02 complaint). Main fill: false.
+        preserveExtras: !!(opts && opts.preserveExtras)
       }, budgets);
       if (out && Array.isArray(out.results)) results.push(...out.results);
     }
@@ -2629,12 +2632,14 @@ const PAGE_SECTIONS = [
 // mappedFieldsFromErrors' loose-but-harmless rule: a section re-fill is idempotent — reconcile +
 // re-filling correct values is a no-op-shaped write, and every record is flagged for review).
 // `names` = parseErrorFieldName outputs; returns PAGE_SECTIONS `name`s, registry order.
+// (normTitle/camelWords/titleContains are shared with deleteTargetsFromErrorNames below.)
+const normTitle = (s) => String(s == null ? "" : s).toLowerCase()
+  .replace(/\(\s*\)/g, " ")                 // "Specialty ()" → "Specialty" (empty parens = a blank template slot)
+  .replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
+const camelWords = (s) => normTitle(String(s || "").replace(/([a-z])([A-Z])/g, "$1 $2"));
+const titleContains = (a, b) => !!(a && b && (a === b || a.includes(b) || b.includes(a)));
 function sectionsFromErrorNames(names) {
-  const norm = (s) => String(s == null ? "" : s).toLowerCase()
-    .replace(/\(\s*\)/g, " ")                 // "Specialty ()" → "Specialty" (empty parens = a blank template slot)
-    .replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
-  const words = (s) => norm(String(s || "").replace(/([a-z])([A-Z])/g, "$1 $2"));
-  const contains = (a, b) => !!(a && b && (a === b || a.includes(b) || b.includes(a)));
+  const norm = normTitle, words = camelWords, contains = titleContains;
   const nList = (Array.isArray(names) ? names : []).map(norm).filter((n) => n && n.length >= 3); // <3 chars = too generic to anchor a section re-run
   if (!nList.length) return [];
   const out = [];
@@ -2656,6 +2661,117 @@ function sectionsFromErrorNames(names) {
     }
   }
   return out;
+}
+
+// AI-4 Tier-1.5 (DETERMINISTIC DELETE — operator rule 2026-07-02): which repeating-section FIELDS do
+// these error-named titles point at? A repeating section is OPTIONAL by nature (rows are removable),
+// so a row that blocks Save & Continue is deletable — the executor (deleteEmptyErrorRows) deletes
+// only rows whose named field reads EMPTY (that's what "is required and must have a value" points
+// at; a row the operator hand-FILLED never reads empty, so it's never deleted). A name matching a
+// NESTED (layer-2) sub-section field targets ONLY the inner rows (cert ▸ specialties) — never the
+// parent entry (deleting the cert to fix a specialty would destroy good data). Cross-section
+// ambiguity (e.g. "Start Date" = WE's startDate AND the nested specialty startDate) returns BOTH
+// targets — safe, because the empty-only rule self-limits each to genuinely blocking rows.
+// Returns [{kind:"entry"|"nested", section, containerPrefix, childBase?, fields:[{field,widget,labelRegex?}]}].
+function deleteTargetsFromErrorNames(names) {
+  const nList = (Array.isArray(names) ? names : []).map(normTitle).filter((n) => n && n.length >= 3);
+  if (!nList.length) return [];
+  const matches = (label, field, labelRegex) => nList.some((n) =>
+    (labelRegex && labelRegex.test(n)) ||
+    (label && titleContains(normTitle(label), n)) ||
+    (field && titleContains(camelWords(field), n)));
+  const out = [];
+  for (const sec of PAGE_SECTIONS) {
+    // NESTED (layer-2) sub-sections — labels come from the config's `fields` (recName-joined)
+    for (const ss of ((sec.nested && sec.nested.subSections) || [])) {
+      const hit = [];
+      for (const fm of (ss.fieldMap || [])) {
+        const rf = (ss.fields || []).find((x) => x.recName === fm.field);
+        if (matches(rf && rf.label, fm.field, null)) hit.push({ field: fm.field, widget: fm.widget });
+      }
+      if (hit.length) out.push({ kind: "nested", section: sec.name, containerPrefix: sec.containerPrefix, childBase: ss.childBase, fields: hit });
+    }
+    // TOP-LEVEL section fields
+    const flat = (sec.fieldMap || []).filter((fm) => matches(null, fm.field, fm.labelRegex || null))
+      .map((fm) => ({ field: fm.field || null, widget: fm.widget, labelRegex: fm.labelRegex || null }));
+    if (flat.length) out.push({ kind: "entry", section: sec.name, containerPrefix: sec.containerPrefix, fields: flat });
+  }
+  return out;
+}
+
+// The Tier-1.5 executor: delete repeating rows whose error-named field reads EMPTY on the live page.
+// kind:"entry" → top-level entries via clickDeleteEntry (highest ordinal first — lower indices stay
+// valid); kind:"nested" → layer-2 child rows via clickNestedDelete (parent entry NEVER deleted; the
+// child's named field is read through the PROBED nested selector — unreadable ⇒ untouched, never a
+// blind delete). Every delete is count-polled; a click that doesn't drop the count halts the loop
+// (no-progress, don't spin the bound). Returns { deleted: [{section, kind, index, parentIndex?, child?}] }.
+async function deleteEmptyErrorRows(act, targets, budgets) {
+  const deleted = [];
+  const ceiling = (budgets && budgets.entryReconcileCeilingMs) || 4000;
+  const interval = (budgets && budgets.entryReconcileIntervalMs) || 150;
+  for (const t of (Array.isArray(targets) ? targets : [])) {
+    if (t.kind === "entry") {
+      let scan = null; try { scan = await act.repeatingScan(); } catch (e) { scan = null; }
+      const s = scan && scan.sections ? scan.sections[t.containerPrefix] : null;
+      if (!s || !Array.isArray(s.entries)) continue;
+      const emptyIdxs = [];
+      for (let i = 0; i < s.entries.length; i++) {
+        const fields = (s.entries[i] && s.entries[i].fields) || [];
+        const anyEmpty = t.fields.some((fm) => {
+          const fd = fm.labelRegex ? fields.find((x) => fm.labelRegex.test(x.label || "")) : fields.find((x) => x.fieldName === fm.field);
+          return fd && !hasLiveValue(fd.value);
+        });
+        if (anyEmpty) emptyIdxs.push(i);
+      }
+      for (const idx of emptyIdxs.slice().sort((a, b) => b - a)) {
+        const before = await act.entryCount(t.containerPrefix);
+        if (before <= 0) break;
+        const del = await act.clickDeleteEntry(t.containerPrefix, idx);
+        if (!del || !del.ok) break;
+        let now = before; const deadline = Date.now() + ceiling;
+        while (Date.now() < deadline) { await act.delay(interval); now = await act.entryCount(t.containerPrefix); if (now < before) break; }
+        if (now >= before) break; // no progress → stop
+        deleted.push({ section: t.section, kind: "entry", index: idx });
+      }
+    } else if (t.kind === "nested" && act.nestedScan && act.clickNestedDelete) {
+      const enumerate = async () => {
+        let ns = null; try { ns = await act.nestedScan(); } catch (e) { return []; }
+        const rows = [];
+        for (const n of ((ns && ns.nestedSections) || [])) {
+          if (n.parentBase !== t.section || n.childBase !== t.childBase) continue;
+          for (const ent of (n.entries || [])) {
+            const lv = ent.levels || []; if (lv.length < 2) continue;
+            rows.push({ pIdx: lv[0].index, cIdx: lv[lv.length - 1].index });
+          }
+        }
+        return rows;
+      };
+      const rows = await enumerate();
+      const empties = [];
+      for (const row of rows) {
+        for (const f of t.fields) {
+          const childFkit = t.section + "-" + row.pIdx + "--" + t.childBase + "-" + row.cIdx + "--" + f.field;
+          let sel = null;
+          if (act.nestedFieldSel) { try { sel = await act.nestedFieldSel(childFkit, f.field); } catch (e) { sel = null; } }
+          else sel = '[data-fkit-id="' + childFkit + '"] [data-automation-id="formField-' + f.field + '"]';
+          if (!sel) continue; // can't resolve → can't read → NEVER delete blind
+          const v = await readLiveValueByWidget(act, f.widget, { wrapperSel: sel });
+          if (!hasLiveValue(v)) { empties.push(row); break; }
+        }
+      }
+      for (const row of empties.sort((a, b) => b.cIdx - a.cIdx)) {
+        const before = (await enumerate()).length;
+        if (!before) break;
+        const del = await act.clickNestedDelete(t.section + "-" + row.pIdx + "--null", t.childBase, row.cIdx);
+        if (!del || !del.ok) break;
+        let now = before; const deadline = Date.now() + ceiling;
+        while (Date.now() < deadline) { await act.delay(interval); now = (await enumerate()).length; if (now < before) break; }
+        if (now >= before) break;
+        deleted.push({ section: t.section, kind: "nested", child: t.childBase, parentIndex: row.pIdx, index: row.cIdx });
+      }
+    }
+  }
+  return { deleted };
 }
 
 // Today's date as a {month, day, year} composite — the WE "currently_work_here but the required
@@ -2823,7 +2939,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
 // canonical "<parentBase>[<pOrd>].<childBase>[<j>].<path>" with nested_parent/nested_child_base so the
 // viewer groups them under the parent entry (summary.js nestedInfoOf / renderNestedSub).
 async function fillNestedSpecialtiesCdp(act, o) {
-  const { parentBase, pOrd, pIdx, childBase, headingStem, fieldMap, items, budgets, aiContext } = o;
+  const { parentBase, pOrd, pIdx, childBase, headingStem, fieldMap, items, budgets, aiContext, preserveExtras } = o;
   const recs = [];
   const N = Array.isArray(items) ? items.length : 0;
   // N=0 does NOT early-return: reconcile DOWN still runs, deleting orphan empty child rows (e.g.
@@ -2850,7 +2966,8 @@ async function fillNestedSpecialtiesCdp(act, o) {
     if (cur.length <= before) break; // mount didn't register — don't spin
   }
   guard = 0;
-  while (cur.length > N && guard++ < 12) { // reconcile DOWN — delete trailing extras
+  // preserveExtras (remediation re-fill): child rows beyond profile-N may be manual — never delete.
+  while (!preserveExtras && cur.length > N && guard++ < 12) { // reconcile DOWN — delete trailing extras
     const before = cur.length;
     const del = await act.clickNestedDelete(parentFkit, childBase, cur[cur.length - 1]);
     if (!del || !del.ok) break;
@@ -3141,7 +3258,9 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   }
 
   // reconcile DOWN — delete trailing extras beyond N (also cleans up when N===0).
-  if (count > N) {
+  // preserveExtras (AI-4 remediation re-fill) SKIPS this: entries beyond profile-N may be the
+  // operator's manual additions — a remediation pass must never wipe them (main fill unchanged).
+  if (count > N && !section.preserveExtras) {
     let deleted = 0;
     while (count > N && deleted < 10) {
       const before = count;
@@ -3256,7 +3375,8 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
         if (pIdx != null && Array.isArray(ss.fieldMap) && act.clickNestedAdd) {
           const filled = await fillNestedSpecialtiesCdp(act, {
             parentBase: name, pOrd: i, pIdx, childBase, headingStem: ss.headingStem || childBase,
-            fieldMap: ss.fieldMap, items: childItems, budgets, aiContext: section.aiContext
+            fieldMap: ss.fieldMap, items: childItems, budgets, aiContext: section.aiContext,
+            preserveExtras: !!section.preserveExtras // remediation re-fill: never delete manual child rows
           });
           results.push(...filled);
         }
@@ -4030,5 +4150,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

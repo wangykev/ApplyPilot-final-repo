@@ -2519,7 +2519,8 @@ function mergeRemediationRecord(out, rec) {
 }
 
 // AI-4 validation-error remediation loop (Tier 0 dup-language → Tier 1 flat re-fill → Tier 1.5
-// section re-fill → Tier 2 AI), bounded + halt-on-no-progress.
+// empty-repeating-row DELETE → Tier 1.6 section re-fill → Tier 2 AI), bounded + halt-on-no-progress,
+// and NEVER acting without error text (each attempt is gated on a non-empty expanded error read).
 // Runs ONLY when the session is LIVE (the caller already excluded sessionDead) and Save & Continue
 // stayed put. GLOBAL shared cap across ALL tiers (REMEDIATION_MAX — Hold 1, "not 2+2"); halts the
 // instant the error set is UNCHANGED after an action (no point re-firing the same fix). Every action
@@ -2528,14 +2529,28 @@ function mergeRemediationRecord(out, rec) {
 const REMEDIATION_MAX = 3;
 async function remediatePageErrors(act, profile, defaults, jobContext, out, pageKey, page, LOG) {
   const actions = [];
-  let st = null; try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
   // expandErrorSamples (lib.js): Workday's top banner concatenates EVERY error into one element —
   // split into individual errors + drop success toasts, so no error hides from the tiers (the
   // 2026-07-01 live Tier-0 dup-language miss was a truncated concatenated banner).
-  let prevErrors = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+  const readErrors = async () => {
+    let st = null; try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
+    return expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+  };
+  // POLL for the banner: it renders LATER than the ~1s fast-exit that got us here (live 2026-07-02:
+  // remediation read "0 error(s)" and Tier 2 acted BLIND — deleted a correctly-filled cert entry).
+  let prevErrors = await readErrors();
+  for (let poll = 0; poll < 8 && !prevErrors.length; poll++) { await cdpDelay(500); prevErrors = await readErrors(); }
   LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s). Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
 
   for (let attempt = 1; attempt <= REMEDIATION_MAX; attempt++) {
+    // NEVER act blind: with no error text there is nothing to anchor a SAFE action on — every tier
+    // (incl. the AI) would be guessing (the blind Tier-2 delete_entry lesson). Also the clean exit
+    // when an action CLEARED the errors but the page still didn't advance: hand the state to the
+    // operator instead of burning the cap on guesses.
+    if (!prevErrors.length) {
+      LOG(`  no error text on the page — ${attempt === 1 ? "nothing to anchor a remediation on" : "errors cleared but the page did not advance"}; halting (no blind actions).`);
+      return { advanced: false, reason: attempt === 1 ? "no-error-text" : "errors-cleared-not-advancing", attempts: attempt - 1, actions };
+    }
     let didSomething = false;
 
     // ── Tier 0 (HARDCODED, DETERMINISTIC, no AI): the known Magna/Workday phantom "Duplicate
@@ -2588,25 +2603,50 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       }
     }
 
-    // ── Tier 1.5 (DETERMINISTIC, no AI): the error names a REPEATING-SECTION field — the flat
-    //    FIELD_MAP/scan can't reach those (the 2026-07-01 live miss: "The field Specialty is
-    //    required" names the NESTED cert specialtyParent, excluded from the flat scan → Tier 2
-    //    correctly named it but had no executable action). Map the named titles to their OWNING
-    //    section(s) (sectionsFromErrorNames: headings / field labels / nested labels) and re-run
-    //    JUST those sections via drivePageFill({onlySections}) — reconcile-to-N + re-fill, incl.
-    //    nested specialties (whose reconcile now deletes orphan empty rows at N=0). ──
+    // ── Tier 1.5 (DETERMINISTIC DELETE, no AI — operator rule 2026-07-02): the error names a
+    //    REPEATING-section field → the offending rows are DELETABLE BY NATURE (a repeating section
+    //    is optional). Delete every row whose named field reads EMPTY — that's what "is required
+    //    and must have a value" points at, and a row the operator hand-FILLED never reads empty,
+    //    so it's never deleted. A NESTED (layer-2) field deletes ONLY the inner rows (cert ▸
+    //    specialties), never the parent entry. Runs BEFORE the section re-fill: deleting the
+    //    blocking row is cheaper and safer than re-running the whole section. ──
+    let named = [];
     if (!didSomething) {
-      const named = prevErrors.map((t) => parseErrorFieldName(t)).filter(Boolean);
+      named = prevErrors.map((t) => parseErrorFieldName(t)).filter(Boolean);
+      const targets = deleteTargetsFromErrorNames(named);
+      if (targets.length) {
+        const del = await deleteEmptyErrorRows(act, targets, DEFAULT_BUDGETS);
+        if (del.deleted.length) {
+          const summary = del.deleted.map((d) => d.kind === "nested"
+            ? `${d.section}[${d.parentIndex}] ▸ ${d.child} row ${d.index}`
+            : `${d.section} entry ${d.index}`).join(", ");
+          LOG(`  attempt ${attempt} (Tier 1.5, deterministic DELETE): error names [${named.join(", ")}] → deleted ${del.deleted.length} EMPTY repeating row(s): ${summary}.`);
+          mergeRemediationRecord(out, {
+            fieldName: "remediation.row-delete", label: "Removed empty repeating row(s)", widgetType: "remediation",
+            status: "needs_review", flag: "ai-remediation", after: null,
+            detail: `AI-4 Tier-1.5: deleted ${del.deleted.length} EMPTY row(s) named by the validation error (${summary}) — repeating sections are optional; re-add manually if needed`
+          });
+          actions.push({ tier: 1.5, action: "delete-empty-rows", deleted: del.deleted });
+          didSomething = true;
+        }
+      }
+    }
+
+    // ── Tier 1.6 (DETERMINISTIC, no AI): the error names a section field whose rows are NOT empty
+    //    (a value problem, not a missing-row problem) → re-run JUST the owning section(s) via
+    //    drivePageFill({onlySections}) — reconcile-UP + re-fill. preserveExtras: the re-run NEVER
+    //    reconciles DOWN (entries beyond profile-N may be the operator's manual additions). ──
+    if (!didSomething) {
       const secNames = sectionsFromErrorNames(named);
       if (secNames.length) {
-        LOG(`  attempt ${attempt} (Tier 1.5, deterministic): error names section field(s) [${named.join(", ")}] → re-run section(s) [${secNames.join(", ")}] (no AI).`);
-        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames) });
+        LOG(`  attempt ${attempt} (Tier 1.6, deterministic): error names section field(s) [${named.join(", ")}] → re-run section(s) [${secNames.join(", ")}] (no AI, manual entries preserved).`);
+        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames), preserveExtras: true });
         for (const r of (rOut.results || [])) {
           r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
-          r.detail = "AI-4 Tier-1.5 section re-fill — " + (r.detail || "");
+          r.detail = "AI-4 Tier-1.6 section re-fill — " + (r.detail || "");
           mergeRemediationRecord(out, r);
         }
-        actions.push({ tier: 1.5, sections: secNames, named });
+        actions.push({ tier: 1.6, sections: secNames, named });
         didSomething = true;
       }
     }
@@ -2670,8 +2710,7 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
     if (res.advanced) return { advanced: true, attempts: attempt, actions };
 
     // ── not advanced → HALT on NO-PROGRESS (error set unchanged); else continue. ──
-    let st2 = null; try { st2 = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-    const newErrors = expandErrorSamples((st2 && st2.errorMarkers && st2.errorMarkers.samples) || []);
+    const newErrors = await readErrors();
     if (errorSetUnchanged(prevErrors, newErrors)) {
       LOG(`  remediation made NO PROGRESS (error set unchanged after the action) — halting.`);
       return { advanced: false, reason: "no-progress", attempts: attempt, actions, errors: newErrors };
@@ -4118,7 +4157,10 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
       // can't skip a real advance (a successful re-fill clears the errors AND changes sig → the
       // advanced path below fires instead). Two consecutive reads guard a transient flicker during a
       // real transition → ~1s instead of burning the full ceiling. sessionLooksDead is checked first.
-      const errCount = (state && state.errorMarkers && state.errorMarkers.count) || 0;
+      // Count EXPANDED errors, not raw markers: the raw count includes [role=alert] SUCCESS toasts
+      // ("resume successfully uploaded"), which persist through a slow clean transition — a toast-only
+      // page must never fast-exit as a validation error (2026-07-02).
+      const errCount = state ? expandErrorSamples((state.errorMarkers && state.errorMarkers.samples) || []).length : 0;
       errSteady = errCount > 0 ? errSteady + 1 : 0;
       if (errSteady >= 2) return { advanced: false, timeout: true, errorDetected: true, errors: (state.errorMarkers.samples || []) };
       continue;

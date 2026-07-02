@@ -1989,3 +1989,40 @@ Three independent gaps lined up — the log is a keeper:
   now always invokes the nested fill (childItems may be empty) and the reconcile-down loop runs at N=0 —
   the same reconcile-to-exactly-N semantics as the M21 top-level sections. The runCdpWalk "clear orphan
   specialties first" PREREQ log is retired.
+
+## 2026-07-02 — AI-4 live round 2: blind Tier-2 delete + the refill-vs-delete rule for repeating rows
+
+Second live walk with remediation (Magna, operator manually added an EMPTY extra Specialty row to
+stage the error). What the log showed, in order:
+
+- **Remediation entered with "0 error(s)" and Tier 2 acted BLIND.** The error-summary banner renders
+  LATER than the ~1s fast-exit that triggers remediation, so the entry read found no error text; all
+  deterministic tiers no-op'd (nothing to match) and the ladder fell through to Tier 2, whose AI —
+  with an empty error list — chose `delete_entry certification-#0` (reason empty) and DELETED the
+  correctly-filled cert entry. Every subsequent error (phantom dup-language fired next, then
+  Specialty-required on the re-created entry) cascaded from that.
+  **Fixes:** (1) `remediatePageErrors` POLLS for the banner (500ms × 8) before reading; (2) every
+  attempt is HARD-GATED on non-empty expanded error text — no tier, including the AI, ever acts
+  without an error to anchor on (`no-error-text` / `errors-cleared-not-advancing` clean halts);
+  (3) `cdpWaitNextPage`'s fast-exit now counts EXPANDED errors, not raw markers — the raw count
+  includes `[role=alert]` SUCCESS toasts ("resume successfully uploaded"), which persist through a
+  slow clean transition.
+- **Operator rule — repeating ⇒ optional ⇒ delete the blocking row, don't re-fill the section.**
+  The old Tier 1.5 answered a "Specialty is required" error by re-running the WHOLE certification
+  section: reconcile-to-profile-N + re-fill — which re-mounts profile specialties AND (via
+  reconcile-DOWN) deletes entries the operator added by hand. New ladder:
+  - **Tier 1.5 = deterministic DELETE** (`deleteTargetsFromErrorNames` + `deleteEmptyErrorRows`,
+    fill-driver.js): map the error-named titles to repeating-section fields; delete every row whose
+    named field reads EMPTY on the live page ("is required and must have a value" = an empty slot;
+    a hand-FILLED row never reads empty → never deleted). A NESTED (layer-2) name (Specialty)
+    deletes ONLY the inner rows via `clickNestedDelete` — the parent cert entry is never touched.
+    Top-level rows read emptiness from the repeating scan's `value`; nested rows via the PROBED
+    `nestedFieldSel` selector + `readLiveValueByWidget` — an unresolvable probe means the row is
+    UNTOUCHED (never a blind delete). Cross-section-ambiguous names ("Start Date" = WE + nested
+    specialties) target both — safe, the empty-only rule self-limits.
+  - **Tier 1.6 = the section re-fill**, demoted behind the delete tier and now `preserveExtras`:
+    the remediation re-run NEVER reconciles DOWN (top-level `driveRepeatingSectionCdp` skip + the
+    nested `fillNestedSpecialtiesCdp` skip), so manual entries survive. The MAIN fill's M21
+    reconcile-to-exactly-N is unchanged.
+  - Tier 0 (dup-language hardcode) kept as the fast path — it live-verified this round (phantom
+    mode deleted both languages correctly).

@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -3002,6 +3002,102 @@ test("drivePageFill onlySections: a PRESENT section NOT named is untouched (zero
   const out = await drivePageFill(act, { websites: [{ url: "https://a.example" }] }, {}, {}, T_BUDGETS, { onlySections: new Set(["language"]) });
   assert.strictEqual(out.results.length, 0, "nothing driven (websites present but not named)");
   assert.ok(!act.log.some((l) => l[0] === "focusText"), "zero actuation on the un-named section");
+});
+
+// ── AI-4 Tier-1.5 — deterministic DELETE of empty error-named repeating rows (operator rule
+// 2026-07-02: repeating ⇒ optional ⇒ a blocking row with nothing to refill gets DELETED; a nested
+// name deletes ONLY the layer-2 rows, never the parent entry) ────────────────────────────────────
+test("AI-4 deleteTargetsFromErrorNames: nested names → layer-2 target; top-level names → entry target; ambiguity → both", () => {
+  const spec = deleteTargetsFromErrorNames(["Specialty ()"]);
+  assert.deepStrictEqual(spec.map((t) => t.kind), ["nested"], "'Specialty' targets the INNER rows only");
+  assert.strictEqual(spec[0].childBase, "specialties");
+  assert.deepStrictEqual(spec[0].fields, [{ field: "specialtyParent", widget: "typeahead" }]);
+  const lang = deleteTargetsFromErrorNames(["Language"]);
+  assert.deepStrictEqual(lang.map((t) => [t.kind, t.section]), [["entry", "language"]]);
+  const sd = deleteTargetsFromErrorNames(["Start Date"]);
+  assert.deepStrictEqual(sd.map((t) => [t.kind, t.section]),
+    [["entry", "workExperience"], ["nested", "certification"]],
+    "an ambiguous name targets BOTH — safe, the empty-only executor self-limits");
+  assert.deepStrictEqual(deleteTargetsFromErrorNames(["Frobnicator"]), []);
+  assert.deepStrictEqual(deleteTargetsFromErrorNames([]), []);
+});
+
+test("AI-4 deleteEmptyErrorRows: top-level — deletes ONLY entries whose named field reads EMPTY", async () => {
+  let entries = [
+    { fields: [{ fieldName: "language", label: "Language*", value: "English" }] },
+    { fields: [{ fieldName: "language", label: "Language*", value: null }] },       // the manually-added empty row
+    { fields: [{ fieldName: "language", label: "Language*", value: "Chinese" }] },
+  ];
+  const deleteLog = [];
+  const act = {
+    delay: async () => {},
+    repeatingScan: async () => ({ sections: { "language-": { entries } } }),
+    entryCount: async () => entries.length,
+    clickDeleteEntry: async (prefix, idx) => { deleteLog.push(idx); entries = entries.filter((_, i) => i !== idx); return { ok: true }; },
+  };
+  const del = await deleteEmptyErrorRows(act, deleteTargetsFromErrorNames(["Language"]), T_BUDGETS);
+  assert.deepStrictEqual(deleteLog, [1], "only the EMPTY entry deleted; filled rows (incl. manual) untouched");
+  assert.strictEqual(entries.length, 2);
+  assert.deepStrictEqual(del.deleted, [{ section: "language", kind: "entry", index: 1 }]);
+});
+
+test("AI-4 deleteEmptyErrorRows: nested — deletes ONLY the EMPTY layer-2 row; the parent cert entry is NEVER deleted", async () => {
+  let kids = [5, 9]; // child 5 filled ("Other"), child 9 empty — the manually-added blocking row
+  const chipBySel = { "SEL-5": ["Other"], "SEL-9": [] };
+  const nestedDeletes = [], parentDeletes = [];
+  const act = {
+    delay: async () => {},
+    nestedScan: async () => ({ nestedSections: kids.length ? [{ parentBase: "certification", childBase: "specialties",
+      entries: kids.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }] })) }] : [] }),
+    nestedFieldSel: async (fkit) => "SEL-" + /specialties-(\d+)--/.exec(fkit)[1],
+    readHier: async (loc) => ({ chips: chipBySel[loc.wrapperSel] || [] }),
+    clickNestedDelete: async (pf, base, idx) => { nestedDeletes.push([pf, idx]); kids = kids.filter((k) => String(k) !== String(idx)); return { ok: true }; },
+    clickDeleteEntry: async (prefix, idx) => { parentDeletes.push(idx); return { ok: true }; },
+  };
+  const del = await deleteEmptyErrorRows(act, deleteTargetsFromErrorNames(["Specialty"]), T_BUDGETS);
+  assert.deepStrictEqual(nestedDeletes, [["certification-287--null", 9]], "only the empty child row deleted");
+  assert.deepStrictEqual(parentDeletes, [], "the parent entry is NEVER deleted for a layer-2 error");
+  assert.deepStrictEqual(kids, [5], "the filled child row survives");
+  assert.deepStrictEqual(del.deleted, [{ section: "certification", kind: "nested", child: "specialties", parentIndex: 287, index: 9 }]);
+});
+
+test("AI-4 deleteEmptyErrorRows: unreadable nested field → row untouched (never a blind delete)", async () => {
+  const kids = [7];
+  const nestedDeletes = [];
+  const act = {
+    delay: async () => {},
+    nestedScan: async () => ({ nestedSections: [{ parentBase: "certification", childBase: "specialties",
+      entries: kids.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }] })) }] }),
+    nestedFieldSel: async () => null, // probe cannot resolve the field → cannot read → must not act
+    readHier: async () => ({ chips: [] }),
+    clickNestedDelete: async (pf, base, idx) => { nestedDeletes.push(idx); return { ok: true }; },
+  };
+  const del = await deleteEmptyErrorRows(act, deleteTargetsFromErrorNames(["Specialty"]), T_BUDGETS);
+  assert.deepStrictEqual(nestedDeletes, [], "unreadable row never deleted");
+  assert.deepStrictEqual(del.deleted, []);
+});
+
+test("driveRepeatingSectionCdp preserveExtras: entries beyond profile-N are KEPT (remediation re-fill never deletes manual entries)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", ""), webEntry("webAddress-2--null", "x"), webEntry("webAddress-3--null", "y")] });
+  const { act } = await runWeb(state, [{ url: "https://a.example" }], { preserveExtras: true });
+  assert.strictEqual(state.entries.length, 3, "no reconcile-down under preserveExtras");
+  assert.ok(!act.log.some((l) => l[0] === "clickDeleteEntry"), "delete never clicked");
+});
+
+test("fillNestedSpecialtiesCdp preserveExtras: N=0 with existing child rows → rows KEPT (the remediation-context inverse of the N=0 reconcile)", async () => {
+  let children = [5, 9];
+  const scan = () => ({ parentOrder: { certification: [287] }, nestedSections: children.length ? [{ parentBase: "certification", childBase: "specialties",
+    entries: children.map((ci) => ({ levels: [{ base: "certification", index: 287 }, { base: "specialties", index: ci }], fields: [] })) }] : [] });
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    nestedScan: async () => scan(),
+    clickNestedAdd: async () => { throw new Error("must NOT add at N=0"); },
+    clickNestedDelete: async () => { throw new Error("must NOT delete under preserveExtras"); },
+  };
+  const recs = await fillNestedSpecialtiesCdp(act, { parentBase: "certification", pOrd: 0, pIdx: 287, childBase: "specialties",
+    headingStem: "specialt", fieldMap: CERT_NESTED.subSections[0].fieldMap, items: [], budgets: T_BUDGETS, preserveExtras: true });
+  assert.deepStrictEqual(children, [5, 9], "rows kept");
+  assert.deepStrictEqual(recs, []);
 });
 
 test("fillNestedSpecialtiesCdp: PROBES the wrapper selector (act.nestedFieldSel) + fills dates from parsed profile values", async () => {
