@@ -8,6 +8,7 @@
       label { display: block; font-size: 12px; margin-top: 4px; }
       input { width: 100%; box-sizing: border-box; margin: 4px 0 6px; padding: 6px; }
       hr { margin: 10px 0; border: none; border-top: 1px solid #ddd; }
+      .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin: 2px 0 6px; }
       #status { font-size: 12px; color: #333; white-space: pre-wrap; min-height: 1.4em; }
     </style>
   </head>
@@ -26,181 +27,42 @@
     <input id="resume-file" type="file" accept="application/pdf,.pdf">
     <div id="resume-status">Saved resume: none</div>
     <hr>
-    <!-- CDP RECON (Step 1 of the CDP actuation port): probe what chrome.debugger
-         INPUT can do to a HIDDEN tab — insertText vs per-char keys, mouse vs
-         keyboard commits, rect validity, commit latencies. Click, then MINIMIZE
-         within 60s; probes start on the first hidden read. Findings land in the
-         SERVICE-WORKER console ([CDP-RECON] lines + one summary JSON). Keep page
-         DevTools CLOSED on the tab — a second debugger client kills the attach. -->
-    <button id="cdp-recon">CDP recon: simple widgets (minimize!)</button>
-    <!-- CDP FILL (Step 2): fill this page's text/dropdown/radio/checkbox fields via
-         chrome.debugger input while the tab is HIDDEN. Load the profile (+ company)
-         first, click, then MINIMIZE within 60s. Typeahead/source are deferred →
-         NEEDS REVIEW; repeating sections untouched. Results in the SW console. -->
-    <button id="cdp-fill">CDP fill (hidden): simple widgets</button>
-    <!-- CDP FILL FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
-         flat fields AND every repeating section present (drivePageFill drives the sections via
-         driveRepeatingSectionCdp). On page 1 == simple-widgets; on page 2 (My Experience) fills
-         the whole page. NO minimize gate: keep the tab VISIBLE for a FAST fill (watch it) or
-         MINIMIZE for slow/background — it adapts live. Load profile first, click. [CDP-PAGE]. -->
+    <div class="section-title">CDP fill</div>
+    <!-- CDP fill FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
+         flat fields AND every repeating section present. On page 1 == simple-widgets; on page 2
+         (My Experience) fills the whole page. NO minimize gate: keep the tab VISIBLE for a FAST
+         fill (watch it) or MINIMIZE for slow/background — it adapts live. Load profile first,
+         click. [CDP-PAGE] in the service-worker console. -->
     <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; visible=fast)</button>
-    <!-- Oracle baseline for the input-lock verification: same full-page fill but with the
-         operator input-lock OFF, so a lock run can be compared field-by-field to confirm the
-         lock's gating drops/corrupts nothing (no self-block). [CDP-PAGE]. -->
-    <button id="cdp-fill-page-nolock">CDP fill FULL PAGE — NO input-lock (baseline)</button>
-    <!-- FULL source AI (isolated to the "How did you hear about us?" field): deterministic fill → AI picks the
-         CATEGORY → DRILL → scroll-enumerate the leaves → AI picks the leaf → typed commit. Verbose
-         [CDP-SRC-DEBUG] log. AI toggle must be ON; keep the tab VISIBLE to watch. -->
-    <button id="cdp-source-ai-debug">Source AI (isolated): det → category → drill → leaf → commit</button>
-    <!-- RE-AUDIT (M40): re-read the live page vs the last full-page fill's recorded values
-         + report any field that no longer matches. The independent backstop for the
-         false-verify class. To TEST it: fill, then manually change a committed field on the
-         page, then click this — it must flag that field. [CDP-AUDIT] in the SW console. -->
-    <button id="cdp-audit">CDP re-audit last fill (flag mismatches)</button>
-    <!-- RESUME-ATTACH RECON (walk prereq 1): probe whether the proven attachResume runs
-         via cdpEval on the debugger attach + whether its confirmation gate survives (run
-         VISIBLE and MINIMIZED, compare elapsed). Needs a resume stored (upload above).
-         Run on the page WITH the upload (Magna page 2 "Application Documents"). ⚠ attaches
-         a REAL file to the live form. [CDP-RESUME-RECON] in the SW console. -->
-    <button id="cdp-resume-recon">CDP recon: resume attach (page 2; attaches a file!)</button>
-    <!-- TYPEAHEAD STRAY RECON: pin when the overwrite/keptLowerTier resting path commits a
-         stray (the fieldOfStudy "Other"→"Accounting" bug). Uses the label regex below
-         (default "field of study"). Pre-set the field to a LOWER tier ("Other") first.
-         Reads chip/activeText/firstOption between each resting step. Run on page 2.
-         [CDP-TA-STRAY] in the SW console. -->
-    <button id="cdp-ta-stray-recon">CDP recon: typeahead stray (page 2; uses label below)</button>
-    <!-- FoS OPTION-ENUMERATION RECON (read-only): does the Field-of-Study typeahead enumerate a
-         bounded option list (on open / a broad search) or is it server-search-only? Decides whether
-         a later round can capture all options for an editable summary typeahead. Uses the label
-         input (default "field of study"). Run on page 2. [CDP-FOS-RECON] in the SW console. -->
-    <button id="cdp-fos-recon">CDP recon: FoS options (read-only; page 2; uses label below)</button>
-    <!-- FoS CAPTURE-PROBE (read-only): prove the FAST in-page scroll-accumulate scrape gets the
-         COMPLETE bounded FoS option list (frame-paced, <1s). Uses the label input. Page 2.
-         [CDP-FOS-CAPTURE] in the SW console. -->
-    <button id="cdp-fos-capture">CDP FoS capture-probe (read-only; fast scroll-scrape; page 2)</button>
-    <!-- TREE-vs-FLAT RECON (read-only, 0.4): open every typeahead/hierarchical field on the page, dump
-         its option-row markers (chevron / aria-expanded / role=treeitem), classify TREE vs FLAT — the
-         discriminator that excludes tree pickers (source, certification) from the AI typeahead fallback.
-         Run on page 1 (source, countryPhoneCode) AND page 2 (Field of Study, certification).
-         [CDP-TREE-RECON] in the SW console. -->
-    <button id="cdp-tree-recon">CDP recon: tree-vs-flat (read-only; pages 1 & 2)</button>
-    <!-- TREE-DRILL RECON (read-mostly; cert page 2): open the cert tree, click a CATEGORY to expand it,
-         dump the revealed leaves — proves how to drill on CDP (gates the tree-AI build). Uses the label
-         input (default "certification"). [CDP-TREE-DRILL] in the SW console. -->
-    <button id="cdp-tree-drill-recon">CDP recon: tree DRILL (read-mostly; cert; page 2; uses label below)</button>
-    <!-- PAGE-IDENTITY RECON (read-only): fingerprint ANY page (maintenance / dead session / login /
-         error / a normal form) so an unknown page state can be detected in code. Run it on whatever
-         page is showing (e.g. the Workday maintenance page). [CDP-PAGE-RECON] in the SW console. -->
-    <button id="cdp-page-recon">CDP recon: page identity (read-only; ANY page — maintenance/error/login)</button>
-    <!-- FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
-         empty-results (a higher-tier no-match) DROP searchBox focus, and does RE-FOCUS restore + disarm the
-         highlight? cand-1 Enter→0 (no commit); "Other" typed char-by-char, never Enter'd. Page 2, uses the
-         label input. [CDP-FOS-FOCUS] in the SW console. -->
-    <button id="cdp-fos-focus-recon">CDP FoS FOCUS-recon (read-mostly; empty-results focus drop; page 2)</button>
-    <!-- RESULTS-BANNER RECON: capture the exact markup of the "Search Results (N)" results banner vs the
-         "No matches found" no-match banner, so the terminal-state gate can distinguish them. Types a matching
-         query (the input below, default "a" → broad multi-match → results banner) + a non-match, dumps both
-         states, NEVER commits. Page 2, uses the label input. [CDP-RESULTS-BANNER] in the SW console. -->
-    <button id="cdp-results-banner-recon">CDP recon: results-vs-no-match banner markup (read-only; page 2)</button>
-    <label for="results-banner-query">↑ results-banner recon: matching query (broad → multi-match):</label>
-    <input id="results-banner-query" type="text" placeholder="a" value="a">
-    <!-- INPUT-LOCK RECON: probe whether an operator input-lock is feasible — does a
-         pointer-events overlay block the bot's OWN cdpClickAt; does a keydown-blocker eat
-         insertText vs per-char keys; the __apActing flag-gate cost + the toggle-timing
-         self-block (clear-after-dispatch vs clear-after-confirm). Run on any form page.
-         [INPUTLOCK-RECON] in the SW console. -->
-    <button id="cdp-inputlock-recon">CDP recon: input-lock feasibility (any form page)</button>
     <!-- CDP WALK (M38 Part 3): the N-PAGE WALK. Fills each page (the full fold + audit +
          accumulating review summary) → guarded Save & Continue → repeats to the REVIEW
          page, where it STOPS and NEVER submits (double guard). Clears the prior summary
          once at start. ⚠ on a LIVE session this ADVANCES the real application through every
-         page — use a DISPOSABLE application, and clear orphan cert specialties first (an
-         empty required specialty blocks Save & Continue). Keep the tab VISIBLE to watch it
-         reach review and stop. [CDP-WALK] in the SW console. -->
+         page — use a DISPOSABLE application. Keep the tab VISIBLE to watch it reach review
+         and stop. [CDP-WALK] in the service-worker console. -->
     <button id="cdp-walk">CDP WALK to review (fills all pages; never submits)</button>
-    <!-- AI-4 TEST HARNESS: fill a page, deliberately clear a required field, watch AI-4 remediate.
-         Run on page 1 / My Information (fully fillable, no required upload). [CDP-TEST-AI4]. -->
-    <button id="cdp-test-ai4">CDP TEST AI-4 (fixable — re-fill + advance)</button>
-    <button id="cdp-test-ai4-unfixable">CDP TEST AI-4 (unfixable — watch cap halt)</button>
-    <!-- Label/field regex for "CDP fill one date" below (the remaining fill-one harness). -->
-    <label for="ta-label">CDP fill-one target (label/field regex):</label>
-    <input id="ta-label" type="text" placeholder="e.g. issuedDate">
-    <!-- SESSION RECON (M30 Step 0): read-only snapshot to find the signal that tells a
-         live apply form from a logged-out/expired state. NO minimize needed. Run once
-         on a VALID form and once LOGGED-OUT/stale; paste both [SESSION-RECON] blocks. -->
-    <button id="cdp-session-recon">CDP recon: session state (no minimize)</button>
-    <!-- SOURCE FILL (backlog C — Phase B): fill the "How did you hear about us?" picker
-         via the typeahead-style source brain HIDDEN, candidates from
-         defaults.how_did_you_hear (preferred LinkedIn). Minimize within 60s; [CDP-SRC]
-         in the SW console. -->
-    <button id="cdp-source-fill">CDP fill source: LinkedIn (minimize!)</button>
-    <!-- REPEATING-SECTION RECON (M32 Step 0): the FIRST step of porting page-2
-         (My Experience) repeating sections to CDP. Read-only structure dump
-         (sections present, entries, per-entry fields, Add/Delete rects) + a
-         Websites shape check + one bounded DATE-SPINBUTTON probe (the key
-         unknown — CDP has no native setter). Run on My Experience (page 2);
-         minimize within 60s (the date probe actuates one segment, restored
-         after). [REPEAT-RECON] in the SW console. -->
+    <hr>
+    <div class="section-title">New-tenant recon (read-only)</div>
+    <!-- Run FIRST on any new Workday tenant before relying on the fill path. Each dumps
+         structure to the SERVICE-WORKER console. Keep page DevTools CLOSED on the tab — a
+         second debugger client kills the attach. -->
+    <!-- Probe what chrome.debugger INPUT can do to a HIDDEN tab (insertText vs per-char keys,
+         mouse vs keyboard commits, rect validity, latencies). Click, then MINIMIZE within 60s.
+         [CDP-RECON]. -->
+    <button id="cdp-recon">CDP recon: simple widgets (minimize!)</button>
+    <!-- Read-only structure dump of a repeating-section page (sections present → entries →
+         per-entry fields) + a bounded date-spinbutton probe. Run on My Experience (page 2);
+         minimize within 60s. [REPEAT-RECON]. -->
     <button id="cdp-repeat-recon">CDP recon: repeating sections (minimize!)</button>
-    <!-- GENERIC-SECTION RECON (Sections milestone 1): READ-ONLY proof that enumerate-and-group
-         on data-fkit-id detects the right repeating sections (no live fill-path change). No
-         actuation → runs VISIBLE (no minimize). [GENERIC-SECTIONS] in the SW console. -->
-    <button id="cdp-generic-section-recon">CDP recon: GENERIC section detect (read-only)</button>
-    <!-- GENERIC NESTED-SECTION RECON: read-only dump of repeating-sections-inside-repeating-entries
-         (cert → Specialties + Attachments) via the multi-level data-fkit-id parse. Add ≥1 specialty +
-         an attachment to a cert entry on the form first. [NESTED-RECON] in the SW console. -->
-    <button id="cdp-generic-nested-recon">CDP recon: NESTED sections (read-only; add a specialty first)</button>
+    <!-- Read-only static snapshot to classify a live form vs a logged-out/expired state.
+         No minimize. Run once on a VALID form and once LOGGED-OUT, diff. [SESSION-RECON]. -->
+    <button id="cdp-session-recon">CDP recon: session state (no minimize)</button>
+    <!-- Read-only dump of a screening-questions page (verbatim labels + each dropdown's
+         options + a clean-close proof). [Q-RECON]. -->
     <button id="cdp-questions-recon">CDP recon: screening QUESTIONS (read-only)</button>
-    <!-- CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the NESTED Specialties
-         sub-section inside a Certification entry (a repeating section within a repeating
-         entry). Mounts ONE specialty, dumps the data-fkit-id + field diff (the specialty
-         container prefix + per-specialty typeahead/start-end dates + Attachments presence),
-         then restores. Run on My Experience (page 2); minimize within 60s.
-         [CERT-SPECIALTY-RECON] in the SW console. -->
-    <button id="cdp-cert-specialty-recon">CDP recon: cert specialties (page 2; minimize!)</button>
-    <!-- TEXTAREA RECON (M37 Part 0 — the WE gate): does CDP actuation drive a Workday
-         <textarea>? Probes the Work Experience roleDescription textarea with a MULTI-LINE
-         value (insertText vs native-setter), confirming the newline survives + React
-         survival. Run on My Experience (page 2) with ≥1 WE entry; minimize within 60s.
-         [TEXTAREA-RECON] in the SW console. -->
-    <button id="cdp-textarea-recon">CDP recon: WE textarea (page 2; minimize!)</button>
-    <!-- CASCADE RECON (submit prereq): characterize fields REVEALED when a value
-         changes (previously-employed Yes → follow-ups; Country → local-name boxes;
-         Yes/Other → please-specify). OPERATOR-DRIVEN + READ-ONLY — keep the tab
-         VISIBLE, then manually change ONE field. [CASCADE-RECON] in the SW console. -->
-    <button id="cdp-cascade-recon">CDP recon: cascade / revealed fields (keep visible)</button>
-    <!-- M2 SUBMIT REPLAY (DRY): replays the SAVED approved review-summary bundle onto THIS
-         live page — FLAT fields only, NO Next, NO Submit. Load the same page you filled
-         (fresh), keep it VISIBLE. [CDP-REPLAY] in the SW console. -->
-    <button id="cdp-replay-page">CDP replay one page — DRY, flat (no submit)</button>
-    <!-- WEBSITES FILL (M32b): the FIRST repeating-section fill on the CDP path —
-         reconcile the Websites section to N + fill each entry's url (date-free; the
-         section the M32 recon flagged as the clean machinery proof). Run on My
-         Experience (page 2); minimize within 60s. [CDP-WEB] in the SW console. -->
-    <button id="cdp-fill-websites">CDP fill websites (page 2; minimize!)</button>
-    <!-- LANGUAGES FILL (M35): reuse the repeating-section driver for the date-free Languages
-         section (language + by-label proficiency dropdowns + "I am fluent" checkbox; deleteOnNoMatch).
-         First live exercise of the labelRegex/hashed-id resolve. Run on My Experience (page 2);
-         minimize within 60s. [CDP-LANG] in the SW console. -->
-    <button id="cdp-fill-languages">CDP fill languages (page 2; minimize!)</button>
-    <!-- WORK EXPERIENCE FILL (M37): reuse the repeating-section driver for WE — text +
-         currentlyWorkHere checkbox + from/to M/Y dates + the roleDescription <textarea>
-         (insertText, recon 2026-06-18). Run on My Experience (page 2); minimize within 60s.
-         [CDP-WE] in the SW console. -->
-    <button id="cdp-fill-work-experience">CDP fill work experience (page 2; minimize!)</button>
-    <!-- EDUCATION FILL (M36): reuse the repeating-section driver for Education — school/degree/
-         fieldOfStudy/GPA + from/to YEAR dates (un-deferred date branch). Run on My Experience
-         (page 2); minimize within 60s. [CDP-EDU] in the SW console. -->
-    <button id="cdp-fill-education">CDP fill education (page 2; minimize!)</button>
-    <!-- CERTIFICATIONS FILL (M36): cert typeahead + number + issued/expiration M/D/Y dates
-         (un-deferred date branch). deleteOnNoMatch. Set a REAL cert name to see the M/D/Y dates
-         render in-section. Run on My Experience (page 2); minimize within 60s. [CDP-CERT]. -->
-    <button id="cdp-fill-certifications">CDP fill certifications (page 2; minimize!)</button>
-    <!-- DATE FILL (M34 verify): fill ONE date composite located by the label regex
-         above (reuses the "CDP typeahead target" input) via fillDateCompositeCdp —
-         proves the date handler on WE M/Y, Education year-only, Certs M/D/Y. Run on
-         My Experience (page 2); minimize within 60s. [CDP-DATE] in the SW console. -->
-    <button id="cdp-fill-date">CDP fill one date (page 2; minimize!)</button>
+    <!-- Read-only fingerprint of ANY page (maintenance / dead session / login / error / a
+         normal form) so an unknown page state can be detected in code. [CDP-PAGE-RECON]. -->
+    <button id="cdp-page-recon">CDP recon: page identity (read-only; ANY page — maintenance/error/login)</button>
     <hr>
     <!-- AI config (AI-0): the multi-provider LLM adapter. Provider + model + API key are
          stored in chrome.storage.local.llmConfig; "AI fill ON" is the opt-in toggle (OFF =
