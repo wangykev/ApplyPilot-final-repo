@@ -94,6 +94,19 @@ function cdpSend(method, params) {
   });
 }
 
+// Best-effort page WAKE: nudge a backgrounded tab out of Chrome's FROZEN lifecycle so Workday's
+// SPA page-to-page transition can run. A HIDDEN tab throttles timers to ~1Hz and pauses rAF; the
+// fill survives that (React schedules its commits on a channel that still runs), but the route
+// transition after "Save & Continue" stalls (the 2026-07-03 hidden page-2→3 stall — advances when
+// visible, never when hidden even with a 40s wait). setWebLifecycleState('active') resumes a frozen
+// page; it is a no-op / swallowed error if the page isn't frozen or the command isn't supported.
+// It does NOT spoof document.visibilityState (that would corrupt the adaptive-pacing sampler and
+// race the next page's fill) — only the freeze lifecycle. If this proves insufficient the cause is
+// pure rAF-pause, which only true tab visibility resumes.
+async function cdpWakePage() {
+  try { await cdpSend("Page.setWebLifecycleState", { state: "active" }); } catch (e) { /* best-effort — no-op if unsupported/not frozen */ }
+}
+
 // Run a SELF-CONTAINED function in the page via Runtime.evaluate and return its
 // JSON value. Args must be JSON-serializable; fn must close over nothing (same
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
