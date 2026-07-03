@@ -852,6 +852,52 @@ test("AI fallback HOLD 2: a non-option choice + a value STRAYS on close → ai-n
   assert.match(rec.detail, /STRAYED/);
 });
 
+// ── AI-1 on a PREFILLED dropdown (Workday restores prior answers on a re-run) ─
+// The 2026-07-02 page-3 bug: a 503-failed AI call on a prefilled screening dropdown reported
+// after:null → the summary showed an EMPTY field while the page held the answer. Every
+// no-commit exit must surface the live kept value (current_value = rec.after in the bundle).
+
+test("AI fallback on a PREFILLED dropdown: a FAILED LLM call reports the live kept value, never after:null (the 503 summary-masking bug)", async () => {
+  const act = makeFakeAct([aiDd({ triggerText: "No" })], { aiEnabled: true,
+    ai: { ok: false, error: "HTTP 503: high demand (gave up after 3 attempts)" } });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review", "an unverified AI question still needs human eyes");
+  assert.strictEqual(rec.flag, "ai-call-failed", "unchanged value → not a stray");
+  assert.strictEqual(rec.after, "No", "the live PREFILLED value — the page truth, not a false blank");
+  assert.match(rec.detail, /HTTP 503/, "the LLM error (incl. its attempts note) is in the detail");
+  assert.match(rec.detail, /already held "No" \(prefilled\) — KEPT/, "the reviewer is told the value was already on the page");
+  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "no commit — nothing was actuated");
+  const e = buildReviewBundle(out.results, {}).entries[0];
+  assert.strictEqual(e.current_value, "No", "the summary SHOWS the prefilled value");
+  assert.strictEqual(e.needs_review, true);
+});
+
+test("AI fallback on a BLANK dropdown: a FAILED LLM call stays after:null ('Select One' is the placeholder, not a value — regression pin)", async () => {
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: { ok: false, error: "HTTP 503: high demand" } });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-call-failed");
+  assert.strictEqual(rec.after, null, "genuinely blank — the placeholder never masquerades as a kept value");
+  assert.ok(!/prefilled/.test(rec.detail), "no kept-prefill note on a blank field");
+});
+
+test("AI fallback on a PREFILLED dropdown: a no-match reply ALSO reports the kept prefilled value", async () => {
+  const act = makeFakeAct([aiDd({ triggerText: "Yes" })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.flag, "ai-nomatch");
+  assert.strictEqual(rec.after, "Yes", "the kept prefill is surfaced, not a false blank");
+  assert.match(rec.detail, /already held "Yes" \(prefilled\)/);
+});
+
+test("AI fallback on a PREFILLED dropdown: a successful pick that REPLACES the prefill names it in the detail (provenance)", async () => {
+  const act = makeFakeAct([aiDd({ triggerText: "Yes" })], { aiEnabled: true, ai: '{"choice":"No","justification":"basis","confidence":"High"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.after, "No");
+  assert.match(rec.detail, /overwrote prefilled "Yes"/, "the replaced prior answer is visible to the reviewer");
+});
+
 test("AI: sensitive-vs-not prominence DATA — both flags + distinct reasons persist (the viewer partitions on the flag, not confidence)", async () => {
   const act = makeFakeAct([
     aiDd({ wrapperSel: "[w-crim]", fieldName: "crim_q", label: "Have you been convicted of a criminal offence?", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] }),
