@@ -5,7 +5,7 @@
 // adapter would crash a fill).
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { callLLM, LLM_DEFAULT_MODELS, LLM_MODELS } = require("../llm.js");
+const { callLLM, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_MS } = require("../llm.js");
 
 // A fake fetch that captures the request + returns a canned JSON body.
 function fakeFetch(captured, body, { ok = true, status = 200, throwNetwork = false, badJson = false } = {}) {
@@ -91,6 +91,64 @@ test("empty / missing text in a 200 response → { ok:false } (never a blank 'su
   const r = await callLLM({ ...base, provider: "gemini" }, ff);
   assert.strictEqual(r.ok, false);
   assert.match(r.error, /no text in response/);
+});
+
+// ── Transient-availability retry (the 2026-07-02 Gemini 503 "high demand") ──
+// A fake fetch returning a SEQUENCE of responses, one per attempt (the last repeats).
+function seqFetch(calls, seq) {
+  return async (url, opts) => {
+    calls.push({ url, opts });
+    const s = seq[Math.min(calls.length - 1, seq.length - 1)];
+    return { ok: s.ok !== false, status: s.status || 200,
+      json: async () => s.body, text: async () => JSON.stringify(s.body) };
+  };
+}
+
+test("retry: HTTP 503 then success → ok:true after ONE wait (the Gemini high-demand spike recovers)", async () => {
+  const calls = [], waits = [];
+  const ff = seqFetch(calls, [
+    { ok: false, status: 503, body: { error: { code: 503, message: "This model is currently experiencing high demand.", status: "UNAVAILABLE" } } },
+    { body: { candidates: [{ content: { parts: [{ text: "OK" }] } }] } }
+  ]);
+  const r = await callLLM({ ...base, provider: "gemini" }, ff, async (ms) => waits.push(ms));
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.text, "OK");
+  assert.strictEqual(calls.length, 2, "one retry");
+  assert.deepStrictEqual(waits, [LLM_RETRY_DELAYS_MS[0]], "waited before the retry");
+});
+
+test("retry: persistent 503 → exhausts every delay then ok:false NAMING the attempts (bounded, never an infinite loop)", async () => {
+  const calls = [], waits = [];
+  const ff = seqFetch(calls, [{ ok: false, status: 503, body: { error: { message: "high demand" } } }]);
+  const r = await callLLM({ ...base, provider: "gemini" }, ff, async (ms) => waits.push(ms));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /HTTP 503/);
+  assert.match(r.error, /high demand/);
+  assert.match(r.error, new RegExp("gave up after " + (LLM_RETRY_DELAYS_MS.length + 1) + " attempts"));
+  assert.strictEqual(calls.length, LLM_RETRY_DELAYS_MS.length + 1, "one attempt per delay + the first");
+  assert.deepStrictEqual(waits, LLM_RETRY_DELAYS_MS, "waited the full ladder");
+});
+
+test("retry: auth/validation (401) NEVER retries — one attempt, no wait, no attempts note", async () => {
+  const calls = [], waits = [];
+  const ff = seqFetch(calls, [{ ok: false, status: 401, body: { error: { message: "invalid api key" } } }]);
+  const r = await callLLM({ ...base, provider: "openai" }, ff, async (ms) => waits.push(ms));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /HTTP 401/);
+  assert.ok(!/gave up after/.test(r.error), "a single attempt carries no attempts note");
+  assert.strictEqual(calls.length, 1);
+  assert.deepStrictEqual(waits, []);
+});
+
+test("retry: 429 (rate limit) is retryable — recovers on the second attempt", async () => {
+  const calls = [];
+  const ff = seqFetch(calls, [
+    { ok: false, status: 429, body: { error: { message: "rate limited" } } },
+    { body: { choices: [{ message: { content: "OK" } }] } }
+  ]);
+  const r = await callLLM({ ...base, provider: "openai" }, ff, async () => {});
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(calls.length, 2);
 });
 
 test("LLM_DEFAULT_MODELS has a default per provider", () => {

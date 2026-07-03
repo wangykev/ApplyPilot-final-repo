@@ -90,11 +90,22 @@ const LLM_PROVIDERS = {
   }
 };
 
+// Transient-availability RETRY (2026-07-02: a Gemini HTTP 503 "high demand … try again later"
+// killed a page-3 screening-question fill). Demand/infra spikes are usually temporary, so a
+// retryable HTTP status WAITS then re-sends the SAME request (delays below, in order) before
+// giving up with ok:false. Status-keyed ONLY: auth/validation failures (400/401/403/404) and
+// malformed-response failures never retry (a retry can't fix them), and a network throw keeps
+// its existing single-attempt contract. Worst case adds ~10s to a failing call — acceptable;
+// the alternative is a needs_review on a field the model could have answered seconds later.
+const LLM_RETRY_STATUS = { 429: true, 500: true, 502: true, 503: true, 504: true, 529: true };
+const LLM_RETRY_DELAYS_MS = [2000, 8000]; // wait-then-retry, in order; length = max retries
+
 // callLLM — provider-agnostic. Returns { ok:true, text } or { ok:false, error }.
 // `fetchImpl` is injectable for Node tests; in the SW/popup it defaults to global fetch.
+// `sleepImpl` is injectable the same way (retry tests pass a capture so they don't wait).
 // NEVER throws — every failure is a normalized { ok:false, error } (the caller flags
 // the field for review; a thrown adapter must not crash a fill).
-async function callLLM(req, fetchImpl) {
+async function callLLM(req, fetchImpl, sleepImpl) {
   const fetchFn = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
   if (!fetchFn) return { ok: false, error: "no fetch available in this context" };
   const cfg = req || {};
@@ -106,13 +117,23 @@ async function callLLM(req, fetchImpl) {
 
   let url, opts;
   try { ({ url, opts } = prov.build(cfg)); } catch (e) { return { ok: false, error: "request build failed: " + String((e && e.message) || e) }; }
+  const sleep = sleepImpl || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
-  let res;
-  try { res = await fetchFn(url, opts); } catch (e) { return { ok: false, error: "network error: " + String((e && e.message) || e) }; }
+  let res, attempt = 0;
+  for (;;) {
+    try { res = await fetchFn(url, opts); } catch (e) { return { ok: false, error: "network error: " + String((e && e.message) || e) }; }
+    if (res && !res.ok && LLM_RETRY_STATUS[res.status] && attempt < LLM_RETRY_DELAYS_MS.length) {
+      await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+      attempt++;
+      continue;
+    }
+    break;
+  }
   if (!res || !res.ok) {
     let body = "";
     try { body = await res.text(); } catch (e) { /* ignore */ }
-    return { ok: false, error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : "") };
+    return { ok: false, error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : "")
+      + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "") };
   }
   let data;
   try { data = await res.json(); } catch (e) { return { ok: false, error: "bad JSON response: " + String((e && e.message) || e) }; }
@@ -140,5 +161,5 @@ const LLM_DEFAULT_MODELS = { anthropic: LLM_MODELS.anthropic[0], gemini: LLM_MOD
 // UMD-lite: export for the Node test runner; in the popup/SW `module` is undefined so
 // the functions stay globals (from <script> / importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS };
+  module.exports = { callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS };
 }

@@ -571,6 +571,19 @@ const closeAndVerifyBlank = async (act, loc, before, budgets) => {
   return { blank: blankNow(s), after: s ? s.triggerText : null };
 };
 
+// Honest AFTER for the AI no-commit exits (call failed / no options / no match). cz.blank means
+// the value did not CHANGE — but an UNCHANGED field is only truly blank when what it held was
+// the placeholder ("Select One"): a PREFILLED dropdown (Workday restores prior answers on a
+// re-run) stays on its REAL value, and reporting after:null there MASKED the live value from the
+// summary (the 2026-07-02 page-3 bug: a 503-failed AI call on a prefilled screening dropdown →
+// the review showed an empty field while the page held the answer; current_value = rec.after, so
+// null hid it). Unchanged+real → report the live value; unchanged+placeholder → null (genuinely
+// blank); changed → the strayed value (the caller's *-stray flag, keyed on cz.blank, is untouched).
+const noCommitAfter = (cz) => (cz.blank && !hasLiveValue(cz.after) ? null : cz.after);
+// The companion review note — tells the reviewer the value they see was ALREADY on the page.
+const keptPrefillNote = (cz) => (cz.blank && hasLiveValue(cz.after)
+  ? "; the field already held \"" + cz.after + "\" (prefilled) — KEPT, verify" : "");
+
 // AI-1 recon (READ-ONLY): open a dropdown, capture its FULL option list, then dismiss it via
 // the VERIFIED-BLANK close (NOT a bare Escape) and report whether it stayed blank. NEVER
 // types/arrows/clicks an option. `clean` is the real property (closed AND still on the
@@ -652,8 +665,8 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
   if (!expanded || !state || state.optionCount === 0) { // couldn't open / no render — infra, not invalid data
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: cz.blank ? "ai-no-options" : "ai-no-options-stray",
-      detail: "AI fallback: dropdown options did not render (not actuated)", options: enabledTextsSafe(state), auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-no-options" : "ai-no-options-stray",
+      detail: "AI fallback: dropdown options did not render (not actuated)" + keptPrefillNote(cz), options: enabledTextsSafe(state), auditLoc: loc.wrapperSel };
   }
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low.";
@@ -665,8 +678,8 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
   const res = await act.llm({ system, user, maxTokens: 512 });
   if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
-      detail: "AI call failed — " + ((res && res.error) || "no reply"), options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
+      detail: "AI call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
   }
   const ai = parseAiReply(res.text);
   const conf = ai.confidence; // the AI's self-reported inference confidence (high/medium/low)
@@ -676,8 +689,8 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
   if (m.targetIndex === -1) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
     const base = "AI chose \"" + ai.choice + "\" — not one of the options" + (ai.justification ? " (" + ai.justification + ")" : "");
-    if (cz.blank) return { status: "needs_review", after: null, flag: "ai-nomatch", confidence: conf,
-      detail: base, options: enabledTexts, auditLoc: loc.wrapperSel };
+    if (cz.blank) return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-nomatch", confidence: conf,
+      detail: base + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
     return { status: "needs_review", after: cz.after, flag: "ai-nomatch-stray", confidence: conf,
       detail: base + "; \"" + cz.after + "\" STRAYED onto this field — review/correct it", options: enabledTexts, auditLoc: loc.wrapperSel };
   }
@@ -694,10 +707,14 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
   }
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-commit-failed", confidence: conf,
     detail: "AI chose \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
-  // ALWAYS filled_review — an AI guess is never silently trusted.
+  // ALWAYS filled_review — an AI guess is never silently trusted. If the dropdown held a REAL
+  // prefilled value the AI's pick replaced, say so (provenance for the reviewer — the prior
+  // answer is otherwise invisible once overwritten).
+  const overwroteNote = hasLiveValue(before) && norm(before) !== norm(target)
+    ? " (overwrote prefilled \"" + before + "\")" : "";
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier,
     flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf,
-    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + target + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
+    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + target + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : "") + overwroteNote,
     options: enabledTexts, auditLoc: loc.wrapperSel };
 };
 // options for the no-render branch (state may be null) — keep the report honest without throwing.
@@ -782,8 +799,8 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
   if (!expanded || !state || state.optionCount === 0) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-canon-no-options",
-      detail: "AI canonicalize: options did not render (not actuated)", auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-no-options",
+      detail: "AI canonicalize: options did not render (not actuated)" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
   }
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   const system = "The applicant has ALREADY STATED a value for this field. Your ONLY job is to pick the option from the provided list that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything about the applicant. If NO option means the same, reply UNKNOWN. Never pick an option that differs in meaning.";
@@ -794,8 +811,8 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
   const res = await act.llm({ system, user, maxTokens: 128 });
   if (!res || !res.ok) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-canon-failed",
-      detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply"), options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-failed",
+      detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
   }
   const ai = parseAiReply(res.text);
   const conf = ai.confidence;
@@ -803,7 +820,7 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
   if (m.targetIndex === -1) { // UNKNOWN / not a real option — never blind-commit a demographic
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
     const base = "AI could not map stated \"" + statedStr + "\" to an option" + (ai.choice ? " (replied \"" + ai.choice + "\")" : "");
-    if (cz.blank) return { status: "needs_review", after: null, flag: "ai-canon-nomatch", confidence: conf, detail: base, options: enabledTexts, auditLoc: loc.wrapperSel };
+    if (cz.blank) return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-nomatch", confidence: conf, detail: base + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
     return { status: "needs_review", after: cz.after, flag: "ai-canon-nomatch-stray", confidence: conf, detail: base + "; \"" + cz.after + "\" STRAYED — review", options: enabledTexts, auditLoc: loc.wrapperSel };
   }
   const target = enabledTexts[m.targetIndex];
@@ -834,7 +851,7 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
   if (!expanded || !state || state.optionCount === 0) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-no-options", detail: "AI EEO: options did not render", auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-eeo-no-options", detail: "AI EEO: options did not render" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
   }
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   const declineOpt = enabledTexts.find((o) => AI_EEO_DECLINE_RE.test(o)) || null;
@@ -847,7 +864,7 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
   const res = await act.llm({ system, user, maxTokens: 128 });
   if (!res || !res.ok) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-failed", detail: "AI EEO call failed — " + ((res && res.error) || "no reply"), options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-eeo-failed", detail: "AI EEO call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
   }
   const ai = parseAiReply(res.text);
   const choseDecline = !!ai.choice && AI_EEO_DECLINE_RE.test(ai.choice);
@@ -858,12 +875,12 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
   else if (declineOpt) { target = declineOpt; declined = true; } // low-confidence guess → override to decline
   if (!target) { // no confident guess + no decline option → can't safely fill
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-undecided", detail: "AI could not confidently infer + no decline option" + (ai.choice ? " (low-confidence \"" + ai.choice + "\")" : ""), options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-eeo-undecided", detail: "AI could not confidently infer + no decline option" + (ai.choice ? " (low-confidence \"" + ai.choice + "\")" : "") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
   }
   const m = apMatch.matchCandidates([target], enabledTexts);
   if (m.targetIndex === -1) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: cz.blank ? null : cz.after, flag: "ai-eeo-nomatch", detail: "AI EEO pick \"" + target + "\" not an option", options: enabledTexts, auditLoc: loc.wrapperSel };
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-eeo-nomatch", detail: "AI EEO pick \"" + target + "\" not an option" + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
   }
   const opt = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, opt);
