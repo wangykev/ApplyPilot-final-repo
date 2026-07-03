@@ -3273,11 +3273,23 @@ async function reconPageTruth(act, results) {
         const fields = (entries[i] && entries[i].fields) || [];
         const fd = fm ? (fm.labelRegex ? fields.find((x) => fm.labelRegex.test(x.label || "")) : fields.find((x) => x.fieldName === fm.field)) : null;
         if (fd && r.after != null) {
-          if (hasLiveValue(fd.value) && norm(String(fd.value)) !== norm(String(r.after))) {
+          // A checkbox's live value is a BOOLEAN — an UNchecked box (false) is a valid, determinate
+          // state, NOT an unfilled field. hasLiveValue(false) is false, which would wrongly flag every
+          // correctly-unchecked "I currently work here" as EMPTY; a checkbox always has a value.
+          const isCheckbox = fd.widgetType === "checkbox" || typeof fd.value === "boolean";
+          const liveHasValue = isCheckbox ? (fd.value != null) : hasLiveValue(fd.value);
+          // Dates compare SEGMENT-wise by NUMERIC value (auditDateMatches): the fill records the
+          // segment INPUT ("9/2024") while this recon re-reads cdpRepeatingScan's DISPLAY value, which
+          // Workday renders ZERO-PADDED ("09/2024") — norm() treats "9"≠"09" and would false-flag every
+          // M/Y|M/D/Y date. Reuse the M40 audit's comparator (the fill afterStr is its exact inverse).
+          const changed = fd.widgetType === "date"
+            ? !auditDateMatches(String(fd.value), String(r.after))
+            : norm(String(fd.value)) !== norm(String(r.after));
+          if (liveHasValue && changed) {
             r.after = String(fd.value);
             r.status = "needs_review"; r.flag = "recon-mismatch";
             r.detail = (r.detail ? r.detail + " | " : "") + "live value changed before advance (post-remediation shift?) — verify";
-          } else if (!hasLiveValue(fd.value)) {
+          } else if (!liveHasValue) {
             r.status = "needs_review"; r.flag = "recon-mismatch";
             r.detail = (r.detail ? r.detail + " | " : "") + "field is EMPTY on the page at advance-time — verify";
           }
