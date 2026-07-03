@@ -1794,6 +1794,7 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
 
     // ── re-Save & Continue (GUARDED — refuses on the review marker) + wait. ──
     const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+    await cdpWakePage(); // wake a frozen hidden tab so the post-remediation transition can run
     const click = await act.clickPageNext();
     if (!click.clicked) return { advanced: false, reason: "click-refused:" + (click.refused || "?"), attempts: attempt, actions };
     // Throttle-generous ceiling (see REMEDIATION_RENAV_CEILING_MS): a hidden tab's post-remediation
@@ -1926,6 +1927,9 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
   let steady = -1, errSteady = 0;
   while (Date.now() - start < timeoutMs) {
     await cdpDelay(intervalMs);
+    // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
+    // hidden page-2→3 stall (2026-07-03). No-op when visible/not-frozen. See cdpWakePage.
+    await cdpWakePage();
     let state = null;
     try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
     if (state && isWorkdayMaintenance(state)) return { advanced: false, maintenance: true, state }; // transient, retry-later — NOT dead (checked first)
@@ -1973,6 +1977,12 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
     if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
     if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
+    // Hidden-tab hint: when the page won't advance AND the tab is hidden AND there's no error text,
+    // the likely cause is Chrome freezing/throttling the background tab so Workday's SPA transition
+    // stalls (advances fine when visible) — tell the operator to bring the tab to the FOREGROUND.
+    if (st && st.visibilityState === "hidden" && !samples.length && !(st && st.errorPageText)) {
+      LOG("⚠ the tab is HIDDEN and the page shows no errors but won't advance — Chrome throttles background tabs, which can STALL Workday's page transition. Bring the tab to the FOREGROUND (visible) and re-run; the fill itself works hidden, but page-to-page advancement may need a visible tab.");
+    }
     const empties = (pageOut && pageOut.results || []).filter((r) => r.status === "skipped");
     if (empties.length) {
       LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
@@ -2044,6 +2054,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──
+      await cdpWakePage(); // wake a frozen hidden tab so the Save & Continue transition can run (hidden page-N→N+1 stall)
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
       if (!click.clicked) {
