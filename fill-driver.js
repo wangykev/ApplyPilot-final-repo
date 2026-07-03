@@ -1945,8 +1945,8 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
 };
 
 // The AI typeahead pass: rescue every GENUINE no-match flat typeahead in `results` via the LLM.
-// Extracted so BOTH drivePageFill (full-page + walk) and the per-section harness (runCdpFillEducation)
-// run the IDENTICAL logic. No-op when act.aiEnabled is false (AI OFF ⇒ no provider call — byte-identical).
+// Extracted as a reusable pass over drivePageFill's results (full-page + walk); kept as a unit seam.
+// No-op when act.aiEnabled is false (AI OFF ⇒ no provider call — byte-identical).
 async function runAiTypeaheadPass(act, results, profile, jobContext, budgets) {
   if (!act || !act.aiEnabled) return;
   for (const rec of results || []) {
@@ -3791,7 +3791,7 @@ async function replayField(act, entry, budgets) {
     default: return { status: "needs_review", detail: "replay: unsupported widget " + widget };
   }
 }
-// replayFlatFields: the DRY-replay orchestrator (the M2 harness + a unit seam). Replays each FLAT,
+// replayFlatFields: the DRY-replay orchestrator (a unit seam for the future M2 strict-replay SUBMIT). Replays each FLAT,
 // PRESENT, re-fillable bundle entry on the live page via replayField; skips repeating (deferred),
 // file_upload, deleted, and any field NOT present in `presentFieldNames` (so it scopes to the
 // current page). NO Next/Submit — the caller stays in control. Returns the per-field results.
