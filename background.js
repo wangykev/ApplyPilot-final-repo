@@ -1597,6 +1597,14 @@ function mergeRemediationRecord(out, rec) {
 // is recorded into out.results (flag ai-remediation) + the bundle re-persisted. NEVER submits — the
 // re-Save&Continue is the GUARDED clickPageNext (refuses on the review marker).
 const REMEDIATION_MAX = 3;
+// The re-navigation AFTER a remediation action needs a MORE generous wall-clock ceiling than the
+// initial Save. When the tab is HIDDEN the page runs throttled (~1Hz) — CDP actuation is throttle-
+// immune but Workday's own post-Save validation + route transition are not. The live hidden page-2→3
+// stall (2026-07-03): Tier-0 cleared the throttle-induced phantom "Duplicate language" error, but the
+// throttled navigation hadn't finished inside the default 15s, so the walk halted "errors-cleared-
+// not-advancing". A genuine validation error still fast-exits in ~1s (errors ⟺ won't-advance), so this
+// larger ceiling ONLY extends the no-error slow-nav case; a VISIBLE fast nav returns early either way.
+const REMEDIATION_RENAV_CEILING_MS = 40000;
 async function remediatePageErrors(act, profile, defaults, jobContext, out, pageKey, page, LOG) {
   const actions = [];
   // expandErrorSamples (lib.js): Workday's top banner concatenates EVERY error into one element —
@@ -1610,7 +1618,11 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
   // remediation read "0 error(s)" and Tier 2 acted BLIND — deleted a correctly-filled cert entry).
   let prevErrors = await readErrors();
   for (let poll = 0; poll < 8 && !prevErrors.length; poll++) { await cdpDelay(500); prevErrors = await readErrors(); }
-  LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s). Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
+  // Diagnostic: a HIDDEN (throttled) tab is the 2026-07-03 signature — Workday's page-side validation
+  // misfires the "Duplicate language" phantom + navigates slowly under ~1Hz throttling, while a VISIBLE
+  // tab advances cleanly. Log it so a stuck hidden run is unambiguous in the trace.
+  let _vis = null; try { const _st = await cdpEval(cdpReadSessionState); _vis = _st ? _st.visibilityState : null; } catch (e) { /* ignore */ }
+  LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s) [tab ${_vis || "?"}]. Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
 
   for (let attempt = 1; attempt <= REMEDIATION_MAX; attempt++) {
     // NEVER act blind: with no error text there is nothing to anchor a SAFE action on — every tier
@@ -1784,12 +1796,17 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
     const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
     const click = await act.clickPageNext();
     if (!click.clicked) return { advanced: false, reason: "click-refused:" + (click.refused || "?"), attempts: attempt, actions };
-    const res = await cdpWaitNextPage(prevSig);
+    // Throttle-generous ceiling (see REMEDIATION_RENAV_CEILING_MS): a hidden tab's post-remediation
+    // nav runs at ~1Hz — the default 15s stalled hidden page-2→3 after Tier-0 cleared the errors.
+    const res = await cdpWaitNextPage(prevSig, REMEDIATION_RENAV_CEILING_MS);
     if (res.sessionDead) return { sessionDead: true, attempts: attempt, actions };
     if (res.advanced) return { advanced: true, attempts: attempt, actions };
 
     // ── not advanced → HALT on NO-PROGRESS (error set unchanged); else continue. ──
-    const newErrors = await readErrors();
+    // POLL the errors (do NOT single-read): under throttle the banner renders LATER than the wait
+    // ceiling — a single read can catch 0 and mislabel a real, still-blocking error as "cleared".
+    let newErrors = await readErrors();
+    for (let poll = 0; poll < 8 && !newErrors.length; poll++) { await cdpDelay(500); newErrors = await readErrors(); }
     if (errorSetUnchanged(prevErrors, newErrors)) {
       LOG(`  remediation made NO PROGRESS (error set unchanged after the action) — halting.`);
       return { advanced: false, reason: "no-progress", attempts: attempt, actions, errors: newErrors };
