@@ -3535,6 +3535,56 @@ test("reconPageTruth: a deleted NESTED row (probed auditLoc stops resolving) dro
   assert.strictEqual(kept[0].status, "filled_review", "no existence seam → record kept as-is");
 });
 
+// ── reconPageTruth false-positive fixes (2026-07-03): the remediation recon wrongly flagged
+// correctly-filled WE dates ("9/2024" input vs "09/2024" display) and unchecked checkboxes ─────
+const weAct = (fields) => ({ scanPage: async () => ({ fields: [] }),
+  repeatingScan: async () => ({ sections: { "workExperience-": { entries: [{ fields }] } } }) });
+
+test("reconPageTruth: a correctly-filled WE date (input 9/2024 vs zero-padded display 09/2024) is NOT flagged", async () => {
+  const results = [{ fieldName: "workExperience[0].startDate", label: "From", widgetType: "date",
+    status: "filled", flag: null, verified: true, after: "9/2024", detail: "segments {...}" }];
+  await reconPageTruth(weAct([{ fieldName: "startDate", widgetType: "date", value: "09/2024" }]), results);
+  assert.strictEqual(results[0].status, "filled", "no spurious recon-mismatch on a zero-padding-only difference");
+  assert.strictEqual(results[0].flag, null);
+});
+
+test("reconPageTruth: a GENUINELY changed WE date IS flagged (regression pin — the fix must not blind the recon)", async () => {
+  const results = [{ fieldName: "workExperience[0].startDate", label: "From", widgetType: "date",
+    status: "filled", flag: null, verified: true, after: "9/2024", detail: null }];
+  await reconPageTruth(weAct([{ fieldName: "startDate", widgetType: "date", value: "10/2024" }]), results);
+  assert.strictEqual(results[0].status, "needs_review");
+  assert.strictEqual(results[0].flag, "recon-mismatch");
+  assert.strictEqual(results[0].after, "10/2024", "refreshed to the live value");
+  assert.match(results[0].detail, /live value changed/);
+});
+
+test("reconPageTruth: a truly EMPTY WE date (display shows placeholders → null) IS flagged EMPTY", async () => {
+  const results = [{ fieldName: "workExperience[0].startDate", label: "From", widgetType: "date",
+    status: "filled", flag: null, verified: true, after: "9/2024", detail: null }];
+  await reconPageTruth(weAct([{ fieldName: "startDate", widgetType: "date", value: null }]), results);
+  assert.strictEqual(results[0].status, "needs_review");
+  assert.strictEqual(results[0].flag, "recon-mismatch");
+  assert.match(results[0].detail, /EMPTY on the page/);
+});
+
+test("reconPageTruth: a correctly-UNCHECKED 'I currently work here' (live false) is NOT flagged EMPTY", async () => {
+  const results = [{ fieldName: "workExperience[0].currentlyWorkHere", label: "I currently work here",
+    widgetType: "checkbox", status: "filled", flag: null, verified: true, after: "false", detail: "already unchecked" }];
+  await reconPageTruth(weAct([{ fieldName: "currentlyWorkHere", widgetType: "checkbox", value: false }]), results);
+  assert.strictEqual(results[0].status, "filled", "an unchecked box is a valid state, not an empty field");
+  assert.strictEqual(results[0].flag, null);
+});
+
+test("reconPageTruth: a genuinely CHANGED checkbox (record false, live true) IS flagged", async () => {
+  const results = [{ fieldName: "workExperience[0].currentlyWorkHere", label: "I currently work here",
+    widgetType: "checkbox", status: "filled", flag: null, verified: true, after: "false", detail: null }];
+  await reconPageTruth(weAct([{ fieldName: "currentlyWorkHere", widgetType: "checkbox", value: true }]), results);
+  assert.strictEqual(results[0].status, "needs_review");
+  assert.strictEqual(results[0].flag, "recon-mismatch");
+  assert.strictEqual(results[0].after, "true");
+  assert.match(results[0].detail, /live value changed/);
+});
+
 test("sweep: a LIVE mapped value whose records were dropped is RE-ADDED as already-filled (the survivor row)", async () => {
   const results = [{ fieldName: "language[0].language", label: "Language", widgetType: "dropdown", isRequired: false,
     mappedPath: "languages[0].language", rawValue: "English", resolved: "English",
