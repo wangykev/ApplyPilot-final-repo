@@ -516,6 +516,7 @@ const fillTextCdp = async (act, loc, value, budgets, tag) => {
 // blank. READ-ONLY — no match/commit. (fillDropdownCdp keeps its own inline copy; this serves
 // reconDropdownDump + aiFillField, the no-commit readers.)
 const openAndReadDropdown = async (act, loc, budgets) => {
+  const delayRender = act.delayRender || act.delayFull; // STAGE 2: render-settle, adaptive under the measured-fast gate (fallback for older fakes)
   const pre = await act.readDropdownState(loc);
   const before = pre ? pre.triggerText : null;
   let state = null, expanded = false;
@@ -529,7 +530,7 @@ const openAndReadDropdown = async (act, loc, budgets) => {
       if (state && state.ariaExpanded === "true") { expanded = true; break; }
     }
   }
-  if (expanded) { // GATE 2: real-time settle to the COMPLETE list (2 equal non-zero reads)
+  if (expanded) { // GATE 2: settle to the COMPLETE list (2 equal non-zero reads); interval adaptive under the measured-fast gate (delayRender)
     let prevCount = -1, stable = 0;
     const openDeadline = Date.now() + budgets.openCeilingMs;
     while (Date.now() < openDeadline) {
@@ -537,7 +538,7 @@ const openAndReadDropdown = async (act, loc, budgets) => {
       if (n > 0 && n === prevCount) { stable++; if (stable >= budgets.stableReads - 1) break; }
       else stable = 0;
       prevCount = n;
-      await act.delayFull(budgets.settleIntervalMs);
+      await delayRender(budgets.settleIntervalMs);
       state = await act.readDropdownState(loc);
     }
   }
@@ -968,6 +969,7 @@ async function closeDropdownConfirmed(act, loc, budgets) {
 // behind the same trigger-text verify gate.
 const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const norm = apMatch.normalize;
+  const delayRender = act.delayRender || act.delayFull; // STAGE 2: option-settle + commit-persistence intervals, adaptive under the measured-fast gate (fallback for older fakes)
   const pre = await act.readDropdownState(loc);
   const before = pre ? pre.triggerText : null;
 
@@ -1021,11 +1023,17 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   }
   // GATE 2: the trigger IS expanded — NEVER re-click it. Poll optionCount to the FULL
   // ceiling (a cold lazy list renders after the expand). Settle = 2 equal non-zero reads.
-  // delayFull (NON-adaptive): the option list renders at the PAGE's pace, which the
-  // foreground speedup must NOT shorten — at fast-scaled intervals the "2 stable reads"
-  // span only ~140ms and conclude on an INCOMPLETE render, so a pick lands on a partial
-  // list and is discarded on render-complete (the false verified:true). Real-time stability
-  // ⇒ the list is fully rendered before we match/click.
+  // STAGE 2 — delayRender (adaptive under the measured-fast gate, was NON-adaptive delayFull):
+  // the historic hazard was a fast-scaled poll spanning only ~140ms concluding on an
+  // INCOMPLETE render → a pick lands on a partial list, discarded on render-complete (the
+  // false verified:true). That is now safe on two independent counts: (1) delayRender shrinks
+  // the interval ONLY when timers MEASURE fast (worker-timers/visible), i.e. exactly when the
+  // list renders in ~50ms so "2 reads ~70ms apart" both observe the COMPLETE list — a
+  // throttled/network-cold list keeps the count at 0 (the n>0 gate) or full delayFull (measured
+  // slow); and (2) even a premature settle is backstopped by the commit PERSISTENCE re-read
+  // below (a discarded pick reverts → committedText fails → keeps polling → honest needs_review,
+  // never a wrong/silent commit). The ceiling stays raw (full) so a genuinely slow list never
+  // false-times-out. The openDeadline/ceiling are NOT routed through delayRender (stay full).
   if (expanded) {
     let prevCount = -1, stable = 0;
     const openDeadline = Date.now() + budgets.openCeilingMs;
@@ -1038,7 +1046,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
         stable = 0;
       }
       prevCount = n;
-      await act.delayFull(budgets.settleIntervalMs);
+      await delayRender(budgets.settleIntervalMs);
       state = await act.readDropdownState(loc);
     }
   }
@@ -1095,16 +1103,18 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     let after = null;
     const deadline = Date.now() + budgets.commitCeilingMs;
     while (Date.now() < deadline) {
-      await act.delayFull(budgets.commitIntervalMs); // real time — the page commits the pick at its own pace
+      await delayRender(budgets.commitIntervalMs); // the page commits the pick at its own pace — adaptive under the measured-fast gate (STAGE 2)
       const cs = await act.readDropdownState(loc);
       after = cs ? cs.triggerText : after;
       if (committedText(after)) {
         // PERSISTENCE (the false-verify guard): a pick made before the option list finished
         // rendering shows for an instant, then is DISCARDED on render-complete — that momentary
         // value is exactly what produced the false verified:true. Confirm the trigger STILL
-        // shows the target after another real-time beat before accepting; a revert keeps polling
-        // (→ honest needs_review), never a silent wrong fill.
-        await act.delayFull(budgets.commitIntervalMs);
+        // shows the target after another beat before accepting; a revert keeps polling (→ honest
+        // needs_review), never a silent wrong fill. This re-read is the interval-LENGTH-INDEPENDENT
+        // gate that makes the adaptive delayRender safe: shrinking the beat only re-polls sooner —
+        // acceptance still requires the target to PERSIST across the beat.
+        await delayRender(budgets.commitIntervalMs);
         const cs2 = await act.readDropdownState(loc);
         const after2 = cs2 ? cs2.triggerText : null;
         if (committedText(after2)) return { ok: true, after: after2 };
@@ -1133,7 +1143,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     if (!re || re.optionCount === 0) {
       if (await act.openDropdown(loc)) {
         const d = Date.now() + Math.min(budgets.openCeilingMs, 8000);
-        while (Date.now() < d) { await act.delayFull(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; }
+        while (Date.now() < d) { await delayRender(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; } // re-open settle — adaptive under the measured-fast gate (STAGE 2); gated by optionCount>0, interval-independent
       }
     }
     if (re && re.optionCount > 0) res = await commitByClick();

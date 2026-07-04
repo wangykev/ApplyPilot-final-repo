@@ -2294,7 +2294,8 @@ function makeCdpActuation(llmConfig) {
     // toggle never opens/actuates). Mirrors act.llm's own enabled check (both read llmConfig).
     aiEnabled: !!(llmConfig && llmConfig.enabled),
     delay: cdpAdaptiveDelay, // ALL driver pacing goes through this — visibility-adaptive: fast foreground, full hidden (SW wall-clock)
-    delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility (dropdown option-list render + commit-verify). The 5x speedup is for OUR pacing between actions, NEVER the page's render.
+    delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility. The 5x speedup is for OUR pacing between actions, NEVER the page's render.
+    delayRender: cdpAdaptiveDelay, // STAGE 2 (2026-07-04): render-SETTLE intervals (dropdown option-list settle + commit-persistence) — adaptive on the SAME cdpFast() measured signal as `delay`. Safe to shrink because the sites gated by it use interval-LENGTH-INDEPENDENT state gates (2-equal-non-zero reads / persistence re-read), and it only shrinks when timers MEASURE fast (worker-backed/visible → the render genuinely completes in ~50ms). Slow/throttled ⇒ full ⇒ byte-identical to the old delayFull. Driver falls back to delayFull when this is absent (older fakes).
 
     scanPage: () => cdpEval(cdpPageScan),
 
