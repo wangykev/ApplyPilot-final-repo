@@ -56,7 +56,9 @@ function cdpAttach(tabId) {
         return;
       }
       cdpTabId = tabId;
-      _visCache = { visible: false, at: 0 }; // fresh foreground sampling per run (adaptive pacing)
+      _visCache = { visible: false, at: 0 };   // fresh foreground sampling per run (adaptive pacing)
+      _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
+      _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
@@ -127,21 +129,57 @@ async function cdpWakePage() {
 // covers any FUTURE full document load / session refresh; a Runtime.evaluate of
 // the SAME source patches the CURRENT already-loaded SPA doc (the walk attaches
 // when the operator is already on the form — the SPA never reloads, so the new-
-// document hook alone would never fire). __apRafPatched makes both idempotent.
+// document hook alone would never fire). __apOverridesInstalled makes both idempotent.
 //
-// STAGED (see the plan): this is the SIMPLE override (rAF→setTimeout + hasFocus).
-// If live-verify shows the hidden page-2→3 transition STILL stalls, escalate:
-//   • Step 2 — also spoof document.visibilityState/hidden + swallow
-//     visibilitychange/blur. SAFE now because cdpVisible() reads REAL visibility
-//     from the SW (chrome.tabs/windows), not the spoofable page value.
-//   • Step 3 — route setTimeout through a Web Worker for full-speed timers, with
-//     a try/catch fallback to native setTimeout (Workday CSP may block blob:
-//     workers). Only if 1fps is proven too slow.
-const OVERRIDE_SRC = `(function () {
+// STAGE 1 (2026-07-04): the override now ALSO installs a WORKER-TIMERS polyfill so a
+// hidden tab runs FAST, not just correct. rAF→setTimeout alone still fires at ~1fps
+// hidden (setTimeout is throttled to ~1Hz), so the fill worked hidden but crawled.
+// Timers routed through a Web Worker escape Chrome's main-thread background throttle
+// (the callback returns via postMessage, which isn't throttled) — so the page's own
+// debounced reactions (typeahead filter, dropdown render, section mounts) run at
+// full speed hidden, and our pacing can follow (see cdpFast/cdpTimersFast). The
+// worker install is BEST-EFFORT (Workday CSP may block blob: workers): its own
+// try/catch sets window.__apWorkerTimers true/false and NEVER stops the rAF override
+// (which installs after it). When the worker is unavailable we fall back to native
+// (throttled) timers → measured slow → the pacing stays full → byte-identical to the
+// pre-Stage-1 slow-but-correct path. rAF's inner window.setTimeout is worker-backed
+// when available, so rAF fires fast too. Set window.__apWorkerTimers is read back by
+// cdpInstallPageOverrides into _workerTimersActive.
+//
+// forceNoWorker (the forceWorkerTimersOff debug flag): skip the worker block and set
+// __apWorkerTimers=false — simulates a CSP-blocked tenant so the no-regression slow
+// path can be exercised on demand (Workday's real CSP is an empirical unknown).
+let _workerTimersActive = false; // did the worker-timers polyfill install on the CURRENT doc? (set by cdpInstallPageOverrides readback; reset at attach)
+
+function buildOverrideSrc(opts) {
+  const forceNoWorker = !!(opts && opts.forceNoWorker);
+  const workerBlock = forceNoWorker
+    ? `window.__apWorkerTimers = false; /* forceWorkerTimersOff — simulate a CSP-blocked tenant (slow-path test) */`
+    : `try {
+      var __wsrc = "var m={};onmessage=function(e){var d=e.data;" +
+        "if(d.c==='s'){m[d.i]=setTimeout(function(){delete m[d.i];postMessage(d.i);},d.ms);}" +
+        "else if(d.c==='v'){m[d.i]=setInterval(function(){postMessage(d.i);},d.ms);}" +
+        "else{clearTimeout(m[d.i]);clearInterval(m[d.i]);delete m[d.i];}};";
+      var __w = new Worker(URL.createObjectURL(new Blob([__wsrc], { type: "application/javascript" }))); // THROWS if CSP blocks blob: workers
+      var __cbs = {}, __seq = 1;
+      var __toFn = function (f) { if (typeof f === "function") return f; try { return new Function(f); } catch (x) { return function () {}; } };
+      __w.onmessage = function (e) { var r = __cbs[e.data]; if (!r) return; if (r.once) delete __cbs[e.data]; try { r.fn.apply(null, r.args); } catch (x) {} };
+      window.setTimeout = function (fn, ms) { var i = __seq++; __cbs[i] = { fn: __toFn(fn), args: [].slice.call(arguments, 2), once: true }; __w.postMessage({ c: "s", i: i, ms: ms || 0 }); return i; };
+      window.setInterval = function (fn, ms) { var i = __seq++; __cbs[i] = { fn: __toFn(fn), args: [].slice.call(arguments, 2), once: false }; __w.postMessage({ c: "v", i: i, ms: ms || 0 }); return i; };
+      window.clearTimeout = function (i) { delete __cbs[i]; __w.postMessage({ c: "x", i: i }); };
+      window.clearInterval = function (i) { delete __cbs[i]; __w.postMessage({ c: "x", i: i }); };
+      window.__apWorkerTimers = true;
+    } catch (e) { window.__apWorkerTimers = false; }`;
+  return `(function () {
   try {
-    if (window.__apRafPatched) return;
-    window.__apRafPatched = true;
+    if (window.__apOverridesInstalled) return;
+    window.__apOverridesInstalled = true;
     Document.prototype.hasFocus = function () { return true; };
+    // (S1) worker-timers FIRST (own try/catch) — so the rAF polyfill below picks up
+    // the worker-backed window.setTimeout and fires fast, not ~1fps, when hidden.
+    ${workerBlock}
+    // rAF→setTimeout — installs regardless of the worker outcome (a paused-forever
+    // rAF becomes an eventually-firing timer; worker-backed = fast, native = ~1fps).
     var last = 0;
     window.requestAnimationFrame = function (cb) {
       var now = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -153,16 +191,26 @@ const OVERRIDE_SRC = `(function () {
     window.cancelAnimationFrame = function (id) { window.clearTimeout(id); };
   } catch (e) { /* best-effort */ }
 })();`;
+}
 
-// Install OVERRIDE_SRC both for future documents AND on the current SPA doc.
-// Best-effort: an install failure logs and is swallowed — it must NEVER abort a
-// run (the fill already works hidden; this only helps page-to-page advancement).
+// Install the override (buildOverrideSrc) both for future documents AND on the current
+// SPA doc, then read back whether worker-timers took. Best-effort: an install failure
+// logs and is swallowed — it must NEVER abort a run (the fill already works hidden;
+// this helps page-to-page advancement AND, via worker-timers, hidden-run SPEED).
 async function cdpInstallPageOverrides() {
+  let forceNoWorker = false;
+  try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
   try {
-    await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: OVERRIDE_SRC }); // future loads / re-auth
-    await cdpSend("Runtime.evaluate", { expression: OVERRIDE_SRC });                  // the current already-loaded SPA doc
-    console.log("[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus) — hidden-tab SPA-transition unblock.");
+    const src = buildOverrideSrc({ forceNoWorker });
+    await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: src }); // future loads / re-auth
+    await cdpSend("Runtime.evaluate", { expression: src });                  // the current already-loaded SPA doc
+    // Read back whether the worker-timers polyfill actually installed on the CURRENT
+    // doc (CSP could block blob: workers → false → we stay on the safe slow path).
+    try { _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers)); } catch (e) { _workerTimersActive = false; }
+    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : "OFF (CSP?)");
+    console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
   } catch (e) {
+    _workerTimersActive = false;
     console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
   }
 }
@@ -201,6 +249,16 @@ const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amo
 
 let _visCache = { visible: false, at: 0 };
 
+// Measured page-timer-latency cache (STAGE 1). The HONEST "is the page throttled?"
+// signal: a real in-page setTimeout(0) round-trip. Fast (worker-backed or visible) ≈
+// <10ms; a ~1Hz-throttled tab ≈ ~1000ms. This is what lets us pace fast on a HIDDEN
+// tab — but ONLY when timers MEASURE fast, never on the mere assumption the worker
+// installed (install success ≠ the override reached Workday's call sites / the worker
+// still alive). See cdpTimersFast (non-blocking) + cdpFast (the gate).
+let _timerLatCache = { fast: null, at: 0 };
+const TIMER_FAST_MS = 200;  // <TIMER_FAST_MS round-trip ⇒ not throttled. 1Hz throttle ≈ 1000ms; fast ≈ <10ms; 200ms is a safe margin AND the race timeout.
+const TIMER_TTL_MS = 1500;  // throttle state is stable; re-measure occasionally (catches worker death / occlusion change mid-run)
+
 // Cached, off-loop foreground read. Reads REAL visibility from the SERVICE WORKER
 // (chrome.tabs + chrome.windows), NOT document.visibilityState from the page.
 // WHY (hidden-walk fix, 2026-07-03): the escalation path SPOOFS document.
@@ -228,10 +286,44 @@ async function cdpVisible() {
   return vis;
 }
 
-// The adaptive pacing primitive wired into act.delay. Visible → scaled-down wait;
-// hidden → the full caller-requested wait (byte-identical to the proven path).
+// Measure a page-side setTimeout(0) round-trip — the "not throttled" signal (STAGE 1).
+// NON-BLOCKING by construction: a throttled probe takes ~1s and a DEAD worker's probe
+// NEVER resolves (window.setTimeout posts to a dead thread → the callback never fires →
+// the awaitPromise CDP call would hang the SW forever). So we race the probe against an
+// SW-side timeout EQUAL to the fast/slow threshold — the race IS the decision, and it
+// bounds every probe to ≤TIMER_FAST_MS. The losing probe promise is abandoned (it
+// resolves harmlessly later on a merely-slow page, or dangles on a dead worker — the
+// page is broken then anyway). cdpFast short-circuits with !_workerTimersActive so the
+// pure no-worker path never even reaches here (never pays the probe cost).
+async function cdpTimersFast() {
+  if (Date.now() - _timerLatCache.at <= TIMER_TTL_MS && _timerLatCache.fast != null) return _timerLatCache.fast;
+  let fast = false;
+  try {
+    const probe = cdpSend("Runtime.evaluate", {
+      expression: "new Promise(function(r){var t=performance.now();setTimeout(function(){r(performance.now()-t)},0)})",
+      awaitPromise: true, returnByValue: true }); // may take ~1s (throttled) or never (dead worker) — NOT awaited directly
+    const res = await Promise.race([probe, cdpDelay(TIMER_FAST_MS).then(() => "TIMEOUT")]);
+    fast = res !== "TIMEOUT"; // probe won ⇒ setTimeout(0) round-tripped in < TIMER_FAST_MS ⇒ not throttled
+  } catch (e) { fast = false; }
+  _timerLatCache = { fast, at: Date.now() };
+  return fast;
+}
+
+// The pacing decision (STAGE 1). Visible → fast (cheap, no probe). Hidden + no worker
+// installed → slow (today's behavior; skip the probe). Hidden + worker installed →
+// fast ONLY if timers MEASURE fast (the honest gate against a fast wait on a still-
+// throttled page — the false-verify class the whole design guards against).
+async function cdpFast() {
+  if (await cdpVisible()) return true;
+  if (!_workerTimersActive) return false;
+  return await cdpTimersFast();
+}
+
+// The adaptive pacing primitive wired into act.delay. Fast (visible, or hidden with
+// worker-verified-fast timers) → scaled-down wait; slow (hidden + throttled/no worker)
+// → the full caller-requested wait (byte-identical to the proven path).
 async function cdpAdaptiveDelay(ms) {
-  const fast = await cdpVisible();
+  const fast = await cdpFast();
   await cdpDelay(fast ? Math.max(FAST_FLOOR_MS, Math.round(ms * FAST_FACTOR)) : ms);
 }
 
