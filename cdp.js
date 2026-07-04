@@ -44,7 +44,10 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 const cdpDelay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Attach to `tabId` and enable the domains we use (Runtime for evaluate, DOM for
-// the DOM.focus fallback; Input.* needs no enable). { ok } or { ok:false, error }.
+// the DOM.focus fallback, Page for addScriptToEvaluateOnNewDocument — the hidden-
+// tab SPA-transition override installer; Input.* needs no enable). The attach
+// SURVIVES same-tab navigation regardless of enabled domains — no re-injection.
+// { ok } or { ok:false, error }.
 function cdpAttach(tabId) {
   return new Promise((resolve) => {
     chrome.debugger.attach({ tabId }, "1.3", async () => {
@@ -57,6 +60,7 @@ function cdpAttach(tabId) {
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
+        await cdpSend("Page.enable", {}); // required for Page.addScriptToEvaluateOnNewDocument (cdpInstallPageOverrides)
         // Refresh the debug input-trace toggle per run (popup checkbox → chrome.storage.local).
         try { const { debugInputTrace } = await new Promise((r) => chrome.storage.local.get("debugInputTrace", r)); setInputTrace(!!debugInputTrace); } catch (e) { /* default stays OFF */ }
         resolve({ ok: true });
@@ -107,6 +111,62 @@ async function cdpWakePage() {
   try { await cdpSend("Page.setWebLifecycleState", { state: "active" }); } catch (e) { /* best-effort — no-op if unsupported/not frozen */ }
 }
 
+// ── Hidden-tab SPA-transition unblock (2026-07-03) ───────────────────────────
+// A HIDDEN/minimized tab has requestAnimationFrame FULLY PAUSED (and timers
+// throttled to ~1Hz). The CDP fill survives that (React commits on a channel that
+// still runs backgrounded — 40 fields audit clean hidden), but Workday's page-to-
+// page SPA ROUTE TRANSITION after "Save & Continue" defers on rAF, so it never
+// runs while hidden → the walk stalls at page 2 (live-diagnosed: the errors clear
+// 2→0 but the page never advances, even in a 40s wait; a VISIBLE tab advances).
+// FIX: repoint requestAnimationFrame at setTimeout — a paused-forever rAF becomes
+// an eventually-firing timer (~1fps under the background throttle, enough to
+// unblock a one-shot router "next frame" defer). hasFocus() is patched to true
+// (Workday gates some logic on focus; it is a METHOD, not a getter).
+//
+// Installed at attach (cdpInstallPageOverrides): addScriptToEvaluateOnNewDocument
+// covers any FUTURE full document load / session refresh; a Runtime.evaluate of
+// the SAME source patches the CURRENT already-loaded SPA doc (the walk attaches
+// when the operator is already on the form — the SPA never reloads, so the new-
+// document hook alone would never fire). __apRafPatched makes both idempotent.
+//
+// STAGED (see the plan): this is the SIMPLE override (rAF→setTimeout + hasFocus).
+// If live-verify shows the hidden page-2→3 transition STILL stalls, escalate:
+//   • Step 2 — also spoof document.visibilityState/hidden + swallow
+//     visibilitychange/blur. SAFE now because cdpVisible() reads REAL visibility
+//     from the SW (chrome.tabs/windows), not the spoofable page value.
+//   • Step 3 — route setTimeout through a Web Worker for full-speed timers, with
+//     a try/catch fallback to native setTimeout (Workday CSP may block blob:
+//     workers). Only if 1fps is proven too slow.
+const OVERRIDE_SRC = `(function () {
+  try {
+    if (window.__apRafPatched) return;
+    window.__apRafPatched = true;
+    Document.prototype.hasFocus = function () { return true; };
+    var last = 0;
+    window.requestAnimationFrame = function (cb) {
+      var now = (window.performance && performance.now) ? performance.now() : Date.now();
+      var wait = Math.max(0, 16 - (now - last));
+      var id = window.setTimeout(function () { cb((window.performance && performance.now) ? performance.now() : Date.now()); }, wait);
+      last = now + wait;
+      return id;
+    };
+    window.cancelAnimationFrame = function (id) { window.clearTimeout(id); };
+  } catch (e) { /* best-effort */ }
+})();`;
+
+// Install OVERRIDE_SRC both for future documents AND on the current SPA doc.
+// Best-effort: an install failure logs and is swallowed — it must NEVER abort a
+// run (the fill already works hidden; this only helps page-to-page advancement).
+async function cdpInstallPageOverrides() {
+  try {
+    await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: OVERRIDE_SRC }); // future loads / re-auth
+    await cdpSend("Runtime.evaluate", { expression: OVERRIDE_SRC });                  // the current already-loaded SPA doc
+    console.log("[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus) — hidden-tab SPA-transition unblock.");
+  } catch (e) {
+    console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
+  }
+}
+
 // Run a SELF-CONTAINED function in the page via Runtime.evaluate and return its
 // JSON value. Args must be JSON-serializable; fn must close over nothing (same
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
@@ -137,18 +197,33 @@ async function cdpEval(fn, ...args) {
 // focus) is a separate, newly-exercised surface — see runCdpFillPage / docs.
 const FAST_FACTOR = 0.2;    // visible delays = 1/5 the hidden delays (conservative; tunable — raise if a visible fill races)
 const FAST_FLOOR_MS = 25;   // …but never below this (a too-short wait races even full-speed)
-const VIS_TTL_MS = 500;     // re-sample document.visibilityState at most this often (amortize the cdpEval round-trip)
+const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amortize the chrome.tabs/windows round-trip)
 
 let _visCache = { visible: false, at: 0 };
 
-// Cached, off-loop foreground read. cdpEval runs promptly even when hidden, so
-// this is reliable in both states; the TTL keeps act.delay from round-tripping
-// every call. Reset at attach (fresh per run). On read failure (tab closing)
-// default to NOT-visible → full (safe) delays.
+// Cached, off-loop foreground read. Reads REAL visibility from the SERVICE WORKER
+// (chrome.tabs + chrome.windows), NOT document.visibilityState from the page.
+// WHY (hidden-walk fix, 2026-07-03): the escalation path SPOOFS document.
+// visibilityState in the page to make Workday's SPA route transition run while
+// backgrounded. If this sampler read the spoofed page value it would always see
+// "visible" and drive act.delay 5× faster on a still-throttled page → races the
+// fill. Reading REAL visibility here is the PREREQUISITE that keeps that spoof
+// safe (and is strictly more accurate regardless of whether the spoof is on).
+// Visibility = tab.active (the tab is frontmost in its window) AND the window not
+// minimized — focus is NOT required (an unfocused-but-active tab still renders
+// full-speed). The TTL keeps act.delay from round-tripping every call. Reset at
+// attach (fresh per run). On any read failure (tab/window gone, not attached)
+// default to NOT-visible → full (safe) delays, matching the prior behavior.
 async function cdpVisible() {
   if (Date.now() - _visCache.at <= VIS_TTL_MS) return _visCache.visible;
   let vis = false;
-  try { vis = (await cdpEval(() => document.visibilityState)) === "visible"; } catch (e) { vis = false; }
+  try {
+    const tab = await new Promise((resolve, reject) =>
+      chrome.tabs.get(cdpTabId, (t) => (chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(t))));
+    const win = await new Promise((resolve, reject) =>
+      chrome.windows.get(tab.windowId, (w) => (chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(w))));
+    vis = tab.active === true && win.state !== "minimized";
+  } catch (e) { vis = false; }
   _visCache = { visible: vis, at: Date.now() };
   return vis;
 }
@@ -159,6 +234,11 @@ async function cdpAdaptiveDelay(ms) {
   const fast = await cdpVisible();
   await cdpDelay(fast ? Math.max(FAST_FLOOR_MS, Math.round(ms * FAST_FACTOR)) : ms);
 }
+
+// REAL-visibility label ("visible"/"hidden") for DIAGNOSTICS — reads from the SW
+// (cdpVisible), never document.visibilityState, so a "[tab hidden]" log stays
+// TRUTHFUL even after the page's visibilityState is spoofed. Cheap (TTL-cached).
+async function cdpVisibilityLabel() { return (await cdpVisible()) ? "visible" : "hidden"; }
 
 // ── Operator input-lock (recon 2026-06-22) ──────────────────────────────────
 // While the bot actuates a VISIBLE tab the operator could accidentally click/type and

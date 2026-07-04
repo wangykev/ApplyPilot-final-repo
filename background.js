@@ -1620,8 +1620,9 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
   for (let poll = 0; poll < 8 && !prevErrors.length; poll++) { await cdpDelay(500); prevErrors = await readErrors(); }
   // Diagnostic: a HIDDEN (throttled) tab is the 2026-07-03 signature — Workday's page-side validation
   // misfires the "Duplicate language" phantom + navigates slowly under ~1Hz throttling, while a VISIBLE
-  // tab advances cleanly. Log it so a stuck hidden run is unambiguous in the trace.
-  let _vis = null; try { const _st = await cdpEval(cdpReadSessionState); _vis = _st ? _st.visibilityState : null; } catch (e) { /* ignore */ }
+  // tab advances cleanly. Log it so a stuck hidden run is unambiguous in the trace. Reads REAL visibility
+  // (SW-side) — NOT document.visibilityState, which the rAF-override fix may spoof to "visible".
+  let _vis = null; try { _vis = await cdpVisibilityLabel(); } catch (e) { /* ignore */ }
   LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s) [tab ${_vis || "?"}]. Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
 
   for (let attempt = 1; attempt <= REMEDIATION_MAX; attempt++) {
@@ -1844,6 +1845,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
+    await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so a hidden single-page fill behaves like the walk
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
@@ -1904,8 +1906,9 @@ async function runCdpPageRecon(tabId) {
 // for each page, fold-fill + audit + accumulate (fillAndPersistPage) → GUARDED Save &
 // Continue → wait for the transition (or session-death) → repeat, until the REVIEW
 // page (STOP — never submit), a terminal page, session death, a nav-timeout, or the
-// MAX_PAGES cap. The CDP attach SURVIVES navigation (only Runtime+DOM enabled, no Page
-// domain) — no re-injection; we re-read via cdpEval on the same attach. Detaches in
+// MAX_PAGES cap. The CDP attach SURVIVES navigation — no re-injection; we re-read via
+// cdpEval on the same attach (Page is now enabled only for the hidden-tab rAF override
+// installer — cdpInstallPageOverrides — which does not affect nav survival). Detaches in
 // finally. SUBMIT-NEVER (double guard, reused verbatim from M31): the review terminal
 // is checked at the TOP of each iteration BEFORE any fill/click, AND clickPageNext
 // refuses on the review marker. Review-page reached = SUCCESS (walked the whole app).
@@ -1977,11 +1980,15 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
     if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
     if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
-    // Hidden-tab hint: when the page won't advance AND the tab is hidden AND there's no error text,
-    // the likely cause is Chrome freezing/throttling the background tab so Workday's SPA transition
-    // stalls (advances fine when visible) — tell the operator to bring the tab to the FOREGROUND.
-    if (st && st.visibilityState === "hidden" && !samples.length && !(st && st.errorPageText)) {
-      LOG("⚠ the tab is HIDDEN and the page shows no errors but won't advance — Chrome throttles background tabs, which can STALL Workday's page transition. Bring the tab to the FOREGROUND (visible) and re-run; the fill itself works hidden, but page-to-page advancement may need a visible tab.");
+    // Hidden-tab hint: when the page won't advance AND the tab is really hidden AND there's no error
+    // text, the likely cause is Chrome freezing/throttling the background tab so Workday's SPA
+    // transition stalls (advances fine when visible). The rAF-override fix (cdpInstallPageOverrides)
+    // aims to unblock this while hidden; if we STILL land here, that override was insufficient — bring
+    // the tab to the FOREGROUND as a fallback and re-run. Reads REAL visibility (SW-side), not the
+    // page's (possibly-spoofed) document.visibilityState.
+    let _visLabel = "?"; try { _visLabel = await cdpVisibilityLabel(); } catch (e) { /* ignore */ }
+    if (_visLabel === "hidden" && !samples.length && !(st && st.errorPageText)) {
+      LOG("⚠ the tab is HIDDEN and the page shows no errors but won't advance — the rAF-override fix did not unblock the transition this time. Bring the tab to the FOREGROUND (visible) and re-run; the fill itself works hidden, but page-to-page advancement may still need a visible tab as a fallback.");
     }
     const empties = (pageOut && pageOut.results || []).filter((r) => r.status === "skipped");
     if (empties.length) {
@@ -1994,6 +2001,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so page-to-page advancement runs while backgrounded
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
