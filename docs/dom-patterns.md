@@ -399,6 +399,21 @@ this trigger (each entry's portaled list renders adjacent to its own trigger), p
 are byte-identical (first-match short-circuit). The commit-verify (exact-normalize read-back) caught
 the swap as `needs_review` — never a false fill — so the safety gate held throughout.
 
+**Correction (live re-run) — the dominant cause was a wrong-option COORDINATE click, not an id
+collision.** The hidden re-run logged NO listbox-id collision (the shared-`aria-controls`-id theory was
+wrong), yet the swap persisted: clicking the **"English"** option committed **"Chinese"**. Mechanism:
+the plain-dropdown commit computed the option's rect (`cdpDropdownOptionRectByText`) and coordinate-
+clicked it (`cdpClickAt`) a CDP round-trip LATER — so under the ~1Hz hidden throttle the virtualized
+list re-rendered/shifted in the gap and the click landed on a neighbour. This is the SAME class the
+source-tree fill (`cdpSourceRowRect`, dom-patterns 2026-06-28) already solved with a settle +
+`elementFromPoint` validation, which the plain dropdown lacked. **Fix:** `cdpDropdownOptionRectByText`
+is now async and, after `scrollIntoView`, SETTLES (`frame()`+sleep) and confirms
+`document.elementFromPoint` at the option centre IS the target (re-finding each iter — rows recycle)
+before returning the rect; `clickDropdownOptionByText` refuses to click an unvalidated coordinate (→
+honest `needs_review`, never a mis-commit). The close-on-success hygiene (above) independently fixed the
+SECOND entry (it removed the overlapping stale list). CDP-path only — the page engine clicks the element
+ref (`robustClick(el)`), immune to coordinate staleness.
+
 ---
 
 ## 2026-06-03 — LiveRamp Workday wd5, two-page walk (M15)

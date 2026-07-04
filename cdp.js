@@ -1436,31 +1436,54 @@ function cdpOptionRect(wrapperSel, index) {
 // listbox (same as cdpReadDropdownState, so chips / other listboxes are excluded);
 // skips aria-disabled options (the "Select One" placeholder). `text` is itself a
 // scraped option text, so an exact trimmed match resolves the same element.
-function cdpDropdownOptionRectByText(wrapperSel, text) {
+// ASYNC + SETTLE-AND-VALIDATE (mirrors cdpSourceRowRect). The rect is computed here but the
+// coordinate click fires a CDP round-trip LATER — so under the hidden ~1Hz throttle a virtualized/
+// re-rendering list can SHIFT in that gap and the click lands on a NEIGHBOR (the live hidden bug:
+// clicking "English" committed "Chinese"; not an id collision — the diagnostic showed lbCount==1).
+// Fix: after scrollIntoView, SETTLE (frame+sleep) and confirm document.elementFromPoint at the
+// option's center IS this option before trusting the rect; re-find each iter (rows recycle). Returns
+// { …rect, hitText, validated }. validated:false (off-viewport / occluded / shifted) ⇒ the caller must
+// NOT blind-click (→ honest needs_review, never a wrong commit); the commit-verify remains the backstop.
+async function cdpDropdownOptionRectByText(wrapperSel, text) {
   const w = document.querySelector(wrapperSel);
   const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
   if (!trigger) return null;
   const id = trigger.getAttribute("aria-controls");
-  // Entry-scoped listbox resolution [DUP: keep identical in cdpReadDropdownState /
-  // cdpOptionRect / cdpDropdownOptionRectByText] — see cdpReadDropdownState for why.
-  // This is the COMMIT-CLICK target, so a wrong-list resolution here is what actually
-  // committed the swapped value; disambiguating to THIS trigger's list fixes the swap.
-  const _m = id ? Array.from(document.querySelectorAll('[id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]')) : [];
-  let lb = _m.length <= 1 ? (_m[0] || null) : null;
-  if (!lb && _m.length) {
+  // Entry-scoped listbox resolution [DUP: keep identical in cdpReadDropdownState / cdpOptionRect]
+  // — see cdpReadDropdownState. Re-resolved each iteration (a settle can re-mount the portaled list).
+  const resolveLb = () => {
+    const m = id ? Array.from(document.querySelectorAll('[id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]')) : [];
+    if (m.length <= 1) return m[0] || null;
     const tr = trigger.getBoundingClientRect();
-    const vis = _m.filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-    let bestD = Infinity;
-    for (const el of (vis.length ? vis : _m)) { const r = el.getBoundingClientRect(); const d = Math.hypot(r.left - tr.left, r.top - tr.bottom); if (d < bestD) { bestD = d; lb = el; } }
-  }
-  if (!lb) return null;
-  const el = Array.from(lb.querySelectorAll('[role="option"]'))
-    .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
+    const vis = m.filter((el) => { const rr = el.getBoundingClientRect(); return rr.width > 0 && rr.height > 0; });
+    let best = null, bestD = Infinity;
+    for (const el of (vis.length ? vis : m)) { const rr = el.getBoundingClientRect(); const d = Math.hypot(rr.left - tr.left, rr.top - tr.bottom); if (d < bestD) { bestD = d; best = el; } }
+    return best;
+  };
+  const findOpt = () => { const lb = resolveLb(); return lb ? Array.from(lb.querySelectorAll('[role="option"]')).find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text) : null; };
+  // rAF freezes on a hidden tab → race a setTimeout fallback so the settle can't hang (as cdpSourceRowRect).
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rectOf = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) }; };
+  let el = findOpt();
   if (!el) return null;
-  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
-  const r = el.getBoundingClientRect();
-  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
-           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  let hitText = null;
+  for (let i = 0; i < 5; i++) {
+    if (i > 0) { el = findOpt(); if (!el) return null; }
+    const r = rectOf(el);
+    const onScreen = r.w > 0 && r.h > 0 && r.cx >= 0 && r.cy >= 0 && r.cx <= window.innerWidth && r.cy <= window.innerHeight;
+    if (onScreen) {
+      const hit = document.elementFromPoint(r.cx, r.cy);
+      const hitOpt = hit && hit.closest && hit.closest('[role="option"]');
+      if (hitOpt === el) return Object.assign(r, { hitText: text, validated: true });
+      hitText = hitOpt ? (hitOpt.textContent || "").trim() : (hit ? (hit.tagName || null) : null);
+    }
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+    await frame(); await sleep(120);
+  }
+  el = findOpt();
+  if (!el) return null;
+  return Object.assign(rectOf(el), { hitText, validated: false });
 }
 
 function cdpReadRadioState(wrapperSel) {
@@ -2312,6 +2335,13 @@ function makeCdpActuation(llmConfig) {
     clickDropdownOptionByText: async (loc, text) => {
       const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
       if (!rect || rect.w <= 0) return false;
+      // elementFromPoint at the option's center did NOT resolve to the target (off-viewport /
+      // occluded / a throttled virtualized shift) — do NOT blind-click a coordinate that isn't the
+      // target (that is the wrong-option commit). Return false → the caller retries / flags honestly.
+      if (rect.validated === false) {
+        console.log('[ApplyPilot][CDP] dropdown option "' + text + '" not validated at its coordinate (elementFromPoint saw ' + JSON.stringify(rect.hitText) + ') — skipping the click to avoid a wrong-option commit; caller will retry/flag.');
+        return false;
+      }
       await cdpClickAt(rect.cx, rect.cy);
       return true;
     },
