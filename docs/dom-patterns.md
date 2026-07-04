@@ -382,6 +382,23 @@ that listbox only**. This excludes both the chips and the sibling dropdown's lis
 verified per widget, not trusted blindly.) `settlePoll` (typeahead) additionally excludes
 `[data-automation-id="selectedItemList"]` chips for the same reason.
 
+**Extension (2026-07-04) — repeating entries SHARE the `aria-controls` id, so `getElementById` is
+not enough.** M14.1 proved uniqueness for *distinct* fields (`ctny0/ctny1/ctny2`). But a dropdown
+that REPEATS across entries (`language[0].language` vs `language[1].language`) carries the SAME
+`formField-language` id → the SAME `aria-controls` popup id. `document.getElementById(id)` returns the
+FIRST element in document order, so when two entries' lists coexist — which happens because the
+success path didn't close the list AND a hidden ~1Hz throttle delays the teardown — entry-1's
+read/click resolved into entry-0's still-mounted list → the two language NAMES committed SWAPPED
+(`language[0]`→"Chinese", `language[1]`→"English"), while the small proficiency lists (settle/close
+in time) stayed correct. VISIBLE fills fine (the first list unmounts before the next opens). **Fix:**
+resolve the listbox per-trigger — when >1 element carries the id, pick the one whose rect is NEAREST
+this trigger (each entry's portaled list renders adjacent to its own trigger), preferring visible ones
+(`cdp.js` `cdpReadDropdownState`/`cdpOptionRect`/`cdpDropdownOptionRectByText`; LOCKSTEP page-engine
+`fillDropdown`); plus close the list on the SUCCESS path for repeating entries (`fillDropdownCdp`
+`closeDropdownConfirmed`, gated on `data-fkit-id`) so the lists never coexist. Single-listbox pages
+are byte-identical (first-match short-circuit). The commit-verify (exact-normalize read-back) caught
+the swap as `needs_review` — never a false fill — so the safety gate held throughout.
+
 ---
 
 ## 2026-06-03 — LiveRamp Workday wd5, two-page walk (M15)

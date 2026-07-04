@@ -2476,7 +2476,18 @@ async function fillEngine(profile, defaults, jobContext) {
     const start = Date.now();
     while (Date.now() - start < 5000) {
       const id = trigger.getAttribute("aria-controls");
-      const lb = id ? document.getElementById(id) : null;
+      // Entry-scoped listbox resolution [LOCKSTEP with cdp.js cdpReadDropdownState]: repeating
+      // entries share the same formField→aria-controls id, so getElementById's first-match can pick
+      // a SIBLING entry's lingering list (the language[0]/[1] name swap). When >1 element carries the
+      // id, pick the one nearest THIS trigger, preferring visible ones. Single-listbox: first match.
+      const _m = id ? Array.from(document.querySelectorAll('[id="' + CSS.escape(id) + '"]')) : [];
+      let lb = _m.length <= 1 ? (_m[0] || null) : null;
+      if (!lb && _m.length) {
+        const tr = trigger.getBoundingClientRect();
+        const vis = _m.filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+        let bestD = Infinity;
+        for (const el of (vis.length ? vis : _m)) { const r = el.getBoundingClientRect(); const d = Math.hypot(r.left - tr.left, r.top - tr.bottom); if (d < bestD) { bestD = d; lb = el; } }
+      }
       if (lb && lb.querySelector('[role="option"]')) { ownList = lb; break; }
       await new Promise((r) => setTimeout(r, 50));
     }

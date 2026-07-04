@@ -1125,6 +1125,10 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   }
   const fullIdx = fresh.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
   const idxCanary = (fresh.options[fullIdx] && norm(fresh.options[fullIdx].text) === norm(target)) ? "" : " [option-index desync vs scrape — text-keyed click used]";
+  // Diagnostic (language-swap probe): >1 element carries this trigger's aria-controls id ⇒ a sibling
+  // entry's list is coexisting and the resolvers disambiguated by proximity. Surfaced in the record
+  // detail so a collision is visible in the console table + review summary (recon-first confirmation).
+  const lbNote = (fresh && fresh.lbCount > 1) ? ` [listbox-id-collision x${fresh.lbCount} — resolved per-trigger]` : "";
 
   let res = await commitByClick();
   if (!res.ok) {
@@ -1139,12 +1143,18 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     if (re && re.optionCount > 0) res = await commitByClick();
   }
   if (res.ok) {
-    const out = { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };
-    if (preTierIndex > 0) { out.flag = "dropdown-overwrite-success"; out.detail = `overwrote pre-fill "${before}" → "${res.after}" (higher-priority tier); text-click-commit${idxCanary}`; }
+    // Repeating-entry dropdowns share the formField→aria-controls id, so a lingering committed list
+    // lets the NEXT entry's same-id read/click resolve against THIS one (the hidden language[0]/[1]
+    // swap). Confirm-close before returning so the lists never coexist — the resolvers' proximity
+    // tiebreak is the deterministic fix; this keeps only one list mounted. Gated to repeating entries
+    // (wrapperSel carries data-fkit-id) so flat page-1 fills (unique ids) pay no extra close latency.
+    if (loc && loc.wrapperSel && loc.wrapperSel.indexOf("data-fkit-id") !== -1) await closeDropdownConfirmed(act, loc, budgets);
+    const out = { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}${lbNote}`, options: enabledTexts };
+    if (preTierIndex > 0) { out.flag = "dropdown-overwrite-success"; out.detail = `overwrote pre-fill "${before}" → "${res.after}" (higher-priority tier); text-click-commit${idxCanary}${lbNote}`; }
     return out;
   }
   await act.pressEscape();
-  return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")`, after: res.after, options: enabledTexts, matchTier: m.matchTier };
+  return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")${lbNote}`, after: res.after, options: enabledTexts, matchTier: m.matchTier };
 };
 
 // Radio: label-text exact match (case-insensitive, candidates in order — M22

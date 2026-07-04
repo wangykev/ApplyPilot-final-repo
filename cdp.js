@@ -1361,7 +1361,22 @@ function cdpReadDropdownState(wrapperSel) {
   const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
   if (!trigger) return null;
   const id = trigger.getAttribute("aria-controls");
-  const lb = id ? document.getElementById(id) : null;
+  // Entry-scoped listbox resolution [DUP: keep identical in cdpReadDropdownState /
+  // cdpOptionRect / cdpDropdownOptionRectByText]. document.getElementById returns the
+  // FIRST element in document order — but repeating entries share the same
+  // formField→aria-controls id, so under a slow/hidden teardown a LINGERING sibling
+  // entry's list gets picked → the language[0]/[1] name swap (fills fine visible, where
+  // the first list unmounts before the next opens). When >1 element carries the id, pick
+  // the one nearest THIS trigger (each entry's portaled list renders adjacent to its own
+  // trigger), preferring visible ones. Single-listbox pages: byte-identical (first match).
+  const _m = id ? Array.from(document.querySelectorAll('[id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]')) : [];
+  let lb = _m.length <= 1 ? (_m[0] || null) : null;
+  if (!lb && _m.length) {
+    const tr = trigger.getBoundingClientRect();
+    const vis = _m.filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+    let bestD = Infinity;
+    for (const el of (vis.length ? vis : _m)) { const r = el.getBoundingClientRect(); const d = Math.hypot(r.left - tr.left, r.top - tr.bottom); if (d < bestD) { bestD = d; lb = el; } }
+  }
   const options = lb
     ? Array.from(lb.querySelectorAll('[role="option"]')).map((el) => ({
         text: (el.textContent || "").trim(),
@@ -1379,6 +1394,10 @@ function cdpReadDropdownState(wrapperSel) {
     // open-retry gates on this: a raced no-op click never flips it to "true".
     ariaExpanded: trigger.getAttribute("aria-expanded"),
     listboxPresent: !!lb,
+    // Diagnostic (the language-swap probe): how many elements carry this aria-controls id.
+    // >1 ⇒ a sibling entry's list coexists and we disambiguated by proximity above.
+    lbId: id,
+    lbCount: _m.length,
     optionCount: options.filter((o) => !o.disabled).length,
     options,
     activeText: activeEl ? (activeEl.textContent || "").trim() : null
@@ -1392,7 +1411,16 @@ function cdpOptionRect(wrapperSel, index) {
   const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
   if (!trigger) return null;
   const id = trigger.getAttribute("aria-controls");
-  const lb = id ? document.getElementById(id) : null;
+  // Entry-scoped listbox resolution [DUP: keep identical in cdpReadDropdownState /
+  // cdpOptionRect / cdpDropdownOptionRectByText] — see cdpReadDropdownState for why.
+  const _m = id ? Array.from(document.querySelectorAll('[id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]')) : [];
+  let lb = _m.length <= 1 ? (_m[0] || null) : null;
+  if (!lb && _m.length) {
+    const tr = trigger.getBoundingClientRect();
+    const vis = _m.filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+    let bestD = Infinity;
+    for (const el of (vis.length ? vis : _m)) { const r = el.getBoundingClientRect(); const d = Math.hypot(r.left - tr.left, r.top - tr.bottom); if (d < bestD) { bestD = d; lb = el; } }
+  }
   if (!lb) return null;
   const el = Array.from(lb.querySelectorAll('[role="option"]'))[index];
   if (!el) return null;
@@ -1413,7 +1441,18 @@ function cdpDropdownOptionRectByText(wrapperSel, text) {
   const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
   if (!trigger) return null;
   const id = trigger.getAttribute("aria-controls");
-  const lb = id ? document.getElementById(id) : null;
+  // Entry-scoped listbox resolution [DUP: keep identical in cdpReadDropdownState /
+  // cdpOptionRect / cdpDropdownOptionRectByText] — see cdpReadDropdownState for why.
+  // This is the COMMIT-CLICK target, so a wrong-list resolution here is what actually
+  // committed the swapped value; disambiguating to THIS trigger's list fixes the swap.
+  const _m = id ? Array.from(document.querySelectorAll('[id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]')) : [];
+  let lb = _m.length <= 1 ? (_m[0] || null) : null;
+  if (!lb && _m.length) {
+    const tr = trigger.getBoundingClientRect();
+    const vis = _m.filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+    let bestD = Infinity;
+    for (const el of (vis.length ? vis : _m)) { const r = el.getBoundingClientRect(); const d = Math.hypot(r.left - tr.left, r.top - tr.bottom); if (d < bestD) { bestD = d; lb = el; } }
+  }
   if (!lb) return null;
   const el = Array.from(lb.querySelectorAll('[role="option"]'))
     .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
