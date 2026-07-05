@@ -1827,6 +1827,7 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
   const label = String(aiCtx.label || aiCtx.fieldName || "this field");
   const eeo = isEeoField({ widgetType: "hierarchical", fieldName: aiCtx.fieldName, label });
   const norm = apMatch.normalize;
+  const delayRender = act.delayRender || act.delayFull; // STAGE 3: typeahead render-settle, adaptive under the measured-fast gate (fallback for older fakes)
   const ctx = statedAnswerBlock(candidates, profile); // STATED answer (match it) vs PROFILE (infer)
   const fail = (flag, confidence, detail, extra) => Object.assign({ status: "needs_review", after: null, verified: false, flag, confidence, detail, auditLoc: loc.wrapperSel }, extra || {});
 
@@ -1834,7 +1835,7 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
   //     fallback now (its category LABELS render as promptOptions → scrapeSourceRows returns them in `options`).
   let categories = (Array.isArray(preCats) && preCats.length) ? preCats.slice() : [];
   if (!categories.length) {
-    await act.delayFull(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner)
+    await delayRender(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner) — adaptive under the measured-fast gate (STAGE 3); the category scrape/drill/commit downstream is chip-gated
     let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
     categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
   }
@@ -1861,7 +1862,7 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
     if (category_dom && category_dom.found && category_dom.rect && category_dom.rect.w > 0 && act.clickAt) {
       await act.clickAt(category_dom.rect.cx, category_dom.rect.cy); clicked = true; // TRUSTED click on the leaf's live center
     }
-    await act.delayFull(budgets.commitIntervalMs);
+    await delayRender(budgets.commitIntervalMs); // (debug harness) adaptive under the measured-fast gate (STAGE 3)
     let post = null, chips = null;
     try { post = await act.scrapeSourceRows(loc); } catch (e) {}
     try { const s = await act.readSource(loc); chips = (s && s.chips) || []; } catch (e) {}
@@ -3925,6 +3926,7 @@ function applyAuditVerdicts(results, verdicts) {
 // search → empty scrape) or corrupts the commit, so it is NOT called inline.
 async function captureFieldOptions(act, loc, budgets) {
   if (!act || !act.scrapeTaOptions) return null; // substrate (or an older fake) without the scrape → no-op
+  const delayRender = act.delayRender || act.delayFull; // STAGE 3: read-only capture render-settle, adaptive under the measured-fast gate (fallback for older fakes)
   try {
     // open + re-assert focus on the searchBox so the full (empty-filter) list renders
     const ensureFocused = async () => {
@@ -3933,12 +3935,12 @@ async function captureFieldOptions(act, loc, budgets) {
         await act.openHier(loc);
         const t0 = Date.now();
         while (Date.now() - t0 < budgets.taOpenCeilingMs) {
-          await act.delayFull(budgets.taOpenIntervalMs);
+          await delayRender(budgets.taOpenIntervalMs); // poll for searchBox.visible; ceiling stays raw (full)
           st = await act.readHier(loc);
           if (st && st.searchBox && st.searchBox.visible) break;
         }
       }
-      if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs); }
+      if (st && st.searchBox && st.searchBox.visible && !st.searchBox.focused) { await act.focusHierSearch(loc); await delayRender(budgets.taOpenIntervalMs); }
       const r = await act.readHier(loc);
       return !!(r && r.searchBox && r.searchBox.visible);
     };
@@ -3951,7 +3953,7 @@ async function captureFieldOptions(act, loc, budgets) {
     // the only clean non-committing exit (Escape keeps focus + any armed row; Tab abandons it). The
     // field's existing chip is preserved; the end-of-page M40 audit backstops any stray.
     await act.pressTab();
-    await act.delayFull(budgets.reopenSettleMs);
+    await delayRender(budgets.reopenSettleMs); // post-Tab close settle — adaptive under the measured-fast gate (STAGE 3)
     return options;
   } catch (e) { return null; } // non-fatal: null → summary falls back to captured_options
 }
@@ -4033,12 +4035,13 @@ function summarizeEntries(entries) {
 // (role=option scrape) → a searchable combobox. ONE open cycle.
 async function captureTypeaheadOptions(act, loc, budgets) {
   if (!act || !act.openHier) return null;
+  const delayRender = act.delayRender || act.delayFull; // STAGE 3: read-only capture render-settle, adaptive under the measured-fast gate (fallback for older fakes)
   try {
     let st = null; const t0 = Date.now();
     const ceiling = budgets.taOpenCeilingMs || 20000;
     await act.openHier(loc);
     while (Date.now() - t0 < ceiling) {
-      await act.delayFull(budgets.taOpenIntervalMs || 300);
+      await delayRender(budgets.taOpenIntervalMs || 300); // poll for searchBox.visible; ceiling stays raw (full)
       st = act.readHier ? await act.readHier(loc) : null;
       if (st && st.searchBox && st.searchBox.visible) break;
       // RE-OPEN: a FRESHLY-MOUNTED typeahead's first open-click can no-op (React still rendering the
@@ -4053,7 +4056,7 @@ async function captureTypeaheadOptions(act, loc, budgets) {
     if (Array.isArray(cats) && cats.length) { // TREE → just tag hierarchical (categories aren't useful
       console.log("[ApplyPilot][ta-recon] TREE (" + cats.length + " categories) → hierarchical/tier editor:", loc.wrapperSel);
       if (act.pressTab) await act.pressTab();  // in the summary; the user supplies tier candidates instead)
-      await act.delayFull(budgets.reopenSettleMs || 300);
+      await delayRender(budgets.reopenSettleMs || 300); // post-Tab close settle — adaptive under the measured-fast gate (STAGE 3)
       return { widget_type: "hierarchical" };
     }
     // FLAT → focus so the full list renders, then scrape [role=option]. A FRESHLY-MOUNTED typeahead's
@@ -4066,15 +4069,15 @@ async function captureTypeaheadOptions(act, loc, budgets) {
     const t2 = Date.now();
     while (act.scrapeTaOptions && Date.now() - t2 < scCeiling) {
       const s2 = act.readHier ? await act.readHier(loc) : st;
-      if (!(s2 && s2.searchBox && s2.searchBox.visible)) { if (act.openHier) await act.openHier(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); continue; } // box closed → re-open
-      if (s2.searchBox && !s2.searchBox.focused && act.focusHierSearch) { await act.focusHierSearch(loc); await act.delayFull(budgets.taOpenIntervalMs || 300); }
+      if (!(s2 && s2.searchBox && s2.searchBox.visible)) { if (act.openHier) await act.openHier(loc); await delayRender(budgets.taOpenIntervalMs || 300); continue; } // box closed → re-open
+      if (s2.searchBox && !s2.searchBox.focused && act.focusHierSearch) { await act.focusHierSearch(loc); await delayRender(budgets.taOpenIntervalMs || 300); }
       const sc = await act.scrapeTaOptions(loc);
       if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { opts = sc.options.slice(); break; }
-      await act.delayFull(budgets.taOpenIntervalMs || 300);
+      await delayRender(budgets.taOpenIntervalMs || 300); // poll interval between scrape attempts; scCeiling stays raw (full)
     }
     console.log("[ApplyPilot][ta-recon] FLAT →", opts.length, "options after " + (Math.round((Date.now() - t2) / 100) / 10) + "s:", loc.wrapperSel);
     if (act.pressTab) await act.pressTab();
-    await act.delayFull(budgets.reopenSettleMs || 300);
+    await delayRender(budgets.reopenSettleMs || 300); // post-Tab close settle — adaptive under the measured-fast gate (STAGE 3)
     return { widget_type: "typeahead", options: opts };
   } catch (e) { return null; }
 }
