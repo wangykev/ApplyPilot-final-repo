@@ -1706,22 +1706,32 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
     return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
   };
-  // 2 frames let the virtualizer render. rAF is fast when VISIBLE but FREEZES on a hidden tab, so race a
-  // setTimeout fallback (throttled to ~1Hz when hidden) — without it this scroll loop would HANG when hidden.
+  // rAF races a setTimeout fallback so the loop never HANGS on a hidden tab (frozen rAF); see settleWindow.
   const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
   const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
+  // Wait for the virtualizer to MOUNT the current window before reading/advancing: poll frames until the
+  // mounted option count is STABLE across two consecutive frames (bounded). Gating on the COUNT (not a fixed
+  // wall-clock) is correct whether frames are fast (worker-timers/visible) or slow (hidden, no worker).
+  // WHY (2026-07-05): worker-timers made the in-page rAF fast EVEN WHEN HIDDEN, so a single frame() per step
+  // (~32ms) let this loop scroll a whole window faster than the hidden-tab virtualizer could mount the next
+  // rows → it collected nothing new, hit atBottom on the big jumps, and false-bottomed early (the truncated
+  // FoS list, "stopped at Design"). Pre-worker-timers this was masked: hidden rAF was FROZEN, so frame() fell
+  // back to the ~1s throttled setTimeout — slow, but always enough time for the mount.
+  const settleWindow = async () => { let last = -1; for (let i = 0; i < 16; i++) { await frame(); const n = curOpts().length; if (n === last) return; last = n; } };
   const sc = findScroller();
   collect();
   let steps = 0, stable = 0, atBottom = false;
-  const MAX_STEPS = 60; // safety bound — a curated FoS list is tens of options / a few windows
+  const MAX_STEPS = 80; // safety bound — a curated FoS list is tens of options; overlap steps raise the count
   if (sc) {
-    sc.scrollTop = 0; await frame(); collect();
+    // OVERLAPPING scroll (~0.8 window) so a row straddling two windows is never skipped between mounts.
+    const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
+    sc.scrollTop = 0; await settleWindow(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight, sc.scrollHeight);
-      await frame();
+      sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
+      await settleWindow();
       collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
@@ -1770,26 +1780,29 @@ async function cdpScrapeSourceRows(wrapperSel, debug) {
   // (throttled to ~1Hz when hidden) — without the fallback this scroll loop would HANG on a hidden tab.
   const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  // Per-step settle. DEFAULT (debug OFF) = full speed: rAF only — proven sufficient for a virtualized list by
-  // the FoS scrape (cdpScrapeTaOptions, rAF-only). The extra guaranteed ~120ms/step is DEBUG-ONLY, so the
-  // operator can WATCH the scroll when "Debug: log keystrokes" is checked (cdpAttach → setInputTrace).
-  const stepSettle = async () => { await frame(); if (debug) await sleep(120); };
+  // Per-step settle: wait for the virtualizer to MOUNT this window before reading/advancing — poll frames
+  // until the mounted promptOption count is STABLE across two consecutive frames (bounded). Count-gated (not
+  // wall-clock), so correct whether frames are fast (worker-timers/visible) or slow (hidden, no worker). This
+  // REPLACES the old single-frame stepSettle, whose "rAF-only is sufficient" assumption worker-timers broke:
+  // fast hidden rAF (~32ms) outran the hidden virtualizer's mount → truncated enumeration (the FoS-scrape
+  // regression, same root cause). The debug +120ms (so the operator can WATCH the scroll) is kept, in-poll.
+  const settleWindow = async () => { let last = -1; for (let i = 0; i < 16; i++) { await frame(); if (debug) await sleep(120); const n = curOpts().length; if (n === last) return; last = n; } };
   const seen = new Map(); // label → order (first-seen, de-dupe within ONE view)
   const collect = () => { for (const o of curOpts()) { const t = leafLabel(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
   let steps = 0, stable = 0, atBottom = false;
-  const MAX_STEPS = 40;
+  const MAX_STEPS = 60;
   collect();
   if (sc) {
     // OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window (overlap,
-    // no row skipped). Pacing is via stepSettle (rAF; +120ms only in debug; hidden-safe setTimeout fallback).
+    // no row skipped). Pacing is via settleWindow (mount-gated; +120ms/poll only in debug; hidden-safe).
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    sc.scrollTop = 0; await stepSettle(); collect();
+    sc.scrollTop = 0; await settleWindow(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
       sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
-      await stepSettle(); collect();
+      await settleWindow(); collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
