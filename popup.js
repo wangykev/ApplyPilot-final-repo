@@ -139,6 +139,22 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
   });
 });
 
+// M3 SUBMIT replay (DRY): replay the SAVED approved review-summary bundle onto the current page
+// (flat + repeating), NO Next/Submit. Load the same page you filled (fresh). [CDP-REPLAY].
+document.getElementById("cdp-replay-page").addEventListener("click", () => {
+  setStatus("Dry replay — replaying the SAVED approved bundle onto THIS page (flat + repeating). Keep the tab VISIBLE. NO submit. Findings → SW console [CDP-REPLAY].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REPLAY_PAGE" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have lost focus — SW console has it all
+    if (resp.ok === false && resp.error === "no-bundle") {
+      setStatus('No saved summary to replay — fill a page first, then dry-replay it. ("View last summary" to confirm.)');
+    } else if (resp.ok === false) {
+      setStatus("Replay failed: " + resp.error + " — see the service worker console.");
+    } else {
+      setStatus(`Dry replay done — ${resp.flat} flat + ${resp.repeating} repeating record(s), ${resp.needs_review} need review. NO submit. See [CDP-REPLAY].`);
+    }
+  });
+});
+
 // SESSION RECON (M30 Step 0): read-only static snapshot to classify live-form vs
 // logged-out/expired. No minimize. Run on a VALID form + a LOGGED-OUT state, diff.
 document.getElementById("cdp-session-recon").addEventListener("click", () => {

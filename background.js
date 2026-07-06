@@ -84,6 +84,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // M3 SUBMIT replay (DRY): replay the SAVED approved review-summary bundle onto the current
+  // page (flat + repeating) — NO Next, NO Submit. Uses the bundle, not the profile. [CDP-REPLAY].
+  if (message.type === "RUN_CDP_REPLAY_PAGE") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpReplayPage(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // PAGE-IDENTITY RECON (read-only): dump title / URL / automation-ids / headings / body text + state
   // markers for ANY page (maintenance / dead session / login / error / a normal form) so an unknown page
   // state can be DETECTED in code instead of surfacing an opaque "unknown error". [CDP-PAGE-RECON] in SW.
@@ -1861,6 +1873,48 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — stuck-lock is the worst operator failure
+    await cdpDetach();
+  }
+}
+
+// ── M3 (strict-replay SUBMIT — dry harness) ─────────────────────────────────
+// Replay the SAVED, human-approved reviewSummary bundle onto the CURRENT live page — FLAT fields
+// (replayFlatFields) + repeating sections (replayRepeatingSections, strict: no AI, never drop an
+// approved entry). NO Next, NO Submit (dry). Reads the bundle from storage, NOT the profile — that's
+// the point of replay. Load the same page you filled (fresh) + keep it VISIBLE to watch the approved
+// values land; a value the form no longer offers HALTS that field (needs_review), never guesses.
+// [CDP-REPLAY] in the SW console.
+async function runCdpReplayPage(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      LOG('no reviewSummary bundle in storage — fill a page first (this dry-replays the saved approved values). "View last summary" to confirm one exists.');
+      return { ok: false, error: "no-bundle" };
+    }
+    await cdpInstallPageOverrides();
+    LOG("DRY REPLAY — replaying the SAVED approved bundle onto THIS live page (flat + repeating). NO Next, NO Submit. Keep the tab VISIBLE; a value the form no longer offers HALTS that field (needs_review), never guesses.");
+    const act = makeCdpActuation(await getLlmConfig());
+    await installInputLock();
+    const scan = await cdpEval(cdpPageScan);
+    const present = new Set(((scan && scan.fields) || []).map((f) => f.fieldName));
+    const flat = await replayFlatFields(act, bundle.entries, present, DEFAULT_BUDGETS);
+    const rep = await replayRepeatingSections(act, bundle.entries, DEFAULT_BUDGETS);
+    const results = flat.concat(rep);
+    const nr = results.filter((r) => r.status === "needs_review" || r.status === "error");
+    LOG(`replayed ${flat.length} flat + ${rep.length} repeating record(s); ${nr.length} need review/failed.`);
+    if (nr.length) { LOG("NEEDS REVIEW / FAILED:"); nr.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`)); }
+    try { console.table(results.map((r) => ({ field: r.field || r.fieldName, type: r.widgetType, status: r.status, after: r.after, verified: r.verified }))); } catch (e) { results.forEach((r) => LOG(JSON.stringify(r))); }
+    LOG("dry replay complete — NOTHING submitted, no page advance. (Unknown/generic sections + attachments are deferred.)");
+    return { ok: true, flat: flat.length, repeating: rep.length, needs_review: nr.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("replay aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await removeInputLock(); // BEFORE detach
     await cdpDetach();
   }
 }

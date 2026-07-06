@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -690,7 +690,7 @@ test("dropdown: click dispatched but nothing commits → needs_review, never a s
   assert.strictEqual(rec.after, "Select One"); // unchanged trigger surfaced, not accepted
 });
 
-test("dropdown: trigger already matches a candidate → filled / dropdown-prefilled-kept, NO re-open (M27 Commit C)", async () => {
+test("dropdown: trigger already matches a candidate → filled / dropdown-prefilled-kept, value never overwritten (M27 Commit C)", async () => {
   const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
   const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
   const rec = out.results[0];
@@ -699,7 +699,11 @@ test("dropdown: trigger already matches a candidate → filled / dropdown-prefil
   assert.strictEqual(rec.flag, "dropdown-prefilled-kept");
   assert.strictEqual(rec.confidence, "high");
   assert.strictEqual(rec.after, "United States of America");
-  assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a matching dropdown is not re-opened");
+  // M27.C: the FILL never overwrites a tier-0 match. (2026-07-05: the end-of-page read-only option
+  // capture MAY re-open it to scrape options for the review editor — value preserved, M40-audited —
+  // so the invariant is "no value-changing commit", not the old "no open".)
+  for (const bad of ["clickDropdownOptionByText", "typeJumpChars", "arrowStep", "clickOptionByIndex"])
+    assert.ok(!act.log.some(([m]) => m === bad), "a tier-0 pre-fill is never re-committed — no " + bad);
 });
 
 // ── dropdown TIER-AWARE pre-filled guard (M36.1 parity; the priority-blind bug) ──
@@ -730,13 +734,17 @@ test("dropdown TIER-AWARE: a tier>0 pre-fill with NO higher tier offered is KEPT
   assert.ok(act.log.some(([m]) => m === "openDropdown"), "opened to check for a higher tier");
 });
 
-test("dropdown TIER-AWARE: a tier-0 pre-fill is KEPT with ZERO actuation (no re-open)", async () => {
+test("dropdown TIER-AWARE: a tier-0 pre-fill is KEPT and never overwritten (fill does not actuate)", async () => {
   const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
   const out = await drivePageFill(act, { personal_info: { country: ["United States of America", "United States", "Canada"] } }, {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "dropdown-prefilled-kept");
-  assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a tier-0 pre-fill must never re-open the list");
+  assert.strictEqual(rec.after, "United States of America");
+  // Value never mutated. (The read-only end-of-page option capture re-opens to scrape options for the
+  // review editor — no commit — value preserved + M40-audited.)
+  for (const bad of ["clickDropdownOptionByText", "typeJumpChars", "arrowStep", "clickOptionByIndex"])
+    assert.ok(!act.log.some(([m]) => m === bad), "a tier-0 pre-fill must never be overwritten — no " + bad);
 });
 
 test("dropdown: 'Select One' placeholder does NOT trigger keep — falls through to the verified fill", async () => {
@@ -1928,10 +1936,11 @@ test("typeahead: Enter and click both fail → next candidate carries, never a s
   assert.strictEqual(rec.settle_trace[0].note, "matched leaf but commit did not verify (no isselected flip / chip)");
 });
 
-test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", async () => {
-  // Workday auto-derives the phone code from Country, so an already-correct
-  // chip is the common case. The failure mode is "verifying" it by re-typing —
-  // duplicating or clearing a correct chip. ZERO actuation allowed.
+test("countryPhoneCode pre-filled-correct → kept, chip never re-typed/cleared (read-only recon aside)", async () => {
+  // Workday auto-derives the phone code from Country, so an already-correct chip is the common case.
+  // The failure mode is "verifying" it by re-typing — duplicating or clearing a correct chip. The FILL
+  // does none of that. (2026-07-05: the end-of-page read-only option capture re-opens it to scrape
+  // options for the review editor — no type/clear/Enter/leaf-click — chip preserved + M40-audited.)
   const act = makeFakeAct([taField({ chips: ["United States of America (+1)"] })]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America", "United States"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
@@ -1940,7 +1949,8 @@ test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", a
   assert.strictEqual(rec.flag, "prefilled-kept");
   assert.strictEqual(rec.after, "United States of America (+1)");
   assert.strictEqual(rec.verified, true);
-  assert.strictEqual(act.log.length, 0, "pre-filled-correct must not be touched (no overwrite actuation)");
+  for (const bad of ["typeInHier", "clearHierSearch", "pressEnter", "clickHierLeaf", "typeText", "insertText"])
+    assert.ok(!act.log.some(([m]) => m === bad), "pre-filled-correct must not be mutated — no " + bad);
 });
 
 // ── M27 Commit B: non-destructive overwrite of a mismatched pre-fill ─────────
@@ -2027,16 +2037,19 @@ test("typeahead: first candidate to commit wins — later candidates never typed
 // the pre-fill if none is offered; tier -1 → full overwrite walk (unchanged).
 const taTypedQueries = (act) => act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
 
-test('INVARIANT (M36.1): a tier-0 pre-fill is KEPT with ZERO actuation — countryPhoneCode auto-derive is never re-typed', async () => {
-  // The chip carries the (+1) suffix; normalize() strips it, so it is tier 0 vs the
-  // tiered candidate list — keep, no open/clear/type/Enter.
+test('INVARIANT (M36.1): a tier-0 pre-fill is KEPT and never re-typed — countryPhoneCode auto-derive is never mutated', async () => {
+  // The chip carries the (+1) suffix; normalize() strips it, so it is tier 0 vs the tiered candidate
+  // list — keep, the FILL does no clear/type/Enter/leaf-click. (2026-07-05: the end-of-page read-only
+  // option capture re-opens it to scrape options for the review editor — value-preserving, M40-audited
+  // — so the invariant is "never MUTATED", not the old literal "never opened".)
   const act = makeFakeAct([taField({ chips: ["United States of America (+1)"] })]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America", "United States"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "prefilled-kept");
   assert.strictEqual(rec.after, "United States of America (+1)");
-  assert.strictEqual(act.log.length, 0, "a tier-0 (top) pre-fill must never be actuated");
+  for (const bad of ["typeInHier", "clearHierSearch", "pressEnter", "clickHierLeaf", "typeText", "insertText"])
+    assert.ok(!act.log.some(([m]) => m === bad), "a tier-0 (top) pre-fill must never be mutated — no " + bad);
 });
 
 test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available, not first-that-lands)", async () => {
@@ -4975,16 +4988,18 @@ test("choice-capture: typeahead scrapes ONCE for two same-key records and copies
   assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // cached per captureKey → one re-open
 });
 
-test("choice-capture: untagged-typeahead / not-filled / unlocated records are untouched", async () => {
+test("choice-capture: an untagged (flat, prefilled-kept) typeahead is NOW captured; not-filled / unlocated stay untouched", async () => {
   const recs = [
-    taggedRec({ captureOptions: false, auditLoc: "[w-a]" }), // untagged typeahead (no captureOptions) → not captured
-    taggedRec({ status: "needs_review", auditLoc: "[w-c]" }), // not filled
-    taggedRec({ auditLoc: null }) // no locator
+    taggedRec({ captureOptions: false, auditLoc: "[w-a]" }), // flat typeahead (no captureOptions tag) kept w/o actuation → NOW captured
+    taggedRec({ status: "needs_review", auditLoc: "[w-c]" }), // not filled → untouched
+    taggedRec({ auditLoc: null }) // no locator → untouched
   ];
   const { act, calls } = makeCaptureAct();
   await captureChoiceOptions(act, recs, CAP_BUDGETS);
-  for (const r of recs) assert.strictEqual(r.options, undefined);
-  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0);
+  assert.deepStrictEqual(recs[0].options, FOS_OPTS); // flat typeahead captured for the review editor (2026-07-05 parity)
+  assert.strictEqual(recs[1].options, undefined);    // not-filled untouched
+  assert.strictEqual(recs[2].options, undefined);    // unlocated untouched
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // only the flat filled one scraped
 });
 
 test("choice-capture: distinct captureKeys each get their own scrape", async () => {
@@ -5042,12 +5057,12 @@ test("choice-capture: a repeating prefilled-kept dropdown (no options) gets rec.
   assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // only the optionless one re-opened
 });
 
-test("choice-capture: a FLAT dropdown (page 1, no [idx].) is NOT re-opened — M27.C preserved for big cold lists", async () => {
+test("choice-capture: a FLAT dropdown (page 1, prefilled-kept, no options) is NOW captured for the review editor (2026-07-05)", async () => {
   const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }]; // prefilled-kept, no options
   const { act, calls } = makeDropdownAct();
   await captureChoiceOptions(act, recs, T_BUDGETS);
-  assert.strictEqual(recs[0].options, undefined);                 // flat dropdown not captured
-  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0); // never re-opened
+  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]); // flat dropdown re-opened + captured so review shows a <select>
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1);       // re-opened once (the M27.C cost, paid deliberately)
 });
 
 test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cache), both get options", async () => {
@@ -5620,6 +5635,107 @@ test("replayField: is_deleted and file_upload are skipped (handled elsewhere), z
   assert.strictEqual(act.log.length, 0, "neither touches the form");
 });
 
+// ── Skip-if-correct: a replay CHANGES only what differs (minimal-diff reconciliation) ────────────
+test("replayValueMatches: text exact, choice normalize-equal, date segment-numeric, checkbox desired-bool", () => {
+  assert.strictEqual(replayValueMatches("text", "Kevin", "Kevin"), true);
+  assert.strictEqual(replayValueMatches("text", "kevin", "Kevin"), false, "text is exact, not normalized");
+  assert.strictEqual(replayValueMatches("dropdown", "United States of America (+1)", "United States of America"), true, "choice widgets normalize (drops the (+1))");
+  assert.strictEqual(replayValueMatches("date", "6/15/2024", "06/15/2024"), true, "dates compare segment-numeric");
+  assert.strictEqual(replayValueMatches("date", "6/15/2024", "6/16/2024"), false);
+  assert.strictEqual(replayValueMatches("checkbox", "true", "yes"), true, "checkbox: live 'true' == desired 'yes'");
+  assert.strictEqual(replayValueMatches("checkbox", "false", "yes"), false);
+  assert.strictEqual(replayValueMatches("text", "x", null), false, "a null side never matches (no false skip)");
+});
+
+test("replayField (SKIP-IF-CORRECT): an already-correct TEXT field is left UNTOUCHED — zero actuation", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Kevin" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", widget_type: "text", current_value: "Kevin", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(r.flag, "replay-already-correct");
+  assert.strictEqual(r.after, "Kevin");
+  assert.ok(!act.log.some((e) => e[0] === "focusText" || e[0] === "typeText" || e[0] === "clearText"), "a correct text field is never re-typed");
+});
+
+test("replayField (SKIP-IF-CORRECT): an already-correct DROPDOWN is left as-is — never even opened", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "United States of America", options: [{ text: "Select One", disabled: true }, { text: "Canada" }, { text: "United States of America" }] };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-country", widget_type: "dropdown", current_value: "United States of America", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(r.flag, "replay-already-correct");
+  assert.ok(!act.log.some((e) => e[0] === "openDropdown"), "a correct dropdown is not re-opened (no stray-click exposure)");
+});
+
+test("replayField (SKIP-IF-CORRECT): a DIFFERING value STILL actuates (only-what-differs, not skip-everything)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Wrongname" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", widget_type: "text", current_value: "Kevin", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.notStrictEqual(r.flag, "replay-already-correct");
+  assert.strictEqual(f.value, "Kevin", "a field that differs from the approved value is corrected");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "the differing field WAS actuated");
+});
+
+// ── Phone auto-format tolerance: "(850) 666-0266" == "8506660266" (same number, format-only diff) ──
+test("textValuesMatch (phone): same digits in different formats match; letters/lengths still exact", () => {
+  assert.strictEqual(textValuesMatch("(850) 666-0266", "8506660266"), true, "Workday's auto-format == raw digits");
+  assert.strictEqual(textValuesMatch("(850) 666-0266", "850-666-0266"), true);
+  assert.strictEqual(textValuesMatch("(850) 666-0266", "(850) 666-0266"), true);
+  assert.strictEqual(textValuesMatch("8506660266", "8506660267"), false, "different digits never match");
+  assert.strictEqual(textValuesMatch("Acme Corp", "acme corp"), false, "ordinary text stays exact — not phone-shaped");
+  assert.strictEqual(textValuesMatch("12345", "1-2345"), false, "too few digits to be a phone → exact-only");
+  assert.strictEqual(textValuesMatch("+1 (850) 666-0266", "8506660266"), false, "a country-code prefix changes the digit count — genuinely different");
+  assert.strictEqual(phoneShaped("(850) 666-0266"), true);
+  assert.strictEqual(phoneShaped("Suite 200"), false, "has letters → not phone-shaped");
+});
+
+test("replayField (SKIP-IF-CORRECT, phone): a phone already in Workday's (850) 666-0266 format is left untouched", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-phoneNumber--phoneNumber"]', fieldName: "phoneNumber--phoneNumber", widgetType: "text", value: "(850) 666-0266" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-phoneNumber--phoneNumber", widget_type: "text", current_value: "8506660266", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.flag, "replay-already-correct", "the reformatted phone counts as correct — nothing changes");
+  assert.ok(!act.log.some((e) => e[0] === "typeText"), "the phone is not re-typed");
+});
+
+// ── GENERIC skip-if-correct: page-2 repeating entries stop fully re-filling correct fields ─────────
+test("replay skip-if-correct (REPEATING): a website entry already holding the approved url is left UNTOUCHED", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", "https://a.example")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items: [{ url: "https://a.example" }], fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, Object.assign({}, T_BUDGETS, { skipIfCorrect: true }));
+  const url = out.results.find((r) => /\.url$/.test(r.fieldName));
+  assert.strictEqual(url.status, "filled");
+  assert.strictEqual(url.flag, "replay-already-correct");
+  assert.ok(!act.log.some((e) => e[0] === "typeText" || e[0] === "focusText"), "a correct repeating field is not re-typed (page 2 no longer fully refills)");
+});
+
+test("replay skip-if-correct (REPEATING): a DIFFERING url IS re-filled (only-what-differs, not skip-all)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", "https://old.example")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items: [{ url: "https://new.example" }], fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, Object.assign({}, T_BUDGETS, { skipIfCorrect: true }));
+  const url = out.results.find((r) => /\.url$/.test(r.fieldName));
+  assert.notStrictEqual(url.flag, "replay-already-correct");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "a differing repeating field WAS re-typed");
+  assert.strictEqual(state.entries[0].fields[0].value, "https://new.example");
+});
+
+test("NORMAL fill (no skipIfCorrect): an already-correct repeating url is STILL re-typed (fill path unchanged)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", "https://a.example")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items: [{ url: "https://a.example" }], fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  const url = out.results.find((r) => /\.url$/.test(r.fieldName));
+  assert.notStrictEqual(url.flag, "replay-already-correct");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "without the flag the fill path is byte-identical (still re-types)");
+});
+
 test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {
   const fn = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "" };
   const cty = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }] };
@@ -5673,4 +5789,108 @@ test("dropdown tier-keep: a slow-closing list is RE-ESCAPED until closed (not a 
   const escapes = act.log.filter(([m]) => m === "pressEscape").length;
   assert.ok(escapes >= 2, `re-escaped a slow-closing list (saw ${escapes})`);
   assert.strictEqual(out.results[0].after, "United States of America", "value intact (escapeWontClose doesn't change it)");
+});
+
+// ── M3: repeating-field replay — bundle→items reconstruction ─────────────────
+// coerceReplayValue reverses the bundle's DISPLAY value into fillEntryCdp's item[key] shape;
+// bundleToSectionItems rebuilds a section's profile-shaped items (grouped/re-indexed, path→key,
+// dates re-parsed, nested + Feature-B added entries) to feed driveRepeatingSectionCdp.
+
+test("coerceReplayValue: dates reversed to the parsed shape; checkbox→bool; text passthrough; null→null", () => {
+  assert.deepStrictEqual(coerceReplayValue("6/15/2024", "date"), { month: "6", day: "15", year: "2024" });
+  assert.deepStrictEqual(coerceReplayValue("5/2025", "date"), { month: "5", year: "2025" });
+  assert.strictEqual(coerceReplayValue("2024", "date"), "2024");        // single segment (year) → string
+  assert.strictEqual(coerceReplayValue("2024", "year"), "2024");
+  assert.strictEqual(coerceReplayValue("true", "checkbox"), true);
+  assert.strictEqual(coerceReplayValue("false", "checkbox"), false);
+  assert.strictEqual(coerceReplayValue("Software Engineer", "text"), "Software Engineer");
+  assert.strictEqual(coerceReplayValue(null, "text"), null);
+  assert.strictEqual(coerceReplayValue("", "dropdown"), null);
+});
+
+const weSection = () => PAGE_SECTIONS.find((s) => s.name === "workExperience");
+const certSection = () => PAGE_SECTIONS.find((s) => s.name === "certification");
+const bent = (cf, val, extra) => Object.assign({ canonical_field: cf, current_value: val, widget_type: "text" }, extra || {});
+
+test("bundleToSectionItems (WE): path→key mapping, date reparse, checkbox bool, multi-entry", () => {
+  const items = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Engineer"),
+    bent("workExperience[0].company", "Acme"),
+    bent("workExperience[0].currently_work_here", "true"),
+    bent("workExperience[0].from", "5/2025"),
+    bent("workExperience[0].role_description", "Built things"),
+    bent("workExperience[1].job_title", "Intern")
+  ], weSection());
+  assert.strictEqual(items.length, 2);
+  assert.deepStrictEqual(items[0], { job_title: "Engineer", company: "Acme", currently_work_here: true, fromParsed: { month: "5", year: "2025" }, bulletsText: "Built things" });
+  assert.deepStrictEqual(items[1], { job_title: "Intern" });
+});
+
+test("bundleToSectionItems: drops soft-deleted entries and re-indexes the survivors 0..M-1", () => {
+  const items = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Deleted", { is_deleted: true }),
+    bent("workExperience[1].job_title", "Kept")
+  ], weSection());
+  assert.strictEqual(items.length, 1, "the deleted entry is dropped");
+  assert.deepStrictEqual(items[0], { job_title: "Kept" }, "survivor re-indexed to 0");
+});
+
+test("bundleToSectionItems: Feature-B added entry (higher index) is INCLUDED", () => {
+  const items = bundleToSectionItems([
+    bent("workExperience[0].job_title", "First"),
+    bent("workExperience[2].job_title", "Added", { is_added: true, flag: "added-entry" })
+  ], weSection());
+  assert.strictEqual(items.length, 2, "added entry included → replay must CREATE it");
+  assert.deepStrictEqual(items.map((i) => i.job_title), ["First", "Added"]);
+});
+
+test("bundleToSectionItems (cert nested): reconstructs item.specialties[j] with key mapping + date reparse", () => {
+  const items = bundleToSectionItems([
+    bent("certification[0].certification", "CPP", { widget_type: "typeahead" }),
+    bent("certification[0].specialties[0].specialtyParent", "Safety", { widget_type: "typeahead" }),
+    bent("certification[0].specialties[0].startDate", "6/15/2024", { widget_type: "date" })
+  ], certSection());
+  assert.strictEqual(items.length, 1);
+  assert.strictEqual(items[0].certification, "CPP");
+  assert.deepStrictEqual(items[0].specialties, [{ specialty: "Safety", startDateParsed: { month: "6", day: "15", year: "2024" } }]);
+});
+
+// ── M3: replayRepeatingSections orchestrator ─────────────────────────────────
+// Feeds bundleToSectionItems into driveRepeatingSectionCdp (strict: deleteOnNoMatch:false,
+// aiContext:null) for each present section that has approved bundle entries.
+
+test("replayRepeatingSections: replays a present section's entries from the approved bundle", async () => {
+  const state = webState({ entries: [webEntry("webAddress-0--null", ""), webEntry("webAddress-1--null", "")] });
+  const act = makeFakeRepeatAct(state);
+  const entries = [
+    { canonical_field: "website[0].url", current_value: "https://a.example", widget_type: "text" },
+    { canonical_field: "website[1].url", current_value: "https://b.example", widget_type: "text" }
+  ];
+  const results = await replayRepeatingSections(act, entries, T_BUDGETS);
+  const r0 = results.find((r) => r.fieldName === "website[0].url");
+  const r1 = results.find((r) => r.fieldName === "website[1].url");
+  assert.strictEqual(r0 && r0.after, "https://a.example");
+  assert.strictEqual(r1 && r1.after, "https://b.example");
+});
+
+test("replayRepeatingSections: skips a present section that has NO approved bundle entries (untouched)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-0--null", "")] }); // website present on the page
+  const act = makeFakeRepeatAct(state);
+  const entries = [{ canonical_field: "personal_info.first_name", current_value: "Ada", widget_type: "text" }]; // no website[*]
+  const results = await replayRepeatingSections(act, entries, T_BUDGETS);
+  assert.strictEqual(results.length, 0, "no approved website entries → section untouched");
+  assert.ok(!act.log.some(([m]) => m === "clickSectionAdd"), "no reconcile on an empty-bundle section");
+});
+
+test("replayRepeatingSections: CREATES a Feature-B added entry (reconciles UP) and fills it", async () => {
+  const state = webState({ entries: [webEntry("webAddress-0--null", "")] }); // live form starts with 1 entry
+  const act = makeFakeRepeatAct(state);
+  const entries = [
+    { canonical_field: "website[0].url", current_value: "https://a.example", widget_type: "text" },
+    { canonical_field: "website[1].url", current_value: "https://added.example", widget_type: "text", is_added: true, flag: "added-entry" }
+  ];
+  const results = await replayRepeatingSections(act, entries, T_BUDGETS);
+  assert.strictEqual(state.entries.length, 2, "reconciled UP to include the added entry");
+  assert.ok(act.log.some(([m]) => m === "clickSectionAdd"), "created the added entry");
+  assert.ok(results.some((r) => r.fieldName === "website[1].url" && r.after === "https://added.example"), "filled the added entry");
 });
