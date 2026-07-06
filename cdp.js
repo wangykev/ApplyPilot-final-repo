@@ -1706,43 +1706,33 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
     return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
   };
-  // rAF races a setTimeout fallback so the loop never HANGS on a hidden tab (frozen rAF); see settleWindow.
+  // rAF races a setTimeout fallback so the loop never HANGS on a hidden tab (frozen rAF); one frame per step
+  // lets the virtualizer render the just-scrolled window before we read (proven sufficient — see doScroll).
   const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
   const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
-  // Wait for the virtualizer to MOUNT the current window before reading/advancing: poll frames until the
-  // mounted option count is STABLE across two consecutive frames (bounded). Gating on the COUNT (not a fixed
-  // wall-clock) is correct whether frames are fast (worker-timers/visible) or slow (hidden, no worker).
-  // WHY (2026-07-05): worker-timers made the in-page rAF fast EVEN WHEN HIDDEN, so a single frame() per step
-  // (~32ms) let this loop scroll a whole window faster than the hidden-tab virtualizer could mount the next
-  // rows → it collected nothing new, hit atBottom on the big jumps, and false-bottomed early (the truncated
-  // FoS list, "stopped at Design"). Pre-worker-timers this was masked: hidden rAF was FROZEN, so frame() fell
-  // back to the ~1s throttled setTimeout — slow, but always enough time for the mount.
-  const settleWindow = async () => { let last = -1; for (let i = 0; i < 16; i++) { await frame(); const n = curOpts().length; if (n === last) return; last = n; } };
   const sc = findScroller();
-  // A programmatic scrollTop change does NOT drive a react virtualizer's row re-render on a HIDDEN tab
-  // (diag 2026-07-05: scrollTop climbed 0→1772 over sh:1984 but the mounted set stayed a FROZEN 17 rows,
-  // never swapping in the rest → the FoS list truncated to the on-open window). Fire an explicit 'scroll'
-  // event after each set so the virtualizer's scroll listener runs and mounts the new window even hidden.
+  // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive a react virtualizer's row re-render on
+  // a HIDDEN tab — scrollTop climbed 0→1772 over sh:1984 but the mounted set stayed a FROZEN 17 rows, so the
+  // FoS list truncated to the on-open window. Firing an explicit 'scroll' after each set makes the virtualizer
+  // mount the new window even hidden (live-verified: 65/65 options, seen-count climbs with scrollTop). A
+  // single frame() per step then suffices — the same pacing that always worked VISIBLE (it was never the
+  // pacing; the earlier mount-gated settleWindow was reverted — it only slowed the scroll without fixing it).
   const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
   collect();
-  const initialMounted = curOpts().length; // rows present on open, before any scroll (DIAG)
-  const trace = [];                          // per-step {t:scrollTop, m:mounted-now, s:total-seen} (DIAG)
   let steps = 0, stable = 0, atBottom = false;
   const MAX_STEPS = 80; // safety bound — a curated FoS list is tens of options; overlap steps raise the count
   if (sc) {
     // OVERLAPPING scroll (~0.8 window) so a row straddling two windows is never skipped between mounts.
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    doScroll(0); await settleWindow(); collect();
-    trace.push({ t: Math.round(sc.scrollTop), m: curOpts().length, s: seen.size });
+    doScroll(0); await frame(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
       doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
-      await settleWindow();
+      await frame();
       collect();
       steps++;
-      trace.push({ t: Math.round(sc.scrollTop), m: curOpts().length, s: seen.size });
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
       if (seen.size === before && (atBottom || movedNothing)) { if (++stable >= 2) break; } else stable = 0;
@@ -1750,8 +1740,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
   }
   const options = Array.from(seen.keys());
   return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
-    scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null,
-    initialMounted, trace };
+    scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
 
 // Scroll-accumulate the source promptOption LABELS — a VIRTUALIZED list needs scrolling to enumerate EVERY
@@ -1790,33 +1779,30 @@ async function cdpScrapeSourceRows(wrapperSel, debug) {
   // (throttled to ~1Hz when hidden) — without the fallback this scroll loop would HANG on a hidden tab.
   const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  // Per-step settle: wait for the virtualizer to MOUNT this window before reading/advancing — poll frames
-  // until the mounted promptOption count is STABLE across two consecutive frames (bounded). Count-gated (not
-  // wall-clock), so correct whether frames are fast (worker-timers/visible) or slow (hidden, no worker). This
-  // REPLACES the old single-frame stepSettle, whose "rAF-only is sufficient" assumption worker-timers broke:
-  // fast hidden rAF (~32ms) outran the hidden virtualizer's mount → truncated enumeration (the FoS-scrape
-  // regression, same root cause). The debug +120ms (so the operator can WATCH the scroll) is kept, in-poll.
-  const settleWindow = async () => { let last = -1; for (let i = 0; i < 16; i++) { await frame(); if (debug) await sleep(120); const n = curOpts().length; if (n === last) return; last = n; } };
+  // Per-step settle: one frame lets the virtualizer render the just-scrolled window before we read (the
+  // fix is doScroll below, not the settle length). DEFAULT (debug OFF) = one frame; the +120ms is DEBUG-ONLY
+  // so the operator can WATCH the scroll when "Debug: log keystrokes" is checked.
+  const stepSettle = async () => { await frame(); if (debug) await sleep(120); };
   const seen = new Map(); // label → order (first-seen, de-dupe within ONE view)
   const collect = () => { for (const o of curOpts()) { const t = leafLabel(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
-  // Fire an explicit 'scroll' after each set — a programmatic scrollTop does NOT drive the virtualizer's
-  // row re-render on a HIDDEN tab (the FoS-scrape diag: mounted set stayed frozen while scrollTop climbed),
-  // so without this the enumeration truncates to the on-open window. Same fix as cdpScrapeTaOptions.
+  // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive the virtualizer's row re-render on a
+  // HIDDEN tab (mounted set stayed frozen while scrollTop climbed → enumeration truncated to the on-open
+  // window). Fire an explicit 'scroll' after each set so the virtualizer mounts the new window even hidden.
   const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
   let steps = 0, stable = 0, atBottom = false;
   const MAX_STEPS = 60;
   collect();
   if (sc) {
     // OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window (overlap,
-    // no row skipped). Pacing is via settleWindow (mount-gated; +120ms/poll only in debug; hidden-safe).
+    // no row skipped). Pacing is via stepSettle (one frame; +120ms only in debug; hidden-safe setTimeout).
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    doScroll(0); await settleWindow(); collect();
+    doScroll(0); await stepSettle(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
       doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
-      await settleWindow(); collect();
+      await stepSettle(); collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
@@ -2422,16 +2408,7 @@ function makeCdpActuation(llmConfig) {
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      if (r && r.ok) {
-        console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r.count + " options" + (r.atBottom ? " (reached bottom)" : ""));
-        // DIAG (2026-07-05): full scroll metrics + per-step trace to root-cause the hidden truncation.
-        // scroller:false OR sh≈ch ⇒ nothing to scroll (short/unmounted list). m stuck while t climbs ⇒ the
-        // hidden virtualizer isn't rendering new rows on programmatic scroll (a scroll-event/paint issue,
-        // not pacing). s growing with t ⇒ scroll+mount working (pacing/step tuning).
-        console.log("[ApplyPilot][CDP-SCRAPE-TA][diag]", `scroller:${r.scrollerFound} sh:${r.scrollHeight} ch:${r.clientHeight} top:${r.scrollTop} initMounted:${r.initialMounted} steps:${r.steps} atBottom:${r.atBottom} capped:${r.cappedOut}`, "trace:", JSON.stringify(r.trace));
-      } else {
-        console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, "FAILED");
-      }
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") : "FAILED");
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
