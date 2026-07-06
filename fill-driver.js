@@ -4155,9 +4155,15 @@ async function captureDropdownOptions(act, loc, budgets) {
 
 // END-OF-PAGE option capture for the summary's editable choice fields. Runs in drivePageFill AFTER
 // the whole page is filled but BEFORE the M40 audit (which then re-reads each VALUE + backstops any
-// capture-induced stray). For every filled/filled_review choice record that LACKS options (a committed
-// dropdown already carries enabledTexts → skipped; a prefilled-kept dropdown or a tagged FoS typeahead
-// does not), scrape the full list into rec.options. Dispatch by widget; cache per option-set key so
+// capture-induced stray). For every filled/filled_review choice record that LACKS options, scrape the
+// full list into rec.options so the review editor renders a real <select>/combobox, not a bare textbox.
+// The `!rec.options.length` guard (below) means only OPTIONLESS records ever re-open — a committed flat
+// dropdown already carries enabledTexts and a start-scraped flat typeahead already carries its options,
+// so both are skipped. The records that DO reach a scrape here are the tier-0 "kept without actuation"
+// ones — a `dropdown-prefilled-kept` flat dropdown (country/state/phone) and a `prefilled-kept` flat
+// typeahead (countryPhoneCode), plus the repeating-section dropdowns/FoS typeaheads. This is the M27.C
+// cold-list cost, now PAID deliberately (operator ask 2026-07-05: page-1 choice fields must show a real
+// dropdown in review, same as page-2 does). Dispatch by widget; cache per option-set key so
 // same-vocabulary fields (FoS across education entries; language/proficiency dropdowns across entries)
 // re-open ONCE, not N times. Non-fatal throughout.
 async function captureChoiceOptions(act, results, budgets) {
@@ -4166,15 +4172,19 @@ async function captureChoiceOptions(act, results, budgets) {
   for (const rec of results || []) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
-    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown already has them
+    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown / start-scraped typeahead already has them
     let key, scrape;
-    if (rec.widgetType === "typeahead" && rec.captureOptions && act.scrapeTaOptions) {
+    if (rec.widgetType === "typeahead" && act.scrapeTaOptions) {
+      // Repeating-section FoS typeaheads AND flat page-1 typeaheads kept without actuation
+      // (prefilled-kept, e.g. countryPhoneCode): a tier-0 keep never opened the widget so nothing was
+      // start-scraped. captureKey groups same-vocabulary repeating fields; a flat field keys on fieldName.
       key = "ta:" + (rec.captureKey || rec.fieldName);
       scrape = () => captureFieldOptions(act, { wrapperSel: rec.auditLoc }, budgets);
-    } else if (rec.widgetType === "dropdown" && act.openDropdown && /\[\d+\]\./.test(rec.fieldName || "")) {
-      // REPEATING-section dropdowns only (fieldName = "education[0].degree" / "language[1].readingProficiency"
-      // — small lists). Flat dropdowns (country/state/phone, page 1) are SKIPPED: those are large cold lists
-      // (re-opening them is exactly the M27.C cost) and they fill fresh WITH options on a first run anyway.
+    } else if (rec.widgetType === "dropdown" && act.openDropdown) {
+      // Repeating-section dropdowns (education[0].degree, language[1].readingProficiency — cached by stem)
+      // AND flat page-1 dropdowns kept as pre-filled (country/state/phone — dropdown-prefilled-kept, zero
+      // actuation → no options). A flat field has no "[idx]." segment, so split(".").pop() yields the bare
+      // fieldName (country/countryRegion/phoneType) — each keyed distinctly, scraped once.
       key = "dd:" + String(rec.fieldName).split(".").pop(); // recName stem (degree/language/readingProficiency) — same stem ⇒ same option vocabulary
       scrape = () => captureDropdownOptions(act, { wrapperSel: rec.auditLoc }, budgets);
     } else continue;

@@ -453,8 +453,20 @@ function buildEditor(entry) {
     // seed the list from an existing bot value (shown as tier 1) — display only; doesn't mark edited.
     if (!Array.isArray(entry.tiers)) entry.tiers = (entry.current_value != null && entry.current_value !== "") ? [entry.current_value] : [];
     const wrap = el("div", { class: "tier-ed" }), list = el("div", { class: "tier-list" });
+    // CURRENT FILLED VALUE — a read-only box ABOVE the candidate editor (operator ask 2026-07-05). The
+    // filled value used to appear ONLY as candidate "1." inside a list labeled "value to try", which
+    // read like it hadn't been filled. This box makes the actually-filled value unambiguous; the tier
+    // list below is the re-fill candidate order. Shows current_value (= top tier, the effective value).
+    const filled = el("div", { class: "tier-filled" });
+    const renderFilled = () => {
+      filled.textContent = "";
+      const v = entry.current_value, has = v != null && v !== "";
+      filled.appendChild(el("span", { class: "tier-filled-lb", text: "Filled" }));
+      filled.appendChild(el("span", { class: has ? "tier-filled-v" : "tier-filled-v empty", text: has ? String(v) : "— blank —" }));
+    };
     const persist = () => commit(entry, (entry.tiers && entry.tiers.length) ? entry.tiers[0] : ""); // top tier → current_value
     const render = () => {
+      renderFilled();
       list.textContent = "";
       (entry.tiers || []).forEach((t, i) => {
         const rm = el("button", { class: "tier-rm", title: "remove", text: "×" });
@@ -467,10 +479,12 @@ function buildEditor(entry) {
     inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); addVal(); } });
     const btn = el("button", { class: "tier-try", text: "Try this next" });
     btn.addEventListener("click", addVal);
+    wrap.appendChild(filled);
+    wrap.appendChild(el("div", { class: "tier-cap", text: "Values to try on re-fill (most specific first)" }));
     wrap.appendChild(el("div", { class: "tier-add-row" }, [inp, btn]));
     wrap.appendChild(list);
     render();
-    return { node: wrap, set: () => {}, tier: true };
+    return { node: wrap, set: () => { renderFilled(); }, tier: true };
   };
   if (wt === "file_upload") {
     // A per-entry attachment the FORM offers (detected, flag "nested-attachment") → a real "Choose

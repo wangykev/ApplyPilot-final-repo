@@ -690,7 +690,7 @@ test("dropdown: click dispatched but nothing commits → needs_review, never a s
   assert.strictEqual(rec.after, "Select One"); // unchanged trigger surfaced, not accepted
 });
 
-test("dropdown: trigger already matches a candidate → filled / dropdown-prefilled-kept, NO re-open (M27 Commit C)", async () => {
+test("dropdown: trigger already matches a candidate → filled / dropdown-prefilled-kept, value never overwritten (M27 Commit C)", async () => {
   const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
   const out = await drivePageFill(act, usProfile, {}, {}, T_BUDGETS);
   const rec = out.results[0];
@@ -699,7 +699,11 @@ test("dropdown: trigger already matches a candidate → filled / dropdown-prefil
   assert.strictEqual(rec.flag, "dropdown-prefilled-kept");
   assert.strictEqual(rec.confidence, "high");
   assert.strictEqual(rec.after, "United States of America");
-  assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a matching dropdown is not re-opened");
+  // M27.C: the FILL never overwrites a tier-0 match. (2026-07-05: the end-of-page read-only option
+  // capture MAY re-open it to scrape options for the review editor — value preserved, M40-audited —
+  // so the invariant is "no value-changing commit", not the old "no open".)
+  for (const bad of ["clickDropdownOptionByText", "typeJumpChars", "arrowStep", "clickOptionByIndex"])
+    assert.ok(!act.log.some(([m]) => m === bad), "a tier-0 pre-fill is never re-committed — no " + bad);
 });
 
 // ── dropdown TIER-AWARE pre-filled guard (M36.1 parity; the priority-blind bug) ──
@@ -730,13 +734,17 @@ test("dropdown TIER-AWARE: a tier>0 pre-fill with NO higher tier offered is KEPT
   assert.ok(act.log.some(([m]) => m === "openDropdown"), "opened to check for a higher tier");
 });
 
-test("dropdown TIER-AWARE: a tier-0 pre-fill is KEPT with ZERO actuation (no re-open)", async () => {
+test("dropdown TIER-AWARE: a tier-0 pre-fill is KEPT and never overwritten (fill does not actuate)", async () => {
   const act = makeFakeAct([ddField({ triggerText: "United States of America" })]);
   const out = await drivePageFill(act, { personal_info: { country: ["United States of America", "United States", "Canada"] } }, {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "dropdown-prefilled-kept");
-  assert.ok(!act.log.some(([m]) => m === "openDropdown"), "a tier-0 pre-fill must never re-open the list");
+  assert.strictEqual(rec.after, "United States of America");
+  // Value never mutated. (The read-only end-of-page option capture re-opens to scrape options for the
+  // review editor — no commit — value preserved + M40-audited.)
+  for (const bad of ["clickDropdownOptionByText", "typeJumpChars", "arrowStep", "clickOptionByIndex"])
+    assert.ok(!act.log.some(([m]) => m === bad), "a tier-0 pre-fill must never be overwritten — no " + bad);
 });
 
 test("dropdown: 'Select One' placeholder does NOT trigger keep — falls through to the verified fill", async () => {
@@ -1928,10 +1936,11 @@ test("typeahead: Enter and click both fail → next candidate carries, never a s
   assert.strictEqual(rec.settle_trace[0].note, "matched leaf but commit did not verify (no isselected flip / chip)");
 });
 
-test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", async () => {
-  // Workday auto-derives the phone code from Country, so an already-correct
-  // chip is the common case. The failure mode is "verifying" it by re-typing —
-  // duplicating or clearing a correct chip. ZERO actuation allowed.
+test("countryPhoneCode pre-filled-correct → kept, chip never re-typed/cleared (read-only recon aside)", async () => {
+  // Workday auto-derives the phone code from Country, so an already-correct chip is the common case.
+  // The failure mode is "verifying" it by re-typing — duplicating or clearing a correct chip. The FILL
+  // does none of that. (2026-07-05: the end-of-page read-only option capture re-opens it to scrape
+  // options for the review editor — no type/clear/Enter/leaf-click — chip preserved + M40-audited.)
   const act = makeFakeAct([taField({ chips: ["United States of America (+1)"] })]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America", "United States"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
@@ -1940,7 +1949,8 @@ test("countryPhoneCode pre-filled-correct → kept with ZERO actuation calls", a
   assert.strictEqual(rec.flag, "prefilled-kept");
   assert.strictEqual(rec.after, "United States of America (+1)");
   assert.strictEqual(rec.verified, true);
-  assert.strictEqual(act.log.length, 0, "pre-filled-correct must not be touched (no overwrite actuation)");
+  for (const bad of ["typeInHier", "clearHierSearch", "pressEnter", "clickHierLeaf", "typeText", "insertText"])
+    assert.ok(!act.log.some(([m]) => m === bad), "pre-filled-correct must not be mutated — no " + bad);
 });
 
 // ── M27 Commit B: non-destructive overwrite of a mismatched pre-fill ─────────
@@ -2027,16 +2037,19 @@ test("typeahead: first candidate to commit wins — later candidates never typed
 // the pre-fill if none is offered; tier -1 → full overwrite walk (unchanged).
 const taTypedQueries = (act) => act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
 
-test('INVARIANT (M36.1): a tier-0 pre-fill is KEPT with ZERO actuation — countryPhoneCode auto-derive is never re-typed', async () => {
-  // The chip carries the (+1) suffix; normalize() strips it, so it is tier 0 vs the
-  // tiered candidate list — keep, no open/clear/type/Enter.
+test('INVARIANT (M36.1): a tier-0 pre-fill is KEPT and never re-typed — countryPhoneCode auto-derive is never mutated', async () => {
+  // The chip carries the (+1) suffix; normalize() strips it, so it is tier 0 vs the tiered candidate
+  // list — keep, the FILL does no clear/type/Enter/leaf-click. (2026-07-05: the end-of-page read-only
+  // option capture re-opens it to scrape options for the review editor — value-preserving, M40-audited
+  // — so the invariant is "never MUTATED", not the old literal "never opened".)
   const act = makeFakeAct([taField({ chips: ["United States of America (+1)"] })]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)", "United States of America", "United States"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.flag, "prefilled-kept");
   assert.strictEqual(rec.after, "United States of America (+1)");
-  assert.strictEqual(act.log.length, 0, "a tier-0 (top) pre-fill must never be actuated");
+  for (const bad of ["typeInHier", "clearHierSearch", "pressEnter", "clickHierLeaf", "typeText", "insertText"])
+    assert.ok(!act.log.some(([m]) => m === bad), "a tier-0 (top) pre-fill must never be mutated — no " + bad);
 });
 
 test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available, not first-that-lands)", async () => {
@@ -4975,16 +4988,18 @@ test("choice-capture: typeahead scrapes ONCE for two same-key records and copies
   assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // cached per captureKey → one re-open
 });
 
-test("choice-capture: untagged-typeahead / not-filled / unlocated records are untouched", async () => {
+test("choice-capture: an untagged (flat, prefilled-kept) typeahead is NOW captured; not-filled / unlocated stay untouched", async () => {
   const recs = [
-    taggedRec({ captureOptions: false, auditLoc: "[w-a]" }), // untagged typeahead (no captureOptions) → not captured
-    taggedRec({ status: "needs_review", auditLoc: "[w-c]" }), // not filled
-    taggedRec({ auditLoc: null }) // no locator
+    taggedRec({ captureOptions: false, auditLoc: "[w-a]" }), // flat typeahead (no captureOptions tag) kept w/o actuation → NOW captured
+    taggedRec({ status: "needs_review", auditLoc: "[w-c]" }), // not filled → untouched
+    taggedRec({ auditLoc: null }) // no locator → untouched
   ];
   const { act, calls } = makeCaptureAct();
   await captureChoiceOptions(act, recs, CAP_BUDGETS);
-  for (const r of recs) assert.strictEqual(r.options, undefined);
-  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0);
+  assert.deepStrictEqual(recs[0].options, FOS_OPTS); // flat typeahead captured for the review editor (2026-07-05 parity)
+  assert.strictEqual(recs[1].options, undefined);    // not-filled untouched
+  assert.strictEqual(recs[2].options, undefined);    // unlocated untouched
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // only the flat filled one scraped
 });
 
 test("choice-capture: distinct captureKeys each get their own scrape", async () => {
@@ -5042,12 +5057,12 @@ test("choice-capture: a repeating prefilled-kept dropdown (no options) gets rec.
   assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // only the optionless one re-opened
 });
 
-test("choice-capture: a FLAT dropdown (page 1, no [idx].) is NOT re-opened — M27.C preserved for big cold lists", async () => {
+test("choice-capture: a FLAT dropdown (page 1, prefilled-kept, no options) is NOW captured for the review editor (2026-07-05)", async () => {
   const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }]; // prefilled-kept, no options
   const { act, calls } = makeDropdownAct();
   await captureChoiceOptions(act, recs, T_BUDGETS);
-  assert.strictEqual(recs[0].options, undefined);                 // flat dropdown not captured
-  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0); // never re-opened
+  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]); // flat dropdown re-opened + captured so review shows a <select>
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1);       // re-opened once (the M27.C cost, paid deliberately)
 });
 
 test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cache), both get options", async () => {
