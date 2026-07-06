@@ -1715,19 +1715,23 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
     return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
   };
-  // rAF races a setTimeout fallback so the loop never HANGS on a hidden tab (frozen rAF); one frame per step
-  // lets the virtualizer render the just-scrolled window before we read (proven sufficient — see doScroll).
-  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
+  // ONE rAF racing a setTimeout fallback so the loop never HANGS on a hidden tab (frozen rAF → the timer wins).
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(fin); setTimeout(fin, 250); });
   const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
+  const curSig = () => { let s = ""; for (const o of curOpts()) s += (o.textContent || "").trim() + ""; return s; }; // signature of the CURRENTLY-mounted window
   const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
   // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive a react virtualizer's row re-render on
-  // a HIDDEN tab — scrollTop climbed 0→1772 over sh:1984 but the mounted set stayed a FROZEN 17 rows, so the
-  // FoS list truncated to the on-open window. Firing an explicit 'scroll' after each set makes the virtualizer
-  // mount the new window even hidden (live-verified: 65/65 options, seen-count climbs with scrollTop). A
-  // single frame() per step then suffices — the same pacing that always worked VISIBLE (it was never the
-  // pacing; the earlier mount-gated settleWindow was reverted — it only slowed the scroll without fixing it).
+  // a HIDDEN tab — the mounted set stayed a FROZEN 17 rows → the FoS list truncated to the on-open window.
+  // Firing an explicit 'scroll' after each set makes the virtualizer mount the new window even hidden
+  // (live-verified: 65/65 options, seen-count climbs with scrollTop).
   const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
+  // FASTER per-step wait (2026-07-06): poll single frames until the mounted set actually CHANGES (React
+  // committed the just-scrolled window) — breaks at ~1 frame on the common steps (≈2× the old fixed
+  // double-rAF), capped at 3 (≈ the old worst case, so NEVER slower and safe for a slow commit). The
+  // sig-change IS the mount signal, so this reads a COMMITTED window — it can't advance before the mount, so
+  // it can't re-truncate; overlap + de-dup + stable-2-at-bottom still backstop completeness.
+  const awaitRender = async (beforeSig) => { for (let i = 0; i < 3; i++) { await frame(); if (curSig() !== beforeSig) return; } };
   collect();
   let steps = 0, stable = 0, atBottom = false;
   const MAX_STEPS = 80; // safety bound — a curated FoS list is tens of options; overlap steps raise the count
@@ -1735,11 +1739,13 @@ async function cdpScrapeTaOptions(wrapperSel) {
     // OVERLAPPING scroll (~0.8 window) so a row straddling two windows is never skipped between mounts.
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
     doScroll(0); await frame(); collect();
+    let priorSig = curSig();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
       doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
-      await frame();
+      await awaitRender(priorSig);
+      priorSig = curSig();
       collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
