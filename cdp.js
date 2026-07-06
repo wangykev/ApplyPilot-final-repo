@@ -2437,22 +2437,15 @@ function makeCdpActuation(llmConfig) {
     // no scrape-order index assumption). A null/zero rect (text not resolvable) →
     // false; a missed click dismisses harmlessly and the trigger-text gate verifies.
     clickDropdownOptionByText: async (loc, text) => {
-      // RE-CAPTURE until the target option is CONFIRMED at the click coords (elementFromPoint == target),
-      // so a still-settling/virtualizing list that shifts the row between the rect read and the coordinate
-      // click can't land the click on a NEIGHBOR — the dup-language "English"→"Chinese" mis-commit (recon
-      // 2026-07-06; aggravated by the fast-timer delayRender). Bounded (4×, ~80ms between); if it never
-      // stabilizes we click the last rect anyway (the commit-persistence re-read still refuses a wrong value
-      // → needs_review, never silent). Logs the Vector-B signal (aria-controls collisions across entries).
-      let rect = null;
-      for (let i = 0; i < 4; i++) {
-        rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
-        if (!rect || rect.w <= 0) return false;
-        if (rect.collisions > 1) console.log("[ApplyPilot][CDP-DD-COMMIT] ⚠ aria-controls id collides across " + rect.collisions + " elements — the option click may route to the WRONG entry's listbox (" + loc.wrapperSel + ")");
-        if (rect.hitTarget) break;
-        console.log('[ApplyPilot][CDP-DD-COMMIT] "' + text + '" not at its own coords (at-point="' + rect.atPointText + '") — list still settling, re-capturing (' + (i + 1) + '/4)');
-        await cdpDelay(80);
-      }
+      const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
       if (!rect || rect.w <= 0) return false;
+      // DIAGNOSTIC (pre-filled dropdown OVERWRITE recon 2026-07-06): the languages start pre-filled+flipped
+      // and the overwrite click isn't taking. Log whether the target option is ACTUALLY at its own click
+      // coords (hitTarget; else what elementFromPoint hit) + the aria-controls collision count — so the
+      // failing commit reveals WHY: hitTarget=false ⇒ the coordinate click lands off the option (out-of-view
+      // / portaled-popup "Uruguay" dismiss / stale rect); collisions>1 ⇒ wrong-entry listbox routing;
+      // hitTarget=true yet the trigger doesn't change ⇒ the click hits it but Workday doesn't re-commit.
+      console.log('[ApplyPilot][CDP-DD-COMMIT] "' + text + '" hitTarget=' + rect.hitTarget + ' atPoint="' + rect.atPointText + '" collisions=' + rect.collisions + ' rect=' + rect.cx + ',' + rect.cy + ' (' + loc.wrapperSel + ')');
       await cdpClickAt(rect.cx, rect.cy);
       return true;
     },

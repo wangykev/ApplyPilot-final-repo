@@ -2150,9 +2150,16 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   option was STILL at those coords. A still-settling / virtualizing portaled listbox shifts the row between
   the two round-trips, so the click for "English" lands on a NEIGHBOR ("Chinese" is a few rows away in an
   alphabetical language list). Intermittent, and AGGRAVATED by the fast-timer `delayRender` (shorter settle).
-  FIX: `cdpDropdownOptionRectByText` now reports `hitTarget` = `document.elementFromPoint(cx,cy).closest('[role=option]') === el`; `clickDropdownOptionByText` RE-CAPTURES (≤4×, ~80ms apart) until the target is
-  confirmed in place before clicking (mirrors the source-drill's `elementFromPoint` validation). The
-  commit-persistence re-read remains the backstop.
+  **CORRECTION (operator clarified 2026-07-06):** this was the WRONG diagnosis. The two languages start
+  **pre-filled and FLIPPED** (entry 0=Chinese, entry 1=English) and the fill must OVERWRITE each to the
+  profile value; the overwrite click is not taking, leaving them flipped. It is NOT a neighbor mis-click. The
+  `elementFromPoint` RE-CAPTURE that was added here was **REVERTED** — it regressed a previously-working
+  overwrite (entry 1 had been committing; with the re-capture, BOTH entries failed). What's kept:
+  `cdpDropdownOptionRectByText` still returns `hitTarget`/`atPointText`/`collisions`, and
+  `clickDropdownOptionByText` clicks ONCE (prior behavior) but now LOGS `[ApplyPilot][CDP-DD-COMMIT] "<opt>"
+  hitTarget=… atPoint=… collisions=… rect=…` per commit — a read-only diagnostic to capture WHY a pre-filled
+  overwrite click fails (off-target click vs wrong-entry routing vs click-lands-but-no-recommit). Root cause +
+  real fix PENDING that log.
 - **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
   aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
   across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The
