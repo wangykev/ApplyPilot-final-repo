@@ -471,10 +471,32 @@ const pollCheckedIs = async (act, id, want, budgets) => {
 // "textarea" for the WE roleDescription (recon 2026-06-18: coordinate-click focus +
 // Input.insertText drives a Workday <textarea> with the newline intact + React-
 // surviving). The default keeps every existing <input> caller byte-identical.
+// Text-value equality with Workday's phone auto-format tolerance. An exact string match, OR — when
+// BOTH sides are phone-shaped (only digits + phone punctuation, ≥7 digits) — the same digit sequence.
+// Workday reformats a typed phone to "(850) 666-0266"; "8506660266" / "850-666-0266" are the SAME
+// number, so a format-only difference is NOT a change (don't re-type, don't flag, don't audit-fail).
+// SAFE: any value containing a letter is never phone-shaped, so ordinary text still compares exactly;
+// the digit path only engages when the exact match already failed AND both sides are pure phone shape.
+const PHONE_SHAPE = /^[\d()\-.\s+]+$/;
+const phoneShaped = (s) => typeof s === "string" && PHONE_SHAPE.test(s.trim()) && s.replace(/\D/g, "").length >= 7;
+function textValuesMatch(actual, expected) {
+  if (actual == null || expected == null) return false;
+  if (String(actual) === String(expected)) return true;
+  if (phoneShaped(String(actual)) && phoneShaped(String(expected)) && String(actual).replace(/\D/g, "") === String(expected).replace(/\D/g, "")) return true;
+  return false;
+}
+
 const fillTextCdp = async (act, loc, value, budgets, tag) => {
   const pre = await act.readTextValue(loc, tag);
   if (!pre) return { status: "error", detail: "no " + (tag || "input") + " in wrapper" };
   const before = pre.value;
+  // SKIP-IF-CORRECT (minimal-diff replay, budgets.skipIfCorrect): the box already holds the value
+  // (phone-format-tolerant) → leave it UNTOUCHED, zero actuation. A replay changes only what DIFFERS;
+  // this is what makes page-2 repeating entries stop fully re-typing correct fields. Inert on the
+  // normal fill path (the flag is unset), where an empty box never matches a real value anyway.
+  if (budgets && budgets.skipIfCorrect && textValuesMatch(before, value)) {
+    return { status: "filled", after: before, verified: true, flag: "replay-already-correct", detail: "already correct — left unchanged (no actuation)" };
+  }
   // SELF-HEAL retry: a read-back mismatch (the live "fFirmware…" stray-char bug) is a WRONG value,
   // not a slow one — the reactive poll below already waits out lag, so a miss means a bad fill. Retry
   // the whole focus→clear→type→poll up to budgets.textFillAttempts before flagging. The happy path is
@@ -495,10 +517,10 @@ const fillTextCdp = async (act, loc, value, budgets, tag) => {
     do {
       const read = await act.readTextValue(loc, tag);
       after = read ? read.value : null;
-      if (after === value) break;
+      if (textValuesMatch(after, value)) break; // COMPLETE-state (phone-format-tolerant: Workday reformats a typed phone)
       await act.delay(budgets.textReadIntervalMs);
     } while (Date.now() < deadline);
-    if (after === value) {
+    if (textValuesMatch(after, value)) {
       let detail = before ? `overwrote "${before}"` : null;
       if (attempt > 1) detail = (detail ? detail + " | " : "") + `self-healed on attempt ${attempt}`;
       return { status: "filled", after, verified: true, detail };
@@ -1173,6 +1195,11 @@ const fillRadioCdp = async (act, loc, candidates, budgets) => {
     if (found) { target = found; break; }
   }
   if (!target) return { status: "needs_review", detail: "no candidate matched radio labels", after: before, options: optionLabels };
+  // SKIP-IF-CORRECT (minimal-diff replay): the correct option is already selected → leave it, zero
+  // actuation. Inert on the normal fill path (radios start unselected, so beforeOpt is null there).
+  if (budgets && budgets.skipIfCorrect && beforeOpt && beforeOpt.id === target.id) {
+    return { status: "filled", after: before, verified: true, matchTier: "label-exact", flag: "replay-already-correct", detail: "already correct — left unchanged (no actuation)", options: optionLabels };
+  }
 
   let pathUsed = "label-click";
   let committed = (await act.clickRadioLabel(loc, target.id)) && (await pollCheckedIs(act, target.id, true, budgets));
@@ -3684,6 +3711,23 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
   if (present(norm.year)) segs.push(["Year", String(norm.year)]);
   if (!segs.length) return { status: "skipped", detail: "no date value to fill" };
 
+  // SKIP-IF-CORRECT (minimal-diff replay, budgets.skipIfCorrect): if EVERY segment already reads the
+  // desired numeric value, leave the composite UNTOUCHED — zero actuation (page 2 stops re-typing a
+  // correct date). Segment-numeric compare (parseInt), matching auditDateMatches / fillSegment's poll.
+  if (b.skipIfCorrect) {
+    const cur = {};
+    let allMatch = true;
+    for (const [seg, val] of segs) {
+      const r = await act.readDateSegment(loc, seg);
+      cur[seg] = r ? r.value : null;
+      if (!r || parseInt(r.value, 10) !== parseInt(val, 10)) { allMatch = false; break; }
+    }
+    if (allMatch) {
+      const afterStr = ["Month", "Day", "Year"].filter((s) => cur[s] != null).map((s) => cur[s]).join("/");
+      return { status: "filled", after: afterStr, verified: true, flag: "replay-already-correct", detail: "already correct — left unchanged (no actuation)" };
+    }
+  }
+
   const after = {};
   const trace = {};
   let allVerified = true;
@@ -3840,10 +3884,23 @@ function deriveFlatWrapperSel(entry) {
   const automationId = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
   return automationId ? '[data-automation-id="' + automationId + '"]' : null;
 }
+// Does the field's LIVE value already equal the approved value? Mirrors reconcileAudit's classify
+// (text/textarea exact; checkbox by desired-boolean; date segment-numeric; choice widgets
+// normalize-equal). The skip-if-correct gate: a replay CHANGES only what differs — re-committing a
+// correct field is wasted work and re-opens the stray/false-verify risk (the degree→Associates class).
+function replayValueMatches(widget, actual, expected) {
+  if (actual == null || expected == null) return false;
+  if (widget === "checkbox") { const want = expected === true || /^(true|yes)$/i.test(String(expected)); return String(actual) === String(want); }
+  if (widget === "text" || widget === "textarea") return textValuesMatch(actual, expected); // phone-format-tolerant
+  if (widget === "date") return auditDateMatches(String(actual), String(expected));
+  return apMatch.normalize(String(actual)) === apMatch.normalize(String(expected)); // dropdown / radio / typeahead / hierarchical
+}
+
 async function replayField(act, entry, budgets) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const widget = entry && entry.widget_type;
   if (!entry || !widget || widget === "section") return { status: "skipped", detail: "no widget / section op (not replayable)" };
+  if (widget === "section_stub" || widget === "nested_section_stub") return { status: "skipped", flag: "replay-stub-skip", detail: "section stub — a display-only add-entry card, not a fillable field" };
   if (entry.is_deleted) return { status: "skipped", flag: "replay-deleted", detail: "deleted entry — dropped by the section reconcile, not replayed" };
   if (isRepeatingEntry(entry)) return { status: "skipped", flag: "replay-repeating-deferred", detail: "repeating-section field — replayed positionally by the section reconcile (M3), not by a recorded selector" };
   if (widget === "file_upload") return { status: "skipped", flag: "replay-file-deferred", detail: "résumé re-attach handled by the SW attachResumeForPage step, not replayField" };
@@ -3862,6 +3919,18 @@ async function replayField(act, entry, budgets) {
     }
     return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
   }
+
+  // SKIP-IF-CORRECT (minimal-diff replay): read the field's LIVE value FIRST; if it already equals the
+  // approved value, leave it UNTOUCHED — zero actuation. A replay changes only what DIFFERS: re-committing
+  // a correct field is wasted work and re-opens the stray/false-verify risk (the degree→Associates class).
+  // (Choice widgets self-skip via their keep-guards too; this covers text/date/radio/checkbox uniformly
+  // and avoids even opening a correct dropdown.) A failed live read → fall through and actuate normally.
+  try {
+    const live = await auditReReadActual(act, { widgetType: widget, auditLoc: sel, auditTag: widget === "textarea" ? "textarea" : undefined, expected: value });
+    if (live && live.readable && replayValueMatches(widget, live.actual, value)) {
+      return { status: "filled", verified: true, after: live.actual, replay: "already-correct", flag: "replay-already-correct", detail: "already correct on the page — left unchanged (no actuation)" };
+    }
+  } catch (e) { /* live read failed → actuate normally below */ }
 
   // NORMAL: replay the approved value through the SAME per-widget handler (single candidate → match ladder).
   switch (widget) {
@@ -3900,6 +3969,115 @@ async function replayFlatFields(act, entries, presentFieldNames, budgets) {
   return results;
 }
 
+// ── M3 (strict-replay SUBMIT — repeating sections) ───────────────────────────
+// coerceReplayValue: turn a bundle entry's DISPLAY current_value back into the profile-shaped
+// value fillEntryCdp expects at item[f.key]. Dates are the only real transform — the bundle stores
+// the rendered string ("6/15/2024", "5/2025", "2024") but fillDateCompositeCdp wants the SW-parsed
+// shape: a "YYYY" STRING for a year-only field, or {month,day?,year} for an M/Y or M/D/Y date
+// (auditDateSegments does the same split the audit uses). Checkbox → boolean. Everything else
+// (text/textarea/dropdown/typeahead) passes through verbatim → resolve() makes it a single candidate
+// through the match ladder (strict — the approved value or needs_review, never a guess).
+function coerceReplayValue(currentValue, widget) {
+  if (currentValue == null || currentValue === "") return null;
+  if (widget === "checkbox") return currentValue === true || /^(true|yes)$/i.test(String(currentValue));
+  if (widget === "year") return String(currentValue);                 // fillDateCompositeCdp accepts a "YYYY" string
+  if (widget === "date") {
+    const segs = auditDateSegments(currentValue);                     // [["Month","6"],["Day","15"],["Year","2024"]] etc.
+    if (segs.length === 1) return String(segs[0][1]);                 // year-only → the year string
+    const o = {}; for (const [k, v] of segs) o[k.toLowerCase()] = v; // {month, day?, year}
+    return o;
+  }
+  return currentValue;                                                // text / textarea / dropdown / typeahead
+}
+
+// bundleToSectionItems: reconstruct the profile-shaped `items` array for ONE known PAGE_SECTION from
+// the approved bundle, so the strict replay can feed driveRepeatingSectionCdp (reconcile-to-N +
+// entry-scoped fill). Groups the section's entries by index (canonical `<name>[i].…`), DROPS
+// soft-deleted entries, re-indexes 0..M-1 (INCLUDING Feature-B added entries — same canonical
+// shape), maps each field's canonical `path` → the fieldMap `key` (via coerceReplayValue), and
+// reconstructs nested sub-sections (cert ▸ specialties → item[itemsKey][j]). A field with no
+// fieldMap entry or no value is omitted → fillEntryCdp skips it (a cleared/blank field stays blank,
+// correct on a fresh form). Pure + unit-testable. Unknown/generic sections (no fieldMap) are NOT
+// handled here — they're the caller's deferral.
+function bundleToSectionItems(entries, section) {
+  const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp("^" + esc(section.name) + "\\[(\\d+)\\]\\.(.+)$");
+  const nestedRe = /^([A-Za-z_]+)\[(\d+)\]\.(.+)$/;
+  const pathToFm = {}; for (const m of (section.fieldMap || [])) pathToFm[m.path] = m;
+  const byIdx = new Map(); const order = [];
+  for (const e of (entries || [])) {
+    if (!e || e.is_deleted) continue;
+    const m = String(e.canonical_field || "").match(re);
+    if (!m) continue;
+    const i = +m[1], rest = m[2];
+    if (!byIdx.has(i)) { byIdx.set(i, { flat: {}, nested: {} }); order.push(i); }
+    const bucket = byIdx.get(i);
+    const nm = rest.match(nestedRe);
+    if (nm && section.nested) {                                       // nested: "childBase[j].childPath"
+      const sub = (section.nested.subSections || []).find((s) => s.childBase === nm[1]);
+      const cfm = sub && (sub.fieldMap || []).find((x) => x.path === nm[3]);
+      if (!cfm) continue;
+      const v = coerceReplayValue(e.current_value, cfm.widget); if (v == null) continue;
+      bucket.nested[nm[1]] = bucket.nested[nm[1]] || new Map();
+      const j = +nm[2]; if (!bucket.nested[nm[1]].has(j)) bucket.nested[nm[1]].set(j, {});
+      bucket.nested[nm[1]].get(j)[cfm.key] = v;
+    } else {                                                          // flat entry field: "<path>"
+      const fm = pathToFm[rest]; if (!fm) continue;
+      const v = coerceReplayValue(e.current_value, fm.widget); if (v == null) continue;
+      bucket.flat[fm.key] = v;
+    }
+  }
+  order.sort((a, b) => a - b);                                        // positional: original index order, re-indexed on output
+  return order.map((i) => {
+    const bucket = byIdx.get(i);
+    const item = Object.assign({}, bucket.flat);
+    for (const childBase of Object.keys(bucket.nested)) {
+      const sub = section.nested.subSections.find((s) => s.childBase === childBase);
+      const js = [...bucket.nested[childBase].keys()].sort((a, b) => a - b);
+      item[sub.itemsKey] = js.map((j) => bucket.nested[childBase].get(j));
+    }
+    return item;
+  });
+}
+
+// replayRepeatingSections: the repeating-section counterpart to replayFlatFields. For each KNOWN
+// PAGE_SECTION present on the live page that has approved bundle entries, reconstruct its items
+// (bundleToSectionItems) and re-fill via the SAME driveRepeatingSectionCdp — but STRICT:
+//   • deleteOnNoMatch:false — never drop an approved entry on a transient no-match (keep + flag).
+//   • aiContext:null        — no AI; the human already approved the value.
+// driveRepeatingSectionCdp reconciles the live count to the bundle's kept-entry count (CREATING
+// Feature-B added entries) and fills each entry positionally + nested (cert specialties) via the
+// proven per-widget handlers — a single approved candidate through the match ladder (a live
+// no-match → needs_review, never a guess). A section with no approved entries is skipped (the
+// emptied-section reconcile-to-0 case is a follow-on). UNKNOWN/generic sections (no fieldMap) are
+// deferred. NO Next/Submit — the caller stays in control. Returns the per-field/section records.
+async function replayRepeatingSections(act, entries, budgets) {
+  // skipIfCorrect: minimal-diff replay — the per-widget handlers (text/date/radio, and checkbox
+  // already) read the live value first and leave an already-correct field UNTOUCHED (zero actuation),
+  // so page-2 repeating entries no longer fully re-fill. Choice widgets self-skip via their keep-guards.
+  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {}, { skipIfCorrect: true });
+  const results = [];
+  let rscan = null;
+  try { rscan = await act.repeatingScan(); } catch (e) { return results; } // no repeating substrate → nothing to replay
+  if (!rscan || !(rscan.sections || rscan.addButtons)) return results;
+  for (const sec of PAGE_SECTIONS) {
+    const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
+    const re = new RegExp(sec.headingRegex, "i");
+    const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((bt) => re.test((bt && bt.nearestHeading) || ""));
+    if (!hasContainer && !hasAdd) continue;                            // section not on this page
+    const items = bundleToSectionItems(entries, sec);
+    if (!items.length) continue;                                       // no approved entries to replay
+    const out = await driveRepeatingSectionCdp(act, {
+      name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
+      items, fieldMap: sec.fieldMap, nested: sec.nested,
+      deleteOnNoMatch: false, // strict: keep + flag an approved entry that won't match, never delete
+      aiContext: null         // strict: no AI — the human approved the value
+    }, b);
+    if (out && Array.isArray(out.results)) results.push(...out.results);
+  }
+  return results;
+}
+
 // reconcileAudit: re-read each entry's live value + classify match / mismatch / unverifiable.
 // One settle first (delayFull — the page's render takes real wall-clock; the foreground
 // speedup must not shorten it). Pure verdict list; the caller (inline or SW) acts on it.
@@ -3913,7 +4091,8 @@ async function reconcileAudit(act, entries, budgets, opts) {
   const refillOnMismatch = !!(opts && opts.refillOnMismatch);
   const classify = (e, actual, readable) => {
     if (!readable || actual === null) return "unverifiable";
-    if (e.widgetType === "text" || e.widgetType === "textarea" || e.widgetType === "checkbox") return actual === e.expected ? "match" : "mismatch";
+    if (e.widgetType === "checkbox") return actual === e.expected ? "match" : "mismatch";
+    if (e.widgetType === "text" || e.widgetType === "textarea") return textValuesMatch(actual, e.expected) ? "match" : "mismatch"; // phone-format-tolerant
     if (e.widgetType === "date") return auditDateMatches(actual, e.expected) ? "match" : "mismatch";
     return norm(actual) === norm(e.expected) ? "match" : "mismatch"; // dropdown / radio / typeahead / source
   };
@@ -4473,5 +4652,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
