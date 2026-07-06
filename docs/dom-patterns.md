@@ -2079,3 +2079,37 @@ sub-section stub notes the removal).
   VERIFIES the post-Tab chip: still == original → `filled`/`prefilled-better-tier-unavailable`;
   differs → `overwrite-stray` with the honest live value; vanished → honest needs_review. The
   recommitFn closure + TYPEAHEAD_SELF_VERIFY are deleted.
+
+## 2026-07-04..06 — Hidden-tab SPEED: worker-timers, the virtualized-list scroll mechanics, and the dropdown close race
+
+The rapidfire work surfaced four load-bearing DOM/runtime facts (all live-verified on Magna wd3):
+
+- **A hidden tab throttles `setTimeout`/`setInterval` to ~1Hz and PAUSES rAF — but timers in a Web
+  Worker DON'T.** A `blob:` Worker whose callback returns via `postMessage` escapes the main-thread
+  background throttle. Injecting a worker-timers polyfill (`buildOverrideSrc`) that reroutes the page's
+  `setTimeout`/`setInterval` (and rAF) through it makes a hidden fill run at page-speed. CAVEAT: this can't
+  be ASSUMED (Workday CSP could block `blob:` workers, though Magna does NOT) — pace fast only on a MEASURED
+  in-page `setTimeout(0)` round-trip (`cdpTimersFast`), never on install-success alone; a blocked/slow probe
+  ⇒ the old slow-but-correct path, unchanged.
+
+- **A react virtualizer does NOT re-render its rows on a programmatic `scrollTop` change when the tab is
+  HIDDEN.** Live diag: `scrollTop` climbed 0→1772 over `scrollHeight 1984`, but the mounted `[role=option]`
+  set stayed a FROZEN 17 rows — so the virtualized option scrape (`cdpScrapeTaOptions`) truncated the
+  Field-of-Study list to the on-open window (~17 of 65). FIX: **dispatch an explicit `scroll` event**
+  (`el.dispatchEvent(new Event("scroll"))`) after each `scrollTop` set → the virtualizer's scroll listener
+  runs and mounts the new window even hidden. (Visible tabs re-render on the native scroll, so this was
+  invisible until hidden fills became usable.)
+
+- **A virtualizer keeps a MUCH larger window MOUNTED than the viewport** (viewport + overscan — ~17 rows
+  mounted for a ~7-row / 211px viewport, i.e. the mounted span is ~2–3× `clientHeight`). So the scrape hops
+  by the MEASURED mounted-window pixel span (`getBoundingClientRect` of the mounted rows), not by a
+  viewport, with ~30–40% overlap — cutting a 65-item enumeration from ~12 hops to ~5 while never skipping a
+  row. Per-hop it breaks the instant the mounted set changes (render-completion), not on a fixed frame.
+
+- **A dropdown's trigger `aria-expanded` flips to "false" the instant Escape fires, but the PORTALED
+  listbox lingers a beat still mounted and CLICKABLE.** So a fast close that returned on `aria-expanded`
+  alone let the NEXT recon field's open-click land on a lingering option — the live "Landline committed to
+  Phone Device Type" stray (Phone Device Type's dropdown overlapped where the Country-Phone-Code box sits).
+  FIX: gate every read-only recon close on the LISTBOX/LEAVES being GONE — `optionCount === 0` (dropdown,
+  `closeAndVerifyBlank`) / `leafCount === 0` (typeahead, `awaitTypeaheadClosed`; leaves = `promptOption`s) —
+  before the next field opens. `listboxPresent`/`leafCount` come from `cdpReadDropdownState`/`cdpReadHierState`.
