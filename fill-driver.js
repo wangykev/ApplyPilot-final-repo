@@ -3779,6 +3779,18 @@ function deriveFlatWrapperSel(entry) {
   const automationId = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
   return automationId ? '[data-automation-id="' + automationId + '"]' : null;
 }
+// Does the field's LIVE value already equal the approved value? Mirrors reconcileAudit's classify
+// (text/textarea exact; checkbox by desired-boolean; date segment-numeric; choice widgets
+// normalize-equal). The skip-if-correct gate: a replay CHANGES only what differs — re-committing a
+// correct field is wasted work and re-opens the stray/false-verify risk (the degree→Associates class).
+function replayValueMatches(widget, actual, expected) {
+  if (actual == null || expected == null) return false;
+  if (widget === "checkbox") { const want = expected === true || /^(true|yes)$/i.test(String(expected)); return String(actual) === String(want); }
+  if (widget === "text" || widget === "textarea") return String(actual) === String(expected);
+  if (widget === "date") return auditDateMatches(String(actual), String(expected));
+  return apMatch.normalize(String(actual)) === apMatch.normalize(String(expected)); // dropdown / radio / typeahead / hierarchical
+}
+
 async function replayField(act, entry, budgets) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const widget = entry && entry.widget_type;
@@ -3802,6 +3814,18 @@ async function replayField(act, entry, budgets) {
     }
     return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
   }
+
+  // SKIP-IF-CORRECT (minimal-diff replay): read the field's LIVE value FIRST; if it already equals the
+  // approved value, leave it UNTOUCHED — zero actuation. A replay changes only what DIFFERS: re-committing
+  // a correct field is wasted work and re-opens the stray/false-verify risk (the degree→Associates class).
+  // (Choice widgets self-skip via their keep-guards too; this covers text/date/radio/checkbox uniformly
+  // and avoids even opening a correct dropdown.) A failed live read → fall through and actuate normally.
+  try {
+    const live = await auditReReadActual(act, { widgetType: widget, auditLoc: sel, auditTag: widget === "textarea" ? "textarea" : undefined, expected: value });
+    if (live && live.readable && replayValueMatches(widget, live.actual, value)) {
+      return { status: "filled", verified: true, after: live.actual, replay: "already-correct", flag: "replay-already-correct", detail: "already correct on the page — left unchanged (no actuation)" };
+    }
+  } catch (e) { /* live read failed → actuate normally below */ }
 
   // NORMAL: replay the approved value through the SAME per-widget handler (single candidate → match ladder).
   switch (widget) {
@@ -4509,5 +4533,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

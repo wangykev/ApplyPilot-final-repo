@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5618,6 +5618,47 @@ test("replayField: is_deleted and file_upload are skipped (handled elsewhere), z
   const up = await replayField(act, { field_id: "P2::formField-resume", canonical_field: null, widget_type: "file_upload", current_value: null }, T_BUDGETS);
   assert.strictEqual(up.flag, "replay-file-deferred");
   assert.strictEqual(act.log.length, 0, "neither touches the form");
+});
+
+// ── Skip-if-correct: a replay CHANGES only what differs (minimal-diff reconciliation) ────────────
+test("replayValueMatches: text exact, choice normalize-equal, date segment-numeric, checkbox desired-bool", () => {
+  assert.strictEqual(replayValueMatches("text", "Kevin", "Kevin"), true);
+  assert.strictEqual(replayValueMatches("text", "kevin", "Kevin"), false, "text is exact, not normalized");
+  assert.strictEqual(replayValueMatches("dropdown", "United States of America (+1)", "United States of America"), true, "choice widgets normalize (drops the (+1))");
+  assert.strictEqual(replayValueMatches("date", "6/15/2024", "06/15/2024"), true, "dates compare segment-numeric");
+  assert.strictEqual(replayValueMatches("date", "6/15/2024", "6/16/2024"), false);
+  assert.strictEqual(replayValueMatches("checkbox", "true", "yes"), true, "checkbox: live 'true' == desired 'yes'");
+  assert.strictEqual(replayValueMatches("checkbox", "false", "yes"), false);
+  assert.strictEqual(replayValueMatches("text", "x", null), false, "a null side never matches (no false skip)");
+});
+
+test("replayField (SKIP-IF-CORRECT): an already-correct TEXT field is left UNTOUCHED — zero actuation", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Kevin" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", widget_type: "text", current_value: "Kevin", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(r.flag, "replay-already-correct");
+  assert.strictEqual(r.after, "Kevin");
+  assert.ok(!act.log.some((e) => e[0] === "focusText" || e[0] === "typeText" || e[0] === "clearText"), "a correct text field is never re-typed");
+});
+
+test("replayField (SKIP-IF-CORRECT): an already-correct DROPDOWN is left as-is — never even opened", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "United States of America", options: [{ text: "Select One", disabled: true }, { text: "Canada" }, { text: "United States of America" }] };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-country", widget_type: "dropdown", current_value: "United States of America", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(r.flag, "replay-already-correct");
+  assert.ok(!act.log.some((e) => e[0] === "openDropdown"), "a correct dropdown is not re-opened (no stray-click exposure)");
+});
+
+test("replayField (SKIP-IF-CORRECT): a DIFFERING value STILL actuates (only-what-differs, not skip-everything)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Wrongname" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", widget_type: "text", current_value: "Kevin", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.notStrictEqual(r.flag, "replay-already-correct");
+  assert.strictEqual(f.value, "Kevin", "a field that differs from the approved value is corrected");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "the differing field WAS actuated");
 });
 
 test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {
