@@ -1691,8 +1691,18 @@ async function cdpScrapeTaOptions(wrapperSel) {
   const sb = w.querySelector('input[data-automation-id="searchBox"]');
   const acId = sb ? sb.getAttribute("aria-controls") : null;
   const acEl = acId ? document.getElementById(acId) : null;
-  const optSel = '[role="option"]';
+  // Option nodes: most tenants render role=option, but some typeaheads render the leaves ONLY as
+  // data-automation-id="promptOption" WITHOUT role=option (the SAME divergence cdpReadHierState handles —
+  // see dom-patterns: leaves are promptOption, NOT role=option). Prefer role=option (keeps every working
+  // tenant/field byte-identical — FoS scrapes 65 unchanged); fall back to promptOption only when role=option
+  // finds nothing (diag 2026-07-06: countryPhoneCode scraped 0 under role=option alone). roleCount/promptCount
+  // are returned so the log tells us which shape a 0-result field actually is (empty-on-open vs role-mismatch).
+  const countFor = (sel) => { const scope = (acEl && acEl.querySelector(sel)) ? acEl : document; return scope.querySelectorAll(sel).length; };
+  const roleCount = countFor('[role="option"]');
+  const promptCount = countFor('[data-automation-id="promptOption"]');
+  const optSel = roleCount ? '[role="option"]' : (promptCount ? '[data-automation-id="promptOption"]' : '[role="option"]');
   const root = (acEl && acEl.querySelector(optSel)) ? acEl : document;
+  const labelOf = (el) => (el.getAttribute && el.getAttribute("data-automation-label")) || (el.textContent || "").trim();
   const curOpts = () => Array.from(root.querySelectorAll(optSel))
     .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]'));
   // Scroll container = the nearest scrollable ancestor of an option (overflow-y auto/scroll +
@@ -1710,7 +1720,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // lets the virtualizer render the just-scrolled window before we read (proven sufficient — see doScroll).
   const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
-  const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
+  const collect = () => { for (const o of curOpts()) { const t = labelOf(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
   // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive a react virtualizer's row re-render on
   // a HIDDEN tab — scrollTop climbed 0→1772 over sh:1984 but the mounted set stayed a FROZEN 17 rows, so the
@@ -1740,6 +1750,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
   }
   const options = Array.from(seen.keys());
   return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
+    roleCount, promptCount, usedSel: optSel,
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
 
@@ -2408,7 +2419,7 @@ function makeCdpActuation(llmConfig) {
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") : "FAILED");
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]" : "FAILED");
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
