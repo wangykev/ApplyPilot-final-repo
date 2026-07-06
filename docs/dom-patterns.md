@@ -2210,3 +2210,27 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
 - **AI-4 dup-language dedups on the OBSERVED `.after`** (`lib.js` `languageEntriesFromResults`/`languageDeletionPlan`),
   so two-Chinese (one mis-filled) reads as a "real" duplicate → it deletes an entry and MASKS the mis-commit.
   It's a safety net, not a diagnosis — the real fix is preventing the mis-click above.
+
+## 2026-07-06 — Dropdown CLOSE race in the FILL path: gate on options-GONE, not aria-expanded (and close-confirm the successful commit)
+
+Operator report on this branch: "dropdowns don't close instantly — you must wait for the listbox to be closed
+and options to be 0 before the next action or the dropdowns race." The recon close was already hardened to
+gate on listbox-GONE (`closeAndVerifyBlank` / `awaitTypeaheadClosed`, `optionCount`/`leafCount === 0`), but the
+FILL path had two gaps:
+
+- **`closeDropdownConfirmed` (the fill-path close used by the tier-KEEP + genuine-no-match returns) gated on
+  `ariaExpanded === "true"`.** aria flips to `"false"` the INSTANT a commit/Escape fires, but the portaled
+  option list lingers a beat while it unmounts and its options STAY CLICKABLE — so it returned while options
+  were still up, and the next field's open-click strayed onto a lingering option (the degree→"Associates" /
+  "Landline → Phone Device Type" cross-field stray). Fixed to the SAME gate as the recon close: `stillOpen =
+  listboxPresent && optionCount > 0`; poll (re-Escaping) until the options are gone, bounded by iterations.
+  (Not a main-vs-branch drift — `closeDropdownConfirmed` is byte-identical on main; the recon-close hardening
+  simply never reached this helper.)
+- **The SUCCESSFUL COMMIT return didn't close-confirm at all** — it returned `filled` the moment the commit
+  verified, while the just-committed list was still unmounting. Now every `fillDropdownCdp` return that opened
+  the list — successful commit, commit-failed, tier-keep, no-match — calls `closeDropdownConfirmed` before
+  returning, so the next field never opens over a lingering list.
+
+`closeDropdownConfirmed` is now exported + unit-pinned (aria always `"false"` yet options linger 2 reads → the
+gate must keep polling/Escaping until `optionCount === 0`; an aria-only gate would Escape zero times). Happy
+path adds ~1 read (options already gone → returns immediately). `node -c` clean; 484 tests green.

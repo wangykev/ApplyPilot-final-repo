@@ -172,3 +172,24 @@ every overwrite.
   refill (a fast miss re-opens and commits, ending `filled` — never left flipped). `node -c` clean; unit
   suite green (**483**). **LIVE-VERIFY PENDING** on the branch before merging to main (main has diverged — a
   real merge, not FF).
+
+## 2026-07-06 — Dropdown CLOSE race in the FILL path: gate on options-GONE, not aria-expanded
+
+Operator report on this branch: dropdowns don't close instantly — the next action must wait for the listbox
+to be closed / options === 0 or the dropdowns race. The RECON close was already hardened to gate on
+listbox-GONE (`closeAndVerifyBlank` / `awaitTypeaheadClosed`), but the FILL path had two gaps (both byte-
+identical on main — the recon-close hardening never reached them, so main was NOT actually fixed here):
+
+- **`closeDropdownConfirmed` gated on `ariaExpanded`** (used by the tier-KEEP + genuine-no-match returns).
+  aria flips `"false"` the instant Escape/commit fires, but the options linger a beat while they unmount and
+  STAY CLICKABLE → returned early → the next field's open-click strayed onto a lingering option. Fixed to the
+  SAME gate as the recon close: `stillOpen = listboxPresent && optionCount > 0`; poll (re-Escaping) until the
+  options are gone.
+- **The SUCCESSFUL COMMIT return didn't close-confirm at all** — it returned `filled` while the list was still
+  unmounting. Now every `fillDropdownCdp` return that opened the list (successful commit, commit-failed,
+  tier-keep, no-match) calls `closeDropdownConfirmed` before returning.
+
+`closeDropdownConfirmed` exported + unit-pinned (aria always `"false"` yet options linger 2 reads → the gate
+must keep polling until `optionCount === 0`; an aria-only gate would Escape zero times). Happy path adds ~1
+read (options already gone → immediate). Docs synced (CLAUDE.md close-gate invariant, dom-patterns entry).
+`node -c` clean; unit suite green (**484**). **LIVE-VERIFY PENDING** with the fast-first change before merge.

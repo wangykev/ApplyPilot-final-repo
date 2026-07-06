@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -739,6 +739,25 @@ test("dropdown OVERWRITE fast-first: a fast-attempt MISS re-opens and commits on
   assert.strictEqual(rec.flag, "dropdown-overwrite-success");
   assert.strictEqual(act.log.filter(([m]) => m === "clickDropdownOptionByText").length, 2, "fast attempt missed → exactly one refill click");
   assert.ok(act.log.filter(([m]) => m === "openDropdown").length >= 2, "re-opened the list for the refill");
+});
+
+test("closeDropdownConfirmed: waits for the LISTBOX to unmount (options gone), NOT just aria-expanded=false", async () => {
+  // The close race: aria-expanded flips to "false" the instant a commit/Escape fires, but the portaled
+  // options linger a beat while they unmount and STAY CLICKABLE. Gating on aria alone returns too early →
+  // the next field's open-click strays onto a lingering option. Here aria is ALWAYS "false" yet options
+  // linger for 2 reads — a correct gate must keep polling (re-Escaping) until optionCount hits 0.
+  let escapes = 0, lingering = 2;
+  const act = {
+    delayFull: async () => {},
+    pressEscape: async () => { escapes++; },
+    readDropdownState: async () => {
+      const open = lingering > 0; if (lingering > 0) lingering -= 1;
+      return { ariaExpanded: "false", listboxPresent: open, optionCount: open ? 5 : 0 };
+    }
+  };
+  const gone = await closeDropdownConfirmed(act, { wrapperSel: "[w]" }, { openRetries: 3, commitIntervalMs: 1 });
+  assert.strictEqual(gone, true, "confirmed closed only once the options unmounted");
+  assert.ok(escapes >= 1, "kept Escaping while options lingered — an aria-only gate would have Escaped 0 times");
 });
 
 test("dropdown TIER-AWARE: a tier>0 pre-fill with NO higher tier offered is KEPT (better-tier-unavailable)", async () => {

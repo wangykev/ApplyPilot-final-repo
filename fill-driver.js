@@ -981,23 +981,28 @@ const parseRemediation = (text) => {
   return { action: "none", reason: String(obj.reason || (action ? "unknown action: " + action : "no action")).trim() };
 };
 
-// Close an OPENED dropdown and CONFIRM it's gone (aria-expanded → false) before returning. The
-// portaled option list OVERLAPS the next field, so a lingering list lets the NEXT field's open-click
-// land on a stale option — the live degree→"Associates" stray (the Field-of-Study box sits exactly
-// over the degree list's "Associates"). pressEscape alone fires-and-returns, racing the close at
-// fast (M39) pacing; here we poll readDropdownState until closed, re-Escaping each round (real-time
-// delayFull — the listbox closes at the page's pace), bounded by iterations so a stuck list can't
-// spin. Returns true iff confirmed closed. Used by the tier-aware KEEP path (which opens the list to
-// check for a higher tier) and the genuine-no-match path — both opened the list, both must close it.
+// Close an OPENED dropdown and CONFIRM the portaled option LIST IS GONE before returning. The list
+// OVERLAPS the next field, so a lingering list lets the NEXT field's open-click land on a stale option
+// — the live degree→"Associates" / "Landline → Phone Device Type" cross-field stray (the next field
+// sits exactly where a stale option rendered). GATE ON THE LISTBOX BEING GONE (`!listboxPresent ||
+// optionCount === 0`), NOT aria-expanded: aria flips to "false" the instant Escape/commit fires, but
+// the options linger a beat while they unmount and STAY CLICKABLE — returning on aria alone raced the
+// close at fast (M39) pacing (this branch's dropdowns-don't-close-instantly report; matches the
+// closeAndVerifyBlank listbox-gone gate). We poll readDropdownState until the options are gone,
+// re-Escaping each round (real-time delayFull — the listbox closes at the page's pace), bounded by
+// iterations so a stuck list can't spin. Returns true iff confirmed gone. Used by the successful
+// COMMIT path, the commit-failed path, the tier-aware KEEP path, and the genuine-no-match path — every
+// path that opened the list must confirm it's gone before the next field.
 async function closeDropdownConfirmed(act, loc, budgets) {
+  const stillOpen = (s) => !!(s && s.listboxPresent && s.optionCount > 0); // clickable options still mounted
   const maxTries = (budgets.openRetries || 3) + 1;
   let st = await act.readDropdownState(loc);
-  for (let i = 0; i < maxTries && st && st.ariaExpanded === "true"; i++) {
+  for (let i = 0; i < maxTries && stillOpen(st); i++) {
     await act.pressEscape();
     await act.delayFull(budgets.commitIntervalMs);
     st = await act.readDropdownState(loc);
   }
-  return !(st && st.ariaExpanded === "true");
+  return !stillOpen(st);
 }
 
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
@@ -1229,11 +1234,15 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     }
   }
   if (res.ok) {
+    // Don't return `filled` until the option LIST has UNMOUNTED — the commit closes it but a beat later,
+    // and its options stay clickable meanwhile; returning early lets the next field's open-click stray onto
+    // a lingering option (gate on options-gone, not aria — this branch's close-race report).
+    await closeDropdownConfirmed(act, loc, budgets);
     const out = { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };
     if (preTierIndex > 0) { out.flag = "dropdown-overwrite-success"; out.detail = `overwrote pre-fill "${before}" → "${res.after}" (higher-priority tier); text-click-commit${idxCanary}`; }
     return out;
   }
-  await act.pressEscape();
+  await closeDropdownConfirmed(act, loc, budgets); // confirm the list is gone (not just aria) before the next field, even on a failed commit
   return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")`, after: res.after, options: enabledTexts, matchTier: m.matchTier };
 };
 
@@ -4664,5 +4673,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
