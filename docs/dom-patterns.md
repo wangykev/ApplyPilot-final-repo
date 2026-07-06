@@ -2135,3 +2135,31 @@ VISIBLY opened a full country-code list. Two stacked facts, both now handled in 
   (NOT `role=option`), matching the hierarchical-typeahead model (`cdpReadHierState`); FoS's are `role=option`.
   `cdpScrapeTaOptions` now tries `role=option` first, falls back to `promptOption`, picking whichever finds
   non-chip leaves (returns `roleCount`/`promptCount`/`usedSel` in the `[CDP-SCRAPE-TA]` log for future triage).
+
+## 2026-07-06 — dup-language recon: a repeating-dropdown commit can MIS-CLICK a neighbor (coordinate click on a stale rect)
+
+Live on a Magna walk: `language[0].language` (profile English) came back `needs_review` "commit failed for
+\"English\" (trigger shows \"Chinese\")", and `language[1]` was Chinese → Workday flagged a DUPLICATE language
+and AI-4 Tier-0 deleted one. The read-back CAUGHT it (flagged, not silent — the safety contract held), but
+the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdownOptionRectByText` +
+`clickDropdownOptionByText`, cdp.js):
+
+- **Vector A (the likely cause) — the option COMMIT is a coordinate click on a rect captured in a SEPARATE
+  round-trip.** `cdpDropdownOptionRectByText` scrolls the matched option into view and returns its center
+  `(cx,cy)`; `clickDropdownOptionByText` then issues a separate `cdpClickAt(cx,cy)`. Nothing re-verified the
+  option was STILL at those coords. A still-settling / virtualizing portaled listbox shifts the row between
+  the two round-trips, so the click for "English" lands on a NEIGHBOR ("Chinese" is a few rows away in an
+  alphabetical language list). Intermittent, and AGGRAVATED by the fast-timer `delayRender` (shorter settle).
+  FIX: `cdpDropdownOptionRectByText` now reports `hitTarget` = `document.elementFromPoint(cx,cy).closest('[role=option]') === el`; `clickDropdownOptionByText` RE-CAPTURES (≤4×, ~80ms apart) until the target is
+  confirmed in place before clicking (mirrors the source-drill's `elementFromPoint` validation). The
+  commit-persistence re-read remains the backstop.
+- **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
+  aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
+  across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The
+  portaled listbox lives outside the entry subtree, so a `closest()` owner-check is unreliable; instead the
+  commit now logs `collisions` (count of elements sharing the id) — `[CDP-DD-COMMIT] ⚠ aria-controls id
+  collides…` — so the next occurrence confirms or rules out cross-entry routing. (Per-field ids ARE distinct —
+  M14.1 `ctny0/1/2` — but per-ENTRY uniqueness for the same repeating field is still to be confirmed live.)
+- **AI-4 dup-language dedups on the OBSERVED `.after`** (`lib.js` `languageEntriesFromResults`/`languageDeletionPlan`),
+  so two-Chinese (one mis-filled) reads as a "real" duplicate → it deletes an entry and MASKS the mis-commit.
+  It's a safety net, not a diagnosis — the real fix is preventing the mis-click above.

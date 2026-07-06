@@ -1516,13 +1516,27 @@ function cdpDropdownOptionRectByText(wrapperSel, text) {
   const id = trigger.getAttribute("aria-controls");
   const lb = id ? document.getElementById(id) : null;
   if (!lb) return null;
+  // Vector-B diagnostic (dup-language recon 2026-07-06): if the aria-controls id COLLIDES across repeating
+  // entries, getElementById(id) returns the FIRST in DOM — possibly the WRONG entry's listbox. collisions>1
+  // flags that risk (the portaled listbox lives outside the entry subtree, so a closest()-based owner check
+  // is unreliable — the count is the honest signal).
+  let collisions = 0; try { collisions = id ? document.querySelectorAll('[id="' + id + '"]').length : 0; } catch (e) { collisions = -1; }
   const el = Array.from(lb.querySelectorAll('[role="option"]'))
     .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
   if (!el) return null;
   if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
   const r = el.getBoundingClientRect();
-  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
-           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
+  // Vector-A guard (dup-language mis-commit): a still-settling/virtualizing list can SHIFT the row between
+  // this rect read and the caller's separate coordinate click, landing it on a NEIGHBOR (the live "English"
+  // click that committed "Chinese"). Report whether the target option is ACTUALLY at (cx,cy) via
+  // elementFromPoint so the caller only clicks a CONFIRMED-in-place target (else re-captures).
+  const atEl = document.elementFromPoint(cx, cy);
+  const atOpt = atEl && atEl.closest ? atEl.closest('[role="option"]') : null;
+  const hitTarget = atOpt === el;
+  const atPointText = atOpt ? (atOpt.textContent || "").trim() : (atEl ? (atEl.textContent || "").trim().slice(0, 40) : null);
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx, cy,
+           hitTarget, atPointText, collisions };
 }
 
 function cdpReadRadioState(wrapperSel) {
@@ -2423,7 +2437,21 @@ function makeCdpActuation(llmConfig) {
     // no scrape-order index assumption). A null/zero rect (text not resolvable) →
     // false; a missed click dismisses harmlessly and the trigger-text gate verifies.
     clickDropdownOptionByText: async (loc, text) => {
-      const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
+      // RE-CAPTURE until the target option is CONFIRMED at the click coords (elementFromPoint == target),
+      // so a still-settling/virtualizing list that shifts the row between the rect read and the coordinate
+      // click can't land the click on a NEIGHBOR — the dup-language "English"→"Chinese" mis-commit (recon
+      // 2026-07-06; aggravated by the fast-timer delayRender). Bounded (4×, ~80ms between); if it never
+      // stabilizes we click the last rect anyway (the commit-persistence re-read still refuses a wrong value
+      // → needs_review, never silent). Logs the Vector-B signal (aria-controls collisions across entries).
+      let rect = null;
+      for (let i = 0; i < 4; i++) {
+        rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
+        if (!rect || rect.w <= 0) return false;
+        if (rect.collisions > 1) console.log("[ApplyPilot][CDP-DD-COMMIT] ⚠ aria-controls id collides across " + rect.collisions + " elements — the option click may route to the WRONG entry's listbox (" + loc.wrapperSel + ")");
+        if (rect.hitTarget) break;
+        console.log('[ApplyPilot][CDP-DD-COMMIT] "' + text + '" not at its own coords (at-point="' + rect.atPointText + '") — list still settling, re-capturing (' + (i + 1) + '/4)');
+        await cdpDelay(80);
+      }
       if (!rect || rect.w <= 0) return false;
       await cdpClickAt(rect.cx, rect.cy);
       return true;
