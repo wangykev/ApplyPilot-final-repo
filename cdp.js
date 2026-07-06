@@ -1720,6 +1720,11 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // back to the ~1s throttled setTimeout — slow, but always enough time for the mount.
   const settleWindow = async () => { let last = -1; for (let i = 0; i < 16; i++) { await frame(); const n = curOpts().length; if (n === last) return; last = n; } };
   const sc = findScroller();
+  // A programmatic scrollTop change does NOT drive a react virtualizer's row re-render on a HIDDEN tab
+  // (diag 2026-07-05: scrollTop climbed 0→1772 over sh:1984 but the mounted set stayed a FROZEN 17 rows,
+  // never swapping in the rest → the FoS list truncated to the on-open window). Fire an explicit 'scroll'
+  // event after each set so the virtualizer's scroll listener runs and mounts the new window even hidden.
+  const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
   collect();
   const initialMounted = curOpts().length; // rows present on open, before any scroll (DIAG)
   const trace = [];                          // per-step {t:scrollTop, m:mounted-now, s:total-seen} (DIAG)
@@ -1728,12 +1733,12 @@ async function cdpScrapeTaOptions(wrapperSel) {
   if (sc) {
     // OVERLAPPING scroll (~0.8 window) so a row straddling two windows is never skipped between mounts.
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    sc.scrollTop = 0; await settleWindow(); collect();
+    doScroll(0); await settleWindow(); collect();
     trace.push({ t: Math.round(sc.scrollTop), m: curOpts().length, s: seen.size });
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
+      doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
       await settleWindow();
       collect();
       steps++;
@@ -1795,6 +1800,10 @@ async function cdpScrapeSourceRows(wrapperSel, debug) {
   const seen = new Map(); // label → order (first-seen, de-dupe within ONE view)
   const collect = () => { for (const o of curOpts()) { const t = leafLabel(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
+  // Fire an explicit 'scroll' after each set — a programmatic scrollTop does NOT drive the virtualizer's
+  // row re-render on a HIDDEN tab (the FoS-scrape diag: mounted set stayed frozen while scrollTop climbed),
+  // so without this the enumeration truncates to the on-open window. Same fix as cdpScrapeTaOptions.
+  const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
   let steps = 0, stable = 0, atBottom = false;
   const MAX_STEPS = 60;
   collect();
@@ -1802,18 +1811,18 @@ async function cdpScrapeSourceRows(wrapperSel, debug) {
     // OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window (overlap,
     // no row skipped). Pacing is via settleWindow (mount-gated; +120ms/poll only in debug; hidden-safe).
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    sc.scrollTop = 0; await settleWindow(); collect();
+    doScroll(0); await settleWindow(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
+      doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
       await settleWindow(); collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
       if (seen.size === before && (atBottom || movedNothing)) { if (++stable >= 2) break; } else stable = 0;
     }
-    sc.scrollTop = 0; await frame(); // back to top so early rows are mounted for a subsequent category click
+    doScroll(0); await frame(); // back to top so early rows are mounted for a subsequent category click
   }
   // banner = the current promptTitle text (drill-confirmation: the clicked category name once drilled).
   let banner = "";
