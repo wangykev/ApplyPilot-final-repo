@@ -1175,7 +1175,21 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   // is unaffected — this is a targeted commit-reliability wait for pre-filled dropdowns only (rare on a fresh
   // form). Net FASTER on the failing case: it commits instead of two ~10s fail-poll+retry cycles.
   const isOverwrite = !!before && norm(before) !== norm(target) && enabledTexts.some((t) => norm(t) === norm(before));
-  if (isOverwrite && act.delayFull) await act.delayFull(budgets.settleIntervalMs * 2); // ~700ms interactive settle (matches the slow path's option-settle duration)
+  if (isOverwrite && act.delayFull) {
+    // TEMP RECON (2026-07-06): keep the working ~700ms interactive settle, but SAMPLE the dropdown's readiness
+    // signals across it (opacity/visibility/pointer-events/transition/aria-activedescendant/selected/rect) so
+    // we can find what flips when the just-opened list becomes CLICKABLE → make the wait adaptive-by-polling.
+    // Still waits ~700ms total, then commits as before. `before→target` labels each sample. Remove after.
+    if (act.sampleDropdownReadiness) {
+      for (let t = 0; t <= 700; t += 100) {
+        let s = null; try { s = await act.sampleDropdownReadiness(loc); } catch (e) {}
+        console.log(`[ApplyPilot][DD-READY] ${before}→${target} t=${t}ms ${JSON.stringify(s)}`);
+        await act.delayFull(100);
+      }
+    } else {
+      await act.delayFull(budgets.settleIntervalMs * 2);
+    }
+  }
 
   let res = await commitByClick(act.clickDropdownOptionByText);
   if (!res.ok) {
