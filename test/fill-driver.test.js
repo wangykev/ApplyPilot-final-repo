@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5673,4 +5673,108 @@ test("dropdown tier-keep: a slow-closing list is RE-ESCAPED until closed (not a 
   const escapes = act.log.filter(([m]) => m === "pressEscape").length;
   assert.ok(escapes >= 2, `re-escaped a slow-closing list (saw ${escapes})`);
   assert.strictEqual(out.results[0].after, "United States of America", "value intact (escapeWontClose doesn't change it)");
+});
+
+// ── M3: repeating-field replay — bundle→items reconstruction ─────────────────
+// coerceReplayValue reverses the bundle's DISPLAY value into fillEntryCdp's item[key] shape;
+// bundleToSectionItems rebuilds a section's profile-shaped items (grouped/re-indexed, path→key,
+// dates re-parsed, nested + Feature-B added entries) to feed driveRepeatingSectionCdp.
+
+test("coerceReplayValue: dates reversed to the parsed shape; checkbox→bool; text passthrough; null→null", () => {
+  assert.deepStrictEqual(coerceReplayValue("6/15/2024", "date"), { month: "6", day: "15", year: "2024" });
+  assert.deepStrictEqual(coerceReplayValue("5/2025", "date"), { month: "5", year: "2025" });
+  assert.strictEqual(coerceReplayValue("2024", "date"), "2024");        // single segment (year) → string
+  assert.strictEqual(coerceReplayValue("2024", "year"), "2024");
+  assert.strictEqual(coerceReplayValue("true", "checkbox"), true);
+  assert.strictEqual(coerceReplayValue("false", "checkbox"), false);
+  assert.strictEqual(coerceReplayValue("Software Engineer", "text"), "Software Engineer");
+  assert.strictEqual(coerceReplayValue(null, "text"), null);
+  assert.strictEqual(coerceReplayValue("", "dropdown"), null);
+});
+
+const weSection = () => PAGE_SECTIONS.find((s) => s.name === "workExperience");
+const certSection = () => PAGE_SECTIONS.find((s) => s.name === "certification");
+const bent = (cf, val, extra) => Object.assign({ canonical_field: cf, current_value: val, widget_type: "text" }, extra || {});
+
+test("bundleToSectionItems (WE): path→key mapping, date reparse, checkbox bool, multi-entry", () => {
+  const items = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Engineer"),
+    bent("workExperience[0].company", "Acme"),
+    bent("workExperience[0].currently_work_here", "true"),
+    bent("workExperience[0].from", "5/2025"),
+    bent("workExperience[0].role_description", "Built things"),
+    bent("workExperience[1].job_title", "Intern")
+  ], weSection());
+  assert.strictEqual(items.length, 2);
+  assert.deepStrictEqual(items[0], { job_title: "Engineer", company: "Acme", currently_work_here: true, fromParsed: { month: "5", year: "2025" }, bulletsText: "Built things" });
+  assert.deepStrictEqual(items[1], { job_title: "Intern" });
+});
+
+test("bundleToSectionItems: drops soft-deleted entries and re-indexes the survivors 0..M-1", () => {
+  const items = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Deleted", { is_deleted: true }),
+    bent("workExperience[1].job_title", "Kept")
+  ], weSection());
+  assert.strictEqual(items.length, 1, "the deleted entry is dropped");
+  assert.deepStrictEqual(items[0], { job_title: "Kept" }, "survivor re-indexed to 0");
+});
+
+test("bundleToSectionItems: Feature-B added entry (higher index) is INCLUDED", () => {
+  const items = bundleToSectionItems([
+    bent("workExperience[0].job_title", "First"),
+    bent("workExperience[2].job_title", "Added", { is_added: true, flag: "added-entry" })
+  ], weSection());
+  assert.strictEqual(items.length, 2, "added entry included → replay must CREATE it");
+  assert.deepStrictEqual(items.map((i) => i.job_title), ["First", "Added"]);
+});
+
+test("bundleToSectionItems (cert nested): reconstructs item.specialties[j] with key mapping + date reparse", () => {
+  const items = bundleToSectionItems([
+    bent("certification[0].certification", "CPP", { widget_type: "typeahead" }),
+    bent("certification[0].specialties[0].specialtyParent", "Safety", { widget_type: "typeahead" }),
+    bent("certification[0].specialties[0].startDate", "6/15/2024", { widget_type: "date" })
+  ], certSection());
+  assert.strictEqual(items.length, 1);
+  assert.strictEqual(items[0].certification, "CPP");
+  assert.deepStrictEqual(items[0].specialties, [{ specialty: "Safety", startDateParsed: { month: "6", day: "15", year: "2024" } }]);
+});
+
+// ── M3: replayRepeatingSections orchestrator ─────────────────────────────────
+// Feeds bundleToSectionItems into driveRepeatingSectionCdp (strict: deleteOnNoMatch:false,
+// aiContext:null) for each present section that has approved bundle entries.
+
+test("replayRepeatingSections: replays a present section's entries from the approved bundle", async () => {
+  const state = webState({ entries: [webEntry("webAddress-0--null", ""), webEntry("webAddress-1--null", "")] });
+  const act = makeFakeRepeatAct(state);
+  const entries = [
+    { canonical_field: "website[0].url", current_value: "https://a.example", widget_type: "text" },
+    { canonical_field: "website[1].url", current_value: "https://b.example", widget_type: "text" }
+  ];
+  const results = await replayRepeatingSections(act, entries, T_BUDGETS);
+  const r0 = results.find((r) => r.fieldName === "website[0].url");
+  const r1 = results.find((r) => r.fieldName === "website[1].url");
+  assert.strictEqual(r0 && r0.after, "https://a.example");
+  assert.strictEqual(r1 && r1.after, "https://b.example");
+});
+
+test("replayRepeatingSections: skips a present section that has NO approved bundle entries (untouched)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-0--null", "")] }); // website present on the page
+  const act = makeFakeRepeatAct(state);
+  const entries = [{ canonical_field: "personal_info.first_name", current_value: "Ada", widget_type: "text" }]; // no website[*]
+  const results = await replayRepeatingSections(act, entries, T_BUDGETS);
+  assert.strictEqual(results.length, 0, "no approved website entries → section untouched");
+  assert.ok(!act.log.some(([m]) => m === "clickSectionAdd"), "no reconcile on an empty-bundle section");
+});
+
+test("replayRepeatingSections: CREATES a Feature-B added entry (reconciles UP) and fills it", async () => {
+  const state = webState({ entries: [webEntry("webAddress-0--null", "")] }); // live form starts with 1 entry
+  const act = makeFakeRepeatAct(state);
+  const entries = [
+    { canonical_field: "website[0].url", current_value: "https://a.example", widget_type: "text" },
+    { canonical_field: "website[1].url", current_value: "https://added.example", widget_type: "text", is_added: true, flag: "added-entry" }
+  ];
+  const results = await replayRepeatingSections(act, entries, T_BUDGETS);
+  assert.strictEqual(state.entries.length, 2, "reconciled UP to include the added entry");
+  assert.ok(act.log.some(([m]) => m === "clickSectionAdd"), "created the added entry");
+  assert.ok(results.some((r) => r.fieldName === "website[1].url" && r.after === "https://added.example"), "filled the added entry");
 });

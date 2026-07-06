@@ -3783,6 +3783,7 @@ async function replayField(act, entry, budgets) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const widget = entry && entry.widget_type;
   if (!entry || !widget || widget === "section") return { status: "skipped", detail: "no widget / section op (not replayable)" };
+  if (widget === "section_stub" || widget === "nested_section_stub") return { status: "skipped", flag: "replay-stub-skip", detail: "section stub — a display-only add-entry card, not a fillable field" };
   if (entry.is_deleted) return { status: "skipped", flag: "replay-deleted", detail: "deleted entry — dropped by the section reconcile, not replayed" };
   if (isRepeatingEntry(entry)) return { status: "skipped", flag: "replay-repeating-deferred", detail: "repeating-section field — replayed positionally by the section reconcile (M3), not by a recorded selector" };
   if (widget === "file_upload") return { status: "skipped", flag: "replay-file-deferred", detail: "résumé re-attach handled by the SW attachResumeForPage step, not replayField" };
@@ -3835,6 +3836,112 @@ async function replayFlatFields(act, entries, presentFieldNames, budgets) {
     const r = await replayField(act, entry, b);
     results.push(Object.assign({ field: fname, widgetType: entry.widget_type }, r));
     await act.delay(b.interFieldMs);
+  }
+  return results;
+}
+
+// ── M3 (strict-replay SUBMIT — repeating sections) ───────────────────────────
+// coerceReplayValue: turn a bundle entry's DISPLAY current_value back into the profile-shaped
+// value fillEntryCdp expects at item[f.key]. Dates are the only real transform — the bundle stores
+// the rendered string ("6/15/2024", "5/2025", "2024") but fillDateCompositeCdp wants the SW-parsed
+// shape: a "YYYY" STRING for a year-only field, or {month,day?,year} for an M/Y or M/D/Y date
+// (auditDateSegments does the same split the audit uses). Checkbox → boolean. Everything else
+// (text/textarea/dropdown/typeahead) passes through verbatim → resolve() makes it a single candidate
+// through the match ladder (strict — the approved value or needs_review, never a guess).
+function coerceReplayValue(currentValue, widget) {
+  if (currentValue == null || currentValue === "") return null;
+  if (widget === "checkbox") return currentValue === true || /^(true|yes)$/i.test(String(currentValue));
+  if (widget === "year") return String(currentValue);                 // fillDateCompositeCdp accepts a "YYYY" string
+  if (widget === "date") {
+    const segs = auditDateSegments(currentValue);                     // [["Month","6"],["Day","15"],["Year","2024"]] etc.
+    if (segs.length === 1) return String(segs[0][1]);                 // year-only → the year string
+    const o = {}; for (const [k, v] of segs) o[k.toLowerCase()] = v; // {month, day?, year}
+    return o;
+  }
+  return currentValue;                                                // text / textarea / dropdown / typeahead
+}
+
+// bundleToSectionItems: reconstruct the profile-shaped `items` array for ONE known PAGE_SECTION from
+// the approved bundle, so the strict replay can feed driveRepeatingSectionCdp (reconcile-to-N +
+// entry-scoped fill). Groups the section's entries by index (canonical `<name>[i].…`), DROPS
+// soft-deleted entries, re-indexes 0..M-1 (INCLUDING Feature-B added entries — same canonical
+// shape), maps each field's canonical `path` → the fieldMap `key` (via coerceReplayValue), and
+// reconstructs nested sub-sections (cert ▸ specialties → item[itemsKey][j]). A field with no
+// fieldMap entry or no value is omitted → fillEntryCdp skips it (a cleared/blank field stays blank,
+// correct on a fresh form). Pure + unit-testable. Unknown/generic sections (no fieldMap) are NOT
+// handled here — they're the caller's deferral.
+function bundleToSectionItems(entries, section) {
+  const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp("^" + esc(section.name) + "\\[(\\d+)\\]\\.(.+)$");
+  const nestedRe = /^([A-Za-z_]+)\[(\d+)\]\.(.+)$/;
+  const pathToFm = {}; for (const m of (section.fieldMap || [])) pathToFm[m.path] = m;
+  const byIdx = new Map(); const order = [];
+  for (const e of (entries || [])) {
+    if (!e || e.is_deleted) continue;
+    const m = String(e.canonical_field || "").match(re);
+    if (!m) continue;
+    const i = +m[1], rest = m[2];
+    if (!byIdx.has(i)) { byIdx.set(i, { flat: {}, nested: {} }); order.push(i); }
+    const bucket = byIdx.get(i);
+    const nm = rest.match(nestedRe);
+    if (nm && section.nested) {                                       // nested: "childBase[j].childPath"
+      const sub = (section.nested.subSections || []).find((s) => s.childBase === nm[1]);
+      const cfm = sub && (sub.fieldMap || []).find((x) => x.path === nm[3]);
+      if (!cfm) continue;
+      const v = coerceReplayValue(e.current_value, cfm.widget); if (v == null) continue;
+      bucket.nested[nm[1]] = bucket.nested[nm[1]] || new Map();
+      const j = +nm[2]; if (!bucket.nested[nm[1]].has(j)) bucket.nested[nm[1]].set(j, {});
+      bucket.nested[nm[1]].get(j)[cfm.key] = v;
+    } else {                                                          // flat entry field: "<path>"
+      const fm = pathToFm[rest]; if (!fm) continue;
+      const v = coerceReplayValue(e.current_value, fm.widget); if (v == null) continue;
+      bucket.flat[fm.key] = v;
+    }
+  }
+  order.sort((a, b) => a - b);                                        // positional: original index order, re-indexed on output
+  return order.map((i) => {
+    const bucket = byIdx.get(i);
+    const item = Object.assign({}, bucket.flat);
+    for (const childBase of Object.keys(bucket.nested)) {
+      const sub = section.nested.subSections.find((s) => s.childBase === childBase);
+      const js = [...bucket.nested[childBase].keys()].sort((a, b) => a - b);
+      item[sub.itemsKey] = js.map((j) => bucket.nested[childBase].get(j));
+    }
+    return item;
+  });
+}
+
+// replayRepeatingSections: the repeating-section counterpart to replayFlatFields. For each KNOWN
+// PAGE_SECTION present on the live page that has approved bundle entries, reconstruct its items
+// (bundleToSectionItems) and re-fill via the SAME driveRepeatingSectionCdp — but STRICT:
+//   • deleteOnNoMatch:false — never drop an approved entry on a transient no-match (keep + flag).
+//   • aiContext:null        — no AI; the human already approved the value.
+// driveRepeatingSectionCdp reconciles the live count to the bundle's kept-entry count (CREATING
+// Feature-B added entries) and fills each entry positionally + nested (cert specialties) via the
+// proven per-widget handlers — a single approved candidate through the match ladder (a live
+// no-match → needs_review, never a guess). A section with no approved entries is skipped (the
+// emptied-section reconcile-to-0 case is a follow-on). UNKNOWN/generic sections (no fieldMap) are
+// deferred. NO Next/Submit — the caller stays in control. Returns the per-field/section records.
+async function replayRepeatingSections(act, entries, budgets) {
+  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
+  const results = [];
+  let rscan = null;
+  try { rscan = await act.repeatingScan(); } catch (e) { return results; } // no repeating substrate → nothing to replay
+  if (!rscan || !(rscan.sections || rscan.addButtons)) return results;
+  for (const sec of PAGE_SECTIONS) {
+    const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
+    const re = new RegExp(sec.headingRegex, "i");
+    const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((bt) => re.test((bt && bt.nearestHeading) || ""));
+    if (!hasContainer && !hasAdd) continue;                            // section not on this page
+    const items = bundleToSectionItems(entries, sec);
+    if (!items.length) continue;                                       // no approved entries to replay
+    const out = await driveRepeatingSectionCdp(act, {
+      name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
+      items, fieldMap: sec.fieldMap, nested: sec.nested,
+      deleteOnNoMatch: false, // strict: keep + flag an approved entry that won't match, never delete
+      aiContext: null         // strict: no AI — the human approved the value
+    }, b);
+    if (out && Array.isArray(out.results)) results.push(...out.results);
   }
   return results;
 }
@@ -4402,5 +4509,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
