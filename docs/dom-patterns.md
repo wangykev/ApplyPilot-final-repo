@@ -2170,15 +2170,12 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   (all-`delayFull`) path commits BOTH languages correctly on the first coordinate click (`text-click-commit`).
   So committing a dropdown RE-SELECTION needs the just-opened dropdown to be INTERACTIVE before the click, and
   fast pacing (~70ms option-settle) clicks before it is — the click lands (hitTarget=true) but doesn't fire
-  the selection, so it never commits. **FIX (adaptive — no fixed sleep):** `commitByClick` RE-CLICKS the
-  target while the dropdown is still OPEN + uncommitted (throttled to ~200ms), inside the existing
-  commit-persistence poll. The click commits the instant the dropdown becomes interactive, so we wait ONLY
-  as long as THIS dropdown needs — a fast/empty dropdown commits on the FIRST click (the re-click branch
-  never runs, zero added cost), and a racing overwrite re-clicks a few times until it takes. (An earlier fix
-  used a fixed `delayFull(~700ms)` pre-click beat for overwrites — it worked but waited a hardcoded amount
-  every time; the re-click is adaptive and superseded it.) The commit-persistence re-read still gates
-  acceptance (never a false fill). Proficiency dropdowns fill fine hidden because they're EMPTY (not
-  overwrites). (The element-dispatch retry is moot — the primary commits — but left as a harmless fallback.)
+  the selection, so it never commits. **FIX:** for an OVERWRITE (`before` is a real enabled option ≠ target),
+  `fillDropdownCdp` inserts a NON-ADAPTIVE `act.delayFull(~700ms)` before the commit click (replicates the
+  slow path's option-settle duration). EMPTY fills (`before` = the disabled placeholder, not an enabled
+  option) don't race → stay fast, no beat. Net FASTER on the failing case (commits instead of burning two
+  ~10s fail-poll+retry cycles). Proficiency dropdowns fill fine hidden because they're EMPTY (not overwrites).
+  (The element-dispatch retry is now moot — the primary commits — but left as a harmless fallback.)
 - **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
   aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
   across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The
