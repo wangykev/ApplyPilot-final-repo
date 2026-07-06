@@ -127,3 +127,28 @@ exclude chips before choosing the selector, and frame-poll until real non-chip l
 (role=option → promptOption fallback; returns roleCount/promptCount/usedSel for triage). FoS resolves at
 frame 0 (unchanged). **LIVE-VERIFIED on Magna** — countryPhoneCode now shows a searchable option list in the
 summary. Unit suite green (465 on the branch; 482 on merged main). Merged to main.
+
+## 2026-07-06 — Required-radio AI fallback (`aiFillRadio`) — the deferred milestone, BUILT (live-verify pending)
+
+A REQUIRED radio the deterministic pass can't answer was left BLANK, which BLOCKS Save & Continue (and halts
+the walk). Reported live: `candidateIsPreviousWorker` on Magna with no `jobContext.company` set → `decidePreviousWorker`
+"unevaluable" → blank + review. Built the deferred required-radio AI fallback, mirroring the dropdown AI-1
+(`aiFillField`) exactly:
+
+- **`aiFillRadio` (fill-driver.js)**: read the live radio labels → LLM infers the best option from the profile
+  → the pick must clear the match ladder vs the live labels (never blind-commit) → commit via the proven
+  `fillRadioCdp` (label-click → focus+Space → read-back verify) → ALWAYS `filled_review`, never silently trusted.
+- **Dispatch**: a dedicated post-pass in `drivePageFill` (NOT via `aiEligible`, which stays radio→false — mirrors
+  the typeahead pass), gated `act.aiEnabled && f.isRequired && widgetType==="radio" && record.resolved == null &&
+  status not filled/filled_review`. The `resolved == null` gate is the load-bearing SAFETY: a decision the
+  deterministic pass already made but failed to commit (e.g. a matched employer "Yes") is NEVER overridden by a
+  contradictory guess — it stays review-flagged.
+- **Flagging**: `candidateIsPreviousWorker` is force-flagged `ai-choice-sensitive` (LEGALLY-LOADED badge — it sits
+  next to a truthfulness certification; a wrong "Yes" is a false statement); a low-confidence guess auto-escalates
+  to super-hard in the viewer. A demographic radio → `ai-eeo-guess` (re-tagged at the call site). The
+  truthfulness-cert invariant holds under AI: a "Yes" is ALWAYS `filled_review`, never plain `filled`.
+- **Optional / AI-OFF**: never fires (a blank optional radio doesn't block; unit-pinned).
+
+8 new unit tests (473 total, green on the branch). `aiEligible` unchanged (radio still excluded there — the AI
+runs through the separate pass). CLAUDE.md updated (AI safety/eligibility bullet + open-items). **HARD GATE per
+CLAUDE.md: live-verify eyes-on, on a DISPOSABLE application — this changes a truthfulness-cert-adjacent field.**
