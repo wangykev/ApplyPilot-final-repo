@@ -245,6 +245,7 @@ async function cdpEval(fn, ...args) {
 // focus) is a separate, newly-exercised surface — see runCdpFillPage / docs.
 const FAST_FACTOR = 0.1;    // fast delays = 1/10 the full delays (rapidfire; raise if a fast fill races — all adaptive sites are gated, so a race retries/flags, never a silent wrong fill)
 const FAST_FLOOR_MS = 10;   // …but never below this (a too-short wait races even full-speed)
+const TYPE_FAST_FLOOR_MS = 15; // per-KEYSTROKE floor (Stage B) — higher than FAST_FLOOR_MS so keystroke-driven listeners still arm the typeahead highlight when typing fast (see cdpTypeChars)
 const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amortize the chrome.tabs/windows round-trip)
 
 let _visCache = { visible: false, at: 0 };
@@ -472,13 +473,21 @@ const CDP_KEYS = {
 // Probe/profile strings are plain text; vk is best-effort for non-alphanumerics
 // (the `text` field is what produces the character).
 async function cdpTypeChars(text, perCharDelayMs = 40) {
+  // Per-char gap is ADAPTIVE (Stage B): fast (fg / worker-fast) → scale by FAST_FACTOR but keep the
+  // typing-specific TYPE_FAST_FLOOR_MS (> FAST_FLOOR_MS) so keystroke-driven listeners still arm the
+  // typeahead's first-option highlight (cdpTypeChars is the KEYSTROKE path chosen over insertText for
+  // exactly that — see typeInSearch). Slow path (hidden no-worker) keeps the full perCharDelayMs. Sampled
+  // ONCE (not per char — no per-keystroke round-trip). A too-fast type that misses is caught downstream
+  // (chip/value read-back → needs_review), never a silent wrong fill.
+  const fast = await cdpFast();
+  const gap = fast ? Math.max(TYPE_FAST_FLOOR_MS, Math.round(perCharDelayMs * FAST_FACTOR)) : perCharDelayMs;
   for (const ch of String(text)) {
     const isLetter = /^[a-z]$/i.test(ch);
     const isDigit = /^[0-9]$/.test(ch);
     const code = isLetter ? "Key" + ch.toUpperCase() : isDigit ? "Digit" + ch : ch === " " ? "Space" : "";
     const vk = isLetter || isDigit ? ch.toUpperCase().charCodeAt(0) : ch === " " ? 32 : 0;
     await cdpKeyTap({ key: ch, code, vk, text: ch });
-    await cdpDelay(perCharDelayMs);
+    await cdpDelay(gap);
   }
 }
 
@@ -486,7 +495,7 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
 // then Delete. Trusted key path so React sees a real edit, unlike a "" setter.
 async function cdpSelectAllDelete() {
   await cdpKeyTap({ key: "a", code: "KeyA", vk: 65, modifiers: 2 });
-  await cdpDelay(60);
+  await cdpAdaptiveDelay(60); // adaptive (Stage B): fast fg/worker-fast, full on the slow path; a stale-text race is caught by the caller's post-clear read-back
   await cdpKeyTap(CDP_KEYS.delete);
 }
 
@@ -2327,7 +2336,7 @@ function makeCdpActuation(llmConfig) {
         const rect = await cdpEval(cdpRectOf, sel, true);
         if (rect && rect.w > 0) {
           await cdpClickAt(rect.cx, rect.cy);
-          await cdpDelay(250);
+          await cdpAdaptiveDelay(250); // focus settle — adaptive (Stage B); gated by the .focused read below (a too-short settle just costs one ladder retry, never a wrong fill)
           const s = await cdpEval(cdpReadTextState, loc.wrapperSel, tag);
           if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(sel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (cdp-click)`); return "cdp-click"; }
         }
@@ -2538,12 +2547,22 @@ function makeCdpActuation(llmConfig) {
         const rect = await cdpEval(cdpRectOf, loc.wrapperSel + part, true);
         if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); break; }
       }
-      await cdpDelay(700); // let the portaled list render (non-adaptive — the page's own render)
-      const dump = await cdpEval(cdpReadSourceState, loc.wrapperSel);
-      const rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
+      // GATED render wait (Stage B — was a blind 700ms). Poll until the portaled list has MOUNTED (any
+      // rows present), THEN classify — fast when it renders fast (the common case; FoS mounts ~immediately),
+      // but never reads an EMPTY list (which would misclassify a tree as flat). Raw ceiling so a genuinely
+      // slow render still resolves; a still-empty list at the ceiling = no options on open (search-only) →
+      // treated flat, same conclusion the old blind read reached. Read-only (no type/Enter/arrow/click).
+      let dump = null, rows = [];
+      const treeDeadline = Date.now() + 1500; // raw bound (old blind wait was 700ms; give a slow mount room)
+      while (Date.now() < treeDeadline) {
+        await cdpAdaptiveDelay(120); // adaptive poll interval — tight when fast, full on the slow path
+        dump = await cdpEval(cdpReadSourceState, loc.wrapperSel);
+        rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
+        if (rows.length > 0) break;
+      }
       const isTree = rows.some((r) => r && r.isCategory);
       await cdpKeyTap(CDP_KEYS.tab); // clean non-committing close
-      await cdpDelay(200);
+      await cdpAdaptiveDelay(200);
       return isTree;
     },
 
@@ -2649,11 +2668,11 @@ function makeCdpActuation(llmConfig) {
       let attempt = 0;
       while (true) {
         const r = await cdpEval(cdpRectOf, displaySel, true);
-        if (r && r.w > 0) { await cdpTripleClickAt(r.cx, r.cy); await cdpDelay(200); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(displaySel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (triple-click-display)`); return "triple-click-display"; } }
-        if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (el.focus)`); return "el.focus()"; } }
-        try { await cdpDomFocus(inputSel); await cdpDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; } } catch (e) { /* not found */ }
+        if (r && r.w > 0) { await cdpTripleClickAt(r.cx, r.cy); await cdpAdaptiveDelay(200); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(displaySel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (triple-click-display)`); return "triple-click-display"; } }
+        if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpAdaptiveDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (el.focus)`); return "el.focus()"; } }
+        try { await cdpDomFocus(inputSel); await cdpAdaptiveDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; } } catch (e) { /* not found */ }
         if (Date.now() - start >= RECT_READY_CEILING_MS) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `gave up after ${Date.now() - start}ms / ${attempt} retries`); return null; }
-        await cdpDelay(RECT_READY_INTERVAL_MS);
+        await cdpAdaptiveDelay(RECT_READY_INTERVAL_MS); // focus-retry poll interval — adaptive (Stage B); gated by focused() re-check
         attempt++;
       }
     },
