@@ -34,8 +34,17 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source && source.tabId === cdpTabId) {
-    console.log("[ApplyPilot][CDP] chrome.debugger detached externally —", reason);
+    console.log("[ApplyPilot][CDP] chrome.debugger detached externally —", reason, "— tearing down the input-lock overlay.");
+    const tid = cdpTabId;
     cdpTabId = null;
+    inputLockActive = false;
+    // The native infobar "Cancel" detaches the debugger MID-RUN, which strands the "please don't click or
+    // type" input-lock overlay on the page: the run's finally → removeInputLock() goes through cdpEval,
+    // which now can't reach the (detached) page and silently no-ops. So tear the overlay down here via
+    // chrome.scripting (no debugger needed). cdpRemoveInputLock is self-contained + a no-op if never
+    // installed / the tab is gone. This is the "Cancel ⇒ detach + remove the lock banner" behavior.
+    try { chrome.scripting.executeScript({ target: { tabId: tid }, func: cdpRemoveInputLock }).catch(() => {}); }
+    catch (e) { /* tab gone / no scripting host — nothing to clean */ }
   }
 });
 
@@ -2632,6 +2641,31 @@ function makeCdpActuation(llmConfig) {
       if (reviewPresent) return { clicked: false, refused: "review-page" };
       const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
       if (!rect) return { clicked: false, refused: "no-button" };
+      // A popup/overlay (e.g. the Simplify extension's dialog, a cookie banner, a modal) can sit OVER the
+      // Save & Continue button. A coordinate click would land on the popup and be SWALLOWED — the page never
+      // advances and it surfaces as a bare nav-timeout. So elementFromPoint the button's center first: the
+      // top node there must BE the button (or in its subtree). If something else covers it, refuse with a
+      // diagnostic that NAMES the blocker instead of clicking blindly.
+      const cover = await cdpEval((cx, cy) => {
+        const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+        const top = document.elementFromPoint(cx, cy);
+        if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+        const desc = (el) => {
+          const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
+          if (el.id) p.push("#" + el.id);
+          const aid = el.getAttribute && el.getAttribute("data-automation-id");
+          if (aid) p.push('[data-automation-id="' + aid + '"]');
+          const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+          if (cls) p.push("." + cls);
+          const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+          return p.join("") + (txt ? ' "' + txt + '"' : "");
+        };
+        return { blocked: true, by: desc(top) };
+      }, rect.cx, rect.cy);
+      if (cover && cover.blocked) {
+        console.log("[ApplyPilot][CDP] Save & Continue is COVERED by an overlay/popup — NOT clicking. Blocked by:", cover.by);
+        return { clicked: false, refused: "blocked", blockedBy: cover.by };
+      }
       await cdpClickAt(rect.cx, rect.cy);
       return { clicked: true };
     },

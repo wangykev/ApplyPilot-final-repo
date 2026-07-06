@@ -156,3 +156,25 @@ the walk). Reported live: `candidateIsPreviousWorker` on Magna with no `jobConte
 8 new unit tests (473 total, green on the branch). `aiEligible` unchanged (radio still excluded there — the AI
 runs through the separate pass). CLAUDE.md updated (AI safety/eligibility bullet + open-items). **HARD GATE per
 CLAUDE.md: live-verify eyes-on, on a DISPOSABLE application — this changes a truthfulness-cert-adjacent field.**
+
+## 2026-07-06 — Detach-cleanup + blocking-popup detection on Save & Continue (operator UX)
+
+Two robustness fixes (CDP substrate; live-verify pending):
+
+- **External detach strands the input-lock overlay → onDetach cleanup.** The native `chrome.debugger` infobar's
+  "Cancel" detaches MID-RUN; the run's `finally → removeInputLock()` goes through `cdpEval`, which can't reach the
+  now-detached page, so the "⏳ ApplyPilot is filling this form — please don't click or type" overlay was left
+  STUCK. Fix: the `chrome.debugger.onDetach` listener (cdp.js) now tears the overlay down via
+  `chrome.scripting.executeScript(cdpRemoveInputLock)` (no debugger needed; self-contained; no-op if never
+  installed). So Cancel ⇒ detach **+ remove the lock banner**. NOTE the "started debugging" banner is Chrome's
+  NATIVE infobar — the extension can't add/intercept its X/Cancel; merely dismissing it (without detach) already
+  leaves the run running, so there's nothing to change there.
+- **Blocking popup over the Next button → detect + log, don't swallow.** `clickPageNext` did a coordinate click
+  at the button rect without checking what's on top; a popup/overlay (Simplify's dialog, a consent modal) would
+  swallow the click and surface as a bare nav-timeout. Fix: `elementFromPoint` the button's center first — if the
+  top node isn't the button (or its subtree), refuse `{clicked:false, refused:"blocked", blockedBy:<descriptor>}`
+  and log "Save & Continue is COVERED by an overlay/popup — Blocked by: <tag#id[data-automation-id].class \"text\">".
+  The walk halts `click-refused:blocked` with `blocked_by` in the result (self-explaining, not a generic error).
+
+Unit suite unaffected (490 green — these are substrate methods, not unit-tested). CLAUDE.md updated (input-lock
+bullet + the multi-page clickPageNext note).
