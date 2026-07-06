@@ -582,11 +582,16 @@ const openAndReadDropdown = async (act, loc, budgets) => {
 // strayed value) — Hold 2. The SOLE guard on the no-commit path (M40 never re-reads a blank field).
 const closeAndVerifyBlank = async (act, loc, before, budgets) => {
   const norm = apMatch.normalize;
+  const dr = act.delayRender || act.delayFull; // adaptive close-settle (fast fg/worker-fast; full on the slow path) — fallback for older fakes
   const blankNow = (s) => !!s && before != null && norm(s.triggerText) === norm(before);
   let s = null;
   for (let attempt = 1; attempt <= budgets.openRetries; attempt++) {
     await act.pressEscape();
-    await act.delayFull(budgets.reopenSettleMs);
+    // ADAPTIVE (2026-07-06): the close-settle is now the fast delayRender, not the never-scaled delayFull —
+    // this was the ~0.4s×N dead time BETWEEN recon fields (open/close are quick; this wait wasn't). Safe:
+    // the ariaExpanded read below GATES it — a too-short wait reads "still open" → the loop Escapes+waits
+    // again (up to openRetries), so the close is still confirmed; only the happy-path wall-clock shrinks.
+    await dr(budgets.reopenSettleMs);
     s = await act.readDropdownState(loc);
     if (s && s.ariaExpanded === "false") break; // closed — done (blank decided by the value)
     // still open (or unreadable) → Escape again, NEVER reopen; give the close real time
