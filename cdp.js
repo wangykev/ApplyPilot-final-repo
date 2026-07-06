@@ -34,10 +34,17 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source && source.tabId === cdpTabId) {
-    console.log("[ApplyPilot][CDP] chrome.debugger detached externally —", reason, "— tearing down the input-lock overlay.");
+    const operatorCancel = reason === "canceled_by_user"; // native infobar Cancel/X
+    console.log(operatorCancel
+      ? "[ApplyPilot][CDP] ⛔ OPERATOR CANCELLED mid-run — the debugger was detached (Cancel/X on the “started debugging” banner). The in-flight fill's CDP calls will now fail; THIS is the cause of any errors below. Tearing down the input-lock overlay."
+      : "[ApplyPilot][CDP] chrome.debugger detached externally — " + reason + " — the in-flight fill will error out. Tearing down the input-lock overlay.");
     const tid = cdpTabId;
     cdpTabId = null;
     inputLockActive = false;
+    // Persist the CAUSE so the aborted run's errors aren't mysterious: the popup + the summary page read
+    // `lastRunAbort` and show "operator cancelled mid-run" (cleared at the next cdpAttach — fresh session).
+    try { chrome.storage.local.set({ lastRunAbort: { reason: operatorCancel ? "operator-cancelled" : "debugger-detached", detachReason: reason || null, at: Date.now() } }); }
+    catch (e) { /* storage unavailable — the SW log above still names the cause */ }
     // The native infobar "Cancel" detaches the debugger MID-RUN, which strands the "please don't click or
     // type" input-lock overlay on the page: the run's finally → removeInputLock() goes through cdpEval,
     // which now can't reach the (detached) page and silently no-ops. So tear the overlay down here via
@@ -68,6 +75,7 @@ function cdpAttach(tabId) {
         return;
       }
       cdpTabId = tabId;
+      try { chrome.storage.local.remove("lastRunAbort"); } catch (e) { /* ignore */ } // fresh session — drop any prior operator-cancel marker
       _visCache = { visible: false, at: 0 };   // fresh foreground sampling per run (adaptive pacing)
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
