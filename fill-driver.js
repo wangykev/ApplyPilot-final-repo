@@ -1125,8 +1125,8 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   // match) and on long lists (step cap), and worst it returned needs_review BEFORE
   // any click could run. Behind the SAME verify gate: filled only if the trigger
   // then shows the target exactly; otherwise needs_review (never a wrong commit).
-  const commitByClick = async () => {
-    if (!(await act.clickDropdownOptionByText(loc, target))) {
+  const commitByClick = async (clicker) => {
+    if (!(await clicker(loc, target))) {
       const cs = await act.readDropdownState(loc);
       return { ok: false, after: cs ? cs.triggerText : null };
     }
@@ -1166,9 +1166,14 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const fullIdx = fresh.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
   const idxCanary = (fresh.options[fullIdx] && norm(fresh.options[fullIdx].text) === norm(target)) ? "" : " [option-index desync vs scrape — text-keyed click used]";
 
-  let res = await commitByClick();
+  let res = await commitByClick(act.clickDropdownOptionByText);
   if (!res.ok) {
-    // One retry: re-open if the click closed the list without committing, then re-click.
+    // One retry: re-open if the click closed the list without committing, then re-click. RETRY VIA A DIRECT
+    // ELEMENT-TARGETED dispatch (2026-07-06): a trusted COORDINATE click can fail to fire a portaled option's
+    // onClick on a HIDDEN tab (live: language[0] "English" never committed hidden though coords/target/
+    // collisions were all correct) — the element-dispatch (`clickDropdownOptionDirect`, robustClick pattern)
+    // targets the option directly, no coordinate hit-test. Falls back to the coordinate click for substrates
+    // (older fakes) that lack the direct method; the commit-persistence re-read still gates acceptance.
     let re = await act.readDropdownState(loc);
     if (!re || re.optionCount === 0) {
       if (await act.openDropdown(loc)) {
@@ -1176,7 +1181,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
         while (Date.now() < d) { await delayRender(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; } // re-open settle — adaptive under the measured-fast gate (STAGE 2); gated by optionCount>0, interval-independent
       }
     }
-    if (re && re.optionCount > 0) res = await commitByClick();
+    if (re && re.optionCount > 0) res = await commitByClick(act.clickDropdownOptionDirect || act.clickDropdownOptionByText);
   }
   if (res.ok) {
     const out = { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };

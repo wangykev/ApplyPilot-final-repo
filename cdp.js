@@ -1539,6 +1539,42 @@ function cdpDropdownOptionRectByText(wrapperSel, text) {
            hitTarget, atPointText, collisions };
 }
 
+// ELEMENT-TARGETED option click (the dropdown-commit fallback, 2026-07-06). A trusted CDP COORDINATE click
+// on a portaled listbox option can fail to fire the option's onClick on a HIDDEN tab (live: language[0]
+// "English" never committed hidden though the coords/target/collisions were all correct + hitTarget=true) —
+// the coordinate hit-test doesn't reach the non-composited overlay. This dispatches the robustClick pointer/
+// mouse sequence DIRECTLY on the option element (no coordinate hit-test), so the handler runs regardless of
+// compositing/visibility. Synthetic (isTrusted:false) — used ONLY as the commit RETRY after the trusted
+// coordinate click didn't take; the commit-persistence re-read still gates acceptance (never a false fill).
+function cdpClickDropdownOptionDirect(wrapperSel, text) {
+  const w = document.querySelector(wrapperSel);
+  const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
+  if (!trigger) return { ok: false, reason: "no trigger" };
+  const id = trigger.getAttribute("aria-controls");
+  const lb = id ? document.getElementById(id) : null;
+  if (!lb) return { ok: false, reason: "no listbox" };
+  const el = Array.from(lb.querySelectorAll('[role="option"]'))
+    .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
+  if (!el) return { ok: false, reason: "option not found" };
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  const o = { bubbles: true, cancelable: true, composed: true, view: window,
+              clientX: Math.round(r.x + r.width / 2), clientY: Math.round(r.y + r.height / 2), button: 0 };
+  const target = el.closest('[role="option"]') || el;
+  const fire = (type, usePointer) => {
+    let ev;
+    try { ev = usePointer && window.PointerEvent ? new PointerEvent(type, Object.assign({ pointerId: 1, isPrimary: true, pointerType: "mouse" }, o)) : new MouseEvent(type, o); }
+    catch (e) { try { ev = new Event(type, { bubbles: true }); } catch (e2) { return; } }
+    target.dispatchEvent(ev);
+  };
+  // pointerdown → mousedown → pointerup → mouseup → click (the proven robustClick order; +over/enter first).
+  fire("pointerover", true); fire("mouseover", false);
+  fire("pointerdown", true); fire("mousedown", false);
+  fire("pointerup", true); fire("mouseup", false);
+  fire("click", false);
+  return { ok: true };
+}
+
 function cdpReadRadioState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;
@@ -2448,6 +2484,13 @@ function makeCdpActuation(llmConfig) {
       console.log('[ApplyPilot][CDP-DD-COMMIT] "' + text + '" hitTarget=' + rect.hitTarget + ' atPoint="' + rect.atPointText + '" collisions=' + rect.collisions + ' rect=' + rect.cx + ',' + rect.cy + ' (' + loc.wrapperSel + ')');
       await cdpClickAt(rect.cx, rect.cy);
       return true;
+    },
+    // ELEMENT-TARGETED option click — the commit RETRY when the trusted coordinate click above didn't take
+    // (a hidden-tab portaled option that a coordinate hit-test can't reach; see cdpClickDropdownOptionDirect).
+    clickDropdownOptionDirect: async (loc, text) => {
+      const r = await cdpEval(cdpClickDropdownOptionDirect, loc.wrapperSel, text);
+      console.log('[ApplyPilot][CDP-DD-COMMIT] direct element-dispatch retry "' + text + '" → ' + (r && r.ok ? "dispatched" : "FAILED: " + (r && r.reason)) + ' (' + loc.wrapperSel + ')');
+      return !!(r && r.ok);
     },
 
     // ── typeahead (M25) ──

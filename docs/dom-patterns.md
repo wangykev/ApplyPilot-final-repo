@@ -2158,8 +2158,19 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   `cdpDropdownOptionRectByText` still returns `hitTarget`/`atPointText`/`collisions`, and
   `clickDropdownOptionByText` clicks ONCE (prior behavior) but now LOGS `[ApplyPilot][CDP-DD-COMMIT] "<opt>"
   hitTarget=… atPoint=… collisions=… rect=…` per commit — a read-only diagnostic to capture WHY a pre-filled
-  overwrite click fails (off-target click vs wrong-entry routing vs click-lands-but-no-recommit). Root cause +
-  real fix PENDING that log.
+  overwrite click fails (off-target click vs wrong-entry routing vs click-lands-but-no-recommit).
+  **CONFIRMED by the `[CDP-DD-COMMIT]` log (2026-07-06):** VISIBLE and HIDDEN are byte-identical —
+  `hitTarget=true atPoint="English" collisions=1 rect=456,298` — yet VISIBLE commits and HIDDEN does not
+  (`language[0]` "English" never leaves "Chinese", persistence-poll to the ceiling; even the re-open retry's
+  coordinate click fails). So a TRUSTED CDP COORDINATE click lands on the correct portaled option but does NOT
+  fire its onClick when the tab is HIDDEN — the coordinate hit-test doesn't reach the non-composited overlay.
+  (Not id-collision, not neighbor, not scroll — coords/target verified correct.) **FIX:** the commit RETRY now
+  dispatches the click DIRECTLY on the option element (`cdpClickDropdownOptionDirect` / `clickDropdownOptionDirect`
+  — the robustClick pointer→mouse→click sequence, element-targeted, no coordinate hit-test), so the handler
+  runs regardless of compositing/visibility. Synthetic (isTrusted:false) so used only as the retry AFTER the
+  trusted coordinate click didn't take; the commit-persistence re-read still gates acceptance (never a false
+  fill). Proficiency dropdowns fill fine hidden (they were empty, not overwrites) — the failure is specific to
+  a hidden coordinate re-selection.
 - **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
   aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
   across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The
