@@ -243,8 +243,8 @@ async function cdpEval(fn, ...args) {
 // fast happy path; safe failure ceiling either way.
 // NOTE: pacing only. Visible CDP ACTUATION itself (coordinate-clicks, scrollIntoView,
 // focus) is a separate, newly-exercised surface — see runCdpFillPage / docs.
-const FAST_FACTOR = 0.2;    // visible delays = 1/5 the hidden delays (conservative; tunable — raise if a visible fill races)
-const FAST_FLOOR_MS = 25;   // …but never below this (a too-short wait races even full-speed)
+const FAST_FACTOR = 0.1;    // fast delays = 1/10 the full delays (rapidfire; raise if a fast fill races — all adaptive sites are gated, so a race retries/flags, never a silent wrong fill)
+const FAST_FLOOR_MS = 10;   // …but never below this (a too-short wait races even full-speed)
 const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amortize the chrome.tabs/windows round-trip)
 
 let _visCache = { visible: false, at: 0 };
