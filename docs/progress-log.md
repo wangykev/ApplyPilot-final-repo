@@ -134,3 +134,31 @@ exclude chips before choosing the selector, and frame-poll until real non-chip l
 (role=option → promptOption fallback; returns roleCount/promptCount/usedSel for triage). FoS resolves at
 frame 0 (unchanged). **LIVE-VERIFIED on Magna** — countryPhoneCode now shows a searchable option list in the
 summary. Unit suite green (465 on the branch; 482 on merged main). Merged to main.
+
+## 2026-07-06 — Dropdown OVERWRITE commit: elapsed-time-adaptive debounce beat (replaces the hardcoded 700ms)
+
+Follow-up to the dup-language fix (see dom-patterns 2026-07-06 Vector A). Committing a RE-SELECTION (replacing
+a real prior value — the pre-filled+flipped languages) failed under fast pacing: the trusted coordinate click
+landed on the correct portaled option (`hitTarget=true`) but didn't fire its selection. Confirmed via
+`forceWorkerTimersOff` that the slow (all-`delayFull`) path commits on the first click — it's a Workday-internal
+option-click DEBOUNCE after the list opens, and fast pacing clicks inside it. The first fix was a hardcoded
+non-adaptive `act.delayFull(~700ms)` before an overwrite's commit click (live-verified — languages committed
+correctly visible AND hidden). The operator then asked to make the wait adaptive rather than pay it flat on
+every overwrite.
+
+- **Recon FIRST (per the working principle — trace, don't guess):** a temp read-only sampler
+  (`cdpDropdownReadinessSample` + `act.sampleDropdownReadiness`) logged the just-opened list's readiness signals
+  every 100ms across the 700ms window — `aria-expanded`, listbox-present, enabled-option count,
+  `opacity`/`visibility`/`pointer-events`/`transition`, `aria-activedescendant`, selected-option, listbox rect.
+  **`[DD-READY]` result: every signal is at its settled value from t=0 — NOTHING flips 0→700ms.** So the list
+  is fully DOM-READY immediately; the debounce has NO pollable DOM correlate. (Operator confirmed the recon run
+  committed English + Chinese correctly.)
+- **Fix — elapsed-time is the only honest adaptivity.** `fillDropdownCdp` now records `openedAt` when the
+  trigger first reads `aria-expanded="true"`, and the overwrite beat waits only the REMAINDER:
+  `DEBOUNCE_MS - (Date.now() - openedAt)` (`DEBOUNCE_MS = settleIntervalMs*2 ≈ 700ms`) via non-adaptive
+  `act.delayFull`. The option-settle poll + match + fresh-read already consumed part of the window and count
+  against it — so a slow/cold list (settle already >700ms) waits **zero**, and only a fast path pays the leftover.
+  EMPTY fills (`before` = the disabled placeholder, not an enabled option) don't race → no beat, still rapidfire.
+- Removed the temp sampler (`cdpDropdownReadinessSample` + the `sampleDropdownReadiness` method). Docs updated
+  (CLAUDE.md dropdowns rule + dom-patterns Vector A refinement). `node -c` clean; unit suite green (482).
+  **LIVE-VERIFY PENDING** on the branch before merging to main (main has diverged — a real merge, not FF).

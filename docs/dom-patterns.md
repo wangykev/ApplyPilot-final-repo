@@ -2176,6 +2176,18 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   option) don't race → stay fast, no beat. Net FASTER on the failing case (commits instead of burning two
   ~10s fail-poll+retry cycles). Proficiency dropdowns fill fine hidden because they're EMPTY (not overwrites).
   (The element-dispatch retry is now moot — the primary commits — but left as a harmless fallback.)
+  **REFINEMENT (2026-07-06, `[DD-READY]` recon → made adaptive):** the hardcoded 700ms was live-verified but
+  paid on every overwrite. Before removing it, a temp read-only sampler (`cdpDropdownReadinessSample`) logged
+  the just-opened list's readiness signals every 100ms across the window — `aria-expanded`, listbox present,
+  enabled-option count, `opacity`/`visibility`/`pointer-events`/`transition`, `aria-activedescendant`,
+  selected-option, and the listbox rect. **Result: NOTHING flips 0→700ms — every signal is at its settled
+  value from t=0.** So the list is fully DOM-READY immediately and there is **NO pollable readiness signal**;
+  the ~700ms is a Workday-internal option-click DEBOUNCE with no DOM correlate. The only honest adaptivity is
+  therefore ELAPSED-TIME: `fillDropdownCdp` records `openedAt` when the trigger reads `aria-expanded="true"`,
+  and the overwrite beat waits only `DEBOUNCE_MS - (Date.now() - openedAt)` (≈700ms since open, `DEBOUNCE_MS =
+  settleIntervalMs*2`) via `act.delayFull` — the option-settle poll + match + fresh-read already consumed part
+  of the window count against it, so a slow/cold list (settle already >700ms) waits **zero** and only a fast
+  path pays the remainder. The sampler was removed after the recon. (`node -c` + 482 tests green.)
 - **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
   aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
   across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The

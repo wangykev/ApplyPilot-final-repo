@@ -1575,31 +1575,6 @@ function cdpClickDropdownOptionDirect(wrapperSel, text) {
   return { ok: true };
 }
 
-// TEMP RECON (2026-07-06): sample a dropdown's listbox readiness signals so we can find what flips between
-// "click doesn't commit" (early, ~70ms after open — the hidden fast-pacing race) and "click commits"
-// (~700ms). Read-only (no click). The overwrite fill logs a timeline of these across its settle window; the
-// signal that reaches its "ready" value ~when commits start working becomes the adaptive poll condition.
-function cdpDropdownReadinessSample(wrapperSel) {
-  const w = document.querySelector(wrapperSel);
-  const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
-  if (!trigger) return { err: "no trigger" };
-  const id = trigger.getAttribute("aria-controls");
-  const lb = id ? document.getElementById(id) : null;
-  const cs = lb ? getComputedStyle(lb) : null;
-  const opts = lb ? Array.from(lb.querySelectorAll('[role="option"]')) : [];
-  const enabled = opts.filter((o) => o.getAttribute("aria-disabled") !== "true");
-  const selected = opts.find((o) => o.getAttribute("aria-selected") === "true");
-  const r = lb ? lb.getBoundingClientRect() : null;
-  return {
-    exp: trigger.getAttribute("aria-expanded"), lb: !!lb, n: enabled.length,
-    opacity: cs ? cs.opacity : null, vis: cs ? cs.visibility : null, pe: cs ? cs.pointerEvents : null,
-    trans: cs ? (cs.transitionProperty + "/" + cs.transitionDuration) : null,
-    ad: (lb && lb.getAttribute("aria-activedescendant")) || trigger.getAttribute("aria-activedescendant") || null,
-    sel: selected ? (selected.textContent || "").trim() : null,
-    top: r ? Math.round(r.top) : null, h: r ? Math.round(r.height) : null
-  };
-}
-
 function cdpReadRadioState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;
@@ -2517,7 +2492,6 @@ function makeCdpActuation(llmConfig) {
       console.log('[ApplyPilot][CDP-DD-COMMIT] direct element-dispatch retry "' + text + '" → ' + (r && r.ok ? "dispatched" : "FAILED: " + (r && r.reason)) + ' (' + loc.wrapperSel + ')');
       return !!(r && r.ok);
     },
-    sampleDropdownReadiness: (loc) => cdpEval(cdpDropdownReadinessSample, loc.wrapperSel), // TEMP recon (dropdown-readiness timeline)
 
     // ── typeahead (M25) ──
     // Opener ladder: multiselectInputContainer → selectinput → first input →

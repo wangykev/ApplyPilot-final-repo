@@ -1038,7 +1038,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   // inverse bug: NEVER re-click a trigger already reading aria-expanded="true" — a
   // second click TOGGLES the open dropdown SHUT. So openDropdown is called ONLY while
   // not yet expanded (the for-loop's `!expanded` guard); once expanded we only poll.
-  let state = null, expanded = false;
+  let state = null, expanded = false, openedAt = 0; // openedAt: when the list actually opened — the debounce window is measured from here (see the overwrite beat)
   for (let attempt = 1; attempt <= budgets.openRetries && !expanded; attempt++) {
     if (attempt > 1) { await act.pressEscape(); await act.delay(budgets.reopenSettleMs); } // close the half-state + let the re-render finish
     if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
@@ -1048,7 +1048,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     while (Date.now() < expandDeadline) {
       await act.delay(budgets.settleIntervalMs);
       state = await act.readDropdownState(loc);
-      if (state && state.ariaExpanded === "true") { expanded = true; break; }
+      if (state && state.ariaExpanded === "true") { expanded = true; openedAt = Date.now(); break; }
     }
   }
   // GATE 2: the trigger IS expanded — NEVER re-click it. Poll optionCount to the FULL
@@ -1166,29 +1166,20 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const fullIdx = fresh.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
   const idxCanary = (fresh.options[fullIdx] && norm(fresh.options[fullIdx].text) === norm(target)) ? "" : " [option-index desync vs scrape — text-keyed click used]";
 
-  // OVERWRITE reliability (2026-07-06, confirmed via forceWorkerTimersOff: the slow/full path commits, the
-  // fast path races). Committing a RE-SELECTION (replacing a real prior value) needs the just-opened dropdown
-  // to be INTERACTIVE before the click — under fast pacing the click lands on the correct option (hitTarget=
-  // true) but doesn't fire the selection, so it never commits (then burns the full commit ceiling failing).
-  // Give an OVERWRITE a NON-ADAPTIVE settle before the click (replicates the working slow path). EMPTY fills
-  // (`before` = the disabled placeholder, not an enabled option) don't race → stay fast, no beat. `act.delay`
-  // is unaffected — this is a targeted commit-reliability wait for pre-filled dropdowns only (rare on a fresh
-  // form). Net FASTER on the failing case: it commits instead of two ~10s fail-poll+retry cycles.
+  // OVERWRITE reliability (2026-07-06, confirmed via forceWorkerTimersOff + the [DD-READY] recon). Committing
+  // a RE-SELECTION (replacing a real prior value) fails under fast pacing: the click lands on the correct
+  // option (hitTarget=true) but doesn't fire the selection, so it never commits. The recon proved the list is
+  // fully DOM-READY from t=0 (opacity/pointer-events/aria-activedescendant/rect all settled) — NOTHING flips
+  // across 0→700ms — so there is NO pollable readiness signal; Workday internally DEBOUNCES option clicks for
+  // ~N ms after open (no DOM correlate). The only honest adaptivity is ELAPSED-TIME: wait until DEBOUNCE_MS
+  // have passed SINCE THE LIST OPENED, subtracting time already spent (option-settle + match + fresh-read) —
+  // so we wait only the REMAINDER, and if the pre-commit work already outlasted the window we wait NOTHING.
+  // EMPTY fills (`before` = the disabled placeholder, not an enabled option) don't race → no wait.
   const isOverwrite = !!before && norm(before) !== norm(target) && enabledTexts.some((t) => norm(t) === norm(before));
-  if (isOverwrite && act.delayFull) {
-    // TEMP RECON (2026-07-06): keep the working ~700ms interactive settle, but SAMPLE the dropdown's readiness
-    // signals across it (opacity/visibility/pointer-events/transition/aria-activedescendant/selected/rect) so
-    // we can find what flips when the just-opened list becomes CLICKABLE → make the wait adaptive-by-polling.
-    // Still waits ~700ms total, then commits as before. `before→target` labels each sample. Remove after.
-    if (act.sampleDropdownReadiness) {
-      for (let t = 0; t <= 700; t += 100) {
-        let s = null; try { s = await act.sampleDropdownReadiness(loc); } catch (e) {}
-        console.log(`[ApplyPilot][DD-READY] ${before}→${target} t=${t}ms ${JSON.stringify(s)}`);
-        await act.delayFull(100);
-      }
-    } else {
-      await act.delayFull(budgets.settleIntervalMs * 2);
-    }
+  const DEBOUNCE_MS = budgets.settleIntervalMs * 2; // ~700ms — the observed post-open window a re-selection needs (measured from open, not added on top)
+  if (isOverwrite && act.delayFull && openedAt) {
+    const remaining = DEBOUNCE_MS - (Date.now() - openedAt);
+    if (remaining > 0) await act.delayFull(remaining); // wait ONLY the leftover of the debounce window (0 if the settle/match already covered it)
   }
 
   let res = await commitByClick(act.clickDropdownOptionByText);
