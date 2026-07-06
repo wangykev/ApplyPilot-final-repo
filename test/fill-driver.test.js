@@ -491,6 +491,10 @@ function makeFakeAct(fields, opts) {
       log.push(["clickDropdownOptionByText", text]);
       const f = byLoc(loc);
       if (f.clickDismisses) return true;
+      // commitsOnAttempt: N → the first N-1 text-clicks DISMISS the list without committing (the
+      // fast-overwrite MISS the fast-first path models), the Nth commits. Exercises the slow refill.
+      f._clickN = (f._clickN || 0) + 1;
+      if (f.commitsOnAttempt && f._clickN < f.commitsOnAttempt) { f.open = false; return true; }
       const o = (f.options || []).find((x) => !x.disabled && x.text === text);
       if (!o) return false;
       f.triggerText = o.text;
@@ -720,6 +724,21 @@ test("dropdown TIER-AWARE: a tier>0 pre-fill is OVERWRITTEN to the highest tier 
   assert.strictEqual(rec.flag, "dropdown-overwrite-success");
   assert.ok(act.log.some(([m]) => m === "openDropdown"), "must open to overwrite");
   assert.ok(act.log.some(([m]) => m === "clickDropdownOptionByText"), "committed the higher tier by text-click");
+});
+
+test("dropdown OVERWRITE fast-first: a fast-attempt MISS re-opens and commits on the slow refill (never left flipped)", async () => {
+  // Models the pre-filled+flipped languages: the fast (small-beat) click MISSES (dismisses the list without
+  // committing), so the fast-first path must re-open and commit on the full ~700ms refill — ending FILLED,
+  // not needs_review. commitsOnAttempt:2 → 1st text-click dismisses, 2nd commits.
+  const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }, { text: "United States" }];
+  const act = makeFakeAct([ddField({ triggerText: "United States of America", options: opts, commitsOnAttempt: 2 })]);
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America", "United States"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "commits on the slow refill — not left flipped/needs_review");
+  assert.strictEqual(rec.after, "Afghanistan", "upgraded to the tier-0 candidate after the refill");
+  assert.strictEqual(rec.flag, "dropdown-overwrite-success");
+  assert.strictEqual(act.log.filter(([m]) => m === "clickDropdownOptionByText").length, 2, "fast attempt missed → exactly one refill click");
+  assert.ok(act.log.filter(([m]) => m === "openDropdown").length >= 2, "re-opened the list for the refill");
 });
 
 test("dropdown TIER-AWARE: a tier>0 pre-fill with NO higher tier offered is KEPT (better-tier-unavailable)", async () => {

@@ -2183,11 +2183,23 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   selected-option, and the listbox rect. **Result: NOTHING flips 0→700ms — every signal is at its settled
   value from t=0.** So the list is fully DOM-READY immediately and there is **NO pollable readiness signal**;
   the ~700ms is a Workday-internal option-click DEBOUNCE with no DOM correlate. The only honest adaptivity is
-  therefore ELAPSED-TIME: `fillDropdownCdp` records `openedAt` when the trigger reads `aria-expanded="true"`,
-  and the overwrite beat waits only `DEBOUNCE_MS - (Date.now() - openedAt)` (≈700ms since open, `DEBOUNCE_MS =
-  settleIntervalMs*2`) via `act.delayFull` — the option-settle poll + match + fresh-read already consumed part
-  of the window count against it, so a slow/cold list (settle already >700ms) waits **zero** and only a fast
-  path pays the remainder. The sampler was removed after the recon. (`node -c` + 482 tests green.)
+  therefore ELAPSED-TIME. The sampler was removed after the recon.
+  **FINAL SHAPE (2026-07-06, operator ask — "fill fast, refill slower only if it misses; log the refill rate
+  to tune"): FAST-FIRST with a slow refill fallback.** `fillDropdownCdp` records `openedAt` when the trigger
+  reads `aria-expanded="true"`. For an OVERWRITE it then runs **attempt 1 FAST**: wait only up to
+  `overwriteFastBeatMs` (default 300 — THE tuning knob) since open, click, and confirm with a SHORT failure
+  deadline (`min(overwriteFailFastMs, commitCeilingMs)`, default 600ms) so a miss is detected cheaply. If the
+  fast click MISSES (didn't clear the debounce), **attempt 2 refills SLOW**: re-open if the list closed, wait
+  the full proven ~700ms (`settleIntervalMs*2`) since the (re-)open, and commit with the full ceiling. A
+  `[CDP-DD-REFILL]` line logs `"<before>"→"<target>" fastBeat=Nms → committed on FAST attempt | MISSED fast →
+  refilled slow(~700ms): OK/FAILED` per overwrite, so the operator counts the refill rate and lowers
+  `overwriteFastBeatMs` to where most overwrites still commit fast. The commit-PERSISTENCE re-read still gates
+  every accept, so a fast miss can only cost a slow refill — never a wrong/silent fill (unit-pinned: a
+  fast-miss dropdown re-opens and commits on the refill, ending `filled`, never left flipped). EMPTY fills
+  (`before` = the disabled placeholder) never race → single fast commit, no beat. Trade: visible/warm
+  overwrites (which used to pay a flat ~700ms) now commit fast; the rarer hidden overwrite pays a fast miss +
+  the ~700ms refill (raise `overwriteFastBeatMs` toward 700 if a flow shows many hidden overwrites). (`node -c`
+  + 483 tests green.)
 - **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
   aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
   across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The

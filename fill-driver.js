@@ -322,7 +322,16 @@ const DEFAULT_BUDGETS = {
   // wait — it relies on the reveal latency (~5.6s, Magna recon) being ABSORBED by the
   // fill work that already runs after the triggering field (so the post-fold scan sees
   // the reveal already mounted). The cap is a runaway backstop (chained reveals are rare).
-  maxCascadeRounds: 3
+  maxCascadeRounds: 3,
+  // Dropdown OVERWRITE commit (2026-07-06 fast-first). Committing a RE-SELECTION needs the just-opened list
+  // past a Workday-internal option-click DEBOUNCE (no DOM signal — the [DD-READY] recon). Rather than pay the
+  // proven ~700ms on every overwrite, ATTEMPT 1 waits only overwriteFastBeatMs then clicks; if that misses,
+  // ATTEMPT 2 re-opens and pays the full ~700ms (settleIntervalMs*2). overwriteFastBeatMs is THE tuning knob —
+  // watch the [CDP-DD-REFILL] log and lower it to where most overwrites still commit on the FAST attempt
+  // (empty fills never race and skip the beat entirely). overwriteFailFastMs caps how long attempt 1 waits to
+  // confirm/deny the commit so a MISS is detected cheaply (further capped by commitCeilingMs).
+  overwriteFastBeatMs: 300,
+  overwriteFailFastMs: 600
 };
 
 // ── Verbatim M22 ports (background.js fillEngine — change in lockstep) ──────
@@ -1125,13 +1134,13 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   // match) and on long lists (step cap), and worst it returned needs_review BEFORE
   // any click could run. Behind the SAME verify gate: filled only if the trigger
   // then shows the target exactly; otherwise needs_review (never a wrong commit).
-  const commitByClick = async (clicker) => {
+  const commitByClick = async (clicker, ceilingMs) => {
     if (!(await clicker(loc, target))) {
       const cs = await act.readDropdownState(loc);
       return { ok: false, after: cs ? cs.triggerText : null };
     }
     let after = null;
-    const deadline = Date.now() + budgets.commitCeilingMs;
+    const deadline = Date.now() + (ceilingMs || budgets.commitCeilingMs); // ceilingMs: SHORT deadline for the fast overwrite attempt (fail quick → slow refill); full ceiling otherwise
     while (Date.now() < deadline) {
       await delayRender(budgets.commitIntervalMs); // the page commits the pick at its own pace — adaptive under the measured-fast gate (STAGE 2)
       const cs = await act.readDropdownState(loc);
@@ -1166,38 +1175,58 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const fullIdx = fresh.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
   const idxCanary = (fresh.options[fullIdx] && norm(fresh.options[fullIdx].text) === norm(target)) ? "" : " [option-index desync vs scrape — text-keyed click used]";
 
-  // OVERWRITE reliability (2026-07-06, confirmed via forceWorkerTimersOff + the [DD-READY] recon). Committing
-  // a RE-SELECTION (replacing a real prior value) fails under fast pacing: the click lands on the correct
-  // option (hitTarget=true) but doesn't fire the selection, so it never commits. The recon proved the list is
-  // fully DOM-READY from t=0 (opacity/pointer-events/aria-activedescendant/rect all settled) — NOTHING flips
-  // across 0→700ms — so there is NO pollable readiness signal; Workday internally DEBOUNCES option clicks for
-  // ~N ms after open (no DOM correlate). The only honest adaptivity is ELAPSED-TIME: wait until DEBOUNCE_MS
-  // have passed SINCE THE LIST OPENED, subtracting time already spent (option-settle + match + fresh-read) —
-  // so we wait only the REMAINDER, and if the pre-commit work already outlasted the window we wait NOTHING.
-  // EMPTY fills (`before` = the disabled placeholder, not an enabled option) don't race → no wait.
+  // OVERWRITE commit — FAST-FIRST with a slow refill fallback (2026-07-06). Background: committing a
+  // RE-SELECTION (replacing a real prior value — e.g. pre-filled+flipped languages) fails under fast pacing:
+  // the click lands on the correct option (hitTarget=true) but doesn't fire the selection. The [DD-READY]
+  // recon proved the just-opened list has NO pollable readiness signal (every DOM signal is settled from
+  // t=0) — it's a Workday-internal option-click DEBOUNCE with no DOM correlate — so the ONLY lever is elapsed
+  // time since open. Rather than pay the proven-safe ~700ms on EVERY overwrite, try a SMALL tunable beat
+  // first (`overwriteFastBeatMs` — commits immediately on fast/warm/visible lists) and, ONLY if that click
+  // MISSES, re-open and pay the full ~700ms beat. A [CDP-DD-REFILL] line logs whether each overwrite committed
+  // fast or needed the slow refill, so `overwriteFastBeatMs` can be TUNED to where most overwrites commit on
+  // the first attempt. The commit-PERSISTENCE re-read still gates every accept, so a fast miss can only cost a
+  // slow refill — never a wrong/silent fill. EMPTY fills (`before` = the disabled placeholder) never race →
+  // single fast commit, no beat.
   const isOverwrite = !!before && norm(before) !== norm(target) && enabledTexts.some((t) => norm(t) === norm(before));
-  const DEBOUNCE_MS = budgets.settleIntervalMs * 2; // ~700ms — the observed post-open window a re-selection needs (measured from open, not added on top)
-  if (isOverwrite && act.delayFull && openedAt) {
-    const remaining = DEBOUNCE_MS - (Date.now() - openedAt);
-    if (remaining > 0) await act.delayFull(remaining); // wait ONLY the leftover of the debounce window (0 if the settle/match already covered it)
-  }
-
-  let res = await commitByClick(act.clickDropdownOptionByText);
-  if (!res.ok) {
-    // One retry: re-open if the click closed the list without committing, then re-click. RETRY VIA A DIRECT
-    // ELEMENT-TARGETED dispatch (2026-07-06): a trusted COORDINATE click can fail to fire a portaled option's
-    // onClick on a HIDDEN tab (live: language[0] "English" never committed hidden though coords/target/
-    // collisions were all correct) — the element-dispatch (`clickDropdownOptionDirect`, robustClick pattern)
-    // targets the option directly, no coordinate hit-test. Falls back to the coordinate click for substrates
-    // (older fakes) that lack the direct method; the commit-persistence re-read still gates acceptance.
-    let re = await act.readDropdownState(loc);
-    if (!re || re.optionCount === 0) {
-      if (await act.openDropdown(loc)) {
-        const d = Date.now() + Math.min(budgets.openCeilingMs, 8000);
-        while (Date.now() < d) { await delayRender(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; } // re-open settle — adaptive under the measured-fast gate (STAGE 2); gated by optionCount>0, interval-independent
+  const SLOW_BEAT_MS = budgets.settleIntervalMs * 2; // ~700ms — the proven post-open window a re-selection needs (measured from open)
+  let res, refilled = false;
+  if (isOverwrite) {
+    // Attempt 1 — FAST: wait only up to overwriteFastBeatMs since the list opened, then click with a SHORT
+    // failure deadline (capped by the commit ceiling) so a MISS is detected quickly instead of burning ~10s.
+    if (act.delayFull && openedAt) { const r = budgets.overwriteFastBeatMs - (Date.now() - openedAt); if (r > 0) await act.delayFull(r); }
+    res = await commitByClick(act.clickDropdownOptionByText, Math.min(budgets.overwriteFailFastMs, budgets.commitCeilingMs));
+    if (!res.ok) {
+      // Fast attempt MISSED (the small beat didn't clear the debounce). Re-open if the click closed the list,
+      // wait the full proven ~700ms SINCE THE (RE-)OPEN, then commit again with the full ceiling.
+      refilled = true;
+      let re = await act.readDropdownState(loc), reAt = openedAt;
+      if (!re || re.optionCount === 0) {
+        reAt = 0;
+        if (await act.openDropdown(loc)) {
+          const d = Date.now() + Math.min(budgets.openCeilingMs, 8000);
+          while (Date.now() < d) { await delayRender(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) { reAt = Date.now(); break; } } // re-open settle — adaptive under the measured-fast gate; gated by optionCount>0, interval-independent
+        }
+      }
+      if (re && re.optionCount > 0) {
+        if (act.delayFull && reAt) { const r = SLOW_BEAT_MS - (Date.now() - reAt); if (r > 0) await act.delayFull(r); } // full ~700ms beat since the (re-)open, minus time already spent
+        res = await commitByClick(act.clickDropdownOptionByText, budgets.commitCeilingMs);
       }
     }
-    if (re && re.optionCount > 0) res = await commitByClick(act.clickDropdownOptionDirect || act.clickDropdownOptionByText);
+    console.log(`[ApplyPilot][CDP-DD-REFILL] "${before}"→"${target}" fastBeat=${budgets.overwriteFastBeatMs}ms → ${refilled ? `MISSED fast → refilled slow(~${SLOW_BEAT_MS}ms)` : "committed on FAST attempt"}: ${res && res.ok ? `OK "${res.after}"` : `FAILED "${res && res.after}"`}`);
+  } else {
+    // EMPTY fill (placeholder → value): no debounce race — a single fast commit + the generic re-open retry
+    // (direct element-dispatch, which targets the option element directly with no coordinate hit-test).
+    res = await commitByClick(act.clickDropdownOptionByText);
+    if (!res.ok) {
+      let re = await act.readDropdownState(loc);
+      if (!re || re.optionCount === 0) {
+        if (await act.openDropdown(loc)) {
+          const d = Date.now() + Math.min(budgets.openCeilingMs, 8000);
+          while (Date.now() < d) { await delayRender(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) break; } // re-open settle — adaptive under the measured-fast gate; gated by optionCount>0, interval-independent
+        }
+      }
+      if (re && re.optionCount > 0) res = await commitByClick(act.clickDropdownOptionDirect || act.clickDropdownOptionByText);
+    }
   }
   if (res.ok) {
     const out = { status: "filled", after: res.after, verified: true, matchTier: m.matchTier, detail: `text-click-commit${idxCanary}`, options: enabledTexts };

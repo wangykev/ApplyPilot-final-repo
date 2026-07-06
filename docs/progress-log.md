@@ -153,12 +153,22 @@ every overwrite.
   **`[DD-READY]` result: every signal is at its settled value from t=0 — NOTHING flips 0→700ms.** So the list
   is fully DOM-READY immediately; the debounce has NO pollable DOM correlate. (Operator confirmed the recon run
   committed English + Chinese correctly.)
-- **Fix — elapsed-time is the only honest adaptivity.** `fillDropdownCdp` now records `openedAt` when the
-  trigger first reads `aria-expanded="true"`, and the overwrite beat waits only the REMAINDER:
-  `DEBOUNCE_MS - (Date.now() - openedAt)` (`DEBOUNCE_MS = settleIntervalMs*2 ≈ 700ms`) via non-adaptive
-  `act.delayFull`. The option-settle poll + match + fresh-read already consumed part of the window and count
-  against it — so a slow/cold list (settle already >700ms) waits **zero**, and only a fast path pays the leftover.
-  EMPTY fills (`before` = the disabled placeholder, not an enabled option) don't race → no beat, still rapidfire.
-- Removed the temp sampler (`cdpDropdownReadinessSample` + the `sampleDropdownReadiness` method). Docs updated
-  (CLAUDE.md dropdowns rule + dom-patterns Vector A refinement). `node -c` clean; unit suite green (482).
-  **LIVE-VERIFY PENDING** on the branch before merging to main (main has diverged — a real merge, not FF).
+- **First fix — elapsed-time beat.** `fillDropdownCdp` records `openedAt` at `aria-expanded="true"` and the
+  overwrite beat waited only the REMAINDER of ~700ms since open. Removed the temp sampler
+  (`cdpDropdownReadinessSample` + the `sampleDropdownReadiness` method).
+- **Final shape — FAST-FIRST with a slow refill fallback (operator ask: "fill fast, refill slower only if it
+  misses; log the refill rate to tune").** For an overwrite, **attempt 1 FAST** waits only
+  `overwriteFastBeatMs` (default 300 — THE tuning knob) since open, clicks, and confirms with a SHORT failure
+  deadline (`min(overwriteFailFastMs, commitCeilingMs)`, default 600ms) so a miss is caught cheaply. On a
+  MISS, **attempt 2 refills SLOW**: re-open if the list closed, wait the full proven ~700ms
+  (`settleIntervalMs*2`) since the (re-)open, commit with the full ceiling. A `[CDP-DD-REFILL]` line logs
+  `committed on FAST attempt` vs `MISSED fast → refilled slow` per overwrite, so the operator counts the
+  refill rate and lowers `overwriteFastBeatMs` to where most overwrites still commit fast. `commitByClick`
+  gained an optional ceiling arg; the commit-PERSISTENCE re-read still gates every accept → a fast miss can
+  only cost a slow refill, NEVER a wrong/silent fill. EMPTY fills skip the beat (rapidfire, unchanged). Trade:
+  visible/warm overwrites (which used to pay a flat ~700ms) commit fast; the rarer hidden overwrite pays a
+  fast miss + refill (raise the knob toward 700 if a flow shows many hidden overwrites).
+- Docs updated (CLAUDE.md dropdowns rule + dom-patterns Vector A refinement). New unit test pins the slow
+  refill (a fast miss re-opens and commits, ending `filled` — never left flipped). `node -c` clean; unit
+  suite green (**483**). **LIVE-VERIFY PENDING** on the branch before merging to main (main has diverged — a
+  real merge, not FF).
