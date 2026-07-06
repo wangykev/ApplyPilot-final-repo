@@ -582,15 +582,23 @@ const openAndReadDropdown = async (act, loc, budgets) => {
 // strayed value) — Hold 2. The SOLE guard on the no-commit path (M40 never re-reads a blank field).
 const closeAndVerifyBlank = async (act, loc, before, budgets) => {
   const norm = apMatch.normalize;
+  const dr = act.delayRender || act.delayFull; // adaptive close-settle (fast fg/worker-fast; full on the slow path) — fallback for older fakes
   const blankNow = (s) => !!s && before != null && norm(s.triggerText) === norm(before);
   let s = null;
-  for (let attempt = 1; attempt <= budgets.openRetries; attempt++) {
+  // Poll until the portaled LISTBOX is truly GONE — NOT merely aria-expanded="false". aria flips the instant
+  // Escape fires, but the listbox lingers a beat while it unmounts and its options stay CLICKABLE; returning
+  // on aria alone let the NEXT recon field's open-click land on a lingering option (the live "Landline
+  // committed to Phone Device Type" stray — the next field sat exactly where that option rendered). The
+  // adaptive wait keeps the happy path fast (breaks the instant the listbox is gone — usually ~1 poll); a
+  // real deadline (the old openRetries×reopenSettleMs budget) bounds a genuinely slow close so we NEVER
+  // return with the list still up. Re-Escape each poll (idempotent on an already-closing list; never reopen).
+  const deadline = Date.now() + (budgets.openRetries || 3) * (budgets.reopenSettleMs || 400);
+  do {
     await act.pressEscape();
-    await act.delayFull(budgets.reopenSettleMs);
+    await dr(budgets.reopenSettleMs);
     s = await act.readDropdownState(loc);
-    if (s && s.ariaExpanded === "false") break; // closed — done (blank decided by the value)
-    // still open (or unreadable) → Escape again, NEVER reopen; give the close real time
-  }
+    if (s && (!s.listboxPresent || s.optionCount === 0)) break; // fully closed → no lingering clickable option
+  } while (Date.now() < deadline);
   return { blank: blankNow(s), after: s ? s.triggerText : null };
 };
 
@@ -4161,6 +4169,23 @@ function applyAuditVerdicts(results, verdicts) {
 // → nothing arms), then a stray-safe close (Tab — the only clean non-committing exit; Escape kept
 // focus + any armed row, Tab abandons it).
 // Returns the options array, or null (NON-FATAL: null → the summary falls back to captured_options).
+// Anti-stray close-confirm for the READ-ONLY typeahead recon (2026-07-06): after a Tab-blur the searchBox
+// and portaled promptOption LEAVES linger a beat, still clickable — so the NEXT recon field's open-click can
+// land on a lingering leaf (the same race the dropdown recon close had — "Landline → Phone Device Type").
+// Poll `leafCount` (the mounted promptOptions — the analog of the dropdown's optionCount) until it reaches 0
+// (leaves unmounted → no clickable stray target). Adaptive → breaks the instant the popup empties (fast
+// happy path); bounded by iterations + a real deadline so a slow close (or an older substrate whose readHier
+// lacks leafCount) never hangs. Read-only (only readHier + a settle).
+async function awaitTypeaheadClosed(act, loc, budgets) {
+  if (!act || !act.readHier) return;
+  const dr = act.delayRender || act.delayFull;
+  const dl = Date.now() + (budgets.openRetries || 3) * (budgets.reopenSettleMs || 400);
+  for (let i = 0; i < 12 && Date.now() < dl; i++) {
+    let cs = null; try { cs = await act.readHier(loc); } catch (e) { return; }
+    if (!cs || cs.leafCount === 0) return; // leaves gone → no lingering clickable option
+    if (dr) await dr(budgets.reopenSettleMs); else return;
+  }
+}
 // Called from captureChoiceOptions at END OF PAGE (when fields are settled/closed → a fresh re-open
 // shows the empty-filter full list); an inline call races the post-commit state (banner / residual
 // search → empty scrape) or corrupts the commit, so it is NOT called inline.
@@ -4193,7 +4218,7 @@ async function captureFieldOptions(act, loc, budgets) {
     // the only clean non-committing exit (Escape keeps focus + any armed row; Tab abandons it). The
     // field's existing chip is preserved; the end-of-page M40 audit backstops any stray.
     await act.pressTab();
-    await delayRender(budgets.reopenSettleMs); // post-Tab close settle — adaptive under the measured-fast gate (STAGE 3)
+    await awaitTypeaheadClosed(act, loc, budgets); // confirm the popup's leaves are GONE before returning — anti-stray for the next recon field (was a fixed adaptive settle that could return with leaves still up)
     return options;
   } catch (e) { return null; } // non-fatal: null → summary falls back to captured_options
 }
@@ -4305,8 +4330,7 @@ async function captureTypeaheadOptions(act, loc, budgets) {
     if (act.readTreeCategories) { try { cats = await act.readTreeCategories(loc); } catch (e) {} }
     if (Array.isArray(cats) && cats.length) { // TREE → just tag hierarchical (categories aren't useful
       console.log("[ApplyPilot][ta-recon] TREE (" + cats.length + " categories) → hierarchical/tier editor:", loc.wrapperSel);
-      if (act.pressTab) await act.pressTab();  // in the summary; the user supplies tier candidates instead)
-      await delayRender(budgets.reopenSettleMs || 300); // post-Tab close settle — adaptive under the measured-fast gate (STAGE 3)
+      if (act.pressTab) { await act.pressTab(); await awaitTypeaheadClosed(act, loc, budgets); } // anti-stray: wait until the popup's leaves unmount before the next recon field opens
       return { widget_type: "hierarchical" };
     }
     // FLAT → focus so the full list renders, then scrape [role=option]. A FRESHLY-MOUNTED typeahead's
@@ -4326,8 +4350,7 @@ async function captureTypeaheadOptions(act, loc, budgets) {
       await delayRender(budgets.taOpenIntervalMs || 300); // poll interval between scrape attempts; scCeiling stays raw (full)
     }
     console.log("[ApplyPilot][ta-recon] FLAT →", opts.length, "options after " + (Math.round((Date.now() - t2) / 100) / 10) + "s:", loc.wrapperSel);
-    if (act.pressTab) await act.pressTab();
-    await delayRender(budgets.reopenSettleMs || 300); // post-Tab close settle — adaptive under the measured-fast gate (STAGE 3)
+    if (act.pressTab) { await act.pressTab(); await awaitTypeaheadClosed(act, loc, budgets); } // anti-stray: wait until the popup's leaves unmount before the next recon field opens
     return { widget_type: "typeahead", options: opts };
   } catch (e) { return null; }
 }

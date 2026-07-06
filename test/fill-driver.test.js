@@ -5016,15 +5016,17 @@ const CAP_LOC = { wrapperSel: '[data-fkit-id="education-7--null"] [data-automati
 function makeCaptureAct(opts = {}) {
   const calls = [];
   const scrape = opts.scrape === undefined ? { ok: true, options: FOS_OPTS.slice() } : opts.scrape;
-  const taState = { searchBox: { visible: true, focused: true }, activeText: null, chips: opts.chips || [] };
+  let closed = false; // typeahead popup state: Tab-blur closes it (leaves unmount → leafCount 0); open re-opens
+  // readHier reflects open/closed so the anti-stray close-confirm (awaitTypeaheadClosed) breaks on close
+  const readState = () => ({ searchBox: { visible: !closed, focused: !closed }, activeText: null, chips: opts.chips || [], leaves: closed ? [] : FOS_OPTS.slice(), leafCount: closed ? 0 : FOS_OPTS.length });
   const act = {
     delay: () => { calls.push(["delay"]); return Promise.resolve(); },
     delayFull: () => { calls.push(["delayFull"]); return Promise.resolve(); },
-    openHier: (loc) => { calls.push(["openHier", loc.wrapperSel]); return Promise.resolve(true); },
-    readHier: (loc) => { calls.push(["readHier", loc.wrapperSel]); return Promise.resolve(taState); },
+    openHier: (loc) => { calls.push(["openHier", loc.wrapperSel]); closed = false; return Promise.resolve(true); },
+    readHier: (loc) => { calls.push(["readHier", loc.wrapperSel]); return Promise.resolve(readState()); },
     focusHierSearch: (loc) => { calls.push(["focusHierSearch", loc.wrapperSel]); return Promise.resolve(true); },
     pressEscape: () => { calls.push(["pressEscape"]); return Promise.resolve(); },
-    pressTab: () => { calls.push(["pressTab"]); return Promise.resolve(); }
+    pressTab: () => { calls.push(["pressTab"]); closed = true; return Promise.resolve(); }
   };
   if (!opts.noScrape) act.scrapeTaOptions = (loc) => { calls.push(["scrapeTaOptions", loc.wrapperSel]); return Promise.resolve(scrape); };
   return { act, calls };
