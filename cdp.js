@@ -1732,18 +1732,29 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // sig-change IS the mount signal, so this reads a COMMITTED window — it can't advance before the mount, so
   // it can't re-truncate; overlap + de-dup + stable-2-at-bottom still backstop completeness.
   const awaitRender = async (beforeSig) => { for (let i = 0; i < 3; i++) { await frame(); if (curSig() !== beforeSig) return; } };
+  // Measure the CURRENTLY-mounted window's pixel span (viewport + the virtualizer's overscan, typically
+  // 2–3× clientHeight). Stepping by a fraction of THIS (not the viewport) means far fewer hops to the bottom
+  // — the big visible-scroll speedup — while self-adapting to the tenant's overscan. Falls back to clientHeight.
+  const mountedSpan = () => {
+    const els = curOpts();
+    if (!sc || els.length < 2) return sc ? sc.clientHeight : 0;
+    let top = Infinity, bottom = -Infinity;
+    for (const e of els) { const r = e.getBoundingClientRect(); if (r.top < top) top = r.top; if (r.bottom > bottom) bottom = r.bottom; }
+    return Math.max(sc.clientHeight, bottom - top);
+  };
   collect();
   let steps = 0, stable = 0, atBottom = false;
-  const MAX_STEPS = 80; // safety bound — a curated FoS list is tens of options; overlap steps raise the count
+  const MAX_STEPS = 80; // safety bound (far more than the ~4–8 mounted-span hops a real list needs)
   if (sc) {
-    // OVERLAPPING scroll (~0.8 window) so a row straddling two windows is never skipped between mounts.
-    const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
     doScroll(0); await frame(); collect();
     let priorSig = curSig();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
+      // Hop by 0.6× the mounted-window span → ~40% overlap between consecutive windows, so no row is skipped
+      // even if the span is mis-measured by up to 40% (a big safety margin; de-dup + stable-2 still backstop).
+      const inc = Math.max(60, Math.floor(mountedSpan() * 0.6));
+      doScroll(Math.min(sc.scrollTop + inc, sc.scrollHeight));
       await awaitRender(priorSig);
       priorSig = curSig();
       collect();
