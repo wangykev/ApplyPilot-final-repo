@@ -43,7 +43,10 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     // which now can't reach the (detached) page and silently no-ops. So tear the overlay down here via
     // chrome.scripting (no debugger needed). cdpRemoveInputLock is self-contained + a no-op if never
     // installed / the tab is gone. This is the "Cancel ⇒ detach + remove the lock banner" behavior.
-    try { chrome.scripting.executeScript({ target: { tabId: tid }, func: cdpRemoveInputLock }).catch(() => {}); }
+    // world:"MAIN" is LOAD-BEARING: the overlay was installed via cdpEval (CDP Runtime.evaluate → the page's
+    // MAIN world), so window.__apLock lives there. chrome.scripting defaults to the ISOLATED world, where
+    // __apLock is undefined → cdpRemoveInputLock would no-op and leave the banner stuck (the 2026-07-06 bug).
+    try { chrome.scripting.executeScript({ target: { tabId: tid }, world: "MAIN", func: cdpRemoveInputLock }).catch(() => {}); }
     catch (e) { /* tab gone / no scripting host — nothing to clean */ }
   }
 });
