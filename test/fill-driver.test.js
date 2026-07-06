@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5659,6 +5659,66 @@ test("replayField (SKIP-IF-CORRECT): a DIFFERING value STILL actuates (only-what
   assert.notStrictEqual(r.flag, "replay-already-correct");
   assert.strictEqual(f.value, "Kevin", "a field that differs from the approved value is corrected");
   assert.ok(act.log.some((e) => e[0] === "typeText"), "the differing field WAS actuated");
+});
+
+// ── Phone auto-format tolerance: "(850) 666-0266" == "8506660266" (same number, format-only diff) ──
+test("textValuesMatch (phone): same digits in different formats match; letters/lengths still exact", () => {
+  assert.strictEqual(textValuesMatch("(850) 666-0266", "8506660266"), true, "Workday's auto-format == raw digits");
+  assert.strictEqual(textValuesMatch("(850) 666-0266", "850-666-0266"), true);
+  assert.strictEqual(textValuesMatch("(850) 666-0266", "(850) 666-0266"), true);
+  assert.strictEqual(textValuesMatch("8506660266", "8506660267"), false, "different digits never match");
+  assert.strictEqual(textValuesMatch("Acme Corp", "acme corp"), false, "ordinary text stays exact — not phone-shaped");
+  assert.strictEqual(textValuesMatch("12345", "1-2345"), false, "too few digits to be a phone → exact-only");
+  assert.strictEqual(textValuesMatch("+1 (850) 666-0266", "8506660266"), false, "a country-code prefix changes the digit count — genuinely different");
+  assert.strictEqual(phoneShaped("(850) 666-0266"), true);
+  assert.strictEqual(phoneShaped("Suite 200"), false, "has letters → not phone-shaped");
+});
+
+test("replayField (SKIP-IF-CORRECT, phone): a phone already in Workday's (850) 666-0266 format is left untouched", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-phoneNumber--phoneNumber"]', fieldName: "phoneNumber--phoneNumber", widgetType: "text", value: "(850) 666-0266" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-phoneNumber--phoneNumber", widget_type: "text", current_value: "8506660266", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.flag, "replay-already-correct", "the reformatted phone counts as correct — nothing changes");
+  assert.ok(!act.log.some((e) => e[0] === "typeText"), "the phone is not re-typed");
+});
+
+// ── GENERIC skip-if-correct: page-2 repeating entries stop fully re-filling correct fields ─────────
+test("replay skip-if-correct (REPEATING): a website entry already holding the approved url is left UNTOUCHED", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", "https://a.example")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items: [{ url: "https://a.example" }], fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, Object.assign({}, T_BUDGETS, { skipIfCorrect: true }));
+  const url = out.results.find((r) => /\.url$/.test(r.fieldName));
+  assert.strictEqual(url.status, "filled");
+  assert.strictEqual(url.flag, "replay-already-correct");
+  assert.ok(!act.log.some((e) => e[0] === "typeText" || e[0] === "focusText"), "a correct repeating field is not re-typed (page 2 no longer fully refills)");
+});
+
+test("replay skip-if-correct (REPEATING): a DIFFERING url IS re-filled (only-what-differs, not skip-all)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", "https://old.example")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items: [{ url: "https://new.example" }], fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, Object.assign({}, T_BUDGETS, { skipIfCorrect: true }));
+  const url = out.results.find((r) => /\.url$/.test(r.fieldName));
+  assert.notStrictEqual(url.flag, "replay-already-correct");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "a differing repeating field WAS re-typed");
+  assert.strictEqual(state.entries[0].fields[0].value, "https://new.example");
+});
+
+test("NORMAL fill (no skipIfCorrect): an already-correct repeating url is STILL re-typed (fill path unchanged)", async () => {
+  const state = webState({ entries: [webEntry("webAddress-1--null", "https://a.example")] });
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
+    items: [{ url: "https://a.example" }], fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  const url = out.results.find((r) => /\.url$/.test(r.fieldName));
+  assert.notStrictEqual(url.flag, "replay-already-correct");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "without the flag the fill path is byte-identical (still re-types)");
 });
 
 test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {
