@@ -2164,13 +2164,18 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   (`language[0]` "English" never leaves "Chinese", persistence-poll to the ceiling; even the re-open retry's
   coordinate click fails). So a TRUSTED CDP COORDINATE click lands on the correct portaled option but does NOT
   fire its onClick when the tab is HIDDEN — the coordinate hit-test doesn't reach the non-composited overlay.
-  (Not id-collision, not neighbor, not scroll — coords/target verified correct.) **FIX:** the commit RETRY now
-  dispatches the click DIRECTLY on the option element (`cdpClickDropdownOptionDirect` / `clickDropdownOptionDirect`
-  — the robustClick pointer→mouse→click sequence, element-targeted, no coordinate hit-test), so the handler
-  runs regardless of compositing/visibility. Synthetic (isTrusted:false) so used only as the retry AFTER the
-  trusted coordinate click didn't take; the commit-persistence re-read still gates acceptance (never a false
-  fill). Proficiency dropdowns fill fine hidden (they were empty, not overwrites) — the failure is specific to
-  a hidden coordinate re-selection.
+  (Not id-collision, not neighbor, not scroll — coords/target verified correct.) A DIRECT element-dispatch
+  retry (synthetic robustClick on the option element) was tried — it **also failed** hidden, so it's NOT the
+  click method. **ROOT CAUSE (confirmed via `forceWorkerTimersOff`):** it's the FAST PACING. Forcing the slow
+  (all-`delayFull`) path commits BOTH languages correctly on the first coordinate click (`text-click-commit`).
+  So committing a dropdown RE-SELECTION needs the just-opened dropdown to be INTERACTIVE before the click, and
+  fast pacing (~70ms option-settle) clicks before it is — the click lands (hitTarget=true) but doesn't fire
+  the selection, so it never commits. **FIX:** for an OVERWRITE (`before` is a real enabled option ≠ target),
+  `fillDropdownCdp` inserts a NON-ADAPTIVE `act.delayFull(~700ms)` before the commit click (replicates the
+  slow path's option-settle duration). EMPTY fills (`before` = the disabled placeholder, not an enabled
+  option) don't race → stay fast, no beat. Net FASTER on the failing case (commits instead of burning two
+  ~10s fail-poll+retry cycles). Proficiency dropdowns fill fine hidden because they're EMPTY (not overwrites).
+  (The element-dispatch retry is now moot — the primary commits — but left as a harmless fallback.)
 - **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
   aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
   across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The

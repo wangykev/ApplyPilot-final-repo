@@ -1166,6 +1166,17 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   const fullIdx = fresh.options.findIndex((o) => !o.disabled && norm(o.text) === norm(target));
   const idxCanary = (fresh.options[fullIdx] && norm(fresh.options[fullIdx].text) === norm(target)) ? "" : " [option-index desync vs scrape — text-keyed click used]";
 
+  // OVERWRITE reliability (2026-07-06, confirmed via forceWorkerTimersOff: the slow/full path commits, the
+  // fast path races). Committing a RE-SELECTION (replacing a real prior value) needs the just-opened dropdown
+  // to be INTERACTIVE before the click — under fast pacing the click lands on the correct option (hitTarget=
+  // true) but doesn't fire the selection, so it never commits (then burns the full commit ceiling failing).
+  // Give an OVERWRITE a NON-ADAPTIVE settle before the click (replicates the working slow path). EMPTY fills
+  // (`before` = the disabled placeholder, not an enabled option) don't race → stay fast, no beat. `act.delay`
+  // is unaffected — this is a targeted commit-reliability wait for pre-filled dropdowns only (rare on a fresh
+  // form). Net FASTER on the failing case: it commits instead of two ~10s fail-poll+retry cycles.
+  const isOverwrite = !!before && norm(before) !== norm(target) && enabledTexts.some((t) => norm(t) === norm(before));
+  if (isOverwrite && act.delayFull) await act.delayFull(budgets.settleIntervalMs * 2); // ~700ms interactive settle (matches the slow path's option-settle duration)
+
   let res = await commitByClick(act.clickDropdownOptionByText);
   if (!res.ok) {
     // One retry: re-open if the click closed the list without committing, then re-click. RETRY VIA A DIRECT
