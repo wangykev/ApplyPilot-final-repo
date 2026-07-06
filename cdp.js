@@ -1721,12 +1721,15 @@ async function cdpScrapeTaOptions(wrapperSel) {
   const settleWindow = async () => { let last = -1; for (let i = 0; i < 16; i++) { await frame(); const n = curOpts().length; if (n === last) return; last = n; } };
   const sc = findScroller();
   collect();
+  const initialMounted = curOpts().length; // rows present on open, before any scroll (DIAG)
+  const trace = [];                          // per-step {t:scrollTop, m:mounted-now, s:total-seen} (DIAG)
   let steps = 0, stable = 0, atBottom = false;
   const MAX_STEPS = 80; // safety bound — a curated FoS list is tens of options; overlap steps raise the count
   if (sc) {
     // OVERLAPPING scroll (~0.8 window) so a row straddling two windows is never skipped between mounts.
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
     sc.scrollTop = 0; await settleWindow(); collect();
+    trace.push({ t: Math.round(sc.scrollTop), m: curOpts().length, s: seen.size });
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
@@ -1734,6 +1737,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
       await settleWindow();
       collect();
       steps++;
+      trace.push({ t: Math.round(sc.scrollTop), m: curOpts().length, s: seen.size });
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
       if (seen.size === before && (atBottom || movedNothing)) { if (++stable >= 2) break; } else stable = 0;
@@ -1741,7 +1745,8 @@ async function cdpScrapeTaOptions(wrapperSel) {
   }
   const options = Array.from(seen.keys());
   return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
-    scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
+    scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null,
+    initialMounted, trace };
 }
 
 // Scroll-accumulate the source promptOption LABELS — a VIRTUALIZED list needs scrolling to enumerate EVERY
@@ -2408,7 +2413,16 @@ function makeCdpActuation(llmConfig) {
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") : "FAILED");
+      if (r && r.ok) {
+        console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r.count + " options" + (r.atBottom ? " (reached bottom)" : ""));
+        // DIAG (2026-07-05): full scroll metrics + per-step trace to root-cause the hidden truncation.
+        // scroller:false OR sh≈ch ⇒ nothing to scroll (short/unmounted list). m stuck while t climbs ⇒ the
+        // hidden virtualizer isn't rendering new rows on programmatic scroll (a scroll-event/paint issue,
+        // not pacing). s growing with t ⇒ scroll+mount working (pacing/step tuning).
+        console.log("[ApplyPilot][CDP-SCRAPE-TA][diag]", `scroller:${r.scrollerFound} sh:${r.scrollHeight} ch:${r.clientHeight} top:${r.scrollTop} initMounted:${r.initialMounted} steps:${r.steps} atBottom:${r.atBottom} capped:${r.cappedOut}`, "trace:", JSON.stringify(r.trace));
+      } else {
+        console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, "FAILED");
+      }
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
