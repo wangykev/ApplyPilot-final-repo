@@ -178,3 +178,20 @@ Two robustness fixes (CDP substrate; live-verify pending):
 
 Unit suite unaffected (490 green — these are substrate methods, not unit-tested). CLAUDE.md updated (input-lock
 bullet + the multi-page clickPageNext note).
+
+## 2026-07-06 — Operator-cancel cause on the summary page + world:MAIN overlay teardown (live-verified pieces)
+
+Live testing of the detach/banner behavior surfaced two fixes:
+
+- **Stranded input-lock overlay on Cancel → `world:"MAIN"`.** The overlay is installed via `cdpEval` (CDP
+  Runtime.evaluate → the page's MAIN world), so `window.__apLock` lives there. The onDetach cleanup used
+  `chrome.scripting.executeScript` WITHOUT a world → ran in the ISOLATED world where `__apLock` is undefined →
+  `cdpRemoveInputLock` no-op'd and the "please don't click or type" banner stayed STUCK after Cancel. Passing
+  `world:"MAIN"` fixes it. **LIVE-VERIFIED**: Cancel now clears the banner (operator confirmed). X and Cancel
+  BOTH detach (Chrome-native infobar, indistinguishable) — accepted; no auto-reattach.
+- **Operator-cancel cause on the summary (+ SW log).** A mid-run detach makes the in-flight fill's CDP calls
+  fail, and the errors looked causeless. Now `chrome.debugger.onDetach` writes a `lastRunAbort` marker (reason
+  `operator-cancelled` when Chrome's `reason==="canceled_by_user"`, else `debugger-detached`), cleared at the
+  next `cdpAttach`. The SW log says "⛔ OPERATOR CANCELLED mid-run …", and `summary.js` renders a red
+  `abort-banner` at the top (shown even when the cancel wrote no bundle) explaining the incomplete/errored
+  state. Unit suite unaffected (490 green). CLAUDE.md input-lock bullet updated.
