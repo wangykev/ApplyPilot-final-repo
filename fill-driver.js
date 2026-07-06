@@ -585,17 +585,20 @@ const closeAndVerifyBlank = async (act, loc, before, budgets) => {
   const dr = act.delayRender || act.delayFull; // adaptive close-settle (fast fg/worker-fast; full on the slow path) — fallback for older fakes
   const blankNow = (s) => !!s && before != null && norm(s.triggerText) === norm(before);
   let s = null;
-  for (let attempt = 1; attempt <= budgets.openRetries; attempt++) {
+  // Poll until the portaled LISTBOX is truly GONE — NOT merely aria-expanded="false". aria flips the instant
+  // Escape fires, but the listbox lingers a beat while it unmounts and its options stay CLICKABLE; returning
+  // on aria alone let the NEXT recon field's open-click land on a lingering option (the live "Landline
+  // committed to Phone Device Type" stray — the next field sat exactly where that option rendered). The
+  // adaptive wait keeps the happy path fast (breaks the instant the listbox is gone — usually ~1 poll); a
+  // real deadline (the old openRetries×reopenSettleMs budget) bounds a genuinely slow close so we NEVER
+  // return with the list still up. Re-Escape each poll (idempotent on an already-closing list; never reopen).
+  const deadline = Date.now() + (budgets.openRetries || 3) * (budgets.reopenSettleMs || 400);
+  do {
     await act.pressEscape();
-    // ADAPTIVE (2026-07-06): the close-settle is now the fast delayRender, not the never-scaled delayFull —
-    // this was the ~0.4s×N dead time BETWEEN recon fields (open/close are quick; this wait wasn't). Safe:
-    // the ariaExpanded read below GATES it — a too-short wait reads "still open" → the loop Escapes+waits
-    // again (up to openRetries), so the close is still confirmed; only the happy-path wall-clock shrinks.
     await dr(budgets.reopenSettleMs);
     s = await act.readDropdownState(loc);
-    if (s && s.ariaExpanded === "false") break; // closed — done (blank decided by the value)
-    // still open (or unreadable) → Escape again, NEVER reopen; give the close real time
-  }
+    if (s && (!s.listboxPresent || s.optionCount === 0)) break; // fully closed → no lingering clickable option
+  } while (Date.now() < deadline);
   return { blank: blankNow(s), after: s ? s.triggerText : null };
 };
 
