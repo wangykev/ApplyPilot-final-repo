@@ -1700,10 +1700,31 @@ async function cdpScrapeTaOptions(wrapperSel) {
   const sb = w.querySelector('input[data-automation-id="searchBox"]');
   const acId = sb ? sb.getAttribute("aria-controls") : null;
   const acEl = acId ? document.getElementById(acId) : null;
-  const optSel = '[role="option"]';
-  const root = (acEl && acEl.querySelector(optSel)) ? acEl : document;
-  const curOpts = () => Array.from(root.querySelectorAll(optSel))
-    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]'));
+  // rAF races a setTimeout fallback so a loop never HANGS on a hidden tab (frozen rAF). Used both to WAIT
+  // for the list to render (below) and to pace the virtualizer between scroll steps (see doScroll).
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
+  const labelOf = (el) => (el.getAttribute && el.getAttribute("data-automation-label")) || (el.textContent || "").trim();
+  // A REAL option leaf: visible, not the disabled placeholder, and NOT a selectedItem CHIP. Chips carry
+  // role="option" markup too (the documented chip-contamination), so they must NEVER count as options — else
+  // a prefilled field's chip alone locks the selector + masks the real list (countryPhoneCode diag 2026-07-06:
+  // role=2/prompt=2 were the 2 CHIPS, 0 real leaves).
+  const nonChip = (el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]');
+  // Leaves are role=option on most tenants, promptOption-only on some (the divergence cdpReadHierState handles).
+  const OPT_SELECTORS = ['[role="option"]', '[data-automation-id="promptOption"]'];
+  const optsFor = (sel) => { const scope = (acEl && acEl.querySelector(sel)) ? acEl : document; return Array.from(scope.querySelectorAll(sel)).filter(nonChip); };
+  const bannerUp = () => Array.from(document.querySelectorAll('[data-automation-id="promptTitle"]'))
+    .some((el) => isVisible(el) && /no matches found/i.test((el.textContent || "").trim()));
+  // WAIT for the list to render, then pick the selector that finds REAL (non-chip) leaves. The searchBox
+  // becomes visible a beat BEFORE the virtualized rows mount, so an immediate read finds only chips (0 real)
+  // — that was the countryPhoneCode 0-options bug. Frame-poll until non-chip leaves appear (or a no-match
+  // banner, or a ~24-frame ceiling). FoS is already rendered when scraped mid-fill → resolves at frame 0.
+  const pickSel = () => OPT_SELECTORS.find((sel) => optsFor(sel).length) || null;
+  let optSel = pickSel();
+  for (let i = 0; i < 24 && !optSel && !bannerUp(); i++) { await frame(); optSel = pickSel(); }
+  optSel = optSel || '[role="option"]';
+  const roleCount = optsFor('[role="option"]').length;                       // non-chip counts (diagnostic)
+  const promptCount = optsFor('[data-automation-id="promptOption"]').length;
+  const curOpts = () => optsFor(optSel);
   // Scroll container = the nearest scrollable ancestor of an option (overflow-y auto/scroll +
   // scrollHeight > clientHeight); fall back to acEl / the option's parent.
   const findScroller = () => {
@@ -1715,11 +1736,9 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
     return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
   };
-  // ONE rAF racing a setTimeout fallback so the loop never HANGS on a hidden tab (frozen rAF → the timer wins).
-  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(fin); setTimeout(fin, 250); });
-  const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
-  const curSig = () => { let s = ""; for (const o of curOpts()) s += (o.textContent || "").trim() + ""; return s; }; // signature of the CURRENTLY-mounted window
-  const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
+  const seen = new Map(); // text -> first-seen order (de-dupe, preserve order)
+  const curSig = () => { let s = ""; for (const o of curOpts()) s += labelOf(o) + ""; return s; }; // signature of the CURRENTLY-mounted window (change = a new window committed); labelOf to match collect
+  const collect = () => { for (const o of curOpts()) { const t = labelOf(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
   // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive a react virtualizer's row re-render on
   // a HIDDEN tab — the mounted set stayed a FROZEN 17 rows → the FoS list truncated to the on-open window.
@@ -1766,6 +1785,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
   }
   const options = Array.from(seen.keys());
   return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
+    roleCount, promptCount, usedSel: optSel,
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
 
@@ -2434,7 +2454,7 @@ function makeCdpActuation(llmConfig) {
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") : "FAILED");
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]" : "FAILED");
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list

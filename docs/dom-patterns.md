@@ -2113,3 +2113,25 @@ The rapidfire work surfaced four load-bearing DOM/runtime facts (all live-verifi
   FIX: gate every read-only recon close on the LISTBOX/LEAVES being GONE — `optionCount === 0` (dropdown,
   `closeAndVerifyBlank`) / `leafCount === 0` (typeahead, `awaitTypeaheadClosed`; leaves = `promptOption`s) —
   before the next field opens. `listboxPresent`/`leafCount` come from `cdpReadDropdownState`/`cdpReadHierState`.
+
+## 2026-07-06 — Typeahead option scrape: chips carry role=option + the list mounts a beat AFTER the searchBox opens
+
+Live on Magna wd3, page 1, `countryPhoneCode` (a flat, prefilled-kept typeahead). The end-of-page review
+recon (`captureFieldOptions` → `cdpScrapeTaOptions`) logged `0 options [role=2 prompt=2]` while the widget
+VISIBLY opened a full country-code list. Two stacked facts, both now handled in `cdpScrapeTaOptions`:
+
+- **Selected-value CHIPS carry `role="option"` markup** (the same chip-contamination seen in dropdown scrapes
+  — `<li role="option" data-automation-id="selectedItem">` inside `selectedItemList`). A prefilled typeahead
+  shows its value as ~1–2 such chips. The scrape counted them (`role=2`), which (a) LOCKED the option-selector
+  to `role=option` and (b) were then filtered out by the visible/not-in-selectedItemList guard → **0 real
+  options**. Fix: exclude `selectedItemList` descendants BEFORE choosing the selector (`nonChip`), so chips
+  can neither mask nor lock the real list.
+- **The virtualized option rows mount a beat AFTER the searchBox becomes visible.** `ensureFocused` gates on
+  `searchBox.visible`, which flips true before the leaves render, so a single immediate scrape reads 0. Fix:
+  `cdpScrapeTaOptions` frame-polls (rAF, ~24-frame ceiling, bails on a "No matches found" banner) until
+  NON-CHIP leaves appear, THEN scrapes. Field-of-Study is scraped mid-fill when its list is already rendered,
+  so it resolves at frame 0 — unchanged (still 65).
+- **Selector divergence confirmed:** `countryPhoneCode`'s real leaves are `data-automation-id="promptOption"`
+  (NOT `role=option`), matching the hierarchical-typeahead model (`cdpReadHierState`); FoS's are `role=option`.
+  `cdpScrapeTaOptions` now tries `role=option` first, falls back to `promptOption`, picking whichever finds
+  non-chip leaves (returns `roleCount`/`promptCount`/`usedSel` in the `[CDP-SCRAPE-TA]` log for future triage).
