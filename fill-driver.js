@@ -3982,25 +3982,38 @@ async function captureDropdownOptions(act, loc, budgets) {
 // same-vocabulary fields (FoS across education entries; language/proficiency dropdowns across entries)
 // re-open ONCE, not N times. Non-fatal throughout.
 async function captureChoiceOptions(act, results, budgets) {
-  if (!act) return;
-  const cache = new Map(); // key → options[] | null (already attempted)
+  // REUSE-SIBLINGS ONLY (operator choice 2026-07-05 — kill the slow end-of-page "recon"). The review
+  // editor's alternatives list for a choice field is populated ONLY by reusing options already captured
+  // from a SAME-VOCABULARY sibling — NO end-of-page re-open / virtualized scroll. A committed/filled field
+  // (or a start-scraped flat typeahead) carries its own options; a prefilled-kept field of the same
+  // vocabulary (e.g. education[1].degree when education[0].degree was filled) reuses them for FREE. A field
+  // whose vocabulary has NO sibling-with-options is left as-is → the viewer degrades that entry to a text
+  // box / tier editor (value preserved, still editable). This removes the re-open + scroll cost for
+  // already-correct fields (the two slow things the operator flagged). Pure data copy — no `act` actuation
+  // (act/budgets kept for the signature). NOTE: this no longer calls captureFieldOptions (now only
+  // unit-tested) or captureDropdownOptions (still used by the generic-section shape capture, L2269/L4172).
+  const keyOf = (rec) => {
+    if (!rec) return null;
+    if (rec.widgetType === "typeahead" && rec.captureOptions) return "ta:" + (rec.captureKey || rec.fieldName);
+    if (rec.widgetType === "dropdown" && /\[\d+\]\./.test(rec.fieldName || "")) return "dd:" + String(rec.fieldName).split(".").pop(); // repeating-section stem = the shared vocabulary
+    return null;
+  };
+  // Pass 1: index every already-captured option list by vocabulary key (order-independent — a sibling
+  // filled LATER in the list still seeds an earlier prefilled-kept field).
+  const bySibling = new Map();
+  for (const rec of results || []) {
+    const key = keyOf(rec);
+    if (key && Array.isArray(rec.options) && rec.options.length && !bySibling.has(key)) bySibling.set(key, rec.options.slice());
+  }
+  // Pass 2: fill in records that LACK options from a sibling's list (no re-open); lone vocabularies (no
+  // sibling with options) are left untouched → text box / tier editor in the viewer.
   for (const rec of results || []) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
-    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown already has them
-    let key, scrape;
-    if (rec.widgetType === "typeahead" && rec.captureOptions && act.scrapeTaOptions) {
-      key = "ta:" + (rec.captureKey || rec.fieldName);
-      scrape = () => captureFieldOptions(act, { wrapperSel: rec.auditLoc }, budgets);
-    } else if (rec.widgetType === "dropdown" && act.openDropdown && /\[\d+\]\./.test(rec.fieldName || "")) {
-      // REPEATING-section dropdowns only (fieldName = "education[0].degree" / "language[1].readingProficiency"
-      // — small lists). Flat dropdowns (country/state/phone, page 1) are SKIPPED: those are large cold lists
-      // (re-opening them is exactly the M27.C cost) and they fill fresh WITH options on a first run anyway.
-      key = "dd:" + String(rec.fieldName).split(".").pop(); // recName stem (degree/language/readingProficiency) — same stem ⇒ same option vocabulary
-      scrape = () => captureDropdownOptions(act, { wrapperSel: rec.auditLoc }, budgets);
-    } else continue;
-    if (!cache.has(key)) cache.set(key, await scrape());
-    const opts = cache.get(key);
+    if (Array.isArray(rec.options) && rec.options.length) continue;
+    const key = keyOf(rec);
+    if (!key) continue;
+    const opts = bySibling.get(key);
     if (opts && opts.length) rec.options = opts.slice();
   }
 }

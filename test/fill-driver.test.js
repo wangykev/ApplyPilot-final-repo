@@ -4966,13 +4966,14 @@ const taggedRec = (over = {}) => Object.assign({
   captureOptions: true, captureKey: "fieldOfStudy", auditLoc: "[w-fos]"
 }, over);
 
-test("choice-capture: typeahead scrapes ONCE for two same-key records and copies options to both", async () => {
-  const recs = [taggedRec({ auditLoc: "[w-fos-0]" }), taggedRec({ auditLoc: "[w-fos-1]" })];
+test("choice-capture: a prefilled-kept typeahead REUSES a filled same-key sibling's options (no scrape)", async () => {
+  // reuse-siblings only: [0] carries options (start-scraped/committed) → seeds; [1] same captureKey lacks
+  // options → reuses [0]'s list for free. NO re-open / scroll.
+  const recs = [taggedRec({ auditLoc: "[w-fos-0]", options: FOS_OPTS.slice() }), taggedRec({ auditLoc: "[w-fos-1]" })];
   const { act, calls } = makeCaptureAct();
   await captureChoiceOptions(act, recs, CAP_BUDGETS);
-  assert.deepStrictEqual(recs[0].options, FOS_OPTS);
-  assert.deepStrictEqual(recs[1].options, FOS_OPTS);
-  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // cached per captureKey → one re-open
+  assert.deepStrictEqual(recs[1].options, FOS_OPTS); // reused from the sibling
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0); // reuse-only — never scrapes
 });
 
 test("choice-capture: untagged-typeahead / not-filled / unlocated records are untouched", async () => {
@@ -4987,12 +4988,12 @@ test("choice-capture: untagged-typeahead / not-filled / unlocated records are un
   assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0);
 });
 
-test("choice-capture: distinct captureKeys each get their own scrape", async () => {
-  const recs = [taggedRec({ auditLoc: "[w-fos]", captureKey: "fieldOfStudy" }), taggedRec({ auditLoc: "[w-cert]", captureKey: "certification", fieldName: "cert" })];
+test("choice-capture: a LONE field (no sibling with options) is left untouched — no scrape/open", async () => {
+  const recs = [taggedRec({ auditLoc: "[w-fos]" })]; // lone typeahead, no options, no same-key sibling
   const { act, calls } = makeCaptureAct();
   await captureChoiceOptions(act, recs, CAP_BUDGETS);
-  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 2);
-  assert.ok(recs[0].options && recs[1].options);
+  assert.strictEqual(recs[0].options, undefined); // left as-is → tier editor in the viewer
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0);
 });
 
 // ── captureDropdownOptions (read-only open → enabled texts → no-commit close) ──────────────
@@ -5030,16 +5031,17 @@ test("dropdown-capture is READ-ONLY: never commits (no type/arrow/click-option) 
   assert.deepStrictEqual(calls.filter((c) => !allowed.has(c[0])), [], "dropdown-capture made a non-read-only call");
 });
 
-test("choice-capture: a repeating prefilled-kept dropdown (no options) gets rec.options; a committed one is skipped", async () => {
+test("choice-capture: a prefilled-kept dropdown REUSES a filled same-vocab sibling; a lone one is left untouched (no re-open)", async () => {
   const recs = [
-    { fieldName: "education[0].degree", widgetType: "dropdown", status: "filled", auditLoc: "[w-degree]" },              // kept, no options → capture
-    { fieldName: "language[0].language", widgetType: "dropdown", status: "filled", auditLoc: "[w-lang]", options: ["English", "Chinese"] } // committed (has options) → skip
+    { fieldName: "education[0].degree", widgetType: "dropdown", status: "filled", auditLoc: "[w-d0]", options: ["Bachelors", "Masters", "Doctorate"] }, // committed → seeds dd:degree
+    { fieldName: "education[1].degree", widgetType: "dropdown", status: "filled", auditLoc: "[w-d1]" }, // prefilled-kept, SAME vocab → reuse
+    { fieldName: "language[0].language", widgetType: "dropdown", status: "filled", auditLoc: "[w-lang]" } // LONE vocab (no sibling with options) → untouched
   ];
   const { act, calls } = makeDropdownAct();
   await captureChoiceOptions(act, recs, T_BUDGETS);
-  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]);
-  assert.deepStrictEqual(recs[1].options, ["English", "Chinese"]); // untouched
-  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // only the optionless one re-opened
+  assert.deepStrictEqual(recs[1].options, ["Bachelors", "Masters", "Doctorate"]); // reused from the sibling
+  assert.strictEqual(recs[2].options, undefined); // lone → text box in the viewer
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0); // reuse-only — NO re-open
 });
 
 test("choice-capture: a FLAT dropdown (page 1, no [idx].) is NOT re-opened — M27.C preserved for big cold lists", async () => {
@@ -5050,16 +5052,16 @@ test("choice-capture: a FLAT dropdown (page 1, no [idx].) is NOT re-opened — M
   assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0); // never re-opened
 });
 
-test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cache), both get options", async () => {
+test("choice-capture: two same-stem repeating dropdowns that BOTH lack options get none (reuse-only, no re-open)", async () => {
   const recs = [
     { fieldName: "language[0].readingProficiency", widgetType: "dropdown", status: "filled", auditLoc: "[w-r0]" },
     { fieldName: "language[1].readingProficiency", widgetType: "dropdown", status: "filled", auditLoc: "[w-r1]" }
   ];
   const { act, calls } = makeDropdownAct();
   await captureChoiceOptions(act, recs, T_BUDGETS);
-  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"]);
-  assert.deepStrictEqual(recs[1].options, ["Bachelors", "Masters", "Doctorate"]);
-  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // cached by stem "readingProficiency"
+  assert.strictEqual(recs[0].options, undefined); // no sibling carries options → nothing to reuse
+  assert.strictEqual(recs[1].options, undefined);
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0); // reuse-only — NO re-open
 });
 
 // ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
