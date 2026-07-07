@@ -260,3 +260,24 @@ Live testing of the detach/banner behavior surfaced two fixes:
   next `cdpAttach`. The SW log says "⛔ OPERATOR CANCELLED mid-run …", and `summary.js` renders a red
   `abort-banner` at the top (shown even when the cancel wrote no bundle) explaining the incomplete/errored
   state. Unit suite unaffected (490 green). CLAUDE.md input-lock bullet updated.
+
+## 2026-07-06 — Best-effort auto-dismiss of a popup covering Save & Continue (shadow-DOM aware)
+
+Follow-up to the blocking-popup DETECTION (which live-verified). Operator opted into auto-CLOSING the popup so
+the walk can proceed. Live case: the blocker is `div.simplify-jobs-shadow-root` — Simplify renders into a
+SHADOW DOM, so its X button lives in `host.shadowRoot` and is invisible to a light-DOM query / `elementFromPoint`
+(which only ever returns the shadow HOST).
+
+- **`cdpFindDismissControl(cx,cy)`** (cdp.js): reads the blocker at the button's center; searches its OPEN
+  `shadowRoot` (Simplify) or, for a regular modal, its subtree climbed to a dialog/overlay ancestor. Returns the
+  viewport rect of ONE clearly-dismissive control — X-glyph / aria-label|title|class close|dismiss / text
+  "Close"/"No thanks"/"Not now"/"Skip"/"Dismiss" — for a trusted click. **SAFETY**: an affirmative deny-list
+  (`accept|agree|ok|got it|allow|yes|confirm|continue|submit|save|…|autofill|apply`) is checked FIRST, so a
+  consent/accept button is NEVER clicked; big containers (>120px) are skipped (target the icon, not the panel);
+  a CLOSED shadow root or no safe control → not-found. Never removes/hides DOM.
+- **`clickPageNext`**: on a detected block, try the dismiss ONCE (trusted click on the control), poll ~1.5s for
+  the cover to clear (`elementFromPoint` no longer the blocker), then click Save & Continue → `{clicked:true,
+  dismissed}`. If it stays covered / no safe control → the existing halt `click-refused:blocked` (+ `dismissTried`).
+
+Unit suite unaffected (490 green — CDP substrate). CLAUDE.md multi-page `clickPageNext` note updated. Live-verify
+pending on the real Simplify overlay.
