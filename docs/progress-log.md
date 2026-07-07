@@ -164,13 +164,14 @@ every overwrite.
   commit with the full ceiling. **The beats split on REAL tab visibility** (`act.visible` = `cdpVisible`, now
   exposed to the fill layer — tab active + window not minimized, NOT `cdpFast` which is true for hidden+worker-
   timers) because the debounce is a PAINT thing (tiny visible, ~700ms hidden): **VISIBLE = fast `30` / slow
-  `100`; HIDDEN = fast `100` / slow `700`** (`overwriteFastBeatMs`/`overwriteSlowBeatMs` + `*VisibleMs`). A
+  `100`; HIDDEN = fast `120` / slow `700`** (`overwriteFastBeatMs`/`overwriteSlowBeatMs` + `*VisibleMs`). A
   `[CDP-DD-REFILL]` line logs `VISIBLE|hidden fastBeat=Nms → committed on FAST attempt | MISSED fast → refilled
   slow` per overwrite for retuning. `commitByClick` gained an optional ceiling arg; the commit-PERSISTENCE
   re-read still gates every accept → a fast miss can only cost a slow refill, NEVER a wrong/silent fill. EMPTY
   fills skip the beat (rapidfire, unchanged).
 - **Live-tuning history:** 300 (initial) → 70 hidden (BOTH languages refilled — fallback verified) → 100 hidden
-  (committed fast) → visibility split, 30 visible (committed fast) / 100 hidden. All live-verified on Magna.
+  (committed fast) → visibility split, 30 visible (committed fast) / 100 hidden → hidden bumped to 120 (small
+  margin over the verified-fast 100). All live-verified on Magna.
 - Docs synced (CLAUDE.md dropdowns rule, dom-patterns Vector A FINAL SHAPE). New unit tests pin the slow refill
   (a fast miss re-opens and commits, ending `filled` — never left flipped) and the visibility split (visible
   fast beat < hidden's). `node -c` clean; unit suite green (**485**). Merged to main.

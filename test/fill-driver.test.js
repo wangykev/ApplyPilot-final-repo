@@ -846,7 +846,7 @@ test("dropdown OVERWRITE beat is VISIBILITY-aware: visible uses a SMALLER fast b
   const fastBeatOf = (arr) => Math.max(0, ...arr.filter((b) => b > 0 && b < 500)); // audit settle (600) excluded
   const vb = fastBeatOf(vis._beats), hb = fastBeatOf(hid._beats);
   assert.ok(vb <= 30, `visible fast beat ≤30 (got ${vb})`);
-  assert.ok(hb > 30 && hb <= 100, `hidden fast beat ~100 (got ${hb})`);
+  assert.ok(hb > 30 && hb <= 120, `hidden fast beat ~120 (got ${hb})`);
   assert.ok(vb < hb, `visible beat (${vb}) < hidden beat (${hb})`);
 });
 

@@ -2194,8 +2194,9 @@ the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdow
   **The beats SPLIT on REAL tab visibility** (`act.visible` = `cdpVisible`, tab active + window not minimized —
   NOT `cdpFast`, which is true for hidden+worker-timers): the debounce is a PAINT thing, so a VISIBLE tab needs
   a tiny beat and a HIDDEN tab needs ~700ms. Live-tuned + verified: **VISIBLE = fast `30` / slow `100`; HIDDEN =
-  fast `100` / slow `700`** (`overwriteFastBeatMs`/`overwriteSlowBeatMs` + the `*VisibleMs` pair). 70ms hidden
-  refilled both languages (proving the fallback); 100ms hidden committed fast; 30ms visible committed fast. A
+  fast `120` / slow `700`** (`overwriteFastBeatMs`/`overwriteSlowBeatMs` + the `*VisibleMs` pair). 70ms hidden
+  refilled both languages (proving the fallback); 100ms hidden committed fast (120 keeps a small margin); 30ms
+  visible committed fast. A
   `[CDP-DD-REFILL]` line logs `"<before>"→"<target>" VISIBLE|hidden fastBeat=Nms → committed on FAST attempt |
   MISSED fast → refilled slow(~Nms): OK/FAILED` per overwrite, so the operator retunes from the log. The
   commit-PERSISTENCE re-read still gates every accept, so a fast miss can only cost a slow refill — never a

@@ -332,7 +332,7 @@ const DEFAULT_BUDGETS = {
   // commits fast at 100ms, visible at 30ms. overwriteFailFastMs caps how long attempt 1 waits to confirm/deny
   // the commit so a MISS is detected cheaply (further capped by commitCeilingMs). Empty fills never race and
   // skip the beat entirely. Watch [CDP-DD-REFILL] (it logs VISIBLE/hidden + the beat) to retune.
-  overwriteFastBeatMs: 100,        // HIDDEN fast-attempt beat (live-verified: commits fast at 100ms hidden)
+  overwriteFastBeatMs: 120,        // HIDDEN fast-attempt beat (live-verified: commits fast at 100ms hidden; 120 = a small margin)
   overwriteSlowBeatMs: 700,        // HIDDEN slow refill beat (the proven ~700ms ≈ settleIntervalMs*2)
   overwriteFastBeatVisibleMs: 30,  // VISIBLE fast-attempt beat (visible paints → tiny debounce)
   overwriteSlowBeatVisibleMs: 100, // VISIBLE slow refill beat (a rare visible miss refills quickly)
