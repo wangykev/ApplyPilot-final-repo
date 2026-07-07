@@ -741,6 +741,30 @@ test("dropdown OVERWRITE fast-first: a fast-attempt MISS re-opens and commits on
   assert.ok(act.log.filter(([m]) => m === "openDropdown").length >= 2, "re-opened the list for the refill");
 });
 
+test("dropdown OVERWRITE beat is VISIBILITY-aware: visible uses a SMALLER fast beat than hidden", async () => {
+  // The overwrite debounce is a PAINT thing (tiny visible, ~700ms hidden), so the fast beat splits on
+  // act.visible: visible=30ms, hidden=100ms. Record the delayFull durations and confirm the overwrite's
+  // fast beat (the largest sub-500ms delayFull; the audit settle is 600, excluded) is smaller when visible.
+  const mk = (visible) => {
+    const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }];
+    const a = makeFakeAct([ddField({ triggerText: "United States of America", options: opts })]);
+    a.visible = async () => visible;
+    a._beats = [];
+    const d = a.delayFull;
+    a.delayFull = async (ms) => { a._beats.push(ms); return d(ms); };
+    return a;
+  };
+  const vis = mk(true), hid = mk(false);
+  const prof = { personal_info: { country: ["Afghanistan", "United States of America"] } }; // tier-0 upgrade → overwrite
+  await drivePageFill(vis, prof, {}, {}, T_BUDGETS);
+  await drivePageFill(hid, prof, {}, {}, T_BUDGETS);
+  const fastBeatOf = (arr) => Math.max(0, ...arr.filter((b) => b > 0 && b < 500)); // audit settle (600) excluded
+  const vb = fastBeatOf(vis._beats), hb = fastBeatOf(hid._beats);
+  assert.ok(vb <= 30, `visible fast beat ≤30 (got ${vb})`);
+  assert.ok(hb > 30 && hb <= 100, `hidden fast beat ~100 (got ${hb})`);
+  assert.ok(vb < hb, `visible beat (${vb}) < hidden beat (${hb})`);
+});
+
 test("closeDropdownConfirmed: waits for the LISTBOX to unmount (options gone), NOT just aria-expanded=false", async () => {
   // The close race: aria-expanded flips to "false" the instant a commit/Escape fires, but the portaled
   // options linger a beat while they unmount and STAY CLICKABLE. Gating on aria alone returns too early →

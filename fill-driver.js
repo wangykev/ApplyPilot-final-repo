@@ -323,14 +323,19 @@ const DEFAULT_BUDGETS = {
   // fill work that already runs after the triggering field (so the post-fold scan sees
   // the reveal already mounted). The cap is a runaway backstop (chained reveals are rare).
   maxCascadeRounds: 3,
-  // Dropdown OVERWRITE commit (2026-07-06 fast-first). Committing a RE-SELECTION needs the just-opened list
-  // past a Workday-internal option-click DEBOUNCE (no DOM signal — the [DD-READY] recon). Rather than pay the
-  // proven ~700ms on every overwrite, ATTEMPT 1 waits only overwriteFastBeatMs then clicks; if that misses,
-  // ATTEMPT 2 re-opens and pays the full ~700ms (settleIntervalMs*2). overwriteFastBeatMs is THE tuning knob —
-  // watch the [CDP-DD-REFILL] log and lower it to where most overwrites still commit on the FAST attempt
-  // (empty fills never race and skip the beat entirely). overwriteFailFastMs caps how long attempt 1 waits to
-  // confirm/deny the commit so a MISS is detected cheaply (further capped by commitCeilingMs).
-  overwriteFastBeatMs: 300,
+  // Dropdown OVERWRITE commit (2026-07-06 fast-first, VISIBILITY-AWARE). Committing a RE-SELECTION needs the
+  // just-opened list past a Workday-internal option-click DEBOUNCE (no DOM signal — the [DD-READY] recon). The
+  // debounce is a PAINT thing: tiny when the tab is VISIBLE (painting), ~700ms when HIDDEN (not painting, even
+  // with worker-timers — forceWorkerTimersOff was irrelevant to the original fix). So the beats split on REAL
+  // tab visibility (act.visible): ATTEMPT 1 waits the fast beat then clicks; on a MISS, ATTEMPT 2 re-opens and
+  // pays the slow beat. VISIBLE overwrites commit at a much lower beat than hidden — live-verified: hidden
+  // commits fast at 100ms, visible at 30ms. overwriteFailFastMs caps how long attempt 1 waits to confirm/deny
+  // the commit so a MISS is detected cheaply (further capped by commitCeilingMs). Empty fills never race and
+  // skip the beat entirely. Watch [CDP-DD-REFILL] (it logs VISIBLE/hidden + the beat) to retune.
+  overwriteFastBeatMs: 100,        // HIDDEN fast-attempt beat (live-verified: commits fast at 100ms hidden)
+  overwriteSlowBeatMs: 700,        // HIDDEN slow refill beat (the proven ~700ms ≈ settleIntervalMs*2)
+  overwriteFastBeatVisibleMs: 30,  // VISIBLE fast-attempt beat (visible paints → tiny debounce)
+  overwriteSlowBeatVisibleMs: 100, // VISIBLE slow refill beat (a rare visible miss refills quickly)
   overwriteFailFastMs: 600
 };
 
@@ -1193,12 +1198,16 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   // slow refill — never a wrong/silent fill. EMPTY fills (`before` = the disabled placeholder) never race →
   // single fast commit, no beat.
   const isOverwrite = !!before && norm(before) !== norm(target) && enabledTexts.some((t) => norm(t) === norm(before));
-  const SLOW_BEAT_MS = budgets.settleIntervalMs * 2; // ~700ms — the proven post-open window a re-selection needs (measured from open)
+  // VISIBILITY split: the overwrite debounce is a PAINT thing — tiny visible, ~700ms hidden. Pick the beats
+  // off REAL tab visibility (act.visible; absent on older fakes ⇒ treat as hidden = the safe/larger beats).
+  const dropdownVisible = act.visible ? await act.visible() : false;
+  const FAST_BEAT_MS = dropdownVisible ? budgets.overwriteFastBeatVisibleMs : budgets.overwriteFastBeatMs;
+  const SLOW_BEAT_MS = dropdownVisible ? budgets.overwriteSlowBeatVisibleMs : budgets.overwriteSlowBeatMs;
   let res, refilled = false;
   if (isOverwrite) {
-    // Attempt 1 — FAST: wait only up to overwriteFastBeatMs since the list opened, then click with a SHORT
+    // Attempt 1 — FAST: wait only up to FAST_BEAT_MS since the list opened, then click with a SHORT
     // failure deadline (capped by the commit ceiling) so a MISS is detected quickly instead of burning ~10s.
-    if (act.delayFull && openedAt) { const r = budgets.overwriteFastBeatMs - (Date.now() - openedAt); if (r > 0) await act.delayFull(r); }
+    if (act.delayFull && openedAt) { const r = FAST_BEAT_MS - (Date.now() - openedAt); if (r > 0) await act.delayFull(r); }
     res = await commitByClick(act.clickDropdownOptionByText, Math.min(budgets.overwriteFailFastMs, budgets.commitCeilingMs));
     if (!res.ok) {
       // Fast attempt MISSED (the small beat didn't clear the debounce). Re-open if the click closed the list,
@@ -1217,7 +1226,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
         res = await commitByClick(act.clickDropdownOptionByText, budgets.commitCeilingMs);
       }
     }
-    console.log(`[ApplyPilot][CDP-DD-REFILL] "${before}"→"${target}" fastBeat=${budgets.overwriteFastBeatMs}ms → ${refilled ? `MISSED fast → refilled slow(~${SLOW_BEAT_MS}ms)` : "committed on FAST attempt"}: ${res && res.ok ? `OK "${res.after}"` : `FAILED "${res && res.after}"`}`);
+    console.log(`[ApplyPilot][CDP-DD-REFILL] "${before}"→"${target}" ${dropdownVisible ? "VISIBLE" : "hidden"} fastBeat=${FAST_BEAT_MS}ms → ${refilled ? `MISSED fast → refilled slow(~${SLOW_BEAT_MS}ms)` : "committed on FAST attempt"}: ${res && res.ok ? `OK "${res.after}"` : `FAILED "${res && res.after}"`}`);
   } else {
     // EMPTY fill (placeholder → value): no debounce race — a single fast commit + the generic re-open retry
     // (direct element-dispatch, which targets the option element directly with no coordinate hit-test).

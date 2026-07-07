@@ -156,22 +156,24 @@ every overwrite.
 - **First fix — elapsed-time beat.** `fillDropdownCdp` records `openedAt` at `aria-expanded="true"` and the
   overwrite beat waited only the REMAINDER of ~700ms since open. Removed the temp sampler
   (`cdpDropdownReadinessSample` + the `sampleDropdownReadiness` method).
-- **Final shape — FAST-FIRST with a slow refill fallback (operator ask: "fill fast, refill slower only if it
-  misses; log the refill rate to tune").** For an overwrite, **attempt 1 FAST** waits only
-  `overwriteFastBeatMs` (default 300 — THE tuning knob) since open, clicks, and confirms with a SHORT failure
-  deadline (`min(overwriteFailFastMs, commitCeilingMs)`, default 600ms) so a miss is caught cheaply. On a
-  MISS, **attempt 2 refills SLOW**: re-open if the list closed, wait the full proven ~700ms
-  (`settleIntervalMs*2`) since the (re-)open, commit with the full ceiling. A `[CDP-DD-REFILL]` line logs
-  `committed on FAST attempt` vs `MISSED fast → refilled slow` per overwrite, so the operator counts the
-  refill rate and lowers `overwriteFastBeatMs` to where most overwrites still commit fast. `commitByClick`
-  gained an optional ceiling arg; the commit-PERSISTENCE re-read still gates every accept → a fast miss can
-  only cost a slow refill, NEVER a wrong/silent fill. EMPTY fills skip the beat (rapidfire, unchanged). Trade:
-  visible/warm overwrites (which used to pay a flat ~700ms) commit fast; the rarer hidden overwrite pays a
-  fast miss + refill (raise the knob toward 700 if a flow shows many hidden overwrites).
-- Docs updated (CLAUDE.md dropdowns rule + dom-patterns Vector A refinement). New unit test pins the slow
-  refill (a fast miss re-opens and commits, ending `filled` — never left flipped). `node -c` clean; unit
-  suite green (**483**). **LIVE-VERIFY PENDING** on the branch before merging to main (main has diverged — a
-  real merge, not FF).
+- **Final shape — FAST-FIRST with a slow refill fallback, VISIBILITY-SPLIT beats (operator asks: "fill fast,
+  refill slower only if it misses; log the refill rate to tune", then "make visible and hidden different").**
+  For an overwrite, **attempt 1 FAST** waits only the fast beat since open, clicks, and confirms with a SHORT
+  failure deadline (`min(overwriteFailFastMs, commitCeilingMs)`, default 600ms) so a miss is caught cheaply. On
+  a MISS, **attempt 2 refills SLOW**: re-open if the list closed, wait the slow beat since the (re-)open,
+  commit with the full ceiling. **The beats split on REAL tab visibility** (`act.visible` = `cdpVisible`, now
+  exposed to the fill layer — tab active + window not minimized, NOT `cdpFast` which is true for hidden+worker-
+  timers) because the debounce is a PAINT thing (tiny visible, ~700ms hidden): **VISIBLE = fast `30` / slow
+  `100`; HIDDEN = fast `100` / slow `700`** (`overwriteFastBeatMs`/`overwriteSlowBeatMs` + `*VisibleMs`). A
+  `[CDP-DD-REFILL]` line logs `VISIBLE|hidden fastBeat=Nms → committed on FAST attempt | MISSED fast → refilled
+  slow` per overwrite for retuning. `commitByClick` gained an optional ceiling arg; the commit-PERSISTENCE
+  re-read still gates every accept → a fast miss can only cost a slow refill, NEVER a wrong/silent fill. EMPTY
+  fills skip the beat (rapidfire, unchanged).
+- **Live-tuning history:** 300 (initial) → 70 hidden (BOTH languages refilled — fallback verified) → 100 hidden
+  (committed fast) → visibility split, 30 visible (committed fast) / 100 hidden. All live-verified on Magna.
+- Docs synced (CLAUDE.md dropdowns rule, dom-patterns Vector A FINAL SHAPE). New unit tests pin the slow refill
+  (a fast miss re-opens and commits, ending `filled` — never left flipped) and the visibility split (visible
+  fast beat < hidden's). `node -c` clean; unit suite green (**485**). Merged to main.
 
 ## 2026-07-06 — Dropdown CLOSE race in the FILL path: gate on options-GONE, not aria-expanded
 
