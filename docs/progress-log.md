@@ -281,3 +281,16 @@ SHADOW DOM, so its X button lives in `host.shadowRoot` and is invisible to a lig
 
 Unit suite unaffected (490 green — CDP substrate). CLAUDE.md multi-page `clickPageNext` note updated. Live-verify
 pending on the real Simplify overlay.
+
+## 2026-07-06 — Simplify auto-dismiss LIVE-VERIFIED + English-last language order
+
+- **Simplify overlay auto-dismiss — LIVE-VERIFIED.** The blocker-dump recon showed `div.simplify-jobs-shadow-root`
+  has an OPEN shadow root with a `<button aria-label="Minimize">`. Added `minimi[sz]e` to the dismiss-control
+  matcher (NOT "collapse" — that matches Simplify's "Collapse Resume Section" sub-control). `clickPageNext` now
+  minimizes Simplify's panel and advances past Save & Continue (operator confirmed: "it minimizes and advances").
+  The DIAG blocker dump was removed.
+- **English filled LAST (`prepareProfile`).** Operator found that ordering English last in the Languages section
+  reduces Workday's spurious "duplicate languages not allowed" ghost error on Save & Continue. `prepareProfile`
+  now stable-partitions `out.languages` (non-English first, English last) before the CDP fill consumes it.
+
+Unit suite green.
