@@ -1610,36 +1610,6 @@ function cdpFindDismissControl(cx, cy) {
   return best ? { found: true, cx: best.cx, cy: best.cy, label: best.label } : { found: false };
 }
 
-// DIAG (2026-07-06): dump the blocking popup's structure so we can build a TARGETED dismiss. The auto-dismiss
-// heuristic missed Simplify's X — we need to SEE the real shadow DOM (is the shadowRoot open? what/where is the
-// close control?). Read-only. Logged by clickPageNext when a block is detected.
-function cdpDumpBlocker(cx, cy) {
-  const host = document.elementFromPoint(cx, cy);
-  if (!host) return { host: null };
-  const clsOf = (el) => (typeof el.className === "string" ? el.className : (el.className && el.className.baseVal) || "");
-  const rectOf = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) }; };
-  const short = (s) => (s || "").replace(/\s+/g, " ").trim().slice(0, 40);
-  const info = { hostTag: host.tagName.toLowerCase(), hostClass: clsOf(host).slice(0, 80), hostId: host.id || null,
-    shadow: host.shadowRoot ? "OPEN" : "null-or-closed" };
-  const root = host.shadowRoot || host;
-  const all = Array.from(root.querySelectorAll("*"));
-  info.totalEls = all.length;
-  info.nestedShadowHosts = all.filter((el) => el.shadowRoot).slice(0, 10).map((el) => el.tagName.toLowerCase() + "." + (clsOf(el).split(/\s+/)[0] || ""));
-  info.candidates = all.filter((el) => {
-    const r = el.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return false;
-    const tag = el.tagName.toLowerCase();
-    const cls = clsOf(el);
-    const aria = el.getAttribute("aria-label") || el.getAttribute("title") || "";
-    const txt = short(el.textContent);
-    return tag === "button" || el.getAttribute("role") === "button" || tag === "svg" || tag === "path" || !!aria
-      || /close|dismiss|hide|exit|cross/i.test(cls) || (txt.length <= 3 && /[×✕✖xX⨯╳]/.test(txt));
-  }).slice(0, 50).map((el) => ({ tag: el.tagName.toLowerCase(), cls: clsOf(el).slice(0, 60),
-    aria: el.getAttribute("aria-label") || el.getAttribute("title") || null, role: el.getAttribute("role") || null,
-    text: short(el.textContent), rect: rectOf(el) }));
-  return info;
-}
-
 function cdpReadCheckboxState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   const input = w && w.querySelector('input[type="checkbox"]');
@@ -2761,8 +2731,6 @@ function makeCdpActuation(llmConfig) {
         return { blocked: true, by: desc(top) };
       }, rect.cx, rect.cy);
       if (cover && cover.blocked) {
-        // DIAG (2026-07-06): dump the blocker's real structure so we can build a targeted dismiss for it.
-        try { const dump = await cdpEval(cdpDumpBlocker, rect.cx, rect.cy); console.log("[ApplyPilot][CDP-BLOCKER-DUMP]", JSON.stringify(dump)); } catch (e) { /* diag only */ }
         // Best-effort auto-dismiss (operator opted in 2026-07-06): try ONCE to click a clearly-dismissive
         // control (X/Close/No-thanks — never Accept/OK) inside the popup, incl. Simplify's shadow-DOM overlay,
         // then re-check. If it clears → proceed; else halt (operator closes it) — never force-remove DOM.
