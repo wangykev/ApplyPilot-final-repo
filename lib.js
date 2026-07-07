@@ -423,10 +423,14 @@ function languageDeletionPlan(entries) {
 //
 // Value agreement is normalize()-based with a containment + fuzzy≥90 relief (so a dropdown's
 // "United States of America (+1)" reconciles with the review page's "United States of America").
-// checkbox/file_upload are NOT reconciled (they don't render as comparable text), and unreplaced AI
-// placeholders are excluded (they are not real values) — both surfaced as counts, never false bugs.
+// WIDGET-AWARE: a CHECKBOX's current_value is "true"/"false" (String(checked)) and the review page
+// shows a checked box as its label → "Yes", so a checked box is verified present (an unchecked box is
+// SKIPPED — the review page doesn't render it, so its absence is not a bug); a FILE_UPLOAD's
+// current_value is the resume filename, matched by containment against the review's "Attachments" value
+// (label-independent). Unreplaced AI placeholders are excluded (not real values). All exclusions are
+// surfaced as counts, never false bugs.
 function reconcileReviewPage(reviewItems, bundleEntries) {
-  const EXCLUDED = new Set(["checkbox", "file_upload"]);
+  const TRUEISH = /^(true|yes|checked|selected|on|1)$/i;
   const items = (Array.isArray(reviewItems) ? reviewItems : [])
     .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false }))
     .filter((it) => it.label || it.value)
@@ -452,22 +456,48 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
   };
 
   const agree = [], disagree = [], missing_on_review = [], ambiguous = [];
-  let excluded = 0, placeholders = 0, claimed = 0;
+  let skipped = 0, placeholders = 0, claimed = 0;
 
   for (const e of (Array.isArray(bundleEntries) ? bundleEntries : [])) {
     if (!e) continue;
     const cv = e.current_value;
     if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
-    if (EXCLUDED.has(e.widget_type)) { excluded++; continue; }      // not comparable as review text
     if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
-    claimed++;
-    const nlabel = normalizeLabel(e.question_label), nval = normalize(String(cv));
-    const base = { label: e.question_label != null ? e.question_label : null, value_bundle: String(cv),
-                   field_id: e.field_id != null ? e.field_id : null, widget_type: e.widget_type != null ? e.widget_type : null,
+    const wt = e.widget_type, cvs = String(cv);
+    const base = { label: e.question_label != null ? e.question_label : null, value_bundle: cvs,
+                   field_id: e.field_id != null ? e.field_id : null, widget_type: wt != null ? wt : null,
                    canonical_field: e.canonical_field != null ? e.canonical_field : null,
                    is_required: !!e.is_required, page_number: e.page_number != null ? e.page_number : null };
 
-    // Candidate review items whose label matches this entry's (exact first, else containment), unused.
+    // ── file_upload: match by FILENAME containment against ANY review value (label-independent —
+    //    the review shows the resume inside an "Attachments" blob). Absent ⇒ resume didn't attach. ──
+    if (wt === "file_upload") {
+      claimed++;
+      const nfile = normalize(cvs);
+      const hit = items.find((it) => !it.used && nfile.length >= 3 &&
+        (it.nval.includes(nfile) || (it.nval.length >= 3 && nfile.includes(it.nval))));
+      if (hit) { hit.used = true; agree.push({ ...base, value_review: hit.value, tier: "file" }); }
+      else missing_on_review.push(base);
+      continue;
+    }
+
+    // ── checkbox: an UNCHECKED box is skipped (not rendered on review); a CHECKED box must appear as
+    //    its label → "Yes". Not found ⇒ a (required) box that didn't stick. ──
+    if (wt === "checkbox") {
+      if (!TRUEISH.test(cvs.trim())) { skipped++; continue; }
+      claimed++;
+      const nlabel = normalizeLabel(e.question_label);
+      const cand = items.find((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
+      if (!cand) { missing_on_review.push(base); continue; }
+      cand.used = true;
+      if (TRUEISH.test(cand.value.trim()) || valueTier("yes", cand.nval)) agree.push({ ...base, value_review: cand.value, tier: "checkbox" });
+      else disagree.push({ ...base, value_review: cand.value });
+      continue;
+    }
+
+    // ── everything else: label match (exact then containment), then value compare ──
+    claimed++;
+    const nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
     const exact = items.filter((it) => !it.used && it.nlabel && it.nlabel === nlabel);
     const cands = exact.length ? exact : items.filter((it) => !it.used && labelMatches(it.nlabel, nlabel));
     if (!cands.length) { missing_on_review.push(base); continue; }
@@ -494,7 +524,7 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
   return {
     agree, disagree, missing_on_review, extra_on_review, ambiguous,
     counts: { claimed, agree: agree.length, disagree: disagree.length, missing_on_review: missing_on_review.length,
-              extra_on_review: extra_on_review.length, ambiguous: ambiguous.length, excluded, placeholders },
+              extra_on_review: extra_on_review.length, ambiguous: ambiguous.length, skipped, placeholders },
   };
 }
 

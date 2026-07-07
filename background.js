@@ -1260,20 +1260,21 @@ async function runCdpQuestionsRecon(tabId) {
 
 // SELF-CONTAINED (evaluated via cdpEval — closes over nothing). Read-only dump of the Workday REVIEW
 // page (the final application page that renders every filled value as read-only text). The review-page
-// DOM has NOT been traced before — the walk only DETECTS this page (boolean applyFlowReviewPage marker)
-// to halt, it never reads it — so this dump is deliberately BROAD and produces refinement material:
-//   (a) `raw`   — every automation-id-bearing node under the container with its trimmed direct text +
-//                 depth (the structural map to refine the pairing strategy from, after a live run),
-//   (b) `sections` — heading text (Workday groups the review by section), and
-//   (c) `items` — a best-effort heuristic label→value pairing via several strategies, each tagged with
-//                 `via`, deduped. The reconciler consumes `items`; the raw map tells us how to improve
-//                 the strategies. Never throws; returns {ok:false, reason} when not on the review page.
-function cdpReadReviewPage() {
+// DOM is UNTRACED, so rather than guess its shape this ANCHORS on the values we already know (passed in
+// as `valueHints` = the bundle's claimed [{label, value, widget}] entries): it locates each recorded
+// value's text on the page and walks up to its label. That is DOM-shape-agnostic and directly answers
+// "did this value make it onto the review page?". It ALSO keeps the generic strategies (dl / <label> /
+// two-leaf-row) so a row present with the WRONG value still surfaces (the disagree case), and returns
+// compact diagnostics (`anchor_samples` = ancestry of the first finds; a trimmed `raw` map) to refine
+// the generic pass later. The reconciler consumes `items`. Never throws; {ok:false,reason} if off-page.
+function cdpReadReviewPage(valueHints) {
   const container = document.querySelector('[data-automation-id="applyFlowReviewPage"]');
   const url = location.href;
   if (!container) return { ok: false, reason: "no-review-page", url };
+  const hints = Array.isArray(valueHints) ? valueHints : [];
 
   const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const norm = (s) => clean(s).toLowerCase().replace(/\s*\(\+\d+\)\s*$/, ""); // mirror of lib.normalize
   const directText = (el) => { // text from THIS element's own text nodes only (labels/values are usually leaves)
     let t = "";
     for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent;
@@ -1281,27 +1282,47 @@ function cdpReadReviewPage() {
   };
   const depthOf = (el) => { let d = 0, p = el; while (p && p !== container) { d++; p = p.parentElement; } return d; };
 
-  // (a) RAW structural map — every automation-id node (bounded), with own text + a short full-text sample.
-  const raw = [];
-  const all = Array.from(container.querySelectorAll('[data-automation-id]'));
-  for (const el of all) {
-    if (raw.length >= 800) break;
-    const dt = directText(el);
-    const full = clean(el.textContent);
-    raw.push({ aid: el.getAttribute("data-automation-id"), tag: el.tagName.toLowerCase(), depth: depthOf(el),
-               text: dt || null, fullText: full.length <= 120 ? full : full.slice(0, 120) + "…" });
-  }
-
-  // (b) section headings
-  const sections = [];
-  for (const h of container.querySelectorAll('h1,h2,h3,h4,[role="heading"]')) {
-    const t = clean(h.textContent);
-    if (t) sections.push({ tag: h.tagName.toLowerCase(), text: t });
-  }
-
-  // (c) heuristic label→value pairs (several strategies; each pair tagged with `via`).
   const items = [];
   const push = (label, value, via) => { const l = clean(label); if (l) items.push({ label: l, value: clean(value), via }); };
+
+  // ── (1) VALUE-ANCHORED (primary): find each known value's leaf on the page, derive its label. ──
+  // The label is the first <label>/<dt> in an ancestor (≤6 up) not containing the value node, else the
+  // nearest preceding leaf text. Every occurrence yields an item, so repeating rows pair correctly.
+  const leaves = Array.from(container.querySelectorAll("*")).filter((el) => el.children.length === 0 && clean(el.textContent));
+  const findLabel = (leaf) => {
+    let a = leaf;
+    for (let up = 0; up < 6 && a && a !== container; up++) {
+      a = a.parentElement;
+      if (!a) break;
+      for (const l of a.querySelectorAll("label, dt")) { if (!l.contains(leaf)) { const t = clean(l.textContent); if (t) return t; } }
+    }
+    // fallback: nearest preceding leaf text
+    const idx = leaves.indexOf(leaf);
+    for (let i = idx - 1; i >= 0 && i >= idx - 8; i--) { const t = clean(leaves[i].textContent); if (t && leaves[i] !== leaf) return t; }
+    return null;
+  };
+  const anchorSamples = [];
+  for (const h of hints) {
+    const nv = norm(h && h.value);
+    if (nv.length < 4) continue; // too short to anchor safely (Yes/No/short) — rides the generic/label pass
+    for (const leaf of leaves) {
+      const lt = norm(leaf.textContent);
+      if (lt === nv || lt.includes(nv)) {
+        push(findLabel(leaf) || (h && h.label), leaf.textContent, "anchored");
+        if (anchorSamples.length < 6) {
+          const chain = []; let a = leaf;
+          for (let up = 0; up < 6 && a && a !== container; up++) {
+            chain.push({ tag: a.tagName.toLowerCase(), aid: a.getAttribute && a.getAttribute("data-automation-id"), own: directText(a) || null, depth: depthOf(a) });
+            a = a.parentElement;
+          }
+          anchorSamples.push({ hint: clean(h && h.value), labelFound: findLabel(leaf), chain });
+        }
+      }
+    }
+  }
+
+  // ── (2) GENERIC strategies (keep for the disagree case — a row present with a WRONG value). ──
+  const all = Array.from(container.querySelectorAll('[data-automation-id]'));
   // definition lists: <dt> → following <dd>
   for (const dl of container.querySelectorAll("dl")) {
     const kids = Array.from(dl.children);
@@ -1325,12 +1346,24 @@ function cdpReadReviewPage() {
     if (kids.length === 2 && kids.every((c) => c.children.length === 0)) push(kids[0].textContent, kids[1].textContent, "row2");
   }
 
-  // dedupe (a pair can surface via more than one strategy)
+  // dedupe by normalized label+value (NOT by `via` — the same pair caught by two strategies is one pair).
   const seen = new Set(), uniq = [];
-  for (const it of items) { const k = it.via + "|" + it.label + "|" + it.value; if (!seen.has(k)) { seen.add(k); uniq.push(it); } }
+  for (const it of items) { const k = norm(it.label) + "|" + norm(it.value); if (!seen.has(k)) { seen.add(k); uniq.push(it); } }
+
+  // section headings + a trimmed raw map (own-text nodes only, capped) — refinement material.
+  const sections = [];
+  for (const h of container.querySelectorAll('h1,h2,h3,h4,[role="heading"]')) { const t = clean(h.textContent); if (t) sections.push({ tag: h.tagName.toLowerCase(), text: t }); }
+  const raw = [];
+  for (const el of all) {
+    if (raw.length >= 250) break;
+    const dt = directText(el);
+    if (!dt) continue;
+    raw.push({ aid: el.getAttribute("data-automation-id"), tag: el.tagName.toLowerCase(), depth: depthOf(el), text: dt });
+  }
 
   return { ok: true, url, container_found: true, section_count: sections.length, sections,
-           item_count: uniq.length, items: uniq, raw_count: raw.length, raw };
+           item_count: uniq.length, items: uniq, anchored_count: items.filter((i) => i.via === "anchored").length,
+           anchor_samples: anchorSamples, raw_count: raw.length, raw };
 }
 
 // REVIEW-PAGE CHECK (end-to-end fill-verify): scrape the Workday review page (ground truth) via
@@ -1344,34 +1377,41 @@ async function runCdpReviewReconcile(tabId) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     LOG("attached. READ-ONLY: scrapes the review page's displayed values and diffs them vs the saved reviewSummary bundle. NEVER clicks Next/Submit. Run ON the final review page.");
-    const dump = await cdpEval(cdpReadReviewPage);
+
+    // Read the saved bundle FIRST — its claimed values become value-anchor HINTS for the scraper
+    // (locate each recorded value on the page → derive its label; DOM-shape-agnostic).
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+    const entries = bundle && Array.isArray(bundle.entries) ? bundle.entries : [];
+    const hints = entries
+      .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
+      .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
+
+    const dump = await cdpEval(cdpReadReviewPage, hints);
     if (!dump || !dump.ok) {
       LOG("not on the review page (marker applyFlowReviewPage absent). reason:", dump && dump.reason, "· url:", dump && dump.url);
       return { ok: false, error: (dump && dump.reason) || "no-dump" };
     }
-    LOG(`review page: ${dump.item_count} label→value pair(s) scraped · ${dump.section_count} section heading(s) · ${dump.raw_count} raw node(s).`);
-
-    // Dump the structural material first — the scraper's pairing strategy is provisional (untraced DOM),
-    // so the raw map + scraped pairs are how we refine it after this first live run.
+    LOG(`review page: ${dump.item_count} label→value pair(s) scraped (${dump.anchored_count} value-anchored) · ${dump.section_count} section(s) · ${dump.raw_count} raw node(s).`);
     LOG("── SECTIONS ──"); for (const s of dump.sections) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(s));
     LOG("── SCRAPED PAIRS (label · value · via) ──"); for (const it of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(it));
-    LOG("── RAW NODES (automation-id · tag · depth · text) — refine the scraper from these ──"); for (const r of dump.raw) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(r));
+    LOG("── ANCHOR SAMPLES (ancestry of the first value-anchored finds — the real field DOM) ──"); for (const a of dump.anchor_samples) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a));
 
-    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
-    if (!bundle || !Array.isArray(bundle.entries)) {
-      LOG("⚠ NO reviewSummary bundle in storage — run the fill/walk first so there's something to check against.");
+    if (!entries.length) {
+      LOG("⚠ NO reviewSummary bundle in storage — run the fill/walk first so there's something to check against. (Scraped pairs above are still shown.)");
       return { ok: true, url: dump.url, scraped: dump.item_count, reconciled: false, note: "no-bundle" };
     }
 
-    const rec = reconcileReviewPage(dump.items, bundle.entries);
+    const rec = reconcileReviewPage(dump.items, entries);
     const c = rec.counts;
-    LOG(`── RECONCILIATION (bundle ${bundle.entries.length} entries · ${c.claimed} claimed value-bearing · ${c.excluded} excluded checkbox/file · ${c.placeholders} unreplaced AI) ──`);
+    LOG(`── RECONCILIATION (bundle ${entries.length} entries · ${c.claimed} claimed value-bearing · ${c.skipped} skipped unchecked-box · ${c.placeholders} unreplaced AI) ──`);
     LOG(`AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING-ON-REVIEW ${c.missing_on_review} · EXTRA-ON-REVIEW ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous}`);
     if (rec.disagree.length) { LOG("‼ DISAGREEMENTS (bundle value ≠ review page — investigate as BUGS):"); for (const d of rec.disagree) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(d)); }
     else LOG("✓ no value disagreements among matched fields.");
-    if (rec.missing_on_review.length) { LOG("⚠ FILLED IN BUNDLE, NOT FOUND ON REVIEW PAGE (label wording differs / unshown section / value reverted to blank):"); for (const m of rec.missing_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(m)); }
-    if (rec.ambiguous.length) { LOG("? AMBIGUOUS label matches (repeating-section collisions — refine after seeing the raw map):"); for (const a of rec.ambiguous) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a)); }
+    if (rec.missing_on_review.length) { LOG("⚠ FILLED IN BUNDLE, NOT FOUND ON REVIEW PAGE (value reverted to blank / label wording differs / unshown section):"); for (const m of rec.missing_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(m)); }
+    if (rec.ambiguous.length) { LOG("? AMBIGUOUS label matches (repeating-section collisions):"); for (const a of rec.ambiguous) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a)); }
     if (rec.extra_on_review.length) { LOG(`(info) ${rec.extra_on_review.length} review-page value(s) with no matching bundle entry (pre-filled / not recorded / scraper noise):`); for (const e of rec.extra_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(e)); }
+    // The raw map only matters when something didn't match — print it (capped) ONLY then, so a clean run stays quiet.
+    if (rec.missing_on_review.length) { LOG("── RAW NODES (own-text · automation-id · tag · depth) — refine the generic scraper from these ──"); for (const r of dump.raw) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(r)); }
 
     return { ok: true, url: dump.url, scraped: dump.item_count, reconciled: true, counts: c, disagree: rec.disagree, missing_on_review: rec.missing_on_review };
   } catch (e) {

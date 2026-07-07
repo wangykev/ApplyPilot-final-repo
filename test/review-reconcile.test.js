@@ -79,16 +79,51 @@ test("a review value with no matching bundle entry → extra_on_review (informat
   assert.strictEqual(r.extra_on_review[0].value_review, "A Friend");
 });
 
-test("checkbox and file_upload are excluded (not comparable review text), never a false bug", () => {
+test("checkbox: a CHECKED box (true) shows on review as its label → 'Yes' → agree", () => {
+  const r = reconcileReviewPage(
+    [{ label: "I currently work here", value: "Yes" }],
+    [entry({ question_label: "I currently work here", current_value: "true", widget_type: "checkbox" })]
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "checkbox");
+});
+
+test("checkbox: a CHECKED box not found on review → missing_on_review (didn't stick)", () => {
+  const r = reconcileReviewPage(
+    [{ label: "First Name", value: "Ada" }],
+    [entry({ question_label: "I agree to the terms", current_value: "true", widget_type: "checkbox", is_required: true })]
+  );
+  assert.strictEqual(r.counts.missing_on_review, 1);
+  assert.strictEqual(r.counts.agree, 0);
+});
+
+test("checkbox: an UNCHECKED box (false) is skipped — the review page doesn't render it, so absence is not a bug", () => {
   const r = reconcileReviewPage(
     [],
-    [entry({ question_label: "I currently work here", current_value: "true", widget_type: "checkbox" }),
-     entry({ question_label: "Resume", current_value: "ada.pdf", widget_type: "file_upload" })]
+    [entry({ question_label: "I currently work here", current_value: "false", widget_type: "checkbox" })]
   );
-  assert.strictEqual(r.counts.excluded, 2);
+  assert.strictEqual(r.counts.skipped, 1);
   assert.strictEqual(r.counts.claimed, 0);
-  assert.strictEqual(r.counts.disagree, 0);
   assert.strictEqual(r.counts.missing_on_review, 0);
+});
+
+test("file_upload: the resume filename inside the review's Attachments blob → agree (label-independent)", () => {
+  const r = reconcileReviewPage(
+    [{ label: "Attachments", value: "Kevin's Resume 2.pdf successfully uploaded Kevin's Resume 2.pdf 173.59 KB" }],
+    [entry({ question_label: "Resume", current_value: "Kevin's Resume 2.pdf", widget_type: "file_upload" })]
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "file");
+  assert.strictEqual(r.counts.extra_on_review, 0, "the Attachments item is consumed, not left as extra");
+});
+
+test("file_upload: filename absent from the review page → missing_on_review (resume didn't attach)", () => {
+  const r = reconcileReviewPage(
+    [{ label: "Attachments", value: "someone-elses-file.pdf" }],
+    [entry({ question_label: "Resume", current_value: "Kevin's Resume 2.pdf", widget_type: "file_upload" })]
+  );
+  assert.strictEqual(r.counts.missing_on_review, 1);
+  assert.strictEqual(r.counts.agree, 0);
 });
 
 test("an unreplaced AI placeholder is excluded (not a real value)", () => {
@@ -137,5 +172,5 @@ test("same label, NO value reconciles among multiple candidates → ambiguous, n
 test("empty inputs are safe", () => {
   const r = reconcileReviewPage(null, null);
   assert.deepStrictEqual(r.counts, { claimed: 0, agree: 0, disagree: 0, missing_on_review: 0,
-    extra_on_review: 0, ambiguous: 0, excluded: 0, placeholders: 0 });
+    extra_on_review: 0, ambiguous: 0, skipped: 0, placeholders: 0 });
 });
