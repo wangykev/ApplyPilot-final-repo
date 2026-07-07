@@ -67,6 +67,9 @@
     <!-- Read-only fingerprint of ANY page (maintenance / dead session / login / error / a
          normal form) so an unknown page state can be detected in code. [CDP-PAGE-RECON]. -->
     <button id="cdp-page-recon">CDP recon: page identity (read-only; ANY page — maintenance/error/login)</button>
+    <!-- Read-only: on the FINAL review page, diff the page's displayed values vs the saved
+         reviewSummary bundle. Disagreements flag fill bugs. NEVER submits. [REVIEW-CHECK]. -->
+    <button id="cdp-review-check">CDP: review-page CHECK (diff vs summary, read-only)</button>
     <hr>
     <!-- AI config (AI-0): the multi-provider LLM adapter. Provider + model + API key are
          stored in chrome.storage.local.llmConfig; "AI fill ON" is the opt-in toggle (OFF =

@@ -297,6 +297,21 @@ document.getElementById("cdp-questions-recon").addEventListener("click", () => {
   });
 });
 
+// REVIEW-PAGE CHECK (end-to-end fill-verify): on the FINAL review page, scrape the displayed values
+// and diff them vs the saved reviewSummary bundle. Disagreements flag fill bugs. READ-ONLY — never
+// submits. Output is [REVIEW-CHECK] in the service worker console.
+document.getElementById("cdp-review-check").addEventListener("click", () => {
+  setStatus("Review-page check… navigate to the FINAL review page (the walk stops there) and keep it VISIBLE. Findings land in the service worker console as [REVIEW-CHECK].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REVIEW_CHECK" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // SW console has it all
+    if (resp.ok === false) { setStatus("Review check failed: " + resp.error + " — are you on the review page? See the SW console."); return; }
+    if (!resp.reconciled) { setStatus(`Scraped ${resp.scraped} value(s) but ${resp.note === "no-bundle" ? "no saved summary to check against" : resp.note} — see [REVIEW-CHECK].`); return; }
+    const c = resp.counts;
+    const bugs = c.disagree + c.missing_on_review;
+    setStatus(`Review check: ${c.agree} agree · ${c.disagree} DISAGREE · ${c.missing_on_review} missing${bugs ? " ⚠ investigate" : " ✓"}. See [REVIEW-CHECK] in the SW console.`);
+  });
+});
+
 // ── AI config (AI-0): multi-provider LLM adapter ────────────────────────────
 // chrome.storage.local.llmConfig = { provider, model, apiKey, enabled }. Restore on open;
 // "Save" persists; "Test connection" round-trips a trivial prompt (RUN_LLM_TEST → callLLM in

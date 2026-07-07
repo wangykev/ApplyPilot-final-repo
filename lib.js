@@ -407,8 +407,99 @@ function languageDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
+// REVIEW-PAGE RECONCILIATION (the end-to-end fill-verify). The Workday review page (the final
+// application page) renders every value ACTUALLY in the form as read-only text — the ground truth of
+// what would be submitted. Compare it against what the extension RECORDED it filled (the accumulated
+// reviewSummary bundle's entries). A disagreement means the fill did not stick (the React value-revert
+// class the safety contract exists to catch) or the extension recorded a value that is not really on
+// the form — a bug to investigate. DOM-AGNOSTIC on purpose: it consumes plain `[{label, value}]` pairs
+// (however the scraper obtained them), so the match/compare logic is unit-testable independent of the
+// review page's (untraced) DOM. The scraper (cdpReadReviewPage) is the part that needs live refinement.
+//
+//   reviewItems   : [{label, value}]           scraped from the review page (display strings)
+//   bundleEntries : reviewSummary.entries[]     (question_label, current_value, fill_status,
+//                   widget_type, canonical_field, is_required, page_number, field_id)
+// Returns { agree, disagree, missing_on_review, extra_on_review, ambiguous, counts }.
+//
+// Value agreement is normalize()-based with a containment + fuzzy≥90 relief (so a dropdown's
+// "United States of America (+1)" reconciles with the review page's "United States of America").
+// checkbox/file_upload are NOT reconciled (they don't render as comparable text), and unreplaced AI
+// placeholders are excluded (they are not real values) — both surfaced as counts, never false bugs.
+function reconcileReviewPage(reviewItems, bundleEntries) {
+  const EXCLUDED = new Set(["checkbox", "file_upload"]);
+  const items = (Array.isArray(reviewItems) ? reviewItems : [])
+    .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false }))
+    .filter((it) => it.label || it.value)
+    .map((it) => ({ ...it, nlabel: normalizeLabel(it.label), nval: normalize(it.value) }));
+
+  // A label containment match is only trusted when the shorter label is non-trivial (≥3 chars).
+  const labelMatches = (a, b) => {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    return short.length >= 3 && long.includes(short);
+  };
+  // Value agreement: exact-normalized, then containment (shorter ≥4 chars, so "No"/"Yes" stay
+  // exact-only and can't false-match a longer string), then fuzzy≥90 (typo tolerance). Returns the
+  // tier ("exact"/"containment"/"fuzzy") or null.
+  const valueTier = (a, b) => {
+    if (a === b) return a === "" ? "exact-blank" : "exact";
+    if (!a || !b) return null;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    if (short.length >= 4 && long.includes(short)) return "containment";
+    if (a.length >= 3 && b.length >= 3 && fuzzyRatio(a, b) >= 90) return "fuzzy";
+    return null;
+  };
+
+  const agree = [], disagree = [], missing_on_review = [], ambiguous = [];
+  let excluded = 0, placeholders = 0, claimed = 0;
+
+  for (const e of (Array.isArray(bundleEntries) ? bundleEntries : [])) {
+    if (!e) continue;
+    const cv = e.current_value;
+    if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
+    if (EXCLUDED.has(e.widget_type)) { excluded++; continue; }      // not comparable as review text
+    if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
+    claimed++;
+    const nlabel = normalizeLabel(e.question_label), nval = normalize(String(cv));
+    const base = { label: e.question_label != null ? e.question_label : null, value_bundle: String(cv),
+                   field_id: e.field_id != null ? e.field_id : null, widget_type: e.widget_type != null ? e.widget_type : null,
+                   canonical_field: e.canonical_field != null ? e.canonical_field : null,
+                   is_required: !!e.is_required, page_number: e.page_number != null ? e.page_number : null };
+
+    // Candidate review items whose label matches this entry's (exact first, else containment), unused.
+    const exact = items.filter((it) => !it.used && it.nlabel && it.nlabel === nlabel);
+    const cands = exact.length ? exact : items.filter((it) => !it.used && labelMatches(it.nlabel, nlabel));
+    if (!cands.length) { missing_on_review.push(base); continue; }
+
+    // Disambiguate by value: prefer a candidate whose value also reconciles.
+    const withTier = cands.map((it) => ({ it, tier: valueTier(nval, it.nval) }));
+    const agreeing = withTier.filter((c) => c.tier);
+    if (agreeing.length) {
+      const pick = agreeing[0]; pick.it.used = true;
+      agree.push({ ...base, value_review: pick.it.value, tier: pick.tier });
+    } else if (cands.length === 1) {
+      cands[0].used = true;
+      disagree.push({ ...base, value_review: cands[0].value });
+    } else {
+      // multiple label matches, none reconcile by value — can't confidently pick (repeating-section
+      // label collisions land here). Surface all candidate values rather than guess a wrong "disagree".
+      ambiguous.push({ ...base, candidates: cands.map((it) => it.value) });
+    }
+  }
+
+  const extra_on_review = items.filter((it) => !it.used && it.value.trim())
+    .map((it) => ({ label: it.label || null, value_review: it.value }));
+
+  return {
+    agree, disagree, missing_on_review, extra_on_review, ambiguous,
+    counts: { claimed, agree: agree.length, disagree: disagree.length, missing_on_review: missing_on_review.length,
+              extra_on_review: extra_on_review.length, ambiguous: ambiguous.length, excluded, placeholders },
+  };
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage };
 }

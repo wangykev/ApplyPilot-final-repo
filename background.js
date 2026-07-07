@@ -65,6 +65,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // REVIEW-PAGE CHECK (end-to-end fill-verify): on the FINAL review page — the one that renders every
+  // filled value as read-only text (ground truth of what would submit) — scrape those displayed values
+  // and reconcile them against the saved reviewSummary bundle (what the extension RECORDED it filled).
+  // Disagreements flag fill bugs (the React value-revert class). READ-ONLY — never clicks Next/Submit.
+  // [REVIEW-CHECK] in the SW console.
+  if (message.type === "RUN_CDP_REVIEW_CHECK") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpReviewReconcile(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // CDP FILL FULL PAGE (M38 Part 1): the FOLD — one drivePageFill fills flat fields +
   // every present repeating section. [CDP-PAGE] in the SW console.
   if (message.type === "RUN_CDP_FILL_PAGE") {
@@ -1237,6 +1252,131 @@ async function runCdpQuestionsRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("questions recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// SELF-CONTAINED (evaluated via cdpEval — closes over nothing). Read-only dump of the Workday REVIEW
+// page (the final application page that renders every filled value as read-only text). The review-page
+// DOM has NOT been traced before — the walk only DETECTS this page (boolean applyFlowReviewPage marker)
+// to halt, it never reads it — so this dump is deliberately BROAD and produces refinement material:
+//   (a) `raw`   — every automation-id-bearing node under the container with its trimmed direct text +
+//                 depth (the structural map to refine the pairing strategy from, after a live run),
+//   (b) `sections` — heading text (Workday groups the review by section), and
+//   (c) `items` — a best-effort heuristic label→value pairing via several strategies, each tagged with
+//                 `via`, deduped. The reconciler consumes `items`; the raw map tells us how to improve
+//                 the strategies. Never throws; returns {ok:false, reason} when not on the review page.
+function cdpReadReviewPage() {
+  const container = document.querySelector('[data-automation-id="applyFlowReviewPage"]');
+  const url = location.href;
+  if (!container) return { ok: false, reason: "no-review-page", url };
+
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const directText = (el) => { // text from THIS element's own text nodes only (labels/values are usually leaves)
+    let t = "";
+    for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent;
+    return clean(t);
+  };
+  const depthOf = (el) => { let d = 0, p = el; while (p && p !== container) { d++; p = p.parentElement; } return d; };
+
+  // (a) RAW structural map — every automation-id node (bounded), with own text + a short full-text sample.
+  const raw = [];
+  const all = Array.from(container.querySelectorAll('[data-automation-id]'));
+  for (const el of all) {
+    if (raw.length >= 800) break;
+    const dt = directText(el);
+    const full = clean(el.textContent);
+    raw.push({ aid: el.getAttribute("data-automation-id"), tag: el.tagName.toLowerCase(), depth: depthOf(el),
+               text: dt || null, fullText: full.length <= 120 ? full : full.slice(0, 120) + "…" });
+  }
+
+  // (b) section headings
+  const sections = [];
+  for (const h of container.querySelectorAll('h1,h2,h3,h4,[role="heading"]')) {
+    const t = clean(h.textContent);
+    if (t) sections.push({ tag: h.tagName.toLowerCase(), text: t });
+  }
+
+  // (c) heuristic label→value pairs (several strategies; each pair tagged with `via`).
+  const items = [];
+  const push = (label, value, via) => { const l = clean(label); if (l) items.push({ label: l, value: clean(value), via }); };
+  // definition lists: <dt> → following <dd>
+  for (const dl of container.querySelectorAll("dl")) {
+    const kids = Array.from(dl.children);
+    for (let i = 0; i < kids.length - 1; i++)
+      if (kids[i].tagName === "DT" && kids[i + 1].tagName === "DD") push(kids[i].textContent, kids[i + 1].textContent, "dl");
+  }
+  // <label> + its associated value (for= target, next sibling, or a sibling value node in the same row)
+  for (const lab of container.querySelectorAll("label")) {
+    const l = clean(lab.textContent);
+    if (!l) continue;
+    let val = "";
+    const forId = lab.getAttribute("for");
+    if (forId) { const t = document.getElementById(forId); if (t) val = t.value != null && t.value !== "" ? t.value : t.textContent; }
+    if (!val && lab.nextElementSibling) val = lab.nextElementSibling.textContent;
+    if (!val && lab.parentElement) for (const sib of lab.parentElement.children) { if (sib !== lab) { const s = clean(sib.textContent); if (s) { val = s; break; } } }
+    push(l, val, "label");
+  }
+  // two-leaf rows: an element whose only two text-bearing children are both leaves (label div + value div)
+  for (const el of all) {
+    const kids = Array.from(el.children).filter((c) => clean(c.textContent));
+    if (kids.length === 2 && kids.every((c) => c.children.length === 0)) push(kids[0].textContent, kids[1].textContent, "row2");
+  }
+
+  // dedupe (a pair can surface via more than one strategy)
+  const seen = new Set(), uniq = [];
+  for (const it of items) { const k = it.via + "|" + it.label + "|" + it.value; if (!seen.has(k)) { seen.add(k); uniq.push(it); } }
+
+  return { ok: true, url, container_found: true, section_count: sections.length, sections,
+           item_count: uniq.length, items: uniq, raw_count: raw.length, raw };
+}
+
+// REVIEW-PAGE CHECK (end-to-end fill-verify): scrape the Workday review page (ground truth) via
+// cdpReadReviewPage and reconcile it against the saved reviewSummary bundle (reconcileReviewPage, PURE).
+// Disagreements ⇒ a fill bug to investigate. READ-ONLY — attaches, reads, detaches; NEVER clicks Next
+// or Submit (the review page's footer button IS Submit). Run ON the review page (the walk stops here).
+// Output is [REVIEW-CHECK] in the SW console + a summary in sendResponse. No profile/LLM needed.
+async function runCdpReviewReconcile(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][REVIEW-CHECK]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. READ-ONLY: scrapes the review page's displayed values and diffs them vs the saved reviewSummary bundle. NEVER clicks Next/Submit. Run ON the final review page.");
+    const dump = await cdpEval(cdpReadReviewPage);
+    if (!dump || !dump.ok) {
+      LOG("not on the review page (marker applyFlowReviewPage absent). reason:", dump && dump.reason, "· url:", dump && dump.url);
+      return { ok: false, error: (dump && dump.reason) || "no-dump" };
+    }
+    LOG(`review page: ${dump.item_count} label→value pair(s) scraped · ${dump.section_count} section heading(s) · ${dump.raw_count} raw node(s).`);
+
+    // Dump the structural material first — the scraper's pairing strategy is provisional (untraced DOM),
+    // so the raw map + scraped pairs are how we refine it after this first live run.
+    LOG("── SECTIONS ──"); for (const s of dump.sections) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(s));
+    LOG("── SCRAPED PAIRS (label · value · via) ──"); for (const it of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(it));
+    LOG("── RAW NODES (automation-id · tag · depth · text) — refine the scraper from these ──"); for (const r of dump.raw) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(r));
+
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+    if (!bundle || !Array.isArray(bundle.entries)) {
+      LOG("⚠ NO reviewSummary bundle in storage — run the fill/walk first so there's something to check against.");
+      return { ok: true, url: dump.url, scraped: dump.item_count, reconciled: false, note: "no-bundle" };
+    }
+
+    const rec = reconcileReviewPage(dump.items, bundle.entries);
+    const c = rec.counts;
+    LOG(`── RECONCILIATION (bundle ${bundle.entries.length} entries · ${c.claimed} claimed value-bearing · ${c.excluded} excluded checkbox/file · ${c.placeholders} unreplaced AI) ──`);
+    LOG(`AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING-ON-REVIEW ${c.missing_on_review} · EXTRA-ON-REVIEW ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous}`);
+    if (rec.disagree.length) { LOG("‼ DISAGREEMENTS (bundle value ≠ review page — investigate as BUGS):"); for (const d of rec.disagree) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(d)); }
+    else LOG("✓ no value disagreements among matched fields.");
+    if (rec.missing_on_review.length) { LOG("⚠ FILLED IN BUNDLE, NOT FOUND ON REVIEW PAGE (label wording differs / unshown section / value reverted to blank):"); for (const m of rec.missing_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(m)); }
+    if (rec.ambiguous.length) { LOG("? AMBIGUOUS label matches (repeating-section collisions — refine after seeing the raw map):"); for (const a of rec.ambiguous) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a)); }
+    if (rec.extra_on_review.length) { LOG(`(info) ${rec.extra_on_review.length} review-page value(s) with no matching bundle entry (pre-filled / not recorded / scraper noise):`); for (const e of rec.extra_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(e)); }
+
+    return { ok: true, url: dump.url, scraped: dump.item_count, reconciled: true, counts: c, disagree: rec.disagree, missing_on_review: rec.missing_on_review };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("review check aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
