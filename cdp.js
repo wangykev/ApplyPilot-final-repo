@@ -1554,6 +1554,59 @@ function cdpReadRadioState(wrapperSel) {
   });
 }
 
+// Best-effort: find a clearly-DISMISSIVE control (X / Close / No thanks — NEVER Accept/Agree/OK/Got it)
+// inside the popup covering (cx,cy), so the walk can close it and proceed. Handles SHADOW-DOM overlays
+// (Simplify renders into div.simplify-jobs-shadow-root → the X lives in host.shadowRoot, invisible to a
+// light-DOM query) AND regular in-page modals. Read-only: returns the control's viewport rect for a TRUSTED
+// click (or {found:false}). SAFETY: the affirmative deny-list is checked first so we never click a
+// consent/accept button; if nothing clearly-dismissive is found we return not-found → the caller halts.
+function cdpFindDismissControl(cx, cy) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const cs = win.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const host = document.elementFromPoint(cx, cy);
+  if (!host) return { found: false };
+  // Search root: an OPEN shadow root if the blocker is a shadow host (Simplify), else the blocker's own
+  // subtree climbed to a dialog/overlay-ish ancestor (bounded). A CLOSED shadow root → shadowRoot is null →
+  // we can't reach the X → not-found → safe halt.
+  let root = host.shadowRoot || null;
+  if (!root) {
+    let el = host;
+    for (let i = 0; i < 4 && el && el.parentElement; i++) {
+      const role = el.getAttribute && el.getAttribute("role");
+      if (role === "dialog" || role === "alertdialog") break;
+      el = el.parentElement;
+    }
+    root = el || host;
+  }
+  const AFFIRM = /accept|agree|\bok\b|okay|got\s*it|allow|\byes\b|confirm|continue|submit|\bsave\b|sign\s*up|subscribe|\bnext\b|enable|turn\s*on|autofill|\bapply\b/i;
+  const X_GLYPH = /^(×|✕|✖|⨯|✗|x|╳|⤫|⤬)$/i;
+  const DISMISS_TXT = /^(close|dismiss|no thanks|no,\s*thanks|not now|skip|maybe later|later)$/i;
+  const DISMISS_META = /close|dismiss/i;
+  // Candidates: interactive controls + common close-icon carriers (class*=close/dismiss, X-glyph spans/divs).
+  const cand = Array.from(root.querySelectorAll('button, [role="button"], a[href], [aria-label], [title], [class*="close" i], [class*="dismiss" i], span, div, svg'));
+  let best = null;
+  for (const el of cand) {
+    if (!isVisible(el)) continue;
+    const meta = ((el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title"))) || "").trim();
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (AFFIRM.test(meta) || AFFIRM.test(txt)) continue;          // never click a consent/affirmative control
+    const cls = (el.className && typeof el.className === "string") ? el.className : "";
+    const dismissive = DISMISS_META.test(meta) || DISMISS_TXT.test(txt) || X_GLYPH.test(txt) || /(^|[-_ ])(close|dismiss)([-_ ]|$)/i.test(cls);
+    if (!dismissive) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width > 120 || r.height > 120) continue;                // skip big containers — target the small X/button, not the whole panel
+    const score = r.width * r.height;                             // prefer the smallest (the icon)
+    if (!best || score < best.score) best = { score, cx: r.left + r.width / 2, cy: r.top + r.height / 2, label: meta || txt || cls.slice(0, 40) };
+  }
+  return best ? { found: true, cx: best.cx, cy: best.cy, label: best.label } : { found: false };
+}
+
 function cdpReadCheckboxState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   const input = w && w.querySelector('input[type="checkbox"]');
@@ -2674,7 +2727,29 @@ function makeCdpActuation(llmConfig) {
         return { blocked: true, by: desc(top) };
       }, rect.cx, rect.cy);
       if (cover && cover.blocked) {
-        console.log("[ApplyPilot][CDP] Save & Continue is COVERED by an overlay/popup — NOT clicking. Blocked by:", cover.by);
+        // Best-effort auto-dismiss (operator opted in 2026-07-06): try ONCE to click a clearly-dismissive
+        // control (X/Close/No-thanks — never Accept/OK) inside the popup, incl. Simplify's shadow-DOM overlay,
+        // then re-check. If it clears → proceed; else halt (operator closes it) — never force-remove DOM.
+        const d = await cdpEval(cdpFindDismissControl, rect.cx, rect.cy);
+        if (d && d.found) {
+          console.log("[ApplyPilot][CDP] Save & Continue covered by", cover.by, "— clicking its dismiss control:", JSON.stringify(d.label));
+          await cdpClickAt(d.cx, d.cy);
+          const coverGone = async () => cdpEval((cx, cy) => {
+            const b = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+            const t = document.elementFromPoint(cx, cy);
+            return !b || !t || t === b || b.contains(t) || t.contains(b);
+          }, rect.cx, rect.cy);
+          let clear = false;
+          for (let i = 0; i < 5 && !clear; i++) { await cdpDelay(300); clear = await coverGone(); } // let it animate out
+          if (clear) {
+            console.log("[ApplyPilot][CDP] popup dismissed — Save & Continue is now clickable.");
+            await cdpClickAt(rect.cx, rect.cy);
+            return { clicked: true, dismissed: cover.by };
+          }
+          console.log("[ApplyPilot][CDP] auto-dismiss clicked", JSON.stringify(d.label), "but the button is STILL covered — halting for the operator.");
+          return { clicked: false, refused: "blocked", blockedBy: cover.by, dismissTried: d.label };
+        }
+        console.log("[ApplyPilot][CDP] Save & Continue is COVERED by an overlay/popup — NOT clicking (no safe dismiss control found). Blocked by:", cover.by);
         return { clicked: false, refused: "blocked", blockedBy: cover.by };
       }
       await cdpClickAt(rect.cx, rect.cy);
