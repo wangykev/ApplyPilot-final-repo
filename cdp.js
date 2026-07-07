@@ -1536,63 +1536,13 @@ function cdpDropdownOptionRectByText(wrapperSel, text) {
   const id = trigger.getAttribute("aria-controls");
   const lb = id ? document.getElementById(id) : null;
   if (!lb) return null;
-  // Vector-B diagnostic (dup-language recon 2026-07-06): if the aria-controls id COLLIDES across repeating
-  // entries, getElementById(id) returns the FIRST in DOM — possibly the WRONG entry's listbox. collisions>1
-  // flags that risk (the portaled listbox lives outside the entry subtree, so a closest()-based owner check
-  // is unreliable — the count is the honest signal).
-  let collisions = 0; try { collisions = id ? document.querySelectorAll('[id="' + id + '"]').length : 0; } catch (e) { collisions = -1; }
   const el = Array.from(lb.querySelectorAll('[role="option"]'))
     .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
   if (!el) return null;
   if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
   const r = el.getBoundingClientRect();
-  const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
-  // Vector-A guard (dup-language mis-commit): a still-settling/virtualizing list can SHIFT the row between
-  // this rect read and the caller's separate coordinate click, landing it on a NEIGHBOR (the live "English"
-  // click that committed "Chinese"). Report whether the target option is ACTUALLY at (cx,cy) via
-  // elementFromPoint so the caller only clicks a CONFIRMED-in-place target (else re-captures).
-  const atEl = document.elementFromPoint(cx, cy);
-  const atOpt = atEl && atEl.closest ? atEl.closest('[role="option"]') : null;
-  const hitTarget = atOpt === el;
-  const atPointText = atOpt ? (atOpt.textContent || "").trim() : (atEl ? (atEl.textContent || "").trim().slice(0, 40) : null);
-  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx, cy,
-           hitTarget, atPointText, collisions };
-}
-
-// ELEMENT-TARGETED option click (the dropdown-commit fallback, 2026-07-06). A trusted CDP COORDINATE click
-// on a portaled listbox option can fail to fire the option's onClick on a HIDDEN tab (live: language[0]
-// "English" never committed hidden though the coords/target/collisions were all correct + hitTarget=true) —
-// the coordinate hit-test doesn't reach the non-composited overlay. This dispatches the robustClick pointer/
-// mouse sequence DIRECTLY on the option element (no coordinate hit-test), so the handler runs regardless of
-// compositing/visibility. Synthetic (isTrusted:false) — used ONLY as the commit RETRY after the trusted
-// coordinate click didn't take; the commit-persistence re-read still gates acceptance (never a false fill).
-function cdpClickDropdownOptionDirect(wrapperSel, text) {
-  const w = document.querySelector(wrapperSel);
-  const trigger = w && w.querySelector('button[aria-haspopup="listbox"]');
-  if (!trigger) return { ok: false, reason: "no trigger" };
-  const id = trigger.getAttribute("aria-controls");
-  const lb = id ? document.getElementById(id) : null;
-  if (!lb) return { ok: false, reason: "no listbox" };
-  const el = Array.from(lb.querySelectorAll('[role="option"]'))
-    .find((o) => o.getAttribute("aria-disabled") !== "true" && (o.textContent || "").trim() === text);
-  if (!el) return { ok: false, reason: "option not found" };
-  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
-  const r = el.getBoundingClientRect();
-  const o = { bubbles: true, cancelable: true, composed: true, view: window,
-              clientX: Math.round(r.x + r.width / 2), clientY: Math.round(r.y + r.height / 2), button: 0 };
-  const target = el.closest('[role="option"]') || el;
-  const fire = (type, usePointer) => {
-    let ev;
-    try { ev = usePointer && window.PointerEvent ? new PointerEvent(type, Object.assign({ pointerId: 1, isPrimary: true, pointerType: "mouse" }, o)) : new MouseEvent(type, o); }
-    catch (e) { try { ev = new Event(type, { bubbles: true }); } catch (e2) { return; } }
-    target.dispatchEvent(ev);
-  };
-  // pointerdown → mousedown → pointerup → mouseup → click (the proven robustClick order; +over/enter first).
-  fire("pointerover", true); fire("mouseover", false);
-  fire("pointerdown", true); fire("mousedown", false);
-  fire("pointerup", true); fire("mouseup", false);
-  fire("click", false);
-  return { ok: true };
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
 function cdpReadRadioState(wrapperSel) {
@@ -2496,22 +2446,8 @@ function makeCdpActuation(llmConfig) {
     clickDropdownOptionByText: async (loc, text) => {
       const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
       if (!rect || rect.w <= 0) return false;
-      // DIAGNOSTIC (pre-filled dropdown OVERWRITE recon 2026-07-06): the languages start pre-filled+flipped
-      // and the overwrite click isn't taking. Log whether the target option is ACTUALLY at its own click
-      // coords (hitTarget; else what elementFromPoint hit) + the aria-controls collision count — so the
-      // failing commit reveals WHY: hitTarget=false ⇒ the coordinate click lands off the option (out-of-view
-      // / portaled-popup "Uruguay" dismiss / stale rect); collisions>1 ⇒ wrong-entry listbox routing;
-      // hitTarget=true yet the trigger doesn't change ⇒ the click hits it but Workday doesn't re-commit.
-      console.log('[ApplyPilot][CDP-DD-COMMIT] "' + text + '" hitTarget=' + rect.hitTarget + ' atPoint="' + rect.atPointText + '" collisions=' + rect.collisions + ' rect=' + rect.cx + ',' + rect.cy + ' (' + loc.wrapperSel + ')');
       await cdpClickAt(rect.cx, rect.cy);
       return true;
-    },
-    // ELEMENT-TARGETED option click — the commit RETRY when the trusted coordinate click above didn't take
-    // (a hidden-tab portaled option that a coordinate hit-test can't reach; see cdpClickDropdownOptionDirect).
-    clickDropdownOptionDirect: async (loc, text) => {
-      const r = await cdpEval(cdpClickDropdownOptionDirect, loc.wrapperSel, text);
-      console.log('[ApplyPilot][CDP-DD-COMMIT] direct element-dispatch retry "' + text + '" → ' + (r && r.ok ? "dispatched" : "FAILED: " + (r && r.reason)) + ' (' + loc.wrapperSel + ')');
-      return !!(r && r.ok);
     },
 
     // ── typeahead (M25) ──
