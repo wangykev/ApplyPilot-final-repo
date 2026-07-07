@@ -1586,8 +1586,11 @@ function cdpFindDismissControl(cx, cy) {
   }
   const AFFIRM = /accept|agree|\bok\b|okay|got\s*it|allow|\byes\b|confirm|continue|submit|\bsave\b|sign\s*up|subscribe|\bnext\b|enable|turn\s*on|autofill|\bapply\b/i;
   const X_GLYPH = /^(×|✕|✖|⨯|✗|x|╳|⤫|⤬)$/i;
-  const DISMISS_TXT = /^(close|dismiss|no thanks|no,\s*thanks|not now|skip|maybe later|later)$/i;
-  const DISMISS_META = /close|dismiss/i;
+  const DISMISS_TXT = /^(close|dismiss|minimi[sz]e|no thanks|no,\s*thanks|not now|skip|maybe later|later)$/i;
+  // Simplify's overlay (div.simplify-jobs-shadow-root) collapses out of the way via a <button aria-label="Minimize">
+  // — the safe get-out-of-the-way action (no close/consent). NOT "collapse" (that matches its "Collapse Resume
+  // Section" SUB-control, which wouldn't uncover the button). Recon-confirmed 2026-07-06.
+  const DISMISS_META = /close|dismiss|minimi[sz]e/i;
   // Candidates: interactive controls + common close-icon carriers (class*=close/dismiss, X-glyph spans/divs).
   const cand = Array.from(root.querySelectorAll('button, [role="button"], a[href], [aria-label], [title], [class*="close" i], [class*="dismiss" i], span, div, svg'));
   let best = null;
