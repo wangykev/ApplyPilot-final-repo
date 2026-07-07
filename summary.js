@@ -23,6 +23,7 @@
 
 const root = document.getElementById("root");
 let currentBundle = null;            // the loaded reviewSummary, mutated in place on edit
+let lastRunAbort = null;             // { reason, detachReason, at } if the last run was cut short (operator Cancel/X → debugger detach)
 let currentFilter = "all";           // all | review | edited
 const collapsed = new Set();         // section keys the user collapsed
 const fieldRefreshers = new Map();   // field_id -> Set<fn>  (keeps every editor for a field in sync)
@@ -659,6 +660,17 @@ const fieldRow = (e, opts = {}) => {
 const render = () => {
   const bundle = currentBundle;
   root.textContent = ""; fieldRefreshers.clear(); fieldRowNodes.clear();
+  // Operator-cancel banner (shown BEFORE the no-bundle check, so a cancel that stopped the fill before any
+  // summary was written still explains WHY there's nothing / why fields error). Cleared on the next run.
+  if (lastRunAbort) {
+    const op = lastRunAbort.reason === "operator-cancelled";
+    root.appendChild(el("div", { class: "abort-banner" }, [
+      el("span", { class: "abort-ico", "aria-hidden": "true", text: "⛔" }),
+      el("span", { class: "abort-txt", text: op
+        ? "This run was CANCELLED mid-fill by the operator — the debugger was detached (Cancel/X on Chrome's “started debugging” banner). Any errors are from that cancel, and the summary below may be incomplete or from an earlier page."
+        : "The last fill run ended early — the debugger detached" + (lastRunAbort.detachReason ? ` (${lastRunAbort.detachReason})` : "") + ". The summary below may be incomplete." }),
+    ]));
+  }
   if (!bundle || !Array.isArray(bundle.entries)) { root.appendChild(el("div", { class: "empty", text: "No summary yet — run a fill, then open “View last summary”." })); return; }
   const entries = bundle.entries;
   const live = entries.filter((e) => !e.is_deleted);           // deleted entries drop out of counts/list
@@ -870,8 +882,9 @@ const jumpToField = (e) => {
 const relTime = (iso) => { if (!iso) return "—"; const t = Date.parse(iso); if (isNaN(t)) return String(iso); const s = Math.round((Date.now() - t) / 1000); if (s < 45) return "just now"; if (s < 3600) return `${Math.round(s / 60)} min ago`; if (s < 86400) return `${Math.round(s / 3600)} h ago`; return new Date(t).toLocaleString(); };
 
 const load = () => {
-  chrome.storage.local.get("reviewSummary", ({ reviewSummary }) => {
+  chrome.storage.local.get(["reviewSummary", "lastRunAbort"], ({ reviewSummary, lastRunAbort: abort }) => {
     currentBundle = reviewSummary || null;
+    lastRunAbort = abort || null;
     render();
   });
 };

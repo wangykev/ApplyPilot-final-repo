@@ -611,6 +611,91 @@ test("radio: no candidate matches the labels → needs_review with the options",
   assert.deepStrictEqual(rec.options, ["Yeah", "Nope"]);
 });
 
+// ── AI required-radio fallback (aiFillRadio) — the deferred required-radio path ──────────────
+// A REQUIRED radio the deterministic pass can't answer would BLOCK Save & Continue → guess-to-reach-
+// review (never blind-trust): infer + commit + ALWAYS filled_review, flagged HARD. AI OFF / OPTIONAL → blank.
+const aiPwField = (flags) => pwField(Object.assign({ isRequired: true }, flags || {}));
+
+test("AI radio (prev-worker unevaluable): infers No → filled_review + ai-choice-sensitive (LOUD), committed, confidence carried", async () => {
+  // no company set + Magna not in employment history → decidePreviousWorker is UNEVALUABLE (blank);
+  // the required-radio AI fallback then infers "No" from the ABSENCE of Magna in the profile.
+  const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"No","justification":"Magna not in employment history","confidence":"High"}' });
+  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", "an AI guess is never silently filled");
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.flag, "ai-choice-sensitive", "prev-worker sits next to a truthfulness cert → always LOUD");
+  assert.strictEqual(rec.confidence, "high");
+  assert.match(rec.detail, /employment history/);
+  assert.ok(act.log.some(([m]) => m === "llm") && act.log.some(([m]) => m === "clickRadioLabel"), "called the LLM + committed the radio");
+  const e = buildReviewBundle([rec], {}).entries[0];
+  assert.strictEqual(e.needs_review, true);
+  assert.strictEqual(e.confidence_source, "ai_inference");
+  assert.strictEqual(e.current_value, "No");
+});
+
+test('AI radio: an inferred "Yes" is STILL filled_review, never plain filled (the truthfulness-cert invariant holds under AI)', async () => {
+  const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"Yes","justification":"prior tenure suggested","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "Yes");
+  assert.notStrictEqual(rec.status, "filled", "a Yes is never silently filled");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-choice-sensitive");
+});
+
+test("AI radio SAFETY: a determined-but-uncommitted decision (resolved set) is NEVER overridden by an AI guess", async () => {
+  // exact company match → decidePreviousWorker decides "Yes"; the commit FAILS (dead rect + space fails).
+  // resolved is set, so the AI fallback must NOT fire (else it could flip the answer). Stays deterministic.
+  const act = makeFakeAct([aiPwField({ radioClickRectDead: true, spaceFails: true })], { aiEnabled: true, ai: '{"choice":"No","justification":"x","confidence":"High"}' });
+  const rec = (await drivePageFill(act, pwProfile(["Magna"]), {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review", "stays the deterministic review — not AI-overridden");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "the AI radio fallback must not fire when a decision was already made");
+});
+
+test("AI radio: an UNMAPPED required radio → AI picks a label → filled_review + ai-choice (not sensitive)", async () => {
+  const field = { wrapperSel: "[w-r]", fieldName: "unknown_screen", widgetType: "radio", isRequired: true, label: "Do you have reliable transportation?",
+    options: [{ id: "r-yes", labelText: "Yes", checked: false }, { id: "r-no", labelText: "No", checked: false }] };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Yes","justification":"driver license in profile","confidence":"Medium"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.flag, "ai-choice");
+  assert.strictEqual(rec.confidence, "medium");
+});
+
+test("AI radio: a demographic (EEO) required radio → re-tagged ai-eeo-guess (DEMOGRAPHIC badge)", async () => {
+  const field = { wrapperSel: "[w-g]", fieldName: "gender", widgetType: "radio", isRequired: true, label: "Gender",
+    options: [{ id: "g-m", labelText: "Male", checked: false }, { id: "g-f", labelText: "Female", checked: false }, { id: "g-x", labelText: "Decline to self-identify", checked: false }] };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"Decline to self-identify","justification":"no gender stated","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "ai-eeo-guess");
+});
+
+test("AI radio: the AI's pick is not one of the labels → needs_review (ai-nomatch), no commit", async () => {
+  const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"Maybe","justification":"unsure","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "ai-nomatch");
+  assert.strictEqual(rec.after, null);
+  assert.ok(!act.log.some(([m]) => m === "clickRadioLabel"), "never committed a non-option");
+});
+
+test("AI radio: an OPTIONAL blank radio never calls the LLM (optional doesn't block → no guess)", async () => {
+  const field = pwField(); // no isRequired
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"No","justification":"x","confidence":"High"}' });
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!act.log.some(([m]) => m === "llm"), "optional radio: no LLM call");
+  assert.strictEqual(rec.after, null, "stays the deterministic unevaluable blank");
+});
+
+test("AI radio OFF: prev-worker unevaluable stays blank needs_review (no AI without the toggle)", async () => {
+  const act = makeFakeAct([aiPwField()]); // aiEnabled default OFF
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.after, null);
+  assert.ok(!act.log.some(([m]) => m === "llm"));
+});
+
 // ── text ─────────────────────────────────────────────────────────────────────
 
 const textField = (flags) => Object.assign({
@@ -1256,6 +1341,8 @@ test("cascade-removed: a field DELETED from the DOM after fills → status 'remo
 test("AI INVARIANT: prev-worker / file_upload / radio never AI-eligible; dropdown + text/textarea ARE — and EEO is NOW eligible (rule retracted)", () => {
   assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "candidateIsPreviousWorker", label: "Have you worked here?" }), false);
   assert.strictEqual(aiEligible({ widgetType: "file_upload", fieldName: "resume", label: "Resume" }), false);
+  // radio stays OUT of aiEligible on purpose — a REQUIRED radio gets AI via its OWN post-pass
+  // (aiFillRadio), exactly like typeaheads, NOT through this dropdown/text gate.
   assert.strictEqual(aiEligible({ widgetType: "radio", fieldName: "x", label: "Pick one" }), false);
   assert.strictEqual(aiEligible({ widgetType: "dropdown", fieldName: "gender", label: "What is your gender?" }), true, "EEO is NOW AI-eligible (exclusion retracted)");
   assert.strictEqual(aiEligible({ widgetType: "text", fieldName: "disabilityStatus", label: "Disability status" }), true, "EEO text is NOW eligible too");

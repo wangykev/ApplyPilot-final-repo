@@ -195,3 +195,67 @@ identical on main — the recon-close hardening never reached them, so main was 
 must keep polling until `optionCount === 0`; an aria-only gate would Escape zero times). Happy path adds ~1
 read (options already gone → immediate). Docs synced (CLAUDE.md close-gate invariant, dom-patterns entry).
 `node -c` clean; unit suite green (**484**). **LIVE-VERIFY PENDING** with the fast-first change before merge.
+
+## 2026-07-06 — Required-radio AI fallback (`aiFillRadio`) — the deferred milestone, BUILT (live-verify pending)
+
+A REQUIRED radio the deterministic pass can't answer was left BLANK, which BLOCKS Save & Continue (and halts
+the walk). Reported live: `candidateIsPreviousWorker` on Magna with no `jobContext.company` set → `decidePreviousWorker`
+"unevaluable" → blank + review. Built the deferred required-radio AI fallback, mirroring the dropdown AI-1
+(`aiFillField`) exactly:
+
+- **`aiFillRadio` (fill-driver.js)**: read the live radio labels → LLM infers the best option from the profile
+  → the pick must clear the match ladder vs the live labels (never blind-commit) → commit via the proven
+  `fillRadioCdp` (label-click → focus+Space → read-back verify) → ALWAYS `filled_review`, never silently trusted.
+- **Dispatch**: a dedicated post-pass in `drivePageFill` (NOT via `aiEligible`, which stays radio→false — mirrors
+  the typeahead pass), gated `act.aiEnabled && f.isRequired && widgetType==="radio" && record.resolved == null &&
+  status not filled/filled_review`. The `resolved == null` gate is the load-bearing SAFETY: a decision the
+  deterministic pass already made but failed to commit (e.g. a matched employer "Yes") is NEVER overridden by a
+  contradictory guess — it stays review-flagged.
+- **Flagging**: `candidateIsPreviousWorker` is force-flagged `ai-choice-sensitive` (LEGALLY-LOADED badge — it sits
+  next to a truthfulness certification; a wrong "Yes" is a false statement); a low-confidence guess auto-escalates
+  to super-hard in the viewer. A demographic radio → `ai-eeo-guess` (re-tagged at the call site). The
+  truthfulness-cert invariant holds under AI: a "Yes" is ALWAYS `filled_review`, never plain `filled`.
+- **Optional / AI-OFF**: never fires (a blank optional radio doesn't block; unit-pinned).
+
+8 new unit tests (473 total, green on the branch). `aiEligible` unchanged (radio still excluded there — the AI
+runs through the separate pass). CLAUDE.md updated (AI safety/eligibility bullet + open-items). **HARD GATE per
+CLAUDE.md: live-verify eyes-on, on a DISPOSABLE application — this changes a truthfulness-cert-adjacent field.**
+
+## 2026-07-06 — Detach-cleanup + blocking-popup detection on Save & Continue (operator UX)
+
+Two robustness fixes (CDP substrate; live-verify pending):
+
+- **External detach strands the input-lock overlay → onDetach cleanup.** The native `chrome.debugger` infobar's
+  "Cancel" detaches MID-RUN; the run's `finally → removeInputLock()` goes through `cdpEval`, which can't reach the
+  now-detached page, so the "⏳ ApplyPilot is filling this form — please don't click or type" overlay was left
+  STUCK. Fix: the `chrome.debugger.onDetach` listener (cdp.js) now tears the overlay down via
+  `chrome.scripting.executeScript(cdpRemoveInputLock)` (no debugger needed; self-contained; no-op if never
+  installed). So Cancel ⇒ detach **+ remove the lock banner**. NOTE the "started debugging" banner is Chrome's
+  NATIVE infobar — the extension can't add/intercept its X/Cancel; merely dismissing it (without detach) already
+  leaves the run running, so there's nothing to change there.
+- **Blocking popup over the Next button → detect + log, don't swallow.** `clickPageNext` did a coordinate click
+  at the button rect without checking what's on top; a popup/overlay (Simplify's dialog, a consent modal) would
+  swallow the click and surface as a bare nav-timeout. Fix: `elementFromPoint` the button's center first — if the
+  top node isn't the button (or its subtree), refuse `{clicked:false, refused:"blocked", blockedBy:<descriptor>}`
+  and log "Save & Continue is COVERED by an overlay/popup — Blocked by: <tag#id[data-automation-id].class \"text\">".
+  The walk halts `click-refused:blocked` with `blocked_by` in the result (self-explaining, not a generic error).
+
+Unit suite unaffected (490 green — these are substrate methods, not unit-tested). CLAUDE.md updated (input-lock
+bullet + the multi-page clickPageNext note).
+
+## 2026-07-06 — Operator-cancel cause on the summary page + world:MAIN overlay teardown (live-verified pieces)
+
+Live testing of the detach/banner behavior surfaced two fixes:
+
+- **Stranded input-lock overlay on Cancel → `world:"MAIN"`.** The overlay is installed via `cdpEval` (CDP
+  Runtime.evaluate → the page's MAIN world), so `window.__apLock` lives there. The onDetach cleanup used
+  `chrome.scripting.executeScript` WITHOUT a world → ran in the ISOLATED world where `__apLock` is undefined →
+  `cdpRemoveInputLock` no-op'd and the "please don't click or type" banner stayed STUCK after Cancel. Passing
+  `world:"MAIN"` fixes it. **LIVE-VERIFIED**: Cancel now clears the banner (operator confirmed). X and Cancel
+  BOTH detach (Chrome-native infobar, indistinguishable) — accepted; no auto-reattach.
+- **Operator-cancel cause on the summary (+ SW log).** A mid-run detach makes the in-flight fill's CDP calls
+  fail, and the errors looked causeless. Now `chrome.debugger.onDetach` writes a `lastRunAbort` marker (reason
+  `operator-cancelled` when Chrome's `reason==="canceled_by_user"`, else `debugger-detached`), cleared at the
+  next `cdpAttach`. The SW log says "⛔ OPERATOR CANCELLED mid-run …", and `summary.js` renders a red
+  `abort-banner` at the top (shown even when the cancel wrote no bundle) explaining the incomplete/errored
+  state. Unit suite unaffected (490 green). CLAUDE.md input-lock bullet updated.

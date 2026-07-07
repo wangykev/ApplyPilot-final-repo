@@ -1300,6 +1300,51 @@ const fillRadioCdp = async (act, loc, candidates, budgets) => {
   };
 };
 
+// AI-1 for REQUIRED RADIOS (the deferred required-radio fallback). A required radio the deterministic
+// pass could not answer is left BLANK, which BLOCKS Save & Continue — so, exactly like the dropdown
+// AI-1 (aiFillField), GUESS-to-reach-review rather than leave it empty: read the live labels → LLM
+// INFERS the best option from the profile → the pick MUST clear the match ladder vs the live labels
+// (never blind-commit arbitrary text) → commit via the proven fillRadioCdp (label-click → focus+Space →
+// read-back) → ALWAYS filled_review, never silently trusted. candidateIsPreviousWorker is force-flagged
+// sensitive: it sits next to a truthfulness certification (a wrong "Yes" is a false statement), so its
+// guess renders LOUD (LEGALLY-LOADED), and a low-confidence guess auto-escalates to super-hard in the viewer.
+const aiFillRadio = async (act, loc, f, profile, jobContext, budgets) => {
+  const opts = await act.readRadioState(loc);
+  if (!opts || opts.length === 0) return { status: "needs_review", after: null, flag: "ai-no-options", detail: "AI radio fallback: no radio inputs found (not actuated)", auditLoc: loc.wrapperSel };
+  const optionLabels = opts.map((o) => o.labelText).filter(Boolean);
+  const sensitive = legallyLoaded(f.label) || f.fieldName === "candidateIsPreviousWorker";
+  const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, whether they PREVIOUSLY WORKED at a company from their employment history, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"company not in employment history\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low.";
+  const user = "Question: " + String(f.label || "")
+    + "\nAnswer options (choose exactly one; reply with its EXACT text): " + JSON.stringify(optionLabels)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\"}";
+  const res = await act.llm({ system, user, maxTokens: 512 });
+  if (!res || !res.ok) return { status: "needs_review", after: null, flag: "ai-call-failed", detail: "AI call failed — " + ((res && res.error) || "no reply"), options: optionLabels, auditLoc: loc.wrapperSel };
+  const ai = parseAiReply(res.text);
+  const conf = ai.confidence;
+  // The AI's choice is a CANDIDATE — clear the match ladder vs the live labels. A paraphrase / refusal
+  // won't match → needs_review (never blind-commit arbitrary text onto a truthfulness-adjacent field).
+  const m = ai.choice ? apMatch.matchCandidates([ai.choice], optionLabels) : { targetIndex: -1, matchTier: null };
+  if (m.targetIndex === -1) {
+    return { status: "needs_review", after: null, flag: "ai-nomatch", confidence: conf,
+      detail: "AI chose \"" + ai.choice + "\" — not one of the options" + (ai.justification ? " (" + ai.justification + ")" : ""),
+      options: optionLabels, auditLoc: loc.wrapperSel };
+  }
+  const target = optionLabels[m.targetIndex];
+  const hr = await fillRadioCdp(act, loc, [target], budgets); // proven commit: label-click → focus+Space → read-back verify
+  if (!hr || hr.status !== "filled") {
+    return { status: "needs_review", after: (hr && hr.after != null) ? hr.after : null, flag: "ai-commit-failed", confidence: conf,
+      detail: "AI chose \"" + target + "\" but the radio did not commit (" + ((hr && hr.detail) || "no result") + ")",
+      options: optionLabels, auditLoc: loc.wrapperSel };
+  }
+  // ALWAYS filled_review — an AI guess is never silently trusted; the human review gate is the safety.
+  return { status: "filled_review", after: hr.after, verified: true, matchTier: m.matchTier,
+    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf,
+    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + hr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
+    options: optionLabels, auditLoc: loc.wrapperSel };
+};
+
 // Checkbox: reconcile to the desired boolean (the M22 fillMappedEntry checkbox
 // semantics) — label-click primary, focus+Space fallback, checked read-back.
 const fillCheckboxCdp = async (act, loc, want, budgets) => {
@@ -2301,6 +2346,22 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         && (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || "")))) {
       try { Object.assign(record, await aiInferEeoField(act, loc, f, profile, budgets)); }
       catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI EEO infer error: " + String((e && e.message) || e); }
+    }
+
+    // ── Required-RADIO AI fallback (the deferred required-radio path) ── a REQUIRED radio the deterministic
+    // pass could NOT answer (unmapped → skipped; the employer-match "unevaluable" branch / no-options →
+    // needs_review with no resolved value) is left BLANK, which BLOCKS Save & Continue. Like the dropdown/
+    // typeahead AI-1: GUESS-to-reach-review (aiFillRadio) — infer + commit + ALWAYS filled_review, flagged
+    // HARD. GATE on `record.resolved == null` so a decision the deterministic pass ALREADY made but failed to
+    // commit (e.g. a matched "Yes" employer decision) is NEVER overridden by a contradictory guess — it stays
+    // review-flagged. AI OFF / OPTIONAL → never fires (a blank optional radio doesn't block; unit-pinned).
+    if (act.aiEnabled && f.isRequired && f.widgetType === "radio" && record.resolved == null
+        && record.status !== "filled" && record.status !== "filled_review") {
+      try {
+        const aiRes = await aiFillRadio(act, loc, f, profile, jobContext, budgets);
+        if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess"; // a demographic radio → loud demographic badge
+        if (aiRes) Object.assign(record, aiRes);
+      } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI radio fallback error: " + String((e && e.message) || e); }
     }
 
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
@@ -4682,5 +4743,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, aiFillField, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

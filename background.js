@@ -1809,7 +1809,10 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
     const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
     await cdpWakePage(); // wake a frozen hidden tab so the post-remediation transition can run
     const click = await act.clickPageNext();
-    if (!click.clicked) return { advanced: false, reason: "click-refused:" + (click.refused || "?"), attempts: attempt, actions };
+    if (!click.clicked) {
+      if (click.blockedBy) LOG(`re-Save&Continue refused — a popup/overlay is COVERING the button: ${click.blockedBy}`);
+      return { advanced: false, reason: "click-refused:" + (click.refused || "?"), blockedBy: click.blockedBy || null, attempts: attempt, actions };
+    }
     // Throttle-generous ceiling (see REMEDIATION_RENAV_CEILING_MS): a hidden tab's post-remediation
     // nav runs at ~1Hz — the default 15s stalled hidden page-2→3 after Tier-0 cleared the errors.
     const res = await cdpWaitNextPage(prevSig, REMEDIATION_RENAV_CEILING_MS);
@@ -2120,8 +2123,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
       if (!click.clicked) {
-        LOG(`advance refused on page ${page} (${click.refused}) — stop.`);
-        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), pages_filled: pagesFilled.length, pages: pagesFilled };
+        const blockNote = click.blockedBy ? ` — a popup/overlay is COVERING the button: ${click.blockedBy}. Close it, then re-run.` : "";
+        LOG(`advance refused on page ${page} (${click.refused})${blockNote} — stop.`);
+        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), blocked_by: click.blockedBy || null, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
 
       // ── (f) Wait for the transition OR session-death OR a nav-timeout (dirty halt). ──
