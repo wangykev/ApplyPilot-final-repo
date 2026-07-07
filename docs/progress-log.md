@@ -294,3 +294,19 @@ pending on the real Simplify overlay.
   now stable-partitions `out.languages` (non-English first, English last) before the CDP fill consumes it.
 
 Unit suite green.
+
+## 2026-07-06 — Session round LIVE-VERIFIED on Magna (review fixes + detach/popup/radio)
+
+Operator live-verified the full round on Magna wd3; all shipped to main:
+- Review summary: tier-editor "Filled" box; page-1 flat dropdown/typeahead recon (country → real `<select>`;
+  countryPhoneCode combobox — chip-exclusion + wait-for-render + promptOption fallback in `cdpScrapeTaOptions`).
+- Required-radio AI fallback (`aiFillRadio`): `candidateIsPreviousWorker` unevaluable → AI-guessed, LEGALLY-LOADED
+  flag, never blank-blocks.
+- Input-lock/detach: `world:"MAIN"` teardown clears the "please don't click or type" banner on Cancel; X/Cancel
+  both detach (accepted); a mid-run detach writes `lastRunAbort` → SW "OPERATOR CANCELLED mid-run" log + a red
+  `abort-banner` on the summary page.
+- Save & Continue: blocking-popup detection; best-effort auto-dismiss — Simplify's `div.simplify-jobs-shadow-root`
+  is minimized via its `<button aria-label="Minimize">` (open shadow root), then the walk advances.
+- Languages: `prepareProfile` fills English LAST (reduces the ghost duplicate-language error).
+
+The earlier per-feature "live-verify pending" notes are now superseded — this round is verified.
