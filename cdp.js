@@ -2363,6 +2363,53 @@ function cdpSourceCategoryRect(label) {
                    cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) } };
 }
 
+// ── Batched audit re-read (perf) ─────────────────────────────────────────────
+// The M40 audit re-reads every field the bot actuated. Doing one cdpEval PER FIELD is N serial
+// SW↔page round-trips; on a HIDDEN tab (where the fill is slowest — throttled reaction, and each
+// debugger round-trip costs more) that IPC latency dominates the otherwise-instant reads.
+// cdpReadAuditRaw reads ALL fields in ONE Runtime.evaluate by COMPOSING the SINGLE-SOURCE reader
+// functions (their .toString(), NO body duplication → no lockstep hazard) with a dispatcher inside
+// one scoped IIFE. Returns a parallel array of RAW reader outputs (the same shapes
+// act.readTextValue/readDropdownState/… return; a "date" entry → an array of per-segment reads),
+// null per field on a page-side error. The {actual,readable} MAPPING stays SW-side in fill-driver
+// (auditActualFromRaw — Node-testable); reconcileAudit falls back to the per-field path when this
+// method is absent (older fakes / a minimal audit act).
+const AUDIT_RAW_READERS = [cdpReadTextState, cdpReadInputBySel, cdpReadDropdownState,
+  cdpReadCheckboxState, cdpReadRadioState, cdpReadHierState, cdpReadSourcePick];
+// Page-side dispatcher — receives [{widgetType, wrapperSel, tag, dateSegs}] and returns the raw read
+// per spec. Self-contained: references ONLY the AUDIT_RAW_READERS (injected as sibling declarations
+// by cdpReadAuditRaw) + page globals. Keep the widget→reader map in LOCKSTEP with fill-driver's
+// auditReReadActual (typeahead→Hier, hierarchical→SourcePick).
+function cdpAuditRawDispatch(specs) {
+  return (specs || []).map(function (s) {
+    try {
+      switch (s.widgetType) {
+        case "text": case "textarea": return cdpReadTextState(s.wrapperSel, s.tag);
+        case "dropdown": return cdpReadDropdownState(s.wrapperSel);
+        case "checkbox": return cdpReadCheckboxState(s.wrapperSel);
+        case "radio": return cdpReadRadioState(s.wrapperSel);
+        case "typeahead": return cdpReadHierState(s.wrapperSel);
+        case "hierarchical": return cdpReadSourcePick(s.wrapperSel);
+        case "date": return (s.dateSegs || []).map(function (seg) {
+          return cdpReadInputBySel(s.wrapperSel + ' [data-automation-id="dateSection' + seg + '-input"]');
+        });
+        default: return null;
+      }
+    } catch (e) { return null; }
+  });
+}
+async function cdpReadAuditRaw(specs) {
+  const readerSrc = AUDIT_RAW_READERS.map((f) => String(f)).join("\n");
+  const expression = "(function(){\n" + readerSrc + "\nreturn (" + String(cdpAuditRawDispatch)
+    + ")(" + JSON.stringify(specs || []) + ");\n})()";
+  const res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  if (res && res.exceptionDetails) {
+    const d = res.exceptionDetails;
+    throw new Error("cdpReadAuditRaw: " + ((d.exception && d.exception.description) || d.text || "page exception"));
+  }
+  return res && res.result ? res.result.value : undefined;
+}
+
 // The actuation object. No tabId param — the substrate's single tracked
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 // `llmConfig` (AI-0 seam): the operator's {provider,model,apiKey,enabled} from storage,
@@ -2528,6 +2575,8 @@ function makeCdpActuation(llmConfig) {
       return false;
     },
     readHier: (loc) => cdpEval(cdpReadHierState, loc.wrapperSel),
+    // Perf: read MANY fields' raw state in ONE round-trip for the M40 audit (see cdpReadAuditRaw).
+    readAuditRaw: (specs) => cdpReadAuditRaw(specs),
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),

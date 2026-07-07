@@ -4828,6 +4828,101 @@ test("M40 audit: a clean drivePageFill run gets NO audit-* flags (no false flags
   assert.strictEqual(out.results[0].status, "filled");
 });
 
+// ── M40 audit — BATCHED re-read (one round-trip via act.readAuditRaw) ─────────
+// The batched path (reconcileAudit → act.readAuditRaw) must yield the IDENTICAL verdicts as the
+// per-field path — it changes only HOW the raw reads are fetched (ONE call vs N), not the mapping.
+// makeAuditActBatched builds readAuditRaw from the SAME per-field reads makeAuditAct exposes, and
+// SPIES (via un-wrapped originals) so a test can assert the per-field reads are NOT used when
+// readAuditRaw is present, and readAuditRaw is called exactly once for the whole page.
+function makeAuditActBatched(live) {
+  const base = makeAuditAct(live);
+  const orig = {};
+  const calls = { readAuditRaw: 0, perField: 0 };
+  ["readTextValue", "readDropdownState", "readCheckboxState", "readRadioState", "readHier", "readSource", "readDateSegment"].forEach((name) => {
+    orig[name] = base[name];
+    base[name] = async (...a) => { calls.perField++; return orig[name](...a); };
+  });
+  base.readAuditRaw = async (specs) => {
+    calls.readAuditRaw++;
+    // one call → all raw reads; mirrors cdp.js cdpReadAuditRaw's per-widget dispatch (raw shapes only).
+    return Promise.all((specs || []).map(async (s) => {
+      const loc = { wrapperSel: s.wrapperSel };
+      switch (s.widgetType) {
+        case "text": case "textarea": return orig.readTextValue(loc, s.tag);
+        case "dropdown": return orig.readDropdownState(loc);
+        case "checkbox": return orig.readCheckboxState(loc);
+        case "radio": return orig.readRadioState(loc);
+        case "typeahead": return orig.readHier(loc);
+        case "hierarchical": return orig.readSource(loc);
+        case "date": { const out = []; for (const seg of (s.dateSegs || [])) out.push(await orig.readDateSegment(loc, seg)); return out; }
+        default: return null;
+      }
+    }));
+  };
+  base._calls = calls;
+  return base;
+}
+const auditVerdictBatched = async (entry, liveForKey) => {
+  const act = makeAuditActBatched({ "[w]": liveForKey });
+  const v = await reconcileAudit(act, [Object.assign({ key: "k", auditLoc: "[w]" }, entry)], T_BUDGETS);
+  return { verdict: v[0].verdict, calls: act._calls };
+};
+
+test("M40 audit BATCHED: verdict PARITY with the per-field path across every widget (+ one round-trip, no per-field reads)", async () => {
+  const cases = [
+    [{ widgetType: "dropdown", expected: "Bachelors" }, { trigger: "Associates" }],                          // mismatch
+    [{ widgetType: "dropdown", expected: "United States of America" }, { trigger: "United States of America" }], // normalize match
+    [{ widgetType: "text", expected: "Tallahassee, FL" }, { text: "Pittsburgh, PA" }],                        // mismatch
+    [{ widgetType: "text", expected: "Tallahassee, FL" }, { text: "Tallahassee, FL" }],                       // match
+    [{ widgetType: "checkbox", expected: "true" }, { checked: true }],                                        // match
+    [{ widgetType: "checkbox", expected: "true" }, { checked: false }],                                       // mismatch
+    [{ widgetType: "radio", expected: "Yes" }, { radioLabel: "Yes" }],                                        // match
+    [{ widgetType: "typeahead", expected: "Other" }, { chips: ["Electrical Engineering"] }],                  // mismatch
+    [{ widgetType: "hierarchical", expected: "LinkedIn" }, { chips: ["LinkedIn"] }],                          // match
+    [{ widgetType: "date", expected: "6/15/2024" }, { segments: { Month: "6", Day: "15", Year: "2024" } }],   // match
+    [{ widgetType: "date", expected: "6/15/2024" }, { segments: { Month: "1", Day: "15", Year: "2024" } }],   // mismatch
+    [{ widgetType: "dropdown", expected: "Bachelors" }, { missing: true }],                                   // unverifiable
+    [{ widgetType: "date", expected: "2024" }, { missing: true }]                                             // unverifiable
+  ];
+  for (const [entry, live] of cases) {
+    const perField = await auditVerdict(entry, live);
+    const b = await auditVerdictBatched(entry, live);
+    assert.strictEqual(b.verdict, perField, `verdict parity for ${entry.widgetType} ${JSON.stringify(live)}`);
+    assert.strictEqual(b.calls.readAuditRaw, 1, "readAuditRaw called exactly once (N→1 round-trip)");
+    assert.strictEqual(b.calls.perField, 0, "per-field reads NOT used when readAuditRaw is present");
+  }
+});
+
+test("M40 audit BATCHED: a whole page of fields → ONE readAuditRaw call for all of them", async () => {
+  const act = makeAuditActBatched({
+    "[w1]": { trigger: "Associates" },
+    "[w2]": { text: "Tallahassee, FL" },
+    "[w3]": { segments: { Month: "6", Day: "15", Year: "2024" } }
+  });
+  const verdicts = await reconcileAudit(act, [
+    { key: "k1", auditLoc: "[w1]", widgetType: "dropdown", expected: "Bachelors" },
+    { key: "k2", auditLoc: "[w2]", widgetType: "text", expected: "Tallahassee, FL" },
+    { key: "k3", auditLoc: "[w3]", widgetType: "date", expected: "6/15/2024" }
+  ], T_BUDGETS);
+  assert.deepStrictEqual(verdicts.map((v) => v.verdict), ["mismatch", "match", "match"]);
+  assert.strictEqual(act._calls.readAuditRaw, 1, "one round-trip for the whole page");
+  assert.strictEqual(act._calls.perField, 0);
+});
+
+test("M40 audit BATCHED: a wrong-length batch result falls back to the per-field path (verdict still correct)", async () => {
+  const act = makeAuditAct({ "[w]": { trigger: "Associates" } });
+  act.readAuditRaw = async () => []; // shape mismatch (0 ≠ 1 entry) → guard rejects → per-field fallback
+  const v = await reconcileAudit(act, [{ key: "k", auditLoc: "[w]", widgetType: "dropdown", expected: "Bachelors" }], T_BUDGETS);
+  assert.strictEqual(v[0].verdict, "mismatch");
+});
+
+test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never aborts the audit)", async () => {
+  const act = makeAuditAct({ "[w]": { text: "Tallahassee, FL" } });
+  act.readAuditRaw = async () => { throw new Error("boom"); };
+  const v = await reconcileAudit(act, [{ key: "k", auditLoc: "[w]", widgetType: "text", expected: "Tallahassee, FL" }], T_BUDGETS);
+  assert.strictEqual(v[0].verdict, "match");
+});
+
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.

@@ -3882,28 +3882,53 @@ function auditDateMatches(actual, expected) {
   return true;
 }
 
+// Map a widget's RAW read (the shape act.readTextValue/readDropdownState/… return) → {actual,
+// readable}. PURE, and the SINGLE derivation used by BOTH the per-field re-read (auditReReadActual)
+// and the batched one-round-trip pass (reconcileAudit via act.readAuditRaw). Keeping it SW-side keeps
+// it Node-testable and means the batched page-side reader (cdp.js cdpReadAuditRaw) only fetches raw
+// DOM state — no verdict logic leaks into the page. For "date", `raw` is an ARRAY of per-segment
+// reads in auditDateSegments order; ANY missing segment → unverifiable (matches the per-field path).
+function auditActualFromRaw(widgetType, raw) {
+  switch (widgetType) {
+    case "text": case "textarea": return { actual: raw ? raw.value : null, readable: !!raw };
+    case "dropdown": return { actual: raw ? raw.triggerText : null, readable: !!raw };
+    case "checkbox": return { actual: raw ? String(raw.checked) : null, readable: !!(raw && raw.inputId != null) };
+    case "radio": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
+    case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
+    case "date": {
+      if (!Array.isArray(raw)) return { actual: null, readable: false };
+      const parts = [];
+      for (const r of raw) { if (!r || r.value == null) return { actual: null, readable: false }; parts.push(r.value); }
+      return { actual: parts.join("/"), readable: true };
+    }
+    default: return { actual: null, readable: false }; // unauditable type → unverifiable, never a pass
+  }
+}
+
 // Re-read ONE field's live value by widget type (reusing the existing act reads, all keyed
 // by wrapperSel — a SELECTOR STRING, re-resolved fresh from document, never a held node).
-// Returns { actual, readable }: readable=false ⇒ the loc no longer resolves / read failed
-// (→ audit-unverifiable, NEVER a silent pass).
+// Fetches the raw read per widget, then maps via auditActualFromRaw (the SAME mapping the batched
+// path uses). Returns { actual, readable }: readable=false ⇒ the loc no longer resolves / read
+// failed (→ audit-unverifiable, NEVER a silent pass).
 async function auditReReadActual(act, e) {
   const loc = { wrapperSel: e.auditLoc };
   try {
+    let raw;
     switch (e.widgetType) {
-      case "text": case "textarea": { const r = await act.readTextValue(loc, e.auditTag); return { actual: r ? r.value : null, readable: !!r }; }
-      case "dropdown": { const r = await act.readDropdownState(loc); return { actual: r ? r.triggerText : null, readable: !!r }; }
-      case "checkbox": { const r = await act.readCheckboxState(loc); return { actual: r ? String(r.checked) : null, readable: !!(r && r.inputId != null) }; }
-      case "radio": { const r = await act.readRadioState(loc); const ok = Array.isArray(r) && r.length > 0; const c = ok && r.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
-      case "typeahead": { const r = await act.readHier(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
-      case "hierarchical": { const r = await act.readSource(loc); return { actual: r && r.chips ? r.chips.join("; ") : null, readable: !!r }; }
+      case "text": case "textarea": raw = await act.readTextValue(loc, e.auditTag); break;
+      case "dropdown": raw = await act.readDropdownState(loc); break;
+      case "checkbox": raw = await act.readCheckboxState(loc); break;
+      case "radio": raw = await act.readRadioState(loc); break;
+      case "typeahead": raw = await act.readHier(loc); break;
+      case "hierarchical": raw = await act.readSource(loc); break;
       case "date": {
-        const segs = auditDateSegments(e.expected);
-        const parts = [];
-        for (const [seg] of segs) { const r = await act.readDateSegment(loc, seg); if (!r || r.value == null) return { actual: null, readable: false }; parts.push(r.value); }
-        return { actual: parts.join("/"), readable: true };
+        raw = [];
+        for (const [seg] of auditDateSegments(e.expected)) raw.push(await act.readDateSegment(loc, seg));
+        break;
       }
       default: return { actual: null, readable: false }; // unauditable type → unverifiable, never a pass
     }
+    return auditActualFromRaw(e.widgetType, raw);
   } catch (err) { return { actual: null, readable: false }; }
 }
 
@@ -4170,9 +4195,25 @@ async function reconcileAudit(act, entries, budgets, opts) {
     return norm(actual) === norm(e.expected) ? "match" : "mismatch"; // dropdown / radio / typeahead / source
   };
   await act.delayFull(b.auditSettleMs);
+  // PERF (hidden runs): read every field's live state in ONE page-side round-trip instead of one
+  // cdpEval per field. Falls back to the per-field path when the substrate lacks readAuditRaw (older
+  // fakes / a minimal audit act) or the batch shape doesn't line up. A single snapshot is also more
+  // consistent than N reads spread across the pass. The mismatch→refill re-read below stays per-field
+  // (a fresh read of the ONE field just re-filled). Any batch failure → null → per-field fallback.
+  let batch = null;
+  if (typeof act.readAuditRaw === "function" && entries.length) {
+    try {
+      const raws = await act.readAuditRaw(entries.map((e) => ({
+        widgetType: e.widgetType, wrapperSel: e.auditLoc, tag: e.auditTag || null,
+        dateSegs: e.widgetType === "date" ? auditDateSegments(e.expected).map((s) => s[0]) : null
+      })));
+      if (Array.isArray(raws) && raws.length === entries.length) batch = raws;
+    } catch (err) { batch = null; }
+  }
   const verdicts = [];
-  for (const e of entries) {
-    let { actual, readable } = await auditReReadActual(act, e);
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    let { actual, readable } = batch ? auditActualFromRaw(e.widgetType, batch[i]) : await auditReReadActual(act, e);
     let verdict = classify(e, actual, readable);
     if (verdict === "mismatch" && refillOnMismatch) {
       try {
