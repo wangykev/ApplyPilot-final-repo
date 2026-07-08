@@ -850,10 +850,10 @@ test("dropdown OVERWRITE beat is VISIBILITY-aware: visible uses a SMALLER fast b
   assert.ok(vb < hb, `visible beat (${vb}) < hidden beat (${hb})`);
 });
 
-test("overwriteBeatLadder: visible → [30,100,700] (the 700 tier is ALWAYS reachable); hidden → [120,700]; ascending + deduped", () => {
-  const b = { overwriteFastBeatVisibleMs: 30, overwriteSlowBeatVisibleMs: 100, overwriteFastBeatMs: 120, overwriteSlowBeatMs: 700 };
-  assert.deepStrictEqual(overwriteBeatLadder(b, true), [30, 100, 700], "visible escalates all the way to the big beat");
-  assert.deepStrictEqual(overwriteBeatLadder(b, false), [120, 700], "hidden unchanged (proven pair)");
+test("overwriteBeatLadder: visible → [30,100,700,5000]; hidden → [120,700,5000] (final 5s safety tier); ascending + deduped", () => {
+  const b = { overwriteFastBeatVisibleMs: 30, overwriteSlowBeatVisibleMs: 100, overwriteFastBeatMs: 120, overwriteSlowBeatMs: 700, overwriteMaxBeatMs: 5000 };
+  assert.deepStrictEqual(overwriteBeatLadder(b, true), [30, 100, 700, 5000], "visible escalates through the big beat to the 5s safety tier");
+  assert.deepStrictEqual(overwriteBeatLadder(b, false), [120, 700, 5000], "hidden: proven pair + the 5s safety tier");
   // defensive: a tenant retune that makes beats out-of-order / duplicated still yields an ascending unique ladder
   assert.deepStrictEqual(overwriteBeatLadder({ overwriteFastBeatVisibleMs: 100, overwriteSlowBeatVisibleMs: 30, overwriteSlowBeatMs: 700 }, true), [30, 100, 700]);
 });

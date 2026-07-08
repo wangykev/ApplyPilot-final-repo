@@ -338,9 +338,10 @@ const DEFAULT_BUDGETS = {
   // ceiling). Empty fills never race → single fast commit, no ladder. Watch [CDP-DD-REFILL] (logs the ladder +
   // which tier committed) to retune.
   overwriteFastBeatMs: 120,        // HIDDEN ladder tier 0 (live-verified: commits fast at 100ms hidden; 120 = a small margin)
-  overwriteSlowBeatMs: 700,        // TOP tier for BOTH ladders (the proven ~700ms ≈ settleIntervalMs*2) — always reachable
+  overwriteSlowBeatMs: 700,        // the proven ~700ms beat (≈ settleIntervalMs*2) — the main "not painting" tier
   overwriteFastBeatVisibleMs: 30,  // VISIBLE ladder tier 0 (visible paints → tiny debounce)
   overwriteSlowBeatVisibleMs: 100, // VISIBLE ladder tier 1 (a laggy-but-painting visible miss)
+  overwriteMaxBeatMs: 5000,        // FINAL safety tier for BOTH ladders — a deeply-throttled/occluded tab that even 700ms misses gets one last 5s attempt before needs_review
   overwriteFailFastMs: 600
 };
 
@@ -1025,11 +1026,13 @@ async function closeDropdownConfirmed(act, loc, budgets) {
 // each miss — the persistence re-read gates every accept, so escalation only ever costs extra re-opens,
 // never a wrong fill. act.visible only picks the STARTING tiers (skip the tiny beats on a known-hidden
 // tab); the full ~700ms tier is ALWAYS reachable, even when labeled visible (the alt-tab / occluded fix:
-// a mislabeled tab self-corrects to the big beat instead of failing to needs_review). Ascending, deduped.
+// a mislabeled tab self-corrects to the big beat instead of failing to needs_review). Every ladder ends
+// with a FINAL ~5s safety tier (overwriteMaxBeatMs) so a deeply-throttled/occluded tab that even 700ms
+// misses gets one last long attempt before needs_review. Ascending, deduped.
 function overwriteBeatLadder(b, visible) {
   const ladder = visible
-    ? [b.overwriteFastBeatVisibleMs, b.overwriteSlowBeatVisibleMs, b.overwriteSlowBeatMs] // 30 → 100 → 700
-    : [b.overwriteFastBeatMs, b.overwriteSlowBeatMs];                                     // 120 → 700
+    ? [b.overwriteFastBeatVisibleMs, b.overwriteSlowBeatVisibleMs, b.overwriteSlowBeatMs, b.overwriteMaxBeatMs] // 30 → 100 → 700 → 5000
+    : [b.overwriteFastBeatMs, b.overwriteSlowBeatMs, b.overwriteMaxBeatMs];                                     // 120 → 700 → 5000
   return ladder.filter((v, i) => typeof v === "number" && v > 0 && ladder.indexOf(v) === i).sort((x, y) => x - y);
 }
 
