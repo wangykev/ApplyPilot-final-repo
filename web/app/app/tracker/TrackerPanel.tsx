@@ -2,6 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { Trash2, ExternalLink } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { updateApplicationStatus, deleteApplication } from "./actions";
@@ -146,12 +147,14 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                   className="h-2 w-2 shrink-0 rounded-full"
                   style={{ background: COLOR[a.status] }}
                 />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm text-ink">{a.company || host(a.url)}</div>
+                <Link href={`/app/tracker/${a.id}`} className="group min-w-0 flex-1">
+                  <div className="truncate text-sm text-ink transition-colors group-hover:text-amber">
+                    {a.company || host(a.url)}
+                  </div>
                   <div className="truncate font-mono text-[11px] text-ink-faint">
                     {a.role || host(a.url)}
                   </div>
-                </div>
+                </Link>
 
                 {a.needs_review_count > 0 && (
                   <span className="shrink-0 rounded border border-amber/40 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-amber">
