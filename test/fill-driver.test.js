@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -848,6 +848,41 @@ test("dropdown OVERWRITE beat is VISIBILITY-aware: visible uses a SMALLER fast b
   assert.ok(vb <= 30, `visible fast beat ≤30 (got ${vb})`);
   assert.ok(hb > 30 && hb <= 120, `hidden fast beat ~120 (got ${hb})`);
   assert.ok(vb < hb, `visible beat (${vb}) < hidden beat (${hb})`);
+});
+
+test("overwriteBeatLadder: visible → [30,100,700] (the 700 tier is ALWAYS reachable); hidden → [120,700]; ascending + deduped", () => {
+  const b = { overwriteFastBeatVisibleMs: 30, overwriteSlowBeatVisibleMs: 100, overwriteFastBeatMs: 120, overwriteSlowBeatMs: 700 };
+  assert.deepStrictEqual(overwriteBeatLadder(b, true), [30, 100, 700], "visible escalates all the way to the big beat");
+  assert.deepStrictEqual(overwriteBeatLadder(b, false), [120, 700], "hidden unchanged (proven pair)");
+  // defensive: a tenant retune that makes beats out-of-order / duplicated still yields an ascending unique ladder
+  assert.deepStrictEqual(overwriteBeatLadder({ overwriteFastBeatVisibleMs: 100, overwriteSlowBeatVisibleMs: 30, overwriteSlowBeatMs: 700 }, true), [30, 100, 700]);
+});
+
+test("dropdown OVERWRITE escalation: a VISIBLE-labeled tab whose commit needs the BIG beat escalates 30→100→700 and COMMITS (occlusion/alt-tab fix)", async () => {
+  // The alt-tab/occlusion bug: act.visible reported "visible" but the tab was occluded (not painting), so
+  // the overwrite only commits at the ~700ms beat. The OLD visible pair [30,100] never reached 700 → both
+  // missed → needs_review (the observed swapped/failed languages). The ladder must escalate to the 700 tier
+  // and end FILLED. commitsOnAttempt:3 → the first two tiers miss, the third (700) commits.
+  const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }];
+  const act = makeFakeAct([ddField({ triggerText: "United States of America", options: opts, commitsOnAttempt: 3 })]);
+  act.visible = async () => true; // mislabeled "visible" (occluded in reality)
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "escalated to the big beat and committed — NOT left needs_review");
+  assert.strictEqual(rec.after, "Afghanistan");
+  assert.strictEqual(rec.flag, "dropdown-overwrite-success");
+  assert.strictEqual(act.log.filter(([m]) => m === "clickDropdownOptionByText").length, 3, "one click per tier (30, 100, 700)");
+  assert.ok(act.log.filter(([m]) => m === "openDropdown").length >= 3, "re-opened the list for each escalation tier");
+});
+
+test("dropdown OVERWRITE escalation: a commit that NEVER takes exhausts the ladder → needs_review (never a wrong/silent fill)", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }];
+  const act = makeFakeAct([ddField({ triggerText: "United States of America", options: opts, commitsOnAttempt: 99 })]); // never commits
+  act.visible = async () => true;
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review", "exhausted all tiers without a persisted commit → honest needs_review");
+  assert.notStrictEqual(rec.after, "Afghanistan", "never reported the target as filled when it did not persist");
 });
 
 test("closeDropdownConfirmed: waits for the LISTBOX to unmount (options gone), NOT just aria-expanded=false", async () => {

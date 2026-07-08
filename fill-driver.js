@@ -323,19 +323,24 @@ const DEFAULT_BUDGETS = {
   // fill work that already runs after the triggering field (so the post-fold scan sees
   // the reveal already mounted). The cap is a runaway backstop (chained reveals are rare).
   maxCascadeRounds: 3,
-  // Dropdown OVERWRITE commit (2026-07-06 fast-first, VISIBILITY-AWARE). Committing a RE-SELECTION needs the
-  // just-opened list past a Workday-internal option-click DEBOUNCE (no pollable DOM readiness signal). The
-  // debounce is a PAINT thing: tiny when the tab is VISIBLE (painting), ~700ms when HIDDEN (not painting, even
-  // with worker-timers — forceWorkerTimersOff was irrelevant to the original fix). So the beats split on REAL
-  // tab visibility (act.visible): ATTEMPT 1 waits the fast beat then clicks; on a MISS, ATTEMPT 2 re-opens and
-  // pays the slow beat. VISIBLE overwrites commit at a much lower beat than hidden — live-verified: hidden
-  // commits fast at 100ms, visible at 30ms. overwriteFailFastMs caps how long attempt 1 waits to confirm/deny
-  // the commit so a MISS is detected cheaply (further capped by commitCeilingMs). Empty fills never race and
-  // skip the beat entirely. Watch [CDP-DD-REFILL] (it logs VISIBLE/hidden + the beat) to retune.
-  overwriteFastBeatMs: 120,        // HIDDEN fast-attempt beat (live-verified: commits fast at 100ms hidden; 120 = a small margin)
-  overwriteSlowBeatMs: 700,        // HIDDEN slow refill beat (the proven ~700ms ≈ settleIntervalMs*2)
-  overwriteFastBeatVisibleMs: 30,  // VISIBLE fast-attempt beat (visible paints → tiny debounce)
-  overwriteSlowBeatVisibleMs: 100, // VISIBLE slow refill beat (a rare visible miss refills quickly)
+  // Dropdown OVERWRITE commit (2026-07-06 fast-first; 2026-07-07 ESCALATING LADDER). Committing a
+  // RE-SELECTION needs the just-opened list past a Workday-internal option-click DEBOUNCE (no pollable DOM
+  // readiness signal). The debounce is a PAINT thing: tiny when the tab is VISIBLE (painting), ~700ms when
+  // HIDDEN (not painting, even with worker-timers). act.visible picks the STARTING beats, BUT it can't detect
+  // OCCLUSION (a tab alt-tabbed behind another app is throttled like hidden yet still reports
+  // tab.active && !minimized → act.visible mislabels it "visible"), so the commit no longer trusts the label:
+  // overwriteBeatLadder gives an ASCENDING ladder (visible [fast,slow-vis,slow-hidden]=30→100→700; hidden
+  // [120,700]) and the commit ESCALATES on each MISS up to the ~700ms tier REGARDLESS of the label — a
+  // painting tab commits on tier 0 (no penalty), a mislabeled/occluded tab self-corrects to the big beat
+  // instead of failing to needs_review (the alt-tab language-swap bug). The persistence re-read gates every
+  // accept, so escalation only costs extra re-opens, never a wrong fill. overwriteFailFastMs caps each
+  // non-final tier so a MISS escalates cheaply (further capped by commitCeilingMs; the last tier gets the full
+  // ceiling). Empty fills never race → single fast commit, no ladder. Watch [CDP-DD-REFILL] (logs the ladder +
+  // which tier committed) to retune.
+  overwriteFastBeatMs: 120,        // HIDDEN ladder tier 0 (live-verified: commits fast at 100ms hidden; 120 = a small margin)
+  overwriteSlowBeatMs: 700,        // TOP tier for BOTH ladders (the proven ~700ms ≈ settleIntervalMs*2) — always reachable
+  overwriteFastBeatVisibleMs: 30,  // VISIBLE ladder tier 0 (visible paints → tiny debounce)
+  overwriteSlowBeatVisibleMs: 100, // VISIBLE ladder tier 1 (a laggy-but-painting visible miss)
   overwriteFailFastMs: 600
 };
 
@@ -1010,6 +1015,24 @@ async function closeDropdownConfirmed(act, loc, budgets) {
   return !stillOpen(st);
 }
 
+// The dropdown OVERWRITE commit BEAT LADDER (ascending). Committing a re-selection needs the
+// just-opened list past a Workday-internal option-click DEBOUNCE whose only lever is elapsed-time-
+// since-open; a LONGER wait is strictly safer. We CANNOT reliably detect the true paint state: an
+// OCCLUDED window (alt-tabbed behind another app) is throttled like hidden yet still reports
+// `tab.active && !minimized`, so act.visible mislabels it "visible"; and the page's own
+// visibilityState / rAF are spoofed / polyfilled by the hidden-tab overrides, so paint can't be read
+// from the page either. So rather than trust the label, the commit ESCALATES through this ladder on
+// each miss — the persistence re-read gates every accept, so escalation only ever costs extra re-opens,
+// never a wrong fill. act.visible only picks the STARTING tiers (skip the tiny beats on a known-hidden
+// tab); the full ~700ms tier is ALWAYS reachable, even when labeled visible (the alt-tab / occluded fix:
+// a mislabeled tab self-corrects to the big beat instead of failing to needs_review). Ascending, deduped.
+function overwriteBeatLadder(b, visible) {
+  const ladder = visible
+    ? [b.overwriteFastBeatVisibleMs, b.overwriteSlowBeatVisibleMs, b.overwriteSlowBeatMs] // 30 → 100 → 700
+    : [b.overwriteFastBeatMs, b.overwriteSlowBeatMs];                                     // 120 → 700
+  return ladder.filter((v, i) => typeof v === "number" && v > 0 && ladder.indexOf(v) === i).sort((x, y) => x - y);
+}
+
 // Dropdown: the Playwright pattern ported, commit = type-to-highlight +
 // VERIFIED Enter (recon: a coordinate click on an out-of-view option dismisses
 // the popup — the Uruguay failure; Enter on a verified highlight commits).
@@ -1199,19 +1222,20 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   // VISIBILITY split: the overwrite debounce is a PAINT thing — tiny visible, ~700ms hidden. Pick the beats
   // off REAL tab visibility (act.visible; absent on older fakes ⇒ treat as hidden = the safe/larger beats).
   const dropdownVisible = act.visible ? await act.visible() : false;
-  const FAST_BEAT_MS = dropdownVisible ? budgets.overwriteFastBeatVisibleMs : budgets.overwriteFastBeatMs;
-  const SLOW_BEAT_MS = dropdownVisible ? budgets.overwriteSlowBeatVisibleMs : budgets.overwriteSlowBeatMs;
-  let res, refilled = false;
+  // Escalating beat ladder (occlusion/alt-tab fix): try the smallest beat first, and on each MISS re-open
+  // and wait the next-larger beat — up to the full ~700ms tier — REGARDLESS of the visibility label. A
+  // painting tab commits on tier 0 (no penalty); a mislabeled/occluded/hidden tab self-corrects to the big
+  // beat instead of failing (the old visible pair capped at 100ms → the alt-tab language-swap bug). The
+  // commit-PERSISTENCE re-read gates every accept, so escalation only ever costs extra re-opens — never a
+  // wrong/silent fill. EMPTY fills (placeholder → value) never race → single fast commit, no ladder.
+  const beats = overwriteBeatLadder(budgets, dropdownVisible);
+  let res = { ok: false, after: null }, committedTier = -1;
   if (isOverwrite) {
-    // Attempt 1 — FAST: wait only up to FAST_BEAT_MS since the list opened, then click with a SHORT
-    // failure deadline (capped by the commit ceiling) so a MISS is detected quickly instead of burning ~10s.
-    if (act.delayFull && openedAt) { const r = FAST_BEAT_MS - (Date.now() - openedAt); if (r > 0) await act.delayFull(r); }
-    res = await commitByClick(act.clickDropdownOptionByText, Math.min(budgets.overwriteFailFastMs, budgets.commitCeilingMs));
-    if (!res.ok) {
-      // Fast attempt MISSED (the small beat didn't clear the debounce). Re-open if the click closed the list,
-      // wait the full proven ~700ms SINCE THE (RE-)OPEN, then commit again with the full ceiling.
-      refilled = true;
-      let re = await act.readDropdownState(loc), reAt = openedAt;
+    let reAt = openedAt; // when the currently-open list opened; the beat is measured from here
+    for (let tier = 0; tier < beats.length; tier++) {
+      // Tier 0: the list is already open from the initial open (openedAt). Later tiers: the prior missed
+      // click usually closed it → re-open and reset the beat clock (reAt) to the fresh open.
+      let re = await act.readDropdownState(loc);
       if (!re || re.optionCount === 0) {
         reAt = 0;
         if (await act.openDropdown(loc)) {
@@ -1219,12 +1243,14 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
           while (Date.now() < d) { await delayRender(budgets.settleIntervalMs); re = await act.readDropdownState(loc); if (re && re.optionCount > 0) { reAt = Date.now(); break; } } // re-open settle — adaptive under the measured-fast gate; gated by optionCount>0, interval-independent
         }
       }
-      if (re && re.optionCount > 0) {
-        if (act.delayFull && reAt) { const r = SLOW_BEAT_MS - (Date.now() - reAt); if (r > 0) await act.delayFull(r); } // full ~700ms beat since the (re-)open, minus time already spent
-        res = await commitByClick(act.clickDropdownOptionByText, budgets.commitCeilingMs);
-      }
+      if (!re || re.optionCount === 0) break; // couldn't (re-)open → needs_review below
+      if (act.delayFull && reAt) { const r = beats[tier] - (Date.now() - reAt); if (r > 0) await act.delayFull(r); } // this tier's beat SINCE the (re-)open, minus time already spent
+      // Fail-fast on every tier BUT the last (so misses escalate quickly); the last tier gets the full ceiling.
+      const ceiling = tier === beats.length - 1 ? budgets.commitCeilingMs : Math.min(budgets.overwriteFailFastMs, budgets.commitCeilingMs);
+      res = await commitByClick(act.clickDropdownOptionByText, ceiling);
+      if (res.ok) { committedTier = tier; break; }
     }
-    console.log(`[ApplyPilot][CDP-DD-REFILL] "${before}"→"${target}" ${dropdownVisible ? "VISIBLE" : "hidden"} fastBeat=${FAST_BEAT_MS}ms → ${refilled ? `MISSED fast → refilled slow(~${SLOW_BEAT_MS}ms)` : "committed on FAST attempt"}: ${res && res.ok ? `OK "${res.after}"` : `FAILED "${res && res.after}"`}`);
+    console.log(`[ApplyPilot][CDP-DD-REFILL] "${before}"→"${target}" ${dropdownVisible ? "VISIBLE" : "hidden"} beats=[${beats.join(",")}]ms → ${committedTier === 0 ? "committed on tier 0 (fast)" : committedTier > 0 ? `escalated → committed on tier ${committedTier} (${beats[committedTier]}ms)` : "MISSED all tiers"}: ${res && res.ok ? `OK "${res.after}"` : `FAILED "${res && res.after}"`}`);
   } else {
     // EMPTY fill (placeholder → value): no debounce race — a single fast commit + the generic re-open retry.
     res = await commitByClick(act.clickDropdownOptionByText);
@@ -4810,5 +4836,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
