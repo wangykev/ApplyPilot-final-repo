@@ -2458,6 +2458,38 @@ async function getLlmConfig() {
   return await new Promise((resolve) => chrome.storage.local.get("llmConfig", (r) => resolve((r && r.llmConfig) || {})));
 }
 
+// P3b (website tracker): after a completed page fill, push the review bundle +
+// status to the website backend so the operator's Tracker + hosted review summary
+// populate. Uses the per-user ingest credential the website synced via AP_SET_SESSION.
+// FIRE-AND-FORGET — wrapped so it NEVER throws and NEVER affects the fill; if the
+// website isn't connected (no apSession) it's a silent no-op. status is NEVER
+// "submitted" (the human submits — the engine only ever fills to review).
+async function reportApplication(bundle, jobContext) {
+  try {
+    if (!bundle) return;
+    const { apSession } = await new Promise((res) => chrome.storage.local.get("apSession", res));
+    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return;
+    const needs = bundle.needs_review_count || 0;
+    const payload = {
+      company: (jobContext && jobContext.company) || bundle.tenant || null,
+      role: null,
+      url: bundle.url || null,
+      status: needs > 0 ? "needs_review" : "filling",
+      needs_review_count: needs,
+      captured_at: bundle.captured_at || new Date().toISOString(),
+      review_bundle: bundle
+    };
+    const res = await fetch(apSession.ingestUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
+      body: JSON.stringify(payload)
+    });
+    console.log("[ApplyPilot] application reported —", res && res.status, `(${payload.status}, ${needs} need review)`);
+  } catch (e) {
+    console.log("[ApplyPilot] application report skipped:", String((e && e.message) || e));
+  }
+}
+
 async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
   try {
@@ -2474,6 +2506,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
     const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
     const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
     const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts);
+    await reportApplication(bundle, jobContext); // fire-and-forget → website Tracker (no-op if not connected)
     return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total, audit_flagged: auditFlags.length };
   } catch (e) {
     const msg = String((e && e.message) || e);

@@ -155,7 +155,7 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 
 - **v1 (done)** — auth · resume upload + AI parse · profile editor · job context · AI config · **extension auto-sync**. The core "upload your resume and feed the extension" loop.
 - **P2 (done)** — Tracker + Queue: `/app/queue` (paste Workday URLs → `queue_items`, manage) + `GET /api/extension/queue` (ingest-key pull); `/app/tracker` (applications list, stats strip, status lights, pipeline-stage select, filters) fed by `POST /api/extension/report`. Queue + Tracker promoted to live sidebar nav; dashboard updated; Analytics now the "coming soon" item. A hard-gated `DEV_PREVIEW` sample dataset makes both demoable pre-Supabase.
-- **P3** — Hosted review summaries: React port of `summary.js` over the `reviewSummary` schema; extension pushes the bundle; edits write back.
+- **P3 (done)** — Hosted review summaries: `lib/review-summary.ts` + `ReviewSummaryView` render the `reviewSummary` bundle at `/app/tracker/[id]` (needs-review-first, safety badges, grouped all-fields) — read-only; tracker rows link in. The extension now PUSHES its bundle: `reportApplication(bundle, jobContext)` in `background.js` fires after `runCdpFillPage` (fire-and-forget, no-op if the website isn't connected, status never "submitted"); `POST /api/extension/report` upserts-by-URL so re-runs don't duplicate. *(Edit/write-back-to-extension + the walk-side report are follow-ups; live extension push is the operator's verify step.)*
 - **P4** — Analytics dashboard + pipeline stages + reminders.
 - **P5** — AI-tailored resume variants + cover letter generation.
 - **P6** — Auto-discover jobs (board integrations) + production hardening (pinned extension ID via manifest `key`, encrypted keys, deploy).
