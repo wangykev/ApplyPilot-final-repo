@@ -4234,40 +4234,12 @@ async function reconcileAudit(act, entries, budgets, opts) {
     widgetType: e.widgetType, wrapperSel: e.auditLoc, tag: e.auditTag || null,
     dateSegs: e.widgetType === "date" ? auditDateSegments(e.expected).map((s) => s[0]) : null
   }));
-  let _tBatchMs = null;
   if (typeof act.readAuditRaw === "function" && entries.length) {
-    const _t0 = Date.now();
     try {
       const raws = await act.readAuditRaw(_specs);
       if (Array.isArray(raws) && raws.length === entries.length) batch = raws;
     } catch (err) { batch = null; }
-    _tBatchMs = Date.now() - _t0;
   }
-  // ⏱ [PERF-TEMP] REMOVE BEFORE MERGE — hidden-run verification. Confirms (1) the batched path is
-  // actually taken on the live page, (2) it AGREES with the per-field reads (a throwaway per-field
-  // pass — read-only, results discarded — cross-checks every field), (3) how much wall-clock it
-  // saves. This ADDS a full extra per-field read pass, so it roughly doubles the audit's read time
-  // ON THE DIAGNOSTIC RUN — that's the point (it's the number we compare against). Gated on
-  // `act.visible` so it runs ONLY on the real CDP substrate (never in unit fakes). Delete this whole
-  // block (down to the next `const verdicts = [];`) once the hidden speedup is confirmed.
-  if (typeof act.visible === "function" && typeof act.readAuditRaw === "function" && entries.length) {
-    let visLabel = "visible";
-    try { if (!(await act.visible())) visLabel = "HIDDEN"; } catch (e) {}
-    if (batch) {
-      const _tp0 = Date.now();
-      let disagree = 0;
-      for (let i = 0; i < entries.length; i++) {
-        const per = await auditReReadActual(act, entries[i]);
-        const bat = auditActualFromRaw(entries[i].widgetType, batch[i]);
-        if (String(per.actual) !== String(bat.actual) || per.readable !== bat.readable) disagree++;
-      }
-      const _tPerMs = Date.now() - _tp0;
-      console.log(`[ApplyPilot][PERF-TEMP] M40 audit re-read (${visLabel}): ${entries.length} fields — batched ${_tBatchMs}ms (1 round-trip) vs per-field ${_tPerMs}ms (${entries.length} round-trips) → saved ~${_tPerMs - _tBatchMs}ms; batched↔per-field disagreements: ${disagree}${disagree ? " ⚠" : ""}`);
-    } else {
-      console.log(`[ApplyPilot][PERF-TEMP] M40 audit (${visLabel}): batched read FELL BACK to per-field (readAuditRaw returned an unusable shape or threw) — ${entries.length} fields`);
-    }
-  }
-  // ⏱ [PERF-TEMP] end
   const verdicts = [];
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
