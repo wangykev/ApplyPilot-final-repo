@@ -11,6 +11,11 @@ data/*
 # Dev tooling (tests) — the extension itself ships no node_modules.
 node_modules/
 
+# Extension signing key + any OAuth client secrets. The private key PINS the
+# extension ID (manifest "key" = its public half); keep it to preserve the ID on
+# publish, but never commit it. See docs/gmail-setup.md.
+secrets/
+
 # OS / editor noise
 .DS_Store
 Thumbs.db

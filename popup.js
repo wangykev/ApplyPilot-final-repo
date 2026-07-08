@@ -349,3 +349,85 @@ document.getElementById("llm-test").addEventListener("click", () => {
     setStatus(resp.ok ? `✓ AI connected — reply: "${resp.text}". Save the config to use it.` : `✗ AI test failed: ${resp.error}`);
   });
 });
+
+// ── Onboarding (pre-form walk): credentials + Gmail auto-verify + start ──────
+// credentials → chrome.storage.local.credentials (loaded from data/.credentials.json,
+// same handoff pattern as the profile). onboardConfig = { gmailEnabled, continueToWalk,
+// startUrl } — the toggles + optional start URL, merged read-modify-write.
+const credentialsStatusEl = document.getElementById("credentials-status");
+const showSavedCredentials = () => chrome.storage.local.get("credentials", ({ credentials }) => {
+  credentialsStatusEl.textContent = credentials && credentials.email ? `Credentials: ${credentials.email}` : "Credentials: none loaded";
+});
+showSavedCredentials();
+
+document.getElementById("load-credentials").addEventListener("click", async () => {
+  setStatus("Loading credentials…");
+  // Try the dotfile first (matches the reference + .credentials.example.json), then a
+  // plain credentials.json — some Chrome versions don't serve extension dotfiles via
+  // getURL. Both are gitignored by the data/* rule. Rename to credentials.json if the
+  // dotfile 404s in your Chrome.
+  const names = ["data/.credentials.json", "data/credentials.json"];
+  try {
+    let creds = null;
+    for (const name of names) {
+      let res;
+      try { res = await fetch(chrome.runtime.getURL(name)); } catch (e) { continue; }
+      if (res && res.ok) { creds = await res.json(); break; }
+    }
+    if (!creds) { setStatus("No credentials file found — copy data/.credentials.example.json to data/.credentials.json (or data/credentials.json) and fill in email + password."); return; }
+    if (!creds.email || !creds.password) { setStatus("The credentials file is missing an email or password."); return; }
+    await chrome.storage.local.set({ credentials: { email: creds.email, password: creds.password } });
+    showSavedCredentials();
+    setStatus(`Credentials loaded for ${creds.email}.`);
+    console.log("[ApplyPilot] Loaded account credentials for", creds.email);
+  } catch (e) { setStatus("Failed to load credentials: " + e.message); }
+});
+
+// Restore + persist onboardConfig. Each control saves immediately (read-modify-write merge).
+const onboardGmailEl = document.getElementById("onboard-gmail");
+const onboardContinueEl = document.getElementById("onboard-continue");
+const onboardUrlEl = document.getElementById("onboard-url");
+const saveOnboardConfig = async (patch) => {
+  const { onboardConfig } = await chrome.storage.local.get("onboardConfig");
+  await chrome.storage.local.set({ onboardConfig: { ...(onboardConfig || {}), ...patch } });
+};
+chrome.storage.local.get("onboardConfig", ({ onboardConfig }) => {
+  const c = onboardConfig || {};
+  onboardGmailEl.checked = !!c.gmailEnabled;
+  onboardContinueEl.checked = c.continueToWalk === true;
+  if (c.startUrl) onboardUrlEl.value = c.startUrl;
+});
+onboardGmailEl.addEventListener("change", () => saveOnboardConfig({ gmailEnabled: onboardGmailEl.checked }));
+onboardContinueEl.addEventListener("change", () => saveOnboardConfig({ continueToWalk: onboardContinueEl.checked }));
+onboardUrlEl.addEventListener("change", () => saveOnboardConfig({ startUrl: onboardUrlEl.value.trim() }));
+
+document.getElementById("gmail-connect").addEventListener("click", () => {
+  setStatus("Connecting to Gmail (a Chrome account picker/consent may appear)… see [GMAIL-TEST] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_GMAIL_TEST" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) { setStatus("Gmail test failed (no response) — see the service worker console."); return; }
+    setStatus(resp.ok ? `✓ Gmail connected: ${resp.email} (${resp.messagesTotal} messages). Auto-verify can read this inbox.` : `✗ Gmail test failed: ${resp.error}`);
+  });
+});
+
+document.getElementById("cdp-onboard").addEventListener("click", () => {
+  setStatus("Onboarding: apply → apply manually → login → verify → form. Keep the tab VISIBLE. See [ONBOARD] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_ONBOARD" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have closed on the account picker — SW console has it all
+    // Order matters: a needs_operator halt is a SUCCESSFUL run that needs a human (show its detail);
+    // only a genuine crash (attach/navigate/exception) is ok:false with an `error`. Check reached_form
+    // → needs_operator → crash → other, so a halt never renders as "failed: undefined".
+    if (resp.reached_form) {
+      const walkMsg = resp.walked
+        ? (resp.walk && resp.walk.reached_review ? ` Then the fill walk reached REVIEW (${resp.walk.pages_filled} page(s), not submitted).`
+           : resp.walk ? ` Then the fill walk stopped: ${resp.walk.stopped || resp.walk.error}.` : "")
+        : (resp.walk_error === "no-profile" ? ' (Load a profile to continue into the fill walk.)' : "");
+      setStatus(`✓ Reached the application form (${resp.stopped}${resp.account_created ? ", account created" : ""}${resp.verified ? ", email verified" : ""}).${walkMsg}`);
+    } else if (resp.needs_operator) {
+      setStatus(`⚠ Needs you: ${resp.stopped}. ${resp.detail || ""}`);
+    } else if (resp.ok === false) {
+      setStatus("Onboarding failed: " + (resp.error || resp.stopped || "unknown") + " — see the service worker console.");
+    } else {
+      setStatus(`Onboarding stopped: ${resp.stopped || "unknown"}. ${resp.detail || ""} See [ONBOARD].`);
+    }
+  });
+});

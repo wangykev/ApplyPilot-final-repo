@@ -2,7 +2,7 @@
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); llm.js = multi-provider LLM adapter (callLLM); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
+importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
@@ -18,6 +18,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
       const out = await runCdpRecon(tab.id);
       sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
+  // GMAIL SMOKE TEST (onboarding prereq): prove getAuthToken + a readonly
+  // users/me/profile call work, and show the connected inbox. Run this FIRST (after
+  // creating the OAuth client) before trusting auto-verify. [GMAIL-TEST] in the SW console.
+  if (message.type === "RUN_GMAIL_TEST") {
+    (async () => { const out = await runGmailSmokeTest(true); sendResponse(out); })();
+    return true; // async sendResponse
+  }
+
+  // ONBOARDING WALK (the pre-form stage): drive the ACTIVE tab from a job-description
+  // page through Apply → Apply Manually → sign-in/create-account → email verification →
+  // land on the application form. Reads credentials + onboardConfig from storage. By
+  // default it STOPS on the form (never auto-advances a live application); it chains into
+  // the existing CDP fill walk ONLY when onboardConfig.continueToWalk === true. [ONBOARD].
+  if (message.type === "RUN_CDP_ONBOARD") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r));
+      const cfg = store.onboardConfig || {};
+      const onb = await runCdpOnboard(tab.id, { credentials: store.credentials || null, gmailEnabled: !!cfg.gmailEnabled, startUrl: cfg.startUrl || null });
+      if (!onb.ok || !onb.reached_form || cfg.continueToWalk !== true) { sendResponse({ ...onb, walked: false }); return; }
+      if (!store.profile) { sendResponse({ ...onb, walked: false, walk_error: "no-profile" }); return; }
+      console.log("[ApplyPilot][ONBOARD] reached the form — continueToWalk is ON, chaining into the CDP fill walk.");
+      const walk = await runCdpWalk(tab.id, store.profile, store.defaults || {}, store.jobContext || {});
+      sendResponse({ ...onb, walked: true, walk });
     });
     return true; // async sendResponse
   }
@@ -2177,6 +2206,349 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — never strand the operator behind the lock
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// GMAIL SMOKE TEST — the FIRST thing to run after pinning the key + creating the
+// OAuth client (the operator's build-order step): prove chrome.identity.getAuthToken
+// returns a gmail.readonly token AND a users/me/profile readonly call succeeds, BEFORE
+// wiring it into the onboarding flow. Shows the CONNECTED account email so the operator
+// confirms it's the inbox their Workday +alias delivers to. Client-side only — the token
+// and the profile response never leave the extension. [GMAIL-TEST] in the SW console.
+// ============================================================================
+async function runGmailSmokeTest(interactive) {
+  const LOG = (...a) => console.log("[ApplyPilot][GMAIL-TEST]", ...a);
+  let tok = await gmailGetToken(interactive !== false);
+  if (!tok.ok) { LOG("getAuthToken FAILED —", tok.error, "(manifest oauth2.client_id set to your Chrome-Extension OAuth client? identity permission present? extension ID matches the client?)"); return { ok: false, error: tok.error }; }
+  LOG("got a gmail.readonly token — calling users/me/profile (readonly)…");
+  let prof = await gmailApiGet(tok.token, "/profile");
+  if (!prof.ok && (prof.status === 401 || prof.status === 403)) {
+    LOG("profile call 401/403 — refreshing the token once and retrying.");
+    await gmailRemoveCachedToken(tok.token);
+    tok = await gmailGetToken(true);
+    if (tok.ok) prof = await gmailApiGet(tok.token, "/profile");
+  }
+  if (!prof.ok) { LOG("profile call FAILED —", prof.error); return { ok: false, error: prof.error }; }
+  LOG(`✓ connected to Gmail: ${prof.data.emailAddress} (messagesTotal ${prof.data.messagesTotal}). Readonly access confirmed.`);
+  return { ok: true, email: prof.data.emailAddress, messagesTotal: prof.data.messagesTotal };
+}
+
+// ============================================================================
+// ONBOARDING STAGE (the pre-form walk) — JD page → Apply → Apply Manually →
+// sign-in / create-account → email verification (Gmail) → land on the form. Port of
+// the Playwright repo's workday.py (navigate_to_first_form_page → handle_application_modal
+// → handle_auth_screen → _handle_email_verification), on the CDP substrate, hardened.
+//
+// Substrate: drives the ACTIVE tab via the cdp.js primitives (same "SW drives, page
+// returns" discipline as the walk). Detaches in finally. The FILL WALK is a SEPARATE
+// attach (chained by the RUN_CDP_ONBOARD handler only if the operator opts in) — so
+// this stage lands on the form and STOPS there by default (conservative: the fill walk
+// ADVANCES a live application). No input-lock here — a takeover halt (SSO/2FA/CAPTCHA)
+// must leave the operator free to act.
+//
+// SAFETY: never submits an application; never clicks "Use My Last Application" / any
+// affirmative consent-popup control; refuses SSO (halts for manual login). Every halt
+// that needs a human returns needs_operator with a self-explaining reason.
+// ============================================================================
+async function runCdpOnboard(tabId, opts) {
+  const LOG = (...a) => console.log("[ApplyPilot][ONBOARD]", ...a);
+  const o = opts || {};
+  const creds = o.credentials || null;
+  const gmailEnabled = !!o.gmailEnabled;
+  const startUrl = o.startUrl || null;
+  let accountCreated = false, verified = false, softReloads = 0;
+
+  const scan = async () => { try { return await cdpEval(cdpOnboardScan); } catch (e) { return null; } };
+  const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
+  const presentApply = (s) => {
+    const out = [];
+    if (s.markers.adventureButton) out.push('[data-automation-id="adventureButton"]');
+    if (s.markers.continueButton) out.push('[data-automation-id="continueButton"]');
+    if (s.markers.applyManually) out.push('[data-automation-id="applyManually"]');
+    return out;
+  };
+
+  // Wait for the DOM to settle after a navigation/reload (readyState complete + a small
+  // React-hydration beat). Poll-based; mid-nav eval errors are "keep polling".
+  const settlePage = async (timeoutMs) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await cdpDelay(400);
+      await cdpWakePage();
+      let ready = null;
+      try { ready = await cdpEval(() => document.readyState); } catch (e) { continue; }
+      if (ready === "complete") { await cdpDelay(700); return true; }
+    }
+    return false;
+  };
+
+  // Workday's transient "Something went wrong / please refresh" soft-error → reload ONCE
+  // (capped at 2 across the run) and re-scan. Returns true if it reloaded (caller re-scans).
+  const maybeRefresh = async (st) => {
+    if (!st || !isWorkdaySoftError(st.bodyText)) return false;
+    if (softReloads >= 2) { LOG(`⚠ Workday soft-error persists after ${softReloads} reload(s) — not reloading again.`); return false; }
+    softReloads++;
+    LOG(`Workday soft-error ("Something went wrong / please refresh") — reloading the page (reload #${softReloads}) and retrying.`);
+    await cdpReload();
+    await settlePage(9000);
+    return true;
+  };
+
+  // Poll scan() until pred(scan) is true or a timeout; runs the soft-error reload guard
+  // each tick. Returns { matched, scan }.
+  const waitFor = async (pred, timeoutMs, label) => {
+    const start = Date.now();
+    let st = null;
+    while (Date.now() - start < timeoutMs) {
+      await cdpDelay(500);
+      await cdpWakePage();
+      st = await scan();
+      if (!st) continue;
+      if (await maybeRefresh(st)) { st = await scan(); if (!st) continue; }
+      if (pred(st)) return { matched: true, scan: st };
+    }
+    LOG(`waitFor(${label}) timed out after ${timeoutMs}ms`);
+    return { matched: false, scan: st };
+  };
+
+  // Click the first present selector, auto-dismissing a covering popup ONCE (consent-safe,
+  // shadow-DOM aware — reuses the clickPageNext machinery). { clicked, sel } / { clicked:false, blockedBy }.
+  const clickTarget = async (selectors, label) => {
+    for (const sel of selectors) {
+      const rect = await cdpRectReady(sel, true);
+      if (!rect) continue;
+      let cover = await cdpEval(cdpCoverCheck, sel, rect.cx, rect.cy);
+      if (cover && cover.blocked) {
+        const d = await cdpEval(cdpFindDismissControl, rect.cx, rect.cy);
+        if (d && d.found) {
+          LOG(`"${label}" covered by ${cover.by} — clicking its dismiss control ${JSON.stringify(d.label)}.`);
+          await cdpClickAt(d.cx, d.cy);
+          await cdpDelay(800);
+          cover = await cdpEval(cdpCoverCheck, sel, rect.cx, rect.cy);
+        }
+      }
+      if (cover && cover.blocked) { LOG(`"${label}" is covered by ${cover.by} — refusing a blind click.`); return { clicked: false, blockedBy: cover.by, sel }; }
+      await cdpClickAt(rect.cx, rect.cy);
+      LOG(`clicked "${label}".`);
+      return { clicked: true, sel };
+    }
+    return { clicked: false };
+  };
+
+  // Focus → clear → insertText → read-back a text/email/password input by the first
+  // matching selector. Trusted CDP path (survives blur), same technique as the fill's focusText.
+  const fillField = async (selectors, value, label) => {
+    for (const sel of selectors) {
+      const rect = await cdpRectReady(sel, true);
+      if (!rect) continue;
+      await cdpClickAt(rect.cx, rect.cy);
+      await cdpDelay(200);
+      let s = await cdpEval(cdpReadInputBySel, sel);
+      if (!s || !s.focused) { try { await cdpDomFocus(sel); } catch (e) { /* fall through */ } }
+      await cdpSelectAllDelete();
+      await cdpDelay(120);
+      await cdpInsertText(String(value));
+      await cdpDelay(300);
+      s = await cdpEval(cdpReadInputBySel, sel);
+      const ok = !!s && String(s.value) === String(value);
+      LOG(`filled "${label}" — ${ok ? "read-back ok" : "read-back MISMATCH (got " + JSON.stringify(s && s.value) + ")"}.`);
+      return { ok, sel };
+    }
+    LOG(`could not find an input for "${label}" (${selectors.join(", ")}).`);
+    return { ok: false };
+  };
+
+  const fillVerifyPassword = async (value) => {
+    const vp = await fillField(['[data-automation-id="verifyPassword"]'], value, "verify password");
+    if (vp.ok) return vp;
+    const rect = await cdpEvalRectReady(cdpNthPasswordRect, 1); // 2nd password input
+    if (!rect) return { ok: false };
+    await cdpClickAt(rect.cx, rect.cy); await cdpDelay(200);
+    await cdpSelectAllDelete(); await cdpDelay(120);
+    await cdpInsertText(String(value)); await cdpDelay(300);
+    LOG("filled verify password (2nd password-input fallback).");
+    return { ok: true };
+  };
+
+  const checkConsent = async () => {
+    let c = await cdpEval(cdpConsentRect);
+    if (!c) { LOG("no consent checkbox detected — proceeding (some tenants have none)."); return; }
+    if (c.checked) { LOG("consent already checked."); return; }
+    await cdpClickAt(c.cx, c.cy);
+    await cdpDelay(300);
+    c = await cdpEval(cdpConsentRect);
+    LOG(`consent checkbox — ${c && c.checked ? "checked" : "still unchecked (proceeding anyway)"}.`);
+  };
+
+  // Gmail email-verification: find the workday.com link containing the tenant host and
+  // navigate the tab to it. Returns { ok } or a needs_operator halt object.
+  const doVerify = async (st) => {
+    if (!gmailEnabled) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-required-gmail-off", detail: "Workday requires email verification but Gmail auto-verify is OFF. Enable it (and Connect Gmail) in the popup, or click the link in the email yourself and re-run." };
+    const host = st.host || "";
+    LOG(`email verification required — polling Gmail (readonly) for a workday.com link containing "${host}" (up to 120s)…`);
+    let tok = await gmailGetToken(true);
+    if (!tok.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "gmail-auth-failed", detail: tok.error };
+    const args = { token: tok.token, senderContains: "workday.com", urlMustContain: host, timeoutMs: 120000, pollMs: 5000 };
+    let find = await gmailFindVerificationEmail(args);
+    if (!find.ok && (find.status === 401 || find.status === 403)) {
+      LOG("Gmail token 401/403 — refreshing once and retrying.");
+      await gmailRemoveCachedToken(tok.token);
+      tok = await gmailGetToken(true);
+      if (tok.ok) find = await gmailFindVerificationEmail({ ...args, token: tok.token });
+    }
+    if (!find.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-email-not-found", detail: find.error };
+    LOG(`verification link found — navigating the tab to it: ${String(find.url).slice(0, 90)}…`);
+    const nav = await cdpNavigate(find.url);
+    if (!nav.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-nav-failed", detail: nav.error };
+    await settlePage(15000);
+    let post = await scan();
+    if (post && await maybeRefresh(post)) post = await scan();
+    // Operator's flag: a verify link CAN be session-bound. If the landed page says the link
+    // was rejected, surface it (no auth mechanism fixes a session-bound link — verify manually).
+    if (post && /this link (has )?expired|no longer valid|link is invalid|unable to verify|link was not recognized/i.test(post.bodyText || "")) {
+      return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-link-invalid", detail: "the verification link was rejected — it may be session-bound; open it manually in this browser, then re-run." };
+    }
+    LOG("navigated to the verification link — will re-attempt sign-in.");
+    return { ok: true };
+  };
+
+  // Create a Workday account (workday.py _create_account_flow), then let the auth loop
+  // re-check outcome (past-auth / verify / already-exists→sign-in).
+  const doCreateAccount = async (st) => {
+    LOG(`creating a Workday account as ${creds.email}…`);
+    if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await cdpDelay(900); st = await scan() || st; }
+    await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
+    await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
+    await fillVerifyPassword(creds.password);
+    await checkConsent();
+    await cdpDelay(400);
+    const submitted = await clickTarget(['[data-automation-id="click_filter"][aria-label="Create Account"]', '[data-automation-id="createAccountSubmitButton"]'], "Create Account submit");
+    if (!submitted.clicked) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: submitted.blockedBy || "no Create Account button" };
+    const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""), 20000, "post-create-account");
+    let post = w.scan || st;
+    if (await maybeRefresh(post)) post = await scan() || post;
+    if (post && /already (exists|in use)|an account (already )?exists|email is already (in use|registered)/i.test(post.bodyText || "")) {
+      LOG("Workday says the account already exists — will sign in instead.");
+      return { ok: true, alreadyExists: true };
+    }
+    return { ok: true };
+  };
+
+  // Auth loop: try sign-in first; verify→re-sign-in; wrong→create-account→loop.
+  const doAuth = async () => {
+    const maxAttempts = 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let st = await scan();
+      if (!st) { await settlePage(6000); st = await scan(); }
+      if (!st) return { ok: false, error: "no-page-state-in-auth" };
+      if (await maybeRefresh(st)) st = await scan() || st;
+
+      const oc = classifyAuthOutcome(st);
+      if (oc === "success" || isPastAuth(st)) { LOG("reached the application form."); return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified }; }
+      // doVerify/doCreateAccount use their `ok` as an INTERNAL success signal; a halt object
+      // (needs_operator) is a SUCCESSFUL onboarding run that needs a human, so surface it as
+      // ok:true (the outer contract: ok:false ⇒ a crash only). The popup keys off needs_operator/detail.
+      if (oc === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
+
+      if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
+      if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/.credentials.json) in the popup, or sign in manually then re-run." };
+
+      // Prefer the sign-in path (switch to its tab if a link is showing).
+      if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await cdpDelay(800); st = await scan() || st; }
+
+      if (st.passwordInput || st.emailInput) {
+        LOG(`sign-in attempt ${attempt} as ${creds.email}.`);
+        await fillField(['input[type="email"]', '[data-automation-id="email"]'], creds.email, "email");
+        await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
+        await cdpDelay(500); // Workday doesn't commit the field value synchronously (reference note)
+        const submitted = await clickTarget(['[data-automation-id="click_filter"][aria-label="Sign In"]', '[data-automation-id="signInSubmitButton"]', 'button[type="submit"]'], "Sign In submit");
+        if (!submitted.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: submitted.blockedBy || "no Sign In button" };
+        const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || isWorkdaySoftError(s.bodyText), 20000, "sign-in outcome");
+        st = w.scan || st;
+        if (await maybeRefresh(st)) { continue; }
+        const out = classifyAuthOutcome(st);
+        LOG(`sign-in outcome: ${out}.`);
+        if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
+        if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
+        if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
+        return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unknown", detail: `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}` };
+      }
+
+      // No sign-in form but a create-account affordance → create directly.
+      if (st.markers.createAccountLink || st.markers.createAccountSubmit || st.markers.verifyPassword) {
+        const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue;
+      }
+
+      return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unrecognized", detail: st.title };
+    }
+    return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-max-attempts", detail: `exceeded ${maxAttempts} auth attempts` };
+  };
+
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    await cdpInstallPageOverrides();
+    LOG("attached. Onboarding: JD → Apply → Apply Manually → sign-in/create-account → verify → land on the form. Keep the tab VISIBLE to watch. Never submits.");
+
+    if (startUrl) {
+      LOG("navigating to the start URL:", startUrl);
+      const nav = await cdpNavigate(startUrl);
+      if (!nav.ok) return { ok: false, error: "navigate-failed:" + nav.error };
+      await settlePage(15000);
+    }
+
+    let st = await scan();
+    if (!st) { await settlePage(9000); st = await scan(); }
+    if (!st) return { ok: false, error: "no-page-state (is the tab on a Workday page?)" };
+    if (await maybeRefresh(st)) st = await scan() || st;
+
+    if (isPastAuth(st)) { LOG("already on the application form — nothing to onboard."); return { ok: true, reached_form: true, stopped: "already-on-form" }; }
+    if (isWorkdayMaintenance({ title: st.title, bodyText: st.bodyText, formFieldCount: st.formFieldCount, passwordInputPresent: st.passwordInput, signInButtonPresent: st.signInButtonPresent })) {
+      LOG("⛔ Workday planned-maintenance page — retry after the maintenance window.");
+      return { ok: true, reached_form: false, needs_operator: true, stopped: "workday-maintenance" };
+    }
+
+    // ── STAGE 1: Apply ──
+    const applyChain = presentApply(st);
+    const target = pickApplyTarget(applyChain);
+    if (target) {
+      LOG(`Stage 1 — clicking "${target.label}".`);
+      const c = await clickTarget([target.sel], target.label);
+      if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-click-blocked", detail: c.blockedBy || "Apply button not clickable" };
+      const w = await waitFor((s) => s.markers.applyManually || s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply");
+      st = w.scan || st;
+    } else if (st.markers.useMyLastApplication && !st.markers.applyManually) {
+      LOG('only "Use My Last Application" is offered on this page — refusing to reuse a prior application; waiting for a manual-apply/auth path…');
+    }
+
+    // ── STAGE 2: Apply Manually ──
+    st = await scan() || st;
+    if (st.markers.applyManually) {
+      LOG('Stage 2 — clicking "Apply Manually".');
+      const c = await clickTarget(['[data-automation-id="applyManually"]'], "Apply Manually");
+      if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-manually-blocked", detail: c.blockedBy || "Apply Manually not clickable" };
+      const w = await waitFor((s) => s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply-manually");
+      st = w.scan || st;
+    }
+
+    // ── STAGE 3: Auth (+ create-account + verify) ──
+    st = await scan() || st;
+    if (isPastAuth(st)) { LOG("reached the form (no auth needed)."); return { ok: true, reached_form: true, stopped: "reached-form" }; }
+    if (!st.hasAuthEl && !st.signInButtonPresent && st.formFieldCount === 0) {
+      const w = await waitFor((s) => s.hasAuthEl || s.signInButtonPresent || s.formFieldCount > 0, 12000, "auth-or-form");
+      st = w.scan || st;
+      if (isPastAuth(st)) return { ok: true, reached_form: true, stopped: "reached-form" };
+    }
+    if (st.hasAuthEl || st.signInButtonPresent) { LOG("Stage 3 — auth screen detected."); return await doAuth(); }
+    if (st.formFieldCount > 0) return { ok: true, reached_form: true, stopped: "reached-form" };
+    return { ok: true, reached_form: false, needs_operator: true, stopped: "unknown-page", detail: `title="${st.title}" — could not find Apply/auth/form. Navigate to the job posting and re-run.` };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("onboarding aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
     await cdpDetach();
   }
 }
