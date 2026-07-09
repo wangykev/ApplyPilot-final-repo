@@ -2403,14 +2403,22 @@ async function runCdpOnboard(tabId, opts) {
     const nav = await cdpNavigate(find.url);
     if (!nav.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-nav-failed", detail: nav.error };
     await settlePage(15000);
-    let post = await scan();
+    // Workday's activate link ACTIVATES the account then lands on / redirects to the sign-in page,
+    // and that redirect takes a beat. WAIT for the sign-in page (or the form, if a tenant auto-signs-in)
+    // to actually render before the loop re-attempts sign-in — mirrors the reference's
+    // _wait_for_sign_in_page. Without this, the loop re-scanned a transitional page, found no form, and
+    // bailed silently ("activated correctly but didn't sign in" — altasciences wd1, 2026-07-09).
+    const w = await waitFor(
+      (s) => s.passwordInput || s.emailInput || s.signInWithEmail || s.markers.signInLink || s.markers.signInSubmit || s.formFieldCount > 0,
+      20000, "post-activation sign-in page");
+    let post = w.scan || await scan();
     if (post && await maybeRefresh(post)) post = await scan();
     // Operator's flag: a verify link CAN be session-bound. If the landed page says the link
     // was rejected, surface it (no auth mechanism fixes a session-bound link — verify manually).
     if (post && /this link (has )?expired|no longer valid|link is invalid|unable to verify|link was not recognized/i.test(post.bodyText || "")) {
       return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-link-invalid", detail: "the verification link was rejected — it may be session-bound; open it manually in this browser, then re-run." };
     }
-    LOG("navigated to the verification link — will re-attempt sign-in.");
+    LOG(`navigated to the verification link — account activated; sign-in page ${w.matched ? "is up" : "wait timed out, trying anyway"}; re-attempting sign-in.`);
     return { ok: true };
   };
 
