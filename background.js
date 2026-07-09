@@ -2418,7 +2418,12 @@ async function runCdpOnboard(tabId, opts) {
     if (post && /this link (has )?expired|no longer valid|link is invalid|unable to verify|link was not recognized/i.test(post.bodyText || "")) {
       return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-link-invalid", detail: "the verification link was rejected — it may be session-bound; open it manually in this browser, then re-run." };
     }
-    LOG(`navigated to the verification link — account activated; sign-in page ${w.matched ? "is up" : "wait timed out, trying anyway"}; re-attempting sign-in.`);
+    // Let the server COMMIT the activation before the loop re-signs-in. Signing in the instant after
+    // the activate link can leave the account still reading "pending verification" → Workday re-issues
+    // a SECOND verification email and the whole cycle repeats (PANW needed two cycles otherwise,
+    // 2026-07-09 — "maybe it did it too fast"). A fixed wall-clock settle (once per verify, cheap).
+    await cdpDelay(5000);
+    LOG(`navigated to the verification link — account activated; sign-in page ${w.matched ? "is up" : "wait timed out, trying anyway"}; settled 5s for activation to commit; re-attempting sign-in.`);
     return { ok: true };
   };
 
@@ -2452,10 +2457,11 @@ async function runCdpOnboard(tabId, opts) {
 
   // Auth loop: try sign-in first; verify→re-sign-in; wrong→create-account→loop.
   const doAuth = async () => {
-    // Headroom: each real step (chooser reveal, sign-in, create-account, verify, re-sign-in) plus a
-    // possible soft-error reload can each consume an iteration; 8 backstops a genuinely stuck page
-    // without capping a legit chooser→create→verify→re-sign-in chain.
-    const maxAttempts = 8;
+    // Headroom: on a chooser tenant every real step (chooser reveal, sign-in, create-account, verify,
+    // re-sign-in) consumes an iteration, and a stray SECOND verify cycle doubles that — PANW hit
+    // exactly 8 with a double-cycle (2026-07-09), i.e. no margin. 12 comfortably survives a
+    // chooser→create→verify→(re-verify)→re-sign-in chain while still backstopping a genuinely stuck page.
+    const maxAttempts = 12;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let st = await scan();
       if (!st) { await settlePage(6000); st = await scan(); }
