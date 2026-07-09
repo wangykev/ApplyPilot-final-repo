@@ -2434,7 +2434,13 @@ async function runCdpOnboard(tabId, opts) {
     await cdpDelay(400);
     const submitted = await clickTarget(['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'], "Create Account submit");
     if (!submitted.clicked) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: submitted.blockedBy || "no Create Account button" };
-    const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""), 20000, "post-create-account");
+    // Recognize EVERY "the submit was processed and we've moved on" surface so we return in ~1s
+    // instead of burning the 20s ceiling: an outcome (verify/wrong/success), a sign-in submit, an
+    // already-exists message, OR the social-login CHOOSER reappearing (PANW routes back to it after
+    // create-account — signInWithEmail is absent on the create-account form we just submitted, so it
+    // only turns true once the page actually re-routes → no premature return). The loop then reveals
+    // the email form / detects verify on the next iteration.
+    const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || s.signInWithEmail || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""), 20000, "post-create-account");
     let post = w.scan || st;
     if (await maybeRefresh(post)) post = await scan() || post;
     if (post && /already (exists|in use)|an account (already )?exists|email is already (in use|registered)/i.test(post.bodyText || "")) {
