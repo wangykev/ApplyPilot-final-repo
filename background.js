@@ -2477,7 +2477,7 @@ async function runCdpOnboard(tabId, opts) {
       }
 
       if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
-      if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/.credentials.json) in the popup, or sign in manually then re-run." };
+      if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/credentials.json) in the popup, or sign in manually then re-run." };
 
       // Prefer the sign-in path (switch to its tab if a link is showing).
       if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await cdpDelay(800); st = await scan() || st; }

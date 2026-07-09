@@ -351,7 +351,7 @@ document.getElementById("llm-test").addEventListener("click", () => {
 });
 
 // ── Onboarding (pre-form walk): credentials + Gmail auto-verify + start ──────
-// credentials → chrome.storage.local.credentials (loaded from data/.credentials.json,
+// credentials → chrome.storage.local.credentials (loaded from data/credentials.json,
 // same handoff pattern as the profile). onboardConfig = { gmailEnabled, continueToWalk,
 // startUrl } — the toggles + optional start URL, merged read-modify-write.
 const credentialsStatusEl = document.getElementById("credentials-status");
@@ -362,20 +362,14 @@ showSavedCredentials();
 
 document.getElementById("load-credentials").addEventListener("click", async () => {
   setStatus("Loading credentials…");
-  // Try the dotfile first (matches the reference + .credentials.example.json), then a
-  // plain credentials.json — some Chrome versions don't serve extension dotfiles via
-  // getURL. Both are gitignored by the data/* rule. Rename to credentials.json if the
-  // dotfile 404s in your Chrome.
-  const names = ["data/.credentials.json", "data/credentials.json"];
+  // NON-dot filename on purpose: Chrome does not serve dotfiles from an unpacked extension via
+  // getURL (profile.json works; .credentials.json would 404), so data/credentials.json is the
+  // single source. Copy data/credentials.example.json → data/credentials.json. Gitignored (data/*).
   try {
-    let creds = null;
-    for (const name of names) {
-      let res;
-      try { res = await fetch(chrome.runtime.getURL(name)); } catch (e) { continue; }
-      if (res && res.ok) { creds = await res.json(); break; }
-    }
-    if (!creds) { setStatus("No credentials file found — copy data/.credentials.example.json to data/.credentials.json (or data/credentials.json) and fill in email + password."); return; }
-    if (!creds.email || !creds.password) { setStatus("The credentials file is missing an email or password."); return; }
+    const res = await fetch(chrome.runtime.getURL("data/credentials.json"));
+    if (!res || !res.ok) { setStatus("data/credentials.json not found — copy data/credentials.example.json to data/credentials.json and fill in email + password."); return; }
+    const creds = await res.json();
+    if (!creds.email || !creds.password) { setStatus("data/credentials.json is missing an email or password."); return; }
     await chrome.storage.local.set({ credentials: { email: creds.email, password: creds.password } });
     showSavedCredentials();
     setStatus(`Credentials loaded for ${creds.email}.`);

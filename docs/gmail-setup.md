@@ -65,9 +65,9 @@ delivers to (e.g. `wangykev@gmail.com` for `wangykev+NNN@gmail.com`).
 
 ## 4. Credentials
 
-Put the Workday account email + password in `data/.credentials.json` (copy
-`data/.credentials.example.json`). Both `data/.credentials.json` and `data/credentials.json`
-are accepted (some Chrome builds don't serve dotfiles via `getURL`) and both are gitignored.
+Put the Workday account email + password in `data/credentials.json` (copy
+`data/credentials.example.json`). Non-dot on purpose — Chrome doesn't serve dotfiles from an
+unpacked extension via `getURL`, so `data/credentials.json` is the single source (gitignored).
 Click **Load account credentials** in the popup. The **same** email is reused across tenants —
 sign-in-first handles account reuse; a first-time tenant creates the account then verifies.
 
