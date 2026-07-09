@@ -2460,7 +2460,11 @@ async function runCdpOnboard(tabId, opts) {
 
       if (st.passwordInput || st.emailInput) {
         LOG(`sign-in attempt ${attempt} as ${creds.email}.`);
-        await fillField(['input[type="email"]', '[data-automation-id="email"]'], creds.email, "email");
+        // data-automation-id FIRST (Workday-canonical + present on observed tenants); the generic
+        // input[type=email] is the fallback. Ordering matters only for speed — a missing first
+        // selector burns the ~2.5s cdpRectReady ceiling before falling through (live: Comcast has
+        // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
+        await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
         await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
         await cdpDelay(500); // Workday doesn't commit the field value synchronously (reference note)
         const submitted = await clickTarget(['[data-automation-id="click_filter"][aria-label="Sign In"]', '[data-automation-id="signInSubmitButton"]', 'button[type="submit"]'], "Sign In submit");
