@@ -59,3 +59,7 @@ test("looksLikeSso: a sign-in button with no email/password field → true (redi
   assert.strictEqual(looksLikeSso({ url: "https://x/login", signInButtonPresent: true, emailInput: false, passwordInput: false }), true);
   assert.strictEqual(looksLikeSso({ url: "https://x/login", signInButtonPresent: true, emailInput: true, passwordInput: true }), false);
 });
+test("looksLikeSso: a social-login chooser with a 'Sign in with email' button → NOT sso", () => {
+  // Palo Alto Networks variant: Apple/Google/LinkedIn buttons + SignInWithEmailButton, no form yet.
+  assert.strictEqual(looksLikeSso({ url: "https://paloaltonetworks.wd5.myworkdayjobs.com/…/applyManually", signInButtonPresent: true, emailInput: false, passwordInput: false, signInWithEmail: true }), false);
+});

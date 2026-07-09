@@ -1407,6 +1407,9 @@ function cdpOnboardScan() {
   const signInButtonPresent = clickables.some((b) => /\b(sign[- ]?in|log[- ]?in|sign[- ]?on)\b/i.test((b.textContent || "").trim()));
   const emailInput = present('input[type="email"]') || present('[data-automation-id="email"]');
   const passwordInput = present('input[type="password"]') || present('[data-automation-id="password"]');
+  // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
+  // "Sign in with email" button, alongside federated Apple/Google/LinkedIn buttons we NEVER click.
+  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]');
   const markers = {
     adventureButton: present('[data-automation-id="adventureButton"]'),
     continueButton: present('[data-automation-id="continueButton"]'),
@@ -1423,12 +1426,12 @@ function cdpOnboardScan() {
     formField: formFields.length > 0
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
-  const hasAuthEl = passwordInput || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
+  const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
   return {
     url: location.href, host: location.host, title: document.title,
     bodyText,
     formFieldCount: formFields.length,
-    emailInput, passwordInput, signInButtonPresent, hasAuthEl,
+    emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,
     markers
   };
 }

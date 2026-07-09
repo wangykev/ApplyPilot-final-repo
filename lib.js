@@ -475,8 +475,13 @@ function isWorkdaySoftError(bodyText) {
 // is NOT SSO, so this uses a NARROW url pattern (idp/saml/okta/…), not the broad authUrl.
 function looksLikeSso(state) {
   const s = state || {};
+  // A native "Sign in with email" button means Workday offers an email/password path (a
+  // social-login CHOOSER, e.g. Palo Alto Networks) — NOT a forced SSO redirect. Reveal it, don't halt.
+  if (s.signInWithEmail) return false;
   const ssoUrl = /\bsso\b|[?&/](saml|idp|oidc|federation)\b|okta|pingidentity|pingone|onelogin|microsoftonline|\badfs\b|auth0|login\.gov/i.test(String(s.url || ""));
   if (ssoUrl) return true;
+  // A sign-in button with NO email/password field AND no email-chooser button = a bare
+  // "Sign in with <provider>" redirect → SSO.
   if (s.signInButtonPresent && !s.passwordInput && !s.emailInput) return true;
   return false;
 }

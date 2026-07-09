@@ -2452,6 +2452,19 @@ async function runCdpOnboard(tabId, opts) {
       // ok:true (the outer contract: ok:false ⇒ a crash only). The popup keys off needs_operator/detail.
       if (oc === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
 
+      // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
+      // "Sign in with email" button (alongside federated Apple/Google/LinkedIn buttons we NEVER
+      // click). Click it to reveal the normal sign-in screen, then re-loop. Done BEFORE the SSO
+      // check so the chooser isn't mistaken for a forced SSO redirect.
+      if (!st.passwordInput && !st.emailInput && st.signInWithEmail) {
+        LOG('auth is a social-login chooser — clicking "Sign in with email" to reveal the form.');
+        const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]'], "Sign in with email");
+        if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-with-email-blocked", detail: c.blockedBy || "could not click Sign in with email" };
+        const w = await waitFor((s) => s.passwordInput || s.emailInput || s.markers.createAccountLink || s.markers.signInSubmit, 15000, "email-sign-in-form");
+        st = w.scan || st;
+        continue;
+      }
+
       if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
       if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/.credentials.json) in the popup, or sign in manually then re-run." };
 
