@@ -2446,7 +2446,10 @@ async function runCdpOnboard(tabId, opts) {
 
   // Auth loop: try sign-in first; verify→re-sign-in; wrong→create-account→loop.
   const doAuth = async () => {
-    const maxAttempts = 5;
+    // Headroom: each real step (chooser reveal, sign-in, create-account, verify, re-sign-in) plus a
+    // possible soft-error reload can each consume an iteration; 8 backstops a genuinely stuck page
+    // without capping a legit chooser→create→verify→re-sign-in chain.
+    const maxAttempts = 8;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let st = await scan();
       if (!st) { await settlePage(6000); st = await scan(); }
