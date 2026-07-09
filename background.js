@@ -2260,6 +2260,15 @@ async function runCdpOnboard(tabId, opts) {
   const startUrl = o.startUrl || null;
   let accountCreated = false, verified = false, softReloads = 0;
 
+  // Adaptive pacing — mirrors the fill's act.delay: ~10× faster when the tab is VISIBLE (or its
+  // worker-timers measure fast), FULL (throttle-safe) when hidden/backgrounded. Used for ALL
+  // click/type/transition pacing here, so an onboarding run is snappy in the foreground yet safe
+  // hidden (a throttled tab never gets raced). The ONE genuine server-commit wait — the 5s
+  // post-activation settle — stays a fixed cdpDelay (it must be real wall-clock regardless of
+  // visibility). Every pace() site is gated by a subsequent state check (read-back / poll / scan),
+  // so a too-short fast wait can only cost a retry, never a silent wrong action.
+  const pace = (ms) => cdpAdaptiveDelay(ms);
+
   const scan = async () => { try { return await cdpEval(cdpOnboardScan); } catch (e) { return null; } };
   const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
   const presentApply = (s) => {
@@ -2275,11 +2284,11 @@ async function runCdpOnboard(tabId, opts) {
   const settlePage = async (timeoutMs) => {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      await cdpDelay(400);
+      await pace(400);
       await cdpWakePage();
       let ready = null;
       try { ready = await cdpEval(() => document.readyState); } catch (e) { continue; }
-      if (ready === "complete") { await cdpDelay(700); return true; }
+      if (ready === "complete") { await pace(700); return true; }
     }
     return false;
   };
@@ -2302,7 +2311,7 @@ async function runCdpOnboard(tabId, opts) {
     const start = Date.now();
     let st = null;
     while (Date.now() - start < timeoutMs) {
-      await cdpDelay(500);
+      await pace(500);
       await cdpWakePage();
       st = await scan();
       if (!st) continue;
@@ -2325,7 +2334,7 @@ async function runCdpOnboard(tabId, opts) {
         if (d && d.found) {
           LOG(`"${label}" covered by ${cover.by} — clicking its dismiss control ${JSON.stringify(d.label)}.`);
           await cdpClickAt(d.cx, d.cy);
-          await cdpDelay(800);
+          await pace(800);
           cover = await cdpEval(cdpCoverCheck, sel, rect.cx, rect.cy);
         }
       }
@@ -2344,13 +2353,13 @@ async function runCdpOnboard(tabId, opts) {
       const rect = await cdpRectReady(sel, true);
       if (!rect) continue;
       await cdpClickAt(rect.cx, rect.cy);
-      await cdpDelay(200);
+      await pace(200);
       let s = await cdpEval(cdpReadInputBySel, sel);
       if (!s || !s.focused) { try { await cdpDomFocus(sel); } catch (e) { /* fall through */ } }
       await cdpSelectAllDelete();
-      await cdpDelay(120);
+      await pace(120);
       await cdpInsertText(String(value));
-      await cdpDelay(300);
+      await pace(300);
       s = await cdpEval(cdpReadInputBySel, sel);
       const ok = !!s && String(s.value) === String(value);
       LOG(`filled "${label}" — ${ok ? "read-back ok" : "read-back MISMATCH (got " + JSON.stringify(s && s.value) + ")"}.`);
@@ -2365,9 +2374,9 @@ async function runCdpOnboard(tabId, opts) {
     if (vp.ok) return vp;
     const rect = await cdpEvalRectReady(cdpNthPasswordRect, 1); // 2nd password input
     if (!rect) return { ok: false };
-    await cdpClickAt(rect.cx, rect.cy); await cdpDelay(200);
-    await cdpSelectAllDelete(); await cdpDelay(120);
-    await cdpInsertText(String(value)); await cdpDelay(300);
+    await cdpClickAt(rect.cx, rect.cy); await pace(200);
+    await cdpSelectAllDelete(); await pace(120);
+    await cdpInsertText(String(value)); await pace(300);
     LOG("filled verify password (2nd password-input fallback).");
     return { ok: true };
   };
@@ -2377,7 +2386,7 @@ async function runCdpOnboard(tabId, opts) {
     if (!c) { LOG("no consent checkbox detected — proceeding (some tenants have none)."); return; }
     if (c.checked) { LOG("consent already checked."); return; }
     await cdpClickAt(c.cx, c.cy);
-    await cdpDelay(300);
+    await pace(300);
     c = await cdpEval(cdpConsentRect);
     LOG(`consent checkbox — ${c && c.checked ? "checked" : "still unchecked (proceeding anyway)"}.`);
   };
@@ -2431,12 +2440,12 @@ async function runCdpOnboard(tabId, opts) {
   // re-check outcome (past-auth / verify / already-exists→sign-in).
   const doCreateAccount = async (st) => {
     LOG(`creating a Workday account as ${creds.email}…`);
-    if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await cdpDelay(900); st = await scan() || st; }
+    if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await pace(900); st = await scan() || st; }
     await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
     await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
     await fillVerifyPassword(creds.password);
     await checkConsent();
-    await cdpDelay(400);
+    await pace(400);
     const submitted = await clickTarget(['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'], "Create Account submit");
     if (!submitted.clicked) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: submitted.blockedBy || "no Create Account button" };
     // Recognize EVERY "the submit was processed and we've moved on" surface so we return in ~1s
@@ -2492,7 +2501,7 @@ async function runCdpOnboard(tabId, opts) {
       if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/credentials.json) in the popup, or sign in manually then re-run." };
 
       // Prefer the sign-in path (switch to its tab if a link is showing).
-      if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await cdpDelay(800); st = await scan() || st; }
+      if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await pace(800); st = await scan() || st; }
 
       if (st.passwordInput || st.emailInput) {
         LOG(`sign-in attempt ${attempt} as ${creds.email}.`);
@@ -2502,7 +2511,7 @@ async function runCdpOnboard(tabId, opts) {
         // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
         await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
         await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
-        await cdpDelay(500); // Workday doesn't commit the field value synchronously (reference note)
+        await pace(500); // Workday doesn't commit the field value synchronously (reference note); adaptive — full hidden, fast visible (the read-back already confirmed the value stuck)
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
