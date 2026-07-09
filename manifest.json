@@ -4,7 +4,7 @@
   "version": "0.0.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7hlgz1t22GbXAqMh9w2pVpoaWpaIXJCbX0KGIBaSNvAzm2xwgUjfpH8lJJWpeo2WxnnSpPESUknhppwl2DkZwpMCVzhafIRAR7G6em0avlcSnVxh/PYj79m6FVl1OoJ2AKYO35J5RTQ0RgpRjvCp5wqsqFsEXtNIa6MT90e6IyeWpMjKeSoWWMTIxlHva+cT0ICtOSSeaD7t5/M9GE4kjKcYjMxkZDZh0enuStZOXGFm9Gidg9uNdZvF+rlmt/Ymlu6S7ZZ/iy5C3Yvk8eYp6Ov4Jc1o1KIiArN4bM650e6JxWNE26zACTQvwX/Z/zsNIF9x5JX/jsFRPoF1GakRlQIDAQAB",
   "oauth2": {
-    "client_id": "REPLACE_WITH_YOUR_CHROME_EXTENSION_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "client_id": "31236955933-53jqg82148g4puogcm8s3sqo1gmsrsrc.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
   },
   "permissions": ["activeTab", "scripting", "storage", "debugger", "identity"],
