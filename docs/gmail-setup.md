@@ -14,16 +14,23 @@ token and all Gmail message data stay client-side — never routed to any backen
 
 ## 1. The extension ID is pinned
 
-`manifest.json` now carries a `key` (the public half of `secrets/ext-key.pem`), which fixes
-the extension ID to:
+`manifest.json` carries a `key` (the public half of the signing keypair), which fixes the
+extension ID to:
 
 ```
 degflnkiejblbjcihdpmikekdgmbgehb
 ```
 
-- **`secrets/ext-key.pem` is the private half — keep it.** It's what preserves this ID on
-  publish. It's gitignored (`secrets/`). If it's lost, the ID changes and the OAuth client
-  below must be re-registered.
+That `key` field is **all** Chrome needs to pin the ID for an unpacked extension — the
+private `.pem` does **not** belong in the loaded folder (Chrome warns "This extension
+includes the key file …", and zipping the folder would leak the private key).
+
+- **The private key lives OUTSIDE the extension folder** at
+  `C:\Kevin\ApplyPilot\applypilot-ext-signing-key\ext-key.pem` (never in git, never loaded by
+  Chrome). It's only needed later if you "Pack extension" into a `.crx` and want to preserve
+  this exact ID; for unpacked dev it's not used at all. If it's lost, generate a new keypair
+  (`openssl genrsa`), put the new public key in `manifest.json` `key`, and re-register the
+  OAuth client against the new ID — not catastrophic during dev.
 - **Adding the `key` changed the extension ID**, so the first reload wipes the old
   extension's `chrome.storage.local`. Re-add at `chrome://extensions` → reload → re-run
   **Load default profile** and **Load account credentials**.
