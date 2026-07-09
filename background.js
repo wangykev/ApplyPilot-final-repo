@@ -140,6 +140,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // M3 SUBMIT replay WALK (DRY): replay the SAVED approved bundle page-by-page to the REVIEW page,
+  // verifying each field and advancing with the guarded clickPageNext — NEVER submits. [CDP-REPLAY-WALK].
+  if (message.type === "RUN_CDP_REPLAY_WALK") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpReplayWalk(tab.id);
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // PAGE-IDENTITY RECON (read-only): dump title / URL / automation-ids / headings / body text + state
   // markers for ANY page (maintenance / dead session / login / error / a normal form) so an unknown page
   // state can be DETECTED in code instead of surfacing an opaque "unknown error". [CDP-PAGE-RECON] in SW.
@@ -2151,6 +2163,163 @@ async function runCdpReplayPage(tabId) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach
+    await cdpDetach();
+  }
+}
+
+// Re-attach the stored résumé on the CURRENT page (replay path — replayField defers file_upload to
+// this SW step). Mirrors fillAndPersistPage's attach block: read the bytes from IndexedDB, bump
+// window.__apActing so the input-lock passes attachResume's SYNTHETIC delete/attach clicks, run the
+// proven attachResume via cdpEval on the SAME debugger attach, gate on file-upload-successful.
+async function replayAttachResume(LOG) {
+  let resumeRec = null;
+  try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
+  if (!resumeRec || !resumeRec.base64) {
+    LOG("resume: NOT attached — no resume stored (upload one in the popup).");
+    return { attached: false, detail: "no resume stored — upload a PDF in the popup first" };
+  }
+  let ar = null, arErr = null;
+  try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ }
+  try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
+  catch (e) { arErr = String((e && e.message) || e); }
+  finally { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } }
+  if (ar && ar.attached) {
+    LOG(`resume: attached "${ar.fileName || resumeRec.filename}".`);
+    return { attached: true, detail: `attached (cleared ${ar.deletedCount || 0} existing)`, fileName: ar.fileName || resumeRec.filename };
+  }
+  const detail = "resume attach failed — " + (arErr || (ar && ar.detail) || "no confirmation");
+  LOG("resume: NOT attached — " + detail);
+  return { attached: false, detail };
+}
+
+// ── M3: runCdpReplayWalk — the DRY replay WALK (replay → advance → review; NEVER submits) ───────────
+// Replays the SAVED, human-approved reviewSummary bundle page-by-page onto a FRESH application, verifies
+// each field, advances with the SAME guarded clickPageNext the fill walk uses (refuses on the review
+// page), and STOPS at review. NO clickSubmit exists yet (that's M4) — this is the safe dry run. Strict:
+// a value the live form no longer offers HALTS (replay-mismatch); a required field left empty stalls
+// advancement and HALTS (replay-blocked — possibly a cascade-revealed field the bundle doesn't cover);
+// NO AI, NO AI-4 remediation (fill-path only). Reads the bundle from storage, NOT the profile. Keep the
+// tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
+const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
+async function runCdpReplayWalk(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      LOG('no reviewSummary bundle in storage — fill + review an application first, then replay it.');
+      return { ok: false, error: "no-bundle" };
+    }
+    await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
+    LOG(`DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (no submit click exists yet). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
+    const act = makeCdpActuation(await getLlmConfig()); // AI OFF for replay regardless (replayRepeatingSections passes aiContext:null; flat replayField never calls AI)
+    const pagesReplayed = [];
+
+    for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
+      // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
+      let nav = null;
+      try { nav = await cdpEval(cdpReadSessionState); } catch (e) { /* not-ready → handled below */ }
+      if (nav && isWorkdayMaintenance(nav)) {
+        LOG(`⛔ WORKDAY MAINTENANCE at page ${page} — retry after the window.`);
+        return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      if (nav && sessionLooksDead(nav)) {
+        LOG(`⚠⚠ SESSION EXPIRED at page ${page} — refresh, log in, reopen the form, retry.`);
+        return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      if (nav && nav.applyFlowReviewPresent) {
+        LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified. NOT submitting (terminal; no submit click exists yet).`);
+        return { ok: true, stopped: "reached-review", reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+
+      LOG(`──── REPLAY PAGE ${page} ────`);
+      await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+      const scan = await cdpEval(cdpPageScan);
+      const fields = (scan && scan.fields) || [];
+      const liveNames = fields.map((f) => f.fieldName);
+      // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
+      let rscanLive = null;
+      try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
+      const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
+      if (!sel.entries.length || sel.score <= 0) {
+        const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
+        LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). The bundle never captured this page — HALT (can't replay what wasn't reviewed).`);
+        return { ok: true, stopped: "replay-page-not-in-bundle", page, live_fields: liveNames, live_sections: liveSecs, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      LOG(`page ${page} → matched approved page "${(sel.pageKey || "").split("|")[0]}" (${sel.score} flat-field overlap; ${sel.entries.length} approved entr${sel.entries.length === 1 ? "y" : "ies"}).`);
+
+      const present = new Set(liveNames);
+      const flat = await replayFlatFields(act, sel.entries, present, DEFAULT_BUDGETS);
+      const rep = await replayRepeatingSections(act, sel.entries, DEFAULT_BUDGETS);
+      const results = flat.concat(rep);
+
+      // Résumé re-attach (replayField defers file_upload). Required upload blocks advance → HALT if it fails.
+      if (fields.some((f) => f.widgetType === "file_upload")) {
+        const ar = await replayAttachResume(LOG);
+        if (!ar.attached) {
+          LOG(`⚠ resume NOT attached on page ${page} (${ar.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
+          return { ok: true, stopped: "resume-not-attached", resume_detail: ar.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+      }
+
+      const failed = results.filter((r) => r.status === "needs_review" || r.status === "error");
+      const changed = results.filter((r) => (r.status === "filled" || r.status === "filled_review") && r.flag !== "replay-already-correct").length;
+      const kept = results.filter((r) => r.flag === "replay-already-correct").length;
+      pagesReplayed.push({ page, matched_key: sel.pageKey, total: results.length, changed, kept, failed: failed.length });
+      LOG(`page ${page} replay: ${results.length} field(s) — ${changed} changed, ${kept} already-correct, ${failed.length} FAILED.`);
+
+      // ── STRICT verify: any field that did NOT replay cleanly HALTS before advancing (never a guess). ──
+      if (failed.length) {
+        LOG(`⚠ page ${page}: ${failed.length} field(s) did not replay cleanly — HALT before advancing (a value the live form no longer offers is never guessed):`);
+        failed.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`));
+        return { ok: true, stopped: "replay-mismatch", page, failed: failed.map((r) => ({ field: r.field || r.fieldName, widget: r.widgetType, status: r.status, detail: r.detail || null })), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+
+      // ── Guarded advance (clickPageNext independently refuses on the review marker — 2nd guard). ──
+      const navAfter = await cdpEval(cdpReadSessionState);
+      if (!navAfter || !navAfter.nextButtonPresent) {
+        LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
+        return { ok: true, stopped: "no-next-button", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      await cdpWakePage(); // wake a frozen hidden tab so the transition can run
+      const click = await act.clickPageNext();
+      LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
+      if (!click.clicked) {
+        LOG(`advance refused on page ${page} (${click.refused}) — stop.`);
+        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+
+      // ── Wait for the transition OR session-death OR a nav-timeout (required field empty → HALT). ──
+      const res = await cdpWaitNextPage(prevSig);
+      if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+      if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+      if (res.timeout) {
+        // DRY replay does NOT run AI-4 remediation (fill-path only). A nav-timeout means a required field
+        // is empty — most likely a CASCADE-REVEALED field the approved bundle never captured → HALT for
+        // re-review (re-open the summary, approve the revealed field, re-run). Report the live errors.
+        let diag = {};
+        try {
+          const st = await cdpEval(cdpReadSessionState);
+          const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+          if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG("    • " + s)); }
+          diag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null };
+        } catch (e) { /* ignore */ }
+        LOG(`⚠ page ${page} did NOT advance (nav-timeout) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
+        return { ok: true, stopped: "replay-blocked", nav_timeout_page: page, pages_replayed: pagesReplayed.length, pages: pagesReplayed, ...diag };
+      }
+      LOG(`✓ page ${page} → advanced.`);
+    }
+
+    LOG(`⚠ hit the ${REPLAY_MAX_PAGES}-page cap without reaching review — stopping (detection-bug backstop). Eyeball the application.`);
+    return { ok: true, stopped: "max-pages-cap", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("replay walk aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await removeInputLock(); // BEFORE detach — never strand the operator behind the lock
     await cdpDetach();
   }
 }

@@ -155,6 +155,34 @@ document.getElementById("cdp-replay-page").addEventListener("click", () => {
   });
 });
 
+// M3 SUBMIT replay WALK (DRY): replay the SAVED approved bundle page-by-page to the review page,
+// verifying + advancing (guarded), NEVER submitting. Load page 1 of a filled app. [CDP-REPLAY-WALK].
+document.getElementById("cdp-replay-walk").addEventListener("click", () => {
+  setStatus("Dry replay WALK — replaying the SAVED approved bundle page-by-page to the REVIEW page (verify + guarded Save & Continue). Keep the tab VISIBLE. NEVER submits. See [CDP-REPLAY-WALK].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REPLAY_WALK" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have lost focus — SW console has it all
+    if (resp.ok === false && resp.error === "no-bundle") {
+      setStatus('No saved summary to replay — fill + review an application first.');
+    } else if (resp.ok === false) {
+      setStatus("Replay walk failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.reached_review) {
+      setStatus(`✓ Replay walk reached the REVIEW page — ${resp.pages_replayed} page(s) replayed + verified, NOT submitted. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "replay-mismatch") {
+      setStatus(`⚠ Replay HALTED on page ${resp.page}: ${resp.failed ? resp.failed.length : "some"} field(s) the live form no longer offers — never guessed. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "replay-blocked") {
+      setStatus(`⚠ Replay HALTED on page ${resp.nav_timeout_page} — page didn't advance (a required field is empty, likely a cascade-revealed field). Eyeball + re-review. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "replay-page-not-in-bundle") {
+      setStatus(`⚠ Replay HALTED on page ${resp.page} — the approved bundle doesn't cover this page. Start on page 1 of the SAME application you filled. See [CDP-REPLAY-WALK].`);
+    } else if (resp.session_expired) {
+      setStatus(`⚠ SESSION EXPIRED after ${resp.pages_replayed} page(s) — refresh, log in, reopen, retry. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "resume-not-attached") {
+      setStatus(`⚠ Replay halted: resume not attached (required upload blocks advance). Upload one + clear any bad attachment, then re-run. See [CDP-REPLAY-WALK].`);
+    } else {
+      setStatus(`Replay walk stopped — ${resp.stopped} (${resp.pages_replayed} page(s) replayed). See [CDP-REPLAY-WALK].`);
+    }
+  });
+});
+
 // SESSION RECON (M30 Step 0): read-only static snapshot to classify live-form vs
 // logged-out/expired. No minimize. Run on a VALID form + a LOGGED-OUT state, diff.
 document.getElementById("cdp-session-recon").addEventListener("click", () => {

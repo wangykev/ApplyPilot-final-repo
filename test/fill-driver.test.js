@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6015,6 +6015,63 @@ test("NORMAL fill (no skipIfCorrect): an already-correct repeating url is STILL 
   const url = out.results.find((r) => /\.url$/.test(r.fieldName));
   assert.notStrictEqual(url.flag, "replay-already-correct");
   assert.ok(act.log.some((e) => e[0] === "typeText"), "without the flag the fill path is byte-identical (still re-types)");
+});
+
+// ── M3 walk: selectPageBundleEntries — scope replay to THIS live page's approved entries ──────────
+test("selectPageBundleEntries: picks the bundle page-group with the most flat-field overlap", () => {
+  const entries = [
+    { page: "PA", field_id: "PA::formField-firstName", canonical_field: "pi.first" },
+    { page: "PA", field_id: "PA::formField-country", canonical_field: "pi.country" },
+    { page: "PB", field_id: "PB::formField-jobTitle", canonical_field: "we.title" },
+    { page: "PB", field_id: "PB::formField-company", canonical_field: "we.company" },
+  ];
+  const r = selectPageBundleEntries(entries, ["firstName", "country", "phone"]);
+  assert.strictEqual(r.pageKey, "PA");
+  assert.strictEqual(r.score, 2);
+  assert.strictEqual(r.entries.length, 2);
+});
+
+test("selectPageBundleEntries: a cascade-revealed field in the bundle key still matches the pre-reveal live page (overlap, not exact)", () => {
+  const entries = [
+    { page: "PA1", field_id: "PA1::formField-firstName", canonical_field: "pi.first" },
+    { page: "PA1", field_id: "PA1::formField-country", canonical_field: "pi.country" },
+    { page: "PA1", field_id: "PA1::formField-localName", canonical_field: "pi.local" }, // revealed by country last fill
+    { page: "PB", field_id: "PB::formField-jobTitle", canonical_field: "we.title" },
+  ];
+  const r = selectPageBundleEntries(entries, ["firstName", "country"]); // fresh page: localName not yet revealed
+  assert.strictEqual(r.pageKey, "PA1");
+  assert.strictEqual(r.score, 2, "matches on the 2 present fields even though the bundle key has 3");
+});
+
+test("selectPageBundleEntries: a live page with NO overlap → score 0 (the walk HALTs, never guesses)", () => {
+  const entries = [{ page: "PA", field_id: "PA::formField-firstName", canonical_field: "pi.first" }];
+  const r = selectPageBundleEntries(entries, ["someOtherField", "unrelated"]);
+  assert.strictEqual(r.score, 0);
+});
+
+test("selectPageBundleEntries: repeating entries don't count toward the overlap (flat fields decide the page)", () => {
+  const entries = [
+    { page: "P2", field_id: "P2::formField-jobTitle", canonical_field: "workExperience[0].job_title" }, // repeating
+    { page: "P2", field_id: "P2::formField-someFlag", canonical_field: "pi.flag" },
+    { page: "P1", field_id: "P1::formField-firstName", canonical_field: "pi.first" },
+    { page: "P1", field_id: "P1::formField-lastName", canonical_field: "pi.last" },
+  ];
+  const r = selectPageBundleEntries(entries, ["firstName", "lastName"]);
+  assert.strictEqual(r.pageKey, "P1", "repeating jobTitle on P2 is excluded from FLAT overlap → P1 wins");
+  assert.strictEqual(r.score, 2);
+});
+
+test("selectPageBundleEntries: a repeating-only page (My Experience — no flat fields) matches via live SECTION presence", () => {
+  const entries = [
+    { page: "P1", field_id: "P1::formField-firstName", canonical_field: "pi.first" },
+    { page: "P2", field_id: "P2::formField-jobTitle", canonical_field: "workExperience[0].job_title" },
+    { page: "P2", field_id: "P2::formField-school", canonical_field: "education[0].school" },
+  ];
+  // page 2: cdpPageScan returns NO flat fields (all repeating); act.repeatingScan shows the live sections
+  const rscan = { sections: { "workExperience-": {}, "education-": {} }, addButtons: [] };
+  const r = selectPageBundleEntries(entries, [], rscan);
+  assert.strictEqual(r.pageKey, "P2", "the repeating page is matched by its live sections, not flat fields");
+  assert.strictEqual(r.score, 2, "2 live repeating sections overlap the bundle's P2 group");
 });
 
 test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {

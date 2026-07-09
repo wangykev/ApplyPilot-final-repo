@@ -4205,6 +4205,54 @@ async function replayRepeatingSections(act, entries, budgets) {
   return results;
 }
 
+// selectPageBundleEntries (M3 walk): match the CURRENT live page to ONE page-group of the approved
+// bundle, so replay scopes to THIS page's entries (a same-named field on another page never
+// cross-replays — deriveFlatWrapperSel drops the page prefix, so scoping must happen here). Groups the
+// bundle by the `page` merge key, then picks the group with the most OVERLAP with the live page. Overlap
+// counts BOTH flat field names AND repeating SECTION presence — the latter is load-bearing: a repeating
+// page (My Experience) has NO flat fields (cdpPageScan excludes anything inside an indexed fkit entry),
+// so flat-only overlap scores 0 and the page looks "not in the bundle" even though its work-experience /
+// education / … entries are. `liveRepeatingScan` (act.repeatingScan()) tells us which sections are live;
+// PAGE_SECTIONS maps containerPrefix/heading → the section name the bundle's canonical_field uses.
+// Overlap (NOT exact key equality) also survives a cascade reveal changing the flat field-set. score 0 →
+// the bundle doesn't cover this page (the walk HALTS, never guesses).
+function selectPageBundleEntries(entries, liveFieldNames, liveRepeatingScan) {
+  const live = liveFieldNames instanceof Set ? liveFieldNames : new Set(liveFieldNames || []);
+  // Which repeating SECTIONS are live on this page (by PAGE_SECTIONS name)?
+  const liveSecs = new Set();
+  const rscan = liveRepeatingScan;
+  if (rscan && (rscan.sections || rscan.addButtons)) {
+    for (const sec of PAGE_SECTIONS) {
+      const hasContainer = !!(rscan.sections && rscan.sections[sec.containerPrefix]);
+      let hasAdd = false;
+      try { const re = new RegExp(sec.headingRegex, "i"); hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((bt) => re.test((bt && bt.nearestHeading) || "")); } catch (e) { /* bad regex → skip */ }
+      if (hasContainer || hasAdd) liveSecs.add(sec.name);
+    }
+  }
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const auto = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return auto.indexOf("formField-") === 0 ? auto.slice("formField-".length) : null;
+  };
+  const secOf = (e) => { const m = /^([A-Za-z_]+)\s*\[/.exec(String((e && e.canonical_field) || "")); return m ? m[1] : null; };
+  const groups = new Map();
+  for (const e of entries || []) {
+    const k = e && e.page != null ? e.page : "__nopage__";
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(e);
+  }
+  let best = null, bestKey = null, bestScore = -1;
+  for (const [k, es] of groups) {
+    const flatNames = new Set(es.filter((e) => !isRepeatingEntry(e)).map(nameOf).filter(Boolean));
+    const secNames = new Set(es.filter((e) => isRepeatingEntry(e)).map(secOf).filter(Boolean));
+    let inter = 0;
+    for (const n of flatNames) if (live.has(n)) inter++;
+    for (const s of secNames) if (liveSecs.has(s)) inter++;   // a repeating-only page matches here
+    if (inter > bestScore) { bestScore = inter; best = es; bestKey = k; }
+  }
+  return { entries: best || [], pageKey: bestKey, score: bestScore };
+}
+
 // reconcileAudit: re-read each entry's live value + classify match / mismatch / unverifiable.
 // One settle first (delayFull — the page's render takes real wall-clock; the foreground
 // speedup must not shorten it). Pure verdict list; the caller (inline or SW) acts on it.
@@ -4811,5 +4859,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
