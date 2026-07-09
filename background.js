@@ -2432,7 +2432,7 @@ async function runCdpOnboard(tabId, opts) {
     await fillVerifyPassword(creds.password);
     await checkConsent();
     await cdpDelay(400);
-    const submitted = await clickTarget(['[data-automation-id="click_filter"][aria-label="Create Account"]', '[data-automation-id="createAccountSubmitButton"]'], "Create Account submit");
+    const submitted = await clickTarget(['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'], "Create Account submit");
     if (!submitted.clicked) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: submitted.blockedBy || "no Create Account button" };
     const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""), 20000, "post-create-account");
     let post = w.scan || st;
@@ -2488,7 +2488,10 @@ async function runCdpOnboard(tabId, opts) {
         await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
         await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
         await cdpDelay(500); // Workday doesn't commit the field value synchronously (reference note)
-        const submitted = await clickTarget(['[data-automation-id="click_filter"][aria-label="Sign In"]', '[data-automation-id="signInSubmitButton"]', 'button[type="submit"]'], "Sign In submit");
+        // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
+        // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
+        // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
+        const submitted = await clickTarget(['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'], "Sign In submit");
         if (!submitted.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: submitted.blockedBy || "no Sign In button" };
         const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || isWorkdaySoftError(s.bodyText), 20000, "sign-in outcome");
         st = w.scan || st;

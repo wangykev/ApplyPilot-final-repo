@@ -1444,6 +1444,12 @@ function cdpCoverCheck(selector, cx, cy) {
   const btn = document.querySelector(selector);
   const top = document.elementFromPoint(cx, cy);
   if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+  // Workday's own `click_filter` is a TRANSPARENT overlay it renders on top of buttons to CAPTURE
+  // clicks — it IS the intended click surface, not an obstruction (a coordinate click on it activates
+  // the button underneath). elementFromPoint returns it instead of the button, which looked like a
+  // "cover" and made the click refuse (live: PANW Sign In submit, 2026-07-09). Treat it as clear.
+  const aid = top.getAttribute && top.getAttribute("data-automation-id");
+  if (aid === "click_filter" || (top.closest && top.closest('[data-automation-id="click_filter"]'))) return { blocked: false };
   const desc = (el) => {
     const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
     if (el.id) p.push("#" + el.id);
