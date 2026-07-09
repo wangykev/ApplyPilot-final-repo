@@ -58,10 +58,19 @@ test("gmailExtractVerificationUrl: no needle → falls back to an activate/verif
   assert.strictEqual(gmailExtractVerificationUrl("no links here", "acme.com"), null);
 });
 
-test("gmailBuildQuery: sender + recency floor (+ optional subject)", () => {
-  assert.strictEqual(gmailBuildQuery("workday.com"), "from:workday.com newer_than:1h");
-  assert.strictEqual(gmailBuildQuery("workday.com", "Verify"), "from:workday.com newer_than:1h subject:Verify");
-  assert.strictEqual(gmailBuildQuery(), "from:workday.com newer_than:1h"); // default sender
+test("gmailBuildQuery: matches the myworkdayjobs body token OR the sender (+ recency, optional subject)", () => {
+  // Sender-agnostic: some tenants send from Workday@<tenant>.com, so key on the body's activate-link
+  // token (myworkdayjobs) OR the workday.com sender.
+  assert.strictEqual(gmailBuildQuery("workday.com"), "newer_than:1h (myworkdayjobs OR from:workday.com)");
+  assert.strictEqual(gmailBuildQuery("workday.com", "Verify"), "newer_than:1h (myworkdayjobs OR from:workday.com) subject:Verify");
+  assert.strictEqual(gmailBuildQuery(), "newer_than:1h (myworkdayjobs OR from:workday.com)"); // default sender
+});
+
+test("gmailExtractVerificationUrl: prefers the /activate link over a job-listing link on the same host", () => {
+  // A Workday email can carry both a "back to your job" link and the activate link on the same host.
+  const body = "Back to your job: https://paloaltonetworks.wd5.myworkdayjobs.com/panwexternalcareers/job/JR-1\n" +
+    "Confirm: https://paloaltonetworks.wd5.myworkdayjobs.com/panwexternalcareers/activate/tok123/?redirect=%2Fjob";
+  assert.match(gmailExtractVerificationUrl(body, "paloaltonetworks.wd5.myworkdayjobs.com"), /\/activate\/tok123/);
 });
 
 // ── gmailApiGet ───────────────────────────────────────────────────────────────

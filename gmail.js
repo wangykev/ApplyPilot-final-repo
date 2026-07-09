@@ -76,22 +76,31 @@ function gmailExtractBodyText(payload) {
 // needle in practice). HTML bodies encode & as &amp; inside href, so decode it.
 function gmailExtractVerificationUrl(body, urlMustContain) {
   if (!body) return null;
-  const urls = String(body).match(/https?:\/\/[^\s"'<>]+/g) || [];
+  const urls = (String(body).match(/https?:\/\/[^\s"'<>]+/g) || []).map((u) => u.replace(/&amp;/g, "&"));
   const needle = urlMustContain || "";
-  const fallback = /\/(activate|verify|verification|confirm)\b|token=|activationCode=/i;
-  for (const raw of urls) {
-    const u = raw.replace(/&amp;/g, "&");
-    if (needle) { if (u.indexOf(needle) !== -1) return u; }
-    else if (fallback.test(u)) return u;
-  }
-  return null;
+  const activate = /\/(activate|verify|verification|confirm)\b|token=|activationCode=/i;
+  const hostUrls = needle ? urls.filter((u) => u.indexOf(needle) !== -1) : urls;
+  // Prefer an activation/verify-looking link — so a job-listing link that happens to share the
+  // tenant host (a Workday email can carry both) is never mistaken for the verify link.
+  const preferred = hostUrls.find((u) => activate.test(u));
+  if (preferred) return preferred;
+  // With a tenant-host needle, the first host-matching URL is an acceptable fallback; WITHOUT a
+  // needle, only return an activate-looking URL (never a random first link).
+  return needle ? (hostUrls[0] || null) : null;
 }
 
 // The Gmail search `q`. Mirrors the reference: sender + a 1h recency floor (the
 // hard freshness guard is the internalDate cutoff below; newer_than:1h just keeps
 // the result set small). Optional subject narrows further (unused by the caller).
 function gmailBuildQuery(senderContains, subjectContains) {
-  let q = "from:" + (senderContains || "workday.com") + " newer_than:1h";
+  // Match ANY recent Workday verification email. The SENDER is unreliable — some tenants send from
+  // Workday@<tenant>.com rather than workday.com (Palo Alto Networks: Workday@paloaltonetworks.com,
+  // 2026-07-09), so keying on from:workday.com missed it. Instead key on the "myworkdayjobs" token
+  // that the activate LINK in the body always carries, OR the workday.com sender. The
+  // urlMustContain=tenant-host filter downstream is the decisive gate; this only narrows candidates
+  // to the last hour.
+  const sender = senderContains || "workday.com";
+  let q = "newer_than:1h (myworkdayjobs OR from:" + sender + ")";
   if (subjectContains) q += " subject:" + subjectContains;
   return q;
 }
