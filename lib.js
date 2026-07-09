@@ -407,28 +407,46 @@ function languageDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
+// US + Canada region name → postal abbreviation. Workday review pages render the address as ONE blob
+// with the abbreviation ("Tallahassee, FL"), not the spelled-out region a dropdown stored ("Florida"),
+// so a name↔abbrev equivalence stops a stored region from reading as a false "missing".
+const REGION_ABBREV = {
+  alabama:"al",alaska:"ak",arizona:"az",arkansas:"ar",california:"ca",colorado:"co",connecticut:"ct",delaware:"de",
+  florida:"fl",georgia:"ga",hawaii:"hi",idaho:"id",illinois:"il",indiana:"in",iowa:"ia",kansas:"ks",kentucky:"ky",
+  louisiana:"la",maine:"me",maryland:"md",massachusetts:"ma",michigan:"mi",minnesota:"mn",mississippi:"ms",missouri:"mo",
+  montana:"mt",nebraska:"ne",nevada:"nv","new hampshire":"nh","new jersey":"nj","new mexico":"nm","new york":"ny",
+  "north carolina":"nc","north dakota":"nd",ohio:"oh",oklahoma:"ok",oregon:"or",pennsylvania:"pa","rhode island":"ri",
+  "south carolina":"sc","south dakota":"sd",tennessee:"tn",texas:"tx",utah:"ut",vermont:"vt",virginia:"va",
+  washington:"wa","west virginia":"wv",wisconsin:"wi",wyoming:"wy","district of columbia":"dc",
+  alberta:"ab","british columbia":"bc",manitoba:"mb","new brunswick":"nb","newfoundland and labrador":"nl",
+  "nova scotia":"ns",ontario:"on","prince edward island":"pe",quebec:"qc",saskatchewan:"sk",
+};
+
 // REVIEW-PAGE RECONCILIATION (the end-to-end fill-verify). The Workday review page (the final
 // application page) renders every value ACTUALLY in the form as read-only text — the ground truth of
 // what would be submitted. Compare it against what the extension RECORDED it filled (the accumulated
 // reviewSummary bundle's entries). A disagreement means the fill did not stick (the React value-revert
 // class the safety contract exists to catch) or the extension recorded a value that is not really on
-// the form — a bug to investigate. DOM-AGNOSTIC on purpose: it consumes plain `[{label, value}]` pairs
-// (however the scraper obtained them), so the match/compare logic is unit-testable independent of the
-// review page's (untraced) DOM. The scraper (cdpReadReviewPage) is the part that needs live refinement.
+// the form — a bug to investigate.
+//
+// VALUE-PRESENCE, NOT LABEL-MATCH (the 2026-07-07 live lesson). The observed review page has NO
+// reliable field labels — every value is a bare `<span>`/`<div>`, so label-anchored matching mislabels
+// and floods false missing/extra. Instead the primary question is "does each recorded value APPEAR on
+// the page at all?" — DOM-shape-agnostic and exactly the fill-stuck signal. So a DISTINCTIVE value
+// (normalized length ≥ 4) AGREES iff it is a substring of the page text (built from the scraped item
+// values), with a digit-only relief (phones: "8506660266" vs the rendered "+1 850-666-0266") and a
+// region name↔abbrev relief. SHORT values ("Yes"/"No") and CHECKBOXES can't be found by value (they
+// appear everywhere) so they fall back to label-anchored matching against the item whose label matches
+// (the scraper's label-anchored / <label> strategies supply those). FILE_UPLOAD matches the resume
+// filename by page-text containment. Unreplaced AI placeholders are excluded; an unchecked box is
+// SKIPPED (the review page doesn't render it). EXTRA = a distinctive page value NOT explained by any
+// recorded value (e.g. a language the bundle deleted but the form kept). DOM-agnostic — consumes
+// `[{label, value}]` pairs, unit-testable independent of the review DOM.
 //
 //   reviewItems   : [{label, value}]           scraped from the review page (display strings)
 //   bundleEntries : reviewSummary.entries[]     (question_label, current_value, fill_status,
 //                   widget_type, canonical_field, is_required, page_number, field_id)
 // Returns { agree, disagree, missing_on_review, extra_on_review, ambiguous, counts }.
-//
-// Value agreement is normalize()-based with a containment + fuzzy≥90 relief (so a dropdown's
-// "United States of America (+1)" reconciles with the review page's "United States of America").
-// WIDGET-AWARE: a CHECKBOX's current_value is "true"/"false" (String(checked)) and the review page
-// shows a checked box as its label → "Yes", so a checked box is verified present (an unchecked box is
-// SKIPPED — the review page doesn't render it, so its absence is not a bug); a FILE_UPLOAD's
-// current_value is the resume filename, matched by containment against the review's "Attachments" value
-// (label-independent). Unreplaced AI placeholders are excluded (not real values). All exclusions are
-// surfaced as counts, never false bugs.
 function reconcileReviewPage(reviewItems, bundleEntries) {
   const TRUEISH = /^(true|yes|checked|selected|on|1)$/i;
   const items = (Array.isArray(reviewItems) ? reviewItems : [])
@@ -436,17 +454,17 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
     .filter((it) => it.label || it.value)
     .map((it) => ({ ...it, nlabel: normalizeLabel(it.label), nval: normalize(it.value) }));
 
-  // A label containment match is only trusted when the shorter label is non-trivial (≥3 chars).
+  // The whole review page as one lowercased blob (from the scraped item values) + its digits-only form.
+  const pageText = items.map((it) => it.value).join("  ").toLowerCase().replace(/\s+/g, " ");
+  const pageDigits = pageText.replace(/\D+/g, "");
+
   const labelMatches = (a, b) => {
     if (!a || !b) return false;
     if (a === b) return true;
     const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
     return short.length >= 3 && long.includes(short);
   };
-  // Value agreement: exact-normalized, then containment (shorter ≥4 chars, so "No"/"Yes" stay
-  // exact-only and can't false-match a longer string), then fuzzy≥90 (typo tolerance). Returns the
-  // tier ("exact"/"containment"/"fuzzy") or null.
-  const valueTier = (a, b) => {
+  const valueTier = (a, b) => { // value agreement for the label-anchored path (short values / disagree)
     if (a === b) return a === "" ? "exact-blank" : "exact";
     if (!a || !b) return null;
     const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
@@ -454,72 +472,83 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
     if (a.length >= 3 && b.length >= 3 && fuzzyRatio(a, b) >= 90) return "fuzzy";
     return null;
   };
+  // Is this DISTINCTIVE recorded value present on the page? Returns the tier or null.
+  const presentTier = (rawValue) => {
+    const nv = normalize(rawValue);
+    if (nv.length >= 2 && pageText.includes(nv)) return "text";
+    const vd = String(rawValue).replace(/\D+/g, "");
+    if (vd.length >= 4 && pageDigits.includes(vd)) return "digits";
+    const ab = REGION_ABBREV[nv];
+    if (ab && new RegExp("(^|[ ,])" + ab + "([ ,]|$)").test(pageText)) return "region-abbrev";
+    return null;
+  };
 
   const agree = [], disagree = [], missing_on_review = [], ambiguous = [];
   let skipped = 0, placeholders = 0, claimed = 0;
+  const claimedValues = []; // normalized recorded values — drives the EXTRA computation
 
   for (const e of (Array.isArray(bundleEntries) ? bundleEntries : [])) {
     if (!e) continue;
     const cv = e.current_value;
     if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
     if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
-    const wt = e.widget_type, cvs = String(cv);
+    const wt = e.widget_type, cvs = String(cv), nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
     const base = { label: e.question_label != null ? e.question_label : null, value_bundle: cvs,
                    field_id: e.field_id != null ? e.field_id : null, widget_type: wt != null ? wt : null,
                    canonical_field: e.canonical_field != null ? e.canonical_field : null,
                    is_required: !!e.is_required, page_number: e.page_number != null ? e.page_number : null };
 
-    // ── file_upload: match by FILENAME containment against ANY review value (label-independent —
-    //    the review shows the resume inside an "Attachments" blob). Absent ⇒ resume didn't attach. ──
+    // ── file_upload: the resume filename must appear on the page (in the "Attachments" blob). ──
     if (wt === "file_upload") {
-      claimed++;
-      const nfile = normalize(cvs);
-      const hit = items.find((it) => !it.used && nfile.length >= 3 &&
-        (it.nval.includes(nfile) || (it.nval.length >= 3 && nfile.includes(it.nval))));
-      if (hit) { hit.used = true; agree.push({ ...base, value_review: hit.value, tier: "file" }); }
+      claimed++; claimedValues.push(nval);
+      if (nval.length >= 3 && pageText.includes(nval)) agree.push({ ...base, value_review: cvs, tier: "file" });
       else missing_on_review.push(base);
       continue;
     }
 
-    // ── checkbox: an UNCHECKED box is skipped (not rendered on review); a CHECKED box must appear as
-    //    its label → "Yes". Not found ⇒ a (required) box that didn't stick. ──
+    // ── checkbox: unchecked → skipped (not rendered); checked → its label must show "Yes" nearby. ──
     if (wt === "checkbox") {
       if (!TRUEISH.test(cvs.trim())) { skipped++; continue; }
       claimed++;
-      const nlabel = normalizeLabel(e.question_label);
-      const cand = items.find((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
+      const cands = items.filter((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
+      const cand = cands.find((it) => /^(yes|no|true|false)$/i.test(it.value.trim())) || cands[0]; // prefer a yes/no-valued item
       if (!cand) { missing_on_review.push(base); continue; }
       cand.used = true;
-      if (TRUEISH.test(cand.value.trim()) || valueTier("yes", cand.nval)) agree.push({ ...base, value_review: cand.value, tier: "checkbox" });
+      if (TRUEISH.test(cand.value.trim())) agree.push({ ...base, value_review: cand.value, tier: "checkbox" });
       else disagree.push({ ...base, value_review: cand.value });
       continue;
     }
 
-    // ── everything else: label match (exact then containment), then value compare ──
-    claimed++;
-    const nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
-    const exact = items.filter((it) => !it.used && it.nlabel && it.nlabel === nlabel);
-    const cands = exact.length ? exact : items.filter((it) => !it.used && labelMatches(it.nlabel, nlabel));
-    if (!cands.length) { missing_on_review.push(base); continue; }
+    claimed++; claimedValues.push(nval);
 
-    // Disambiguate by value: prefer a candidate whose value also reconciles.
-    const withTier = cands.map((it) => ({ it, tier: valueTier(nval, it.nval) }));
-    const agreeing = withTier.filter((c) => c.tier);
-    if (agreeing.length) {
-      const pick = agreeing[0]; pick.it.used = true;
-      agree.push({ ...base, value_review: pick.it.value, tier: pick.tier });
-    } else if (cands.length === 1) {
-      cands[0].used = true;
-      disagree.push({ ...base, value_review: cands[0].value });
-    } else {
-      // multiple label matches, none reconcile by value — can't confidently pick (repeating-section
-      // label collisions land here). Surface all candidate values rather than guess a wrong "disagree".
-      ambiguous.push({ ...base, candidates: cands.map((it) => it.value) });
+    // ── DISTINCTIVE value → value-presence (label-independent). ──
+    if (nval.length >= 4) {
+      const tier = presentTier(cvs);
+      if (tier) { agree.push({ ...base, value_review: cvs, tier }); continue; }
     }
+    // ── SHORT value (or a distinctive value not found) → label-anchored against the scraped items. ──
+    const cands = items.filter((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
+    if (cands.length) {
+      const ag = cands.find((it) => valueTier(nval, it.nval));
+      if (ag) { ag.used = true; agree.push({ ...base, value_review: ag.value, tier: "label" }); }
+      else if (cands.length === 1) { cands[0].used = true; disagree.push({ ...base, value_review: cands[0].value }); }
+      else ambiguous.push({ ...base, candidates: cands.map((it) => it.value) }); // can't confidently pick
+      continue;
+    }
+    missing_on_review.push(base); // recorded but nowhere on the page — the fill-didn't-stick signal
   }
 
-  const extra_on_review = items.filter((it) => !it.used && it.value.trim())
-    .map((it) => ({ label: it.label || null, value_review: it.value }));
+  // EXTRA = a DISTINCTIVE page value (≥4 chars) not explained by ANY recorded value (either contains the
+  // other). Surfaces a value the form holds that the bundle doesn't — e.g. a language the summary deleted
+  // but the form kept. Short/ambiguous values ("Yes"/"No") are never "extra".
+  const explained = (nv) => claimedValues.some((cvn) => cvn && Math.min(cvn.length, nv.length) >= 4 && (cvn.includes(nv) || nv.includes(cvn)));
+  const seenExtra = new Set(), extra_on_review = [];
+  for (const it of items) {
+    const nv = it.nval;
+    if (nv.length < 4 || explained(nv) || seenExtra.has(nv)) continue;
+    seenExtra.add(nv);
+    extra_on_review.push({ label: it.label || null, value_review: it.value });
+  }
 
   return {
     agree, disagree, missing_on_review, extra_on_review, ambiguous,

@@ -1285,9 +1285,11 @@ function cdpReadReviewPage(valueHints) {
   const items = [];
   const push = (label, value, via) => { const l = clean(label); if (l) items.push({ label: l, value: clean(value), via }); };
 
-  // ── (1) VALUE-ANCHORED (primary): find each known value's leaf on the page, derive its label. ──
-  // The label is the first <label>/<dt> in an ancestor (≤6 up) not containing the value node, else the
-  // nearest preceding leaf text. Every occurrence yields an item, so repeating rows pair correctly.
+  // ── (1) VALUE-ANCHORED (primary): find each known value's leaf on the page. The reconciler matches by
+  // value PRESENCE, not label (the review page has no reliable labels), so a found item is tagged with
+  // the HINT's own (correct) label; findLabel only upgrades to a real <label>/<dt> when the tenant has
+  // one (returns null otherwise — NO nearest-leaf fallback, which invented wrong labels). Every
+  // occurrence yields an item, so repeating rows pair correctly. ──
   const leaves = Array.from(container.querySelectorAll("*")).filter((el) => el.children.length === 0 && clean(el.textContent));
   const findLabel = (leaf) => {
     let a = leaf;
@@ -1296,10 +1298,7 @@ function cdpReadReviewPage(valueHints) {
       if (!a) break;
       for (const l of a.querySelectorAll("label, dt")) { if (!l.contains(leaf)) { const t = clean(l.textContent); if (t) return t; } }
     }
-    // fallback: nearest preceding leaf text
-    const idx = leaves.indexOf(leaf);
-    for (let i = idx - 1; i >= 0 && i >= idx - 8; i--) { const t = clean(leaves[i].textContent); if (t && leaves[i] !== leaf) return t; }
-    return null;
+    return null; // no reliable label element — the reconciler doesn't need one (matches by value)
   };
   const anchorSamples = [];
   for (const h of hints) {
@@ -1317,6 +1316,25 @@ function cdpReadReviewPage(valueHints) {
           }
           anchorSamples.push({ hint: clean(h && h.value), labelFound: findLabel(leaf), chain });
         }
+      }
+    }
+  }
+
+  // ── (1b) LABEL-ANCHORED: for hints with a DISTINCTIVE label (≥12 chars — e.g. the screening
+  // questions), find the label TEXT as a leaf and read the value from the next non-label leaf. This is
+  // the ONLY way to capture a SHORT-valued field ("Yes"/"No") whose value can't be value-anchored. ──
+  const hintLabelSet = new Set(hints.map((h) => norm(h && h.label)).filter((s) => s.length >= 3));
+  for (const h of hints) {
+    const nl = norm(h && h.label);
+    if (nl.length < 12) continue;
+    for (let i = 0; i < leaves.length; i++) {
+      const lt = norm(leaves[i].textContent);
+      if (lt === nl || lt.startsWith(nl) || (lt.length >= 12 && lt.includes(nl))) {
+        for (let j = i + 1; j < leaves.length && j <= i + 3; j++) {
+          const vt = clean(leaves[j].textContent);
+          if (vt && !hintLabelSet.has(norm(vt))) { push(h && h.label, vt, "label-anchored"); break; }
+        }
+        break;
       }
     }
   }

@@ -1,7 +1,9 @@
 // Unit tests for reconcileReviewPage (lib.js) — the end-to-end fill-verify. It diffs what the Workday
-// REVIEW page displays (ground truth, [{label, value}] pairs) against what the extension RECORDED it
-// filled (the reviewSummary bundle's entries). DOM-agnostic, so the match/compare logic is pinned here
-// independent of the (untraced) review-page DOM. A DISAGREE is the headline bug signal.
+// REVIEW page displays (ground truth) against what the extension RECORDED it filled (the reviewSummary
+// bundle). The observed review page has NO reliable field labels, so matching is VALUE-PRESENCE for
+// distinctive values (does the recorded value appear on the page at all?) with a digit + region-abbrev
+// relief, and LABEL-ANCHORED for short values ("Yes"/"No") and checkboxes. DOM-agnostic: consumes
+// [{label, value}] pairs. A MISSING (recorded value nowhere on the page) is the headline bug signal.
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { reconcileReviewPage, AI_NEEDS_ANSWER_MARK } = require("../lib.js");
@@ -10,114 +12,116 @@ const { reconcileReviewPage, AI_NEEDS_ANSWER_MARK } = require("../lib.js");
 const entry = (o) => Object.assign({ question_label: null, current_value: null, fill_status: "filled",
   widget_type: "text", canonical_field: null, is_required: false, page_number: 1, field_id: null }, o);
 
-test("exact label + value → agree (tier exact)", () => {
+test("distinctive value present on the page → agree (value-presence, ignores label)", () => {
   const r = reconcileReviewPage(
-    [{ label: "First Name", value: "Ada" }],
-    [entry({ question_label: "First Name", current_value: "Ada" })]
+    [{ label: "How Did You Hear About Us?", value: "Kevin Wang" }], // deliberately WRONG label
+    [entry({ question_label: "First Name", current_value: "Kevin Wang" })]
   );
   assert.strictEqual(r.counts.agree, 1);
-  assert.strictEqual(r.counts.disagree, 0);
-  assert.strictEqual(r.agree[0].tier, "exact");
+  assert.strictEqual(r.counts.missing_on_review, 0);
+  assert.strictEqual(r.agree[0].tier, "text");
 });
 
 test("dropdown (+dial-code) reconciles with the review page's bare display via normalize", () => {
   const r = reconcileReviewPage(
-    [{ label: "Country Phone Code", value: "United States of America" }],
-    [entry({ question_label: "Country Phone Code", current_value: "United States of America (+1)", widget_type: "dropdown" })]
+    [{ label: "x", value: "United States of America" }],
+    [entry({ question_label: "Country Phone Code", current_value: "United States of America (+1)", widget_type: "typeahead" })]
   );
-  assert.strictEqual(r.counts.agree, 1, "the (+1) suffix is normalized away → exact");
-  assert.strictEqual(r.counts.disagree, 0);
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.counts.missing_on_review, 0);
 });
 
-test("dropdown containment: bundle 'United States' matches review 'United States of America'", () => {
+test("containment: bundle 'United States' is present inside the page's 'United States of America'", () => {
   const r = reconcileReviewPage(
-    [{ label: "Country", value: "United States of America" }],
+    [{ label: "x", value: "715 Middlebrooks Circle Tallahassee, FL 32312 United States of America" }],
     [entry({ question_label: "Country", current_value: "United States", widget_type: "dropdown" })]
   );
   assert.strictEqual(r.counts.agree, 1);
-  assert.strictEqual(r.agree[0].tier, "containment");
 });
 
-test("a real value mismatch is a DISAGREE (the headline bug signal)", () => {
+test("phone matches on DIGITS despite the review page's formatting", () => {
+  const r = reconcileReviewPage(
+    [{ label: "x", value: "+1 850-666-0266 (Mobile)" }],
+    [entry({ question_label: "Phone Number", current_value: "8506660266" })]
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "digits");
+});
+
+test("region name↔abbrev: stored 'Florida' matches the page's 'Tallahassee, FL'", () => {
+  const r = reconcileReviewPage(
+    [{ label: "x", value: "715 Middlebrooks Circle Tallahassee, FL 32312" }],
+    [entry({ question_label: "State", current_value: "Florida", widget_type: "dropdown" })]
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "region-abbrev");
+});
+
+test("a distinctive recorded value NOWHERE on the page → missing_on_review (the didn't-stick signal)", () => {
+  const r = reconcileReviewPage(
+    [{ label: "First Name", value: "Kevin" }],
+    [entry({ question_label: "Secret Field", current_value: "a value that reverted to blank", is_required: true })]
+  );
+  assert.strictEqual(r.counts.missing_on_review, 1);
+  assert.strictEqual(r.missing_on_review[0].is_required, true);
+});
+
+test("disagree: value absent but a same-label item shows a DIFFERENT value", () => {
   const r = reconcileReviewPage(
     [{ label: "State", value: "California" }],
     [entry({ question_label: "State", current_value: "New York", widget_type: "dropdown" })]
   );
   assert.strictEqual(r.counts.disagree, 1);
   assert.strictEqual(r.counts.agree, 0);
-  assert.deepStrictEqual(
-    { l: r.disagree[0].label, b: r.disagree[0].value_bundle, v: r.disagree[0].value_review },
-    { l: "State", b: "New York", v: "California" }
-  );
+  assert.strictEqual(r.disagree[0].value_review, "California");
 });
 
-test("short values ('Yes'/'No') use exact-only — no false containment against a longer string", () => {
-  const r = reconcileReviewPage(
-    [{ label: "Previously employed here?", value: "Not specified" }],
-    [entry({ question_label: "Previously employed here?", current_value: "No", widget_type: "radio" })]
-  );
-  // "no" must NOT be swallowed by "not specified" via containment → this is a real disagreement.
-  assert.strictEqual(r.counts.disagree, 1);
+test("short value (Yes/No) is captured by LABEL-anchoring on the distinctive question", () => {
+  const q = "Are you eligible to work in Canada?";
+  const agreeR = reconcileReviewPage([{ label: q, value: "No" }], [entry({ question_label: q, current_value: "No", widget_type: "dropdown" })]);
+  assert.strictEqual(agreeR.counts.agree, 1);
+  assert.strictEqual(agreeR.agree[0].tier, "label");
+  const disagreeR = reconcileReviewPage([{ label: q, value: "Yes" }], [entry({ question_label: q, current_value: "No", widget_type: "dropdown" })]);
+  assert.strictEqual(disagreeR.counts.disagree, 1);
 });
 
-test("filled in bundle but no matching label on the review page → missing_on_review", () => {
+test("checkbox: prefers the yes/no-valued item over a mislabeled distinctive one (the preferredCheck fix)", () => {
+  // Both items carry the checkbox's label (the scraper mislabeled "Kevin Wang" with it); the reconciler
+  // must pick the "Yes" item, not disagree on "Kevin Wang".
   const r = reconcileReviewPage(
-    [{ label: "First Name", value: "Ada" }],
-    [entry({ question_label: "Secret Question", current_value: "value that vanished", is_required: true })]
-  );
-  assert.strictEqual(r.counts.missing_on_review, 1);
-  assert.strictEqual(r.missing_on_review[0].is_required, true);
-});
-
-test("a review value with no matching bundle entry → extra_on_review (informational)", () => {
-  const r = reconcileReviewPage(
-    [{ label: "Referred By", value: "A Friend" }],
-    [entry({ question_label: "First Name", current_value: "Ada" })]
-  );
-  assert.strictEqual(r.counts.missing_on_review, 1); // First Name unmatched
-  assert.strictEqual(r.counts.extra_on_review, 1);
-  assert.strictEqual(r.extra_on_review[0].value_review, "A Friend");
-});
-
-test("checkbox: a CHECKED box (true) shows on review as its label → 'Yes' → agree", () => {
-  const r = reconcileReviewPage(
-    [{ label: "I currently work here", value: "Yes" }],
-    [entry({ question_label: "I currently work here", current_value: "true", widget_type: "checkbox" })]
+    [{ label: "I have a preferred name", value: "Kevin Wang" }, { label: "I have a preferred name", value: "Yes" }],
+    [entry({ question_label: "I have a preferred name", current_value: "true", widget_type: "checkbox" })]
   );
   assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.counts.disagree, 0);
   assert.strictEqual(r.agree[0].tier, "checkbox");
 });
 
-test("checkbox: a CHECKED box not found on review → missing_on_review (didn't stick)", () => {
+test("checkbox: a checked box not shown on review → missing_on_review", () => {
   const r = reconcileReviewPage(
     [{ label: "First Name", value: "Ada" }],
     [entry({ question_label: "I agree to the terms", current_value: "true", widget_type: "checkbox", is_required: true })]
   );
   assert.strictEqual(r.counts.missing_on_review, 1);
-  assert.strictEqual(r.counts.agree, 0);
 });
 
-test("checkbox: an UNCHECKED box (false) is skipped — the review page doesn't render it, so absence is not a bug", () => {
-  const r = reconcileReviewPage(
-    [],
-    [entry({ question_label: "I currently work here", current_value: "false", widget_type: "checkbox" })]
-  );
+test("checkbox: an unchecked box (false) is skipped — absence isn't a bug", () => {
+  const r = reconcileReviewPage([], [entry({ question_label: "I currently work here", current_value: "false", widget_type: "checkbox" })]);
   assert.strictEqual(r.counts.skipped, 1);
   assert.strictEqual(r.counts.claimed, 0);
   assert.strictEqual(r.counts.missing_on_review, 0);
 });
 
-test("file_upload: the resume filename inside the review's Attachments blob → agree (label-independent)", () => {
+test("file_upload: the resume filename inside the review's Attachments blob → agree", () => {
   const r = reconcileReviewPage(
     [{ label: "Attachments", value: "Kevin's Resume 2.pdf successfully uploaded Kevin's Resume 2.pdf 173.59 KB" }],
     [entry({ question_label: "Resume", current_value: "Kevin's Resume 2.pdf", widget_type: "file_upload" })]
   );
   assert.strictEqual(r.counts.agree, 1);
   assert.strictEqual(r.agree[0].tier, "file");
-  assert.strictEqual(r.counts.extra_on_review, 0, "the Attachments item is consumed, not left as extra");
 });
 
-test("file_upload: filename absent from the review page → missing_on_review (resume didn't attach)", () => {
+test("file_upload: filename absent from the page → missing_on_review (resume didn't attach)", () => {
   const r = reconcileReviewPage(
     [{ label: "Attachments", value: "someone-elses-file.pdf" }],
     [entry({ question_label: "Resume", current_value: "Kevin's Resume 2.pdf", widget_type: "file_upload" })]
@@ -126,47 +130,57 @@ test("file_upload: filename absent from the review page → missing_on_review (r
   assert.strictEqual(r.counts.agree, 0);
 });
 
-test("an unreplaced AI placeholder is excluded (not a real value)", () => {
+test("repeating identical values both agree by presence (no dedup false-missing)", () => {
+  // The scraper dedupes two identical "Tallahassee, FL" rows to ONE item; value-presence still agrees
+  // for BOTH bundle entries.
   const r = reconcileReviewPage(
-    [],
-    [entry({ question_label: "Why us?", current_value: AI_NEEDS_ANSWER_MARK + " essay]", widget_type: "textarea" })]
+    [{ label: "Location", value: "Tallahassee, FL" }],
+    [entry({ question_label: "Location", current_value: "Tallahassee, FL", canonical_field: "workExperience[1].location" }),
+     entry({ question_label: "Location", current_value: "Tallahassee, FL", canonical_field: "workExperience[2].location" })]
   );
+  assert.strictEqual(r.counts.agree, 2);
+  assert.strictEqual(r.counts.missing_on_review, 0);
+});
+
+test("EXTRA: a distinctive page value NOT explained by any recorded value (the deleted-language catch)", () => {
+  const r = reconcileReviewPage(
+    [{ label: "First Name", value: "Kevin" }, { label: "Language", value: "Chinese" }],
+    [entry({ question_label: "First Name", current_value: "Kevin" })] // bundle has NO language (it was deleted)
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.counts.extra_on_review, 1);
+  assert.strictEqual(r.extra_on_review[0].value_review, "Chinese");
+});
+
+test("EXTRA: a value contained in a recorded blob is explained, not extra; short values never extra", () => {
+  const r = reconcileReviewPage(
+    [{ label: "x", value: "715 Middlebrooks Circle Tallahassee, FL 32312" }, { label: "y", value: "Yes" }],
+    [entry({ question_label: "Address Line 1", current_value: "715 Middlebrooks Circle" })]
+  );
+  assert.strictEqual(r.counts.extra_on_review, 0);
+});
+
+test("multiple same-label items, none reconcile by value → ambiguous, not a guessed disagree", () => {
+  const r = reconcileReviewPage(
+    [{ label: "Job Title", value: "Engineer" }, { label: "Job Title", value: "Analyst" }],
+    [entry({ question_label: "Job Title", current_value: "Mgr", canonical_field: "workExperience[0].jobTitle" })] // short + absent
+  );
+  assert.strictEqual(r.counts.ambiguous, 1);
+  assert.strictEqual(r.counts.disagree, 0);
+  assert.deepStrictEqual(r.ambiguous[0].candidates.sort(), ["Analyst", "Engineer"]);
+});
+
+test("an unreplaced AI placeholder is excluded (not a real value)", () => {
+  const r = reconcileReviewPage([], [entry({ question_label: "Why us?", current_value: AI_NEEDS_ANSWER_MARK + " essay]", widget_type: "textarea" })]);
   assert.strictEqual(r.counts.placeholders, 1);
   assert.strictEqual(r.counts.claimed, 0);
   assert.strictEqual(r.counts.missing_on_review, 0);
 });
 
 test("blank/absent bundle values are not reconciled (no false missing)", () => {
-  const r = reconcileReviewPage(
-    [],
-    [entry({ question_label: "Middle Name", current_value: "" }),
-     entry({ question_label: "Suffix", current_value: null })]
-  );
+  const r = reconcileReviewPage([], [entry({ question_label: "Middle Name", current_value: "" }), entry({ question_label: "Suffix", current_value: null })]);
   assert.strictEqual(r.counts.claimed, 0);
   assert.strictEqual(r.counts.missing_on_review, 0);
-});
-
-test("repeating-section label collision disambiguates by value (greedy consume)", () => {
-  // Two 'Job Title' rows on the review page; two bundle entries. Each should pair with its value-match,
-  // not collapse into one match + one missing.
-  const r = reconcileReviewPage(
-    [{ label: "Job Title", value: "Engineer" }, { label: "Job Title", value: "Analyst" }],
-    [entry({ question_label: "Job Title", current_value: "Analyst", canonical_field: "workExperience[0].jobTitle" }),
-     entry({ question_label: "Job Title", current_value: "Engineer", canonical_field: "workExperience[1].jobTitle" })]
-  );
-  assert.strictEqual(r.counts.agree, 2);
-  assert.strictEqual(r.counts.missing_on_review, 0);
-  assert.strictEqual(r.counts.disagree, 0);
-});
-
-test("same label, NO value reconciles among multiple candidates → ambiguous, not a guessed disagree", () => {
-  const r = reconcileReviewPage(
-    [{ label: "Job Title", value: "Engineer" }, { label: "Job Title", value: "Analyst" }],
-    [entry({ question_label: "Job Title", current_value: "Manager", canonical_field: "workExperience[0].jobTitle" })]
-  );
-  assert.strictEqual(r.counts.ambiguous, 1);
-  assert.strictEqual(r.counts.disagree, 0);
-  assert.deepStrictEqual(r.ambiguous[0].candidates.sort(), ["Analyst", "Engineer"]);
 });
 
 test("empty inputs are safe", () => {
