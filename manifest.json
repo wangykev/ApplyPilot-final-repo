@@ -2,9 +2,15 @@
   "manifest_version": 3,
   "name": "ApplyPilot Dev",
   "version": "0.0.1",
-  "permissions": ["activeTab", "scripting", "storage", "debugger"],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7hlgz1t22GbXAqMh9w2pVpoaWpaIXJCbX0KGIBaSNvAzm2xwgUjfpH8lJJWpeo2WxnnSpPESUknhppwl2DkZwpMCVzhafIRAR7G6em0avlcSnVxh/PYj79m6FVl1OoJ2AKYO35J5RTQ0RgpRjvCp5wqsqFsEXtNIa6MT90e6IyeWpMjKeSoWWMTIxlHva+cT0ICtOSSeaD7t5/M9GE4kjKcYjMxkZDZh0enuStZOXGFm9Gidg9uNdZvF+rlmt/Ymlu6S7ZZ/iy5C3Yvk8eYp6Ov4Jc1o1KIiArN4bM650e6JxWNE26zACTQvwX/Z/zsNIF9x5JX/jsFRPoF1GakRlQIDAQAB",
+  "oauth2": {
+    "client_id": "294371060360-3s12db5jkllfqhgil11a79cmmj246a0l.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
+  },
+  "permissions": ["activeTab", "scripting", "storage", "debugger", "identity"],
   "host_permissions": [
     "*://*.myworkdayjobs.com/*",
+    "https://gmail.googleapis.com/*",
     "https://api.anthropic.com/*",
     "https://generativelanguage.googleapis.com/*",
     "https://api.openai.com/*"
