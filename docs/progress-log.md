@@ -260,3 +260,57 @@ Live testing of the detach/banner behavior surfaced two fixes:
   next `cdpAttach`. The SW log says "⛔ OPERATOR CANCELLED mid-run …", and `summary.js` renders a red
   `abort-banner` at the top (shown even when the cancel wrote no bundle) explaining the incomplete/errored
   state. Unit suite unaffected (490 green). CLAUDE.md input-lock bullet updated.
+
+- **Perf: batched M40 audit re-read (one round-trip — hidden-run speedup).** The M40 audit re-read every actuated field with one `cdpEval` PER FIELD → N serial SW↔page round-trips; on a HIDDEN tab (the slowest fill mode, where each debugger round-trip costs most) that IPC latency stacked up. New `act.readAuditRaw` (cdp.js `cdpReadAuditRaw`) reads ALL fields in ONE `Runtime.evaluate` by COMPOSING the single-source reader fns (`cdpReadTextState`/…/`cdpReadSourcePick` via `.toString()` inside one scoped IIFE — NO body duplication, so no new lockstep hazard) + a per-widget dispatcher; returns a parallel array of RAW reads (a "date" entry → an array of per-segment reads). The `{actual,readable}` MAPPING stayed SW-side, extracted to the pure `auditActualFromRaw` (Node-tested) and shared by BOTH the per-field `auditReReadActual` and the batched path — identical verdicts, only the fetch changed N→1. `reconcileAudit` fetches the batch once (guarded: absent method / wrong-length / throw → per-field fallback), and the mismatch→refill re-read STAYS per-field (a fresh read of the one re-filled field). A single snapshot is also more consistent than N reads spread across the pass. 497 tests (+4: verdict PARITY vs the per-field path across every widget + one-round-trip/no-per-field-reads spy, whole-page one-call, wrong-length fallback, throw fallback); composition parse+dispatch validated in a standalone harness. **Live-verify PENDING** on a hidden CDP fill (unit-green + composition-checked; behavior is verdict-identical to the proven path).
+- **Fix: dropdown OVERWRITE commit uses an ESCALATING BEAT LADDER (occlusion / alt-tab fix).** The overwrite commit split its beat off `act.visible` (`tab.active && !minimized`): VISIBLE pair `[30,100]`, HIDDEN `[120,700]`. Live-found: a tab **alt-tabbed BEHIND another app is OCCLUDED** — Chrome stops painting it (throttled like hidden) — yet it still reports `tab.active && !minimized`, so `act.visible` mislabels it "visible" and used the `[30,100]` pair; the option-click DEBOUNCE is a PAINT thing that needs ~700ms when not painting, so BOTH beats missed → the two `language` dropdowns commit-failed / swapped to `needs_review` (safety held — never a wrong fill). Occlusion is NOT reliably detectable: extension APIs expose no occlusion flag, `win.focused` can’t separate "unfocused-but-visible" from "occluded", and the page’s `visibilityState`/`rAF` are spoofed/polyfilled by our own hidden-tab overrides. So instead of detecting the state, the commit ESCALATES: `overwriteBeatLadder` returns an ASCENDING ladder (VISIBLE `[30,100,700]`, HIDDEN `[120,700]`), and on each MISS the commit re-opens + waits the next-larger beat, up to the ~700ms tier REGARDLESS of the label. A painting tab commits on tier 0 (no penalty); a mislabeled/occluded tab self-corrects to the big beat instead of failing. The commit-PERSISTENCE re-read gates every accept, so escalation only ever costs extra re-opens — never a wrong/silent fill. `[CDP-DD-REFILL]` now logs the ladder + which tier committed. 500 tests (+3: `overwriteBeatLadder` ascending/deduped, a VISIBLE-labeled commit that only takes at the 700 tier escalates + commits `filled`, a never-committing commit exhausts the ladder → `needs_review`); existing fast-first + visibility-aware beat tests still green. **Live-verify PENDING** on a genuinely hidden/occluded tab.
+- **Follow-up: final ~5s safety tier on the overwrite ladder.** Appended `overwriteMaxBeatMs: 5000` to BOTH ladders (VISIBLE `[30,100,700,5000]`, HIDDEN `[120,700,5000]`) so a deeply-throttled/occluded tab that even the 700ms tier misses gets one last 5s attempt before `needs_review`. Only ever reached after every shorter tier misses (a stuck field headed for review anyway), so it costs the common paths nothing; the persistence gate still guards correctness. `overwriteBeatLadder` test updated; 500 tests green.
+- **Batched M40 audit — LIVE-VERIFIED (hidden) + temp logging removed.** Confirmed on a genuinely HIDDEN Magna page-2 fill: `batched 14ms (1 round-trip) vs per-field 92ms (40 round-trips) → saved ~78ms; disagreements: 0` (the batched read returned the identical live value for all 40 fields the old per-field path would have). Per-field cost ~2.3ms/read hidden vs ~1.8ms visible — each round-trip costs more hidden, so collapsing 40→1 helps hidden most, as predicted. The throwaway `[PERF-TEMP]` diagnostic block (+ its per-field comparison pass) is now REMOVED; only the single batched read remains. 500 tests green.
+## 2026-07-06 — Best-effort auto-dismiss of a popup covering Save & Continue (shadow-DOM aware)
+
+Follow-up to the blocking-popup DETECTION (which live-verified). Operator opted into auto-CLOSING the popup so
+the walk can proceed. Live case: the blocker is `div.simplify-jobs-shadow-root` — Simplify renders into a
+SHADOW DOM, so its X button lives in `host.shadowRoot` and is invisible to a light-DOM query / `elementFromPoint`
+(which only ever returns the shadow HOST).
+
+- **`cdpFindDismissControl(cx,cy)`** (cdp.js): reads the blocker at the button's center; searches its OPEN
+  `shadowRoot` (Simplify) or, for a regular modal, its subtree climbed to a dialog/overlay ancestor. Returns the
+  viewport rect of ONE clearly-dismissive control — X-glyph / aria-label|title|class close|dismiss / text
+  "Close"/"No thanks"/"Not now"/"Skip"/"Dismiss" — for a trusted click. **SAFETY**: an affirmative deny-list
+  (`accept|agree|ok|got it|allow|yes|confirm|continue|submit|save|…|autofill|apply`) is checked FIRST, so a
+  consent/accept button is NEVER clicked; big containers (>120px) are skipped (target the icon, not the panel);
+  a CLOSED shadow root or no safe control → not-found. Never removes/hides DOM.
+- **`clickPageNext`**: on a detected block, try the dismiss ONCE (trusted click on the control), poll ~1.5s for
+  the cover to clear (`elementFromPoint` no longer the blocker), then click Save & Continue → `{clicked:true,
+  dismissed}`. If it stays covered / no safe control → the existing halt `click-refused:blocked` (+ `dismissTried`).
+
+Unit suite unaffected (490 green — CDP substrate). CLAUDE.md multi-page `clickPageNext` note updated. Live-verify
+pending on the real Simplify overlay.
+
+## 2026-07-06 — Simplify auto-dismiss LIVE-VERIFIED + English-last language order
+
+- **Simplify overlay auto-dismiss — LIVE-VERIFIED.** The blocker-dump recon showed `div.simplify-jobs-shadow-root`
+  has an OPEN shadow root with a `<button aria-label="Minimize">`. Added `minimi[sz]e` to the dismiss-control
+  matcher (NOT "collapse" — that matches Simplify's "Collapse Resume Section" sub-control). `clickPageNext` now
+  minimizes Simplify's panel and advances past Save & Continue (operator confirmed: "it minimizes and advances").
+  The DIAG blocker dump was removed.
+- **English filled LAST (`prepareProfile`).** Operator found that ordering English last in the Languages section
+  reduces Workday's spurious "duplicate languages not allowed" ghost error on Save & Continue. `prepareProfile`
+  now stable-partitions `out.languages` (non-English first, English last) before the CDP fill consumes it.
+
+Unit suite green.
+
+## 2026-07-06 — Session round LIVE-VERIFIED on Magna (review fixes + detach/popup/radio)
+
+Operator live-verified the full round on Magna wd3; all shipped to main:
+- Review summary: tier-editor "Filled" box; page-1 flat dropdown/typeahead recon (country → real `<select>`;
+  countryPhoneCode combobox — chip-exclusion + wait-for-render + promptOption fallback in `cdpScrapeTaOptions`).
+- Required-radio AI fallback (`aiFillRadio`): `candidateIsPreviousWorker` unevaluable → AI-guessed, LEGALLY-LOADED
+  flag, never blank-blocks.
+- Input-lock/detach: `world:"MAIN"` teardown clears the "please don't click or type" banner on Cancel; X/Cancel
+  both detach (accepted); a mid-run detach writes `lastRunAbort` → SW "OPERATOR CANCELLED mid-run" log + a red
+  `abort-banner` on the summary page.
+- Save & Continue: blocking-popup detection; best-effort auto-dismiss — Simplify's `div.simplify-jobs-shadow-root`
+  is minimized via its `<button aria-label="Minimize">` (open shadow root), then the walk advances.
+- Languages: `prepareProfile` fills English LAST (reduces the ghost duplicate-language error).
+
+The earlier per-feature "live-verify pending" notes are now superseded — this round is verified.

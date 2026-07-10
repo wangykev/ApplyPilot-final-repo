@@ -1554,6 +1554,62 @@ function cdpReadRadioState(wrapperSel) {
   });
 }
 
+// Best-effort: find a clearly-DISMISSIVE control (X / Close / No thanks — NEVER Accept/Agree/OK/Got it)
+// inside the popup covering (cx,cy), so the walk can close it and proceed. Handles SHADOW-DOM overlays
+// (Simplify renders into div.simplify-jobs-shadow-root → the X lives in host.shadowRoot, invisible to a
+// light-DOM query) AND regular in-page modals. Read-only: returns the control's viewport rect for a TRUSTED
+// click (or {found:false}). SAFETY: the affirmative deny-list is checked first so we never click a
+// consent/accept button; if nothing clearly-dismissive is found we return not-found → the caller halts.
+function cdpFindDismissControl(cx, cy) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const cs = win.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const host = document.elementFromPoint(cx, cy);
+  if (!host) return { found: false };
+  // Search root: an OPEN shadow root if the blocker is a shadow host (Simplify), else the blocker's own
+  // subtree climbed to a dialog/overlay-ish ancestor (bounded). A CLOSED shadow root → shadowRoot is null →
+  // we can't reach the X → not-found → safe halt.
+  let root = host.shadowRoot || null;
+  if (!root) {
+    let el = host;
+    for (let i = 0; i < 4 && el && el.parentElement; i++) {
+      const role = el.getAttribute && el.getAttribute("role");
+      if (role === "dialog" || role === "alertdialog") break;
+      el = el.parentElement;
+    }
+    root = el || host;
+  }
+  const AFFIRM = /accept|agree|\bok\b|okay|got\s*it|allow|\byes\b|confirm|continue|submit|\bsave\b|sign\s*up|subscribe|\bnext\b|enable|turn\s*on|autofill|\bapply\b/i;
+  const X_GLYPH = /^(×|✕|✖|⨯|✗|x|╳|⤫|⤬)$/i;
+  const DISMISS_TXT = /^(close|dismiss|minimi[sz]e|no thanks|no,\s*thanks|not now|skip|maybe later|later)$/i;
+  // Simplify's overlay (div.simplify-jobs-shadow-root) collapses out of the way via a <button aria-label="Minimize">
+  // — the safe get-out-of-the-way action (no close/consent). NOT "collapse" (that matches its "Collapse Resume
+  // Section" SUB-control, which wouldn't uncover the button). Recon-confirmed 2026-07-06.
+  const DISMISS_META = /close|dismiss|minimi[sz]e/i;
+  // Candidates: interactive controls + common close-icon carriers (class*=close/dismiss, X-glyph spans/divs).
+  const cand = Array.from(root.querySelectorAll('button, [role="button"], a[href], [aria-label], [title], [class*="close" i], [class*="dismiss" i], span, div, svg'));
+  let best = null;
+  for (const el of cand) {
+    if (!isVisible(el)) continue;
+    const meta = ((el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title"))) || "").trim();
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (AFFIRM.test(meta) || AFFIRM.test(txt)) continue;          // never click a consent/affirmative control
+    const cls = (el.className && typeof el.className === "string") ? el.className : "";
+    const dismissive = DISMISS_META.test(meta) || DISMISS_TXT.test(txt) || X_GLYPH.test(txt) || /(^|[-_ ])(close|dismiss)([-_ ]|$)/i.test(cls);
+    if (!dismissive) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width > 120 || r.height > 120) continue;                // skip big containers — target the small X/button, not the whole panel
+    const score = r.width * r.height;                             // prefer the smallest (the icon)
+    if (!best || score < best.score) best = { score, cx: r.left + r.width / 2, cy: r.top + r.height / 2, label: meta || txt || cls.slice(0, 40) };
+  }
+  return best ? { found: true, cx: best.cx, cy: best.cy, label: best.label } : { found: false };
+}
+
 function cdpReadCheckboxState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   const input = w && w.querySelector('input[type="checkbox"]');
@@ -2363,6 +2419,53 @@ function cdpSourceCategoryRect(label) {
                    cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) } };
 }
 
+// ── Batched audit re-read (perf) ─────────────────────────────────────────────
+// The M40 audit re-reads every field the bot actuated. Doing one cdpEval PER FIELD is N serial
+// SW↔page round-trips; on a HIDDEN tab (where the fill is slowest — throttled reaction, and each
+// debugger round-trip costs more) that IPC latency dominates the otherwise-instant reads.
+// cdpReadAuditRaw reads ALL fields in ONE Runtime.evaluate by COMPOSING the SINGLE-SOURCE reader
+// functions (their .toString(), NO body duplication → no lockstep hazard) with a dispatcher inside
+// one scoped IIFE. Returns a parallel array of RAW reader outputs (the same shapes
+// act.readTextValue/readDropdownState/… return; a "date" entry → an array of per-segment reads),
+// null per field on a page-side error. The {actual,readable} MAPPING stays SW-side in fill-driver
+// (auditActualFromRaw — Node-testable); reconcileAudit falls back to the per-field path when this
+// method is absent (older fakes / a minimal audit act).
+const AUDIT_RAW_READERS = [cdpReadTextState, cdpReadInputBySel, cdpReadDropdownState,
+  cdpReadCheckboxState, cdpReadRadioState, cdpReadHierState, cdpReadSourcePick];
+// Page-side dispatcher — receives [{widgetType, wrapperSel, tag, dateSegs}] and returns the raw read
+// per spec. Self-contained: references ONLY the AUDIT_RAW_READERS (injected as sibling declarations
+// by cdpReadAuditRaw) + page globals. Keep the widget→reader map in LOCKSTEP with fill-driver's
+// auditReReadActual (typeahead→Hier, hierarchical→SourcePick).
+function cdpAuditRawDispatch(specs) {
+  return (specs || []).map(function (s) {
+    try {
+      switch (s.widgetType) {
+        case "text": case "textarea": return cdpReadTextState(s.wrapperSel, s.tag);
+        case "dropdown": return cdpReadDropdownState(s.wrapperSel);
+        case "checkbox": return cdpReadCheckboxState(s.wrapperSel);
+        case "radio": return cdpReadRadioState(s.wrapperSel);
+        case "typeahead": return cdpReadHierState(s.wrapperSel);
+        case "hierarchical": return cdpReadSourcePick(s.wrapperSel);
+        case "date": return (s.dateSegs || []).map(function (seg) {
+          return cdpReadInputBySel(s.wrapperSel + ' [data-automation-id="dateSection' + seg + '-input"]');
+        });
+        default: return null;
+      }
+    } catch (e) { return null; }
+  });
+}
+async function cdpReadAuditRaw(specs) {
+  const readerSrc = AUDIT_RAW_READERS.map((f) => String(f)).join("\n");
+  const expression = "(function(){\n" + readerSrc + "\nreturn (" + String(cdpAuditRawDispatch)
+    + ")(" + JSON.stringify(specs || []) + ");\n})()";
+  const res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  if (res && res.exceptionDetails) {
+    const d = res.exceptionDetails;
+    throw new Error("cdpReadAuditRaw: " + ((d.exception && d.exception.description) || d.text || "page exception"));
+  }
+  return res && res.result ? res.result.value : undefined;
+}
+
 // The actuation object. No tabId param — the substrate's single tracked
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 // `llmConfig` (AI-0 seam): the operator's {provider,model,apiKey,enabled} from storage,
@@ -2528,6 +2631,8 @@ function makeCdpActuation(llmConfig) {
       return false;
     },
     readHier: (loc) => cdpEval(cdpReadHierState, loc.wrapperSel),
+    // Perf: read MANY fields' raw state in ONE round-trip for the M40 audit (see cdpReadAuditRaw).
+    readAuditRaw: (specs) => cdpReadAuditRaw(specs),
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
@@ -2675,7 +2780,29 @@ function makeCdpActuation(llmConfig) {
         return { blocked: true, by: desc(top) };
       }, rect.cx, rect.cy);
       if (cover && cover.blocked) {
-        console.log("[ApplyPilot][CDP] Save & Continue is COVERED by an overlay/popup — NOT clicking. Blocked by:", cover.by);
+        // Best-effort auto-dismiss (operator opted in 2026-07-06): try ONCE to click a clearly-dismissive
+        // control (X/Close/No-thanks — never Accept/OK) inside the popup, incl. Simplify's shadow-DOM overlay,
+        // then re-check. If it clears → proceed; else halt (operator closes it) — never force-remove DOM.
+        const d = await cdpEval(cdpFindDismissControl, rect.cx, rect.cy);
+        if (d && d.found) {
+          console.log("[ApplyPilot][CDP] Save & Continue covered by", cover.by, "— clicking its dismiss control:", JSON.stringify(d.label));
+          await cdpClickAt(d.cx, d.cy);
+          const coverGone = async () => cdpEval((cx, cy) => {
+            const b = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+            const t = document.elementFromPoint(cx, cy);
+            return !b || !t || t === b || b.contains(t) || t.contains(b);
+          }, rect.cx, rect.cy);
+          let clear = false;
+          for (let i = 0; i < 5 && !clear; i++) { await cdpDelay(300); clear = await coverGone(); } // let it animate out
+          if (clear) {
+            console.log("[ApplyPilot][CDP] popup dismissed — Save & Continue is now clickable.");
+            await cdpClickAt(rect.cx, rect.cy);
+            return { clicked: true, dismissed: cover.by };
+          }
+          console.log("[ApplyPilot][CDP] auto-dismiss clicked", JSON.stringify(d.label), "but the button is STILL covered — halting for the operator.");
+          return { clicked: false, refused: "blocked", blockedBy: cover.by, dismissTried: d.label };
+        }
+        console.log("[ApplyPilot][CDP] Save & Continue is COVERED by an overlay/popup — NOT clicking (no safe dismiss control found). Blocked by:", cover.by);
         return { clicked: false, refused: "blocked", blockedBy: cover.by };
       }
       await cdpClickAt(rect.cx, rect.cy);

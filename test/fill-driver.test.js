@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -848,6 +848,41 @@ test("dropdown OVERWRITE beat is VISIBILITY-aware: visible uses a SMALLER fast b
   assert.ok(vb <= 30, `visible fast beat ≤30 (got ${vb})`);
   assert.ok(hb > 30 && hb <= 120, `hidden fast beat ~120 (got ${hb})`);
   assert.ok(vb < hb, `visible beat (${vb}) < hidden beat (${hb})`);
+});
+
+test("overwriteBeatLadder: visible → [30,100,700,5000]; hidden → [120,700,5000] (final 5s safety tier); ascending + deduped", () => {
+  const b = { overwriteFastBeatVisibleMs: 30, overwriteSlowBeatVisibleMs: 100, overwriteFastBeatMs: 120, overwriteSlowBeatMs: 700, overwriteMaxBeatMs: 5000 };
+  assert.deepStrictEqual(overwriteBeatLadder(b, true), [30, 100, 700, 5000], "visible escalates through the big beat to the 5s safety tier");
+  assert.deepStrictEqual(overwriteBeatLadder(b, false), [120, 700, 5000], "hidden: proven pair + the 5s safety tier");
+  // defensive: a tenant retune that makes beats out-of-order / duplicated still yields an ascending unique ladder
+  assert.deepStrictEqual(overwriteBeatLadder({ overwriteFastBeatVisibleMs: 100, overwriteSlowBeatVisibleMs: 30, overwriteSlowBeatMs: 700 }, true), [30, 100, 700]);
+});
+
+test("dropdown OVERWRITE escalation: a VISIBLE-labeled tab whose commit needs the BIG beat escalates 30→100→700 and COMMITS (occlusion/alt-tab fix)", async () => {
+  // The alt-tab/occlusion bug: act.visible reported "visible" but the tab was occluded (not painting), so
+  // the overwrite only commits at the ~700ms beat. The OLD visible pair [30,100] never reached 700 → both
+  // missed → needs_review (the observed swapped/failed languages). The ladder must escalate to the 700 tier
+  // and end FILLED. commitsOnAttempt:3 → the first two tiers miss, the third (700) commits.
+  const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }];
+  const act = makeFakeAct([ddField({ triggerText: "United States of America", options: opts, commitsOnAttempt: 3 })]);
+  act.visible = async () => true; // mislabeled "visible" (occluded in reality)
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "escalated to the big beat and committed — NOT left needs_review");
+  assert.strictEqual(rec.after, "Afghanistan");
+  assert.strictEqual(rec.flag, "dropdown-overwrite-success");
+  assert.strictEqual(act.log.filter(([m]) => m === "clickDropdownOptionByText").length, 3, "one click per tier (30, 100, 700)");
+  assert.ok(act.log.filter(([m]) => m === "openDropdown").length >= 3, "re-opened the list for each escalation tier");
+});
+
+test("dropdown OVERWRITE escalation: a commit that NEVER takes exhausts the ladder → needs_review (never a wrong/silent fill)", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Afghanistan" }, { text: "United States of America" }];
+  const act = makeFakeAct([ddField({ triggerText: "United States of America", options: opts, commitsOnAttempt: 99 })]); // never commits
+  act.visible = async () => true;
+  const out = await drivePageFill(act, { personal_info: { country: ["Afghanistan", "United States of America"] } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review", "exhausted all tiers without a persisted commit → honest needs_review");
+  assert.notStrictEqual(rec.after, "Afghanistan", "never reported the target as filled when it did not persist");
 });
 
 test("closeDropdownConfirmed: waits for the LISTBOX to unmount (options gone), NOT just aria-expanded=false", async () => {
@@ -4826,6 +4861,101 @@ test("M40 audit: a clean drivePageFill run gets NO audit-* flags (no false flags
   const out = await drivePageFill(makeFakeAct([ddField()]), usProfile, {}, {}, T_BUDGETS);
   assert.ok(!out.results.some((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable"), "a correct fill must not be audit-flagged");
   assert.strictEqual(out.results[0].status, "filled");
+});
+
+// ── M40 audit — BATCHED re-read (one round-trip via act.readAuditRaw) ─────────
+// The batched path (reconcileAudit → act.readAuditRaw) must yield the IDENTICAL verdicts as the
+// per-field path — it changes only HOW the raw reads are fetched (ONE call vs N), not the mapping.
+// makeAuditActBatched builds readAuditRaw from the SAME per-field reads makeAuditAct exposes, and
+// SPIES (via un-wrapped originals) so a test can assert the per-field reads are NOT used when
+// readAuditRaw is present, and readAuditRaw is called exactly once for the whole page.
+function makeAuditActBatched(live) {
+  const base = makeAuditAct(live);
+  const orig = {};
+  const calls = { readAuditRaw: 0, perField: 0 };
+  ["readTextValue", "readDropdownState", "readCheckboxState", "readRadioState", "readHier", "readSource", "readDateSegment"].forEach((name) => {
+    orig[name] = base[name];
+    base[name] = async (...a) => { calls.perField++; return orig[name](...a); };
+  });
+  base.readAuditRaw = async (specs) => {
+    calls.readAuditRaw++;
+    // one call → all raw reads; mirrors cdp.js cdpReadAuditRaw's per-widget dispatch (raw shapes only).
+    return Promise.all((specs || []).map(async (s) => {
+      const loc = { wrapperSel: s.wrapperSel };
+      switch (s.widgetType) {
+        case "text": case "textarea": return orig.readTextValue(loc, s.tag);
+        case "dropdown": return orig.readDropdownState(loc);
+        case "checkbox": return orig.readCheckboxState(loc);
+        case "radio": return orig.readRadioState(loc);
+        case "typeahead": return orig.readHier(loc);
+        case "hierarchical": return orig.readSource(loc);
+        case "date": { const out = []; for (const seg of (s.dateSegs || [])) out.push(await orig.readDateSegment(loc, seg)); return out; }
+        default: return null;
+      }
+    }));
+  };
+  base._calls = calls;
+  return base;
+}
+const auditVerdictBatched = async (entry, liveForKey) => {
+  const act = makeAuditActBatched({ "[w]": liveForKey });
+  const v = await reconcileAudit(act, [Object.assign({ key: "k", auditLoc: "[w]" }, entry)], T_BUDGETS);
+  return { verdict: v[0].verdict, calls: act._calls };
+};
+
+test("M40 audit BATCHED: verdict PARITY with the per-field path across every widget (+ one round-trip, no per-field reads)", async () => {
+  const cases = [
+    [{ widgetType: "dropdown", expected: "Bachelors" }, { trigger: "Associates" }],                          // mismatch
+    [{ widgetType: "dropdown", expected: "United States of America" }, { trigger: "United States of America" }], // normalize match
+    [{ widgetType: "text", expected: "Tallahassee, FL" }, { text: "Pittsburgh, PA" }],                        // mismatch
+    [{ widgetType: "text", expected: "Tallahassee, FL" }, { text: "Tallahassee, FL" }],                       // match
+    [{ widgetType: "checkbox", expected: "true" }, { checked: true }],                                        // match
+    [{ widgetType: "checkbox", expected: "true" }, { checked: false }],                                       // mismatch
+    [{ widgetType: "radio", expected: "Yes" }, { radioLabel: "Yes" }],                                        // match
+    [{ widgetType: "typeahead", expected: "Other" }, { chips: ["Electrical Engineering"] }],                  // mismatch
+    [{ widgetType: "hierarchical", expected: "LinkedIn" }, { chips: ["LinkedIn"] }],                          // match
+    [{ widgetType: "date", expected: "6/15/2024" }, { segments: { Month: "6", Day: "15", Year: "2024" } }],   // match
+    [{ widgetType: "date", expected: "6/15/2024" }, { segments: { Month: "1", Day: "15", Year: "2024" } }],   // mismatch
+    [{ widgetType: "dropdown", expected: "Bachelors" }, { missing: true }],                                   // unverifiable
+    [{ widgetType: "date", expected: "2024" }, { missing: true }]                                             // unverifiable
+  ];
+  for (const [entry, live] of cases) {
+    const perField = await auditVerdict(entry, live);
+    const b = await auditVerdictBatched(entry, live);
+    assert.strictEqual(b.verdict, perField, `verdict parity for ${entry.widgetType} ${JSON.stringify(live)}`);
+    assert.strictEqual(b.calls.readAuditRaw, 1, "readAuditRaw called exactly once (N→1 round-trip)");
+    assert.strictEqual(b.calls.perField, 0, "per-field reads NOT used when readAuditRaw is present");
+  }
+});
+
+test("M40 audit BATCHED: a whole page of fields → ONE readAuditRaw call for all of them", async () => {
+  const act = makeAuditActBatched({
+    "[w1]": { trigger: "Associates" },
+    "[w2]": { text: "Tallahassee, FL" },
+    "[w3]": { segments: { Month: "6", Day: "15", Year: "2024" } }
+  });
+  const verdicts = await reconcileAudit(act, [
+    { key: "k1", auditLoc: "[w1]", widgetType: "dropdown", expected: "Bachelors" },
+    { key: "k2", auditLoc: "[w2]", widgetType: "text", expected: "Tallahassee, FL" },
+    { key: "k3", auditLoc: "[w3]", widgetType: "date", expected: "6/15/2024" }
+  ], T_BUDGETS);
+  assert.deepStrictEqual(verdicts.map((v) => v.verdict), ["mismatch", "match", "match"]);
+  assert.strictEqual(act._calls.readAuditRaw, 1, "one round-trip for the whole page");
+  assert.strictEqual(act._calls.perField, 0);
+});
+
+test("M40 audit BATCHED: a wrong-length batch result falls back to the per-field path (verdict still correct)", async () => {
+  const act = makeAuditAct({ "[w]": { trigger: "Associates" } });
+  act.readAuditRaw = async () => []; // shape mismatch (0 ≠ 1 entry) → guard rejects → per-field fallback
+  const v = await reconcileAudit(act, [{ key: "k", auditLoc: "[w]", widgetType: "dropdown", expected: "Bachelors" }], T_BUDGETS);
+  assert.strictEqual(v[0].verdict, "mismatch");
+});
+
+test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never aborts the audit)", async () => {
+  const act = makeAuditAct({ "[w]": { text: "Tallahassee, FL" } });
+  act.readAuditRaw = async () => { throw new Error("boom"); };
+  const v = await reconcileAudit(act, [{ key: "k", auditLoc: "[w]", widgetType: "text", expected: "Tallahassee, FL" }], T_BUDGETS);
+  assert.strictEqual(v[0].verdict, "match");
 });
 
 // ── AI-4: validation-error remediation ──────────────────────────────────────

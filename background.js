@@ -253,9 +253,14 @@ function prepareProfile(profile) {
       .map((e) => ({ ...e, url: ensureHttps(e.url) }));          // → full https:// URL
   }
   if (Array.isArray(profile.languages)) {
-    out.languages = meaningfulEntries(profile.languages, ["language"]).map((e) => ({
+    const langs = meaningfulEntries(profile.languages, ["language"]).map((e) => ({
       ...e, _allFluent: isFluent(e.reading) && isFluent(e.speaking) && isFluent(e.writing) // → check the "I am fluent" box
     }));
+    // English LAST (operator, 2026-07-06): filling English as the last language entry reduces Workday's
+    // spurious "duplicate languages not allowed" ghost error on Save & Continue. Stable partition — the
+    // non-English entries keep their order; any English entry moves to the end.
+    const isEnglish = (e) => /english/i.test(String((e && e.language) || ""));
+    out.languages = [...langs.filter((e) => !isEnglish(e)), ...langs.filter(isEnglish)];
   }
   if (Array.isArray(profile.certifications)) {
     out.certifications = meaningfulEntries(profile.certifications, ["certification"]).map((e) => ({
