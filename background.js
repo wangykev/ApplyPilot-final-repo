@@ -2302,6 +2302,7 @@ async function runCdpOnboard(tabId, opts) {
     LOG(`Workday soft-error ("Something went wrong / please refresh") — reloading the page (reload #${softReloads}) and retrying.`);
     await cdpReload();
     await settlePage(9000);
+    await cdpInstallPageOverrides(); // re-install on the reloaded doc (see the nav note in doVerify/start)
     return true;
   };
 
@@ -2435,6 +2436,11 @@ async function runCdpOnboard(tabId, opts) {
     const nav = await cdpNavigate(find.url);
     if (!nav.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-nav-failed", detail: nav.error };
     await settlePage(15000);
+    // Re-install the hidden-tab overrides on this NEW document. Unlike the fill walk (one SPA doc
+    // for the whole run → install once), onboarding NAVIGATES between docs; the post-activation
+    // chooser is a fresh doc whose worker-timer state must be re-measured (its CSP may block the
+    // blob worker even if an earlier page allowed it — the log line reports ON/OFF per page).
+    await cdpInstallPageOverrides();
     // Workday's activate link ACTIVATES the account then lands on / redirects to the sign-in page,
     // and that redirect takes a beat. WAIT for the sign-in page (or the form, if a tenant auto-signs-in)
     // to actually render before the loop re-attempts sign-in — mirrors the reference's
@@ -2594,6 +2600,7 @@ async function runCdpOnboard(tabId, opts) {
       const nav = await cdpNavigate(startUrl);
       if (!nav.ok) return { ok: false, error: "navigate-failed:" + nav.error };
       await settlePage(15000);
+      await cdpInstallPageOverrides(); // re-install on the navigated doc (onboarding moves between docs; see doVerify)
     }
 
     let st = await scan();
