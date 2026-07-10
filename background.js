@@ -2445,7 +2445,7 @@ async function runCdpOnboard(tabId, opts) {
     await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
     await fillVerifyPassword(creds.password);
     await checkConsent();
-    await pace(400);
+    await cdpDelay(500); // FIXED (not paced) — same as the Sign In submit: the Create Account button enables a beat after the fields fill; don't race it.
     const submitted = await clickTarget(['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'], "Create Account submit");
     if (!submitted.clicked) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: submitted.blockedBy || "no Create Account button" };
     // Recognize EVERY "the submit was processed and we've moved on" surface so we return in ~1s
@@ -2511,7 +2511,12 @@ async function runCdpOnboard(tabId, opts) {
         // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
         await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
         await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
-        await pace(500); // Workday doesn't commit the field value synchronously (reference note); adaptive — full hidden, fast visible (the read-back already confirmed the value stuck)
+        // FIXED (not paced) — a real page-reaction wait, like the 5s activation settle: Workday
+        // ENABLES/validates the Sign In submit a beat AFTER the fields fill, and a submit click has
+        // no self-correcting gate (unlike fills/tab-clicks, which cdpRectReady/waitFor re-poll). A
+        // scaled ~50ms wait on a visible tab clicked the not-yet-ready button and no-op'd ("it
+        // doesn't click the sign in", 2026-07-09). 500ms is the reference-proven value.
+        await cdpDelay(500);
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
