@@ -2496,6 +2496,7 @@ async function runCdpOnboard(tabId, opts) {
     // exactly 8 with a double-cycle (2026-07-09), i.e. no margin. 12 comfortably survives a
     // chooser→create→verify→(re-verify)→re-sign-in chain while still backstopping a genuinely stuck page.
     const maxAttempts = 12;
+    let revealStalls = 0; // consecutive "Sign in with email" reveals where the form never rendered (hidden-tab repaint stall)
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let st = await scan();
       if (!st) { await settlePage(6000); st = await scan(); }
@@ -2517,8 +2518,18 @@ async function runCdpOnboard(tabId, opts) {
         LOG('auth is a social-login chooser — clicking "Sign in with email" to reveal the form.');
         const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]'], "Sign in with email");
         if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-with-email-blocked", detail: c.blockedBy || "could not click Sign in with email" };
+        await cdpWakePage();
         const w = await waitFor((s) => s.passwordInput || s.emailInput || s.markers.createAccountLink || s.markers.signInSubmit, 15000, "email-sign-in-form");
         st = w.scan || st;
+        // Hidden-render stall: the chooser→form reveal defers on rAF, which is paused when the tab is
+        // backgrounded (and this page's CSP evidently blocks the worker-timer workaround). Rather than
+        // re-reveal forever (PANW hidden looped to the cap, 2026-07-09), halt after 2 misses with an
+        // ACTIONABLE message. The account is already created/activated by now, so a foreground re-run
+        // signs straight in. focus-emulation (cdpSetFocusEmulation) is the attempted fix; this is the net.
+        if (w.matched) { revealStalls = 0; }
+        else if (++revealStalls >= 2) {
+          return { ok: true, reached_form: false, needs_operator: true, stopped: "hidden-render-stalled", detail: 'the sign-in form did not render after "Sign in with email" — this Workday page does not repaint while the tab is hidden/backgrounded. Bring the tab to the FOREGROUND (visible) and re-run; the account is already created, so it will sign straight in.' };
+        }
         continue;
       }
 
@@ -2575,6 +2586,7 @@ async function runCdpOnboard(tabId, opts) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides();
+    await cdpSetFocusEmulation(true); // best-effort: keep a hidden/backgrounded tab repainting (SPA sub-view transitions defer on rAF, paused when hidden)
     LOG("attached. Onboarding: JD → Apply → Apply Manually → sign-in/create-account → verify → land on the form. Keep the tab VISIBLE to watch. Never submits.");
 
     if (startUrl) {

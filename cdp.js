@@ -160,6 +160,18 @@ async function cdpReload() {
   catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 }
 
+// Force the page to behave as focused+active (Emulation.setFocusEmulationEnabled) — a best-effort
+// nudge to keep a HIDDEN/backgrounded tab REPAINTING. Some Workday SPA sub-view transitions (e.g.
+// the "Sign in with email" chooser→form reveal) defer on rAF, which Chrome pauses when the tab is
+// hidden; the worker-timer override handles most, but a page whose CSP blocks the blob worker leaves
+// the transition stalled (PANW's chooser, 2026-07-09). Focus-emulation is an independent lever that
+// can keep such a page rendering. Does NOT touch the SW-side cdpVisible pacing sampler (that reads
+// chrome.tabs, not page state), so adaptive pacing stays honest. No-op if unsupported.
+async function cdpSetFocusEmulation(enabled) {
+  try { await cdpSend("Emulation.setFocusEmulationEnabled", { enabled: !!enabled }); return true; }
+  catch (e) { return false; }
+}
+
 // ── Hidden-tab SPA-transition unblock (2026-07-03) ───────────────────────────
 // A HIDDEN/minimized tab has requestAnimationFrame FULLY PAUSED (and timers
 // throttled to ~1Hz). The CDP fill survives that (React commits on a channel that
