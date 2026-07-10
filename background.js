@@ -2419,6 +2419,15 @@ async function runCdpOnboard(tabId, opts) {
   const doVerify = async (st) => {
     if (!gmailEnabled) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-required-gmail-off", detail: "Workday requires email verification but Gmail auto-verify is OFF. Enable it (and Connect Gmail) in the popup, or click the link in the email yourself and re-run." };
     const host = st.host || "";
+    // Account-exists-but-UNVERIFIED (a prior run created it, verification never completed): Workday's
+    // sign-in page shows a "Resend Account Verification" button, and the ORIGINAL email may be stale
+    // or expired (past the freshness window / link no longer valid). Click Resend to dispatch a FRESH
+    // email BEFORE polling (operator-confirmed on altasciences, 2026-07-10). Harmless when a fresh
+    // email already exists (this run just created the account) — the poll takes the newest match.
+    try {
+      const resend = await cdpEval(cdpResendVerifyRect);
+      if (resend) { LOG(`account is unverified — clicking "${resend.label}" to request a FRESH verification email before polling.`); await cdpClickAt(resend.cx, resend.cy); await cdpDelay(2500); }
+    } catch (e) { /* best-effort — poll anyway */ }
     LOG(`email verification required — polling Gmail (readonly) for a workday.com link containing "${host}" (up to 120s)…`);
     let tok = await gmailGetToken(true);
     if (!tok.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "gmail-auth-failed", detail: tok.error };

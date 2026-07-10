@@ -1502,6 +1502,26 @@ function cdpConsentRect() {
   return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), checked: !!checkbox.checked, inputId };
 }
 
+// "Resend Account Verification" button — shown on Workday's sign-in page when the account EXISTS
+// but is UNVERIFIED (e.g. a prior run created it and never completed verification). Clicking it
+// dispatches a FRESH verification email; the original may be stale/expired. Matched by TEXT
+// (must contain "resend" + verif/account) so it won't false-fire on Sign In / Create Account / other
+// blurb buttons; the data-automation-id (informationalBlurbButton on altasciences) is tenant-variable.
+// Returns the click point + label, or null.
+function cdpResendVerifyRect() {
+  const cands = Array.from(document.querySelectorAll('button, [role="button"], a, [data-automation-id="informationalBlurbButton"]'));
+  for (const el of cands) {
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!/resend/i.test(txt) || !/verif|account/i.test(txt)) continue; // "Resend Account Verification"
+    const r0 = el.getBoundingClientRect();
+    if (r0.width <= 0 || r0.height <= 0) continue;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+    const r = el.getBoundingClientRect();
+    return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), label: txt.slice(0, 50) };
+  }
+  return null;
+}
+
 // The n-th password input's click point (create-account "verify password" fallback when
 // there's no data-automation-id="verifyPassword": Workday renders a 2nd input[type=password]).
 function cdpNthPasswordRect(n) {
