@@ -2391,6 +2391,29 @@ async function runCdpOnboard(tabId, opts) {
     LOG(`consent checkbox — ${c && c.checked ? "checked" : "still unchecked (proceeding anyway)"}.`);
   };
 
+  // Click a submit button and wait for the auth outcome — with a re-click FALLBACK. If the wait
+  // times out AND the form is still up (`formStillUp` → the submit control is still present, so we
+  // did NOT navigate → the click raced a not-yet-enabled button, or a throttled/hidden page never
+  // reacted), RE-CLICK and wait again, bounded by `tries`. The re-click is gated on the form still
+  // being up so a retry can never click into a page that already advanced. `done(s)` = the page
+  // moved on. Returns { scan } (final scan) or { notFound, blockedBy } if the button was never clickable.
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 2, timeoutMs = 20000 }) => {
+    let st = null;
+    for (let t = 1; t <= tries; t++) {
+      const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
+      if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
+      const w = await waitFor((s) => done(s) || isWorkdaySoftError(s.bodyText), timeoutMs, `${label} outcome`);
+      st = w.scan || st;
+      if (st && await maybeRefresh(st)) st = await scan() || st;
+      if (st && done(st)) return { scan: st };
+      // Timed out. Re-click ONLY if still on this submit form; else the page advanced (done just
+      // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
+      if (t < tries && st && formStillUp(st)) { LOG(`${label}: no outcome after ${Math.round(timeoutMs / 1000)}s and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
+      return { scan: st };
+    }
+    return { scan: st };
+  };
+
   // Gmail email-verification: find the workday.com link containing the tenant host and
   // navigate the tab to it. Returns { ok } or a needs_operator halt object.
   const doVerify = async (st) => {
@@ -2446,17 +2469,19 @@ async function runCdpOnboard(tabId, opts) {
     await fillVerifyPassword(creds.password);
     await checkConsent();
     await cdpDelay(500); // FIXED (not paced) — same as the Sign In submit: the Create Account button enables a beat after the fields fill; don't race it.
-    const submitted = await clickTarget(['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'], "Create Account submit");
-    if (!submitted.clicked) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: submitted.blockedBy || "no Create Account button" };
-    // Recognize EVERY "the submit was processed and we've moved on" surface so we return in ~1s
-    // instead of burning the 20s ceiling: an outcome (verify/wrong/success), a sign-in submit, an
-    // already-exists message, OR the social-login CHOOSER reappearing (PANW routes back to it after
-    // create-account — signInWithEmail is absent on the create-account form we just submitted, so it
-    // only turns true once the page actually re-routes → no premature return). The loop then reveals
-    // the email form / detects verify on the next iteration.
-    const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || s.signInWithEmail || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""), 20000, "post-create-account");
-    let post = w.scan || st;
-    if (await maybeRefresh(post)) post = await scan() || post;
+    // Submit + wait, with the re-click fallback (raced/not-ready button or a throttled page). "Moved
+    // on" = an outcome (verify/wrong/success), a sign-in submit, an already-exists message, OR the
+    // social-login CHOOSER reappearing (PANW routes back to it after create-account; signInWithEmail
+    // is absent on the create form we submitted, so it only turns true on a genuine re-route). Re-click
+    // only while the create form is still up (createAccountSubmit present) — never into an advanced page.
+    const r = await submitAndWait({
+      selectors: ['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'],
+      label: "Create Account submit",
+      done: (s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || s.signInWithEmail || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""),
+      formStillUp: (s) => !!s.markers.createAccountSubmit
+    });
+    if (r.notFound) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: r.blockedBy || "no Create Account button" };
+    let post = r.scan || st;
     if (post && /already (exists|in use)|an account (already )?exists|email is already (in use|registered)/i.test(post.bodyText || "")) {
       LOG("Workday says the account already exists — will sign in instead.");
       return { ok: true, alreadyExists: true };
@@ -2520,11 +2545,14 @@ async function runCdpOnboard(tabId, opts) {
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
-        const submitted = await clickTarget(['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'], "Sign In submit");
-        if (!submitted.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: submitted.blockedBy || "no Sign In button" };
-        const w = await waitFor((s) => classifyAuthOutcome(s) !== "unknown" || isWorkdaySoftError(s.bodyText), 20000, "sign-in outcome");
-        st = w.scan || st;
-        if (await maybeRefresh(st)) { continue; }
+        const r = await submitAndWait({
+          selectors: ['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'],
+          label: "Sign In submit",
+          done: (s) => classifyAuthOutcome(s) !== "unknown",
+          formStillUp: (s) => !!s.markers.signInSubmit
+        });
+        if (r.notFound) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: r.blockedBy || "no Sign In button" };
+        st = r.scan || st;
         const out = classifyAuthOutcome(st);
         LOG(`sign-in outcome: ${out}.`);
         if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
