@@ -349,3 +349,32 @@ document.getElementById("llm-test").addEventListener("click", () => {
     setStatus(resp.ok ? `✓ AI connected — reply: "${resp.text}". Save the config to use it.` : `✗ AI test failed: ${resp.error}`);
   });
 });
+
+// ── JD-MATCH SCORE (Round 1): score profile × JD ────────────────────────────
+// The JD comes from jobContext.jd — Kevin's capture step will write it; until then
+// this textarea is a manual stub. "Score this job" persists the pasted JD (merged so
+// it doesn't clobber the company), then asks the SW (RUN_SCORE_JOB → scoreJob via the
+// LLM seam). Needs the AI toggle ON. Result renders below; [SCORE] in the SW console.
+const jdTextEl = document.getElementById("jd-text");
+const scoreResultEl = document.getElementById("score-result");
+chrome.storage.local.get("jobContext", ({ jobContext }) => {
+  if (jobContext && jobContext.jd) jdTextEl.value = jobContext.jd;
+});
+document.getElementById("score-job").addEventListener("click", async () => {
+  const jd = jdTextEl.value.trim();
+  // Merge into jobContext, preserving company (the JD-paste is a temporary stub;
+  // the real value will come from the JD-capture step writing jobContext.jd).
+  const { jobContext } = await chrome.storage.local.get("jobContext");
+  await chrome.storage.local.set({ jobContext: { ...(jobContext || {}), jd } });
+  scoreResultEl.textContent = "Scoring… (see [SCORE] in the service worker console)";
+  chrome.runtime.sendMessage({ type: "RUN_SCORE_JOB" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) { scoreResultEl.textContent = "Score failed (no response) — see the service worker console."; return; }
+    if (resp.error === "no-profile") { scoreResultEl.textContent = 'No profile — click "Load default profile" first.'; return; }
+    if (resp.error === "ai-off") { scoreResultEl.textContent = "Turn AI fill ON (checkbox above) — scoring uses your API key."; return; }
+    if (resp.error === "no-jd") { scoreResultEl.textContent = "Paste a job description above first."; return; }
+    if (resp.score == null) { scoreResultEl.textContent = "Score failed: " + (resp.error || "unknown") + " — see [SCORE] in the SW console."; return; }
+    const matched = resp.matched_requirements && resp.matched_requirements.length ? "\nMatched: " + resp.matched_requirements.slice(0, 4).join("; ") : "";
+    const gaps = resp.gaps && resp.gaps.length ? "\nGaps: " + resp.gaps.slice(0, 4).join("; ") : "";
+    scoreResultEl.textContent = `${resp.score}/10 — ${resp.verdict}\n${resp.rationale || ""}${matched}${gaps}`;
+  });
+});

@@ -94,6 +94,16 @@
     <label for="company">Company for this application (temporary):</label>
     <input id="company" type="text" placeholder="e.g. Cambium Learning">
     <button id="set-company">Set company</button>
+    <hr>
+    <!-- JD-MATCH SCORE (Round 1): paste the job description (a TEMPORARY stub until the
+         JD-capture step writes jobContext.jd), then score profile × JD to judge "should I
+         even apply?". Needs the AI toggle ON above (uses your key). Result renders below +
+         [SCORE] in the service-worker console. -->
+    <div class="section-title">Match score</div>
+    <label for="jd-text">Job description (paste — temporary stub):</label>
+    <textarea id="jd-text" rows="4" style="width:100%;box-sizing:border-box;margin:4px 0 6px;padding:6px;font-family:inherit;" placeholder="paste the job description here"></textarea>
+    <button id="score-job">Score this job</button>
+    <div id="score-result" style="font-size:12px;white-space:pre-wrap;min-height:1.4em;color:#333;"></div>
     <div id="status"></div>
     <script src="db.js"></script>
     <script src="llm.js"></script>
