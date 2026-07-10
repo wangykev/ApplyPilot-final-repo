@@ -2397,7 +2397,9 @@ async function runCdpOnboard(tabId, opts) {
   // reacted), RE-CLICK and wait again, bounded by `tries`. The re-click is gated on the form still
   // being up so a retry can never click into a page that already advanced. `done(s)` = the page
   // moved on. Returns { scan } (final scan) or { notFound, blockedBy } if the button was never clickable.
-  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 2, timeoutMs = 20000 }) => {
+  // tries = 3 → the initial click + up to TWO re-clicks, so a Sign In / Create Account that "does
+  // nothing" keeps getting retried (operator ask 2026-07-10). Both submits go through this.
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000 }) => {
     let st = null;
     for (let t = 1; t <= tries; t++) {
       const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
