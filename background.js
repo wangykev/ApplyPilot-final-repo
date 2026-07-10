@@ -2482,6 +2482,22 @@ async function runCdpOnboard(tabId, opts) {
     });
     if (r.notFound) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: r.blockedBy || "no Create Account button" };
     let post = r.scan || st;
+    // Hidden-render fallback: some tenants render create-account → sign-in+verify as a CLIENT-SIDE
+    // transition that stalls when the tab is hidden (rAF-paused; worker CSP-blocked), so the outcome
+    // never paints and submitAndWait times out (a tenant that lands straight on "An email has been
+    // sent… please verify your account", 2026-07-10). A full RELOAD renders the server's CURRENT
+    // state (the account now exists+unverified → the sign-in page) even hidden — a fresh load's
+    // initial render isn't rAF-gated, unlike a client-side transition. The auth loop then signs in →
+    // Workday says "verify" → Gmail. Fires ONLY when the outcome is genuinely unresolved (no
+    // success/verify text AND no sign-in affordance) — a rendered outcome skips it (zero cost).
+    const unresolved = !post || (classifyAuthOutcome(post) === "unknown" && !post.markers.signInSubmit && !post.signInWithEmail && !/already (exists|in use)|account (already )?exists|email is already/i.test(post.bodyText || ""));
+    if (unresolved) {
+      LOG("create-account outcome didn't render (likely a hidden client-transition stall) — reloading to surface the server state, then continuing.");
+      await cdpReload();
+      await settlePage(12000);
+      await cdpSetFocusEmulation(true);
+      post = await scan() || post;
+    }
     if (post && /already (exists|in use)|an account (already )?exists|email is already (in use|registered)/i.test(post.bodyText || "")) {
       LOG("Workday says the account already exists — will sign in instead.");
       return { ok: true, alreadyExists: true };
