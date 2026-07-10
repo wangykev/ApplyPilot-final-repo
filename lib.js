@@ -562,8 +562,87 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
   };
 }
 
+// ── Onboarding stage (JD → Apply → Apply Manually → auth → verify) helpers ────
+// The pre-form flow that runs BEFORE the fill walk. These are the PURE, testable
+// decisions; the DOM driving lives in the SW (background.js runCdpOnboard) over the
+// cdp.js primitives. Ported from the Playwright repo's applypilot/ats/workday.py —
+// same behavior, extension substrate.
+
+// The Apply-button chain (workday.py _APPLY_BUTTON_CHAIN): matched by
+// data-automation-id ONLY because the tag varies per tenant (an <a role=button> on
+// some, a <button> on others). Tried in order; FIRST present wins. `applyManually`
+// is included as the last rung — on tenants that surface the manual choice on the
+// listing itself, clicking it here is correct and the modal step then no-ops.
+const APPLY_BUTTON_CHAIN = [
+  { sel: '[data-automation-id="adventureButton"]', label: "Apply (job listing)" },
+  { sel: '[data-automation-id="continueButton"]', label: "Continue Application (returning user)" },
+  { sel: '[data-automation-id="applyManually"]', label: "Apply Manually" }
+];
+// NEVER click these (workday.py _REJECT_SELECTORS): reusing a prior application is
+// the wrong path — we always want a fresh manual fill.
+const APPLY_REJECT = [{ sel: '[data-automation-id="useMyLastApplication"]', label: "Use My Last Application" }];
+// Given the set of automation-id selectors PRESENT on the page, pick the first
+// chain entry to click (or null). Pure so the priority is unit-pinned.
+function pickApplyTarget(presentSelectors) {
+  const present = new Set(presentSelectors || []);
+  for (const c of APPLY_BUTTON_CHAIN) if (present.has(c.sel)) return c;
+  return null;
+}
+
+// Sign-in outcome classifier (workday.py _classify_sign_in_outcome). After submitting
+// the sign-in form, read the page's body text + form state and decide:
+//   "verify"           → Workday sent a verification email (→ the Gmail flow)
+//   "wrong_credentials"→ the account doesn't exist / creds rejected (→ create account)
+//   "success"          → a real Workday form widget is present AND no auth element
+//                        (the content-not-chrome gate — a progressBar/URL is NOT trusted)
+//   "unknown"          → none of the above (caller re-checks after a wait, else halts)
+// PRECEDENCE verify > wrong > success: the message text is decisive; success is the
+// fallback only when the page shows neither message and a genuine form has rendered.
+// `hasAuthEl` = any password field / sign-in|create submit / sign-in|create link is
+// still present (so a lingering auth screen is never mistaken for the form).
+const ONBOARD_VERIFY_RX = /email has been sent|verify your (account|email|identity)|check your (email|inbox)|verification (email|link|code)|we('| ?ha)?ve sent (you )?an? (email|verification)|confirm your email/i;
+const ONBOARD_WRONG_RX = /(wrong|incorrect|invalid) (email|e-?mail|password|user\s?name|login|credentials)|(email|e-?mail|user\s?name|password)[^.\n]{0,40}\b(incorrect|invalid|is not correct|do(es)? not match)|account (might be|is) locked|couldn'?t find (an )?account|no account (was )?(found|exists)|does not match our records/i;
+function classifyAuthOutcome(state) {
+  const s = state || {};
+  const t = String(s.bodyText || "");
+  if (ONBOARD_VERIFY_RX.test(t)) return "verify";
+  if (ONBOARD_WRONG_RX.test(t)) return "wrong_credentials";
+  if ((s.formFieldCount || 0) > 0 && !s.hasAuthEl) return "success";
+  return "unknown";
+}
+
+// Workday's transient soft-error page ("Something went wrong / Please refresh the
+// page and then try again."). The fix is a ONE-SHOT page reload then retry (the
+// reference's handle_auth_screen `refreshed` guard). Require BOTH the apology AND a
+// refresh/try-again cue so an ordinary field-validation "something's wrong" banner
+// can't trigger a needless reload. (workday.py _is_workday_error_page.)
+function isWorkdaySoftError(bodyText) {
+  const t = String(bodyText || "");
+  return /something went wrong|an? (unexpected )?error (has )?occurred|we('| ?a)?re sorry/i.test(t)
+    && /refresh (the|this) page|please refresh|try again/i.test(t);
+}
+
+// SSO / federated-login detection. The reference REFUSES SSO (a Workday tenant that
+// bounces to Okta/Ping/Azure/etc can't be driven with an email+password) — so we halt
+// for operator takeover rather than fumble. Two signals: an SSO-looking URL, or an
+// auth screen that shows a sign-in button but NO email/password field (a "Sign in with
+// …" redirect button). NOTE: a plain Workday login URL contains "login"/"signin" — that
+// is NOT SSO, so this uses a NARROW url pattern (idp/saml/okta/…), not the broad authUrl.
+function looksLikeSso(state) {
+  const s = state || {};
+  // A native "Sign in with email" button means Workday offers an email/password path (a
+  // social-login CHOOSER, e.g. Palo Alto Networks) — NOT a forced SSO redirect. Reveal it, don't halt.
+  if (s.signInWithEmail) return false;
+  const ssoUrl = /\bsso\b|[?&/](saml|idp|oidc|federation)\b|okta|pingidentity|pingone|onelogin|microsoftonline|\badfs\b|auth0|login\.gov/i.test(String(s.url || ""));
+  if (ssoUrl) return true;
+  // A sign-in button with NO email/password field AND no email-chooser button = a bare
+  // "Sign in with <provider>" redirect → SSO.
+  if (s.signInButtonPresent && !s.passwordInput && !s.emailInput) return true;
+  return false;
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
 }

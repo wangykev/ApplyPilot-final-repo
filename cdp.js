@@ -133,6 +133,45 @@ async function cdpWakePage() {
   try { await cdpSend("Page.setWebLifecycleState", { state: "active" }); } catch (e) { /* best-effort — no-op if unsupported/not frozen */ }
 }
 
+// ── Navigation (onboarding stage) ────────────────────────────────────────────
+// The FILL/WALK never navigates (it drives whatever page is active). The ONBOARDING
+// stage does: it drives the tab from a job-description page through Apply → auth →
+// the verification LINK. Page is already enabled in cdpAttach, and the attach SURVIVES
+// navigation, so these are safe on the live attach. Both are SW-side (chrome.debugger),
+// throttle-immune, and never throw — { ok } / { ok:false, error }.
+
+// Navigate the attached tab to `url` (Page.navigate — the port of the reference's
+// page.goto for the verification link). Returns the frameId on success; errorText on
+// a blocked/failed navigation (e.g. a bad URL).
+async function cdpNavigate(url) {
+  try {
+    const res = await cdpSend("Page.navigate", { url: String(url) });
+    if (res && res.errorText) return { ok: false, error: res.errorText };
+    return { ok: true, frameId: res && res.frameId };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Reload the attached tab (Page.reload) — the fix for Workday's transient
+// "Something went wrong / Please refresh the page and then try again." soft-error:
+// the onboarding state machine reloads ONCE (guarded) and retries. ignoreCache:true
+// so a hard reload re-fetches a genuinely stuck SPA bundle.
+async function cdpReload() {
+  try { await cdpSend("Page.reload", { ignoreCache: true }); return { ok: true }; }
+  catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Force the page to behave as focused+active (Emulation.setFocusEmulationEnabled) — a best-effort
+// nudge to keep a HIDDEN/backgrounded tab REPAINTING. Some Workday SPA sub-view transitions (e.g.
+// the "Sign in with email" chooser→form reveal) defer on rAF, which Chrome pauses when the tab is
+// hidden; the worker-timer override handles most, but a page whose CSP blocks the blob worker leaves
+// the transition stalled (PANW's chooser, 2026-07-09). Focus-emulation is an independent lever that
+// can keep such a page rendering. Does NOT touch the SW-side cdpVisible pacing sampler (that reads
+// chrome.tabs, not page state), so adaptive pacing stays honest. No-op if unsupported.
+async function cdpSetFocusEmulation(enabled) {
+  try { await cdpSend("Emulation.setFocusEmulationEnabled", { enabled: !!enabled }); return true; }
+  catch (e) { return false; }
+}
+
 // ── Hidden-tab SPA-transition unblock (2026-07-03) ───────────────────────────
 // A HIDDEN/minimized tab has requestAnimationFrame FULLY PAUSED (and timers
 // throttled to ~1Hz). The CDP fill survives that (React commits on a channel that
@@ -1363,6 +1402,138 @@ function cdpReadSessionState() {
     errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 600)).filter(Boolean) },
     bodyTextSample: bodyText.slice(0, 500).replace(/\s+/g, " ").trim()
   };
+}
+
+// ── Onboarding-stage reads (JD → Apply → Apply Manually → auth → verify) ─────
+// Self-contained page reads for the pre-form flow. The PURE decisions on this data
+// live in lib.js (classifyAuthOutcome / isWorkdaySoftError / looksLikeSso /
+// pickApplyTarget); this just surfaces the raw DOM state. Kept SEPARATE from
+// cdpReadSessionState (which is tuned for the in-flow dead-session / review checks
+// and caps bodyText at 500 chars — too short to classify a sign-in outcome).
+function cdpOnboardScan() {
+  const q = (sel) => document.querySelector(sel);
+  const present = (sel) => !!document.querySelector(sel);
+  const bodyText = ((document.body && document.body.innerText) || "").slice(0, 12000);
+  const formFields = document.querySelectorAll('[data-automation-id^="formField-"]');
+  const clickables = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+  const signInButtonPresent = clickables.some((b) => /\b(sign[- ]?in|log[- ]?in|sign[- ]?on)\b/i.test((b.textContent || "").trim()));
+  const emailInput = present('input[type="email"]') || present('[data-automation-id="email"]');
+  const passwordInput = present('input[type="password"]') || present('[data-automation-id="password"]');
+  // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
+  // "Sign in with email" button, alongside federated Apple/Google/LinkedIn buttons we NEVER click.
+  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]');
+  const markers = {
+    adventureButton: present('[data-automation-id="adventureButton"]'),
+    continueButton: present('[data-automation-id="continueButton"]'),
+    applyManually: present('[data-automation-id="applyManually"]'),
+    useMyLastApplication: present('[data-automation-id="useMyLastApplication"]'),
+    signInLink: present('[data-automation-id="signInLink"]'),
+    createAccountLink: present('[data-automation-id="createAccountLink"]'),
+    signInSubmit: present('[data-automation-id="signInSubmitButton"]') || present('[data-automation-id="click_filter"][aria-label="Sign In"]'),
+    createAccountSubmit: present('[data-automation-id="createAccountSubmitButton"]') || present('[data-automation-id="click_filter"][aria-label="Create Account"]'),
+    verifyPassword: present('[data-automation-id="verifyPassword"]'),
+    agreementCheckbox: present('[data-automation-id="agreementCheckbox"]'),
+    applyFlowPage: present('[data-automation-id="applyFlowPage"]'),
+    applyFlowReviewPage: present('[data-automation-id="applyFlowReviewPage"]'),
+    formField: formFields.length > 0
+  };
+  // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
+  const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
+  return {
+    url: location.href, host: location.host, title: document.title,
+    bodyText,
+    formFieldCount: formFields.length,
+    emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,
+    markers
+  };
+}
+
+// Cover-check for an arbitrary selector's click point (the parametrized sibling of
+// clickPageNext's inline check): is the top element at (cx,cy) the target button (or
+// in its subtree)? If not, a coordinate click would be SWALLOWED by an overlay — return
+// what's covering it so the caller can auto-dismiss (cdpFindDismissControl) or halt.
+function cdpCoverCheck(selector, cx, cy) {
+  const btn = document.querySelector(selector);
+  const top = document.elementFromPoint(cx, cy);
+  if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+  // Workday's own `click_filter` is a TRANSPARENT overlay it renders on top of buttons to CAPTURE
+  // clicks — it IS the intended click surface, not an obstruction (a coordinate click on it activates
+  // the button underneath). elementFromPoint returns it instead of the button, which looked like a
+  // "cover" and made the click refuse (live: PANW Sign In submit, 2026-07-09). Treat it as clear.
+  const aid = top.getAttribute && top.getAttribute("data-automation-id");
+  if (aid === "click_filter" || (top.closest && top.closest('[data-automation-id="click_filter"]'))) return { blocked: false };
+  const desc = (el) => {
+    const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
+    if (el.id) p.push("#" + el.id);
+    const aid = el.getAttribute && el.getAttribute("data-automation-id");
+    if (aid) p.push('[data-automation-id="' + aid + '"]');
+    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+    if (cls) p.push("." + cls);
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    return p.join("") + (txt ? ' "' + txt + '"' : "");
+  };
+  return { blocked: true, by: desc(top) };
+}
+
+// Create-account CONSENT control (workday.py two strategies): the explicit
+// agreementCheckbox (Capital One), else a checkbox whose associated label mentions
+// consent/terms/agree/privacy (AssetMark). Returns the LABEL's click point (preferred —
+// native label-activation fires React's change, the radio/checkbox lesson) + the current
+// checked state + the input id, or null. Read-only; the caller coordinate-clicks + verifies.
+function cdpConsentRect() {
+  let checkbox = document.querySelector('[data-automation-id="agreementCheckbox"] input[type="checkbox"]');
+  const bare = document.querySelector('[data-automation-id="agreementCheckbox"]');
+  if (!checkbox && bare && bare.tagName === "INPUT") checkbox = bare;
+  if (!checkbox) {
+    checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((b) => {
+      const lab = b.id ? document.querySelector('label[for="' + b.id + '"]') : null;
+      const wrapLab = b.closest && b.closest("label");
+      const txt = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || "").toLowerCase();
+      return /consent|terms|agree|privacy|acknowledge/.test(txt);
+    }) || null;
+  }
+  if (!checkbox) return null;
+  const inputId = checkbox.id || null;
+  const lab = inputId ? document.querySelector('label[for="' + inputId + '"]') : (checkbox.closest && checkbox.closest("label"));
+  const target = lab || checkbox;
+  if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = target.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return null;
+  return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), checked: !!checkbox.checked, inputId };
+}
+
+// "Resend Account Verification" button — shown on Workday's sign-in page when the account EXISTS
+// but is UNVERIFIED (e.g. a prior run created it and never completed verification). Clicking it
+// dispatches a FRESH verification email; the original may be stale/expired. Matched by TEXT
+// (must contain "resend" + verif/account) so it won't false-fire on Sign In / Create Account / other
+// blurb buttons; the data-automation-id (informationalBlurbButton on altasciences) is tenant-variable.
+// Returns the click point + label, or null.
+function cdpResendVerifyRect() {
+  const cands = Array.from(document.querySelectorAll('button, [role="button"], a, [data-automation-id="informationalBlurbButton"]'));
+  for (const el of cands) {
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!/resend/i.test(txt) || !/verif|account/i.test(txt)) continue; // "Resend Account Verification"
+    const r0 = el.getBoundingClientRect();
+    if (r0.width <= 0 || r0.height <= 0) continue;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+    const r = el.getBoundingClientRect();
+    return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), label: txt.slice(0, 50) };
+  }
+  return null;
+}
+
+// The n-th password input's click point (create-account "verify password" fallback when
+// there's no data-automation-id="verifyPassword": Workday renders a 2nd input[type=password]).
+function cdpNthPasswordRect(n) {
+  const el = document.querySelectorAll('input[type="password"]')[n];
+  if (!el) return null;
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return null;
+  // Full {x,y,w,h,cx,cy} — this is consumed via cdpEvalRectReady, whose validity gate is
+  // `rect.w > 0`, so w/h are REQUIRED (a {cx,cy}-only rect would always fail that gate).
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
 // AI-4: the visible Workday validation-ERROR links. Recon (2026-06-22, Magna): each error in the

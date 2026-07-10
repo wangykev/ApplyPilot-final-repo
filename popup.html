@@ -27,6 +27,28 @@
     <input id="resume-file" type="file" accept="application/pdf,.pdf">
     <div id="resume-status">Saved resume: none</div>
     <hr>
+    <div class="section-title">Onboarding (JD → apply → login → verify)</div>
+    <!-- Load the Workday account credentials (data/credentials.json → chrome.storage.local.credentials).
+         Same website→extension handoff pattern as "Load default profile"; the file is gitignored + operator-
+         managed. The email should be the Gmail address (or a +alias of it) whose inbox Gmail auto-verify reads. -->
+    <button id="load-credentials">Load account credentials (data/credentials.json)</button>
+    <div id="credentials-status">Credentials: none loaded</div>
+    <!-- Optional: navigate the tab to this job-posting URL before onboarding. Leave BLANK to run on
+         whatever Workday page is already open in the active tab (the active-tab philosophy). -->
+    <label for="onboard-url">Start URL (optional — blank = use the current tab):</label>
+    <input id="onboard-url" type="text" placeholder="https://<tenant>.myworkdayjobs.com/…/job/…">
+    <!-- Gmail auto-verify (chrome.identity.getAuthToken, gmail.readonly ONLY). When ON, account-creation
+         email verification is automatic. "Connect / test" proves the token + shows the connected inbox —
+         run it ONCE first (see docs/gmail-setup.md for the one-time OAuth client setup). -->
+    <label><input id="onboard-gmail" type="checkbox"> Gmail auto-verify ON (reads your inbox — read-only)</label>
+    <button id="gmail-connect">Connect / test Gmail (readonly)</button>
+    <!-- After login lands on the form, ALSO run the CDP fill walk. OFF by default: the fill walk ADVANCES a
+         LIVE application page-by-page — keep it off until you're on a DISPOSABLE application (the hard gate). -->
+    <label><input id="onboard-continue" type="checkbox"> Continue into the fill walk after login (⚠ advances the app)</label>
+    <!-- Drive the whole pre-form flow on the ACTIVE tab. Keep the tab VISIBLE to watch. Never submits.
+         [ONBOARD] in the service-worker console. -->
+    <button id="cdp-onboard">Start application (apply → login → verify → form)</button>
+    <hr>
     <div class="section-title">CDP fill</div>
     <!-- CDP fill FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
          flat fields AND every repeating section present. On page 1 == simple-widgets; on page 2
