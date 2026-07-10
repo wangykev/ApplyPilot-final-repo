@@ -2,7 +2,7 @@
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); llm.js = multi-provider LLM adapter (callLLM); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
+importScripts("db.js", "lib.js", "llm.js", "score.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); llm.js = multi-provider LLM adapter (callLLM); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
@@ -121,6 +121,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       else console.log("[ApplyPilot][LLM-TEST] ✗", res.error);
       sendResponse(res);
     })();
+    return true; // async sendResponse
+  }
+
+  // JD-MATCH SCORE (Round 1): score the current job (profile × JD) through the LLM
+  // seam to judge "should I even apply?". Reads the JD from jobContext.jd (Kevin's
+  // capture step writes it; a popup paste is the interim stub). GATED on the AI
+  // toggle so an OFF extension never spends. scoreJob NEVER throws — a null score
+  // carries an `error`. Result persists to `lastMatchScore` for the popup/summary.
+  // [SCORE] in the SW console. Direct callLLM (like RUN_LLM_TEST) — no tab/attach.
+  if (message.type === "RUN_SCORE_JOB") {
+    chrome.storage.local.get(["profile", "jobContext", "llmConfig"], ({ profile, jobContext, llmConfig }) => {
+      (async () => {
+        if (!profile) { sendResponse({ ok: false, error: "no-profile" }); return; }
+        const cfg = llmConfig || {};
+        if (!cfg.enabled) { sendResponse({ ok: false, error: "ai-off" }); return; } // scoring costs an LLM call — respect the opt-in toggle (no surprise spend)
+        const jd = (jobContext && jobContext.jd) || "";
+        const llm = (req) => callLLM({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, system: req.system, user: req.user, maxTokens: req.maxTokens });
+        const result = await scoreJob({ profile, jd }, llm);
+        chrome.storage.local.set({ lastMatchScore: { ...result, scored_at: Date.now(), jd_len: jd.length } });
+        console.log("[ApplyPilot][SCORE]", result.score == null
+          ? ("— " + result.error)
+          : (result.score + "/10 " + result.verdict + " | matched " + result.matched_requirements.length + ", gaps " + result.gaps.length));
+        sendResponse({ ok: result.score != null, ...result });
+      })();
+    });
     return true; // async sendResponse
   }
 
