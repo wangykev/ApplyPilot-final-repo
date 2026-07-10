@@ -97,6 +97,25 @@ test("checkbox: prefers the yes/no-valued item over a mislabeled distinctive one
   assert.strictEqual(r.agree[0].tier, "checkbox");
 });
 
+test("short but distinctive value (a 3-char name 'Doe') matches by presence", () => {
+  const r = reconcileReviewPage(
+    [{ label: "I have a preferred name", value: "John Doe" }],
+    [entry({ question_label: "Last Name", current_value: "Doe" })]
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.counts.missing_on_review, 0);
+});
+
+test("a bare Yes/No does NOT value-present (it must label-anchor the right question)", () => {
+  // "Yes" appears in the page text, but with no matching label the reconciler must NOT falsely agree.
+  const r = reconcileReviewPage(
+    [{ label: "Some unrelated question", value: "Yes indeed it is" }],
+    [entry({ question_label: "Do you consent?", current_value: "Yes", widget_type: "dropdown" })]
+  );
+  assert.strictEqual(r.counts.agree, 0);
+  assert.strictEqual(r.counts.missing_on_review, 1);
+});
+
 test("checkbox: a checked box not shown on review → missing_on_review", () => {
   const r = reconcileReviewPage(
     [{ label: "First Name", value: "Ada" }],

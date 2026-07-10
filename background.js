@@ -1275,6 +1275,7 @@ function cdpReadReviewPage(valueHints) {
 
   const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
   const norm = (s) => clean(s).toLowerCase().replace(/\s*\(\+\d+\)\s*$/, ""); // mirror of lib.normalize
+  const normL = (s) => norm(s).replace(/[*\s]+$/, ""); // label form: also drop a trailing required "*"/"**"
   const directText = (el) => { // text from THIS element's own text nodes only (labels/values are usually leaves)
     let t = "";
     for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent;
@@ -1323,16 +1324,16 @@ function cdpReadReviewPage(valueHints) {
   // ── (1b) LABEL-ANCHORED: for hints with a DISTINCTIVE label (≥12 chars — e.g. the screening
   // questions), find the label TEXT as a leaf and read the value from the next non-label leaf. This is
   // the ONLY way to capture a SHORT-valued field ("Yes"/"No") whose value can't be value-anchored. ──
-  const hintLabelSet = new Set(hints.map((h) => norm(h && h.label)).filter((s) => s.length >= 3));
+  const hintLabelSet = new Set(hints.map((h) => normL(h && h.label)).filter((s) => s.length >= 3));
   for (const h of hints) {
-    const nl = norm(h && h.label);
+    const nl = normL(h && h.label); // normL, not norm: the bundle label carries a trailing required "*"/"**" the page leaf lacks
     if (nl.length < 12) continue;
     for (let i = 0; i < leaves.length; i++) {
-      const lt = norm(leaves[i].textContent);
+      const lt = normL(leaves[i].textContent);
       if (lt === nl || lt.startsWith(nl) || (lt.length >= 12 && lt.includes(nl))) {
         for (let j = i + 1; j < leaves.length && j <= i + 3; j++) {
           const vt = clean(leaves[j].textContent);
-          if (vt && !hintLabelSet.has(norm(vt))) { push(h && h.label, vt, "label-anchored"); break; }
+          if (vt && !hintLabelSet.has(normL(vt))) { push(h && h.label, vt, "label-anchored"); break; }
         }
         break;
       }

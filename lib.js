@@ -449,6 +449,9 @@ const REGION_ABBREV = {
 // Returns { agree, disagree, missing_on_review, extra_on_review, ambiguous, counts }.
 function reconcileReviewPage(reviewItems, bundleEntries) {
   const TRUEISH = /^(true|yes|checked|selected|on|1)$/i;
+  // Values that are too generic to trust by page-presence (they appear all over the page) — these ride
+  // the label-anchored path instead, so "yes"/"no" verify the RIGHT question, not any stray "no".
+  const AMBIGUOUS_SHORT = /^(yes|no|n\/?a|true|false)$/i;
   const items = (Array.isArray(reviewItems) ? reviewItems : [])
     .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false }))
     .filter((it) => it.label || it.value)
@@ -521,8 +524,10 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
 
     claimed++; claimedValues.push(nval);
 
-    // ── DISTINCTIVE value → value-presence (label-independent). ──
-    if (nval.length >= 4) {
+    // ── DISTINCTIVE value → value-presence (label-independent). A value is distinctive enough to trust
+    //    by presence when it is ≥4 chars, OR ≥3 and not a generic yes/no token (so a short name like
+    //    "Doe" — present in "John Doe" — is found, while a bare "Yes"/"No" stays on the label path). ──
+    if (nval.length >= 4 || (nval.length >= 3 && !AMBIGUOUS_SHORT.test(nval))) {
       const tier = presentTier(cvs);
       if (tier) { agree.push({ ...base, value_review: cvs, tier }); continue; }
     }
