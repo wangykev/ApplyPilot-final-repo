@@ -2237,3 +2237,35 @@ FILL path had two gaps:
 `closeDropdownConfirmed` is now exported + unit-pinned (aria always `"false"` yet options linger 2 reads → the
 gate must keep polling/Escaping until `optionCount === 0`; an aria-only gate would Escape zero times). Happy
 path adds ~1 read (options already gone → returns immediately). `node -c` clean; 484 tests green.
+
+## 2026-07-07 — Magna wd3 REVIEW page (the final application page) — observed for the review-page CHECK
+
+The final review page is marked `[data-automation-id="applyFlowReviewPage"]` and groups the whole
+application into sections (`<h3>`/`<h4>`: My Information → Legal Name / Preferred Name / Address / Email /
+Phone; My Experience → Work Experience / Education / Certifications / Languages / Application Documents /
+Websites; Application Questions; Voluntary Disclosures; Terms and Conditions). What the review-page CHECK's
+scraper had to learn from tracing it:
+
+- **NO reliable field labels.** Each field's value is a bare `<span>`/`<div>` with `data-automation-id=null`
+  and NO associated `<label>`/`<dt>` — the label↔value pairing that works on the *form* pages is absent
+  here. A label-first scrape mislabels wholesale (an ancestor/nearest-leaf fallback tagged address, phone,
+  and screening values all as "How Did You Hear About Us?"). Lesson: reconcile by VALUE PRESENCE, not label.
+- **Address is ONE blob.** Address Line 1 + City + region + postal + country render as a single span
+  ("715 Middlebrooks Circle Tallahassee, FL 32312 United States of America"), so the individual fields are
+  found by substring containment. The region is the **abbreviation** ("FL"), not the stored dropdown value
+  ("Florida") → needs a name↔abbrev map.
+- **Phone is formatted** ("+1 850-666-0266 (Mobile)") — the stored "8506660266" only matches on a
+  digits-only comparison; the device type shows in the "(Mobile)" suffix.
+- **File uploads** render as `data-automation-id="file-upload-item-name"` (the filename) inside an
+  `attachments-FileUpload`/`file-upload-item` subtree, with an `ariaLiveMessage` "…successfully uploaded"
+  sibling — match the résumé by filename containment.
+- **Screening-question labels carry a trailing required marker** ("… please select No.*", "… age of 18?*",
+  a double `**` on some) that the page's value/question leaf does NOT — so a label match must strip a
+  trailing `*`/`**` (`normL`). Short answers ("Yes"/"No") appear as the next leaf after the question text →
+  captured by label-anchoring on the (asterisk-stripped) question text, read the following value leaf.
+- **Repeated identical values** (two work-experience "Tallahassee, FL" locations) collapse under any
+  dedup → value-presence agrees for each bundle entry regardless (both are present), so no false "missing".
+
+Approach that fell out: pass the bundle's claimed values as HINTS, value-anchor each onto the page, and
+reconcile by presence (distinctive values) + label-anchoring (short values / checkboxes). See
+`cdpReadReviewPage` / `reconcileReviewPage` and progress-log 2026-07-07.

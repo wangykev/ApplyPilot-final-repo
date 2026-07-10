@@ -314,3 +314,40 @@ Operator live-verified the full round on Magna wd3; all shipped to main:
 - Languages: `prepareProfile` fills English LAST (reduces the ghost duplicate-language error).
 
 The earlier per-feature "live-verify pending" notes are now superseded — this round is verified.
+
+## 2026-07-07 — Review-page CHECK (end-to-end fill-verify) LIVE-VERIFIED on Magna
+
+New read-only verification tool. The final Workday review page renders every value ACTUALLY in the form
+as read-only text — the ground truth of what would submit. The CHECK scrapes those values and reconciles
+them against the saved `reviewSummary` bundle (what the extension recorded it filled); a divergence flags
+a fill bug. READ-ONLY — attach → read → detach; it NEVER clicks Next/Submit (the review page's footer
+button IS Submit).
+
+- **`reconcileReviewPage(reviewItems, bundleEntries)` (lib.js, PURE, `test/review-reconcile.test.js`).**
+  DOM-agnostic — consumes `[{label, value}]` pairs. Buckets: AGREE / DISAGREE (page value ≠ recorded) /
+  MISSING (recorded but nowhere on the page — the didn't-stick signal) / EXTRA (a distinctive page value
+  the bundle doesn't hold) / AMBIGUOUS.
+- **VALUE-PRESENCE, not label-match (the load-bearing lesson).** The observed review DOM has NO reliable
+  field labels (every value is a bare `<span>`/`<div>`), so label-first matching mislabels and floods
+  false MISSING/EXTRA. Instead a DISTINCTIVE recorded value (≥4 chars, or ≥3 and not a generic yes/no
+  token) AGREES iff it appears in the page text, with a digit-only relief (phones: "8506660266" vs the
+  rendered "+1 850-666-0266") and a US/CA region name↔abbrev relief ("Florida" vs "Tallahassee, FL").
+  SHORT values ("Yes"/"No") and CHECKBOXES can't be found by value (they appear everywhere), so they
+  fall back to LABEL-ANCHORING against the item whose label matches; `normL` strips the trailing required
+  "*"/"**" the bundle label carries but the page leaf lacks. FILE_UPLOAD matches the résumé filename by
+  page-text containment. Checkboxes prefer a yes/no-valued item so a mislabeled distinctive value can't
+  cause a false disagree.
+- **`cdpReadReviewPage(valueHints)` (background.js, self-contained).** Scoped to
+  `[data-automation-id="applyFlowReviewPage"]`. VALUE-ANCHORED: given the bundle's claimed values as
+  hints, it locates each on the page and tags it with the hint's own (correct) label — plus a
+  LABEL-ANCHORED pass (find a distinctive question's text leaf → read the next value leaf, for the
+  short-valued screening dropdowns) and the generic `<label>`/`<dt>`/two-leaf strategies for the disagree
+  case. Returns items + trimmed diagnostics (`anchor_samples`, a capped raw own-text map) that the
+  `[REVIEW-CHECK]` log prints only when something didn't match.
+- **Wiring:** `RUN_CDP_REVIEW_CHECK` → `runCdpReviewReconcile` in background.js; popup button
+  `cdp-review-check`. No profile/LLM needed.
+
+Live-verified on Magna wd3: after the value-presence + label-anchor + region/digit reliefs, every value
+the fill committed reconciles as AGREE (My Information, work/education/certification, screening
+questions, résumé), with the check going quiet except for genuinely-unrecorded page values. Unit suite
+green.
