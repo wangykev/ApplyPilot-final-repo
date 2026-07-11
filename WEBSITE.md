@@ -165,7 +165,7 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 > contract the web app hardcodes — `LLM_MODELS`, profile schema v2.0, the `reviewSummary` envelope,
 > the resume record, the `AP_*` handoff — is UNCHANGED by main. Extension suite 578/578 green; web
 > production build green.
-- **P5** — AI-tailored resume variants + cover letter generation.
+- **P5 (cover letters done; resume variants pending)** — `/app/cover-letter`: generate a tailored cover letter from the profile + a pasted posting via the user's LLM (`lib/cover-letter.ts` prompt + `generateCoverLetter` action), editable, copy-to-clipboard, grounded-only-in-profile. AI-tailored resume *variants* (resume `variant` rows) are the remaining P5 piece.
 - **P6** — Auto-discover jobs (board integrations) + production hardening (pinned extension ID via manifest `key`, encrypted keys, deploy).
 
 ---
