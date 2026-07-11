@@ -156,7 +156,15 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 - **v1 (done)** — auth · resume upload + AI parse · profile editor · job context · AI config · **extension auto-sync**. The core "upload your resume and feed the extension" loop.
 - **P2 (done)** — Tracker + Queue: `/app/queue` (paste Workday URLs → `queue_items`, manage) + `GET /api/extension/queue` (ingest-key pull); `/app/tracker` (applications list, stats strip, status lights, pipeline-stage select, filters) fed by `POST /api/extension/report`. Queue + Tracker promoted to live sidebar nav; dashboard updated; Analytics now the "coming soon" item. A hard-gated `DEV_PREVIEW` sample dataset makes both demoable pre-Supabase.
 - **P3 (done)** — Hosted review summaries: `lib/review-summary.ts` + `ReviewSummaryView` render the `reviewSummary` bundle at `/app/tracker/[id]` (needs-review-first, safety badges, grouped all-fields) — read-only; tracker rows link in. The extension now PUSHES its bundle: `reportApplication(bundle, jobContext)` in `background.js` fires after `runCdpFillPage` (fire-and-forget, no-op if the website isn't connected, status never "submitted"); `POST /api/extension/report` upserts-by-URL so re-runs don't duplicate. *(Edit/write-back-to-extension + the walk-side report are follow-ups; live extension push is the operator's verify step.)*
-- **P4** — Analytics dashboard + pipeline stages + reminders.
+- **P4 (analytics done; reminders pending)** — `/app/analytics`: stat tiles (applications, submitted, interview rate, needs-review load), a labeled pipeline-distribution bar, an outcomes panel (offer/interview rates), and applications-over-time columns — server-rendered SVG, no chart lib, following the dataviz method (status colors always label-paired; palette contrast-validated). Pipeline stages ship via the tracker's status select; per-application **reminders** (the `reminders` table) are the remaining P4 piece.
+
+> **Merged `origin/main` (backend features) — `6219cc2`.** Main added Gmail integration
+> (`gmail.js` + manifest `oauth2`/`identity`/gmail host) and the review→submit **replay/approval**
+> flow (`summary-lib.js`, `runCdpReplayWalk`). Conflicts (my `reportApplication` + `onMessageExternal`
+> vs main dropping the `opts`/skip-lock param) resolved keeping both. **Portability verified:** every
+> contract the web app hardcodes — `LLM_MODELS`, profile schema v2.0, the `reviewSummary` envelope,
+> the resume record, the `AP_*` handoff — is UNCHANGED by main. Extension suite 578/578 green; web
+> production build green.
 - **P5** — AI-tailored resume variants + cover letter generation.
 - **P6** — Auto-discover jobs (board integrations) + production hardening (pinned extension ID via manifest `key`, encrypted keys, deploy).
 
