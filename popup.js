@@ -183,6 +183,36 @@ document.getElementById("cdp-replay-walk").addEventListener("click", () => {
   });
 });
 
+// M5 ARMED SUBMIT (SIMULATED): replay → review → FULL precondition gate → if it passes, LOG
+// "▶▶ WOULD CLICK SUBMIT ◀◀" and STOP. Does NOT actually submit yet (simulateSubmit hardcoded on).
+document.getElementById("cdp-submit").addEventListener("click", () => {
+  setStatus("Armed SUBMIT (SIMULATED) — replaying to review + running the FULL gate. If every check passes it LOGS 'would click submit' and STOPS (no real submit). Keep the tab VISIBLE. See [CDP-REPLAY-WALK].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_SUBMIT" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return; // popup may have lost focus — SW console has it all
+    if (resp.ok === false && resp.error === "no-bundle") {
+      setStatus('No saved summary to replay — fill + review an application first.');
+    } else if (resp.ok === false) {
+      setStatus("Armed submit failed: " + resp.error + " — see the service worker console.");
+    } else if (resp.would_submit) {
+      setStatus(`✅ GATE PASSED — WOULD CLICK SUBMIT (simulated, NOT clicked). Every precondition is satisfied. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "submit-blocked") {
+      setStatus(`⛔ SUBMIT BLOCKED — ${resp.blockers ? resp.blockers.length : "some"} precondition(s) not met (see [CDP-REPLAY-WALK] for the list). Nothing submitted.`);
+    } else if (resp.stopped === "replay-mismatch") {
+      setStatus(`⚠ HALTED on page ${resp.page}: ${resp.failed ? resp.failed.length : "some"} field(s) the live form no longer offers. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "replay-blocked") {
+      setStatus(`⚠ HALTED on page ${resp.nav_timeout_page} — page didn't advance (a required field empty / cascade-revealed). Eyeball + re-review. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "replay-page-not-in-bundle") {
+      setStatus(`⚠ HALTED on page ${resp.page} — the bundle doesn't cover this page. Start on page 1 of the SAME app. See [CDP-REPLAY-WALK].`);
+    } else if (resp.session_expired) {
+      setStatus(`⚠ SESSION EXPIRED after ${resp.pages_replayed} page(s) — refresh, log in, reopen, retry. See [CDP-REPLAY-WALK].`);
+    } else if (resp.stopped === "resume-not-attached") {
+      setStatus(`⚠ Halted: resume not attached (required upload blocks advance). Upload one, then re-run. See [CDP-REPLAY-WALK].`);
+    } else {
+      setStatus(`Armed submit stopped — ${resp.stopped} (${resp.pages_replayed} page(s) replayed). See [CDP-REPLAY-WALK].`);
+    }
+  });
+});
+
 // SESSION RECON (M30 Step 0): read-only static snapshot to classify live-form vs
 // logged-out/expired. No minimize. Run on a VALID form + a LOGGED-OUT state, diff.
 document.getElementById("cdp-session-recon").addEventListener("click", () => {

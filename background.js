@@ -154,6 +154,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // M5 ARMED SUBMIT: replay to review, run the FULL precondition gate (authorize:true), and — when it
+  // passes — would click SUBMIT. ⚠ SAFETY: simulateSubmit:true is HARDCODED here, so this NEVER actually
+  // clicks yet; it logs "▶▶ WOULD CLICK SUBMIT ◀◀" and stops (operator's choice). To go LIVE later, change
+  // simulateSubmit to false (the ONLY change needed) + honor the eyes-on disposable-app hard gate.
+  if (message.type === "RUN_CDP_SUBMIT") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const out = await runCdpReplayWalk(tab.id, { authorize: true, simulateSubmit: true });
+      sendResponse(out);
+    });
+    return true; // async sendResponse
+  }
+
   // PAGE-IDENTITY RECON (read-only): dump title / URL / automation-ids / headings / body text + state
   // markers for ANY page (maintenance / dead session / login / error / a normal form) so an unknown page
   // state can be DETECTED in code instead of surfacing an opaque "unknown error". [CDP-PAGE-RECON] in SW.
@@ -2170,6 +2184,7 @@ const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session chec
 async function runCdpReplayWalk(tabId, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
   const authorize = !!(opts && opts.authorize); // per-run submit token (M4). false ⇒ DRY (reach review + stop).
+  const simulateSubmit = !!(opts && opts.simulateSubmit); // M5 SAFETY BRAKE: run the FULL gate + log "WOULD CLICK SUBMIT", but NEVER actually click (operator not ready for a real submit). Flip via the handler's simulateSubmit:false.
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
@@ -2245,7 +2260,16 @@ async function runCdpReplayWalk(tabId, opts) {
           if (!authorize) LOG(`(DRY run — reached review + stopped. When every blocker above is cleared, the armed Submit button will submit once.)`);
           return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
         }
-        // GATE PASSED + authorized → the ONE irreversible click.
+        // GATE PASSED + authorized. ── M5 SAFETY BRAKE ── While simulateSubmit is on, LOG what WOULD
+        // happen and DO NOT click — no run submits yet (operator's explicit choice). act.clickSubmit is
+        // never called in this mode. Flip to a real submit later by launching with simulateSubmit:false
+        // (the RUN_CDP_SUBMIT handler sets the flag — a one-line change).
+        if (simulateSubmit) {
+          submitFired = true; // single-fire (mirrors the real path)
+          LOG(`✅✅✅ SUBMIT GATE PASSED — ▶▶ WOULD CLICK SUBMIT NOW ◀◀ (SIMULATE MODE: NOT clicking). Every precondition is satisfied, so an armed run (simulateSubmit:false) would submit the application here.`);
+          return { ok: true, stopped: "would-submit", would_submit: true, simulated: true, reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        // (real path — not reached while simulateSubmit is on) → the ONE irreversible click.
         LOG(`✓ submit gate PASSED — clicking SUBMIT ONCE (authorized).`);
         const subSig = cdpPageSig(await cdpEval(cdpPageScan));
         const sub = await act.clickSubmit(true);
