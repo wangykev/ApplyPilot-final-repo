@@ -97,6 +97,21 @@ test("checkbox: prefers the yes/no-valued item over a mislabeled distinctive one
   assert.strictEqual(r.agree[0].tier, "checkbox");
 });
 
+test("checkbox: two IDENTICAL 'I am fluent' labels — a fluent language consumes the 'Yes', not another entry's 'No'", () => {
+  // Live bug (Magna, 2 languages): Chinese not fluent (false → skipped as unchecked), English fluent
+  // (true). The page shows both rows under the SAME label; English's true must AGREE with the 'Yes',
+  // not falsely DISAGREE against Chinese's 'No' (the first label-matching item).
+  const r = reconcileReviewPage(
+    [{ label: "I am fluent in this language.", value: "No" }, { label: "I am fluent in this language.", value: "Yes" }],
+    [
+      entry({ question_label: "I am fluent in this language.", current_value: "false", widget_type: "checkbox" }),
+      entry({ question_label: "I am fluent in this language.", current_value: "true", widget_type: "checkbox" }),
+    ]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "English's true must NOT disagree with Chinese's 'No'");
+  assert.strictEqual(r.counts.agree, 1, "English's true agrees with the 'Yes' row");
+});
+
 test("short but distinctive value (a 3-char name 'Doe') matches by presence", () => {
   const r = reconcileReviewPage(
     [{ label: "I have a preferred name", value: "John Doe" }],

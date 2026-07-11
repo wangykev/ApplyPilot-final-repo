@@ -28,7 +28,9 @@
 // lib.js globals in the SW scope).
 const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
-  : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio };
+  : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio,
+      // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
+      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -4193,7 +4195,21 @@ async function replayRepeatingSections(act, entries, budgets) {
     const hasAdd = Array.isArray(rscan.addButtons) && rscan.addButtons.some((bt) => re.test((bt && bt.nearestHeading) || ""));
     if (!hasContainer && !hasAdd) continue;                            // section not on this page
     const items = bundleToSectionItems(entries, sec);
-    if (!items.length) continue;                                       // no approved entries to replay
+    if (!items.length) {
+      // No approved entries. Distinguish "the operator DELETED this section's entries in review" from
+      // "the section was never in the bundle". If deleted (is_deleted entries exist for this section),
+      // reconcile the LIVE form DOWN TO 0 (driveRepeatingSectionCdp with items:[] deletes all its rows)
+      // — a deleted section left with rows would submit content the operator removed (the "cert did not
+      // delete" bug). If never captured, leave the section untouched (skip).
+      const hadDeleted = (entries || []).some((e) => { const m = /^([A-Za-z_]+)\s*\[/.exec(String((e && e.is_deleted && e.canonical_field) || "")); return m && m[1] === sec.name; });
+      if (!hadDeleted) continue;
+      const cleared = await driveRepeatingSectionCdp(act, {
+        name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
+        items: [], fieldMap: sec.fieldMap, nested: sec.nested, deleteOnNoMatch: false, aiContext: null
+      }, b);
+      if (cleared && Array.isArray(cleared.results)) results.push(...cleared.results);
+      continue;
+    }
     const out = await driveRepeatingSectionCdp(act, {
       name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
       items, fieldMap: sec.fieldMap, nested: sec.nested,
@@ -4475,6 +4491,57 @@ async function captureChoiceOptions(act, results, budgets) {
 // accumulated multi-page bundle (the viewer keys reviewValueNodes on field_id).
 // ============================================================================
 const REVIEW_SCHEMA_VERSION = "1.1"; // 1.1 (Plan 2): + page_number/page_label, is_approved/approved_at. The viewer tolerates 1.0 (missing fields default).
+const ACCEPTED_SCHEMA_VERSIONS = ["1.0", "1.1"]; // M4 submit gate accepts these (the viewer's documented tolerance); anything else = stale build → block.
+
+// submitPrecondition (M4) — the ORDERED gate for the ONE irreversible click (act.clickSubmit). PURE:
+// every input is passed in; returns { ok, blockers[] } (blockers = human-readable reasons, logged for
+// the operator). ALL conditions must pass. This is the safety surface — clickSubmit fires ONLY when
+// this returns ok. Inputs: the approved `bundle` (reviewSummary), the LIVE session state
+// (cdpReadSessionState), the replay `findings` accumulated across the walk, and control `opts`
+// (authorize + alreadyFired single-fire sentinel). NAMED invariant (unit-pinned): SUBMIT never fires
+// with any unresolved flagged/needs_review field, any unreplaced AI placeholder, or without authorize.
+function submitPrecondition(bundle, liveState, findings, opts) {
+  const o = opts || {};
+  const f = findings || {};
+  const blockers = [];
+  const entries = (bundle && Array.isArray(bundle.entries)) ? bundle.entries.filter((e) => !e.is_deleted) : [];
+  // 1. explicit per-run authorization (a token, never a standing setting).
+  if (o.authorize !== true) blockers.push("not authorized (authorize !== true)");
+  // 2. must be ON the review page — the ONLY page where the footer button IS Submit.
+  if (!(liveState && liveState.applyFlowReviewPresent)) blockers.push("not on the review page (applyFlowReviewPresent is false)");
+  // 3. session alive / not planned-maintenance.
+  if (liveState && apMatch.isWorkdayMaintenance(liveState)) blockers.push("Workday maintenance page");
+  else if (liveState && apMatch.sessionLooksDead(liveState)) blockers.push("session dead / expired");
+  // 4. a real bundle + a schema this build can honor (never replay a stale-build bundle).
+  if (!entries.length) blockers.push("no approved bundle entries to replay");
+  if (bundle && bundle.schema_version && ACCEPTED_SCHEMA_VERSIONS.indexOf(bundle.schema_version) === -1) {
+    blockers.push(`bundle schema_version "${bundle.schema_version}" not in accepted ${JSON.stringify(ACCEPTED_SCHEMA_VERSIONS)}`);
+  }
+  // 5. every field that requires approval IS approved. requiresApproval = needs_review && !deleted
+  //    (mirrors summary-lib requiresApproval); super-hard / legally-loaded / needs-answer / eeo-guess
+  //    are ALL needs_review, so this single check covers the whole mustReplace class.
+  const unapproved = entries.filter((e) => e.needs_review && !e.is_approved);
+  if (unapproved.length) blockers.push(`${unapproved.length} flagged field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
+  // 6. no unreplaced AI placeholder — in the BUNDLE, and (belt-and-suspenders) on the LIVE page.
+  const bundlePh = apMatch.unreplacedPlaceholders(entries) || [];
+  if (bundlePh.length) blockers.push(`${bundlePh.length} unreplaced AI placeholder(s) in the bundle`);
+  if (f.livePlaceholder) blockers.push("an unreplaced AI placeholder is VISIBLE on the live review page");
+  // 6b. REVIEW-PAGE EQUALITY — the review page must DISPLAY exactly the approved values (operator
+  //     requirement). A scrape failure = can't confirm → block (strict). disagree = the page shows a
+  //     CONTRADICTING value; missing = an approved value NOT shown on the page. (The caller logs
+  //     extra-on-page but does not block on it — review boilerplate is noisy.)
+  if (f.reviewScrapeFailed) blockers.push("could not read the review page to confirm it matches the approved values");
+  if (Array.isArray(f.reviewDisagree) && f.reviewDisagree.length) blockers.push(`${f.reviewDisagree.length} review-page value(s) DISAGREE with the approved bundle`);
+  if (Array.isArray(f.reviewMissing) && f.reviewMissing.length) blockers.push(`${f.reviewMissing.length} approved value(s) not shown on the review page`);
+  // 7. no cascade-revealed field the bundle never covered (surfaced during the replay walk).
+  if (Array.isArray(f.cascadeRevealed) && f.cascadeRevealed.length) blockers.push(`${f.cascadeRevealed.length} cascade-revealed field(s) not in the approved bundle`);
+  // 8. zero replay-verify mismatches / unverifiables across all pages (a clean walk never reaches here
+  //    with any — it halts earlier — but the gate re-checks; defense in depth).
+  if (Array.isArray(f.mismatches) && f.mismatches.length) blockers.push(`${f.mismatches.length} replay-verify mismatch(es) across the walk`);
+  // 9. single-fire — once clickSubmit has fired this run, a second attempt is a no-op (no double-submit).
+  if (o.alreadyFired) blockers.push("submit already fired this run (single-fire sentinel)");
+  return { ok: blockers.length === 0, blockers };
+}
 
 function summarizeEntries(entries) {
   return {
@@ -4859,5 +4926,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

@@ -514,7 +514,11 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
       if (!TRUEISH.test(cvs.trim())) { skipped++; continue; }
       claimed++;
       const cands = items.filter((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
-      const cand = cands.find((it) => /^(yes|no|true|false)$/i.test(it.value.trim())) || cands[0]; // prefer a yes/no-valued item
+      // PREFER a TRUEISH candidate first: with IDENTICAL repeating labels (two "I am fluent in this
+      // language." rows — Chinese "No", English "Yes"), a CHECKED box must consume the "Yes", not the
+      // first yes/no item (which may be another entry's "No" → false disagree). Then any yes/no-valued
+      // item (the preferredCheck fix — a mislabeled distinctive value), then the first candidate.
+      const cand = cands.find((it) => TRUEISH.test(it.value.trim())) || cands.find((it) => /^(yes|no|true|false)$/i.test(it.value.trim())) || cands[0];
       if (!cand) { missing_on_review.push(base); continue; }
       cand.used = true;
       if (TRUEISH.test(cand.value.trim())) agree.push({ ...base, value_review: cand.value, tier: "checkbox" });

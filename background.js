@@ -140,13 +140,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
-  // M3 SUBMIT replay WALK (DRY): replay the SAVED approved bundle page-by-page to the REVIEW page,
-  // verifying each field and advancing with the guarded clickPageNext — NEVER submits. [CDP-REPLAY-WALK].
+  // M3/M4 SUBMIT replay WALK: replay the SAVED approved bundle page-by-page to the REVIEW page,
+  // verifying each field, advancing with the guarded clickPageNext. authorize:true (M5 armed button)
+  // runs the M4 precondition gate at review and clicks SUBMIT once iff every check passes; otherwise
+  // DRY (reach review + stop). Defaults to DRY (message.authorize absent). [CDP-REPLAY-WALK].
   if (message.type === "RUN_CDP_REPLAY_WALK") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpReplayWalk(tab.id);
+      const out = await runCdpReplayWalk(tab.id, { authorize: message.authorize === true });
       sendResponse(out);
     });
     return true; // async sendResponse
@@ -2201,8 +2203,9 @@ async function replayAttachResume(LOG) {
 // NO AI, NO AI-4 remediation (fill-path only). Reads the bundle from storage, NOT the profile. Keep the
 // tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
 const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
-async function runCdpReplayWalk(tabId) {
+async function runCdpReplayWalk(tabId, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
+  const authorize = !!(opts && opts.authorize); // per-run submit token (M4). false ⇒ DRY (reach review + stop).
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
@@ -2212,9 +2215,13 @@ async function runCdpReplayWalk(tabId) {
       return { ok: false, error: "no-bundle" };
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
-    LOG(`DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (no submit click exists yet). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
+    LOG(authorize
+      ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
+      : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
     const act = makeCdpActuation(await getLlmConfig()); // AI OFF for replay regardless (replayRepeatingSections passes aiContext:null; flat replayField never calls AI)
     const pagesReplayed = [];
+    const findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
+    let submitFired = false; // single-fire sentinel
 
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
@@ -2229,8 +2236,65 @@ async function runCdpReplayWalk(tabId) {
         return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
       if (nav && nav.applyFlowReviewPresent) {
-        LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified. NOT submitting (terminal; no submit click exists yet).`);
-        return { ok: true, stopped: "reached-review", reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified.`);
+        // ── REVIEW-PAGE EQUALITY (operator requirement) — the review page must DISPLAY exactly the
+        //    approved values. Scrape its label→value pairs and diff vs the approved bundle
+        //    (reconcileReviewPage — the SAME read-only check as the "review-page CHECK" button). A
+        //    DISAGREE (page shows a different value), a MISSING (approved value not shown), or a scrape
+        //    FAILURE (can't confirm) each becomes a HARD gate blocker. extra-on-page is logged, not
+        //    blocked (review boilerplate is noisy). Runs even DRY — the operator sees the diff preview. ──
+        const reviewDiff = { disagree: [], missing: [], scrapeFailed: false };
+        try {
+          const hints = bundle.entries
+            .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
+            .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
+          const dump = await cdpEval(cdpReadReviewPage, hints);
+          if (dump && dump.ok && Array.isArray(dump.items)) {
+            const rec = reconcileReviewPage(dump.items, bundle.entries);
+            const c = rec.counts;
+            reviewDiff.disagree = rec.disagree || [];
+            reviewDiff.missing = rec.missing_on_review || [];
+            LOG(`review page vs approved: AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING ${c.missing_on_review} · EXTRA ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous} (of ${c.claimed} value-bearing entries).`);
+            rec.disagree.forEach((d) => LOG(`    ≠ "${d.label || d.canonical_field || d.field_id}": approved "${d.value_bundle}" but the page shows "${d.value_review}"`));
+            rec.missing_on_review.forEach((m) => LOG(`    ∅ approved "${m.value_bundle}" ("${m.label || m.canonical_field || m.field_id}") is NOT shown on the review page`));
+            if ((rec.extra_on_review || []).length) { LOG(`    (${rec.extra_on_review.length} extra value(s) on the page not in the bundle — logged, NOT blocking:)`); rec.extra_on_review.slice(0, 6).forEach((x) => LOG(`      + "${x.value_review}" (${x.label || "?"})`)); }
+          } else {
+            LOG(`⚠ could NOT scrape the review page (${(dump && dump.reason) || "no items"}) — cannot confirm it matches the approved values → the gate will block.`);
+            reviewDiff.scrapeFailed = true;
+          }
+        } catch (e) {
+          LOG(`⚠ review-page diff failed: ${String((e && e.message) || e)} → the gate will block.`);
+          reviewDiff.scrapeFailed = true;
+        }
+
+        // ── M4 SUBMIT GATE — the ordered precondition check. Run it ALWAYS (even DRY) so the operator
+        //    sees a blocker list; clickSubmit fires ONLY when authorize===true AND every check passes. ──
+        let livePlaceholder = false;
+        try { livePlaceholder = await cdpEval(() => ((document.body && document.body.innerText) || "").indexOf("[NEEDS YOUR ANSWER") !== -1); } catch (e) { /* ignore — bundle check still applies */ }
+        const gate = submitPrecondition(bundle, nav, {
+          mismatches: findings.mismatches, cascadeRevealed: findings.cascadeRevealed, livePlaceholder,
+          reviewDisagree: reviewDiff.disagree, reviewMissing: reviewDiff.missing, reviewScrapeFailed: reviewDiff.scrapeFailed
+        }, { authorize, alreadyFired: submitFired });
+        if (!gate.ok) {
+          LOG(`submit gate: ${gate.blockers.length} blocker(s) — NOT submitting:`);
+          gate.blockers.forEach((b) => LOG(`    ✗ ${b}`));
+          if (!authorize) LOG(`(DRY run — reached review + stopped. When every blocker above is cleared, the armed Submit button will submit once.)`);
+          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        // GATE PASSED + authorized → the ONE irreversible click.
+        LOG(`✓ submit gate PASSED — clicking SUBMIT ONCE (authorized).`);
+        const subSig = cdpPageSig(await cdpEval(cdpPageScan));
+        const sub = await act.clickSubmit(true);
+        submitFired = true; // single-fire — never attempt a second submit this run
+        LOG(`clickSubmit:`, JSON.stringify(sub));
+        if (!sub.clicked) {
+          LOG(`⚠ clickSubmit refused (${sub.refused}${sub.blockedBy ? " — covered by " + sub.blockedBy : ""}) — NOT submitted. Eyeball the review page.`);
+          return { ok: true, stopped: "submit-refused:" + (sub.refused || "?"), reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        const res = await cdpWaitNextPage(subSig);
+        const confirmed = !!(res.advanced && !res.sessionDead && !res.maintenance);
+        LOG(confirmed ? `✓✓✓ SUBMITTED — the review page advanced (confirmation). Application submitted.` : `clickSubmit fired but no confirmed advance yet (${JSON.stringify(res)}) — VERIFY on the page.`);
+        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
 
       LOG(`──── REPLAY PAGE ${page} ────`);
@@ -2296,9 +2360,14 @@ async function runCdpReplayWalk(tabId) {
       if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.timeout) {
-        // DRY replay does NOT run AI-4 remediation (fill-path only). A nav-timeout means a required field
-        // is empty — most likely a CASCADE-REVEALED field the approved bundle never captured → HALT for
-        // re-review (re-open the summary, approve the revealed field, re-run). Report the live errors.
+        // CLEAN no-advance fallback first (operator ask): a swallowed Save & Continue re-clicks (up to 2x).
+        // Self-guards on error/session-death, so a real validation block still HALTS (never masked).
+        const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
+        if (reclick.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED during the re-click fallback on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+        if (reclick.advanced) { LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`); continue; }
+        // DRY replay does NOT run AI-4 remediation (fill-path only). Still stuck: a nav-timeout means a
+        // required field is empty — most likely a CASCADE-REVEALED field the approved bundle never
+        // captured → HALT for re-review (re-open the summary, approve the revealed field, re-run).
         let diag = {};
         try {
           const st = await cdpEval(cdpReadSessionState);
@@ -2306,7 +2375,7 @@ async function runCdpReplayWalk(tabId) {
           if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG("    • " + s)); }
           diag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null };
         } catch (e) { /* ignore */ }
-        LOG(`⚠ page ${page} did NOT advance (nav-timeout) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
+        LOG(`⚠ page ${page} did NOT advance (nav-timeout${reclick.errorsPresent ? ", real error present" : ", re-click fallback exhausted"}) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
         return { ok: true, stopped: "replay-blocked", nav_timeout_page: page, pages_replayed: pagesReplayed.length, pages: pagesReplayed, ...diag };
       }
       LOG(`✓ page ${page} → advanced.`);
@@ -2378,6 +2447,33 @@ async function runCdpPageRecon(tabId) {
 // pages on some tenants; dom-patterns).
 function cdpPageSig(scan) {
   return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
+}
+
+// A CLEAN no-advance fallback (operator ask, 2026-07-10, Magna page 1): Save & Continue registered
+// (clicked:true) but the page neither advanced nor showed a validation error — a SWALLOWED / no-op click
+// (a Workday debounce/timing miss). Re-click Save & Continue up to `tries` more times, re-waiting each
+// time. SAFETY: it re-clicks ONLY when the page is CLEAN — no error markers, not session-dead, not
+// already at review — so a real validation error is NEVER masked by a blind re-click (a real block
+// halts, as before). Used by BOTH walks after their normal timeout handling, before the give-up halt.
+async function reclickNextWhenClean(act, prevSig, tries, LOG) {
+  for (let i = 1; i <= tries; i++) {
+    let st = null;
+    try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* not-ready → treat as no-error, try the click */ }
+    if (st && st.applyFlowReviewPresent) return { advanced: true, reachedReview: true };  // it DID reach review
+    if (st && sessionLooksDead(st)) return { advanced: false, sessionDead: true, state: st };
+    const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+    if (samples.length || (st && st.errorPageText)) { LOG(`  re-click fallback: error text present — NOT re-clicking (a real validation block, not a swallowed click).`); return { advanced: false, errorsPresent: true }; }
+    LOG(`  re-click fallback ${i}/${tries}: clicked but no advance + no error/session-death — re-clicking Save & Continue.`);
+    await cdpWakePage();
+    const click = await act.clickPageNext();
+    if (!click.clicked) { LOG(`  re-click refused (${click.refused || "?"}) — stopping the fallback.`); return { advanced: false, refused: click.refused }; }
+    const res = await cdpWaitNextPage(prevSig);
+    if (res.advanced) return { advanced: true, attempts: i };
+    if (res.sessionDead) return { advanced: false, sessionDead: true, state: res.state };
+    if (res.maintenance) return { advanced: false, maintenance: true };
+    // still timeout → loop and try again
+  }
+  return { advanced: false, attempts: tries };
 }
 
 // Poll SW-side after Save & Continue: a fresh dead-session read FIRST (a dead session
@@ -2558,7 +2654,21 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after AI-4 remediation (${rem.attempts} attempt(s)).`);
           continue; // top-of-loop re-checks review/session on the new page
         }
-        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        // Operator ask (2026-07-10): a CLEAN no-advance (clicked:true but the page didn't move AND AI-4
+        // found NO error to fix) is a SWALLOWED Save & Continue → RE-CLICK it (up to 2x). Runs only after
+        // remediation confirmed there's nothing to remediate; reclickNextWhenClean self-guards on
+        // error/session-death, so a real validation block is never masked (it halts as before).
+        const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
+        if (reclick.sessionDead) {
+          LOG(`⚠⚠ SESSION EXPIRED during the re-click fallback on page ${page} — refresh, log in, reopen, retry.`);
+          const diag = await reportPageErrors(out);
+          return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+        }
+        if (reclick.advanced) {
+          LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
+          continue;
+        }
+        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }

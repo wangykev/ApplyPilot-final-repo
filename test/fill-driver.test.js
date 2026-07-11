@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6074,6 +6074,113 @@ test("selectPageBundleEntries: a repeating-only page (My Experience — no flat 
   assert.strictEqual(r.score, 2, "2 live repeating sections overlap the bundle's P2 group");
 });
 
+// ── M4: submitPrecondition — the ordered gate for the ONE irreversible click (SAFETY SURFACE) ─────
+// A clean, GATE-PASSING scenario; each test mutates ONE thing and asserts it blocks.
+const cleanSubmitInputs = () => ({
+  bundle: { schema_version: "1.1", entries: [
+    { field_id: "P::formField-a", canonical_field: "pi.a", needs_review: false },
+    { field_id: "P::formField-b", canonical_field: "pi.b", needs_review: true, is_approved: true },
+  ] },
+  liveState: { applyFlowReviewPresent: true, formFieldCount: 5 },
+  findings: {},
+  opts: { authorize: true, alreadyFired: false },
+});
+const gate = (m) => { const i = cleanSubmitInputs(); if (m) m(i); return submitPrecondition(i.bundle, i.liveState, i.findings, i.opts); };
+
+test("submitPrecondition: a clean authorized review-page scenario PASSES (ok, no blockers)", () => {
+  const r = gate();
+  assert.strictEqual(r.ok, true, r.blockers.join("; "));
+  assert.strictEqual(r.blockers.length, 0);
+});
+
+test("submitPrecondition: authorize !== true BLOCKS (the per-run token is mandatory)", () => {
+  const r = gate((i) => { i.opts.authorize = false; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /not authorized/.test(b)));
+});
+
+test("submitPrecondition: NOT on the review page BLOCKS (never submit off-review)", () => {
+  const r = gate((i) => { i.liveState.applyFlowReviewPresent = false; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /review page/.test(b)));
+});
+
+test("submitPrecondition: a dead session BLOCKS", () => {
+  const r = gate((i) => { i.liveState.signInButtonPresent = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /session dead/.test(b)));
+});
+
+test("submitPrecondition: a maintenance page BLOCKS", () => {
+  const r = gate((i) => { i.liveState.formFieldCount = 0; i.liveState.maintenancePresent = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /maintenance/.test(b)));
+});
+
+test("NAMED INVARIANT — submitPrecondition NEVER passes with an unresolved flagged/needs_review field", () => {
+  const r = gate((i) => { i.bundle.entries[1].is_approved = false; }); // a needs_review field left unapproved
+  assert.strictEqual(r.ok, false, "an unapproved flagged field MUST block submit");
+  assert.ok(r.blockers.some((b) => /flagged field\(s\) not approved/.test(b)));
+});
+
+test("submitPrecondition: an unreplaced AI placeholder in the BUNDLE blocks", () => {
+  const r = gate((i) => { i.bundle.entries.push({ field_id: "P::formField-essay", flag: "ai-text-needs-answer", current_value: "[NEEDS YOUR ANSWER: why us?]", needs_review: true, is_approved: true }); });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /placeholder/.test(b)));
+});
+
+test("submitPrecondition: a placeholder VISIBLE on the live review page blocks (live re-check)", () => {
+  const r = gate((i) => { i.findings.livePlaceholder = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /VISIBLE on the live review page/.test(b)));
+});
+
+test("submitPrecondition: a schema_version this build doesn't accept blocks (stale bundle)", () => {
+  const r = gate((i) => { i.bundle.schema_version = "9.9"; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /schema_version/.test(b)));
+});
+
+test("submitPrecondition: cascade-revealed fields / replay mismatches block", () => {
+  assert.strictEqual(gate((i) => { i.findings.cascadeRevealed = [{ f: "localName" }]; }).ok, false);
+  assert.strictEqual(gate((i) => { i.findings.mismatches = [{ f: "country" }]; }).ok, false);
+});
+
+test("submitPrecondition: a review-page value that DISAGREES with the approved bundle blocks (page must match exactly)", () => {
+  const r = gate((i) => { i.findings.reviewDisagree = [{ label: "Country", value_bundle: "Afghanistan", value_review: "United States" }]; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /DISAGREE with the approved bundle/.test(b)));
+});
+
+test("submitPrecondition: an approved value MISSING from the review page blocks", () => {
+  const r = gate((i) => { i.findings.reviewMissing = [{ label: "Phone", value_bundle: "8506660266" }]; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /not shown on the review page/.test(b)));
+});
+
+test("submitPrecondition: a review-page scrape FAILURE blocks (can't confirm it matches → don't submit)", () => {
+  const r = gate((i) => { i.findings.reviewScrapeFailed = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /could not read the review page/.test(b)));
+});
+
+test("submitPrecondition: single-fire — alreadyFired BLOCKS a second submit (no double-submit)", () => {
+  const r = gate((i) => { i.opts.alreadyFired = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /already fired/.test(b)));
+});
+
+test("submitPrecondition: a soft-DELETED flagged field is EXCLUDED (doesn't block)", () => {
+  const r = gate((i) => { i.bundle.entries.push({ field_id: "P::formField-gone", needs_review: true, is_approved: false, is_deleted: true }); });
+  assert.strictEqual(r.ok, true, "a deleted entry is not part of the approval denominator: " + r.blockers.join("; "));
+});
+
+test("submitPrecondition: reports ALL blockers at once (nothing authorized, off-review, unapproved)", () => {
+  const r = gate((i) => { i.opts.authorize = false; i.liveState.applyFlowReviewPresent = false; i.bundle.entries[1].is_approved = false; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.length >= 3, "each failed check contributes a blocker: " + r.blockers.join("; "));
+});
+
 test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {
   const fn = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "" };
   const cty = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }] };
@@ -6231,4 +6338,18 @@ test("replayRepeatingSections: CREATES a Feature-B added entry (reconciles UP) a
   assert.strictEqual(state.entries.length, 2, "reconciled UP to include the added entry");
   assert.ok(act.log.some(([m]) => m === "clickSectionAdd"), "created the added entry");
   assert.ok(results.some((r) => r.fieldName === "website[1].url" && r.after === "https://added.example"), "filled the added entry");
+});
+
+test("replayRepeatingSections: a DELETED section (is_deleted entries) reconciles the live form DOWN TO 0", async () => {
+  // Operator deleted the section in review → bundle has only is_deleted entries → the LIVE form must be
+  // emptied (the 'cert did not delete' bug: it used to skip, leaving the operator-removed rows to submit).
+  const state = webState({ entries: [webEntry("webAddress-0--null", "https://a.example"), webEntry("webAddress-1--null", "https://b.example")] });
+  const act = makeFakeRepeatAct(state);
+  const entries = [
+    { canonical_field: "website[0].url", current_value: "https://a.example", widget_type: "text", is_deleted: true },
+    { canonical_field: "website[1].url", current_value: "https://b.example", widget_type: "text", is_deleted: true },
+  ];
+  await replayRepeatingSections(act, entries, T_BUDGETS);
+  assert.strictEqual(state.entries.length, 0, "a deleted section is reconciled to 0 on the live form (not left as-is)");
+  assert.ok(act.log.some(([m]) => m === "clickDeleteEntry"), "the live rows were deleted");
 });

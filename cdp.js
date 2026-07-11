@@ -2980,6 +2980,30 @@ function makeCdpActuation(llmConfig) {
       return { clicked: true };
     },
 
+    // clickSubmit(authorize) — the ONE submit-capable click. EXACT INVERSE of clickPageNext: it fires
+    // ONLY when the review marker is PRESENT *and* authorize === true, then clicks pageFooterNextButton
+    // (which IS the Submit button on the review page). This is the sole place an application can be
+    // submitted; clickPageNext refuses on the review page, so no other click can. Defense in depth: the
+    // walk's submitPrecondition gate must ALSO pass before this is ever called. Never auto-dismisses an
+    // overlay (unlike clickPageNext) — a covered Submit button REFUSES, it does not click blindly.
+    clickSubmit: async (authorize) => {
+      if (authorize !== true) return { clicked: false, refused: "not-authorized" };
+      const reviewPresent = await cdpEval(() => !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'));
+      if (!reviewPresent) return { clicked: false, refused: "not-review-page" }; // NEVER submit off the review page
+      const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
+      if (!rect) return { clicked: false, refused: "no-button" };
+      // Covered-button guard (same as clickPageNext) — a swallowed submit click would look like a no-op.
+      const cover = await cdpEval((cx, cy) => {
+        const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+        const top = document.elementFromPoint(cx, cy);
+        if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+        return { blocked: true, by: (top.getAttribute && top.getAttribute("data-automation-id")) || (top.tagName ? top.tagName.toLowerCase() : "?") };
+      }, rect.cx, rect.cy);
+      if (cover && cover.blocked) return { clicked: false, refused: "blocked", blockedBy: cover.by };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { clicked: true, submitted: true };
+    },
+
     // ── AI-4 validation-error remediation ──
     readErrorLinks: () => cdpEval(cdpReadErrorLinks),            // the visible error anchors (rect + text)
     focusedFieldName: () => cdpEval(cdpFocusedFieldName),        // the field an error-anchor click focused
