@@ -422,6 +422,15 @@ const REGION_ABBREV = {
   "nova scotia":"ns",ontario:"on","prince edward island":"pe",quebec:"qc",saskatchewan:"sk",
 };
 
+// Canonical-section name → data-fkit-id prefix. The ONLY divergence between the bundle's
+// canonical_field section name and the review page's fkit prefix is `website`↔`webAddress`
+// (workExperience / education / certification / language are identical on both sides). Mirrors
+// PAGE_SECTIONS' name↔containerPrefix (fill-driver.js) — LOCKSTEP, but lib.js can't import
+// fill-driver.js, so this table is the local source of truth. A section not listed here maps to
+// itself. (Websites ARE panelized on the review page — `Websites-1-panel`/`Websites-2-panel` — so
+// `webAddress` resolves through the normal entry-scoped path like every other repeating section.)
+const CANONICAL_TO_FKIT = { website: "webAddress" };
+
 // REVIEW-PAGE RECONCILIATION (the end-to-end fill-verify). The Workday review page (the final
 // application page) renders every value ACTUALLY in the form as read-only text — the ground truth of
 // what would be submitted. Compare it against what the extension RECORDED it filled (the accumulated
@@ -429,21 +438,30 @@ const REGION_ABBREV = {
 // class the safety contract exists to catch) or the extension recorded a value that is not really on
 // the form — a bug to investigate.
 //
-// VALUE-PRESENCE, NOT LABEL-MATCH (the 2026-07-07 live lesson). The observed review page has NO
-// reliable field labels — every value is a bare `<span>`/`<div>`, so label-anchored matching mislabels
-// and floods false missing/extra. Instead the primary question is "does each recorded value APPEAR on
-// the page at all?" — DOM-shape-agnostic and exactly the fill-stuck signal. So a DISTINCTIVE value
-// (normalized length ≥ 4) AGREES iff it is a substring of the page text (built from the scraped item
-// values), with a digit-only relief (phones: "8506660266" vs the rendered "+1 850-666-0266") and a
-// region name↔abbrev relief. SHORT values ("Yes"/"No") and CHECKBOXES can't be found by value (they
-// appear everywhere) so they fall back to label-anchored matching against the item whose label matches
-// (the scraper's label-anchored / <label> strategies supply those). FILE_UPLOAD matches the resume
-// filename by page-text containment. Unreplaced AI placeholders are excluded; an unchecked box is
-// SKIPPED (the review page doesn't render it). EXTRA = a distinctive page value NOT explained by any
-// recorded value (e.g. a language the bundle deleted but the form kept). DOM-agnostic — consumes
-// `[{label, value}]` pairs, unit-testable independent of the review DOM.
+// ID + SECTION/ENTRY-SCOPED, with a value-presence fallback (the 2026-07-10 rewrite). The review page's
+// DOM is highly regular: each field's value lives in a `<span id="KEY">` whose id IS the form-field name,
+// grouped into repeating entries by `role="group"` panels (`aria-labelledby$="-<N>-panel"`) and sections
+// by h3/h4. So `cdpReadReviewPage` now emits STRUCTURED records ({ key, label, entryOrdinal, fkitPrefix,
+// value, isAttachment }) and the AUTHORITATIVE match is by identity:
+//   (a) FLAT field  → the unused record with entryOrdinal===null && key===<form-field name>.
+//   (b) REPEATING   → SCOPE to the entry FIRST (fkitPrefix===CANONICAL_TO_FKIT(section) && entryOrdinal
+//       ===index+1 — the PANEL ordinal, which RESETS per section; NEVER the global fkit number), THEN
+//       within that ONE entry match key===<name> OR normalizeLabel(label)===normalizeLabel(question).
+//       (The label bridge is safe ONLY because entry-scoping runs first: Reading/Speaking/Writing
+//       Proficiency labels repeat across entries but are distinct within one.)
+// A keyed/entry match is AUTHORITATIVE — a value mismatch is a real DISAGREE, never fall through (which
+// could false-agree against an unrelated field). checkbox → TRUEISH decides; else a single-pair tiered
+// compare (exact→containment→digits→region-abbrev→fuzzy≥90).
 //
-//   reviewItems   : [{label, value}]           scraped from the review page (display strings)
+// FALLBACK — records with no id/entry context (bare `{label,value}`, or a bundle field whose review span
+// carries a GENERATED id that matches no form-field name, e.g. the My-Info Legal Name/Address/Email/Phone
+// spans) flow through the PRESERVED legacy path: value-presence for distinctive values (a substring of
+// the page text, with digit + region-abbrev relief), label-anchoring for short "Yes"/"No" + checkboxes.
+// FILE_UPLOAD matches the resume filename by page-text containment. Unreplaced AI placeholders excluded;
+// an unchecked box is SKIPPED. EXTRA = a distinctive page value NOT explained by any recorded value.
+//
+//   reviewItems   : [{label, value, key?, entryOrdinal?, fkitPrefix?, isAttachment?}]  structured records
+//                   from cdpReadReviewPage (bare {label,value} still works → fallback path)
 //   bundleEntries : reviewSummary.entries[]     (question_label, current_value, fill_status,
 //                   widget_type, canonical_field, is_required, page_number, field_id)
 // Returns { agree, disagree, missing_on_review, extra_on_review, ambiguous, counts }.
@@ -453,7 +471,10 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
   // the label-anchored path instead, so "yes"/"no" verify the RIGHT question, not any stray "no".
   const AMBIGUOUS_SHORT = /^(yes|no|n\/?a|true|false)$/i;
   const items = (Array.isArray(reviewItems) ? reviewItems : [])
-    .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false }))
+    .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false,
+                    key: it && it.key != null ? String(it.key) : null,
+                    entryOrdinal: it && it.entryOrdinal != null ? it.entryOrdinal : null,
+                    fkitPrefix: it && it.fkitPrefix != null ? String(it.fkitPrefix) : null }))
     .filter((it) => it.label || it.value)
     .map((it) => ({ ...it, nlabel: normalizeLabel(it.label), nval: normalize(it.value) }));
 
@@ -485,6 +506,35 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
     if (ab && new RegExp("(^|[ ,])" + ab + "([ ,]|$)").test(pageText)) return "region-abbrev";
     return null;
   };
+  // Single-PAIR tiered value compare (the authoritative path — the two values are already the RIGHT
+  // field, so this only asks "are they equal enough?"): exact→containment→digits→region-abbrev→fuzzy≥90.
+  const valuesAgree = (recRaw, revRaw) => {
+    const a = normalize(recRaw), b = normalize(revRaw);
+    if (a === b) return true;
+    if (!a || !b) return false;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    if (short.length >= 4 && long.includes(short)) return true;
+    const ad = String(recRaw).replace(/\D+/g, ""), bd = String(revRaw).replace(/\D+/g, "");
+    if (ad.length >= 4 && bd.length >= 4 && (ad === bd || bd.includes(ad) || ad.includes(bd))) return true;
+    const ab = REGION_ABBREV[a]; if (ab && new RegExp("(^|[ ,])" + ab + "([ ,]|$)").test(b)) return true;
+    const ba = REGION_ABBREV[b]; if (ba && new RegExp("(^|[ ,])" + ba + "([ ,]|$)").test(a)) return true;
+    if (a.length >= 3 && b.length >= 3 && fuzzyRatio(a, b) >= 90) return true;
+    return false;
+  };
+  // A repeating canonical_field ("workExperience[0].jobTitle") → { section, index, path }; null if flat.
+  const parseCanonical = (cf) => {
+    const m = /^([A-Za-z_]+)\s*\[(\d+)\]\.(.+)$/.exec(String(cf == null ? "" : cf));
+    return m ? { section: m[1], index: parseInt(m[2], 10), path: m[3] } : null;
+  };
+  // field_id ("<page>::formField-<name>", where <name> may be "section[idx].field" for repeating) → the
+  // bare form-field name — the review span's id for a non-renamed field. Strips through the last
+  // "formField-" then a leading "section[idx]." (the repeating canonical embedded in the name).
+  const formFieldOf = (fieldId) => {
+    let s = String(fieldId == null ? "" : fieldId);
+    const i = s.lastIndexOf("formField-");
+    if (i !== -1) s = s.slice(i + "formField-".length);
+    return s.replace(/^[A-Za-z_]+\s*\[\d+\]\./, "");
+  };
 
   const agree = [], disagree = [], missing_on_review = [], ambiguous = [];
   let skipped = 0, placeholders = 0, claimed = 0;
@@ -509,20 +559,51 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
       continue;
     }
 
-    // ── checkbox: unchecked → skipped (not rendered); checked → its label must show "Yes" nearby. ──
+    // ── unchecked checkbox → skipped (the review page doesn't render it — absence isn't a bug). ──
+    if (wt === "checkbox" && !TRUEISH.test(cvs.trim())) { skipped++; continue; }
+
+    // ── AUTHORITATIVE id/entry-scoped match (structured records). Found ⇒ resolve here, NEVER fall
+    //    through (a keyed/entry mismatch is a real disagree — falling through to value-presence could
+    //    false-agree by finding the value in an unrelated field). Bare {label,value} records or an
+    //    unmatched form-field name yield no candidate → the legacy fallback below. ──
+    const ffName = formFieldOf(e.field_id);
+    const rep = parseCanonical(e.canonical_field);
+    let cand = null;
+    if (!rep) {
+      if (ffName) cand = items.find((it) => !it.used && it.entryOrdinal == null && it.key && it.key === ffName);
+    } else {
+      const fkBase = CANONICAL_TO_FKIT[rep.section] || rep.section;
+      const inEntry = items.filter((it) => !it.used && it.fkitPrefix === fkBase && it.entryOrdinal === rep.index + 1);
+      cand = (ffName ? inEntry.find((it) => it.key && it.key === ffName) : null)
+          || (nlabel ? inEntry.find((it) => it.nlabel && it.nlabel === nlabel) : null);
+    }
+    if (cand) {
+      cand.used = true;
+      if (wt === "checkbox") {
+        claimed++;
+        if (TRUEISH.test(cand.value.trim())) agree.push({ ...base, value_review: cand.value, tier: "checkbox-keyed" });
+        else disagree.push({ ...base, value_review: cand.value });
+      } else {
+        claimed++; claimedValues.push(nval);
+        if (valuesAgree(cvs, cand.value)) agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
+        else disagree.push({ ...base, value_review: cand.value });
+      }
+      continue;
+    }
+
+    // ── FALLBACK (legacy, VERBATIM) — checkbox label-anchor; then value-presence; then label-anchor. ──
     if (wt === "checkbox") {
-      if (!TRUEISH.test(cvs.trim())) { skipped++; continue; }
       claimed++;
       const cands = items.filter((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
       // PREFER a TRUEISH candidate first: with IDENTICAL repeating labels (two "I am fluent in this
       // language." rows — Chinese "No", English "Yes"), a CHECKED box must consume the "Yes", not the
       // first yes/no item (which may be another entry's "No" → false disagree). Then any yes/no-valued
       // item (the preferredCheck fix — a mislabeled distinctive value), then the first candidate.
-      const cand = cands.find((it) => TRUEISH.test(it.value.trim())) || cands.find((it) => /^(yes|no|true|false)$/i.test(it.value.trim())) || cands[0];
-      if (!cand) { missing_on_review.push(base); continue; }
-      cand.used = true;
-      if (TRUEISH.test(cand.value.trim())) agree.push({ ...base, value_review: cand.value, tier: "checkbox" });
-      else disagree.push({ ...base, value_review: cand.value });
+      const cbCand = cands.find((it) => TRUEISH.test(it.value.trim())) || cands.find((it) => /^(yes|no|true|false)$/i.test(it.value.trim())) || cands[0];
+      if (!cbCand) { missing_on_review.push(base); continue; }
+      cbCand.used = true;
+      if (TRUEISH.test(cbCand.value.trim())) agree.push({ ...base, value_review: cbCand.value, tier: "checkbox" });
+      else disagree.push({ ...base, value_review: cbCand.value });
       continue;
     }
 
