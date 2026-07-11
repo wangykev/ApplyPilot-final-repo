@@ -11,6 +11,9 @@ const { reconcileReviewPage, AI_NEEDS_ANSWER_MARK } = require("../lib.js");
 // Terse entry builder — only the fields reconcileReviewPage reads.
 const entry = (o) => Object.assign({ question_label: null, current_value: null, fill_status: "filled",
   widget_type: "text", canonical_field: null, is_required: false, page_number: 1, field_id: null }, o);
+// Structured review-RECORD builder (what cdpReadReviewPage now emits). Bare {label,value} still works
+// (all fields default to null → the record flows through the legacy value-presence fallback).
+const rrec = (o) => Object.assign({ label: null, value: "", key: null, entryOrdinal: null, fkitPrefix: null }, o);
 
 test("distinctive value present on the page → agree (value-presence, ignores label)", () => {
   const r = reconcileReviewPage(
@@ -95,6 +98,21 @@ test("checkbox: prefers the yes/no-valued item over a mislabeled distinctive one
   assert.strictEqual(r.counts.agree, 1);
   assert.strictEqual(r.counts.disagree, 0);
   assert.strictEqual(r.agree[0].tier, "checkbox");
+});
+
+test("checkbox: two IDENTICAL 'I am fluent' labels — a fluent language consumes the 'Yes', not another entry's 'No'", () => {
+  // Live bug (Magna, 2 languages): Chinese not fluent (false → skipped as unchecked), English fluent
+  // (true). The page shows both rows under the SAME label; English's true must AGREE with the 'Yes',
+  // not falsely DISAGREE against Chinese's 'No' (the first label-matching item).
+  const r = reconcileReviewPage(
+    [{ label: "I am fluent in this language.", value: "No" }, { label: "I am fluent in this language.", value: "Yes" }],
+    [
+      entry({ question_label: "I am fluent in this language.", current_value: "false", widget_type: "checkbox" }),
+      entry({ question_label: "I am fluent in this language.", current_value: "true", widget_type: "checkbox" }),
+    ]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "English's true must NOT disagree with Chinese's 'No'");
+  assert.strictEqual(r.counts.agree, 1, "English's true agrees with the 'Yes' row");
 });
 
 test("short but distinctive value (a 3-char name 'Doe') matches by presence", () => {
@@ -206,4 +224,122 @@ test("empty inputs are safe", () => {
   const r = reconcileReviewPage(null, null);
   assert.deepStrictEqual(r.counts, { claimed: 0, agree: 0, disagree: 0, missing_on_review: 0,
     extra_on_review: 0, ambiguous: 0, skipped: 0, placeholders: 0 });
+});
+
+// ── STRUCTURED-RECORD tests (id + section/entry-scoped matching, the 2026-07-10 rewrite). Records carry
+//    key (= the value-span id / form-field name), entryOrdinal (the PANEL ordinal, resets per section),
+//    fkitPrefix (section identity). These exercise the AUTHORITATIVE path; the cases above (bare
+//    {label,value}) prove the legacy fallback still holds. ──
+
+test("STRUCTURED: two-language fluent checkbox — entry-scoping picks English's 'Yes' (fixes false-positive #1)", () => {
+  // Chinese (entry 1, not fluent → skipped) and English (entry 2, fluent) share the IDENTICAL label
+  // "I am fluent in this language." and the SAME span key "native". Only entry-scoping (ordinal 2 →
+  // English) makes the checked box AGREE with the 'Yes', never DISAGREE against Chinese's 'No'.
+  const items = [
+    rrec({ key: "native", label: "I am fluent in this language.", value: "No", entryOrdinal: 1, fkitPrefix: "language" }),
+    rrec({ key: "native", label: "I am fluent in this language.", value: "Yes", entryOrdinal: 2, fkitPrefix: "language" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-language[0].native", canonical_field: "language[0]._allFluent", question_label: "I am fluent in this language.", current_value: "false", widget_type: "checkbox" }),
+    entry({ field_id: "P::formField-language[1].native", canonical_field: "language[1]._allFluent", question_label: "I am fluent in this language.", current_value: "true", widget_type: "checkbox" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.disagree, 0, "English's true must NOT disagree with Chinese's 'No'");
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.counts.skipped, 1);
+  assert.strictEqual(r.agree[0].tier, "checkbox-keyed");
+});
+
+test("STRUCTURED: flat screening questions match by hashed key === form-field name (fixes false-positive #2)", () => {
+  // The bundle's hashed questionnaire ids ARE the review span ids → authoritative key match, so short
+  // Yes/No screening answers verify against the RIGHT question (they used to be false MISSING).
+  const items = [
+    rrec({ key: "4f7c0000", label: "Are you eligible to work in Canada?", value: "No" }),
+    rrec({ key: "4f7c0003", label: "Are you over the age of 18?", value: "Yes" }),
+    rrec({ key: "4f7c0006", label: "Have you been convicted of a criminal offence…?", value: "No" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-4f7c0000", question_label: "Are you eligible to work in Canada?", current_value: "No", widget_type: "dropdown", is_required: true }),
+    entry({ field_id: "P::formField-4f7c0003", question_label: "Are you over the age of 18?", current_value: "Yes", widget_type: "dropdown", is_required: true }),
+    entry({ field_id: "P::formField-4f7c0006", question_label: "Have you been convicted of a criminal offence…?", current_value: "No", widget_type: "dropdown", is_required: true }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.agree, 3);
+  assert.strictEqual(r.counts.missing_on_review, 0);
+  assert.ok(r.agree.every((a) => a.tier === "keyed"), "flat key matches tag tier 'keyed'");
+});
+
+test("STRUCTURED: a keyed match with a different value is a real DISAGREE (no fall-through to value-presence)", () => {
+  // The bundle value "LinkedIn" IS present on the page (in an unrelated field), so a value-presence
+  // fall-through would false-AGREE. The authoritative key match on `source` must DISAGREE instead.
+  const items = [
+    rrec({ key: "source", label: "How Did You Hear About Us?", value: "Indeed" }),
+    rrec({ key: "misc", label: "Other", value: "my LinkedIn profile" }),
+  ];
+  const bundle = [ entry({ field_id: "P::formField-source", question_label: "How Did You Hear About Us?", current_value: "LinkedIn", widget_type: "typeahead" }) ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.disagree, 1);
+  assert.strictEqual(r.counts.agree, 0);
+  assert.strictEqual(r.disagree[0].value_review, "Indeed");
+});
+
+test("STRUCTURED: a bundle repeating entry beyond the live entries → missing (soft-delete/reorder → fallback)", () => {
+  // Bundle claims 3 languages; the page shows 2 entries. language[2] scopes to a non-existent panel 3 →
+  // no authoritative match → fallback → its distinctive value isn't on the page → missing (never a crash).
+  const items = [
+    rrec({ key: "language", label: "Language", value: "Chinese", entryOrdinal: 1, fkitPrefix: "language" }),
+    rrec({ key: "language", label: "Language", value: "English", entryOrdinal: 2, fkitPrefix: "language" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-language[0].language", canonical_field: "language[0].language", question_label: "Language", current_value: "Chinese", widget_type: "dropdown" }),
+    entry({ field_id: "P::formField-language[1].language", canonical_field: "language[1].language", question_label: "Language", current_value: "English", widget_type: "dropdown" }),
+    entry({ field_id: "P::formField-language[2].language", canonical_field: "language[2].language", question_label: "Language", current_value: "Spanish", widget_type: "dropdown" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.agree, 2, "Chinese + English entry-matched");
+  assert.strictEqual(r.counts.missing_on_review, 1);
+  assert.strictEqual(r.missing_on_review[0].canonical_field, "language[2].language");
+});
+
+test("STRUCTURED: website[i].url resolves through CANONICAL_TO_FKIT (website↔webAddress) to the panel", () => {
+  const items = [
+    rrec({ key: "url", label: "URL", value: "https://linkedin.com/in/kev", entryOrdinal: 1, fkitPrefix: "webAddress" }),
+    rrec({ key: "url", label: "URL", value: "https://github.com/kev", entryOrdinal: 2, fkitPrefix: "webAddress" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-website[0].url", canonical_field: "website[0].url", question_label: "URL", current_value: "https://linkedin.com/in/kev" }),
+    entry({ field_id: "P::formField-website[1].url", canonical_field: "website[1].url", question_label: "URL", current_value: "https://github.com/kev" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.agree, 2);
+  assert.strictEqual(r.counts.disagree, 0);
+  assert.ok(r.agree.every((a) => a.tier === "entry"));
+});
+
+test("STRUCTURED: hashed proficiency ids match by LABEL within the entry (distinct per entry, repeat across)", () => {
+  // The review span id for "Reading Proficiency" is a hash ≠ the bundle's renamed 'readingProficiency',
+  // so key match fails → the label bridge. Safe ONLY because entry-scoping runs first: the two records
+  // share the SAME hashed key AND the SAME label, separated only by their panel ordinal.
+  const items = [
+    rrec({ key: "5aaaedHASH", label: "Reading Proficiency", value: "Intermediate", entryOrdinal: 1, fkitPrefix: "language" }),
+    rrec({ key: "5aaaedHASH", label: "Reading Proficiency", value: "Fluent", entryOrdinal: 2, fkitPrefix: "language" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-language[0].readingProficiency", canonical_field: "language[0].reading", question_label: "Reading Proficiency", current_value: "Intermediate", widget_type: "dropdown" }),
+    entry({ field_id: "P::formField-language[1].readingProficiency", canonical_field: "language[1].reading", question_label: "Reading Proficiency", current_value: "Fluent", widget_type: "dropdown" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.agree, 2);
+  assert.strictEqual(r.counts.disagree, 0);
+  assert.ok(r.agree.every((a) => a.tier === "entry"));
+});
+
+test("STRUCTURED: a generated-id My-Info span (key matches no form-field name) falls through to value-presence", () => {
+  // The review span carries a build-generated id (wn5o5e) that matches no bundle form-field name → no
+  // authoritative match → the legacy value-presence path (unchanged) still finds the value on the page.
+  const items = [ rrec({ key: "wn5o5e", label: null, value: "Kevin Wangg" }) ];
+  const bundle = [ entry({ field_id: "P::formField-legalName--firstName", question_label: "First Name", current_value: "Kevin Wangg" }) ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "text", "value-presence fallback, not a keyed match");
 });

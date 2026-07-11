@@ -140,13 +140,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
-  // M3 SUBMIT replay WALK (DRY): replay the SAVED approved bundle page-by-page to the REVIEW page,
-  // verifying each field and advancing with the guarded clickPageNext — NEVER submits. [CDP-REPLAY-WALK].
+  // M3/M4 SUBMIT replay WALK: replay the SAVED approved bundle page-by-page to the REVIEW page,
+  // verifying each field, advancing with the guarded clickPageNext. authorize:true (M5 armed button)
+  // runs the M4 precondition gate at review and clicks SUBMIT once iff every check passes; otherwise
+  // DRY (reach review + stop). Defaults to DRY (message.authorize absent). [CDP-REPLAY-WALK].
   if (message.type === "RUN_CDP_REPLAY_WALK") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpReplayWalk(tab.id);
+      const out = await runCdpReplayWalk(tab.id, { authorize: message.authorize === true });
       sendResponse(out);
     });
     return true; // async sendResponse
@@ -1305,130 +1307,98 @@ async function runCdpQuestionsRecon(tabId) {
 }
 
 // SELF-CONTAINED (evaluated via cdpEval — closes over nothing). Read-only dump of the Workday REVIEW
-// page (the final application page that renders every filled value as read-only text). The review-page
-// DOM is UNTRACED, so rather than guess its shape this ANCHORS on the values we already know (passed in
-// as `valueHints` = the bundle's claimed [{label, value, widget}] entries): it locates each recorded
-// value's text on the page and walks up to its label. That is DOM-shape-agnostic and directly answers
-// "did this value make it onto the review page?". It ALSO keeps the generic strategies (dl / <label> /
-// two-leaf-row) so a row present with the WRONG value still surfaces (the disagree case), and returns
-// compact diagnostics (`anchor_samples` = ancestry of the first finds; a trimmed `raw` map) to refine
-// the generic pass later. The reconciler consumes `items`. Never throws; {ok:false,reason} if off-page.
-function cdpReadReviewPage(valueHints) {
+// page (the final application page that renders every filled value as read-only text). The review DOM
+// is highly REGULAR, so this emits STRUCTURED records keyed on STABLE hooks (never the build-variable
+// `css-*` emotion classes) rather than guessing from value-presence:
+//   • Each field's value is a leaf `<span id="KEY">` whose id IS the form-field name (`jobTitle`,
+//     `native`, `url`, a hashed questionnaire id, or a generated `wn5o5e`). The `<span id="attachments">`
+//     wrapper has element children so it's skipped; a "No Response" placeholder has no id so it's skipped.
+//   • The LABEL is `label[for="KEY"]` resolved WITHIN the field's own row/entry (NEVER document-wide —
+//     `for="native"/"url"/"jobTitle"` are DUPLICATED across repeating entries, so a global query returns
+//     only the first), or, when there's no <label>, the row's OWN richText <p> (the nearest ancestor
+//     holding EXACTLY ONE richText — NEVER the section container, which holds several and would collide).
+//   • entryOrdinal = the PANEL ordinal from the nearest `aria-labelledby$="-<N>-panel"` — it RESETS per
+//     section (Languages 1/2, Work Experience 1/2/3) and is the ONLY positional signal. fkitPrefix = the
+//     base of the nearest `data-fkit-id` matching "<base>-<N>--null" (section IDENTITY). fkitNum is a
+//     GLOBAL monotonic counter (differs every form instance) → captured as informational ONLY, never an
+//     ordinal. Attachment rows (`attachments-FileUpload`) → one record isAttachment:true, value = the
+//     joined file-upload-item-name texts.
+// The reconciler (reconcileReviewPage, PURE) matches these records by id + entry, not heuristics. The
+// `valueHints` param is kept for call-site compatibility but IGNORED. Never throws; {ok:false,reason}
+// if off-page. Returns { ok, url, sections, items, counts }.
+function cdpReadReviewPage(valueHints) { // valueHints IGNORED (matching is now id-driven)
   const container = document.querySelector('[data-automation-id="applyFlowReviewPage"]');
   const url = location.href;
   if (!container) return { ok: false, reason: "no-review-page", url };
-  const hints = Array.isArray(valueHints) ? valueHints : [];
 
-  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
-  const norm = (s) => clean(s).toLowerCase().replace(/\s*\(\+\d+\)\s*$/, ""); // mirror of lib.normalize
-  const normL = (s) => norm(s).replace(/[*\s]+$/, ""); // label form: also drop a trailing required "*"/"**"
-  const directText = (el) => { // text from THIS element's own text nodes only (labels/values are usually leaves)
-    let t = "";
-    for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent;
-    return clean(t);
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim(); // collapse ALL whitespace (labels)
+  const cleanVal = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim(); // value: newlines → spaces too
+  const stripStar = (s) => clean(s).replace(/[*\s]+$/, ""); // drop a trailing required "*"/"**"
+
+  // entryOrdinal — nearest ancestor whose aria-labelledby ends "-<N>-panel" (RESETS per section).
+  const ordinalOf = (el) => {
+    for (let a = el; a && a !== container; a = a.parentElement) {
+      const lb = a.getAttribute && a.getAttribute("aria-labelledby");
+      if (lb) { const m = /-(\d+)-panel$/.exec(lb); if (m) return parseInt(m[1], 10); }
+    }
+    return null;
   };
-  const depthOf = (el) => { let d = 0, p = el; while (p && p !== container) { d++; p = p.parentElement; } return d; };
-
-  const items = [];
-  const push = (label, value, via) => { const l = clean(label); if (l) items.push({ label: l, value: clean(value), via }); };
-
-  // ── (1) VALUE-ANCHORED (primary): find each known value's leaf on the page. The reconciler matches by
-  // value PRESENCE, not label (the review page has no reliable labels), so a found item is tagged with
-  // the HINT's own (correct) label; findLabel only upgrades to a real <label>/<dt> when the tenant has
-  // one (returns null otherwise — NO nearest-leaf fallback, which invented wrong labels). Every
-  // occurrence yields an item, so repeating rows pair correctly. ──
-  const leaves = Array.from(container.querySelectorAll("*")).filter((el) => el.children.length === 0 && clean(el.textContent));
-  const findLabel = (leaf) => {
-    let a = leaf;
-    for (let up = 0; up < 6 && a && a !== container; up++) {
-      a = a.parentElement;
-      if (!a) break;
-      for (const l of a.querySelectorAll("label, dt")) { if (!l.contains(leaf)) { const t = clean(l.textContent); if (t) return t; } }
+  // fkit identity — nearest ancestor data-fkit-id matching "<base>-<N>--null" (num = informational only).
+  const fkitOf = (el) => {
+    for (let a = el; a && a !== container; a = a.parentElement) {
+      const f = a.getAttribute && a.getAttribute("data-fkit-id");
+      if (f) { const m = /^(.+?)-(\d+)--null$/.exec(f); if (m) return { prefix: m[1], num: parseInt(m[2], 10) }; }
     }
-    return null; // no reliable label element — the reconciler doesn't need one (matches by value)
+    return { prefix: null, num: null };
   };
-  const anchorSamples = [];
-  for (const h of hints) {
-    const nv = norm(h && h.value);
-    if (nv.length < 4) continue; // too short to anchor safely (Yes/No/short) — rides the generic/label pass
-    for (const leaf of leaves) {
-      const lt = norm(leaf.textContent);
-      if (lt === nv || lt.includes(nv)) {
-        push(findLabel(leaf) || (h && h.label), leaf.textContent, "anchored");
-        if (anchorSamples.length < 6) {
-          const chain = []; let a = leaf;
-          for (let up = 0; up < 6 && a && a !== container; up++) {
-            chain.push({ tag: a.tagName.toLowerCase(), aid: a.getAttribute && a.getAttribute("data-automation-id"), own: directText(a) || null, depth: depthOf(a) });
-            a = a.parentElement;
-          }
-          anchorSamples.push({ hint: clean(h && h.value), labelFound: findLabel(leaf), chain });
-        }
-      }
+  // label — ROW/ENTRY-SCOPED. label[for=key] FIRST (nearest ancestor that contains it); else the nearest
+  // ancestor holding EXACTLY ONE richText's <p> text. NEVER document-wide, NEVER the multi-richText
+  // section container.
+  const labelOf = (span, key) => {
+    for (let a = span.parentElement, up = 0; a && a !== container && up < 8; up++, a = a.parentElement) {
+      const labs = a.getElementsByTagName("label");
+      for (let i = 0; i < labs.length; i++) if (labs[i].getAttribute("for") === key) { const t = stripStar(labs[i].textContent); if (t) return t; }
+    }
+    for (let a = span.parentElement, up = 0; a && a !== container && up < 8; up++, a = a.parentElement) {
+      const rts = a.querySelectorAll('[data-automation-id="richText"]');
+      if (rts.length === 1) { const p = rts[0].querySelector("p") || rts[0]; const t = stripStar(p.textContent); if (t) return t; }
+      if (rts.length > 1) break; // reached a multi-question container (e.g. -section) → stop, don't collide
+    }
+    return null;
+  };
+
+  // ONE document-order walk: track the current h3/h4 section; emit a record per leaf value span + per
+  // attachment widget.
+  const records = [];
+  let curSection = null;
+  for (const el of container.querySelectorAll("*")) {
+    const tag = el.tagName;
+    if (tag === "H3" || tag === "H4") { const t = clean(el.textContent); if (t) curSection = t; continue; }
+    const aid = el.getAttribute("data-automation-id");
+    if (aid === "attachments-FileUpload") {
+      const names = Array.prototype.map.call(el.querySelectorAll('[data-automation-id="file-upload-item-name"]'), (n) => clean(n.textContent)).filter(Boolean);
+      const fk = fkitOf(el);
+      records.push({ section: curSection, entryOrdinal: ordinalOf(el), fkitPrefix: fk.prefix, fkitNum: fk.num,
+                     key: null, label: "Attachments", value: names.join(" "), isAttachment: true });
+      continue;
+    }
+    if (tag === "SPAN" && el.id && el.children.length === 0) { // leaf value span; excludes <span id="attachments"> (has a <p>)
+      const value = cleanVal(el.textContent);
+      if (!value) continue;
+      const fk = fkitOf(el);
+      records.push({ section: curSection, entryOrdinal: ordinalOf(el), fkitPrefix: fk.prefix, fkitNum: fk.num,
+                     key: el.id, label: labelOf(el, el.id), value, isAttachment: false });
     }
   }
 
-  // ── (1b) LABEL-ANCHORED: for hints with a DISTINCTIVE label (≥12 chars — e.g. the screening
-  // questions), find the label TEXT as a leaf and read the value from the next non-label leaf. This is
-  // the ONLY way to capture a SHORT-valued field ("Yes"/"No") whose value can't be value-anchored. ──
-  const hintLabelSet = new Set(hints.map((h) => normL(h && h.label)).filter((s) => s.length >= 3));
-  for (const h of hints) {
-    const nl = normL(h && h.label); // normL, not norm: the bundle label carries a trailing required "*"/"**" the page leaf lacks
-    if (nl.length < 12) continue;
-    for (let i = 0; i < leaves.length; i++) {
-      const lt = normL(leaves[i].textContent);
-      if (lt === nl || lt.startsWith(nl) || (lt.length >= 12 && lt.includes(nl))) {
-        for (let j = i + 1; j < leaves.length && j <= i + 3; j++) {
-          const vt = clean(leaves[j].textContent);
-          if (vt && !hintLabelSet.has(normL(vt))) { push(h && h.label, vt, "label-anchored"); break; }
-        }
-        break;
-      }
-    }
-  }
-
-  // ── (2) GENERIC strategies (keep for the disagree case — a row present with a WRONG value). ──
-  const all = Array.from(container.querySelectorAll('[data-automation-id]'));
-  // definition lists: <dt> → following <dd>
-  for (const dl of container.querySelectorAll("dl")) {
-    const kids = Array.from(dl.children);
-    for (let i = 0; i < kids.length - 1; i++)
-      if (kids[i].tagName === "DT" && kids[i + 1].tagName === "DD") push(kids[i].textContent, kids[i + 1].textContent, "dl");
-  }
-  // <label> + its associated value (for= target, next sibling, or a sibling value node in the same row)
-  for (const lab of container.querySelectorAll("label")) {
-    const l = clean(lab.textContent);
-    if (!l) continue;
-    let val = "";
-    const forId = lab.getAttribute("for");
-    if (forId) { const t = document.getElementById(forId); if (t) val = t.value != null && t.value !== "" ? t.value : t.textContent; }
-    if (!val && lab.nextElementSibling) val = lab.nextElementSibling.textContent;
-    if (!val && lab.parentElement) for (const sib of lab.parentElement.children) { if (sib !== lab) { const s = clean(sib.textContent); if (s) { val = s; break; } } }
-    push(l, val, "label");
-  }
-  // two-leaf rows: an element whose only two text-bearing children are both leaves (label div + value div)
-  for (const el of all) {
-    const kids = Array.from(el.children).filter((c) => clean(c.textContent));
-    if (kids.length === 2 && kids.every((c) => c.children.length === 0)) push(kids[0].textContent, kids[1].textContent, "row2");
-  }
-
-  // dedupe by normalized label+value (NOT by `via` — the same pair caught by two strategies is one pair).
-  const seen = new Set(), uniq = [];
-  for (const it of items) { const k = norm(it.label) + "|" + norm(it.value); if (!seen.has(k)) { seen.add(k); uniq.push(it); } }
-
-  // section headings + a trimmed raw map (own-text nodes only, capped) — refinement material.
+  // section headings (logger/display only) + counts.
   const sections = [];
-  for (const h of container.querySelectorAll('h1,h2,h3,h4,[role="heading"]')) { const t = clean(h.textContent); if (t) sections.push({ tag: h.tagName.toLowerCase(), text: t }); }
-  const raw = [];
-  for (const el of all) {
-    if (raw.length >= 250) break;
-    const dt = directText(el);
-    if (!dt) continue;
-    raw.push({ aid: el.getAttribute("data-automation-id"), tag: el.tagName.toLowerCase(), depth: depthOf(el), text: dt });
-  }
+  for (const h of container.querySelectorAll("h3,h4")) { const t = clean(h.textContent); if (t) sections.push({ tag: h.tagName.toLowerCase(), text: t }); }
+  const entrySet = {};
+  for (const r of records) if (r.entryOrdinal != null && r.fkitPrefix) entrySet[r.fkitPrefix + "#" + r.entryOrdinal] = 1;
 
-  return { ok: true, url, container_found: true, section_count: sections.length, sections,
-           item_count: uniq.length, items: uniq, anchored_count: items.filter((i) => i.via === "anchored").length,
-           anchor_samples: anchorSamples, raw_count: raw.length, raw };
+  return { ok: true, url, sections, items: records,
+           counts: { records: records.length, entries: Object.keys(entrySet).length, attachments: records.filter((r) => r.isAttachment).length } };
 }
 
 // REVIEW-PAGE CHECK (end-to-end fill-verify): scrape the Workday review page (ground truth) via
@@ -1443,27 +1413,23 @@ async function runCdpReviewReconcile(tabId) {
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     LOG("attached. READ-ONLY: scrapes the review page's displayed values and diffs them vs the saved reviewSummary bundle. NEVER clicks Next/Submit. Run ON the final review page.");
 
-    // Read the saved bundle FIRST — its claimed values become value-anchor HINTS for the scraper
-    // (locate each recorded value on the page → derive its label; DOM-shape-agnostic).
+    // Read the saved bundle (the reconcile source of truth). The scraper is now id-driven — it does NOT
+    // need value hints, so nothing is passed to cdpReadReviewPage.
     const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
     const entries = bundle && Array.isArray(bundle.entries) ? bundle.entries : [];
-    const hints = entries
-      .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
-      .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
 
-    const dump = await cdpEval(cdpReadReviewPage, hints);
+    const dump = await cdpEval(cdpReadReviewPage);
     if (!dump || !dump.ok) {
       LOG("not on the review page (marker applyFlowReviewPage absent). reason:", dump && dump.reason, "· url:", dump && dump.url);
       return { ok: false, error: (dump && dump.reason) || "no-dump" };
     }
-    LOG(`review page: ${dump.item_count} label→value pair(s) scraped (${dump.anchored_count} value-anchored) · ${dump.section_count} section(s) · ${dump.raw_count} raw node(s).`);
+    LOG(`review page: ${dump.counts.records} record(s) — ${dump.counts.entries} repeating entr(y/ies) · ${dump.counts.attachments} attachment(s) · ${dump.sections.length} section(s).`);
     LOG("── SECTIONS ──"); for (const s of dump.sections) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(s));
-    LOG("── SCRAPED PAIRS (label · value · via) ──"); for (const it of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(it));
-    LOG("── ANCHOR SAMPLES (ancestry of the first value-anchored finds — the real field DOM) ──"); for (const a of dump.anchor_samples) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a));
+    LOG("── STRUCTURED RECORDS (section · entryOrdinal · fkitPrefix · key · label · value) ──"); for (const it of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(it));
 
     if (!entries.length) {
-      LOG("⚠ NO reviewSummary bundle in storage — run the fill/walk first so there's something to check against. (Scraped pairs above are still shown.)");
-      return { ok: true, url: dump.url, scraped: dump.item_count, reconciled: false, note: "no-bundle" };
+      LOG("⚠ NO reviewSummary bundle in storage — run the fill/walk first so there's something to check against. (Scraped records above are still shown.)");
+      return { ok: true, url: dump.url, scraped: dump.counts.records, reconciled: false, note: "no-bundle" };
     }
 
     const rec = reconcileReviewPage(dump.items, entries);
@@ -1474,11 +1440,11 @@ async function runCdpReviewReconcile(tabId) {
     else LOG("✓ no value disagreements among matched fields.");
     if (rec.missing_on_review.length) { LOG("⚠ FILLED IN BUNDLE, NOT FOUND ON REVIEW PAGE (value reverted to blank / label wording differs / unshown section):"); for (const m of rec.missing_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(m)); }
     if (rec.ambiguous.length) { LOG("? AMBIGUOUS label matches (repeating-section collisions):"); for (const a of rec.ambiguous) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a)); }
-    if (rec.extra_on_review.length) { LOG(`(info) ${rec.extra_on_review.length} review-page value(s) with no matching bundle entry (pre-filled / not recorded / scraper noise):`); for (const e of rec.extra_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(e)); }
-    // The raw map only matters when something didn't match — print it (capped) ONLY then, so a clean run stays quiet.
-    if (rec.missing_on_review.length) { LOG("── RAW NODES (own-text · automation-id · tag · depth) — refine the generic scraper from these ──"); for (const r of dump.raw) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(r)); }
+    if (rec.extra_on_review.length) { LOG(`(info) ${rec.extra_on_review.length} review-page value(s) with no matching bundle entry (pre-filled / not recorded / per-entry attachment):`); for (const e of rec.extra_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(e)); }
+    // On a MISSING, re-print the structured records so the operator can eyeball which field didn't stick.
+    if (rec.missing_on_review.length) { LOG("── STRUCTURED RECORDS (re-shown — locate the missing value) ──"); for (const r of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(r)); }
 
-    return { ok: true, url: dump.url, scraped: dump.item_count, reconciled: true, counts: c, disagree: rec.disagree, missing_on_review: rec.missing_on_review };
+    return { ok: true, url: dump.url, scraped: dump.counts.records, reconciled: true, counts: c, disagree: rec.disagree, missing_on_review: rec.missing_on_review };
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("review check aborted:", msg);
@@ -2201,8 +2167,9 @@ async function replayAttachResume(LOG) {
 // NO AI, NO AI-4 remediation (fill-path only). Reads the bundle from storage, NOT the profile. Keep the
 // tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
 const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
-async function runCdpReplayWalk(tabId) {
+async function runCdpReplayWalk(tabId, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
+  const authorize = !!(opts && opts.authorize); // per-run submit token (M4). false ⇒ DRY (reach review + stop).
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
@@ -2212,9 +2179,13 @@ async function runCdpReplayWalk(tabId) {
       return { ok: false, error: "no-bundle" };
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
-    LOG(`DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (no submit click exists yet). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
+    LOG(authorize
+      ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
+      : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
     const act = makeCdpActuation(await getLlmConfig()); // AI OFF for replay regardless (replayRepeatingSections passes aiContext:null; flat replayField never calls AI)
     const pagesReplayed = [];
+    const findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
+    let submitFired = false; // single-fire sentinel
 
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
@@ -2229,8 +2200,65 @@ async function runCdpReplayWalk(tabId) {
         return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
       if (nav && nav.applyFlowReviewPresent) {
-        LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified. NOT submitting (terminal; no submit click exists yet).`);
-        return { ok: true, stopped: "reached-review", reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified.`);
+        // ── REVIEW-PAGE EQUALITY (operator requirement) — the review page must DISPLAY exactly the
+        //    approved values. Scrape its label→value pairs and diff vs the approved bundle
+        //    (reconcileReviewPage — the SAME read-only check as the "review-page CHECK" button). A
+        //    DISAGREE (page shows a different value), a MISSING (approved value not shown), or a scrape
+        //    FAILURE (can't confirm) each becomes a HARD gate blocker. extra-on-page is logged, not
+        //    blocked (review boilerplate is noisy). Runs even DRY — the operator sees the diff preview. ──
+        const reviewDiff = { disagree: [], missing: [], scrapeFailed: false };
+        try {
+          const hints = bundle.entries
+            .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
+            .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
+          const dump = await cdpEval(cdpReadReviewPage, hints);
+          if (dump && dump.ok && Array.isArray(dump.items)) {
+            const rec = reconcileReviewPage(dump.items, bundle.entries);
+            const c = rec.counts;
+            reviewDiff.disagree = rec.disagree || [];
+            reviewDiff.missing = rec.missing_on_review || [];
+            LOG(`review page vs approved: AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING ${c.missing_on_review} · EXTRA ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous} (of ${c.claimed} value-bearing entries).`);
+            rec.disagree.forEach((d) => LOG(`    ≠ "${d.label || d.canonical_field || d.field_id}": approved "${d.value_bundle}" but the page shows "${d.value_review}"`));
+            rec.missing_on_review.forEach((m) => LOG(`    ∅ approved "${m.value_bundle}" ("${m.label || m.canonical_field || m.field_id}") is NOT shown on the review page`));
+            if ((rec.extra_on_review || []).length) { LOG(`    (${rec.extra_on_review.length} extra value(s) on the page not in the bundle — logged, NOT blocking:)`); rec.extra_on_review.slice(0, 6).forEach((x) => LOG(`      + "${x.value_review}" (${x.label || "?"})`)); }
+          } else {
+            LOG(`⚠ could NOT scrape the review page (${(dump && dump.reason) || "no items"}) — cannot confirm it matches the approved values → the gate will block.`);
+            reviewDiff.scrapeFailed = true;
+          }
+        } catch (e) {
+          LOG(`⚠ review-page diff failed: ${String((e && e.message) || e)} → the gate will block.`);
+          reviewDiff.scrapeFailed = true;
+        }
+
+        // ── M4 SUBMIT GATE — the ordered precondition check. Run it ALWAYS (even DRY) so the operator
+        //    sees a blocker list; clickSubmit fires ONLY when authorize===true AND every check passes. ──
+        let livePlaceholder = false;
+        try { livePlaceholder = await cdpEval(() => ((document.body && document.body.innerText) || "").indexOf("[NEEDS YOUR ANSWER") !== -1); } catch (e) { /* ignore — bundle check still applies */ }
+        const gate = submitPrecondition(bundle, nav, {
+          mismatches: findings.mismatches, cascadeRevealed: findings.cascadeRevealed, livePlaceholder,
+          reviewDisagree: reviewDiff.disagree, reviewMissing: reviewDiff.missing, reviewScrapeFailed: reviewDiff.scrapeFailed
+        }, { authorize, alreadyFired: submitFired });
+        if (!gate.ok) {
+          LOG(`submit gate: ${gate.blockers.length} blocker(s) — NOT submitting:`);
+          gate.blockers.forEach((b) => LOG(`    ✗ ${b}`));
+          if (!authorize) LOG(`(DRY run — reached review + stopped. When every blocker above is cleared, the armed Submit button will submit once.)`);
+          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        // GATE PASSED + authorized → the ONE irreversible click.
+        LOG(`✓ submit gate PASSED — clicking SUBMIT ONCE (authorized).`);
+        const subSig = cdpPageSig(await cdpEval(cdpPageScan));
+        const sub = await act.clickSubmit(true);
+        submitFired = true; // single-fire — never attempt a second submit this run
+        LOG(`clickSubmit:`, JSON.stringify(sub));
+        if (!sub.clicked) {
+          LOG(`⚠ clickSubmit refused (${sub.refused}${sub.blockedBy ? " — covered by " + sub.blockedBy : ""}) — NOT submitted. Eyeball the review page.`);
+          return { ok: true, stopped: "submit-refused:" + (sub.refused || "?"), reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        const res = await cdpWaitNextPage(subSig);
+        const confirmed = !!(res.advanced && !res.sessionDead && !res.maintenance);
+        LOG(confirmed ? `✓✓✓ SUBMITTED — the review page advanced (confirmation). Application submitted.` : `clickSubmit fired but no confirmed advance yet (${JSON.stringify(res)}) — VERIFY on the page.`);
+        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
 
       LOG(`──── REPLAY PAGE ${page} ────`);
@@ -2296,9 +2324,14 @@ async function runCdpReplayWalk(tabId) {
       if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.timeout) {
-        // DRY replay does NOT run AI-4 remediation (fill-path only). A nav-timeout means a required field
-        // is empty — most likely a CASCADE-REVEALED field the approved bundle never captured → HALT for
-        // re-review (re-open the summary, approve the revealed field, re-run). Report the live errors.
+        // CLEAN no-advance fallback first (operator ask): a swallowed Save & Continue re-clicks (up to 2x).
+        // Self-guards on error/session-death, so a real validation block still HALTS (never masked).
+        const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
+        if (reclick.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED during the re-click fallback on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+        if (reclick.advanced) { LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`); continue; }
+        // DRY replay does NOT run AI-4 remediation (fill-path only). Still stuck: a nav-timeout means a
+        // required field is empty — most likely a CASCADE-REVEALED field the approved bundle never
+        // captured → HALT for re-review (re-open the summary, approve the revealed field, re-run).
         let diag = {};
         try {
           const st = await cdpEval(cdpReadSessionState);
@@ -2306,7 +2339,7 @@ async function runCdpReplayWalk(tabId) {
           if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG("    • " + s)); }
           diag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null };
         } catch (e) { /* ignore */ }
-        LOG(`⚠ page ${page} did NOT advance (nav-timeout) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
+        LOG(`⚠ page ${page} did NOT advance (nav-timeout${reclick.errorsPresent ? ", real error present" : ", re-click fallback exhausted"}) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
         return { ok: true, stopped: "replay-blocked", nav_timeout_page: page, pages_replayed: pagesReplayed.length, pages: pagesReplayed, ...diag };
       }
       LOG(`✓ page ${page} → advanced.`);
@@ -2378,6 +2411,33 @@ async function runCdpPageRecon(tabId) {
 // pages on some tenants; dom-patterns).
 function cdpPageSig(scan) {
   return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
+}
+
+// A CLEAN no-advance fallback (operator ask, 2026-07-10, Magna page 1): Save & Continue registered
+// (clicked:true) but the page neither advanced nor showed a validation error — a SWALLOWED / no-op click
+// (a Workday debounce/timing miss). Re-click Save & Continue up to `tries` more times, re-waiting each
+// time. SAFETY: it re-clicks ONLY when the page is CLEAN — no error markers, not session-dead, not
+// already at review — so a real validation error is NEVER masked by a blind re-click (a real block
+// halts, as before). Used by BOTH walks after their normal timeout handling, before the give-up halt.
+async function reclickNextWhenClean(act, prevSig, tries, LOG) {
+  for (let i = 1; i <= tries; i++) {
+    let st = null;
+    try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* not-ready → treat as no-error, try the click */ }
+    if (st && st.applyFlowReviewPresent) return { advanced: true, reachedReview: true };  // it DID reach review
+    if (st && sessionLooksDead(st)) return { advanced: false, sessionDead: true, state: st };
+    const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+    if (samples.length || (st && st.errorPageText)) { LOG(`  re-click fallback: error text present — NOT re-clicking (a real validation block, not a swallowed click).`); return { advanced: false, errorsPresent: true }; }
+    LOG(`  re-click fallback ${i}/${tries}: clicked but no advance + no error/session-death — re-clicking Save & Continue.`);
+    await cdpWakePage();
+    const click = await act.clickPageNext();
+    if (!click.clicked) { LOG(`  re-click refused (${click.refused || "?"}) — stopping the fallback.`); return { advanced: false, refused: click.refused }; }
+    const res = await cdpWaitNextPage(prevSig);
+    if (res.advanced) return { advanced: true, attempts: i };
+    if (res.sessionDead) return { advanced: false, sessionDead: true, state: res.state };
+    if (res.maintenance) return { advanced: false, maintenance: true };
+    // still timeout → loop and try again
+  }
+  return { advanced: false, attempts: tries };
 }
 
 // Poll SW-side after Save & Continue: a fresh dead-session read FIRST (a dead session
@@ -2558,7 +2618,21 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after AI-4 remediation (${rem.attempts} attempt(s)).`);
           continue; // top-of-loop re-checks review/session on the new page
         }
-        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        // Operator ask (2026-07-10): a CLEAN no-advance (clicked:true but the page didn't move AND AI-4
+        // found NO error to fix) is a SWALLOWED Save & Continue → RE-CLICK it (up to 2x). Runs only after
+        // remediation confirmed there's nothing to remediate; reclickNextWhenClean self-guards on
+        // error/session-death, so a real validation block is never masked (it halts as before).
+        const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
+        if (reclick.sessionDead) {
+          LOG(`⚠⚠ SESSION EXPIRED during the re-click fallback on page ${page} — refresh, log in, reopen, retry.`);
+          const diag = await reportPageErrors(out);
+          return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+        }
+        if (reclick.advanced) {
+          LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
+          continue;
+        }
+        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
