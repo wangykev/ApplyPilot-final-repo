@@ -41,6 +41,42 @@ function meaningfulEntries(arr, keys) {
   return Array.isArray(arr) ? arr.filter((e) => e && ks.some((k) => nonEmpty(e[k]))) : [];
 }
 
+// Parse a Workday repeating-section ENTRY container's data-fkit-id into its section base +
+// entry index — the GENERIC replacement for the hardcoded prefix catalog. Shape is
+// "<base>-<N>--null" (N = Workday's internal, non-sequential index). Returns { base, index }
+// or null. The "-<digits>--null" anchor is load-bearing in BOTH exclusion directions:
+//   (a) it drops the date sub-wrappers that share the prefix ("workExperience-3--startDate"/
+//       "--endDate" → no "--null" → null), and
+//   (b) it drops the lone "<name>--null" containers that are NOT repeating entries (e.g. the
+//       page-1 "phoneNumber--null" → no "-<digits>-" index segment → null).
+// LOCKSTEP: cdp.js's cdpGenericRepeatingScan inlines this EXACT regex (it's stringified for
+// cdpEval and can't require this module). Change both together.
+function parseRepeatingFkit(fkitId) {
+  const m = /^(.+?)-(\d+)--null$/.exec(String(fkitId == null ? "" : fkitId).trim());
+  if (!m) return null;
+  return { base: m[1], index: parseInt(m[2], 10) };
+}
+
+// Parse a data-fkit-id into its full NESTED repeating PATH — a "--"-joined sequence of "<base>-<idx>"
+// levels + a trailing field ("null" = the deepest level's entry container). Generic for ANY depth: it's
+// the basis for detecting repeating-sections-inside-repeating-entries (cert → specialties →
+// "certification-54--specialties-5--specialtyParent" = [{certification,54},{specialties,5}], field
+// "specialtyParent"). Returns { levels:[{base,index}], field } or null (not a repeating fkit — e.g. a
+// lone "phoneNumber--null", whose first segment isn't "<base>-<idx>"). levels.length === depth; depth ≥ 2
+// = NESTED. LOCKSTEP: cdp.js cdpGenericNestedScan inlines this same split-on-"--" + /^(.+)-(\d+)$/ parse.
+function parseNestedFkit(fkitId) {
+  const parts = String(fkitId == null ? "" : fkitId).trim().split("--");
+  if (parts.length < 2) return null;
+  const field = parts[parts.length - 1];
+  const levels = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    const m = /^(.+)-(\d+)$/.exec(parts[i]);
+    if (!m) return null;
+    levels.push({ base: m[1], index: parseInt(m[2], 10) });
+  }
+  return { levels, field };
+}
+
 // Convenience wrapper for work_experience (entries with a job title or company).
 function meaningfulWorkExperience(arr) {
   return meaningfulEntries(arr, ["job_title", "company"]);
@@ -304,6 +340,32 @@ function mappedFieldsFromErrors(errorTexts, scanFields, fieldMap) {
   return [...out];
 }
 
+// AI-4 error-sample PREPROCESS (the 2026-07-01 live Tier-0 miss): Workday's top error-summary
+// banner CONCATENATES every error into ONE element ("Error-SpecialtyThe field Specialty is
+// required…Error-LanguageDuplicate language entries are not allowed."), and the M31 diagnostic
+// read truncated each sample — so any error past the first ~2 was INVISIBLE to the remediation
+// tiers (the dup-language hardcode never fired on a banner that plainly contained its error).
+// Split each sample on the per-error "Error-" prefix into individual error texts; drop success
+// toasts (the [role=alert] selector catches "…successfully uploaded" — not errors, just noise
+// in the count/AI prompt); dedupe. Feed THIS to the tiers, never the raw samples.
+function expandErrorSamples(samples) {
+  const out = [];
+  const seen = new Set();
+  for (const s of (Array.isArray(samples) ? samples : [])) {
+    const t = String(s == null ? "" : s).trim();
+    if (!t) continue;
+    for (const piece of t.split(/(?=\bError-)/)) {
+      const p = piece.trim();
+      if (!p) continue;
+      if (/successfully uploaded/i.test(p) && !/\berror\b/i.test(p)) continue; // success toast, not an error
+      if (seen.has(p)) continue;
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
 // AI-4 Tier-0 trigger: the known Magna/Workday phantom "Duplicate language entries are not allowed"
 // bug. Scoped to LANGUAGES only (operator-confirmed) — other sections' duplicate errors may be real.
 function isDuplicateLanguageError(errorTexts) {
@@ -345,8 +407,327 @@ function languageDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
+// US + Canada region name → postal abbreviation. Workday review pages render the address as ONE blob
+// with the abbreviation ("Tallahassee, FL"), not the spelled-out region a dropdown stored ("Florida"),
+// so a name↔abbrev equivalence stops a stored region from reading as a false "missing".
+const REGION_ABBREV = {
+  alabama:"al",alaska:"ak",arizona:"az",arkansas:"ar",california:"ca",colorado:"co",connecticut:"ct",delaware:"de",
+  florida:"fl",georgia:"ga",hawaii:"hi",idaho:"id",illinois:"il",indiana:"in",iowa:"ia",kansas:"ks",kentucky:"ky",
+  louisiana:"la",maine:"me",maryland:"md",massachusetts:"ma",michigan:"mi",minnesota:"mn",mississippi:"ms",missouri:"mo",
+  montana:"mt",nebraska:"ne",nevada:"nv","new hampshire":"nh","new jersey":"nj","new mexico":"nm","new york":"ny",
+  "north carolina":"nc","north dakota":"nd",ohio:"oh",oklahoma:"ok",oregon:"or",pennsylvania:"pa","rhode island":"ri",
+  "south carolina":"sc","south dakota":"sd",tennessee:"tn",texas:"tx",utah:"ut",vermont:"vt",virginia:"va",
+  washington:"wa","west virginia":"wv",wisconsin:"wi",wyoming:"wy","district of columbia":"dc",
+  alberta:"ab","british columbia":"bc",manitoba:"mb","new brunswick":"nb","newfoundland and labrador":"nl",
+  "nova scotia":"ns",ontario:"on","prince edward island":"pe",quebec:"qc",saskatchewan:"sk",
+};
+
+// Canonical-section name → data-fkit-id prefix. The ONLY divergence between the bundle's
+// canonical_field section name and the review page's fkit prefix is `website`↔`webAddress`
+// (workExperience / education / certification / language are identical on both sides). Mirrors
+// PAGE_SECTIONS' name↔containerPrefix (fill-driver.js) — LOCKSTEP, but lib.js can't import
+// fill-driver.js, so this table is the local source of truth. A section not listed here maps to
+// itself. (Websites ARE panelized on the review page — `Websites-1-panel`/`Websites-2-panel` — so
+// `webAddress` resolves through the normal entry-scoped path like every other repeating section.)
+const CANONICAL_TO_FKIT = { website: "webAddress" };
+
+// REVIEW-PAGE RECONCILIATION (the end-to-end fill-verify). The Workday review page (the final
+// application page) renders every value ACTUALLY in the form as read-only text — the ground truth of
+// what would be submitted. Compare it against what the extension RECORDED it filled (the accumulated
+// reviewSummary bundle's entries). A disagreement means the fill did not stick (the React value-revert
+// class the safety contract exists to catch) or the extension recorded a value that is not really on
+// the form — a bug to investigate.
+//
+// ID + SECTION/ENTRY-SCOPED, with a value-presence fallback (the 2026-07-10 rewrite). The review page's
+// DOM is highly regular: each field's value lives in a `<span id="KEY">` whose id IS the form-field name,
+// grouped into repeating entries by `role="group"` panels (`aria-labelledby$="-<N>-panel"`) and sections
+// by h3/h4. So `cdpReadReviewPage` now emits STRUCTURED records ({ key, label, entryOrdinal, fkitPrefix,
+// value, isAttachment }) and the AUTHORITATIVE match is by identity:
+//   (a) FLAT field  → the unused record with entryOrdinal===null && key===<form-field name>.
+//   (b) REPEATING   → SCOPE to the entry FIRST (fkitPrefix===CANONICAL_TO_FKIT(section) && entryOrdinal
+//       ===index+1 — the PANEL ordinal, which RESETS per section; NEVER the global fkit number), THEN
+//       within that ONE entry match key===<name> OR normalizeLabel(label)===normalizeLabel(question).
+//       (The label bridge is safe ONLY because entry-scoping runs first: Reading/Speaking/Writing
+//       Proficiency labels repeat across entries but are distinct within one.)
+// A keyed/entry match is AUTHORITATIVE — a value mismatch is a real DISAGREE, never fall through (which
+// could false-agree against an unrelated field). checkbox → TRUEISH decides; else a single-pair tiered
+// compare (exact→containment→digits→region-abbrev→fuzzy≥90).
+//
+// FALLBACK — records with no id/entry context (bare `{label,value}`, or a bundle field whose review span
+// carries a GENERATED id that matches no form-field name, e.g. the My-Info Legal Name/Address/Email/Phone
+// spans) flow through the PRESERVED legacy path: value-presence for distinctive values (a substring of
+// the page text, with digit + region-abbrev relief), label-anchoring for short "Yes"/"No" + checkboxes.
+// FILE_UPLOAD matches the resume filename by page-text containment. Unreplaced AI placeholders excluded;
+// an unchecked box is SKIPPED. EXTRA = a distinctive page value NOT explained by any recorded value.
+//
+//   reviewItems   : [{label, value, key?, entryOrdinal?, fkitPrefix?, isAttachment?}]  structured records
+//                   from cdpReadReviewPage (bare {label,value} still works → fallback path)
+//   bundleEntries : reviewSummary.entries[]     (question_label, current_value, fill_status,
+//                   widget_type, canonical_field, is_required, page_number, field_id)
+// Returns { agree, disagree, missing_on_review, extra_on_review, ambiguous, counts }.
+function reconcileReviewPage(reviewItems, bundleEntries) {
+  const TRUEISH = /^(true|yes|checked|selected|on|1)$/i;
+  // Values that are too generic to trust by page-presence (they appear all over the page) — these ride
+  // the label-anchored path instead, so "yes"/"no" verify the RIGHT question, not any stray "no".
+  const AMBIGUOUS_SHORT = /^(yes|no|n\/?a|true|false)$/i;
+  const items = (Array.isArray(reviewItems) ? reviewItems : [])
+    .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false,
+                    key: it && it.key != null ? String(it.key) : null,
+                    entryOrdinal: it && it.entryOrdinal != null ? it.entryOrdinal : null,
+                    fkitPrefix: it && it.fkitPrefix != null ? String(it.fkitPrefix) : null }))
+    .filter((it) => it.label || it.value)
+    .map((it) => ({ ...it, nlabel: normalizeLabel(it.label), nval: normalize(it.value) }));
+
+  // The whole review page as one lowercased blob (from the scraped item values) + its digits-only form.
+  const pageText = items.map((it) => it.value).join("  ").toLowerCase().replace(/\s+/g, " ");
+  const pageDigits = pageText.replace(/\D+/g, "");
+
+  const labelMatches = (a, b) => {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    return short.length >= 3 && long.includes(short);
+  };
+  const valueTier = (a, b) => { // value agreement for the label-anchored path (short values / disagree)
+    if (a === b) return a === "" ? "exact-blank" : "exact";
+    if (!a || !b) return null;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    if (short.length >= 4 && long.includes(short)) return "containment";
+    if (a.length >= 3 && b.length >= 3 && fuzzyRatio(a, b) >= 90) return "fuzzy";
+    return null;
+  };
+  // Is this DISTINCTIVE recorded value present on the page? Returns the tier or null.
+  const presentTier = (rawValue) => {
+    const nv = normalize(rawValue);
+    if (nv.length >= 2 && pageText.includes(nv)) return "text";
+    const vd = String(rawValue).replace(/\D+/g, "");
+    if (vd.length >= 4 && pageDigits.includes(vd)) return "digits";
+    const ab = REGION_ABBREV[nv];
+    if (ab && new RegExp("(^|[ ,])" + ab + "([ ,]|$)").test(pageText)) return "region-abbrev";
+    return null;
+  };
+  // Single-PAIR tiered value compare (the authoritative path — the two values are already the RIGHT
+  // field, so this only asks "are they equal enough?"): exact→containment→digits→region-abbrev→fuzzy≥90.
+  const valuesAgree = (recRaw, revRaw) => {
+    const a = normalize(recRaw), b = normalize(revRaw);
+    if (a === b) return true;
+    if (!a || !b) return false;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    if (short.length >= 4 && long.includes(short)) return true;
+    const ad = String(recRaw).replace(/\D+/g, ""), bd = String(revRaw).replace(/\D+/g, "");
+    if (ad.length >= 4 && bd.length >= 4 && (ad === bd || bd.includes(ad) || ad.includes(bd))) return true;
+    const ab = REGION_ABBREV[a]; if (ab && new RegExp("(^|[ ,])" + ab + "([ ,]|$)").test(b)) return true;
+    const ba = REGION_ABBREV[b]; if (ba && new RegExp("(^|[ ,])" + ba + "([ ,]|$)").test(a)) return true;
+    if (a.length >= 3 && b.length >= 3 && fuzzyRatio(a, b) >= 90) return true;
+    return false;
+  };
+  // A repeating canonical_field ("workExperience[0].jobTitle") → { section, index, path }; null if flat.
+  const parseCanonical = (cf) => {
+    const m = /^([A-Za-z_]+)\s*\[(\d+)\]\.(.+)$/.exec(String(cf == null ? "" : cf));
+    return m ? { section: m[1], index: parseInt(m[2], 10), path: m[3] } : null;
+  };
+  // field_id ("<page>::formField-<name>", where <name> may be "section[idx].field" for repeating) → the
+  // bare form-field name — the review span's id for a non-renamed field. Strips through the last
+  // "formField-" then a leading "section[idx]." (the repeating canonical embedded in the name).
+  const formFieldOf = (fieldId) => {
+    let s = String(fieldId == null ? "" : fieldId);
+    const i = s.lastIndexOf("formField-");
+    if (i !== -1) s = s.slice(i + "formField-".length);
+    return s.replace(/^[A-Za-z_]+\s*\[\d+\]\./, "");
+  };
+
+  const agree = [], disagree = [], missing_on_review = [], ambiguous = [];
+  let skipped = 0, placeholders = 0, claimed = 0;
+  const claimedValues = []; // normalized recorded values — drives the EXTRA computation
+
+  for (const e of (Array.isArray(bundleEntries) ? bundleEntries : [])) {
+    if (!e) continue;
+    const cv = e.current_value;
+    if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
+    if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
+    const wt = e.widget_type, cvs = String(cv), nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
+    const base = { label: e.question_label != null ? e.question_label : null, value_bundle: cvs,
+                   field_id: e.field_id != null ? e.field_id : null, widget_type: wt != null ? wt : null,
+                   canonical_field: e.canonical_field != null ? e.canonical_field : null,
+                   is_required: !!e.is_required, page_number: e.page_number != null ? e.page_number : null };
+
+    // ── file_upload: the resume filename must appear on the page (in the "Attachments" blob). ──
+    if (wt === "file_upload") {
+      claimed++; claimedValues.push(nval);
+      if (nval.length >= 3 && pageText.includes(nval)) agree.push({ ...base, value_review: cvs, tier: "file" });
+      else missing_on_review.push(base);
+      continue;
+    }
+
+    // ── unchecked checkbox → skipped (the review page doesn't render it — absence isn't a bug). ──
+    if (wt === "checkbox" && !TRUEISH.test(cvs.trim())) { skipped++; continue; }
+
+    // ── AUTHORITATIVE id/entry-scoped match (structured records). Found ⇒ resolve here, NEVER fall
+    //    through (a keyed/entry mismatch is a real disagree — falling through to value-presence could
+    //    false-agree by finding the value in an unrelated field). Bare {label,value} records or an
+    //    unmatched form-field name yield no candidate → the legacy fallback below. ──
+    const ffName = formFieldOf(e.field_id);
+    const rep = parseCanonical(e.canonical_field);
+    let cand = null;
+    if (!rep) {
+      if (ffName) cand = items.find((it) => !it.used && it.entryOrdinal == null && it.key && it.key === ffName);
+    } else {
+      const fkBase = CANONICAL_TO_FKIT[rep.section] || rep.section;
+      const inEntry = items.filter((it) => !it.used && it.fkitPrefix === fkBase && it.entryOrdinal === rep.index + 1);
+      cand = (ffName ? inEntry.find((it) => it.key && it.key === ffName) : null)
+          || (nlabel ? inEntry.find((it) => it.nlabel && it.nlabel === nlabel) : null);
+    }
+    if (cand) {
+      cand.used = true;
+      if (wt === "checkbox") {
+        claimed++;
+        if (TRUEISH.test(cand.value.trim())) agree.push({ ...base, value_review: cand.value, tier: "checkbox-keyed" });
+        else disagree.push({ ...base, value_review: cand.value });
+      } else {
+        claimed++; claimedValues.push(nval);
+        if (valuesAgree(cvs, cand.value)) agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
+        else disagree.push({ ...base, value_review: cand.value });
+      }
+      continue;
+    }
+
+    // ── FALLBACK (legacy, VERBATIM) — checkbox label-anchor; then value-presence; then label-anchor. ──
+    if (wt === "checkbox") {
+      claimed++;
+      const cands = items.filter((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
+      // PREFER a TRUEISH candidate first: with IDENTICAL repeating labels (two "I am fluent in this
+      // language." rows — Chinese "No", English "Yes"), a CHECKED box must consume the "Yes", not the
+      // first yes/no item (which may be another entry's "No" → false disagree). Then any yes/no-valued
+      // item (the preferredCheck fix — a mislabeled distinctive value), then the first candidate.
+      const cbCand = cands.find((it) => TRUEISH.test(it.value.trim())) || cands.find((it) => /^(yes|no|true|false)$/i.test(it.value.trim())) || cands[0];
+      if (!cbCand) { missing_on_review.push(base); continue; }
+      cbCand.used = true;
+      if (TRUEISH.test(cbCand.value.trim())) agree.push({ ...base, value_review: cbCand.value, tier: "checkbox" });
+      else disagree.push({ ...base, value_review: cbCand.value });
+      continue;
+    }
+
+    claimed++; claimedValues.push(nval);
+
+    // ── DISTINCTIVE value → value-presence (label-independent). A value is distinctive enough to trust
+    //    by presence when it is ≥4 chars, OR ≥3 and not a generic yes/no token (so a short name like
+    //    "Doe" — present in "John Doe" — is found, while a bare "Yes"/"No" stays on the label path). ──
+    if (nval.length >= 4 || (nval.length >= 3 && !AMBIGUOUS_SHORT.test(nval))) {
+      const tier = presentTier(cvs);
+      if (tier) { agree.push({ ...base, value_review: cvs, tier }); continue; }
+    }
+    // ── SHORT value (or a distinctive value not found) → label-anchored against the scraped items. ──
+    const cands = items.filter((it) => !it.used && it.nlabel && (it.nlabel === nlabel || labelMatches(it.nlabel, nlabel)));
+    if (cands.length) {
+      const ag = cands.find((it) => valueTier(nval, it.nval));
+      if (ag) { ag.used = true; agree.push({ ...base, value_review: ag.value, tier: "label" }); }
+      else if (cands.length === 1) { cands[0].used = true; disagree.push({ ...base, value_review: cands[0].value }); }
+      else ambiguous.push({ ...base, candidates: cands.map((it) => it.value) }); // can't confidently pick
+      continue;
+    }
+    missing_on_review.push(base); // recorded but nowhere on the page — the fill-didn't-stick signal
+  }
+
+  // EXTRA = a DISTINCTIVE page value (≥4 chars) not explained by ANY recorded value (either contains the
+  // other). Surfaces a value the form holds that the bundle doesn't — e.g. a language the summary deleted
+  // but the form kept. Short/ambiguous values ("Yes"/"No") are never "extra".
+  const explained = (nv) => claimedValues.some((cvn) => cvn && Math.min(cvn.length, nv.length) >= 4 && (cvn.includes(nv) || nv.includes(cvn)));
+  const seenExtra = new Set(), extra_on_review = [];
+  for (const it of items) {
+    const nv = it.nval;
+    if (nv.length < 4 || explained(nv) || seenExtra.has(nv)) continue;
+    seenExtra.add(nv);
+    extra_on_review.push({ label: it.label || null, value_review: it.value });
+  }
+
+  return {
+    agree, disagree, missing_on_review, extra_on_review, ambiguous,
+    counts: { claimed, agree: agree.length, disagree: disagree.length, missing_on_review: missing_on_review.length,
+              extra_on_review: extra_on_review.length, ambiguous: ambiguous.length, skipped, placeholders },
+  };
+}
+
+// ── Onboarding stage (JD → Apply → Apply Manually → auth → verify) helpers ────
+// The pre-form flow that runs BEFORE the fill walk. These are the PURE, testable
+// decisions; the DOM driving lives in the SW (background.js runCdpOnboard) over the
+// cdp.js primitives. Ported from the Playwright repo's applypilot/ats/workday.py —
+// same behavior, extension substrate.
+
+// The Apply-button chain (workday.py _APPLY_BUTTON_CHAIN): matched by
+// data-automation-id ONLY because the tag varies per tenant (an <a role=button> on
+// some, a <button> on others). Tried in order; FIRST present wins. `applyManually`
+// is included as the last rung — on tenants that surface the manual choice on the
+// listing itself, clicking it here is correct and the modal step then no-ops.
+const APPLY_BUTTON_CHAIN = [
+  { sel: '[data-automation-id="adventureButton"]', label: "Apply (job listing)" },
+  { sel: '[data-automation-id="continueButton"]', label: "Continue Application (returning user)" },
+  { sel: '[data-automation-id="applyManually"]', label: "Apply Manually" }
+];
+// NEVER click these (workday.py _REJECT_SELECTORS): reusing a prior application is
+// the wrong path — we always want a fresh manual fill.
+const APPLY_REJECT = [{ sel: '[data-automation-id="useMyLastApplication"]', label: "Use My Last Application" }];
+// Given the set of automation-id selectors PRESENT on the page, pick the first
+// chain entry to click (or null). Pure so the priority is unit-pinned.
+function pickApplyTarget(presentSelectors) {
+  const present = new Set(presentSelectors || []);
+  for (const c of APPLY_BUTTON_CHAIN) if (present.has(c.sel)) return c;
+  return null;
+}
+
+// Sign-in outcome classifier (workday.py _classify_sign_in_outcome). After submitting
+// the sign-in form, read the page's body text + form state and decide:
+//   "verify"           → Workday sent a verification email (→ the Gmail flow)
+//   "wrong_credentials"→ the account doesn't exist / creds rejected (→ create account)
+//   "success"          → a real Workday form widget is present AND no auth element
+//                        (the content-not-chrome gate — a progressBar/URL is NOT trusted)
+//   "unknown"          → none of the above (caller re-checks after a wait, else halts)
+// PRECEDENCE verify > wrong > success: the message text is decisive; success is the
+// fallback only when the page shows neither message and a genuine form has rendered.
+// `hasAuthEl` = any password field / sign-in|create submit / sign-in|create link is
+// still present (so a lingering auth screen is never mistaken for the form).
+const ONBOARD_VERIFY_RX = /email has been sent|verify your (account|email|identity)|check your (email|inbox)|verification (email|link|code)|we('| ?ha)?ve sent (you )?an? (email|verification)|confirm your email/i;
+const ONBOARD_WRONG_RX = /(wrong|incorrect|invalid) (email|e-?mail|password|user\s?name|login|credentials)|(email|e-?mail|user\s?name|password)[^.\n]{0,40}\b(incorrect|invalid|is not correct|do(es)? not match)|account (might be|is) locked|couldn'?t find (an )?account|no account (was )?(found|exists)|does not match our records/i;
+function classifyAuthOutcome(state) {
+  const s = state || {};
+  const t = String(s.bodyText || "");
+  if (ONBOARD_VERIFY_RX.test(t)) return "verify";
+  if (ONBOARD_WRONG_RX.test(t)) return "wrong_credentials";
+  if ((s.formFieldCount || 0) > 0 && !s.hasAuthEl) return "success";
+  return "unknown";
+}
+
+// Workday's transient soft-error page ("Something went wrong / Please refresh the
+// page and then try again."). The fix is a ONE-SHOT page reload then retry (the
+// reference's handle_auth_screen `refreshed` guard). Require BOTH the apology AND a
+// refresh/try-again cue so an ordinary field-validation "something's wrong" banner
+// can't trigger a needless reload. (workday.py _is_workday_error_page.)
+function isWorkdaySoftError(bodyText) {
+  const t = String(bodyText || "");
+  return /something went wrong|an? (unexpected )?error (has )?occurred|we('| ?a)?re sorry/i.test(t)
+    && /refresh (the|this) page|please refresh|try again/i.test(t);
+}
+
+// SSO / federated-login detection. The reference REFUSES SSO (a Workday tenant that
+// bounces to Okta/Ping/Azure/etc can't be driven with an email+password) — so we halt
+// for operator takeover rather than fumble. Two signals: an SSO-looking URL, or an
+// auth screen that shows a sign-in button but NO email/password field (a "Sign in with
+// …" redirect button). NOTE: a plain Workday login URL contains "login"/"signin" — that
+// is NOT SSO, so this uses a NARROW url pattern (idp/saml/okta/…), not the broad authUrl.
+function looksLikeSso(state) {
+  const s = state || {};
+  // A native "Sign in with email" button means Workday offers an email/password path (a
+  // social-login CHOOSER, e.g. Palo Alto Networks) — NOT a forced SSO redirect. Reveal it, don't halt.
+  if (s.signInWithEmail) return false;
+  const ssoUrl = /\bsso\b|[?&/](saml|idp|oidc|federation)\b|okta|pingidentity|pingone|onelogin|microsoftonline|\badfs\b|auth0|login\.gov/i.test(String(s.url || ""));
+  if (ssoUrl) return true;
+  // A sign-in button with NO email/password field AND no email-chooser button = a bare
+  // "Sign in with <provider>" redirect → SSO.
+  if (s.signInButtonPresent && !s.passwordInput && !s.emailInput) return true;
+  return false;
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
 }

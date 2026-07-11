@@ -23,6 +23,7 @@
 
 const root = document.getElementById("root");
 let currentBundle = null;            // the loaded reviewSummary, mutated in place on edit
+let lastRunAbort = null;             // { reason, detachReason, at } if the last run was cut short (operator Cancel/X → debugger detach)
 let currentFilter = "all";           // all | review | edited
 const collapsed = new Set();         // section keys the user collapsed
 const fieldRefreshers = new Map();   // field_id -> Set<fn>  (keeps every editor for a field in sync)
@@ -43,8 +44,24 @@ const el = (tag, props = {}, children = []) => {
 const fmt = (v) => (v == null || v === "" ? "—" : String(v));
 const norm = (v) => (v == null ? "" : String(v));
 const autofilledOf = (e) => (e.original_ai_value != null ? e.original_ai_value : e.current_value);
-const editKindOf = (e) => { const o = norm(e.original_ai_value), c = norm(e.current_value); if (o === c) return null; if (o === "") return "filled_blank"; if (c === "") return "cleared"; return "override"; };
+// Friendly page caption from a bundle/page (Plan 2): page_label wins; an "accumulated (N pages)"
+// envelope shows as-is; otherwise a cdpPageKey ("pathname|field,field,…") or the page-engine
+// field-set key collapses to its last path segment, never the raw composite string.
+const cleanPageName = (b) => {
+  if (!b) return "—";
+  if (b.page_label) return b.page_label;
+  const p = b.page;
+  if (typeof p === "string") {
+    if (/^accumulated/.test(p)) return p;
+    const seg = (p.split("|")[0] || p).split("/").filter(Boolean).pop();
+    if (seg) return seg;
+  }
+  return fmt(p);
+};
+// editKindOf / checkedOf / tokenFor / effectiveValue / approvalEnvelope / requiresApproval live in
+// summary-lib.js (loaded BEFORE this script — globals here, requireable in tests). Do NOT redeclare.
 const PARTIAL_NOTE = "Options the search surfaced — not the full list. Edit on the form for other values.";
+const TIER_NOTE = "Add candidate values, most specific first. On submit the fill tries each in order and uses the first that matches this field's options on the form.";
 const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle });
 
 // Section grouping. Keys = the REAL canonical-field prefixes the fill engine emits
@@ -64,6 +81,20 @@ const sectionOf = (e) => {
   return { key: "_other", label: "Other Fields", index: null };
 };
 
+// NESTED sub-section classifier (cert ▸ Specialties). sectionOf groups by the FIRST base[idx], so a
+// nested field/stub lands under its PARENT entry; nestedInfoOf then tells the per-entry renderer
+// whether an item is the parent's OWN field (null) or belongs to a nested sub-section:
+//   "<parent>[p].<child>[c].<field>" → { kind:"field", childBase, childIndex, field }
+//   "<parent>[p].<child>._stub"      → { kind:"stub",  childBase }
+const nestedInfoOf = (e) => {
+  const cf = e.canonical_field || "";
+  let m = cf.match(/^[A-Za-z_]+\[\d+\]\.([A-Za-z_]+)\[(\d+)\]\.(.+)$/);
+  if (m) return { kind: "field", childBase: m[1], childIndex: +m[2], field: m[3] };
+  m = cf.match(/^[A-Za-z_]+\[\d+\]\.([A-Za-z_]+)\._stub$/);
+  if (m) return { kind: "stub", childBase: m[1], childIndex: null, field: null };
+  return null; // the parent entry's own field (or a flat field)
+};
+
 // Review-card prominence predicates (UNCHANGED from the original viewer): prominence keys
 // off the FLAG, never confidence — a high-confidence reasoning-from-absence answer
 // (criminal→"No") must still be the most conspicuous, not buried.
@@ -76,29 +107,61 @@ const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
 // the riskiest committed AI answers → loudest, rendered FIRST (≥ legally-loaded).
 const isSuperHard = (e) => e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
 const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
+// Pre-populated: the value was ALREADY on the form (Workday account pre-fill / operator / prior
+// run) — ApplyPilot recorded it but never filled it. "-match" = it equals the profile value (unflagged).
+const isPrePopulated = (e) => e.flag === "already-filled" || e.flag === "already-filled-match";
 
 const addRefresher = (id, fn) => { if (!fieldRefreshers.has(id)) fieldRefreshers.set(id, new Set()); fieldRefreshers.get(id).add(fn); };
 // Shared write-back (M14): current_value ← pick (null = cleared), edit_kind/is_edited recomputed,
 // original_ai_value preserved, persisted, then EVERY editor for this field refreshed (sync).
+// Plan 2: a VALUE edit RESETS approval (a stale approval must never ride a changed value into
+// replay — the field re-enters the review pile), and the header approval strip is refreshed.
 const commit = (entry, val) => {
   entry.current_value = val === "" || val == null ? null : val;
   entry.edit_kind = editKindOf(entry); entry.is_edited = entry.edit_kind !== null;
+  if (entry.is_approved) { entry.is_approved = false; entry.approved_at = null; }
   persist();
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
+  updateApprovalUI();
+  // "I currently work here" controls whether the entry's "To" row shows — re-render to apply
+  // (mirrors the form removing the To box). render() preserves collapsed state.
+  if (isCurrentlyWorkHere(entry)) render();
 };
 
-// Checkbox value helpers — a toggle commits a token in the SAME family as the bot's value,
-// so flipping back to the original state reads as "not edited", not a false override.
-const checkedOf = (v) => v === true || /^(checked|true|yes|1|on)$/i.test(norm(v));
-const tokenFor = (orig, want) => {
-  if (typeof orig === "boolean") return want;
-  const fam = [["Checked", "Unchecked"], ["True", "False"], ["Yes", "No"], ["1", "0"], ["On", "Off"]];
-  const s = norm(orig).trim();
-  for (const [c, u] of fam) { if (s.toLowerCase() === c.toLowerCase()) return want ? s : u; if (s.toLowerCase() === u.toLowerCase()) return want ? c : s; }
-  return want ? "Checked" : "Unchecked";
+// Plan 2: per-field approval toggle. Sets is_approved + approved_at, persists, refreshes the
+// field's rows (the toggle + row tint) and the header strip — in place, no full re-render.
+const setApproved = (entry, on) => {
+  entry.is_approved = !!on; entry.approved_at = on ? new Date().toISOString() : null;
+  persist();
+  for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
+  updateApprovalUI();
 };
+// A REQUIRED field with no value can't be approved (it would block Save & Continue on the form) — the
+// per-field button AND the section button both refuse it. Empty OPTIONAL fields aren't flagged at all.
+const isEmptyVal = (e) => e.current_value == null || e.current_value === "";
+const canApprove = (e) => !(e.is_required && isEmptyVal(e));
+// Approve a whole SECTION at once (instead of per-field) — for already-filled / prefilled repeating
+// sections. A required-empty field is skipped (needs a value first); everything else is approved.
+const approveSection = (page, key) => {
+  const at = new Date().toISOString();
+  for (const e of currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key && requiresApproval(e))) {
+    if (!canApprove(e)) continue; // required + empty → needs a value first
+    e.is_approved = true; e.approved_at = at;
+  }
+  persist(); render();
+};
+// Reassigned each render() to recompute the envelope + repaint the header strip / submit button
+// without a full re-render. A no-op before the first render.
+let updateApprovalUI = () => {};
 
 // A 13px trash glyph (SVG via createElementNS — el() is textContent-only by design).
+// Read a picked File → base64 (strip the "data:...;base64," prefix) for IndexedDB storage (db.js).
+const fileToBase64 = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => { const s = String(r.result || ""); resolve(s.slice(s.indexOf(",") + 1)); };
+  r.onerror = () => reject(r.error);
+  r.readAsDataURL(file);
+});
 const svgTrash = () => {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
@@ -113,10 +176,184 @@ const svgTrash = () => {
 // is_deleted (skips the entry on submit) — nothing is removed from the bundle here.
 const entryFieldsOf = (page, key, index) => currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key && sectionOf(e).index === index);
 const setEntryDeleted = (page, key, index, del) => { for (const e of entryFieldsOf(page, key, index)) e.is_deleted = del; persist(); render(); };
+
+// 2b — ADD a repeating-section entry from review (the inverse of the soft-delete). The field
+// SHAPE comes from the highest-index EXISTING entry of the section (real widget_type / options /
+// required from the actual fill), or — for an EMPTY section — the stub's engine-emitted
+// section_field_shape (options unknown → the editor degrades to a text box + the form stays the
+// source of truth). A flat section returns [] (not addable, no button).
+const _stripEntryPrefix = (s, key) => String(s || "").replace(new RegExp("^" + key + "\\[\\d+\\]\\."), "");
+const sectionShapeFor = (page, key) => {
+  const ents = currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key);
+  const indexed = ents.filter((e) => sectionOf(e).index != null && !e.is_deleted);
+  // existing entry fields keyed by recName/path — so a DETECTED field can borrow the captured
+  // options (the scan reads the field SET, not the option lists).
+  const existingByRec = {};
+  for (const e of indexed) {
+    const r = _stripEntryPrefix(String(e.field_id).replace(/^.*formField-/, ""), key);
+    const p = _stripEntryPrefix(e.canonical_field, key);
+    if (r) existingByRec[r] = e; if (p && !(p in existingByRec)) existingByRec[p] = e;
+  }
+  const enrich = (s) => {
+    const ex = existingByRec[s.recName] || existingByRec[s.path];
+    return { recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required,
+      label: s.label != null ? s.label : s.recName,
+      options: ex ? ex.options : (s.options || null), captured_options: ex ? ex.captured_options : (s.captured_options || null),
+      tree_structure: ex ? ex.tree_structure : (s.tree_structure || null),
+      date_order: s.date_order || (ex ? ex.date_order : null) }; // m3c: segment order for the date editor
+  };
+  // (1) 2c: the DOM-DETECTED shape (the field SET read from the live form during the fill, cached
+  // on the bundle — covers a section even when EMPTY this run if it was populated before), enriched
+  // with any options captured for those fields. This is what makes add-entry NOT hardcoded.
+  const detected = currentBundle.section_shapes && currentBundle.section_shapes[key];
+  if (Array.isArray(detected) && detected.length) return detected.map(enrich);
+  // (2) clone from an existing entry (no detected shape — e.g. an older bundle without section_shapes)
+  if (indexed.length) {
+    const maxIx = Math.max(...indexed.map((e) => sectionOf(e).index));
+    return indexed.filter((e) => sectionOf(e).index === maxIx).map((e) => ({
+      recName: _stripEntryPrefix(String(e.field_id).replace(/^.*formField-/, ""), key),
+      path: _stripEntryPrefix(e.canonical_field, key),
+      widget_type: e.widget_type, is_required: e.is_required, label: e.question_label,
+      options: e.options, captured_options: e.captured_options, tree_structure: e.tree_structure,
+      date_order: e.date_order || null // carry the recon'd segment order → segmented date editor, not a text box
+    }));
+  }
+  // (3) cold fallback: the stub's map-derived shape (an empty section never yet seen populated)
+  const stub = ents.find((e) => e.widget_type === "section_stub" && Array.isArray(e.section_field_shape) && e.section_field_shape.length);
+  if (stub) return stub.section_field_shape.map((s) => ({ recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type, is_required: !!s.is_required, label: s.label != null ? s.label : s.recName, options: null, captured_options: null, tree_structure: null, date_order: s.date_order || null }));
+  return [];
+};
+const nextIndexFor = (page, key) => {
+  const idxs = currentBundle.entries.filter((e) => e.page === page && sectionOf(e).key === key).map((e) => sectionOf(e).index).filter((i) => i != null);
+  return idxs.length ? Math.max(...idxs) + 1 : 0; // include soft-deleted so a new index never collides
+};
+const addEntry = (page, key) => {
+  const shape = sectionShapeFor(page, key);
+  if (!shape.length) return;
+  const sample = currentBundle.entries.find((e) => e.page === page); // borrow page_number/label
+  const newIx = nextIndexFor(page, key);
+  const recs = newEntryRecords(shape, { page, pageNumber: sample ? sample.page_number : null, pageLabel: sample ? sample.page_label : null, sectionKey: key, index: newIx, at: new Date().toISOString() });
+  // If this section has recon'd NESTED sub-sections (cert ▸ Specialties — the shapes ride the
+  // section stub's nested_shapes, captured DURING the fill so they survive a deleted parent), attach a
+  // nested-section stub to the newly-added parent so its sub-section shows + is addable here too.
+  const nsStub = currentBundle.entries.find((e) => e.page === page && sectionOf(e).key === key && e.widget_type === "section_stub" && (e.nested_shapes || e.nested_attachments));
+  const baseRec = () => ({ // shared skeleton for an added nested item
+    page: page != null ? page : null, field_index: null,
+    is_required: false, current_value: null, original_ai_value: null,
+    is_edited: false, edit_kind: null, is_added: true, added_at: new Date().toISOString(),
+    is_approved: false, approved_at: null,
+    page_number: sample ? sample.page_number : null, page_label: sample ? sample.page_label : null,
+    confidence: "none", confidence_source: "added", fill_status: "not_filled", fill_error: null,
+    match_tier: null, options: null, captured_options: null, tree_structure: null, date_order: null, tiers: null, character_count: null
+  });
+  const nestedShapes = nsStub ? nsStub.nested_shapes : null;
+  if (nestedShapes) {
+    for (const childBase of Object.keys(nestedShapes)) {
+      const shp = nestedShapes[childBase];
+      if (!Array.isArray(shp) || !shp.length) continue;
+      recs.push(Object.assign(baseRec(), {
+        field_id: (page != null ? page + "::" : "") + "formField-" + key + "[" + newIx + "]." + childBase + "._stub",
+        question_label: humanize(childBase) + " (0)", widget_type: "nested_section_stub",
+        canonical_field: key + "[" + newIx + "]." + childBase + "._stub",
+        needs_review: true, needs_review_reason: "nested_section",
+        detail: "nested repeating sub-section (" + key + " ▸ " + childBase + ") — add or verify entries here",
+        flag: "nested-section-stub",
+        section_field_shape: shp.map((s) => ({ recName: s.recName, widget_type: s.widget_type, path: s.path != null ? s.path : s.recName, label: s.label, is_required: s.is_required, date_order: s.date_order || null, options: Array.isArray(s.options) ? s.options : null })),
+        container_prefix: key + "-<idx>--" + childBase + "-",
+        nested_parent: { base: key, index: newIx }, nested_child_base: childBase, section_known: false
+      }));
+    }
+  }
+  // detected per-entry attachment field (only when the form actually has one — never hardcoded)
+  if (nsStub && nsStub.nested_attachments) {
+    recs.push(Object.assign(baseRec(), {
+      field_id: (page != null ? page + "::" : "") + "formField-" + key + "[" + newIx + "].attachments",
+      question_label: "Attachments", widget_type: "file_upload",
+      canonical_field: key + "[" + newIx + "].attachments",
+      needs_review: true, needs_review_reason: "nested_attachment",
+      detail: "per-entry attachments — upload on the form", flag: "nested-attachment"
+    }));
+  }
+  currentBundle.entries.push(...recs);
+  persist(); render();
+  if (recs[0]) jumpToField(recs[0]);
+};
+// An operator-added entry never existed on the form, so its trash HARD-removes it (there's no
+// soft-delete state to preserve), unlike a form-derived entry (reversible soft-delete the replay
+// still honors).
+const removeAddedEntry = (page, key, index) => {
+  currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === page && sectionOf(e).key === key && sectionOf(e).index === index && e.is_added));
+  persist(); render();
+};
+
+// ── NESTED sub-section (cert ▸ Specialties) — Milestone C ──────────────────────────────────────
+// The next CHILD index for a parent entry's nested sub-section (canonical
+// "<parentKey>[<parentIx>].<childBase>[<n>].…"). Includes soft-deleted so an index never collides.
+const nextNestedIndexFor = (page, parentKey, parentIx, childBase) => {
+  const re = new RegExp("^" + parentKey + "\\[" + parentIx + "\\]\\." + childBase + "\\[(\\d+)\\]");
+  const idxs = currentBundle.entries.filter((e) => e.page === page)
+    .map((e) => { const m = String(e.canonical_field || "").match(re); return m ? +m[1] : null; })
+    .filter((i) => i != null);
+  return idxs.length ? Math.max(...idxs) + 1 : 0;
+};
+// ADD a nested child entry from review — mirrors addEntry but scoped INSIDE a parent entry. The
+// shape rides the nested stub (section_field_shape, reveal-by-add-discovered). Records carry the
+// session-scoped container_prefix + nested_parent/nested_child_base (the backend identifier a
+// future fill-back session reads). newEntryRecords does the rest (added_entry provenance).
+const addNestedEntry = (page, parentKey, parentIx, childBase, stubEntry) => {
+  const shape = (stubEntry.section_field_shape || []).map((s) => ({
+    recName: s.recName, path: s.path != null ? s.path : s.recName, widget_type: s.widget_type,
+    is_required: !!s.is_required, label: s.label != null ? s.label : s.recName,
+    options: Array.isArray(s.options) ? s.options : null, // scanned flat-typeahead options → combobox (tree → hierarchical → tier editor)
+    captured_options: null, tree_structure: null, date_order: s.date_order || null
+  }));
+  if (!shape.length) return;
+  const sample = currentBundle.entries.find((e) => e.page === page);
+  const ci = nextNestedIndexFor(page, parentKey, parentIx, childBase);
+  const recs = newEntryRecords(shape, { page, pageNumber: sample ? sample.page_number : null,
+    pageLabel: sample ? sample.page_label : null, sectionKey: parentKey + "[" + parentIx + "]." + childBase, index: ci, at: new Date().toISOString() });
+  recs.forEach((r) => { r.container_prefix = stubEntry.container_prefix || null; r.nested_child_base = childBase; r.nested_parent = stubEntry.nested_parent || { base: parentKey, index: parentIx }; });
+  currentBundle.entries.push(...recs);
+  persist(); render();
+  if (recs[0]) jumpToField(recs[0]);
+};
+// Render a nested sub-section as a sub-card WITHIN a parent entry: the stub's heading + note, each
+// existing child entry's fields (grouped by child index), and — in the "all" view — a "+ Add" that
+// builds child records from the stub's shape. `bucket` = [{ e, ni }] for this (parentIx, childBase).
+const renderNestedSub = (pg, parentSec, parentIx, childBase, bucket) => {
+  const stub = (bucket.find((x) => x.ni.kind === "stub") || {}).e;
+  const fieldItems = bucket.filter((x) => x.ni.kind === "field");
+  const card = el("div", { class: "nsub" });
+  const label = (stub && stub.question_label) || (humanize(childBase) + " (0)");
+  card.appendChild(el("div", { class: "nsub-head" }, [el("span", { class: "nsub-name", text: label })]));
+  if (stub && stub.detail) card.appendChild(el("div", { class: "nsub-note", text: stub.detail }));
+  const singular = humanize(childBase).replace(/ies$/i, "y").replace(/s$/, ""); // "Specialties" → "Specialty", "Attachments" → "Attachment"
+  const byCi = {}, ciOrder = [];
+  for (const x of fieldItems) { const ci = x.ni.childIndex; if (!(ci in byCi)) { byCi[ci] = []; ciOrder.push(ci); } byCi[ci].push(x.e); }
+  ciOrder.sort((a, b) => a - b);
+  for (const ci of ciOrder) {
+    const added = byCi[ci].some((e) => e.is_added);
+    const eh = el("div", { class: "nsub-eh" }, [el("span", { text: singular + " " + (ci + 1) + (added ? " · added" : "") })]);
+    if (added) { // same trash-icon Delete button as a top-level entry (was a bare "Remove" text button)
+      const rm = el("button", { class: "del", title: "Remove this added " + singular }, [svgTrash(), el("span", { text: "Remove" })]);
+      rm.addEventListener("click", () => { currentBundle.entries = currentBundle.entries.filter((e) => !(e.page === pg && e.is_added && new RegExp("^" + parentSec.key + "\\[" + parentIx + "\\]\\." + childBase + "\\[" + ci + "\\]").test(String(e.canonical_field || "")))); persist(); render(); });
+      eh.appendChild(rm);
+    }
+    card.appendChild(eh);
+    for (const e of byCi[ci]) card.appendChild(fieldRow(e));
+  }
+  if (currentFilter === "all" && stub && Array.isArray(stub.section_field_shape) && stub.section_field_shape.length) {
+    const add = el("button", { class: "add-entry", text: "+ Add " + singular.toLowerCase() });
+    add.addEventListener("click", () => addNestedEntry(pg, parentSec.key, parentIx, childBase, stub));
+    card.appendChild(add);
+  }
+  return card;
+};
 const entryHead = (sec, ix, page) => {
-  const h = el("div", { class: "ehead" }, [el("span", { class: "et", text: `Entry ${ix + 1}` })]);
-  const del = el("button", { class: "del", title: "Delete this entry" }, [svgTrash(), el("span", { text: "Delete" })]);
-  del.addEventListener("click", () => setEntryDeleted(page, sec.key, ix, true));
+  const added = entryFieldsOf(page, sec.key, ix).some((e) => e.is_added);
+  const h = el("div", { class: "ehead" }, [el("span", { class: "et", text: `Entry ${ix + 1}${added ? " · added" : ""}` })]);
+  const del = el("button", { class: "del", title: added ? "Remove this added entry" : "Delete this entry" }, [svgTrash(), el("span", { text: added ? "Remove" : "Delete" })]);
+  del.addEventListener("click", () => added ? removeAddedEntry(page, sec.key, ix) : setEntryDeleted(page, sec.key, ix, true));
   h.appendChild(del);
   return h;
 };
@@ -153,34 +390,164 @@ function buildEditor(entry) {
     inp.value = cur == null ? "" : String(cur);
     const box = el("div", { class: "ta-list", hidden: "" });
     wrap.appendChild(inp); wrap.appendChild(box);
+    // Fixed-position the list at the input's rect; flip UP when there isn't room below (so it's never
+    // cut off by the page/table bottom). Reposition on scroll while open.
+    const position = () => {
+      const r = inp.getBoundingClientRect();
+      box.style.left = r.left + "px"; box.style.width = r.width + "px";
+      const below = window.innerHeight - r.bottom;
+      if (below < 200 && r.top > below) { box.style.top = "auto"; box.style.bottom = (window.innerHeight - r.top + 2) + "px"; box.style.maxHeight = Math.max(120, Math.min(210, r.top - 12)) + "px"; }
+      else { box.style.bottom = "auto"; box.style.top = (r.bottom + 2) + "px"; box.style.maxHeight = Math.max(120, Math.min(210, below - 12)) + "px"; }
+    };
     const matches = () => { const q = inp.value.trim().toLowerCase(); return q === "" ? list.slice() : list.filter((o) => String(o).toLowerCase().includes(q)); };
     const pick = (v) => { onCommit(v); inp.value = entry.current_value == null ? "" : String(entry.current_value); if (v === "" || v == null) draw(true); else { box.hidden = true; box.textContent = ""; } };
     const draw = (all) => {
       box.textContent = "";
       const cr = el("div", { class: "ta-opt ta-clear", text: "— clear —" }); cr.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(""); }); box.appendChild(cr);
       for (const o of (all ? list.slice() : matches())) { const r = el("div", { class: String(o) === norm(entry.current_value) ? "ta-opt sel" : "ta-opt", text: String(o) }); r.addEventListener("mousedown", (ev) => { ev.preventDefault(); pick(String(o)); }); box.appendChild(r); }
-      box.hidden = false;
+      position(); box.hidden = false;
     };
-    inp.addEventListener("focus", () => { inp.select(); draw(true); });
+    const onScroll = () => { if (!box.hidden) position(); };
+    inp.addEventListener("focus", () => { inp.select(); window.addEventListener("scroll", onScroll, true); draw(true); });
     inp.addEventListener("input", () => draw(false));
     inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); const ms = matches(); if (ms.length) pick(String(ms[0])); } else if (ev.key === "Escape") box.hidden = true; });
-    inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; }, 150));
+    inp.addEventListener("blur", () => setTimeout(() => { box.hidden = true; window.removeEventListener("scroll", onScroll, true); }, 150));
     return { node: wrap, set: (v) => { inp.value = v == null ? "" : String(v); } };
   };
-  if (wt === "file_upload") return null;
+  // Segmented date inputs in the FORM's order + granularity (year-only / M-Y / M-D-Y, from the recon'd
+  // date_order) — NOT a browser <input type=date> (which shows the locale order → the dd/mm-vs-mm/dd
+  // bug). No recon'd order → a plain text box (don't guess). Commits "<a>/<b>/<c>" in the form's order.
+  const dateEditor = (order) => {
+    const segs = (Array.isArray(order) && order.length) ? order : null;
+    if (!segs) { const inp = el("input", { class: "editor", type: "text", placeholder: "date" }); inp.value = cur == null ? "" : String(cur); inp.addEventListener("change", () => onCommit(inp.value)); return { node: inp, set: (v) => { inp.value = v == null ? "" : String(v); } }; }
+    const meta = { month: { ph: "MM", max: 2 }, day: { ph: "DD", max: 2 }, year: { ph: "YYYY", max: 4 } };
+    const inputs = {}, wrap = el("div", { class: "date-seg" });
+    const combine = () => { const vals = segs.map((s) => (inputs[s].value || "").trim()); onCommit(vals.every((v) => v === "") ? "" : vals.join("/")); };
+    const parts0 = String(cur == null ? "" : cur).split("/");
+    segs.forEach((s, i) => {
+      if (i) wrap.appendChild(el("span", { class: "date-sep", text: "/" }));
+      const m = meta[s] || { ph: s, max: 4 };
+      const inp = el("input", { class: "editor date-part" + (s === "year" ? " yr" : ""), type: "text", inputmode: "numeric", placeholder: m.ph, maxlength: String(m.max) });
+      inp.value = parts0[i] || "";
+      inp.addEventListener("input", () => {
+        const digits = inp.value.replace(/\D/g, "").slice(0, m.max); // digits only
+        if (digits !== inp.value) inp.value = digits;
+        if (digits.length >= m.max && i < segs.length - 1) { const nxt = inputs[segs[i + 1]]; if (nxt) { nxt.focus(); nxt.select(); } } // auto-advance when full
+      });
+      inp.addEventListener("change", combine);
+      inputs[s] = inp; wrap.appendChild(inp);
+    });
+    return { node: wrap, set: (v) => { const p = String(v == null ? "" : v).split("/"); segs.forEach((s, i) => { if (inputs[s]) inputs[s].value = p[i] || ""; }); } };
+  };
+  // TIER editor (hierarchical / tree fields, e.g. certification): the operator supplies an ORDERED list
+  // of candidate values (most specific first) — the SAME shape the profile's tiered fields use, so it
+  // PORTS cleanly. Stored as entry.tiers; current_value tracks the TOP tier (approval / effectiveValue /
+  // edit-provenance keep working via the shared commit()).
+  // FUTURE FILL-BACK CONTRACT — two paths, per the operator's choice (the "add to profile" choice UI is
+  // a LATER feature; this session only produces entry.tiers):
+  //   (A) to-profile: write entry.tiers into the (newly-added) profile field — resolve() already consumes
+  //       an array as its candidate list, so the mapped typeahead fills, with the AI fallback on a no-match.
+  //   (B) application-only (default): the replay tries entry.tiers via matchCandidates against the live
+  //       options; if NONE match → DELETE the repeating entry + a "none of the tiers matched" note (this
+  //       is exactly the existing deleteOnNoMatch behavior — reuse it).
+  const tierEditor = () => {
+    // seed the list from an existing bot value (shown as tier 1) — display only; doesn't mark edited.
+    if (!Array.isArray(entry.tiers)) entry.tiers = (entry.current_value != null && entry.current_value !== "") ? [entry.current_value] : [];
+    const wrap = el("div", { class: "tier-ed" }), list = el("div", { class: "tier-list" });
+    // CURRENT FILLED VALUE — a read-only box ABOVE the candidate editor (operator ask 2026-07-05). The
+    // filled value used to appear ONLY as candidate "1." inside a list labeled "value to try", which
+    // read like it hadn't been filled. This box makes the actually-filled value unambiguous; the tier
+    // list below is the re-fill candidate order. Shows current_value (= top tier, the effective value).
+    const filled = el("div", { class: "tier-filled" });
+    const renderFilled = () => {
+      filled.textContent = "";
+      const v = entry.current_value, has = v != null && v !== "";
+      filled.appendChild(el("span", { class: "tier-filled-lb", text: "Filled" }));
+      filled.appendChild(el("span", { class: has ? "tier-filled-v" : "tier-filled-v empty", text: has ? String(v) : "— blank —" }));
+    };
+    const persist = () => commit(entry, (entry.tiers && entry.tiers.length) ? entry.tiers[0] : ""); // top tier → current_value
+    const render = () => {
+      renderFilled();
+      list.textContent = "";
+      (entry.tiers || []).forEach((t, i) => {
+        const rm = el("button", { class: "tier-rm", title: "remove", text: "×" });
+        rm.addEventListener("click", () => { entry.tiers.splice(i, 1); persist(); render(); });
+        list.appendChild(el("div", { class: "tier-item" }, [el("span", { class: "tier-n", text: (i + 1) + "." }), el("span", { class: "tier-t", text: String(t) }), rm]));
+      });
+    };
+    const inp = el("input", { class: "editor tier-in", type: "text", placeholder: "value to try" });
+    const addVal = () => { const v = inp.value.trim(); if (!v) return; entry.tiers = (entry.tiers || []).concat(v); inp.value = ""; persist(); render(); inp.focus(); };
+    inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); addVal(); } });
+    const btn = el("button", { class: "tier-try", text: "Try this next" });
+    btn.addEventListener("click", addVal);
+    wrap.appendChild(filled);
+    wrap.appendChild(el("div", { class: "tier-cap", text: "Values to try on re-fill (most specific first)" }));
+    wrap.appendChild(el("div", { class: "tier-add-row" }, [inp, btn]));
+    wrap.appendChild(list);
+    render();
+    return { node: wrap, set: () => { renderFilled(); }, tier: true };
+  };
+  if (wt === "file_upload") {
+    // A per-entry attachment the FORM offers (detected, flag "nested-attachment") → a real "Choose
+    // file…" picker; the chosen file is stored (base64 in IndexedDB, keyed per field) so a future
+    // fill-back attaches it, and current_value = the filename (marks it provided). The top-level
+    // resume / Documents stay display-only here (that's uploaded via the popup).
+    if (entry.flag !== "nested-attachment") return null;
+    // Workday attachment fields take MULTIPLE files → a multi-select picker. Each pick APPENDS to what's
+    // already chosen; all files are stored (base64 in IndexedDB, keyed per field) for a future fill-back,
+    // and current_value = the comma-joined filenames. A per-file "×" removes one.
+    const wrap = el("div", { class: "file-attach" });
+    const list = el("div", { class: "file-list" });
+    const inp = el("input", { type: "file", multiple: "" }); inp.style.display = "none";
+    const btn = el("button", { class: "file-btn", text: "+ Add file(s)…" });
+    const names = () => String(entry.current_value == null ? "" : entry.current_value).split(",").map((s) => s.trim()).filter(Boolean);
+    const store = async (arr) => {
+      onCommit(arr.join(", "));
+      try { if (typeof saveResume === "function") await saveResume({ key: "attachment:" + entry.canonical_field, filenames: arr, savedAt: new Date().toISOString() }); } catch (e) { /* best-effort */ }
+      drawList();
+    };
+    const drawList = () => {
+      list.textContent = "";
+      const arr = names();
+      if (!arr.length) { list.appendChild(el("span", { class: "file-status", text: "no files chosen" })); return; }
+      arr.forEach((nm, i) => {
+        const chip = el("span", { class: "file-chip" }, [el("span", { text: "✓ " + nm }), el("button", { class: "file-x", title: "remove", text: "×" })]);
+        chip.lastChild.addEventListener("click", () => { const next = names(); next.splice(i, 1); store(next); });
+        list.appendChild(chip);
+      });
+    };
+    btn.addEventListener("click", () => inp.click());
+    inp.addEventListener("change", async () => {
+      const files = Array.from(inp.files || []); if (!files.length) return;
+      const merged = names();
+      try {
+        const blobs = [];
+        for (const f of files) { if (!merged.includes(f.name)) merged.push(f.name); blobs.push({ filename: f.name, mime: f.type, size: f.size, base64: await fileToBase64(f) }); }
+        if (typeof saveResume === "function") await saveResume({ key: "attachment:" + entry.canonical_field, filenames: merged, files: blobs, savedAt: new Date().toISOString() });
+      } catch (e) { /* best-effort — the filenames still record intent */ }
+      onCommit(merged.join(", ")); inp.value = ""; drawList();
+    });
+    wrap.appendChild(list); wrap.appendChild(btn); wrap.appendChild(inp);
+    drawList();
+    return { node: wrap, set: () => drawList() };
+  }
+  if (wt === "section_stub") return null; // present-but-empty section → static card, no editor (Feature A; add-entry comes in 2b)
+  if (wt === "nested_section_stub") return null; // nested sub-section header → rendered by renderNestedSub, never a field row
   // TREE-AI (cert): the recon captured the chosen category's leaves → a searchable editor over them
   // (partial — only that category, not the whole tree). Checked before widget_type (cert is mis-tagged typeahead).
   if (entry.tree_structure && Array.isArray(entry.tree_structure.leaves) && entry.tree_structure.leaves.length) return Object.assign(combobox(entry.tree_structure.leaves), { partial: true });
   if (wt === "dropdown" && entry.options && entry.options.length) return selectFrom(entry.options);
   if (wt === "radio" && entry.options && entry.options.length) return selectFrom(entry.options);
+  if (wt === "radio") return Object.assign(textInput("input"), { partial: true }); // options not captured → free text + the partial note (don't silently degrade to a bare box)
   if (wt === "checkbox") {
     const cb = el("input", { class: "editor-check", type: "checkbox" });
     cb.checked = checkedOf(entry.current_value);
     cb.addEventListener("change", () => onCommit(tokenFor(entry.original_ai_value, cb.checked)));
     return { node: cb, set: (v) => { cb.checked = checkedOf(v); } };
   }
-  if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return Object.assign(textInput("input"), { partial: co.length > 0 }); }
-  if (wt === "hierarchical") { const opts = entry.options || entry.captured_options || []; if (opts.length > 2) return Object.assign(selectFrom(opts), { partial: true }); return Object.assign(textInput("input"), { partial: opts.length > 0 }); }
+  if (wt === "typeahead") { if (entry.options && entry.options.length) return Object.assign(combobox(entry.options), { partial: false }); const co = entry.captured_options || []; if (co.length > 2) return Object.assign(selectFrom(co), { partial: true }); return tierEditor(); } // no options recon'd (e.g. a NESTED specialty typeahead) → tier editor, not a bare box
+  if (wt === "hierarchical") return tierEditor(); // tree field → the user supplies ordered tier candidates
+  if (wt === "date") return dateEditor(entry.date_order);
   if (wt === "textarea") return textInput("textarea");
   return textInput("input"); // text / date / unknown
 }
@@ -206,6 +573,7 @@ const fieldRow = (e, opts = {}) => {
     else if (isEeoGuess(e)) lab.appendChild(el("span", { class: "lb eeo", text: "DEMOGRAPHIC" }));
     else if (needsAnswer(e)) lab.appendChild(el("span", { class: "lb crit", text: "NEEDS ANSWER" }));
     else if (isAiFlag(e) && !isSuperHard(e)) lab.appendChild(el("span", { class: "lb ai", text: "AI" }));
+    else if (isPrePopulated(e)) lab.appendChild(el("span", { class: "lb pre", text: "PRE-POPULATED" }));
   }
   lab.appendChild(document.createTextNode(fmt(e.question_label)));
   if (e.is_required) lab.appendChild(el("span", { class: "req", title: "required", text: "✱" }));
@@ -213,8 +581,45 @@ const fieldRow = (e, opts = {}) => {
 
   const val = el("div", { class: "val" });
   const ed = buildEditor(e);
-  if (ed) val.appendChild(ed.node); else val.appendChild(el("span", { class: e.current_value ? "static" : "static empty", text: fmt(e.current_value) }));
+  // Plan 2: editor + Approve toggle sit on ONE horizontal line (approve NEXT TO the box, not
+  // below — saves vertical space). The "autofilled" ref + partial note stay beneath.
+  const line = el("div", { class: "ved" });
+  if (ed) line.appendChild(ed.node); else line.appendChild(el("span", { class: e.current_value ? "static" : "static empty", text: fmt(e.current_value) }));
+  // an Approve toggle on every FLAGGED row (needs_review) — the explicit human sign-off the
+  // future SUBMIT gate reads. Un-flagged fields are approved-by-default → no toggle.
+  let apBtn = null;
+  let apNote = null;
+  if (requiresApproval(e)) {
+    apBtn = el("button", { class: "apbtn" });
+    apNote = el("span", { class: "approve-note", hidden: "" });
+    apBtn.addEventListener("click", () => {
+      // A required field with no value can't be approved — pop a note explaining WHY (instead of
+      // silently lighting green). Un-approving is always allowed.
+      if (!e.is_approved && !canApprove(e)) {
+        apNote.textContent = "Fill in this required field before approving.";
+        apNote.hidden = false;
+        clearTimeout(apNote._t); apNote._t = setTimeout(() => { apNote.hidden = true; }, 4000);
+        return;
+      }
+      if (apNote) apNote.hidden = true;
+      setApproved(e, !e.is_approved);
+    });
+    line.appendChild(apBtn); line.appendChild(apNote);
+  }
+  val.appendChild(line);
   if (ed && ed.partial) val.appendChild(el("div", { class: "partial-note", text: PARTIAL_NOTE }));
+  if (ed && ed.tier) val.appendChild(el("div", { class: "partial-note", text: TIER_NOTE }));
+  // Pre-populated note on EVERY view (the review list shows detail too; the ALL-FIELDS list doesn't
+  // — this small line is the operator's cue that the value was already there, not ApplyPilot's).
+  if (isPrePopulated(e)) val.appendChild(el("div", { class: "partial-note", text: e.flag === "already-filled-match"
+    ? "Pre-populated — matches your profile; not filled by ApplyPilot."
+    : "Pre-populated — not filled by ApplyPilot; verify it's what you want." }));
+  // A FLAGGED row's note shows in the PHYSICAL SECTION too, not just the review list (operator rule
+  // 2026-07-02: e.g. the kept-original "no candidate matched — 'Other - OTH' kept | AI rescue
+  // failed…" must be readable where the field lives). Pre-populated rows keep their friendlier line.
+  if (!opts.review && e.needs_review && e.detail && !isPrePopulated(e)) {
+    val.appendChild(el("div", { class: "partial-note", text: e.detail }));
+  }
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
   row.appendChild(val);
@@ -238,9 +643,14 @@ const fieldRow = (e, opts = {}) => {
     if (ed && ed.set) ed.set(e.current_value);
     const kind = editKindOf(e);
     afref.textContent = "";
-    if (kind) { afref.appendChild(document.createTextNode("autofilled: ")); afref.appendChild(el("b", { text: fmt(autofilledOf(e)) })); }
-    row.classList.toggle("f-crit", !!(e.needs_review && mustReplace(e)));
-    row.classList.toggle("f-warn", !!(e.needs_review && !mustReplace(e)));
+    // "autofilled: X" only when the BOT actually had a value (original_ai_value non-empty). A user-
+    // entered value on a bot-blank field (tiers, filled_blank, added entry) was NOT autofilled → no line.
+    if (kind && String(e.original_ai_value == null ? "" : e.original_ai_value) !== "") { afref.appendChild(document.createTextNode("autofilled: ")); afref.appendChild(el("b", { text: fmt(e.original_ai_value) })); }
+    if (apBtn) { apBtn.classList.toggle("on", !!e.is_approved); apBtn.textContent = e.is_approved ? "✓ Approved" : "Approve"; }
+    const approved = !!(e.needs_review && e.is_approved); // an approved flagged row reads green, not warn/crit
+    row.classList.toggle("f-approved", approved);
+    row.classList.toggle("f-crit", !approved && !!(e.needs_review && mustReplace(e)));
+    row.classList.toggle("f-warn", !approved && !!(e.needs_review && !mustReplace(e)));
     row.classList.toggle("f-edit", !e.needs_review && !!kind);
   };
   addRefresher(e.field_id, refresh); refresh();
@@ -250,6 +660,17 @@ const fieldRow = (e, opts = {}) => {
 const render = () => {
   const bundle = currentBundle;
   root.textContent = ""; fieldRefreshers.clear(); fieldRowNodes.clear();
+  // Operator-cancel banner (shown BEFORE the no-bundle check, so a cancel that stopped the fill before any
+  // summary was written still explains WHY there's nothing / why fields error). Cleared on the next run.
+  if (lastRunAbort) {
+    const op = lastRunAbort.reason === "operator-cancelled";
+    root.appendChild(el("div", { class: "abort-banner" }, [
+      el("span", { class: "abort-ico", "aria-hidden": "true", text: "⛔" }),
+      el("span", { class: "abort-txt", text: op
+        ? "This run was CANCELLED mid-fill by the operator — the debugger was detached (Cancel/X on Chrome's “started debugging” banner). Any errors are from that cancel, and the summary below may be incomplete or from an earlier page."
+        : "The last fill run ended early — the debugger detached" + (lastRunAbort.detachReason ? ` (${lastRunAbort.detachReason})` : "") + ". The summary below may be incomplete." }),
+    ]));
+  }
   if (!bundle || !Array.isArray(bundle.entries)) { root.appendChild(el("div", { class: "empty", text: "No summary yet — run a fill, then open “View last summary”." })); return; }
   const entries = bundle.entries;
   const live = entries.filter((e) => !e.is_deleted);           // deleted entries drop out of counts/list
@@ -263,7 +684,7 @@ const render = () => {
     el("div", { class: "brand" }, [
       el("div", { class: "logo", "aria-hidden": "true", text: "✈" }),
       el("div", { class: "title", text: "Review your application" }),
-      el("div", { class: "meta" }, [document.createTextNode(fmt(bundle.page)), el("span", { class: "d", text: "·" }), document.createTextNode(fmt(bundle.tenant)), el("span", { class: "d", text: "·" }), document.createTextNode(relTime(bundle.captured_at))]),
+      el("div", { class: "meta" }, [document.createTextNode(cleanPageName(bundle)), el("span", { class: "d", text: "·" }), document.createTextNode(fmt(bundle.tenant)), el("span", { class: "d", text: "·" }), document.createTextNode(relTime(bundle.captured_at))]),
     ]),
     el("div", { class: "toolbar" }, [
       el("button", { class: "tbtn", text: "Expand all", onclick: () => { collapsed.clear(); render(); } }),
@@ -281,6 +702,47 @@ const render = () => {
   if (liveCounts.error) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(liveCounts.error) })); info.appendChild(document.createTextNode(" error")); }
   if (removed) { info.appendChild(document.createTextNode("  ·  ")); info.appendChild(el("b", { text: String(removed) })); info.appendChild(document.createTextNode(" removed")); }
   bar.appendChild(info); root.appendChild(bar);
+
+  // ── approval strip (Plan 2) — progress over the FLAGGED fields + "Approve all reviewed" +
+  // a disabled-until-submit_ready "Approve & continue to submit" button that does NOT submit
+  // (SUBMIT/replay is Plan 1). Un-flagged fields are approved-by-default (not counted here). ──
+  const apbar = el("div", { class: "apbar" });
+  const apProg = el("div", { class: "ap-prog" });
+  const apTrack = el("div", { class: "ap-track" }, [el("div", { class: "ap-fill" })]);
+  const apFill = apTrack.firstChild;
+  const apAll = el("button", { class: "apbtn-all", text: "Approve all reviewed" });
+  const submitBtn = el("button", { class: "submit-btn", text: "Approve & continue to submit" });
+  const submitNote = el("div", { class: "submit-note" });
+  apAll.addEventListener("click", () => {
+    const at = new Date().toISOString();
+    // skip required-empty fields — they can't be approved until they have a value (they stay flagged,
+    // so submit_ready stays false, which is correct: an empty required field would block the form).
+    for (const e of currentBundle.entries.filter((e) => requiresApproval(e) && canApprove(e))) { e.is_approved = true; e.approved_at = at; }
+    persist();
+    for (const e of currentBundle.entries.filter(requiresApproval)) for (const fn of fieldRefreshers.get(e.field_id) || []) fn();
+    updateApprovalUI();
+  });
+  submitBtn.addEventListener("click", () => { /* SUBMIT/strict-replay is Plan 1 — intentionally inert here */ });
+  apbar.appendChild(apProg); apbar.appendChild(apTrack); apbar.appendChild(apAll); apbar.appendChild(submitBtn);
+  root.appendChild(apbar); root.appendChild(submitNote);
+
+  updateApprovalUI = () => {
+    const ap = approvalEnvelope(currentBundle.entries);
+    currentBundle.approval = ap; // kept in the in-memory bundle; persisted on the next write (toggle/edit/all)
+    const total = ap.to_approve_count, done = ap.approved_count;
+    apProg.textContent = "";
+    if (total === 0) { apProg.appendChild(el("b", { text: "Nothing flagged" })); apProg.appendChild(document.createTextNode(" — all fields approved by default")); }
+    else { apProg.appendChild(el("b", { text: `${done} / ${total}` })); apProg.appendChild(document.createTextNode(" flagged fields approved")); }
+    apFill.style.width = (total === 0 ? 100 : Math.round((done / total) * 100)) + "%";
+    apAll.disabled = total === 0 || done === total;
+    submitBtn.disabled = !ap.submit_ready;
+    submitNote.textContent = ap.submit_ready
+      ? "Ready to submit — but SUBMIT isn’t built yet (Plan 1). Your approvals are saved."
+      : ap.unreplaced_placeholders
+        ? `Replace ${ap.unreplaced_placeholders} AI placeholder${ap.unreplaced_placeholders > 1 ? "s" : ""} on the form, then approve the remaining flagged fields.`
+        : `Approve the ${ap.pending_count} remaining flagged field${ap.pending_count === 1 ? "" : "s"} to continue.`;
+  };
+  updateApprovalUI();
 
   // ── SUBMIT-BLOCKED banner (a REQUIRED field still holds an AI placeholder) ──
   const blocked = live.filter(needsAnswer);
@@ -309,11 +771,18 @@ const render = () => {
 const filterPass = (e) => currentFilter === "review" ? !!e.needs_review : currentFilter === "edited" ? !!editKindOf(e) : true;
 const groupKeys = () => { const seen = new Set(), out = []; for (const e of (currentBundle ? currentBundle.entries : [])) { const k = e.page + "||" + sectionOf(e).key; if (!seen.has(k)) { seen.add(k); out.push(k); } } return out; };
 
+const pageNumOf = (items) => { const e = items.find((x) => x.page_number != null); return e ? e.page_number : null; };
+const pageCaptionOf = (items, pg) => { const e = items.find((x) => x.page_label != null); if (e) return e.page_label; const n = pageNumOf(items); if (n != null) return "Page " + n; return cleanPageName({ page: pg }); };
+
 const renderFieldList = (mount) => {
   mount.textContent = "";
   const entries = currentBundle.entries;
   const pageOrder = [], pages = {};
   for (const e of entries) { if (!pages[e.page]) { pages[e.page] = []; pageOrder.push(e.page); } pages[e.page].push(e); }
+  // Plan 2: order pages by page_number (the walk's ordinal) when present, else keep first-
+  // appearance. sort() is stable → pages without an ordinal hold their insertion order. Fixes the
+  // re-run reordering (accumulateBundle appends a re-written page last; the ordinal restores order).
+  pageOrder.sort((a, b) => { const na = pageNumOf(pages[a]), nb = pageNumOf(pages[b]); if (na != null && nb != null) return na - nb; if (na != null) return -1; if (nb != null) return 1; return 0; });
   const multiPage = pageOrder.length > 1;
   let shown = false;
 
@@ -324,24 +793,54 @@ const renderFieldList = (mount) => {
 
     for (const g of order.map((k) => byKey[k])) {
       const key = pg + "||" + g.sec.key;
-      const repeating = g.sec.index != null;                       // base[idx] sections get per-entry headers + delete
-      const liveItems = g.items.filter((e) => !e.is_deleted);
+      // 2b: a section with real INDEXED entries SUPPRESSES its stub (it's no longer "empty");
+      // a stub-only or flat section renders its items normally.
+      const realItems = g.items.filter((e) => e.widget_type !== "section_stub");
+      const repeating = realItems.some((e) => sectionOf(e).index != null);  // base[idx] entries → per-entry headers + delete
+      const liveItems = (repeating ? realItems : g.items).filter((e) => !e.is_deleted);
 
       // build the body first — a group is only shown if it ends up with content
       const body = el("div", { class: "gbody" });
       if (repeating) {
         const idxOrder = [], byIdx = {};
-        for (const e of g.items) { const ix = sectionOf(e).index; if (!(ix in byIdx)) { byIdx[ix] = []; idxOrder.push(ix); } byIdx[ix].push(e); }
+        for (const e of realItems) { const ix = sectionOf(e).index; if (ix == null) continue; if (!(ix in byIdx)) { byIdx[ix] = []; idxOrder.push(ix); } byIdx[ix].push(e); }
         for (const ix of idxOrder) {
           const items = byIdx[ix];
           if (items.every((e) => e.is_deleted)) { if (currentFilter === "all") body.appendChild(deletedRow(g.sec, ix, pg)); continue; }
-          const vis = items.filter(filterPass);
+          // "I currently work here" CHECKED → drop this entry's "To" (endDate) row (mirror the form).
+          const vis = visibleEntryItems(items).filter(filterPass);
           if (!vis.length) continue;
           body.appendChild(entryHead(g.sec, ix, pg));
-          for (const e of vis) body.appendChild(fieldRow(e));
+          // Milestone C: split the parent entry's OWN fields from NESTED sub-sections (cert ▸
+          // Specialties). Own fields render as rows; each nested sub-section renders as a sub-card.
+          const own = vis.filter((e) => !nestedInfoOf(e));
+          for (const e of own) body.appendChild(fieldRow(e));
+          const nestedByChild = {}, childOrder = [];
+          for (const e of vis) { const ni = nestedInfoOf(e); if (!ni) continue; if (!(ni.childBase in nestedByChild)) { nestedByChild[ni.childBase] = []; childOrder.push(ni.childBase); } nestedByChild[ni.childBase].push({ e, ni }); }
+          for (const cb of childOrder) body.appendChild(renderNestedSub(pg, g.sec, ix, cb, nestedByChild[cb]));
         }
       } else {
         for (const e of g.items.filter((e) => !e.is_deleted && filterPass(e))) body.appendChild(fieldRow(e));
+      }
+      // 2b: "+ Add entry" for an addable repeating section (clones an existing entry's shape, or a
+      // stub's engine shape for an empty section). Only in the "all" view — keeps review/edited clean.
+      if (currentFilter === "all" && sectionShapeFor(pg, g.sec.key).length) {
+        const addBtn = el("button", { class: "add-entry", text: "+ Add entry" });
+        addBtn.addEventListener("click", () => addEntry(pg, g.sec.key));
+        body.appendChild(addBtn);
+      }
+      // Approve-by-SECTION: one button for all this section's flagged fields (instead of per-row).
+      // Shows for a REPEATING section with flagged fields; a required-empty field can't be approved
+      // (it's counted in the note), and empty OPTIONAL fields aren't flagged (they stay empty).
+      const secFlagged = g.items.filter((e) => !e.is_deleted && requiresApproval(e));
+      if (repeating && secFlagged.length) {
+        const pending = secFlagged.filter((e) => !e.is_approved);
+        const sb = el("button", { class: "sec-approve" + (pending.length ? "" : " done"), text: pending.length ? ("✓ Approve section (" + pending.length + ")") : "✓ Section approved" });
+        sb.disabled = pending.length === 0;
+        sb.addEventListener("click", () => approveSection(pg, g.sec.key));
+        body.appendChild(sb);
+        const blockedReq = secFlagged.filter((e) => e.is_required && (e.current_value == null || e.current_value === ""));
+        if (blockedReq.length) body.appendChild(el("div", { class: "sec-note", text: blockedReq.length + " required field(s) still need a value before this section can be fully approved" }));
       }
       if (!body.childNodes.length) continue;
 
@@ -355,14 +854,18 @@ const renderFieldList = (mount) => {
 
       const isC = collapsed.has(key);
       const visCount = liveItems.filter(filterPass).length;
+      // m3a: an UNKNOWN section shows under its REAL DOM heading (section_heading, carried on its
+      // stub) — e.g. "Volunteer Experience" — not the fkit-base camelCase, and never "unmapped".
+      const hd = g.items.find((e) => e.section_heading);
+      const groupLabel = (hd && hd.section_heading) || g.sec.label;
       const grp = el("div", { class: "grp" + (isC ? " collapsed" : "") });
-      const head = el("button", { class: "ghead", "aria-expanded": isC ? "false" : "true" }, [el("span", { class: "chev", text: "▾" }), el("span", { class: "gname", text: g.sec.label }), el("span", { class: "gcount", text: `(${visCount}${visCount !== liveItems.length ? " of " + liveItems.length : ""})` }), dots]);
+      const head = el("button", { class: "ghead", "aria-expanded": isC ? "false" : "true" }, [el("span", { class: "chev", text: "▾" }), el("span", { class: "gname", text: groupLabel }), el("span", { class: "gcount", text: `(${visCount}${visCount !== liveItems.length ? " of " + liveItems.length : ""})` }), dots]);
       head.addEventListener("click", () => { collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key); render(); });
       grp.appendChild(head); grp.appendChild(body); tbl.appendChild(grp);
     }
     if (!tbl.childNodes.length) continue;
     shown = true;
-    if (multiPage) mount.appendChild(el("div", { class: "pgcap", text: fmt(pg) }));
+    if (multiPage) mount.appendChild(el("div", { class: "pgcap", text: pageCaptionOf(pages[pg], pg) }));
     mount.appendChild(tbl);
   }
   if (!shown) mount.appendChild(el("div", { class: "empty", text: currentFilter === "review" ? "Nothing needs review." : "No edited fields yet." }));
@@ -379,8 +882,9 @@ const jumpToField = (e) => {
 const relTime = (iso) => { if (!iso) return "—"; const t = Date.parse(iso); if (isNaN(t)) return String(iso); const s = Math.round((Date.now() - t) / 1000); if (s < 45) return "just now"; if (s < 3600) return `${Math.round(s / 60)} min ago`; if (s < 86400) return `${Math.round(s / 3600)} h ago`; return new Date(t).toLocaleString(); };
 
 const load = () => {
-  chrome.storage.local.get("reviewSummary", ({ reviewSummary }) => {
+  chrome.storage.local.get(["reviewSummary", "lastRunAbort"], ({ reviewSummary, lastRunAbort: abort }) => {
     currentBundle = reviewSummary || null;
+    lastRunAbort = abort || null;
     render();
   });
 };

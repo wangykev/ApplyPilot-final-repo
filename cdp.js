@@ -34,8 +34,27 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source && source.tabId === cdpTabId) {
-    console.log("[ApplyPilot][CDP] chrome.debugger detached externally —", reason);
+    const operatorCancel = reason === "canceled_by_user"; // native infobar Cancel/X
+    console.log(operatorCancel
+      ? "[ApplyPilot][CDP] ⛔ OPERATOR CANCELLED mid-run — the debugger was detached (Cancel/X on the “started debugging” banner). The in-flight fill's CDP calls will now fail; THIS is the cause of any errors below. Tearing down the input-lock overlay."
+      : "[ApplyPilot][CDP] chrome.debugger detached externally — " + reason + " — the in-flight fill will error out. Tearing down the input-lock overlay.");
+    const tid = cdpTabId;
     cdpTabId = null;
+    inputLockActive = false;
+    // Persist the CAUSE so the aborted run's errors aren't mysterious: the popup + the summary page read
+    // `lastRunAbort` and show "operator cancelled mid-run" (cleared at the next cdpAttach — fresh session).
+    try { chrome.storage.local.set({ lastRunAbort: { reason: operatorCancel ? "operator-cancelled" : "debugger-detached", detachReason: reason || null, at: Date.now() } }); }
+    catch (e) { /* storage unavailable — the SW log above still names the cause */ }
+    // The native infobar "Cancel" detaches the debugger MID-RUN, which strands the "please don't click or
+    // type" input-lock overlay on the page: the run's finally → removeInputLock() goes through cdpEval,
+    // which now can't reach the (detached) page and silently no-ops. So tear the overlay down here via
+    // chrome.scripting (no debugger needed). cdpRemoveInputLock is self-contained + a no-op if never
+    // installed / the tab is gone. This is the "Cancel ⇒ detach + remove the lock banner" behavior.
+    // world:"MAIN" is LOAD-BEARING: the overlay was installed via cdpEval (CDP Runtime.evaluate → the page's
+    // MAIN world), so window.__apLock lives there. chrome.scripting defaults to the ISOLATED world, where
+    // __apLock is undefined → cdpRemoveInputLock would no-op and leave the banner stuck (the 2026-07-06 bug).
+    try { chrome.scripting.executeScript({ target: { tabId: tid }, world: "MAIN", func: cdpRemoveInputLock }).catch(() => {}); }
+    catch (e) { /* tab gone / no scripting host — nothing to clean */ }
   }
 });
 
@@ -44,7 +63,10 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 const cdpDelay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Attach to `tabId` and enable the domains we use (Runtime for evaluate, DOM for
-// the DOM.focus fallback; Input.* needs no enable). { ok } or { ok:false, error }.
+// the DOM.focus fallback, Page for addScriptToEvaluateOnNewDocument — the hidden-
+// tab SPA-transition override installer; Input.* needs no enable). The attach
+// SURVIVES same-tab navigation regardless of enabled domains — no re-injection.
+// { ok } or { ok:false, error }.
 function cdpAttach(tabId) {
   return new Promise((resolve) => {
     chrome.debugger.attach({ tabId }, "1.3", async () => {
@@ -53,10 +75,14 @@ function cdpAttach(tabId) {
         return;
       }
       cdpTabId = tabId;
-      _visCache = { visible: false, at: 0 }; // fresh foreground sampling per run (adaptive pacing)
+      try { chrome.storage.local.remove("lastRunAbort"); } catch (e) { /* ignore */ } // fresh session — drop any prior operator-cancel marker
+      _visCache = { visible: false, at: 0 };   // fresh foreground sampling per run (adaptive pacing)
+      _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
+      _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
+        await cdpSend("Page.enable", {}); // required for Page.addScriptToEvaluateOnNewDocument (cdpInstallPageOverrides)
         // Refresh the debug input-trace toggle per run (popup checkbox → chrome.storage.local).
         try { const { debugInputTrace } = await new Promise((r) => chrome.storage.local.get("debugInputTrace", r)); setInputTrace(!!debugInputTrace); } catch (e) { /* default stays OFF */ }
         resolve({ ok: true });
@@ -94,6 +120,160 @@ function cdpSend(method, params) {
   });
 }
 
+// Best-effort page WAKE: nudge a backgrounded tab out of Chrome's FROZEN lifecycle so Workday's
+// SPA page-to-page transition can run. A HIDDEN tab throttles timers to ~1Hz and pauses rAF; the
+// fill survives that (React schedules its commits on a channel that still runs), but the route
+// transition after "Save & Continue" stalls (the 2026-07-03 hidden page-2→3 stall — advances when
+// visible, never when hidden even with a 40s wait). setWebLifecycleState('active') resumes a frozen
+// page; it is a no-op / swallowed error if the page isn't frozen or the command isn't supported.
+// It does NOT spoof document.visibilityState (that would corrupt the adaptive-pacing sampler and
+// race the next page's fill) — only the freeze lifecycle. If this proves insufficient the cause is
+// pure rAF-pause, which only true tab visibility resumes.
+async function cdpWakePage() {
+  try { await cdpSend("Page.setWebLifecycleState", { state: "active" }); } catch (e) { /* best-effort — no-op if unsupported/not frozen */ }
+}
+
+// ── Navigation (onboarding stage) ────────────────────────────────────────────
+// The FILL/WALK never navigates (it drives whatever page is active). The ONBOARDING
+// stage does: it drives the tab from a job-description page through Apply → auth →
+// the verification LINK. Page is already enabled in cdpAttach, and the attach SURVIVES
+// navigation, so these are safe on the live attach. Both are SW-side (chrome.debugger),
+// throttle-immune, and never throw — { ok } / { ok:false, error }.
+
+// Navigate the attached tab to `url` (Page.navigate — the port of the reference's
+// page.goto for the verification link). Returns the frameId on success; errorText on
+// a blocked/failed navigation (e.g. a bad URL).
+async function cdpNavigate(url) {
+  try {
+    const res = await cdpSend("Page.navigate", { url: String(url) });
+    if (res && res.errorText) return { ok: false, error: res.errorText };
+    return { ok: true, frameId: res && res.frameId };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Reload the attached tab (Page.reload) — the fix for Workday's transient
+// "Something went wrong / Please refresh the page and then try again." soft-error:
+// the onboarding state machine reloads ONCE (guarded) and retries. ignoreCache:true
+// so a hard reload re-fetches a genuinely stuck SPA bundle.
+async function cdpReload() {
+  try { await cdpSend("Page.reload", { ignoreCache: true }); return { ok: true }; }
+  catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Force the page to behave as focused+active (Emulation.setFocusEmulationEnabled) — a best-effort
+// nudge to keep a HIDDEN/backgrounded tab REPAINTING. Some Workday SPA sub-view transitions (e.g.
+// the "Sign in with email" chooser→form reveal) defer on rAF, which Chrome pauses when the tab is
+// hidden; the worker-timer override handles most, but a page whose CSP blocks the blob worker leaves
+// the transition stalled (PANW's chooser, 2026-07-09). Focus-emulation is an independent lever that
+// can keep such a page rendering. Does NOT touch the SW-side cdpVisible pacing sampler (that reads
+// chrome.tabs, not page state), so adaptive pacing stays honest. No-op if unsupported.
+async function cdpSetFocusEmulation(enabled) {
+  try { await cdpSend("Emulation.setFocusEmulationEnabled", { enabled: !!enabled }); return true; }
+  catch (e) { return false; }
+}
+
+// ── Hidden-tab SPA-transition unblock (2026-07-03) ───────────────────────────
+// A HIDDEN/minimized tab has requestAnimationFrame FULLY PAUSED (and timers
+// throttled to ~1Hz). The CDP fill survives that (React commits on a channel that
+// still runs backgrounded — 40 fields audit clean hidden), but Workday's page-to-
+// page SPA ROUTE TRANSITION after "Save & Continue" defers on rAF, so it never
+// runs while hidden → the walk stalls at page 2 (live-diagnosed: the errors clear
+// 2→0 but the page never advances, even in a 40s wait; a VISIBLE tab advances).
+// FIX: repoint requestAnimationFrame at setTimeout — a paused-forever rAF becomes
+// an eventually-firing timer (~1fps under the background throttle, enough to
+// unblock a one-shot router "next frame" defer). hasFocus() is patched to true
+// (Workday gates some logic on focus; it is a METHOD, not a getter).
+//
+// Installed at attach (cdpInstallPageOverrides): addScriptToEvaluateOnNewDocument
+// covers any FUTURE full document load / session refresh; a Runtime.evaluate of
+// the SAME source patches the CURRENT already-loaded SPA doc (the walk attaches
+// when the operator is already on the form — the SPA never reloads, so the new-
+// document hook alone would never fire). __apOverridesInstalled makes both idempotent.
+//
+// STAGE 1 (2026-07-04): the override now ALSO installs a WORKER-TIMERS polyfill so a
+// hidden tab runs FAST, not just correct. rAF→setTimeout alone still fires at ~1fps
+// hidden (setTimeout is throttled to ~1Hz), so the fill worked hidden but crawled.
+// Timers routed through a Web Worker escape Chrome's main-thread background throttle
+// (the callback returns via postMessage, which isn't throttled) — so the page's own
+// debounced reactions (typeahead filter, dropdown render, section mounts) run at
+// full speed hidden, and our pacing can follow (see cdpFast/cdpTimersFast). The
+// worker install is BEST-EFFORT (Workday CSP may block blob: workers): its own
+// try/catch sets window.__apWorkerTimers true/false and NEVER stops the rAF override
+// (which installs after it). When the worker is unavailable we fall back to native
+// (throttled) timers → measured slow → the pacing stays full → byte-identical to the
+// pre-Stage-1 slow-but-correct path. rAF's inner window.setTimeout is worker-backed
+// when available, so rAF fires fast too. Set window.__apWorkerTimers is read back by
+// cdpInstallPageOverrides into _workerTimersActive.
+//
+// forceNoWorker (the forceWorkerTimersOff debug flag): skip the worker block and set
+// __apWorkerTimers=false — simulates a CSP-blocked tenant so the no-regression slow
+// path can be exercised on demand (Workday's real CSP is an empirical unknown).
+let _workerTimersActive = false; // did the worker-timers polyfill install on the CURRENT doc? (set by cdpInstallPageOverrides readback; reset at attach)
+
+function buildOverrideSrc(opts) {
+  const forceNoWorker = !!(opts && opts.forceNoWorker);
+  const workerBlock = forceNoWorker
+    ? `window.__apWorkerTimers = false; /* forceWorkerTimersOff — simulate a CSP-blocked tenant (slow-path test) */`
+    : `try {
+      var __wsrc = "var m={};onmessage=function(e){var d=e.data;" +
+        "if(d.c==='s'){m[d.i]=setTimeout(function(){delete m[d.i];postMessage(d.i);},d.ms);}" +
+        "else if(d.c==='v'){m[d.i]=setInterval(function(){postMessage(d.i);},d.ms);}" +
+        "else{clearTimeout(m[d.i]);clearInterval(m[d.i]);delete m[d.i];}};";
+      var __w = new Worker(URL.createObjectURL(new Blob([__wsrc], { type: "application/javascript" }))); // THROWS if CSP blocks blob: workers
+      var __cbs = {}, __seq = 1;
+      var __toFn = function (f) { if (typeof f === "function") return f; try { return new Function(f); } catch (x) { return function () {}; } };
+      __w.onmessage = function (e) { var r = __cbs[e.data]; if (!r) return; if (r.once) delete __cbs[e.data]; try { r.fn.apply(null, r.args); } catch (x) {} };
+      window.setTimeout = function (fn, ms) { var i = __seq++; __cbs[i] = { fn: __toFn(fn), args: [].slice.call(arguments, 2), once: true }; __w.postMessage({ c: "s", i: i, ms: ms || 0 }); return i; };
+      window.setInterval = function (fn, ms) { var i = __seq++; __cbs[i] = { fn: __toFn(fn), args: [].slice.call(arguments, 2), once: false }; __w.postMessage({ c: "v", i: i, ms: ms || 0 }); return i; };
+      window.clearTimeout = function (i) { delete __cbs[i]; __w.postMessage({ c: "x", i: i }); };
+      window.clearInterval = function (i) { delete __cbs[i]; __w.postMessage({ c: "x", i: i }); };
+      window.__apWorkerTimers = true;
+    } catch (e) { window.__apWorkerTimers = false; }`;
+  return `(function () {
+  try {
+    if (window.__apOverridesInstalled) return;
+    window.__apOverridesInstalled = true;
+    Document.prototype.hasFocus = function () { return true; };
+    // (S1) worker-timers FIRST (own try/catch) — so the rAF polyfill below picks up
+    // the worker-backed window.setTimeout and fires fast, not ~1fps, when hidden.
+    ${workerBlock}
+    // rAF→setTimeout — installs regardless of the worker outcome (a paused-forever
+    // rAF becomes an eventually-firing timer; worker-backed = fast, native = ~1fps).
+    var last = 0;
+    window.requestAnimationFrame = function (cb) {
+      var now = (window.performance && performance.now) ? performance.now() : Date.now();
+      var wait = Math.max(0, 16 - (now - last));
+      var id = window.setTimeout(function () { cb((window.performance && performance.now) ? performance.now() : Date.now()); }, wait);
+      last = now + wait;
+      return id;
+    };
+    window.cancelAnimationFrame = function (id) { window.clearTimeout(id); };
+  } catch (e) { /* best-effort */ }
+})();`;
+}
+
+// Install the override (buildOverrideSrc) both for future documents AND on the current
+// SPA doc, then read back whether worker-timers took. Best-effort: an install failure
+// logs and is swallowed — it must NEVER abort a run (the fill already works hidden;
+// this helps page-to-page advancement AND, via worker-timers, hidden-run SPEED).
+async function cdpInstallPageOverrides() {
+  let forceNoWorker = false;
+  try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
+  try {
+    const src = buildOverrideSrc({ forceNoWorker });
+    await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: src }); // future loads / re-auth
+    await cdpSend("Runtime.evaluate", { expression: src });                  // the current already-loaded SPA doc
+    // Read back whether the worker-timers polyfill actually installed on the CURRENT
+    // doc (CSP could block blob: workers → false → we stay on the safe slow path).
+    try { _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers)); } catch (e) { _workerTimersActive = false; }
+    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : "OFF (CSP?)");
+    console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
+  } catch (e) {
+    _workerTimersActive = false;
+    console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
+  }
+}
+
 // Run a SELF-CONTAINED function in the page via Runtime.evaluate and return its
 // JSON value. Args must be JSON-serializable; fn must close over nothing (same
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
@@ -122,30 +302,95 @@ async function cdpEval(fn, ...args) {
 // fast happy path; safe failure ceiling either way.
 // NOTE: pacing only. Visible CDP ACTUATION itself (coordinate-clicks, scrollIntoView,
 // focus) is a separate, newly-exercised surface — see runCdpFillPage / docs.
-const FAST_FACTOR = 0.2;    // visible delays = 1/5 the hidden delays (conservative; tunable — raise if a visible fill races)
-const FAST_FLOOR_MS = 25;   // …but never below this (a too-short wait races even full-speed)
-const VIS_TTL_MS = 500;     // re-sample document.visibilityState at most this often (amortize the cdpEval round-trip)
+const FAST_FACTOR = 0.1;    // fast delays = 1/10 the full delays (rapidfire; raise if a fast fill races — all adaptive sites are gated, so a race retries/flags, never a silent wrong fill)
+const FAST_FLOOR_MS = 10;   // …but never below this (a too-short wait races even full-speed)
+const TYPE_FAST_FLOOR_MS = 15; // per-KEYSTROKE floor (Stage B) — higher than FAST_FLOOR_MS so keystroke-driven listeners still arm the typeahead highlight when typing fast (see cdpTypeChars)
+const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amortize the chrome.tabs/windows round-trip)
 
 let _visCache = { visible: false, at: 0 };
 
-// Cached, off-loop foreground read. cdpEval runs promptly even when hidden, so
-// this is reliable in both states; the TTL keeps act.delay from round-tripping
-// every call. Reset at attach (fresh per run). On read failure (tab closing)
-// default to NOT-visible → full (safe) delays.
+// Measured page-timer-latency cache (STAGE 1). The HONEST "is the page throttled?"
+// signal: a real in-page setTimeout(0) round-trip. Fast (worker-backed or visible) ≈
+// <10ms; a ~1Hz-throttled tab ≈ ~1000ms. This is what lets us pace fast on a HIDDEN
+// tab — but ONLY when timers MEASURE fast, never on the mere assumption the worker
+// installed (install success ≠ the override reached Workday's call sites / the worker
+// still alive). See cdpTimersFast (non-blocking) + cdpFast (the gate).
+let _timerLatCache = { fast: null, at: 0 };
+const TIMER_FAST_MS = 200;  // <TIMER_FAST_MS round-trip ⇒ not throttled. 1Hz throttle ≈ 1000ms; fast ≈ <10ms; 200ms is a safe margin AND the race timeout.
+const TIMER_TTL_MS = 1500;  // throttle state is stable; re-measure occasionally (catches worker death / occlusion change mid-run)
+
+// Cached, off-loop foreground read. Reads REAL visibility from the SERVICE WORKER
+// (chrome.tabs + chrome.windows), NOT document.visibilityState from the page.
+// WHY (hidden-walk fix, 2026-07-03): the escalation path SPOOFS document.
+// visibilityState in the page to make Workday's SPA route transition run while
+// backgrounded. If this sampler read the spoofed page value it would always see
+// "visible" and drive act.delay 5× faster on a still-throttled page → races the
+// fill. Reading REAL visibility here is the PREREQUISITE that keeps that spoof
+// safe (and is strictly more accurate regardless of whether the spoof is on).
+// Visibility = tab.active (the tab is frontmost in its window) AND the window not
+// minimized — focus is NOT required (an unfocused-but-active tab still renders
+// full-speed). The TTL keeps act.delay from round-tripping every call. Reset at
+// attach (fresh per run). On any read failure (tab/window gone, not attached)
+// default to NOT-visible → full (safe) delays, matching the prior behavior.
 async function cdpVisible() {
   if (Date.now() - _visCache.at <= VIS_TTL_MS) return _visCache.visible;
   let vis = false;
-  try { vis = (await cdpEval(() => document.visibilityState)) === "visible"; } catch (e) { vis = false; }
+  try {
+    const tab = await new Promise((resolve, reject) =>
+      chrome.tabs.get(cdpTabId, (t) => (chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(t))));
+    const win = await new Promise((resolve, reject) =>
+      chrome.windows.get(tab.windowId, (w) => (chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(w))));
+    vis = tab.active === true && win.state !== "minimized";
+  } catch (e) { vis = false; }
   _visCache = { visible: vis, at: Date.now() };
   return vis;
 }
 
-// The adaptive pacing primitive wired into act.delay. Visible → scaled-down wait;
-// hidden → the full caller-requested wait (byte-identical to the proven path).
+// Measure a page-side setTimeout(0) round-trip — the "not throttled" signal (STAGE 1).
+// NON-BLOCKING by construction: a throttled probe takes ~1s and a DEAD worker's probe
+// NEVER resolves (window.setTimeout posts to a dead thread → the callback never fires →
+// the awaitPromise CDP call would hang the SW forever). So we race the probe against an
+// SW-side timeout EQUAL to the fast/slow threshold — the race IS the decision, and it
+// bounds every probe to ≤TIMER_FAST_MS. The losing probe promise is abandoned (it
+// resolves harmlessly later on a merely-slow page, or dangles on a dead worker — the
+// page is broken then anyway). cdpFast short-circuits with !_workerTimersActive so the
+// pure no-worker path never even reaches here (never pays the probe cost).
+async function cdpTimersFast() {
+  if (Date.now() - _timerLatCache.at <= TIMER_TTL_MS && _timerLatCache.fast != null) return _timerLatCache.fast;
+  let fast = false;
+  try {
+    const probe = cdpSend("Runtime.evaluate", {
+      expression: "new Promise(function(r){var t=performance.now();setTimeout(function(){r(performance.now()-t)},0)})",
+      awaitPromise: true, returnByValue: true }); // may take ~1s (throttled) or never (dead worker) — NOT awaited directly
+    const res = await Promise.race([probe, cdpDelay(TIMER_FAST_MS).then(() => "TIMEOUT")]);
+    fast = res !== "TIMEOUT"; // probe won ⇒ setTimeout(0) round-tripped in < TIMER_FAST_MS ⇒ not throttled
+  } catch (e) { fast = false; }
+  _timerLatCache = { fast, at: Date.now() };
+  return fast;
+}
+
+// The pacing decision (STAGE 1). Visible → fast (cheap, no probe). Hidden + no worker
+// installed → slow (today's behavior; skip the probe). Hidden + worker installed →
+// fast ONLY if timers MEASURE fast (the honest gate against a fast wait on a still-
+// throttled page — the false-verify class the whole design guards against).
+async function cdpFast() {
+  if (await cdpVisible()) return true;
+  if (!_workerTimersActive) return false;
+  return await cdpTimersFast();
+}
+
+// The adaptive pacing primitive wired into act.delay. Fast (visible, or hidden with
+// worker-verified-fast timers) → scaled-down wait; slow (hidden + throttled/no worker)
+// → the full caller-requested wait (byte-identical to the proven path).
 async function cdpAdaptiveDelay(ms) {
-  const fast = await cdpVisible();
+  const fast = await cdpFast();
   await cdpDelay(fast ? Math.max(FAST_FLOOR_MS, Math.round(ms * FAST_FACTOR)) : ms);
 }
+
+// REAL-visibility label ("visible"/"hidden") for DIAGNOSTICS — reads from the SW
+// (cdpVisible), never document.visibilityState, so a "[tab hidden]" log stays
+// TRUTHFUL even after the page's visibilityState is spoofed. Cheap (TTL-cached).
+async function cdpVisibilityLabel() { return (await cdpVisible()) ? "visible" : "hidden"; }
 
 // ── Operator input-lock (recon 2026-06-22) ──────────────────────────────────
 // While the bot actuates a VISIBLE tab the operator could accidentally click/type and
@@ -287,13 +532,21 @@ const CDP_KEYS = {
 // Probe/profile strings are plain text; vk is best-effort for non-alphanumerics
 // (the `text` field is what produces the character).
 async function cdpTypeChars(text, perCharDelayMs = 40) {
+  // Per-char gap is ADAPTIVE (Stage B): fast (fg / worker-fast) → scale by FAST_FACTOR but keep the
+  // typing-specific TYPE_FAST_FLOOR_MS (> FAST_FLOOR_MS) so keystroke-driven listeners still arm the
+  // typeahead's first-option highlight (cdpTypeChars is the KEYSTROKE path chosen over insertText for
+  // exactly that — see typeInSearch). Slow path (hidden no-worker) keeps the full perCharDelayMs. Sampled
+  // ONCE (not per char — no per-keystroke round-trip). A too-fast type that misses is caught downstream
+  // (chip/value read-back → needs_review), never a silent wrong fill.
+  const fast = await cdpFast();
+  const gap = fast ? Math.max(TYPE_FAST_FLOOR_MS, Math.round(perCharDelayMs * FAST_FACTOR)) : perCharDelayMs;
   for (const ch of String(text)) {
     const isLetter = /^[a-z]$/i.test(ch);
     const isDigit = /^[0-9]$/.test(ch);
     const code = isLetter ? "Key" + ch.toUpperCase() : isDigit ? "Digit" + ch : ch === " " ? "Space" : "";
     const vk = isLetter || isDigit ? ch.toUpperCase().charCodeAt(0) : ch === " " ? 32 : 0;
     await cdpKeyTap({ key: ch, code, vk, text: ch });
-    await cdpDelay(perCharDelayMs);
+    await cdpDelay(gap);
   }
 }
 
@@ -301,7 +554,7 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
 // then Delete. Trusted key path so React sees a real edit, unlike a "" setter.
 async function cdpSelectAllDelete() {
   await cdpKeyTap({ key: "a", code: "KeyA", vk: 65, modifiers: 2 });
-  await cdpDelay(60);
+  await cdpAdaptiveDelay(60); // adaptive (Stage B): fast fg/worker-fast, full on the slow path; a stale-text race is caught by the caller's post-clear read-back
   await cdpKeyTap(CDP_KEYS.delete);
 }
 
@@ -381,9 +634,32 @@ function cdpPageScan() {
     if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
     return false;
   };
-  const isRepeating = (w) => !!(w.closest('[data-fkit-id^="workExperience-"]') || w.closest('[data-fkit-id^="education-"]')
-    || w.closest('[data-fkit-id^="webAddress-"]') || w.closest('[data-fkit-id^="language-"]')
-    || w.closest('[data-fkit-id^="certification-"]'));
+  // m3a: a field is "repeating" if ANY ancestor data-fkit-id is an INDEXED entry (or its
+  // sub-wrapper) — the "-<digits>--" infix. Generic (was a hardcoded 5-prefix list) so an UNKNOWN
+  // repeating section's fields don't leak into the flat scan; still flat for "phoneNumber--null"
+  // (no -<digits>-- infix). LOCKSTEP idea with lib.js parseRepeatingFkit.
+  const isRepeating = (w) => {
+    let el = w.closest("[data-fkit-id]");
+    while (el) {
+      if (/-\d+--/.test(el.getAttribute("data-fkit-id") || "")) return true;
+      el = el.parentElement ? el.parentElement.closest("[data-fkit-id]") : null;
+    }
+    return false;
+  };
+  // The field's CURRENT live value (the already-filled sweep: the review must inventory everything
+  // the page holds, not just what the bot filled). LOCKSTEP with cdpRepeatingScan's valueOf. Empty
+  // date segments render their "MM"/"DD"/"YYYY" placeholder text → filtered (never counts as filled).
+  const valueOf = (wr, wt) => {
+    try {
+      if (wt === "dropdown") { const b = wr.querySelector('button[aria-haspopup="listbox"]'); return b ? (b.textContent || "").trim() : null; }
+      if (wt === "typeahead" || wt === "hierarchical") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
+      if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
+      if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
+      const segs = Array.from(wr.querySelectorAll('[data-automation-id^="dateSection"][data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t));
+      if (segs.length) return segs.join("/");
+      const inp = wr.querySelector("input, textarea"); return inp ? (inp.value || null) : null;
+    } catch (e) { return null; }
+  };
   const all = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
   const wrappers = all.filter((w) => !isRepeating(w));
   return {
@@ -391,9 +667,76 @@ function cdpPageScan() {
     repeatingFieldCount: all.length - wrappers.length,
     fields: wrappers.map((w) => {
       const id = w.getAttribute("data-automation-id");
+      const wt = classify(w);
       return {
         wrapperSel: '[data-automation-id="' + id + '"]',
         fieldName: id.slice("formField-".length),
+        widgetType: wt,
+        label: labelOf(w),
+        isRequired: requiredOf(w),
+        value: valueOf(w, wt)
+      };
+    })
+  };
+}
+
+// SUBMIT cascade recon: READ-ONLY full-page field-set snapshot for detecting fields
+// REVEALED (or hidden) when a value changes — the "previously employed here? → Yes"
+// follow-ups, a Country choice's local-name boxes, a "Yes/Other → please specify" box.
+// Captures EVERY formField-* wrapper (flat AND inside a repeating entry — a cascade can
+// reveal either), each keyed by automation-id qualified with its enclosing data-fkit-id
+// so duplicated repeating ids stay distinct across the diff. The SW runner snapshots
+// twice (the operator changes ONE field by hand between them) and diffs the key sets to
+// isolate the added/removed fields + their widget shape + required flag. Self-contained
+// (cdpEval stringifies it — no shared helpers).
+function cdpCascadeScan() {
+  const classify = (w) => {
+    const fieldName = (w.getAttribute("data-automation-id") || "").slice("formField-".length);
+    if (fieldName === "source") return "hierarchical";
+    if (w.querySelector('input[type="file"]')) return "file_upload";
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => {
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
+    });
+    if (textLike.length === 1) return "text";
+    if (w.querySelector("textarea")) return "textarea";
+    return "unknown";
+  };
+  const labelOf = (w) => {
+    const legend = w.querySelector("legend");
+    if (legend && legend.textContent.trim()) return legend.textContent.trim().slice(0, 80);
+    for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 80); }
+    const ariaEl = w.matches("[aria-label]") ? w : w.querySelector("[aria-label]");
+    return ariaEl ? ariaEl.getAttribute("aria-label").trim().slice(0, 80) : null;
+  };
+  const requiredOf = (w) => {
+    for (const a of w.querySelectorAll("abbr")) {
+      const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || "");
+      if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true;
+    }
+    if (w.querySelector('[aria-required="true"], [data-required="true"]')) return true;
+    if (w.querySelector('[data-automation-id="requiredMarker"]')) return true;
+    const labelEl = w.querySelector("legend") || w.querySelector("label");
+    if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
+    return false;
+  };
+  const wrappers = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
+  return {
+    url: location.href,
+    fieldCount: wrappers.length,
+    fields: wrappers.map((w) => {
+      const id = w.getAttribute("data-automation-id");
+      const fkitEl = w.closest("[data-fkit-id]");
+      const fkit = fkitEl ? fkitEl.getAttribute("data-fkit-id") : null;
+      return {
+        automationId: id,
+        fieldName: id.slice("formField-".length),
+        fkitContainer: fkit,                 // null = flat (page-level); non-null = inside a repeating entry
+        key: (fkit ? fkit + " " : "") + id,  // stable diff key (distinguishes duplicated repeating ids)
         widgetType: classify(w),
         label: labelOf(w),
         isRequired: requiredOf(w)
@@ -427,7 +770,12 @@ function cdpRepeatingScan() {
     return null;
   };
   const classify = (w) => {
-    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    // LOCKSTEP rungs with cdpPageScan/cdpGenericNestedScan: the file rung types a per-entry
+    // Attachments input file_upload (was "unknown" → the sweep/shape exclusions missed it → a
+    // text-box "Attachments" row in review); selectinput covers a typeahead whose widget node
+    // carries ONLY that marker (Magna's nested specialtyParent — no "multiselect" node).
+    if (w.querySelector('input[type="file"]')) return "file_upload";
+    if (w.querySelector('[data-uxi-widget-type="multiselect"], [data-uxi-widget-type="selectinput"]')) return "typeahead";
     if (w.querySelector('input[type="radio"]')) return "radio";
     if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
@@ -470,13 +818,22 @@ function cdpRepeatingScan() {
     }
     return null;
   };
-  const PREFIXES = ["workExperience-", "education-", "webAddress-", "language-", "certification-"];
+  // m3a: DISCOVER the repeating-section prefixes from the indexed entry containers (was a hardcoded
+  // 5-prefix list) → ANY repeating section is detected, known or not. "<base>-<N>--null" → prefix
+  // "<base>-"; the -<digits>--null anchor excludes the date sub-wrappers AND non-section
+  // "<name>--null" (e.g. phoneNumber--null). LOCKSTEP regex with lib.js parseRepeatingFkit.
+  const PREFIXES = Array.from(new Set(
+    Array.from(document.querySelectorAll('[data-fkit-id$="--null"]'))
+      .map((e) => { const m = /^(.+?)-(\d+)--null$/.exec(e.getAttribute("data-fkit-id") || ""); return m ? m[1] + "-" : null; })
+      .filter(Boolean)
+  ));
   const sections = {};
   for (const prefix of PREFIXES) {
     const entries = Array.from(document.querySelectorAll('[data-fkit-id^="' + prefix + '"][data-fkit-id$="--null"]'));
     if (!entries.length) continue;
     sections[prefix] = {
       entryCount: entries.length,
+      heading: nearestHeading(entries[0]), // m3a: per-section heading (backend identifier + Add anchor)
       entries: entries.map((e) => {
         const fkit = e.getAttribute("data-fkit-id");
         // "Delete" button: climb up to 6 ancestors, find a <button> whose text is "Delete".
@@ -487,16 +844,30 @@ function cdpRepeatingScan() {
           const b = Array.from(p.querySelectorAll("button")).find((x) => /^delete$/i.test((x.textContent || "").trim()));
           if (b) { del = b; break; }
         }
+        // The field's CURRENT value (for surfacing an already-filled UNKNOWN section in review): the
+        // selected dropdown text / typeahead chip / text-input value / checkbox state / date display.
+        const valueOf = (wr, wt) => {
+          try {
+            if (wt === "dropdown") { const b = wr.querySelector('button[aria-haspopup="listbox"]'); return b ? (b.textContent || "").trim() : null; }
+            if (wt === "typeahead") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
+            if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
+            if (wt === "date") { const segs = Array.from(wr.querySelectorAll('[data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t)); return segs.length ? segs.join("/") : null; } // empty segments show "MM"/"DD"/"YYYY" placeholders — never count as filled
+            if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
+            const inp = wr.querySelector('input, textarea'); return inp ? (inp.value || null) : null;
+          } catch (e) { return null; }
+        };
         const fields = Array.from(e.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
           const id = w.getAttribute("data-automation-id");
           const fieldName = id.slice("formField-".length);
+          const wt = classify(w);
           return {
             fieldName, automationId: id,
-            widgetType: classify(w),
+            widgetType: wt,
             label: labelOf(w),
             isRequired: requiredOf(w),
             hashedId: isHashed(fieldName),
             dateSegments: dateSegsOf(w),
+            value: valueOf(w, wt),
             wrapperSel: '[data-fkit-id="' + fkit + '"] [data-automation-id="' + id + '"]'
           };
         });
@@ -504,9 +875,243 @@ function cdpRepeatingScan() {
       })
     };
   }
+  // insideEntry: the Add button sits INSIDE a repeating entry (any ancestor fkit with the
+  // "-<digits>--" infix — the cdpPageScan isRepeating idiom, inlined LOCKSTEP: page fns are
+  // stringified separately). Such a button is a NESTED sub-section's Add (cert ▸ Specialties)
+  // owned by its parent section's nested config — NEVER a top-level section's (the m3b
+  // reveal-by-add must skip it: clicking it mounted the phantom empty specialty row).
+  const insideEntry = (b) => {
+    let el = b.closest("[data-fkit-id]");
+    while (el) {
+      if (/-\d+--/.test(el.getAttribute("data-fkit-id") || "")) return true;
+      el = el.parentElement ? el.parentElement.closest("[data-fkit-id]") : null;
+    }
+    return false;
+  };
   const addButtons = Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
-    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), rect: rectOf(b), nearestHeading: nearestHeading(b) }));
+    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), rect: rectOf(b), nearestHeading: nearestHeading(b), insideEntry: insideEntry(b) }));
   return { url: location.href, sectionsPresent: Object.keys(sections), sections, addButtons };
+}
+
+// GENERIC-DETECTION RECON (Sections milestone 1): READ-ONLY proof that enumerate-and-group on
+// data-fkit-id detects repeating sections WITHOUT the hardcoded 5-prefix catalog. Self-contained
+// (cdpEval stringifies it — can't share helpers with cdpRepeatingScan). Unlike cdpRepeatingScan
+// (which looks up known PREFIXES) this enumerates EVERY "<base>-<N>--null" entry container and
+// groups by base, so a brand-new tenant section surfaces too. Emits, for the operator to verify
+// against reality: (a) detectedBases vs the known catalog (extras = new/unmapped, missing = known
+// but not on this page); (b) the EXCLUDED "<name>--null" list — proof the regex didn't over-match
+// (phoneNumber--null and the date sub-wrappers must NOT appear as sections); (c) a section-level
+// "required" SIGNAL per section (heading-asterisk + a required field in the first entry) — the
+// open unknown for the safe-delete decision (no proven signal exists yet; this gathers evidence).
+// NOTHING is actuated. LOCKSTEP: the parseFkit regex == lib.js parseRepeatingFkit.
+function cdpGenericRepeatingScan() {
+  const labelOf = (w) => {
+    const legend = w.querySelector("legend");
+    if (legend && legend.textContent.trim()) return legend.textContent.trim().slice(0, 60);
+    for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); }
+    return null;
+  };
+  const classify = (w) => {
+    if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => {
+      const t = (el.getAttribute("type") || "").toLowerCase();
+      return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
+    });
+    if (textLike.length === 1) return "text";
+    return "unknown";
+  };
+  const isHashed = (fieldName) => /[0-9a-f]{8}/i.test(fieldName) || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(fieldName);
+  const dateSegsOf = (w) => Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]'))
+    .map((s) => s.getAttribute("data-automation-id")).filter(Boolean);
+  const requiredFieldOf = (w) => {
+    for (const a of w.querySelectorAll("abbr")) {
+      const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || "");
+      if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true;
+    }
+    if (w.querySelector('[aria-required="true"], [data-required="true"]')) return true;
+    const labelEl = w.querySelector("legend") || w.querySelector("label");
+    if (labelEl && /\*\s*$/.test((labelEl.textContent || "").trim())) return true;
+    return false;
+  };
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 60); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 60); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  // LOCKSTEP with lib.js parseRepeatingFkit — same regex.
+  const parseFkit = (id) => { const m = /^(.+?)-(\d+)--null$/.exec(id || ""); return m ? { base: m[1], index: parseInt(m[2], 10) } : null; };
+
+  const KNOWN = ["workExperience", "education", "webAddress", "language", "certification"];
+  const groups = {};
+  const excluded = []; // "<name>--null" that did NOT parse as an entry (false-positive guard evidence)
+  for (const e of Array.from(document.querySelectorAll('[data-fkit-id$="--null"]'))) {
+    const id = e.getAttribute("data-fkit-id");
+    const p = parseFkit(id);
+    if (!p) { excluded.push(id); continue; }
+    const g = (groups[p.base] = groups[p.base] || { base: p.base, indices: [], firstEntryEl: null });
+    g.indices.push(p.index);
+    if (g.firstEntryEl == null) g.firstEntryEl = e;
+  }
+
+  const detected = Object.keys(groups).map((base) => {
+    const g = groups[base];
+    const e0 = g.firstEntryEl;
+    const headingText = nearestHeading(e0);
+    const fields = e0 ? Array.from(e0.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
+      const fid = w.getAttribute("data-automation-id");
+      const fn = fid.slice("formField-".length);
+      return { fieldName: fn, widgetType: classify(w), label: labelOf(w), isRequired: requiredFieldOf(w), hashedId: isHashed(fn), dateSegments: dateSegsOf(w) };
+    }) : [];
+    return {
+      base, prefix: base + "-",
+      isKnown: KNOWN.indexOf(base) !== -1,
+      entryCount: g.indices.length,
+      indices: g.indices.slice().sort((a, b) => a - b),
+      headingText,
+      requiredSignals: { headingAsterisk: !!(headingText && /\*\s*$/.test(headingText)), anyRequiredFieldInFirstEntry: fields.some((f) => f.isRequired) },
+      fieldShape: fields
+    };
+  });
+
+  return {
+    url: location.href,
+    knownPrefixes: KNOWN.map((b) => b + "-"),
+    detected,
+    detectedBases: detected.map((d) => d.base),
+    unknownBases: detected.filter((d) => !d.isKnown).map((d) => d.base),
+    excludedNullContainers: excluded,
+    addButtons: Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
+      .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), nearestHeading: nearestHeading(b) }))
+  };
+}
+
+// GENERIC NESTED-SECTION RECON (read-only): detect repeating sections NESTED inside repeating entries
+// (cert → Specialties + Attachments) WITHOUT hardcoding names, for ANY depth. The generic key: a
+// data-fkit-id is a "--"-joined path of "<base>-<idx>" levels + a trailing field (or "null" = an
+// entry container). "certification-54--specialties-5--specialtyParent" → parent certification[54] →
+// nested specialties[5] → field specialtyParent (depth 2). Dumps, per nested section: parent▸child,
+// entry count, a representative entry's fields (widget/label/required/dates/entry-scoped wrapperSel),
+// the container-prefix pattern, PLUS file-upload (attachment) inputs + Add buttons scoped INSIDE a
+// repeating entry (the per-entry nested Add anchors). NO actuation — pure read.
+function cdpGenericNestedScan() {
+  const labelOf = (w) => { const lg = w.querySelector("legend"); if (lg && lg.textContent.trim()) return lg.textContent.trim().slice(0, 60); for (const l of w.querySelectorAll("label")) { const t = (l.textContent || "").trim(); if (t) return t.slice(0, 60); } return null; };
+  const classify = (w) => {
+    if (w.querySelector('input[type="file"]')) return "file_upload";
+    // nested typeaheads observed with ONLY the selectinput marker (Magna specialtyParent — no
+    // "multiselect" node); include both (self-or-descendant: the fkit node may BE the widget node)
+    const taSel = '[data-uxi-widget-type="multiselect"], [data-uxi-widget-type="selectinput"]';
+    if (w.querySelector(taSel) || (w.matches && w.matches(taSel))) return "typeahead";
+    if (w.querySelector('input[type="radio"]')) return "radio";
+    if (w.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
+    if (w.querySelector('[data-automation-id$="-input"][role="spinbutton"], [data-automation-id^="dateSection"]')) return "date";
+    if (w.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    const textLike = Array.from(w.querySelectorAll("input")).filter((el) => { const t = (el.getAttribute("type") || "").toLowerCase(); return t === "" || ["text", "email", "tel", "number", "url"].includes(t); });
+    if (textLike.length === 1) return "text";
+    return "unknown";
+  };
+  const isHashed = (fn) => /[0-9a-f]{8}/i.test(fn) || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(fn);
+  const dateSegsOf = (w) => Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]')).map((s) => s.getAttribute("data-automation-id")).filter(Boolean);
+  const requiredOf = (w) => { for (const a of w.querySelectorAll("abbr")) { const meta = (a.getAttribute("title") || "") + " " + (a.getAttribute("aria-label") || ""); if (/required/i.test(meta) || (a.textContent || "").includes("*")) return true; } if (w.querySelector('[aria-required="true"],[data-required="true"]')) return true; const le = w.querySelector("legend") || w.querySelector("label"); if (le && /\*\s*$/.test((le.textContent || "").trim())) return true; return false; };
+  const nearestHeading = (el) => { let p = el; for (let i = 0; i < 12 && p; i++) { let s = p.previousElementSibling; while (s) { if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 60); } const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]'); if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 60); } s = s.previousElementSibling; } p = p.parentElement; } return null; };
+  // Parse a fkit into { levels: [{base,idx}...], field }. "--"-joined; each non-last segment is
+  // "<base>-<idx>"; the last is the field ("null" = the level's entry container). Handles ANY depth.
+  const parseFkit = (id) => {
+    const parts = String(id || "").split("--");
+    if (parts.length < 2) return null;
+    const field = parts[parts.length - 1];
+    const levels = [];
+    for (let i = 0; i < parts.length - 1; i++) { const m = /^(.+)-(\d+)$/.exec(parts[i]); if (!m) return null; levels.push({ base: m[1], idx: parseInt(m[2], 10) }); }
+    return { levels, field };
+  };
+  let maxDepth = 0;
+  const nested = {}; // "parent ▸ child" → { parentBase, childBase, depth, entries: { idxpath → {path, fields[]} } }
+  for (const el of Array.from(document.querySelectorAll("[data-fkit-id]"))) {
+    const p = parseFkit(el.getAttribute("data-fkit-id"));
+    if (!p) continue;
+    if (p.levels.length > maxDepth) maxDepth = p.levels.length;
+    if (p.levels.length < 2) continue; // NESTED only (depth ≥ 2)
+    const parent = p.levels[0], child = p.levels[p.levels.length - 1];
+    const key = parent.base + " ▸ " + child.base;
+    const g = (nested[key] = nested[key] || { parentBase: parent.base, childBase: child.base, depth: p.levels.length, entries: {} });
+    const ek = p.levels.map((l) => l.idx).join("|");
+    const ent = (g.entries[ek] = g.entries[ek] || { path: p.levels.map((l) => l.base + "[" + l.idx + "]").join(" / "), levels: p.levels.map((l) => ({ base: l.base, index: l.idx })), fields: [] });
+    if (p.field && p.field !== "null") {
+      const id = el.getAttribute("data-fkit-id");
+      const ffSel = '[data-automation-id="formField-' + p.field + '"]';
+      // fkit ↔ formField relationship varies (Magna specialties: NOT ancestor→descendant) — probe it
+      // and record the selector that actually resolves (the cdpNestedFieldSel ladder, inlined: page
+      // fns are stringified separately and can't share helpers).
+      let ff = el, wrapperSel = '[data-fkit-id="' + id + '"]';
+      const desc = el.querySelector(ffSel);
+      if (desc) { ff = desc; wrapperSel = '[data-fkit-id="' + id + '"] ' + ffSel; }
+      else if (el.matches && el.matches(ffSel)) { /* same node — fkit selector alone */ }
+      else if (el.closest && el.closest(ffSel)) { ff = el.closest(ffSel); wrapperSel = ffSel + ':has([data-fkit-id="' + id + '"])'; }
+      ent.fields.push({ field: p.field, widgetType: classify(ff), label: labelOf(ff), isRequired: requiredOf(ff), hashedId: isHashed(p.field), dateSegments: dateSegsOf(ff), wrapperSel });
+    }
+  }
+  const nestedSections = Object.keys(nested).map((k) => {
+    const g = nested[k]; const eks = Object.keys(g.entries);
+    // ALL entries (each { levels:[{base,index}], fields:[...] }) — the fill needs every entry, not a sample.
+    return { parentBase: g.parentBase, childBase: g.childBase, depth: g.depth, containerPattern: g.parentBase + "-<N>--" + g.childBase + "-<M>--<field>", entryCount: eks.length, entries: eks.map((ek) => g.entries[ek]) };
+  });
+  const enclosing = (el) => { const f = el.closest("[data-fkit-id]"); return f ? f.getAttribute("data-fkit-id") : null; };
+  const fileUploads = Array.from(document.querySelectorAll('input[type="file"], [data-automation-id="select-files"], [data-automation-id^="file-upload"]'))
+    .map((el) => ({ automationId: el.getAttribute("data-automation-id") || el.type, heading: nearestHeading(el), enclosingFkit: enclosing(el) }))
+    .filter((u) => u.enclosingFkit); // only file inputs INSIDE a repeating entry (nested attachments)
+  const addButtons = Array.from(document.querySelectorAll('[data-automation-id="add-button"]'))
+    .map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), heading: nearestHeading(b), enclosingFkit: enclosing(b) }))
+    .filter((a) => a.enclosingFkit); // Add buttons INSIDE a repeating entry = nested-section Add anchors
+  // Parent-entry ORDER per base (--null containers in DOM order) — from the SAME snapshot as the nested
+  // fields, so the fill maps a nested field's parent fkit index → the parent's sequential ordinal (fkit
+  // indices are non-contiguous / non-zero, e.g. certification-173). Robust vs a separate repeatingScan.
+  const parentOrder = {};
+  for (const el of Array.from(document.querySelectorAll('[data-fkit-id$="--null"]'))) {
+    const m = /^(.+?)-(\d+)--null$/.exec(el.getAttribute("data-fkit-id") || "");
+    if (m) (parentOrder[m[1]] = parentOrder[m[1]] || []).push(parseInt(m[2], 10));
+  }
+  // Per-ENTRY attachment areas (deduped by enclosingFkit), pre-parsed "<base>-<idx>--attachments" so the
+  // fill needs no fkit parsing. Excludes the top-level resume ("resumeAttachments--attachments" → no
+  // -<idx> → no match).
+  const nestedAttachments = []; const seenAtt = {};
+  for (const u of fileUploads) {
+    if (seenAtt[u.enclosingFkit]) continue;
+    const am = /^(.+?)-(\d+)--attachments$/.exec(u.enclosingFkit || "");
+    if (!am) continue;
+    seenAtt[u.enclosingFkit] = 1;
+    nestedAttachments.push({ parentBase: am[1], parentIndex: parseInt(am[2], 10), enclosingFkit: u.enclosingFkit, heading: u.heading });
+  }
+  // NESTED sub-section CONTAINERS — the ROBUST detector (empty OR not). A fkit
+  // "<parentBase>-<idx>--<childBase>" node that is NOT a field wrapper (has no
+  // formField-<childBase> descendant) and NOT an attachment area (no input[type=file]) is a repeating
+  // sub-section container (e.g. certification-287--specialties). Found even when EMPTY (no
+  // --<childBase>-<M>-- entries yet) and REGARDLESS of where its "Add" button sits (the addButtons
+  // enclosingFkit is often the parent's --null, which the fill can't key off). GENERIC — no names.
+  const nestedContainers = []; const seenNC = {};
+  for (const el of Array.from(document.querySelectorAll("[data-fkit-id]"))) {
+    const id = el.getAttribute("data-fkit-id") || "";
+    const m = /^(.+?)-(\d+)--([A-Za-z][A-Za-z0-9_]*)$/.exec(id);
+    if (!m || m[3] === "null" || seenNC[id]) continue;
+    const childBase = m[3];
+    if (el.querySelector('[data-automation-id="formField-' + childBase + '"]')) continue; // a FIELD wrapper (wraps its own formField) — not a sub-section
+    if (el.querySelector('input[type="file"]')) continue;                                  // an ATTACHMENT area (file input present) — handled by nestedAttachments
+    if (seenAtt[id] || /attachment/i.test(childBase)) continue;                             // …or the file input renders lazily (not present at scan) → exclude by fkit/name so it never becomes a bogus sub-section "box"
+    seenNC[id] = 1;
+    nestedContainers.push({ parentBase: m[1], parentIndex: parseInt(m[2], 10), childBase, fkit: id, heading: nearestHeading(el) });
+  }
+  return { url: location.href, maxDepth, nestedSections, parentOrder, nestedAttachments, nestedContainers, fileUploads, addButtons };
 }
 
 // M36.2 — read-only structure dump of the Certifications entries, for the NESTED
@@ -650,6 +1255,107 @@ function cdpDeleteEntryRect(prefix, index) {
            cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
+// NESTED-section Add — the "Add" button INSIDE a SPECIFIC parent entry (scoped by the parent's
+// fkit), matched by its nearest-heading regex (e.g. "Specialties" inside a certification-N--null
+// entry). Unlike cdpSectionAddRect (page-wide, grabs the FIRST match), this scopes to ONE parent so
+// reveal-by-add mounts into a KNOWN entry (and can delete from the same). scrollIntoView + rect.
+function cdpNestedAddRect(parentFkit, regexSource) {
+  const re = new RegExp(regexSource, "i");
+  const entry = document.querySelector('[data-fkit-id="' + parentFkit + '"]');
+  if (!entry) return null;
+  const nearestHeading = (el) => {
+    let p = el;
+    for (let i = 0; i < 12 && p; i++) {
+      let s = p.previousElementSibling;
+      while (s) {
+        if (/^H[1-6]$/.test(s.tagName) || s.getAttribute("role") === "heading") { const t = (s.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        const h = s.querySelector && s.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+        if (h) { const t = (h.textContent || "").trim(); if (t) return t.slice(0, 50); }
+        s = s.previousElementSibling;
+      }
+      p = p.parentElement;
+    }
+    return null;
+  };
+  const btn = Array.from(entry.querySelectorAll('[data-automation-id="add-button"]')).find((b) => re.test(nearestHeading(b) || ""));
+  if (!btn) return null;
+  if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = btn.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
+// NESTED-ENTRY Delete — a nested entry (cert Specialty) has NO `--null` container (it's the SET of
+// `<parent>--<child>-<M>--<field>` fkit nodes), so cdpDeleteEntryRect can't find it. Locate a field
+// of the child entry, climb to the SMALLEST ancestor holding a <button>Delete</button>, and GUARD
+// that the ancestor does NOT also span the PARENT's own direct fields (`<parent>--X` where X is not
+// this child) — else we've climbed to the parent entry and its Delete would nuke the whole parent.
+// Fully generic (no hardcoded parent/child names). Returns null (safe no-op) if no scoped Delete.
+function cdpNestedDeleteRect(parentFkit, childBase, childIndex) {
+  const base = String(parentFkit).replace(/--null$/, "");                // e.g. certification-N
+  const specPrefix = base + "--" + childBase + "-" + childIndex + "--";   // certification-N--specialties-M--
+  const field = document.querySelector('[data-fkit-id^="' + specPrefix + '"]');
+  if (!field) return null;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // a PARENT-direct fkit = "<base>--X" where X does NOT begin "<childBase>-<digits>" (the parent's
+  // OWN field, or `--null`) — its presence in an ancestor means we've climbed past the child entry.
+  const parentDirectRe = new RegExp("^" + esc(base) + "--(?!" + esc(childBase) + "-\\d)");
+  const parentEntry = document.querySelector('[data-fkit-id="' + parentFkit + '"]');
+  let p = field, btn = null;
+  for (let i = 0; i < 8 && p; i++) {
+    p = p.parentElement;
+    if (!p) break;
+    if (parentEntry && p === parentEntry) break; // reached the parent entry → its Delete is the PARENT's
+    const spansParent = Array.from(p.querySelectorAll("[data-fkit-id]")).some((n) => parentDirectRe.test(n.getAttribute("data-fkit-id") || ""));
+    if (spansParent) break; // this ancestor covers the parent's own fields → too big, refuse
+    // Delete button shapes vary by tenant: text "Delete"/"Remove", aria-label/title-only, or ICON-ONLY
+    // (a trash svg, e.g. class "wd-icon-trash" — no text). Match all; the ancestor-scoping above (never
+    // spanning the parent's own fields) is what keeps an icon-only match safe.
+    const isDeleteBtn = (x) => /^(delete|remove)$/i.test((x.textContent || "").trim())
+      || /delete|remove|trash/i.test((x.getAttribute("aria-label") || "") + " " + (x.getAttribute("title") || "") + " " + (x.getAttribute("data-automation-id") || ""))
+      || !!x.querySelector('svg[class*="trash" i], [class*="icon-trash" i], [data-automation-id*="trash" i], [data-automation-id*="delete" i]');
+    const b = Array.from(p.querySelectorAll("button")).find(isDeleteBtn);
+    if (b) { btn = b; break; }
+  }
+  if (!btn) return null;
+  if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = btn.getBoundingClientRect();
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+}
+
+// NESTED-FIELD wrapper selector — PROBE the live fkit ↔ formField relationship instead of assuming it.
+// The composed descendant selector ('[data-fkit-id="F"] [formField-X]') failed live on Magna specialties
+// ("typeahead wrapper not found"): the fkit node does NOT wrap the formField there. The relationship is
+// tenant-variable, so resolve it from the real DOM (Working principles: trace, don't guess) and return a
+// SINGLE suffix-composable selector (the substrate string-appends ' input…' etc. — no comma lists). The
+// resolved node must CONTAIN the field's inner controls. Rungs, most-specific first:
+//   1. fkit node wraps the formField → the classic descendant selector
+//   2. fkit node IS the formField (same node) → the fkit selector alone
+//   3. fkit node sits INSIDE the formField (e.g. on the input) → formField:has(fkit)
+//   4. fkit node exists but no formField div anywhere related → the fkit node itself (best effort)
+//   5. no data-fkit-id at all, but an element ID carries the fkit string (observed: the specialty INPUT's
+//      id is "certification-N--specialties-M--specialtyParent") → formField:has([id=…]) / the id node
+// Nothing hardcoded: F is composed at runtime from scanned indices; returns null (honest) when nothing
+// resolves — the caller records an error, never actuates blind.
+function cdpNestedFieldSel(fkit, field) {
+  const ffSel = '[data-automation-id="formField-' + field + '"]';
+  const fkSel = '[data-fkit-id="' + fkit + '"]';
+  const fk = document.querySelector(fkSel);
+  if (fk) {
+    if (fk.querySelector(ffSel)) return fkSel + " " + ffSel;
+    if (fk.matches && fk.matches(ffSel)) return fkSel;
+    if (fk.closest && fk.closest(ffSel)) return ffSel + ":has(" + fkSel + ")";
+    return fkSel;
+  }
+  const byId = document.querySelector('[id="' + fkit + '"]');
+  if (byId) {
+    if (byId.closest && byId.closest(ffSel)) return ffSel + ':has([id="' + fkit + '"])';
+    return '[id="' + fkit + '"]';
+  }
+  return null;
+}
+
 // M30 session-expiry recon read: a READ-ONLY static snapshot to classify whether
 // the page is a live apply form vs a logged-out / expired / error state. No clicks.
 // Run once on a VALID form and once LOGGED-OUT/stale to find the discriminator.
@@ -688,10 +1394,146 @@ function cdpReadSessionState() {
     // state, NOT a dead session (recon 2026-06-27). isWorkdayMaintenance keys off this (+ title/bodyText).
     maintenancePresent: /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(bodyText),
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
-    // M31: error-element detail for the validation-vs-VPS recon diff
-    errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 120)).filter(Boolean) },
+    // M31: error-element detail for the validation-vs-VPS recon diff. Samples are now DECISION
+    // INPUTS (the AI-4 tiers key off them via lib.js expandErrorSamples), not just diagnostics —
+    // and Workday's top summary banner concatenates EVERY error into ONE element, so the old
+    // 120-char slice silently dropped errors past the first ~2 (the 2026-07-01 live Tier-0
+    // dup-language miss). 600 chars ≈ 8 concatenated errors; expandErrorSamples splits them SW-side.
+    errorMarkers: { count: errorEls.length, samples: errorEls.slice(0, 8).map((el) => (el.textContent || "").trim().slice(0, 600)).filter(Boolean) },
     bodyTextSample: bodyText.slice(0, 500).replace(/\s+/g, " ").trim()
   };
+}
+
+// ── Onboarding-stage reads (JD → Apply → Apply Manually → auth → verify) ─────
+// Self-contained page reads for the pre-form flow. The PURE decisions on this data
+// live in lib.js (classifyAuthOutcome / isWorkdaySoftError / looksLikeSso /
+// pickApplyTarget); this just surfaces the raw DOM state. Kept SEPARATE from
+// cdpReadSessionState (which is tuned for the in-flow dead-session / review checks
+// and caps bodyText at 500 chars — too short to classify a sign-in outcome).
+function cdpOnboardScan() {
+  const q = (sel) => document.querySelector(sel);
+  const present = (sel) => !!document.querySelector(sel);
+  const bodyText = ((document.body && document.body.innerText) || "").slice(0, 12000);
+  const formFields = document.querySelectorAll('[data-automation-id^="formField-"]');
+  const clickables = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+  const signInButtonPresent = clickables.some((b) => /\b(sign[- ]?in|log[- ]?in|sign[- ]?on)\b/i.test((b.textContent || "").trim()));
+  const emailInput = present('input[type="email"]') || present('[data-automation-id="email"]');
+  const passwordInput = present('input[type="password"]') || present('[data-automation-id="password"]');
+  // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
+  // "Sign in with email" button, alongside federated Apple/Google/LinkedIn buttons we NEVER click.
+  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]');
+  const markers = {
+    adventureButton: present('[data-automation-id="adventureButton"]'),
+    continueButton: present('[data-automation-id="continueButton"]'),
+    applyManually: present('[data-automation-id="applyManually"]'),
+    useMyLastApplication: present('[data-automation-id="useMyLastApplication"]'),
+    signInLink: present('[data-automation-id="signInLink"]'),
+    createAccountLink: present('[data-automation-id="createAccountLink"]'),
+    signInSubmit: present('[data-automation-id="signInSubmitButton"]') || present('[data-automation-id="click_filter"][aria-label="Sign In"]'),
+    createAccountSubmit: present('[data-automation-id="createAccountSubmitButton"]') || present('[data-automation-id="click_filter"][aria-label="Create Account"]'),
+    verifyPassword: present('[data-automation-id="verifyPassword"]'),
+    agreementCheckbox: present('[data-automation-id="agreementCheckbox"]'),
+    applyFlowPage: present('[data-automation-id="applyFlowPage"]'),
+    applyFlowReviewPage: present('[data-automation-id="applyFlowReviewPage"]'),
+    formField: formFields.length > 0
+  };
+  // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
+  const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
+  return {
+    url: location.href, host: location.host, title: document.title,
+    bodyText,
+    formFieldCount: formFields.length,
+    emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,
+    markers
+  };
+}
+
+// Cover-check for an arbitrary selector's click point (the parametrized sibling of
+// clickPageNext's inline check): is the top element at (cx,cy) the target button (or
+// in its subtree)? If not, a coordinate click would be SWALLOWED by an overlay — return
+// what's covering it so the caller can auto-dismiss (cdpFindDismissControl) or halt.
+function cdpCoverCheck(selector, cx, cy) {
+  const btn = document.querySelector(selector);
+  const top = document.elementFromPoint(cx, cy);
+  if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+  // Workday's own `click_filter` is a TRANSPARENT overlay it renders on top of buttons to CAPTURE
+  // clicks — it IS the intended click surface, not an obstruction (a coordinate click on it activates
+  // the button underneath). elementFromPoint returns it instead of the button, which looked like a
+  // "cover" and made the click refuse (live: PANW Sign In submit, 2026-07-09). Treat it as clear.
+  const aid = top.getAttribute && top.getAttribute("data-automation-id");
+  if (aid === "click_filter" || (top.closest && top.closest('[data-automation-id="click_filter"]'))) return { blocked: false };
+  const desc = (el) => {
+    const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
+    if (el.id) p.push("#" + el.id);
+    const aid = el.getAttribute && el.getAttribute("data-automation-id");
+    if (aid) p.push('[data-automation-id="' + aid + '"]');
+    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+    if (cls) p.push("." + cls);
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    return p.join("") + (txt ? ' "' + txt + '"' : "");
+  };
+  return { blocked: true, by: desc(top) };
+}
+
+// Create-account CONSENT control (workday.py two strategies): the explicit
+// agreementCheckbox (Capital One), else a checkbox whose associated label mentions
+// consent/terms/agree/privacy (AssetMark). Returns the LABEL's click point (preferred —
+// native label-activation fires React's change, the radio/checkbox lesson) + the current
+// checked state + the input id, or null. Read-only; the caller coordinate-clicks + verifies.
+function cdpConsentRect() {
+  let checkbox = document.querySelector('[data-automation-id="agreementCheckbox"] input[type="checkbox"]');
+  const bare = document.querySelector('[data-automation-id="agreementCheckbox"]');
+  if (!checkbox && bare && bare.tagName === "INPUT") checkbox = bare;
+  if (!checkbox) {
+    checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((b) => {
+      const lab = b.id ? document.querySelector('label[for="' + b.id + '"]') : null;
+      const wrapLab = b.closest && b.closest("label");
+      const txt = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || "").toLowerCase();
+      return /consent|terms|agree|privacy|acknowledge/.test(txt);
+    }) || null;
+  }
+  if (!checkbox) return null;
+  const inputId = checkbox.id || null;
+  const lab = inputId ? document.querySelector('label[for="' + inputId + '"]') : (checkbox.closest && checkbox.closest("label"));
+  const target = lab || checkbox;
+  if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = target.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return null;
+  return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), checked: !!checkbox.checked, inputId };
+}
+
+// "Resend Account Verification" button — shown on Workday's sign-in page when the account EXISTS
+// but is UNVERIFIED (e.g. a prior run created it and never completed verification). Clicking it
+// dispatches a FRESH verification email; the original may be stale/expired. Matched by TEXT
+// (must contain "resend" + verif/account) so it won't false-fire on Sign In / Create Account / other
+// blurb buttons; the data-automation-id (informationalBlurbButton on altasciences) is tenant-variable.
+// Returns the click point + label, or null.
+function cdpResendVerifyRect() {
+  const cands = Array.from(document.querySelectorAll('button, [role="button"], a, [data-automation-id="informationalBlurbButton"]'));
+  for (const el of cands) {
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!/resend/i.test(txt) || !/verif|account/i.test(txt)) continue; // "Resend Account Verification"
+    const r0 = el.getBoundingClientRect();
+    if (r0.width <= 0 || r0.height <= 0) continue;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+    const r = el.getBoundingClientRect();
+    return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), label: txt.slice(0, 50) };
+  }
+  return null;
+}
+
+// The n-th password input's click point (create-account "verify password" fallback when
+// there's no data-automation-id="verifyPassword": Workday renders a 2nd input[type=password]).
+function cdpNthPasswordRect(n) {
+  const el = document.querySelectorAll('input[type="password"]')[n];
+  if (!el) return null;
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return null;
+  // Full {x,y,w,h,cx,cy} — this is consumed via cdpEvalRectReady, whose validity gate is
+  // `rect.w > 0`, so w/h are REQUIRED (a {cx,cy}-only rect would always fail that gate).
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
 }
 
 // AI-4: the visible Workday validation-ERROR links. Recon (2026-06-22, Magna): each error in the
@@ -883,6 +1725,62 @@ function cdpReadRadioState(wrapperSel) {
   });
 }
 
+// Best-effort: find a clearly-DISMISSIVE control (X / Close / No thanks — NEVER Accept/Agree/OK/Got it)
+// inside the popup covering (cx,cy), so the walk can close it and proceed. Handles SHADOW-DOM overlays
+// (Simplify renders into div.simplify-jobs-shadow-root → the X lives in host.shadowRoot, invisible to a
+// light-DOM query) AND regular in-page modals. Read-only: returns the control's viewport rect for a TRUSTED
+// click (or {found:false}). SAFETY: the affirmative deny-list is checked first so we never click a
+// consent/accept button; if nothing clearly-dismissive is found we return not-found → the caller halts.
+function cdpFindDismissControl(cx, cy) {
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const cs = win.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
+  };
+  const host = document.elementFromPoint(cx, cy);
+  if (!host) return { found: false };
+  // Search root: an OPEN shadow root if the blocker is a shadow host (Simplify), else the blocker's own
+  // subtree climbed to a dialog/overlay-ish ancestor (bounded). A CLOSED shadow root → shadowRoot is null →
+  // we can't reach the X → not-found → safe halt.
+  let root = host.shadowRoot || null;
+  if (!root) {
+    let el = host;
+    for (let i = 0; i < 4 && el && el.parentElement; i++) {
+      const role = el.getAttribute && el.getAttribute("role");
+      if (role === "dialog" || role === "alertdialog") break;
+      el = el.parentElement;
+    }
+    root = el || host;
+  }
+  const AFFIRM = /accept|agree|\bok\b|okay|got\s*it|allow|\byes\b|confirm|continue|submit|\bsave\b|sign\s*up|subscribe|\bnext\b|enable|turn\s*on|autofill|\bapply\b/i;
+  const X_GLYPH = /^(×|✕|✖|⨯|✗|x|╳|⤫|⤬)$/i;
+  const DISMISS_TXT = /^(close|dismiss|minimi[sz]e|no thanks|no,\s*thanks|not now|skip|maybe later|later)$/i;
+  // Simplify's overlay (div.simplify-jobs-shadow-root) collapses out of the way via a <button aria-label="Minimize">
+  // — the safe get-out-of-the-way action (no close/consent). NOT "collapse" (that matches its "Collapse Resume
+  // Section" SUB-control, which wouldn't uncover the button). Recon-confirmed 2026-07-06.
+  const DISMISS_META = /close|dismiss|minimi[sz]e/i;
+  // Candidates: interactive controls + common close-icon carriers (class*=close/dismiss, X-glyph spans/divs).
+  const cand = Array.from(root.querySelectorAll('button, [role="button"], a[href], [aria-label], [title], [class*="close" i], [class*="dismiss" i], span, div, svg'));
+  let best = null;
+  for (const el of cand) {
+    if (!isVisible(el)) continue;
+    const meta = ((el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title"))) || "").trim();
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (AFFIRM.test(meta) || AFFIRM.test(txt)) continue;          // never click a consent/affirmative control
+    const cls = (el.className && typeof el.className === "string") ? el.className : "";
+    const dismissive = DISMISS_META.test(meta) || DISMISS_TXT.test(txt) || X_GLYPH.test(txt) || /(^|[-_ ])(close|dismiss)([-_ ]|$)/i.test(cls);
+    if (!dismissive) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width > 120 || r.height > 120) continue;                // skip big containers — target the small X/button, not the whole panel
+    const score = r.width * r.height;                             // prefer the smallest (the icon)
+    if (!best || score < best.score) best = { score, cx: r.left + r.width / 2, cy: r.top + r.height / 2, label: meta || txt || cls.slice(0, 40) };
+  }
+  return best ? { found: true, cx: best.cx, cy: best.cy, label: best.label } : { found: false };
+}
+
 function cdpReadCheckboxState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   const input = w && w.querySelector('input[type="checkbox"]');
@@ -1049,10 +1947,31 @@ async function cdpScrapeTaOptions(wrapperSel) {
   const sb = w.querySelector('input[data-automation-id="searchBox"]');
   const acId = sb ? sb.getAttribute("aria-controls") : null;
   const acEl = acId ? document.getElementById(acId) : null;
-  const optSel = '[role="option"]';
-  const root = (acEl && acEl.querySelector(optSel)) ? acEl : document;
-  const curOpts = () => Array.from(root.querySelectorAll(optSel))
-    .filter((el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]'));
+  // rAF races a setTimeout fallback so a loop never HANGS on a hidden tab (frozen rAF). Used both to WAIT
+  // for the list to render (below) and to pace the virtualizer between scroll steps (see doScroll).
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
+  const labelOf = (el) => (el.getAttribute && el.getAttribute("data-automation-label")) || (el.textContent || "").trim();
+  // A REAL option leaf: visible, not the disabled placeholder, and NOT a selectedItem CHIP. Chips carry
+  // role="option" markup too (the documented chip-contamination), so they must NEVER count as options — else
+  // a prefilled field's chip alone locks the selector + masks the real list (countryPhoneCode diag 2026-07-06:
+  // role=2/prompt=2 were the 2 CHIPS, 0 real leaves).
+  const nonChip = (el) => isVisible(el) && el.getAttribute("aria-disabled") !== "true" && !el.closest('[data-automation-id="selectedItemList"]');
+  // Leaves are role=option on most tenants, promptOption-only on some (the divergence cdpReadHierState handles).
+  const OPT_SELECTORS = ['[role="option"]', '[data-automation-id="promptOption"]'];
+  const optsFor = (sel) => { const scope = (acEl && acEl.querySelector(sel)) ? acEl : document; return Array.from(scope.querySelectorAll(sel)).filter(nonChip); };
+  const bannerUp = () => Array.from(document.querySelectorAll('[data-automation-id="promptTitle"]'))
+    .some((el) => isVisible(el) && /no matches found/i.test((el.textContent || "").trim()));
+  // WAIT for the list to render, then pick the selector that finds REAL (non-chip) leaves. The searchBox
+  // becomes visible a beat BEFORE the virtualized rows mount, so an immediate read finds only chips (0 real)
+  // — that was the countryPhoneCode 0-options bug. Frame-poll until non-chip leaves appear (or a no-match
+  // banner, or a ~24-frame ceiling). FoS is already rendered when scraped mid-fill → resolves at frame 0.
+  const pickSel = () => OPT_SELECTORS.find((sel) => optsFor(sel).length) || null;
+  let optSel = pickSel();
+  for (let i = 0; i < 24 && !optSel && !bannerUp(); i++) { await frame(); optSel = pickSel(); }
+  optSel = optSel || '[role="option"]';
+  const roleCount = optsFor('[role="option"]').length;                       // non-chip counts (diagnostic)
+  const promptCount = optsFor('[data-automation-id="promptOption"]').length;
+  const curOpts = () => optsFor(optSel);
   // Scroll container = the nearest scrollable ancestor of an option (overflow-y auto/scroll +
   // scrollHeight > clientHeight); fall back to acEl / the option's parent.
   const findScroller = () => {
@@ -1064,20 +1983,46 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
     return (acEl && acEl.scrollHeight > acEl.clientHeight) ? acEl : null;
   };
-  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); // 2 frames: let the virtualizer render
-  const seen = new Map(); // text → first-seen order (de-dupe, preserve order)
-  const collect = () => { for (const o of curOpts()) { const t = (o.textContent || "").trim(); if (t && !seen.has(t)) seen.set(t, seen.size); } };
+  const seen = new Map(); // text -> first-seen order (de-dupe, preserve order)
+  const curSig = () => { let s = ""; for (const o of curOpts()) s += labelOf(o) + ""; return s; }; // signature of the CURRENTLY-mounted window (change = a new window committed); labelOf to match collect
+  const collect = () => { for (const o of curOpts()) { const t = labelOf(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
+  // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive a react virtualizer's row re-render on
+  // a HIDDEN tab — the mounted set stayed a FROZEN 17 rows → the FoS list truncated to the on-open window.
+  // Firing an explicit 'scroll' after each set makes the virtualizer mount the new window even hidden
+  // (live-verified: 65/65 options, seen-count climbs with scrollTop).
+  const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
+  // FASTER per-step wait (2026-07-06): poll single frames until the mounted set actually CHANGES (React
+  // committed the just-scrolled window) — breaks at ~1 frame on the common steps (≈2× the old fixed
+  // double-rAF), capped at 3 (≈ the old worst case, so NEVER slower and safe for a slow commit). The
+  // sig-change IS the mount signal, so this reads a COMMITTED window — it can't advance before the mount, so
+  // it can't re-truncate; overlap + de-dup + stable-2-at-bottom still backstop completeness.
+  const awaitRender = async (beforeSig) => { for (let i = 0; i < 3; i++) { await frame(); if (curSig() !== beforeSig) return; } };
+  // Measure the CURRENTLY-mounted window's pixel span (viewport + the virtualizer's overscan, typically
+  // 2–3× clientHeight). Stepping by a fraction of THIS (not the viewport) means far fewer hops to the bottom
+  // — the big visible-scroll speedup — while self-adapting to the tenant's overscan. Falls back to clientHeight.
+  const mountedSpan = () => {
+    const els = curOpts();
+    if (!sc || els.length < 2) return sc ? sc.clientHeight : 0;
+    let top = Infinity, bottom = -Infinity;
+    for (const e of els) { const r = e.getBoundingClientRect(); if (r.top < top) top = r.top; if (r.bottom > bottom) bottom = r.bottom; }
+    return Math.max(sc.clientHeight, bottom - top);
+  };
   collect();
   let steps = 0, stable = 0, atBottom = false;
-  const MAX_STEPS = 60; // safety bound — a curated FoS list is tens of options / a few windows
+  const MAX_STEPS = 80; // safety bound (far more than the ~4–8 mounted-span hops a real list needs)
   if (sc) {
-    sc.scrollTop = 0; await frame(); collect();
+    doScroll(0); await frame(); collect();
+    let priorSig = curSig();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight, sc.scrollHeight);
-      await frame();
+      // Hop by 0.6× the mounted-window span → ~40% overlap between consecutive windows, so no row is skipped
+      // even if the span is mis-measured by up to 40% (a big safety margin; de-dup + stable-2 still backstop).
+      const inc = Math.max(60, Math.floor(mountedSpan() * 0.6));
+      doScroll(Math.min(sc.scrollTop + inc, sc.scrollHeight));
+      await awaitRender(priorSig);
+      priorSig = curSig();
       collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
@@ -1087,6 +2032,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
   }
   const options = Array.from(seen.keys());
   return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
+    roleCount, promptCount, usedSel: optSel,
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
 
@@ -1099,7 +2045,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
 // ("No matches found" on the fallback; the CLICKED CATEGORY NAME once drilled — the drill-confirmation signal).
 // Mirrors cdpScrapeTaOptions's scroll loop; resets scrollTop to 0 at the end so early rows are mounted for a
 // subsequent category click. Async — awaited via cdpEval.
-async function cdpScrapeSourceRows(wrapperSel) {
+async function cdpScrapeSourceRows(wrapperSel, debug) {
   const isVisible = (el) => {
     if (!el || !el.getBoundingClientRect) return false;
     const r = el.getBoundingClientRect();
@@ -1122,30 +2068,40 @@ async function cdpScrapeSourceRows(wrapperSel) {
     }
     return null;
   };
-  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  // rAF paces the virtualizer's paint when VISIBLE (fast); a hidden tab FREEZES rAF, so race a setTimeout
+  // (throttled to ~1Hz when hidden) — without the fallback this scroll loop would HANG on a hidden tab.
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Per-step settle: one frame lets the virtualizer render the just-scrolled window before we read (the
+  // fix is doScroll below, not the settle length). DEFAULT (debug OFF) = one frame; the +120ms is DEBUG-ONLY
+  // so the operator can WATCH the scroll when "Debug: log keystrokes" is checked.
+  const stepSettle = async () => { await frame(); if (debug) await sleep(120); };
   const seen = new Map(); // label → order (first-seen, de-dupe within ONE view)
   const collect = () => { for (const o of curOpts()) { const t = leafLabel(o); if (t && !seen.has(t)) seen.set(t, seen.size); } };
   const sc = findScroller();
+  // THE fix (diag 2026-07-05): a programmatic scrollTop does NOT drive the virtualizer's row re-render on a
+  // HIDDEN tab (mounted set stayed frozen while scrollTop climbed → enumeration truncated to the on-open
+  // window). Fire an explicit 'scroll' after each set so the virtualizer mounts the new window even hidden.
+  const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
   let steps = 0, stable = 0, atBottom = false;
-  const MAX_STEPS = 40;
+  const MAX_STEPS = 60;
   collect();
   if (sc) {
-    // SLOW, OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window
-    // (overlap, no row skipped) and wait a real ~120ms per step so every window's rows render before collect().
+    // OVERLAPPING scroll: a virtualizer mounts rows only after a scroll settles → step ~0.8 window (overlap,
+    // no row skipped). Pacing is via stepSettle (one frame; +120ms only in debug; hidden-safe setTimeout).
     const step = Math.max(Math.floor(sc.clientHeight * 0.8), 60);
-    sc.scrollTop = 0; await frame(); await sleep(120); collect();
+    doScroll(0); await stepSettle(); collect();
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      sc.scrollTop = Math.min(sc.scrollTop + step, sc.scrollHeight);
-      await frame(); await sleep(120); collect();
+      doScroll(Math.min(sc.scrollTop + step, sc.scrollHeight));
+      await stepSettle(); collect();
       steps++;
       atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
       const movedNothing = sc.scrollTop === prevTop;
       if (seen.size === before && (atBottom || movedNothing)) { if (++stable >= 2) break; } else stable = 0;
     }
-    sc.scrollTop = 0; await frame(); // back to top so early rows are mounted for a subsequent category click
+    doScroll(0); await frame(); // back to top so early rows are mounted for a subsequent category click
   }
   // banner = the current promptTitle text (drill-confirmation: the clicked category name once drilled).
   let banner = "";
@@ -1224,7 +2180,9 @@ async function cdpSourceRowRect(label) {
     }
     return null;
   };
-  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  // rAF is fast when VISIBLE but FREEZES on a hidden tab, so race a setTimeout fallback (throttled to ~1Hz
+  // when hidden) — without it this scroll-to-find/click loop would HANG when hidden.
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // Is the leaf's center inside the CLICKABLE viewport AND not occluded? CDP's Input.dispatchMouseEvent uses
   // VIEWPORT coords, so a row with cy > innerHeight is unclickable even when it's mounted + "visible" + inside
@@ -1632,6 +2590,53 @@ function cdpSourceCategoryRect(label) {
                    cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) } };
 }
 
+// ── Batched audit re-read (perf) ─────────────────────────────────────────────
+// The M40 audit re-reads every field the bot actuated. Doing one cdpEval PER FIELD is N serial
+// SW↔page round-trips; on a HIDDEN tab (where the fill is slowest — throttled reaction, and each
+// debugger round-trip costs more) that IPC latency dominates the otherwise-instant reads.
+// cdpReadAuditRaw reads ALL fields in ONE Runtime.evaluate by COMPOSING the SINGLE-SOURCE reader
+// functions (their .toString(), NO body duplication → no lockstep hazard) with a dispatcher inside
+// one scoped IIFE. Returns a parallel array of RAW reader outputs (the same shapes
+// act.readTextValue/readDropdownState/… return; a "date" entry → an array of per-segment reads),
+// null per field on a page-side error. The {actual,readable} MAPPING stays SW-side in fill-driver
+// (auditActualFromRaw — Node-testable); reconcileAudit falls back to the per-field path when this
+// method is absent (older fakes / a minimal audit act).
+const AUDIT_RAW_READERS = [cdpReadTextState, cdpReadInputBySel, cdpReadDropdownState,
+  cdpReadCheckboxState, cdpReadRadioState, cdpReadHierState, cdpReadSourcePick];
+// Page-side dispatcher — receives [{widgetType, wrapperSel, tag, dateSegs}] and returns the raw read
+// per spec. Self-contained: references ONLY the AUDIT_RAW_READERS (injected as sibling declarations
+// by cdpReadAuditRaw) + page globals. Keep the widget→reader map in LOCKSTEP with fill-driver's
+// auditReReadActual (typeahead→Hier, hierarchical→SourcePick).
+function cdpAuditRawDispatch(specs) {
+  return (specs || []).map(function (s) {
+    try {
+      switch (s.widgetType) {
+        case "text": case "textarea": return cdpReadTextState(s.wrapperSel, s.tag);
+        case "dropdown": return cdpReadDropdownState(s.wrapperSel);
+        case "checkbox": return cdpReadCheckboxState(s.wrapperSel);
+        case "radio": return cdpReadRadioState(s.wrapperSel);
+        case "typeahead": return cdpReadHierState(s.wrapperSel);
+        case "hierarchical": return cdpReadSourcePick(s.wrapperSel);
+        case "date": return (s.dateSegs || []).map(function (seg) {
+          return cdpReadInputBySel(s.wrapperSel + ' [data-automation-id="dateSection' + seg + '-input"]');
+        });
+        default: return null;
+      }
+    } catch (e) { return null; }
+  });
+}
+async function cdpReadAuditRaw(specs) {
+  const readerSrc = AUDIT_RAW_READERS.map((f) => String(f)).join("\n");
+  const expression = "(function(){\n" + readerSrc + "\nreturn (" + String(cdpAuditRawDispatch)
+    + ")(" + JSON.stringify(specs || []) + ");\n})()";
+  const res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  if (res && res.exceptionDetails) {
+    const d = res.exceptionDetails;
+    throw new Error("cdpReadAuditRaw: " + ((d.exception && d.exception.description) || d.text || "page exception"));
+  }
+  return res && res.result ? res.result.value : undefined;
+}
+
 // The actuation object. No tabId param — the substrate's single tracked
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 // `llmConfig` (AI-0 seam): the operator's {provider,model,apiKey,enabled} from storage,
@@ -1642,7 +2647,9 @@ function makeCdpActuation(llmConfig) {
     // toggle never opens/actuates). Mirrors act.llm's own enabled check (both read llmConfig).
     aiEnabled: !!(llmConfig && llmConfig.enabled),
     delay: cdpAdaptiveDelay, // ALL driver pacing goes through this — visibility-adaptive: fast foreground, full hidden (SW wall-clock)
-    delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility (dropdown option-list render + commit-verify). The 5x speedup is for OUR pacing between actions, NEVER the page's render.
+    delayFull: cdpDelay,     // NON-adaptive (never sped up): waits where the PAGE's own render needs real wall-clock time regardless of tab visibility. The 5x speedup is for OUR pacing between actions, NEVER the page's render.
+    delayRender: cdpAdaptiveDelay, // STAGE 2 (2026-07-04): render-SETTLE intervals (dropdown option-list settle + commit-persistence) — adaptive on the SAME cdpFast() measured signal as `delay`. Safe to shrink because the sites gated by it use interval-LENGTH-INDEPENDENT state gates (2-equal-non-zero reads / persistence re-read), and it only shrinks when timers MEASURE fast (worker-backed/visible → the render genuinely completes in ~50ms). Slow/throttled ⇒ full ⇒ byte-identical to the old delayFull. Driver falls back to delayFull when this is absent (older fakes).
+    visible: cdpVisible, // REAL tab visibility (tab.active && window not minimized), cached — the honest "is the page PAINTING?" signal. NOT cdpFast (which is true for hidden+worker-timers). The dropdown OVERWRITE debounce is a paint thing (~700ms hidden, tiny visible), so the fill uses this to pick the overwrite fast/slow beats. Absent on older fakes ⇒ driver treats as hidden (the safe, larger beat).
 
     scanPage: () => cdpEval(cdpPageScan),
 
@@ -1661,7 +2668,7 @@ function makeCdpActuation(llmConfig) {
         const rect = await cdpEval(cdpRectOf, sel, true);
         if (rect && rect.w > 0) {
           await cdpClickAt(rect.cx, rect.cy);
-          await cdpDelay(250);
+          await cdpAdaptiveDelay(250); // focus settle — adaptive (Stage B); gated by the .focused read below (a too-short settle just costs one ladder retry, never a wrong fill)
           const s = await cdpEval(cdpReadTextState, loc.wrapperSel, tag);
           if (s && s.focused) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusText", JSON.stringify(sel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (cdp-click)`); return "cdp-click"; }
         }
@@ -1742,7 +2749,7 @@ function makeCdpActuation(llmConfig) {
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") : "FAILED");
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]" : "FAILED");
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
@@ -1795,6 +2802,8 @@ function makeCdpActuation(llmConfig) {
       return false;
     },
     readHier: (loc) => cdpEval(cdpReadHierState, loc.wrapperSel),
+    // Perf: read MANY fields' raw state in ONE round-trip for the M40 audit (see cdpReadAuditRaw).
+    readAuditRaw: (specs) => cdpReadAuditRaw(specs),
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
@@ -1826,7 +2835,7 @@ function makeCdpActuation(llmConfig) {
     // enumerate EVERY category (on open) and EVERY leaf (after a drill), so the AI never picks from a
     // partial, on-screen-only list. Read-only (scrolls + reads; resets scrollTop to 0).
     scrapeSourceRows: async (loc) => {
-      const r = await cdpEval(cdpScrapeSourceRows, loc.wrapperSel);
+      const r = await cdpEval(cdpScrapeSourceRows, loc.wrapperSel, inputTraceEnabled);
       console.log("[ApplyPilot][CDP-SRC-SCRAPE]", loc.wrapperSel, r && r.ok ? (r.options.length + " options, banner=" + JSON.stringify(r.banner) + (r.atBottom ? " (bottom)" : "")) : "FAILED");
       return r;
     },
@@ -1872,12 +2881,22 @@ function makeCdpActuation(llmConfig) {
         const rect = await cdpEval(cdpRectOf, loc.wrapperSel + part, true);
         if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); break; }
       }
-      await cdpDelay(700); // let the portaled list render (non-adaptive — the page's own render)
-      const dump = await cdpEval(cdpReadSourceState, loc.wrapperSel);
-      const rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
+      // GATED render wait (Stage B — was a blind 700ms). Poll until the portaled list has MOUNTED (any
+      // rows present), THEN classify — fast when it renders fast (the common case; FoS mounts ~immediately),
+      // but never reads an EMPTY list (which would misclassify a tree as flat). Raw ceiling so a genuinely
+      // slow render still resolves; a still-empty list at the ceiling = no options on open (search-only) →
+      // treated flat, same conclusion the old blind read reached. Read-only (no type/Enter/arrow/click).
+      let dump = null, rows = [];
+      const treeDeadline = Date.now() + 1500; // raw bound (old blind wait was 700ms; give a slow mount room)
+      while (Date.now() < treeDeadline) {
+        await cdpAdaptiveDelay(120); // adaptive poll interval — tight when fast, full on the slow path
+        dump = await cdpEval(cdpReadSourceState, loc.wrapperSel);
+        rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
+        if (rows.length > 0) break;
+      }
       const isTree = rows.some((r) => r && r.isCategory);
       await cdpKeyTap(CDP_KEYS.tab); // clean non-committing close
-      await cdpDelay(200);
+      await cdpAdaptiveDelay(200);
       return isTree;
     },
 
@@ -1910,8 +2929,79 @@ function makeCdpActuation(llmConfig) {
       if (reviewPresent) return { clicked: false, refused: "review-page" };
       const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
       if (!rect) return { clicked: false, refused: "no-button" };
+      // A popup/overlay (e.g. the Simplify extension's dialog, a cookie banner, a modal) can sit OVER the
+      // Save & Continue button. A coordinate click would land on the popup and be SWALLOWED — the page never
+      // advances and it surfaces as a bare nav-timeout. So elementFromPoint the button's center first: the
+      // top node there must BE the button (or in its subtree). If something else covers it, refuse with a
+      // diagnostic that NAMES the blocker instead of clicking blindly.
+      const cover = await cdpEval((cx, cy) => {
+        const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+        const top = document.elementFromPoint(cx, cy);
+        if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+        const desc = (el) => {
+          const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
+          if (el.id) p.push("#" + el.id);
+          const aid = el.getAttribute && el.getAttribute("data-automation-id");
+          if (aid) p.push('[data-automation-id="' + aid + '"]');
+          const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+          if (cls) p.push("." + cls);
+          const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+          return p.join("") + (txt ? ' "' + txt + '"' : "");
+        };
+        return { blocked: true, by: desc(top) };
+      }, rect.cx, rect.cy);
+      if (cover && cover.blocked) {
+        // Best-effort auto-dismiss (operator opted in 2026-07-06): try ONCE to click a clearly-dismissive
+        // control (X/Close/No-thanks — never Accept/OK) inside the popup, incl. Simplify's shadow-DOM overlay,
+        // then re-check. If it clears → proceed; else halt (operator closes it) — never force-remove DOM.
+        const d = await cdpEval(cdpFindDismissControl, rect.cx, rect.cy);
+        if (d && d.found) {
+          console.log("[ApplyPilot][CDP] Save & Continue covered by", cover.by, "— clicking its dismiss control:", JSON.stringify(d.label));
+          await cdpClickAt(d.cx, d.cy);
+          const coverGone = async () => cdpEval((cx, cy) => {
+            const b = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+            const t = document.elementFromPoint(cx, cy);
+            return !b || !t || t === b || b.contains(t) || t.contains(b);
+          }, rect.cx, rect.cy);
+          let clear = false;
+          for (let i = 0; i < 5 && !clear; i++) { await cdpDelay(300); clear = await coverGone(); } // let it animate out
+          if (clear) {
+            console.log("[ApplyPilot][CDP] popup dismissed — Save & Continue is now clickable.");
+            await cdpClickAt(rect.cx, rect.cy);
+            return { clicked: true, dismissed: cover.by };
+          }
+          console.log("[ApplyPilot][CDP] auto-dismiss clicked", JSON.stringify(d.label), "but the button is STILL covered — halting for the operator.");
+          return { clicked: false, refused: "blocked", blockedBy: cover.by, dismissTried: d.label };
+        }
+        console.log("[ApplyPilot][CDP] Save & Continue is COVERED by an overlay/popup — NOT clicking (no safe dismiss control found). Blocked by:", cover.by);
+        return { clicked: false, refused: "blocked", blockedBy: cover.by };
+      }
       await cdpClickAt(rect.cx, rect.cy);
       return { clicked: true };
+    },
+
+    // clickSubmit(authorize) — the ONE submit-capable click. EXACT INVERSE of clickPageNext: it fires
+    // ONLY when the review marker is PRESENT *and* authorize === true, then clicks pageFooterNextButton
+    // (which IS the Submit button on the review page). This is the sole place an application can be
+    // submitted; clickPageNext refuses on the review page, so no other click can. Defense in depth: the
+    // walk's submitPrecondition gate must ALSO pass before this is ever called. Never auto-dismisses an
+    // overlay (unlike clickPageNext) — a covered Submit button REFUSES, it does not click blindly.
+    clickSubmit: async (authorize) => {
+      if (authorize !== true) return { clicked: false, refused: "not-authorized" };
+      const reviewPresent = await cdpEval(() => !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'));
+      if (!reviewPresent) return { clicked: false, refused: "not-review-page" }; // NEVER submit off the review page
+      const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
+      if (!rect) return { clicked: false, refused: "no-button" };
+      // Covered-button guard (same as clickPageNext) — a swallowed submit click would look like a no-op.
+      const cover = await cdpEval((cx, cy) => {
+        const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]');
+        const top = document.elementFromPoint(cx, cy);
+        if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
+        return { blocked: true, by: (top.getAttribute && top.getAttribute("data-automation-id")) || (top.tagName ? top.tagName.toLowerCase() : "?") };
+      }, rect.cx, rect.cy);
+      if (cover && cover.blocked) return { clicked: false, refused: "blocked", blockedBy: cover.by };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { clicked: true, submitted: true };
     },
 
     // ── AI-4 validation-error remediation ──
@@ -1923,6 +3013,7 @@ function makeCdpActuation(llmConfig) {
     // Substrate for driveRepeatingSectionCdp. The brain stays substrate-agnostic:
     // these return data / {ok}, never rects, so the test fake just flips counts.
     repeatingScan: () => cdpEval(cdpRepeatingScan),
+    nestedScan: () => cdpEval(cdpGenericNestedScan), // nested repeating sections (cert → specialties) + parentOrder + attachments
     entryCount: (prefix) => cdpEval(cdpEntryCount, prefix),
     // Click a section's Add button (headingRegexSource is a STRING — RegExp can't
     // cross the eval boundary). scrollIntoView + viewport rect + M29 retry, then click.
@@ -1940,6 +3031,27 @@ function makeCdpActuation(llmConfig) {
       await cdpClickAt(rect.cx, rect.cy);
       return { ok: true };
     },
+    // ── nested repeating sections (reveal-by-add: cert ▸ Specialties) ──
+    // Add scoped INSIDE a specific parent entry (parentFkit = "<base>-<N>--null"); Delete a nested
+    // child entry that has NO --null container. Same scroll + viewport-rect + M29 retry mechanics.
+    clickNestedAdd: async (parentFkit, headingRegexSource) => {
+      const rect = await cdpEvalRectReady(cdpNestedAddRect, parentFkit, headingRegexSource);
+      if (!rect) return { ok: false };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { ok: true };
+    },
+    clickNestedDelete: async (parentFkit, childBase, childIndex) => {
+      const rect = await cdpEvalRectReady(cdpNestedDeleteRect, parentFkit, childBase, childIndex);
+      if (!rect) return { ok: false };
+      await cdpClickAt(rect.cx, rect.cy);
+      return { ok: true };
+    },
+    // Probe the live fkit ↔ formField relationship for a nested field and return the SINGLE
+    // suffix-composable wrapper selector that actually resolves (null = nothing found — honest).
+    nestedFieldSel: (fkit, field) => cdpEval(cdpNestedFieldSel, fkit, field),
+    // Does a selector resolve on the live page? (reconPageTruth's nested-row existence check —
+    // a Tier-1.5 deleted specialty row's probed auditLoc stops resolving.)
+    selExists: (sel) => cdpEval(function (s) { return !!document.querySelector(s); }, sel),
 
     // ── date composite segments (M34) ──
     // A date `-input` (role=spinbutton) is 0-box — can't be coordinate-clicked. Focus
@@ -1961,11 +3073,11 @@ function makeCdpActuation(llmConfig) {
       let attempt = 0;
       while (true) {
         const r = await cdpEval(cdpRectOf, displaySel, true);
-        if (r && r.w > 0) { await cdpTripleClickAt(r.cx, r.cy); await cdpDelay(200); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(displaySel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (triple-click-display)`); return "triple-click-display"; } }
-        if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (el.focus)`); return "el.focus()"; } }
-        try { await cdpDomFocus(inputSel); await cdpDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; } } catch (e) { /* not found */ }
+        if (r && r.w > 0) { await cdpTripleClickAt(r.cx, r.cy); await cdpAdaptiveDelay(200); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(displaySel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (triple-click-display)`); return "triple-click-display"; } }
+        if (await cdpEval(cdpFocusBySel, inputSel)) { await cdpAdaptiveDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (el.focus)`); return "el.focus()"; } }
+        try { await cdpDomFocus(inputSel); await cdpAdaptiveDelay(120); if (await focused()) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `RECOVERED after ${Date.now() - start}ms / ${attempt} retries (DOM.focus)`); return "DOM.focus"; } } catch (e) { /* not found */ }
         if (Date.now() - start >= RECT_READY_CEILING_MS) { if (attempt > 0) console.log("[ApplyPilot][CDP] focusDateSegment", JSON.stringify(inputSel), `gave up after ${Date.now() - start}ms / ${attempt} retries`); return null; }
-        await cdpDelay(RECT_READY_INTERVAL_MS);
+        await cdpAdaptiveDelay(RECT_READY_INTERVAL_MS); // focus-retry poll interval — adaptive (Stage B); gated by focused() re-check
         attempt++;
       }
     },

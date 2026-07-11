@@ -2,7 +2,7 @@
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder); llm.js = multi-provider LLM adapter (callLLM); cdp.js = CDP substrate (off-loop actuation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
+importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
 
 // ============================================================================
 // EXTERNAL messages from ApplyPilot Web (the website → extension handoff).
@@ -117,6 +117,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // GMAIL SMOKE TEST (onboarding prereq): prove getAuthToken + a readonly
+  // users/me/profile call work, and show the connected inbox. Run this FIRST (after
+  // creating the OAuth client) before trusting auto-verify. [GMAIL-TEST] in the SW console.
+  if (message.type === "RUN_GMAIL_TEST") {
+    (async () => { const out = await runGmailSmokeTest(true); sendResponse(out); })();
+    return true; // async sendResponse
+  }
+
+  // ONBOARDING WALK (the pre-form stage): drive the ACTIVE tab from a job-description
+  // page through Apply → Apply Manually → sign-in/create-account → email verification →
+  // land on the application form. Reads credentials + onboardConfig from storage. By
+  // default it STOPS on the form (never auto-advances a live application); it chains into
+  // the existing CDP fill walk ONLY when onboardConfig.continueToWalk === true. [ONBOARD].
+  if (message.type === "RUN_CDP_ONBOARD") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r));
+      const cfg = store.onboardConfig || {};
+      const onb = await runCdpOnboard(tab.id, { credentials: store.credentials || null, gmailEnabled: !!cfg.gmailEnabled, startUrl: cfg.startUrl || null });
+      if (!onb.ok || !onb.reached_form || cfg.continueToWalk !== true) { sendResponse({ ...onb, walked: false }); return; }
+      if (!store.profile) { sendResponse({ ...onb, walked: false, walk_error: "no-profile" }); return; }
+      console.log("[ApplyPilot][ONBOARD] reached the form — continueToWalk is ON, chaining into the CDP fill walk.");
+      const walk = await runCdpWalk(tab.id, store.profile, store.defaults || {}, store.jobContext || {});
+      sendResponse({ ...onb, walked: true, walk });
+    });
+    return true; // async sendResponse
+  }
+
   // SESSION RECON (M30 Step 0): read-only snapshot to classify live-form vs
   // logged-out/expired. No minimize needed. [SESSION-RECON] in the SW console.
   if (message.type === "RUN_CDP_SESSION_RECON") {
@@ -160,188 +189,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
-  // CDP CERT-SPECIALTY RECON (M36.2): read-mostly discovery of the NESTED Specialties
-  // sub-section inside a Certification entry (mounts ONE specialty, dumps the diff,
-  // restores). [CERT-SPECIALTY-RECON] in the SW console. No profile needed.
-  if (message.type === "RUN_CDP_CERT_SPECIALTY_RECON") {
+  // REVIEW-PAGE CHECK (end-to-end fill-verify): on the FINAL review page — the one that renders every
+  // filled value as read-only text (ground truth of what would submit) — scrape those displayed values
+  // and reconcile them against the saved reviewSummary bundle (what the extension RECORDED it filled).
+  // Disagreements flag fill bugs (the React value-revert class). READ-ONLY — never clicks Next/Submit.
+  // [REVIEW-CHECK] in the SW console.
+  if (message.type === "RUN_CDP_REVIEW_CHECK") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpCertSpecialtyRecon(tab.id);
+      const out = await runCdpReviewReconcile(tab.id);
       sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP TEXTAREA RECON (M37 Part 0 — the WE gate): does CDP actuation drive a Workday
-  // <textarea>? Probes the WE roleDescription textarea with a multi-line value via
-  // insertText vs the native-setter cdpEval. [TEXTAREA-RECON] in the SW console.
-  if (message.type === "RUN_CDP_TEXTAREA_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpTextAreaRecon(tab.id);
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP FILL WEBSITES (M32b): the FIRST repeating-section fill on the CDP path —
-  // reconcile the Websites section to N + fill each entry's url (date-free) while
-  // HIDDEN. Proves driveRepeatingSectionCdp; dates are deferred (Websites has none).
-  // Run on My Experience (page 2). Results land as [CDP-WEB] in the SW console.
-  if (message.type === "RUN_CDP_FILL_WEBSITES") {
-    chrome.storage.local.get(["profile"], ({ profile }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-WEB] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillWebsites(tab.id, profile);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP FILL LANGUAGES (M35): reuse driveRepeatingSectionCdp for the date-free Languages
-  // section (language + 3 by-label proficiency dropdowns + "I am fluent" checkbox; deleteOnNoMatch).
-  // First live exercise of the labelRegex/hashed-id resolve. Run on My Experience (page 2). [CDP-LANG].
-  if (message.type === "RUN_CDP_FILL_LANGUAGES") {
-    chrome.storage.local.get(["profile"], ({ profile }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-LANG] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillLanguages(tab.id, profile);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP FILL WORK EXPERIENCE (M37): reuse driveRepeatingSectionCdp; WORK_EXPERIENCE_MAP
-  // (text + currentlyWorkHere checkbox + M/Y dates + roleDescription textarea). Run on
-  // My Experience (page 2). [CDP-WE] in the SW console.
-  if (message.type === "RUN_CDP_FILL_WORK_EXPERIENCE") {
-    chrome.storage.local.get(["profile"], ({ profile }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-WE] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillWorkExperience(tab.id, profile);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP FILL EDUCATION (M36): reuse driveRepeatingSectionCdp; un-deferred date branch fills the
-  // from/to YEAR dates via the M34 composite. Run on My Experience (page 2). [CDP-EDU] in SW console.
-  if (message.type === "RUN_CDP_FILL_EDUCATION") {
-    chrome.storage.local.get(["profile"], ({ profile }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-EDU] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillEducation(tab.id, profile);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP FILL CERTIFICATIONS (M36): reuse driveRepeatingSectionCdp; un-deferred date branch fills the
-  // issued/expiration M/D/Y dates. deleteOnNoMatch (a non-matching cert deletes its entry). Run on My
-  // Experience (page 2). [CDP-CERT] in the SW console.
-  if (message.type === "RUN_CDP_FILL_CERTIFICATIONS") {
-    chrome.storage.local.get(["profile"], ({ profile }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-CERT] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillCertifications(tab.id, profile);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // TARGETED DATE FILL (M34 verify harness): fill ONE date composite located by
-  // label regex via fillDateCompositeCdp HIDDEN — proves the date handler on the
-  // three shapes (WE M/Y, Education year-only, Certs M/D/Y). Run on My Experience
-  // (page 2). Results land as [CDP-DATE] in the SW console.
-  if (message.type === "RUN_CDP_FILL_DATE") {
-    chrome.storage.local.get(["profile"], ({ profile }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-DATE] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillDate(tab.id, profile, String(message.labelRegex || ""));
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // SOURCE FILL (backlog C — Phase B): fill the source picker via fillSourceCdp
-  // (typeahead-style: type → filter → auto-commit/click leaf) HIDDEN, candidates
-  // from defaults.how_did_you_hear (preferred LinkedIn). Selects LinkedIn + reads
-  // the live commit signal. [CDP-SRC] in the SW console.
-  if (message.type === "RUN_CDP_SOURCE_FILL") {
-    chrome.storage.local.get(["defaults"], ({ defaults }) => {
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpSourceFill(tab.id, defaults);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP FILL (Step 2 of the CDP actuation port): fill the active page's SIMPLE
-  // widgets (text/dropdown/radio/checkbox) through chrome.debugger input while
-  // the tab is HIDDEN — the M22 decision logic (fill-driver.js) over the CDP
-  // actuation (cdp.js). Typeahead/source → needs_review untouched; repeating
-  // sections excluded by the scan. Results land in the SW console (NEEDS REVIEW
-  // block first, then the full table). Standalone — RUN_FILL is untouched.
-  if (message.type === "RUN_CDP_FILL") {
-    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-FILL] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFill(tab.id, profile, defaults, jobContext);
-        sendResponse(out);
-      });
     });
     return true; // async sendResponse
   }
@@ -358,135 +216,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
         const tab = tabs[0];
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpFillPage(tab.id, profile, defaults, jobContext, { skipLock: !!message.noLock });
+        const out = await runCdpFillPage(tab.id, profile, defaults, jobContext);
         sendResponse(out);
       });
     });
     return true; // async sendResponse
   }
 
-  // DEBUG: "How did you hear" — deterministic fill → AI picks the best CATEGORY → click it → STOP.
-  if (message.type === "RUN_CDP_SOURCE_AI_DEBUG") {
-    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-SRC-DEBUG] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpSourceAiDebug(tab.id, profile, defaults, jobContext);
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // AI-4 TEST HARNESS: fill the page, deliberately clear a required field, then watch AI-4 remediate.
-  if (message.type === "RUN_CDP_TEST_REMEDIATION") {
-    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
-      if (!profile) {
-        console.log('[ApplyPilot][CDP-TEST-AI4] No profile in storage — click "Load default profile" first.');
-        sendResponse({ ok: false, error: "no-profile" });
-        return;
-      }
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        const tab = tabs[0];
-        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-        const out = await runCdpTestRemediation(tab.id, profile, defaults, jobContext, { unfixable: !!message.unfixable });
-        sendResponse(out);
-      });
-    });
-    return true; // async sendResponse
-  }
-
-  // CDP RE-AUDIT (M40 standalone): re-read the live page vs the persisted reviewAudit
-  // expectations + report mismatches. No profile needed (reads stored expectations).
-  if (message.type === "RUN_CDP_AUDIT") {
+  // M3 SUBMIT replay (DRY): replay the SAVED approved review-summary bundle onto the current
+  // page (flat + repeating) — NO Next, NO Submit. Uses the bundle, not the profile. [CDP-REPLAY].
+  if (message.type === "RUN_CDP_REPLAY_PAGE") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpAudit(tab.id);
+      const out = await runCdpReplayPage(tab.id);
       sendResponse(out);
     });
     return true; // async sendResponse
   }
 
-  // CDP RESUME-ATTACH RECON (walk prereq 1): probe whether attachResume runs via cdpEval
-  // on the debugger attach + how the confirmation gate behaves. Needs a stored resume,
-  // not a profile. Run on the page WITH the upload widget (Magna page 2).
-  if (message.type === "RUN_CDP_RESUME_RECON") {
+  // M3/M4 SUBMIT replay WALK: replay the SAVED approved bundle page-by-page to the REVIEW page,
+  // verifying each field, advancing with the guarded clickPageNext. authorize:true (M5 armed button)
+  // runs the M4 precondition gate at review and clicks SUBMIT once iff every check passes; otherwise
+  // DRY (reach review + stop). Defaults to DRY (message.authorize absent). [CDP-REPLAY-WALK].
+  if (message.type === "RUN_CDP_REPLAY_WALK") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpResumeRecon(tab.id);
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // TYPEAHEAD STRAY-COMMIT RECON: pin when a stray commits in the overwrite/keptLowerTier
-  // resting path (the fieldOfStudy "Other"→"Accounting" bug). No profile needed; label
-  // regex from the ta-label input. Run on the page with the field (page 2 for FoS).
-  if (message.type === "RUN_CDP_TA_STRAY_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpTaStrayRecon(tab.id, String(message.labelRegex || ""));
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // FoS OPTION-ENUMERATION RECON (read-only): does the Field-of-Study typeahead enumerate a
-  // bounded option list (on open / a broad search) or is it server-search-only? Decides whether
-  // a later round can capture entry.options for an editable summary typeahead. Label regex from
-  // the ta-label input (default "field of study"). Run on My Experience (page 2).
-  if (message.type === "RUN_CDP_FOS_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpFosRecon(tab.id, String(message.labelRegex || ""));
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // FoS OPTION CAPTURE-PROBE (read-only): prove the fast in-page scroll-accumulate scrape gets the
-  // COMPLETE bounded FoS option list (before wiring it into the fill + the summary typeahead). Page 2.
-  if (message.type === "RUN_CDP_FOS_CAPTURE") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpFosCapture(tab.id, String(message.labelRegex || ""));
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // TREE-vs-FLAT RECON (read-only, 0.4): open every typeahead/hierarchical field on the current page,
-  // dump its option-row markers (isCategory / chevron / aria-expanded / role=treeitem+aria-level), and
-  // classify TREE vs FLAT — the discriminator that EXCLUDES tree pickers (source, Magna certification)
-  // from the AI typeahead fallback. Run on page 1 (source, countryPhoneCode) + page 2 (Field of Study,
-  // certification). [CDP-TREE-RECON] in the SW console.
-  if (message.type === "RUN_CDP_TREE_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpTreeRecon(tab.id);
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // TREE-DRILL RECON (read-mostly, Step 0 of the tree-AI milestone): how does a cert category expand on
-  // CDP? Open → click category → re-read revealed leaves. Run on page 2 (Certification). [CDP-TREE-DRILL].
-  if (message.type === "RUN_CDP_TREE_DRILL_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpTreeDrillRecon(tab.id, String(message.labelRegex || ""));
+      const out = await runCdpReplayWalk(tab.id, { authorize: message.authorize === true });
       sendResponse(out);
     });
     return true; // async sendResponse
@@ -505,32 +262,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
-  // FoS FOCUS-RECON (read-mostly): confirm the keptLowerTier re-commit stray mechanism — does cand-1's
-  // empty-results drop searchBox focus, and does re-focus restore + disarm? cand-1 Enter→0 (no commit);
-  // "Other" typed char-by-char, never Enter'd. Page 2. [CDP-FOS-FOCUS] in the SW console.
-  if (message.type === "RUN_CDP_FOS_FOCUS_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpFosFocusRecon(tab.id, String(message.labelRegex || ""));
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
-  // RESULTS-BANNER RECON (read-only): dump the typeahead's banner markup in BOTH the results state
-  // ("Search Results (N)") and the no-match state ("No matches found") so the terminal-state gate can
-  // distinguish them. Types a matching + a non-matching query, NEVER commits. Page 2. [CDP-RESULTS-BANNER].
-  if (message.type === "RUN_CDP_RESULTS_BANNER_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpResultsBannerRecon(tab.id, String(message.labelRegex || ""), String(message.matchQuery || "a"));
-      sendResponse(out);
-    });
-    return true; // async sendResponse
-  }
-
   // LLM TEST-CONNECTION (AI-0): round-trip a trivial prompt through the configured provider
   // to prove the call path + key + host_permissions BEFORE wiring the AI into the fill. The
   // popup sends the current config (test-before-save). No tab/attach needed (direct SW fetch).
@@ -543,18 +274,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       else console.log("[ApplyPilot][LLM-TEST] ✗", res.error);
       sendResponse(res);
     })();
-    return true; // async sendResponse
-  }
-
-  // INPUT-LOCK RECON: probe overlay-vs-CDP-click, keydown-vs-insertText, and the __apActing
-  // flag-gate cost + toggle-timing self-block. No profile needed. Run on any form page.
-  if (message.type === "RUN_CDP_INPUTLOCK_RECON") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      const tab = tabs[0];
-      if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpInputlockRecon(tab.id);
-      sendResponse(out);
-    });
     return true; // async sendResponse
   }
 
@@ -672,13 +391,23 @@ function prepareProfile(profile) {
       .map((e) => ({ ...e, url: ensureHttps(e.url) }));          // → full https:// URL
   }
   if (Array.isArray(profile.languages)) {
-    out.languages = meaningfulEntries(profile.languages, ["language"]).map((e) => ({
+    const langs = meaningfulEntries(profile.languages, ["language"]).map((e) => ({
       ...e, _allFluent: isFluent(e.reading) && isFluent(e.speaking) && isFluent(e.writing) // → check the "I am fluent" box
     }));
+    // English LAST (operator, 2026-07-06): filling English as the last language entry reduces Workday's
+    // spurious "duplicate languages not allowed" ghost error on Save & Continue. Stable partition — the
+    // non-English entries keep their order; any English entry moves to the end.
+    const isEnglish = (e) => /english/i.test(String((e && e.language) || ""));
+    out.languages = [...langs.filter((e) => !isEnglish(e)), ...langs.filter(isEnglish)];
   }
   if (Array.isArray(profile.certifications)) {
     out.certifications = meaningfulEntries(profile.certifications, ["certification"]).map((e) => ({
-      ...e, issuedDateParsed: parseYearMonthDay(e.issued_date), expirationDateParsed: parseYearMonthDay(e.expiration_date)
+      ...e, issuedDateParsed: parseYearMonthDay(e.issued_date), expirationDateParsed: parseYearMonthDay(e.expiration_date),
+      // nested Specialties fill: parse each specialty's dates (the specialty value passes through). A
+      // specialty with no `specialty` value is dropped (nothing to fill the required specialtyParent with).
+      specialties: (Array.isArray(e.specialties) ? e.specialties : [])
+        .filter((s) => s && s.specialty != null && String(s.specialty).trim() !== "")
+        .map((s) => ({ ...s, startDateParsed: parseYearMonthDay(s.start_date), endDateParsed: parseYearMonthDay(s.end_date) }))
     }));
   }
   return out;
@@ -742,6 +471,10 @@ function persistAccumulated(pageBundle) {
     chrome.storage.local.get("reviewSummary", ({ reviewSummary }) => {
       const prior = (reviewSummary && Array.isArray(reviewSummary.entries)) ? reviewSummary.entries : [];
       const bundle = accumulateBundle(prior, pageBundle);
+      // 2c: section_shapes = a CACHE of DOM-detected field shapes (by section name) carried on the
+      // bundle, so the review's add-entry uses detected fields even for a section EMPTY this run
+      // (seen on a PRIOR run). Merge prior ∪ this page (this page wins). "Clear summary" resets it.
+      bundle.section_shapes = Object.assign({}, (reviewSummary && reviewSummary.section_shapes) || {}, pageBundle.section_shapes || {});
       chrome.storage.local.set({ reviewSummary: bundle }, () => {
         console.log(`[ApplyPilot] Summary saved (accumulated) — page "${pageBundle.page}": +${pageBundle.total} field(s); total ${bundle.total} across ${bundle.entries.length ? new Set(bundle.entries.map((e) => e.page)).size : 0} page(s), ${bundle.needs_review_count} need review. "View last summary".`);
         resolve();
@@ -783,6 +516,11 @@ async function runWalk(tabId, profile, defaults, jobContext) {
   let pagesFilled = 0;
   let stoppedReason = "max-pages";
 
+  // Plan 2: clear the accumulated summary ONCE at walk START (a fresh application starts clean),
+  // then ACCUMULATE per page (was overwrite-per-page → page 1 was lost, the "My-Experience under
+  // page 1" bug). The field-set page key + page_number now keep the pages distinct + ordered.
+  await new Promise((resolve) => chrome.storage.local.remove("reviewSummary", resolve));
+
   for (let pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
     console.log(`[ApplyPilot] ── Walk: filling page ${pageNum}/${MAX_PAGES} ──`);
     const frameResult = await injectFill(tabId, profile, defaults, jobContext);
@@ -797,7 +535,14 @@ async function runWalk(tabId, profile, defaults, jobContext) {
     // clicking Next (so the resume is attached before the page advances).
     const attach = await attachResumeForPage(tabId, frameResult);
     if (attach) console.log(`[ApplyPilot] Walk: page ${pageNum} resume attach:`, attach);
-    await persistBundle(frameResult.bundle); // overwrite-per-page (decided; see persistBundle)
+    // Stamp the page ordinal (the SW knows it; the engine doesn't) onto the bundle for display
+    // order/caption, then ACCUMULATE (keeps prior pages + viewer edits verbatim).
+    if (frameResult.bundle) {
+      frameResult.bundle.page_number = pageNum;
+      frameResult.bundle.page_label = "Page " + pageNum;
+      for (const e of frameResult.bundle.entries || []) { e.page_number = pageNum; e.page_label = "Page " + pageNum; }
+    }
+    await persistAccumulated(frameResult.bundle);
     pagesFilled++;
 
     const nav = frameResult.nav || {};
@@ -1554,42 +1299,6 @@ async function runCdpRecon(tabId) {
 }
 
 // ============================================================================
-// SOURCE FILL — backlog C, Phase B. Runs fillSourceCdp on formField-source HIDDEN
-// with candidates from defaults.how_did_you_hear (preferred LinkedIn). Selects the
-// match and logs the live commit signal (which verifier fired). Detaches in finally.
-// ============================================================================
-async function runCdpSourceFill(tabId, defaults) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-SRC]", ...a);
-  const WRAP = '[data-automation-id="formField-source"]';
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window).");
-    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run."); return { ok: false, error: "never-hidden" }; }
-
-    const hdyh = defaults && defaults.how_did_you_hear;
-    if (!hdyh || !Array.isArray(hdyh.preferred)) { LOG("no defaults.how_did_you_hear.preferred — Load default profile (seeds defaults) first."); return { ok: false, error: "no-candidates" }; }
-    const candidates = [...hdyh.preferred];
-    if (hdyh.fallback) candidates.push(hdyh.fallback);
-    LOG("candidates (tier order):", JSON.stringify(candidates));
-    LOG("tab is hidden — source fill starting. (Δperf ~1000ms hidden is EXPECTED.)");
-
-    const act = makeCdpActuation();
-    const rec = await fillSourceCdp(act, { wrapperSel: WRAP }, candidates, DEFAULT_BUDGETS);
-    LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, tier: rec.matchTier, flag: rec.flag, confidence: rec.confidence, detail: rec.detail }, null, 2));
-    if (rec.settle_trace) LOG("settle trace:", JSON.stringify(rec.settle_trace, null, 2));
-    if (rec.captured_options) LOG("captured leaves:", JSON.stringify(rec.captured_options));
-    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true, flag: rec.flag || null };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("source fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
 // SESSION RECON (M30 Step 0) — a READ-ONLY static snapshot to find the signal that
 // distinguishes a live apply form from a logged-out / expired / error state. No
 // minimize needed (a static DOM read isn't throttle-sensitive). Run once on a VALID
@@ -1686,6 +1395,154 @@ async function runCdpQuestionsRecon(tabId) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("questions recon aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// SELF-CONTAINED (evaluated via cdpEval — closes over nothing). Read-only dump of the Workday REVIEW
+// page (the final application page that renders every filled value as read-only text). The review DOM
+// is highly REGULAR, so this emits STRUCTURED records keyed on STABLE hooks (never the build-variable
+// `css-*` emotion classes) rather than guessing from value-presence:
+//   • Each field's value is a leaf `<span id="KEY">` whose id IS the form-field name (`jobTitle`,
+//     `native`, `url`, a hashed questionnaire id, or a generated `wn5o5e`). The `<span id="attachments">`
+//     wrapper has element children so it's skipped; a "No Response" placeholder has no id so it's skipped.
+//   • The LABEL is `label[for="KEY"]` resolved WITHIN the field's own row/entry (NEVER document-wide —
+//     `for="native"/"url"/"jobTitle"` are DUPLICATED across repeating entries, so a global query returns
+//     only the first), or, when there's no <label>, the row's OWN richText <p> (the nearest ancestor
+//     holding EXACTLY ONE richText — NEVER the section container, which holds several and would collide).
+//   • entryOrdinal = the PANEL ordinal from the nearest `aria-labelledby$="-<N>-panel"` — it RESETS per
+//     section (Languages 1/2, Work Experience 1/2/3) and is the ONLY positional signal. fkitPrefix = the
+//     base of the nearest `data-fkit-id` matching "<base>-<N>--null" (section IDENTITY). fkitNum is a
+//     GLOBAL monotonic counter (differs every form instance) → captured as informational ONLY, never an
+//     ordinal. Attachment rows (`attachments-FileUpload`) → one record isAttachment:true, value = the
+//     joined file-upload-item-name texts.
+// The reconciler (reconcileReviewPage, PURE) matches these records by id + entry, not heuristics. The
+// `valueHints` param is kept for call-site compatibility but IGNORED. Never throws; {ok:false,reason}
+// if off-page. Returns { ok, url, sections, items, counts }.
+function cdpReadReviewPage(valueHints) { // valueHints IGNORED (matching is now id-driven)
+  const container = document.querySelector('[data-automation-id="applyFlowReviewPage"]');
+  const url = location.href;
+  if (!container) return { ok: false, reason: "no-review-page", url };
+
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim(); // collapse ALL whitespace (labels)
+  const cleanVal = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim(); // value: newlines → spaces too
+  const stripStar = (s) => clean(s).replace(/[*\s]+$/, ""); // drop a trailing required "*"/"**"
+
+  // entryOrdinal — nearest ancestor whose aria-labelledby ends "-<N>-panel" (RESETS per section).
+  const ordinalOf = (el) => {
+    for (let a = el; a && a !== container; a = a.parentElement) {
+      const lb = a.getAttribute && a.getAttribute("aria-labelledby");
+      if (lb) { const m = /-(\d+)-panel$/.exec(lb); if (m) return parseInt(m[1], 10); }
+    }
+    return null;
+  };
+  // fkit identity — nearest ancestor data-fkit-id matching "<base>-<N>--null" (num = informational only).
+  const fkitOf = (el) => {
+    for (let a = el; a && a !== container; a = a.parentElement) {
+      const f = a.getAttribute && a.getAttribute("data-fkit-id");
+      if (f) { const m = /^(.+?)-(\d+)--null$/.exec(f); if (m) return { prefix: m[1], num: parseInt(m[2], 10) }; }
+    }
+    return { prefix: null, num: null };
+  };
+  // label — ROW/ENTRY-SCOPED. label[for=key] FIRST (nearest ancestor that contains it); else the nearest
+  // ancestor holding EXACTLY ONE richText's <p> text. NEVER document-wide, NEVER the multi-richText
+  // section container.
+  const labelOf = (span, key) => {
+    for (let a = span.parentElement, up = 0; a && a !== container && up < 8; up++, a = a.parentElement) {
+      const labs = a.getElementsByTagName("label");
+      for (let i = 0; i < labs.length; i++) if (labs[i].getAttribute("for") === key) { const t = stripStar(labs[i].textContent); if (t) return t; }
+    }
+    for (let a = span.parentElement, up = 0; a && a !== container && up < 8; up++, a = a.parentElement) {
+      const rts = a.querySelectorAll('[data-automation-id="richText"]');
+      if (rts.length === 1) { const p = rts[0].querySelector("p") || rts[0]; const t = stripStar(p.textContent); if (t) return t; }
+      if (rts.length > 1) break; // reached a multi-question container (e.g. -section) → stop, don't collide
+    }
+    return null;
+  };
+
+  // ONE document-order walk: track the current h3/h4 section; emit a record per leaf value span + per
+  // attachment widget.
+  const records = [];
+  let curSection = null;
+  for (const el of container.querySelectorAll("*")) {
+    const tag = el.tagName;
+    if (tag === "H3" || tag === "H4") { const t = clean(el.textContent); if (t) curSection = t; continue; }
+    const aid = el.getAttribute("data-automation-id");
+    if (aid === "attachments-FileUpload") {
+      const names = Array.prototype.map.call(el.querySelectorAll('[data-automation-id="file-upload-item-name"]'), (n) => clean(n.textContent)).filter(Boolean);
+      const fk = fkitOf(el);
+      records.push({ section: curSection, entryOrdinal: ordinalOf(el), fkitPrefix: fk.prefix, fkitNum: fk.num,
+                     key: null, label: "Attachments", value: names.join(" "), isAttachment: true });
+      continue;
+    }
+    if (tag === "SPAN" && el.id && el.children.length === 0) { // leaf value span; excludes <span id="attachments"> (has a <p>)
+      const value = cleanVal(el.textContent);
+      if (!value) continue;
+      const fk = fkitOf(el);
+      records.push({ section: curSection, entryOrdinal: ordinalOf(el), fkitPrefix: fk.prefix, fkitNum: fk.num,
+                     key: el.id, label: labelOf(el, el.id), value, isAttachment: false });
+    }
+  }
+
+  // section headings (logger/display only) + counts.
+  const sections = [];
+  for (const h of container.querySelectorAll("h3,h4")) { const t = clean(h.textContent); if (t) sections.push({ tag: h.tagName.toLowerCase(), text: t }); }
+  const entrySet = {};
+  for (const r of records) if (r.entryOrdinal != null && r.fkitPrefix) entrySet[r.fkitPrefix + "#" + r.entryOrdinal] = 1;
+
+  return { ok: true, url, sections, items: records,
+           counts: { records: records.length, entries: Object.keys(entrySet).length, attachments: records.filter((r) => r.isAttachment).length } };
+}
+
+// REVIEW-PAGE CHECK (end-to-end fill-verify): scrape the Workday review page (ground truth) via
+// cdpReadReviewPage and reconcile it against the saved reviewSummary bundle (reconcileReviewPage, PURE).
+// Disagreements ⇒ a fill bug to investigate. READ-ONLY — attaches, reads, detaches; NEVER clicks Next
+// or Submit (the review page's footer button IS Submit). Run ON the review page (the walk stops here).
+// Output is [REVIEW-CHECK] in the SW console + a summary in sendResponse. No profile/LLM needed.
+async function runCdpReviewReconcile(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][REVIEW-CHECK]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    LOG("attached. READ-ONLY: scrapes the review page's displayed values and diffs them vs the saved reviewSummary bundle. NEVER clicks Next/Submit. Run ON the final review page.");
+
+    // Read the saved bundle (the reconcile source of truth). The scraper is now id-driven — it does NOT
+    // need value hints, so nothing is passed to cdpReadReviewPage.
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+    const entries = bundle && Array.isArray(bundle.entries) ? bundle.entries : [];
+
+    const dump = await cdpEval(cdpReadReviewPage);
+    if (!dump || !dump.ok) {
+      LOG("not on the review page (marker applyFlowReviewPage absent). reason:", dump && dump.reason, "· url:", dump && dump.url);
+      return { ok: false, error: (dump && dump.reason) || "no-dump" };
+    }
+    LOG(`review page: ${dump.counts.records} record(s) — ${dump.counts.entries} repeating entr(y/ies) · ${dump.counts.attachments} attachment(s) · ${dump.sections.length} section(s).`);
+    LOG("── SECTIONS ──"); for (const s of dump.sections) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(s));
+    LOG("── STRUCTURED RECORDS (section · entryOrdinal · fkitPrefix · key · label · value) ──"); for (const it of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(it));
+
+    if (!entries.length) {
+      LOG("⚠ NO reviewSummary bundle in storage — run the fill/walk first so there's something to check against. (Scraped records above are still shown.)");
+      return { ok: true, url: dump.url, scraped: dump.counts.records, reconciled: false, note: "no-bundle" };
+    }
+
+    const rec = reconcileReviewPage(dump.items, entries);
+    const c = rec.counts;
+    LOG(`── RECONCILIATION (bundle ${entries.length} entries · ${c.claimed} claimed value-bearing · ${c.skipped} skipped unchecked-box · ${c.placeholders} unreplaced AI) ──`);
+    LOG(`AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING-ON-REVIEW ${c.missing_on_review} · EXTRA-ON-REVIEW ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous}`);
+    if (rec.disagree.length) { LOG("‼ DISAGREEMENTS (bundle value ≠ review page — investigate as BUGS):"); for (const d of rec.disagree) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(d)); }
+    else LOG("✓ no value disagreements among matched fields.");
+    if (rec.missing_on_review.length) { LOG("⚠ FILLED IN BUNDLE, NOT FOUND ON REVIEW PAGE (value reverted to blank / label wording differs / unshown section):"); for (const m of rec.missing_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(m)); }
+    if (rec.ambiguous.length) { LOG("? AMBIGUOUS label matches (repeating-section collisions):"); for (const a of rec.ambiguous) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(a)); }
+    if (rec.extra_on_review.length) { LOG(`(info) ${rec.extra_on_review.length} review-page value(s) with no matching bundle entry (pre-filled / not recorded / per-entry attachment):`); for (const e of rec.extra_on_review) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(e)); }
+    // On a MISSING, re-print the structured records so the operator can eyeball which field didn't stick.
+    if (rec.missing_on_review.length) { LOG("── STRUCTURED RECORDS (re-shown — locate the missing value) ──"); for (const r of dump.items) console.log("[ApplyPilot][REVIEW-CHECK]", JSON.stringify(r)); }
+
+    return { ok: true, url: dump.url, scraped: dump.counts.records, reconciled: true, counts: c, disagree: rec.disagree, missing_on_review: rec.missing_on_review };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("review check aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
     await cdpDetach();
@@ -1899,279 +1756,6 @@ async function runCdpRepeatRecon(tabId) {
 }
 
 // ============================================================================
-// CDP CERT-SPECIALTY RECON (M36.2) — read-MOSTLY structure discovery of the
-// NESTED Specialties sub-section inside a Certification entry (a repeating
-// section nested inside a repeating entry — never recon'd). Attach → hidden-gate
-// → dump the cert entry → OBSERVE its inside Add buttons → mount ONE specialty
-// (bounded) → dump the before/after data-fkit-id + field DIFF (the specialty
-// container prefix + its per-specialty typeahead/start-end-date fields + entry-
-// scoping + Attachments presence) → RESTORE (delete the mounted specialty, and any
-// cert entry we added) → detach. RECON ONLY — no fill, no profile schema (those are
-// a later build milestone). Attachments are recorded, never filled (deferred — no
-// per-cert files stored). [CERT-SPECIALTY-RECON] in the SW console.
-// ============================================================================
-async function runCdpCertSpecialtyRecon(tabId) {
-  const LOG = (...a) => console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", ...a);
-  const act = makeCdpActuation();
-  // Poll the cert-entry scan until `pred` holds (or the ceiling) — the page mounts
-  // on its throttled hidden loop, so all waits are generous SW wall-clock.
-  const scanUntil = async (pred, ceilingMs) => {
-    const t0 = Date.now();
-    let last = await cdpEval(cdpCertSpecialtyScan);
-    while (!pred(last) && Date.now() - t0 < ceilingMs) { await cdpDelay(250); last = await cdpEval(cdpCertSpecialtyScan); }
-    return last;
-  };
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window). Run on My Experience (page 2).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing probed.");
-      return { ok: false, error: "never-hidden" };
-    }
-    LOG("tab is hidden — cert-specialty recon starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
-
-    // ── (1) ensure a cert entry exists (host for the specialty) ───────────────
-    let scan = await cdpEval(cdpCertSpecialtyScan);
-    if (!scan) return { ok: false, error: "scan-failed" };
-    let addedCert = false;
-    if (scan.certEntryCount === 0) {
-      LOG("no Certification entry present — adding one to host the specialty…");
-      const a = await act.clickSectionAdd("certifications?");
-      if (!a.ok) { LOG("could not click the Certifications Add — abort (navigate to My Experience page 2)."); return { ok: false, error: "cert-add-failed" }; }
-      scan = await scanUntil((s) => s && s.certEntryCount >= 1, 6000);
-      addedCert = !!(scan && scan.certEntryCount >= 1);
-      if (!addedCert) { LOG("Certification entry never mounted after Add — abort."); return { ok: false, error: "no-cert-entry" }; }
-    }
-    const before = scan.certEntries[0];
-    LOG("cert entry:", before.fkit, "| own field count:", before.fieldCount, "| Attachments file inputs:", before.fileInputs);
-    LOG("cert entry BEFORE — nested fkit ids:", JSON.stringify(before.nestedFkitIds));
-    LOG("cert entry BEFORE — full structure:");
-    console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(before, null, 2));
-    LOG("Add buttons INSIDE the cert entry (observe the specialty Add's heading BEFORE clicking):");
-    console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(before.addButtonsInside, null, 2));
-
-    if (!before.addButtonsInside.length) {
-      LOG("⚠ NO Add button inside the cert entry — the Specialties Add may require the cert typeahead filled first, or the structure differs. Recon stops at the BEFORE dump (read-only); fill the cert + re-run, or inspect the dump above.");
-      if (addedCert) { LOG("removing the cert entry we added…"); await act.clickDeleteEntry("certification-", 0); }
-      return { ok: true, mounted: false, note: "no-inside-add" };
-    }
-
-    // ── (2) mount ONE specialty (bounded) — by the observed heading regex ─────
-    const baseline = new Set(before.nestedFkitIds);
-    LOG('mounting one specialty via clickSectionAdd("specialt") …');
-    const m = await act.clickSectionAdd("specialt");
-    let after = before, newFkit = [];
-    if (!m.ok) {
-      LOG('⚠ clickSectionAdd("specialt") found no Add with a "Special…" heading. Check addButtonsInside above for the real heading, then re-run with that regex. (Recon read-only; nothing mounted.)');
-    } else {
-      const post = await scanUntil((s) => {
-        const c0 = s && s.certEntries[0];
-        return c0 && c0.nestedFkitIds.some((id) => !baseline.has(id));
-      }, 6000);
-      const c0 = post && post.certEntries[0];
-      if (c0) { after = c0; newFkit = c0.nestedFkitIds.filter((id) => !baseline.has(id)); }
-    }
-
-    // ── (3) dump the DIFF — the specialty structure ───────────────────────────
-    let specialtyIndex = null;
-    if (!newFkit.length) {
-      LOG("⚠ no NEW nested data-fkit-id appeared after the Add — the specialty may mount in a modal / different DOM, or the heading regex missed. AFTER dump for inspection:");
-      console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(after, null, 2));
-    } else {
-      LOG("✅ specialty mounted — NEW nested data-fkit-id(s):", JSON.stringify(newFkit));
-      // Pattern (recon finding): certification-<N>--specialties-<M>--<field>. NO `--null`
-      // container — the specialty ENTRY is the SET of --specialties-<M>--{specialtyParent,
-      // startDate,endDate} field-fkit nodes (M = the entry index).
-      const sm = newFkit[0].match(/--specialties-(\d+)--/);
-      specialtyIndex = sm ? sm[1] : null;
-      LOG("→ specialty entry fkit pattern: certification-<N>--specialties-<M>--<field> (this entry M=" + (specialtyIndex || "?") + "); NO --null container — the entry is the --specialties-" + (specialtyIndex || "M") + "--{specialtyParent,startDate,endDate} field-fkit set.");
-      const beforeIds = new Set(before.fields.map((f) => f.automationId));
-      const newFields = after.fields.filter((f) => !beforeIds.has(f.automationId));
-      LOG("NEW specialty fields (the diff — expect a typeahead + start/end date composites):");
-      console.log("[ApplyPilot][CERT-SPECIALTY-RECON]", JSON.stringify(newFields, null, 2));
-      // entry-scoping: are the specialty formField ids duplicated vs the cert's own
-      // (the WE/Languages duplicate-id trap → the future nested fill must scope)?
-      const dupVsCert = newFields.filter((f) => beforeIds.has(f.automationId)).map((f) => f.automationId);
-      const dateFields = newFields.filter((f) => f.dateSegments.length > 0);
-      const typeaheads = newFields.filter((f) => f.widgetType === "typeahead");
-      LOG("specialty shape summary:", JSON.stringify({
-        newFieldCount: newFields.length,
-        typeaheadFields: typeaheads.map((f) => f.fieldName),
-        dateFields: dateFields.map((f) => ({ field: f.fieldName, segments: f.dateSegments })),
-        hashedIds: newFields.filter((f) => f.hashedId).map((f) => f.fieldName),
-        duplicateAutomationIdsVsCertOwn: dupVsCert,
-        attachmentsFileInputsInCertEntry: after.fileInputs
-      }, null, 2));
-    }
-
-    // ── (4) RESTORE — HONEST (auto-restore NOT wired for the nested shape) ─────
-    // The specialty entry is NOT a `--null` container (it's the --specialties-<M>--
-    // field-fkit set), so clickDeleteEntry (which keys on --null entries) can't remove
-    // it — and a proper per-cert-entry nested Delete belongs to the DEFERRED fill
-    // milestone, not a half-built one here. So we do NOT auto-delete the mounted
-    // specialty; we log it loudly. ⚠ The operator removes the leftover manually before
-    // the WE / full-page work (a stale empty specialty would confuse a full-page rescan).
-    if (newFkit.length) {
-      LOG("⚠ LEFTOVER — this recon MOUNTED an empty specialty (" + newFkit.join(", ") + ") and does NOT auto-remove it (the nested Delete is part of the deferred fill milestone). REMOVE IT MANUALLY: on the form, click Delete on the empty specialty under the cert's 'Specialties' — before running WE / a full-page fill.");
-    }
-    if (addedCert) {
-      LOG("removing the cert entry we added for the recon (a --null entry, deletable)…");
-      const d = await act.clickDeleteEntry("certification-", 0);
-      LOG(d.ok ? "✅ cert entry removed." : "⚠ could not delete the added cert entry — remove it manually.");
-    }
-    LOG("recon complete — see the BEFORE/diff dumps above. Build (schema + nested fill) is a DEFERRED milestone; Attachments deferred.");
-    return { ok: true, mounted: !!newFkit.length, specialtyIndex };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP TEXTAREA RECON (M37 Part 0 — the GATE before WE) — does CDP actuation drive
-// a Workday <textarea> (roleDescription)? fillTextCdp is <input>-only (focusText
-// targets " input", cdpReadTextState querySelector("input")), and CDP Input.insertText
-// on a textarea is UNPROVEN. Probe the first WE entry's roleDescription textarea with
-// a MULTI-LINE value (≥2 lines + \n — the real fill writes newline-joined bulletsText;
-// insertText can mishandle newlines, so single-line success is weak evidence):
-//   (a) coordinate-click focus + Input.insertText (trusted, consistent with the text path)
-//   (b) native setter via cdpEval/Runtime.evaluate (the EXACT page-engine technique —
-//       off-loop + proven page-side + handles \n trivially → the guaranteed fallback)
-// Verify the FULL value lands WITH the newline intact AND survives React (re-read after
-// a tick); restore (clear) after. Read-mostly. [TEXTAREA-RECON] in the SW console.
-// ============================================================================
-async function runCdpTextAreaRecon(tabId) {
-  const LOG = (...a) => console.log("[ApplyPilot][TEXTAREA-RECON]", ...a);
-  const TA = '[data-fkit-id^="workExperience-"][data-fkit-id$="--null"] [data-automation-id="formField-roleDescription"] textarea';
-  const MULTILINE = "Recon line one — alpha\nRecon line two — bravo"; // 2 lines, exactly one \n
-  const readTA = () => cdpEval((sel) => {
-    const t = document.querySelector(sel);
-    return t ? { value: t.value, lines: t.value.split("\n").length, focused: document.activeElement === t } : null;
-  }, TA);
-  const nativeWrite = (val) => cdpEval((sel, v) => {
-    const t = document.querySelector(sel); if (!t) return false;
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-    if (t.focus) t.focus(); setter.call(t, v);
-    t.dispatchEvent(new Event("input", { bubbles: true })); t.dispatchEvent(new Event("change", { bubbles: true }));
-    return true;
-  }, TA, val);
-  const clearTA = () => nativeWrite("");
-  // A path "passes" only if the FULL multi-line value lands (newline kept) AND survives
-  // a React re-read — not just that some text appeared.
-  const verify = async (label) => {
-    const r1 = await readTA();
-    await cdpDelay(600); // React-survival re-read (did onChange revert it?)
-    const r2 = await readTA();
-    const stuck = !!(r1 && r1.value === MULTILINE);
-    const newlineKept = !!(r1 && r1.lines === 2);
-    const survived = !!(r2 && r2.value === MULTILINE);
-    LOG(label + ":", JSON.stringify({ stuck, newlineKept, survivedReact: survived, read1: r1 && r1.value, read1Lines: r1 && r1.lines, read2Lines: r2 && r2.lines }));
-    return stuck && newlineKept && survived;
-  };
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-    LOG("attached. MINIMIZE THE WINDOW NOW — recon starts on the first hidden read (60s window). Run on My Experience (page 2) with ≥1 Work Experience entry.");
-    if (!(await cdpWaitHidden(60000, 500))) { LOG("tab never went hidden — INVALID run, nothing probed."); return { ok: false, error: "never-hidden" }; }
-    LOG("tab is hidden — textarea recon starting. (Δperf ~1000ms on the page loop is EXPECTED, not failure.)");
-
-    const pre = await readTA();
-    if (!pre) { LOG("⚠ no Work Experience roleDescription textarea found — add a WE entry on My Experience (page 2) and re-run."); return { ok: false, error: "no-textarea" }; }
-    LOG("roleDescription textarea found (original value length " + (pre.value || "").length + "). Probing the MULTI-LINE value:", JSON.stringify(MULTILINE));
-
-    // ── (a) Input.insertText after a coordinate-click focus ──────────────────
-    await clearTA(); await cdpDelay(300);
-    let aResult = "no-rect";
-    const rect = await cdpRectReady(TA, true); // textarea is visible → real rect (unlike the masked date -input)
-    if (rect) {
-      await cdpClickAt(rect.cx, rect.cy); await cdpDelay(250);
-      const f = await readTA();
-      LOG("(a) coordinate-click focus →", (f && f.focused) ? "focused" : "NOT focused");
-      await cdpInsertText(MULTILINE); await cdpDelay(500);
-      aResult = (await verify("(a) Input.insertText (multi-line)")) ? "PASS" : "FAIL";
-    } else { LOG("(a) textarea rect not live — skipping the trusted-input path."); }
-
-    // ── (b) native setter via cdpEval (the proven page-engine technique) ──────
-    await clearTA(); await cdpDelay(300);
-    await nativeWrite(MULTILINE); await cdpDelay(500);
-    const bResult = (await verify("(b) native-setter via cdpEval (multi-line)")) ? "PASS" : "FAIL";
-
-    // ── restore + decision ───────────────────────────────────────────────────
-    await clearTA();
-    const decision = aResult === "PASS" ? "(a) Input.insertText — PREFERRED (trusted input, consistent with fillTextCdp)"
-      : bResult === "PASS" ? "(b) native-setter via cdpEval — fallback (insertText didn't keep the full multi-line value)"
-      : "NEITHER landed the full multi-line value — investigate before building WE";
-    LOG("════ TEXTAREA RECON RESULT ════");
-    LOG("(a) Input.insertText:", aResult, "| (b) native-setter via cdpEval:", bResult);
-    LOG("→ DECISION for the WE build:", decision);
-    LOG("textarea cleared (restored).");
-    return { ok: true, insertText: aResult, nativeSetter: bResult, decision };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("textarea recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP FILL — Step 2 of the CDP actuation port. SW-side runner: attach →
-// hidden-gate → drive the page through fill-driver.js over the CDP actuation →
-// report → detach in finally. No reviewSummary bundle this milestone (the
-// persisted review UI stays a hard requirement before any ship) — the report
-// below is the deliverable, with NEEDS REVIEW impossible to miss.
-// ============================================================================
-async function runCdpFill(tabId, profile, defaults, jobContext) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-FILL]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    LOG("attached. MINIMIZE THE WINDOW NOW — the fill starts on the first hidden read (60s window).");
-    if (!(await cdpWaitHidden(60000, 500))) {
-      LOG("tab never went hidden — INVALID run, nothing filled.");
-      return { ok: false, error: "never-hidden" };
-    }
-    LOG("tab is hidden — CDP fill starting. (Δperf ~1000ms on the page loop is EXPECTED while hidden, not failure.)");
-
-    const act = makeCdpActuation();
-    const out = await drivePageFill(act, profile, defaults, jobContext);
-
-    // ── Report: NEEDS REVIEW first (typeahead/source deferrals AND employer-
-    // match outcomes), then the full per-field table, then counts. ──
-    LOG("page:", out.url);
-    if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
-    if (out.repeatingFieldCount) LOG(`${out.repeatingFieldCount} repeating-section field(s) on this page — untouched (out of scope this milestone).`);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, tier: r.matchTier, flag: r.flag, confidence: r.confidence, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("CDP fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
 // fillAndPersistPage (M38 Part 3 extraction) — the per-page work shared by the
 // single-page fill (runCdpFillPage) AND the N-page walk (runCdpWalk). On an ALREADY-
 // ATTACHED tab: compute the accumulation key → fold-fill (drivePageFill: flat + every
@@ -2186,12 +1770,28 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // on a same-pathname SPA). Computed BEFORE the fill (a field-revealing fill could change
   // the field-set). NOT cdpPageSig (full url incl. query).
   const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
+  // Plan 2: the walk passes its 1..N ordinal so the bundle carries a stable page_number (display
+  // order) + a friendly page_label; single-page fills (no ordinal) leave them null (viewer derives).
+  const pageNumber = (opts && opts.pageNumber != null) ? opts.pageNumber : null;
+  const pageLabel = pageNumber != null ? ("Page " + pageNumber) : null;
   // Operator input-lock: install BEFORE any actuation (idempotent — re-creates the overlay on a
   // fresh page after a nav, so the walk re-protects each page). The 4 CDP input primitives gate
   // on the counter it sets; the caller removes it in its finally (alongside cdpDetach).
-  // opts.skipLock = the NO-LOCK baseline for the oracle-equal verification (lock-off vs lock-on).
-  if (!(opts && opts.skipLock)) await installInputLock();
-  const out = await drivePageFill(act, prepared, defaults, jobContext);
+  await installInputLock();
+  // m3b: pass the prior run's DETECTED section shapes as the reveal-by-add cache so mounting an
+  // entry to discover an EMPTY unknown section's fields fires at most once per bundle-lifetime
+  // (not every fill — the "fast, especially hidden" constraint). headingToBase lets the pre-mount
+  // cache check work for an empty section (base unknown until mounted → matched by heading).
+  const priorSum = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+  const cachedShapes = (priorSum && priorSum.section_shapes) || {};
+  const headingToBase = {};
+  for (const e of ((priorSum && priorSum.entries) || [])) {
+    if (e && e.widget_type === "section_stub" && e.section_heading && typeof e.canonical_field === "string") headingToBase[e.section_heading] = e.canonical_field.replace(/\._stub$/, "");
+  }
+  // (The act.attachStoredResume seam — the TEST-ONLY per-cert résumé attach — was verified live
+  // 2026-07-02 and then REMOVED with the profile test data. The résumé attaches ONLY to the
+  // top-level Documents field, via the post-fill step below.)
+  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
 
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
@@ -2224,7 +1824,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // upload empty blocks Save & Continue). NOTE: attachResume's attached:true is the engine's
   // claim; the FORM accepting it (Save & Continue advances) is the form's truth — the walk's
   // advance is the decisive proof, not this record.
-  const uploadRec = out.results.find((r) => r.widgetType === "file_upload");
+  // Exclude nested-attachment records (a cert's per-entry Attachments — its own in-section attach
+  // path): on a page with no top-level upload, the bare find() would grab a cert's record and
+  // patch the résumé onto the WRONG field.
+  const uploadRec = out.results.find((r) => r.widgetType === "file_upload" && r.flag !== "nested-attachment");
   if (uploadRec) {
     let resumeRec = null;
     try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
@@ -2239,12 +1842,11 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       // clearing an EXISTING attachment intermittently failed under the walk's lock ("removed 0, N
       // remain"; a clean 0-attachment page worked because the attach's `change` event isn't blocked).
       // Bump __apActing around the attach (exactly how the gated CDP primitives gate themselves) so
-      // attachResume's events pass. Gated on the lock being active so non-lock runs pay nothing.
-      const lockOn = !(opts && opts.skipLock);
-      if (lockOn) { try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ } }
+      // attachResume's events pass (the input-lock is always installed for the fill).
+      try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ }
       try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
       catch (e) { arErr = String((e && e.message) || e); }
-      finally { if (lockOn) { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } } }
+      finally { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } }
       if (ar && ar.attached) {
         uploadRec.status = "filled"; uploadRec.verified = true; uploadRec.after = ar.fileName || resumeRec.filename || null;
         uploadRec.detail = `resume attached (file-upload-successful, cleared ${ar.deletedCount || 0} existing)`;
@@ -2267,7 +1869,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 
   // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-  const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
   await persistAccumulated(bundle);
   return { out, bundle, auditFlags, pageKey };
 }
@@ -2275,9 +1877,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
 // AI-4: rebuild + re-persist the page bundle from the CURRENT out.results (after remediation
 // mutates them) — reuses the SAME pageKey so the accumulation merge replaces this page (no
 // duplicate). Keeps the persisted review bundle an honest audit trail of what AI-4 changed.
-async function repersistPageBundle(out, pageKey) {
+async function repersistPageBundle(out, pageKey, pageNumber) {
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-  const bundle = buildReviewBundle(out.results, { page: pageKey, url: out.url, tenant, capturedAt: new Date().toISOString() });
+  const pageLabel = (pageNumber != null) ? ("Page " + pageNumber) : null;
+  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber: pageNumber != null ? pageNumber : null, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
   await persistAccumulated(bundle);
   return bundle;
 }
@@ -2303,20 +1906,52 @@ function mergeRemediationRecord(out, rec) {
   if (i !== -1) out.results[i] = rec; else out.results.push(rec);
 }
 
-// AI-4 validation-error remediation loop (Tier 1 anchors → Tier 2 AI), bounded + halt-on-no-progress.
+// AI-4 validation-error remediation loop (Tier 0 dup-language → Tier 1 flat re-fill → Tier 1.5
+// empty-repeating-row DELETE → Tier 1.6 section re-fill → Tier 2 AI), bounded + halt-on-no-progress,
+// and NEVER acting without error text (each attempt is gated on a non-empty expanded error read).
 // Runs ONLY when the session is LIVE (the caller already excluded sessionDead) and Save & Continue
-// stayed put. GLOBAL shared cap across both tiers (REMEDIATION_MAX — Hold 1, "not 2+2"); halts the
+// stayed put. GLOBAL shared cap across ALL tiers (REMEDIATION_MAX — Hold 1, "not 2+2"); halts the
 // instant the error set is UNCHANGED after an action (no point re-firing the same fix). Every action
 // is recorded into out.results (flag ai-remediation) + the bundle re-persisted. NEVER submits — the
 // re-Save&Continue is the GUARDED clickPageNext (refuses on the review marker).
 const REMEDIATION_MAX = 3;
+// The re-navigation AFTER a remediation action needs a MORE generous wall-clock ceiling than the
+// initial Save. When the tab is HIDDEN the page runs throttled (~1Hz) — CDP actuation is throttle-
+// immune but Workday's own post-Save validation + route transition are not. The live hidden page-2→3
+// stall (2026-07-03): Tier-0 cleared the throttle-induced phantom "Duplicate language" error, but the
+// throttled navigation hadn't finished inside the default 15s, so the walk halted "errors-cleared-
+// not-advancing". A genuine validation error still fast-exits in ~1s (errors ⟺ won't-advance), so this
+// larger ceiling ONLY extends the no-error slow-nav case; a VISIBLE fast nav returns early either way.
+const REMEDIATION_RENAV_CEILING_MS = 40000;
 async function remediatePageErrors(act, profile, defaults, jobContext, out, pageKey, page, LOG) {
   const actions = [];
-  let st = null; try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-  let prevErrors = (st && st.errorMarkers && st.errorMarkers.samples) || [];
-  LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s). Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
+  // expandErrorSamples (lib.js): Workday's top banner concatenates EVERY error into one element —
+  // split into individual errors + drop success toasts, so no error hides from the tiers (the
+  // 2026-07-01 live Tier-0 dup-language miss was a truncated concatenated banner).
+  const readErrors = async () => {
+    let st = null; try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
+    return expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+  };
+  // POLL for the banner: it renders LATER than the ~1s fast-exit that got us here (live 2026-07-02:
+  // remediation read "0 error(s)" and Tier 2 acted BLIND — deleted a correctly-filled cert entry).
+  let prevErrors = await readErrors();
+  for (let poll = 0; poll < 8 && !prevErrors.length; poll++) { await cdpDelay(500); prevErrors = await readErrors(); }
+  // Diagnostic: a HIDDEN (throttled) tab is the 2026-07-03 signature — Workday's page-side validation
+  // misfires the "Duplicate language" phantom + navigates slowly under ~1Hz throttling, while a VISIBLE
+  // tab advances cleanly. Log it so a stuck hidden run is unambiguous in the trace. Reads REAL visibility
+  // (SW-side) — NOT document.visibilityState, which the rAF-override fix may spoof to "visible".
+  let _vis = null; try { _vis = await cdpVisibilityLabel(); } catch (e) { /* ignore */ }
+  LOG(`AI-4 remediation: page ${page} blocked with ${prevErrors.length} error(s) [tab ${_vis || "?"}]. Attempting (cap ${REMEDIATION_MAX}, halt on no-progress).`);
 
   for (let attempt = 1; attempt <= REMEDIATION_MAX; attempt++) {
+    // NEVER act blind: with no error text there is nothing to anchor a SAFE action on — every tier
+    // (incl. the AI) would be guessing (the blind Tier-2 delete_entry lesson). Also the clean exit
+    // when an action CLEARED the errors but the page still didn't advance: hand the state to the
+    // operator instead of burning the cap on guesses.
+    if (!prevErrors.length) {
+      LOG(`  no error text on the page — ${attempt === 1 ? "nothing to anchor a remediation on" : "errors cleared but the page did not advance"}; halting (no blind actions).`);
+      return { advanced: false, reason: attempt === 1 ? "no-error-text" : "errors-cleared-not-advancing", attempts: attempt - 1, actions };
+    }
     let didSomething = false;
 
     // ── Tier 0 (HARDCODED, DETERMINISTIC, no AI): the known Magna/Workday phantom "Duplicate
@@ -2369,6 +2004,54 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       }
     }
 
+    // ── Tier 1.5 (DETERMINISTIC DELETE, no AI — operator rule 2026-07-02): the error names a
+    //    REPEATING-section field → the offending rows are DELETABLE BY NATURE (a repeating section
+    //    is optional). Delete every row whose named field reads EMPTY — that's what "is required
+    //    and must have a value" points at, and a row the operator hand-FILLED never reads empty,
+    //    so it's never deleted. A NESTED (layer-2) field deletes ONLY the inner rows (cert ▸
+    //    specialties), never the parent entry. Runs BEFORE the section re-fill: deleting the
+    //    blocking row is cheaper and safer than re-running the whole section. ──
+    let named = [];
+    if (!didSomething) {
+      named = prevErrors.map((t) => parseErrorFieldName(t)).filter(Boolean);
+      const targets = deleteTargetsFromErrorNames(named);
+      if (targets.length) {
+        const del = await deleteEmptyErrorRows(act, targets, DEFAULT_BUDGETS);
+        if (del.deleted.length) {
+          const summary = del.deleted.map((d) => d.kind === "nested"
+            ? `${d.section}[${d.parentIndex}] ▸ ${d.child} row ${d.index}`
+            : `${d.section} entry ${d.index}`).join(", ");
+          LOG(`  attempt ${attempt} (Tier 1.5, deterministic DELETE): error names [${named.join(", ")}] → deleted ${del.deleted.length} EMPTY repeating row(s): ${summary}.`);
+          mergeRemediationRecord(out, {
+            fieldName: "remediation.row-delete", label: "Removed empty repeating row(s)", widgetType: "remediation",
+            status: "needs_review", flag: "ai-remediation", after: null,
+            detail: `AI-4 Tier-1.5: deleted ${del.deleted.length} EMPTY row(s) named by the validation error (${summary}) — repeating sections are optional; re-add manually if needed`
+          });
+          actions.push({ tier: 1.5, action: "delete-empty-rows", deleted: del.deleted });
+          didSomething = true;
+        }
+      }
+    }
+
+    // ── Tier 1.6 (DETERMINISTIC, no AI): the error names a section field whose rows are NOT empty
+    //    (a value problem, not a missing-row problem) → re-run JUST the owning section(s) via
+    //    drivePageFill({onlySections}) — reconcile-UP + re-fill. preserveExtras: the re-run NEVER
+    //    reconciles DOWN (entries beyond profile-N may be the operator's manual additions). ──
+    if (!didSomething) {
+      const secNames = sectionsFromErrorNames(named);
+      if (secNames.length) {
+        LOG(`  attempt ${attempt} (Tier 1.6, deterministic): error names section field(s) [${named.join(", ")}] → re-run section(s) [${secNames.join(", ")}] (no AI, manual entries preserved).`);
+        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames), preserveExtras: true });
+        for (const r of (rOut.results || [])) {
+          r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
+          r.detail = "AI-4 Tier-1.6 section re-fill — " + (r.detail || "");
+          mergeRemediationRecord(out, r);
+        }
+        actions.push({ tier: 1.6, sections: secNames, named });
+        didSomething = true;
+      }
+    }
+
     // ── Tier 2 (AI, LAST RESORT — only when the deterministic tiers couldn't act): parse the field
     //    name + ask the AI for ONE bounded action (refill a named field / delete a duplicate entry / none). ──
     if (!didSomething) {
@@ -2413,23 +2096,40 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       }
     }
 
-    if (!didSomething) { await repersistPageBundle(out, pageKey); return { advanced: false, reason: "no-action", attempts: attempt, actions }; }
+    if (!didSomething) {
+      // hand the state to the operator with a TRUTHFUL summary (no click follows, same rule)
+      try { await reconPageTruth(act, out.results); } catch (e) { /* read-only — persist regardless */ }
+      await repersistPageBundle(out, pageKey, page);
+      return { advanced: false, reason: "no-action", attempts: attempt, actions };
+    }
 
-    // Record the remediation trail into the persisted bundle BEFORE the re-advance (so it's kept
-    // whether or not this attempt advances).
-    await repersistPageBundle(out, pageKey);
+    // ── PRE-ADVANCE TRUTH RECON (operator rule 2026-07-02): before EVERY re-Save&Continue, re-recon
+    // the live page and re-persist — the summary shows EXACTLY what is on the page at this click
+    // (deleted rows drop, shifted/changed values refresh, unvouched values surface as already-filled;
+    // the synthetic "remediation" rows never reach the bundle — buildReviewBundle filters them). The
+    // latest persist OVERRIDES this page's earlier ones (accumulate merges on the page key). ──
+    try { await reconPageTruth(act, out.results); } catch (e) { LOG("  pre-advance recon failed (persisting records as-is):", String((e && e.message) || e)); }
+    await repersistPageBundle(out, pageKey, page);
 
     // ── re-Save & Continue (GUARDED — refuses on the review marker) + wait. ──
     const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+    await cdpWakePage(); // wake a frozen hidden tab so the post-remediation transition can run
     const click = await act.clickPageNext();
-    if (!click.clicked) return { advanced: false, reason: "click-refused:" + (click.refused || "?"), attempts: attempt, actions };
-    const res = await cdpWaitNextPage(prevSig);
+    if (!click.clicked) {
+      if (click.blockedBy) LOG(`re-Save&Continue refused — a popup/overlay is COVERING the button: ${click.blockedBy}`);
+      return { advanced: false, reason: "click-refused:" + (click.refused || "?"), blockedBy: click.blockedBy || null, attempts: attempt, actions };
+    }
+    // Throttle-generous ceiling (see REMEDIATION_RENAV_CEILING_MS): a hidden tab's post-remediation
+    // nav runs at ~1Hz — the default 15s stalled hidden page-2→3 after Tier-0 cleared the errors.
+    const res = await cdpWaitNextPage(prevSig, REMEDIATION_RENAV_CEILING_MS);
     if (res.sessionDead) return { sessionDead: true, attempts: attempt, actions };
     if (res.advanced) return { advanced: true, attempts: attempt, actions };
 
     // ── not advanced → HALT on NO-PROGRESS (error set unchanged); else continue. ──
-    let st2 = null; try { st2 = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-    const newErrors = (st2 && st2.errorMarkers && st2.errorMarkers.samples) || [];
+    // POLL the errors (do NOT single-read): under throttle the banner renders LATER than the wait
+    // ceiling — a single read can catch 0 and mislabel a real, still-blocking error as "cleared".
+    let newErrors = await readErrors();
+    for (let poll = 0; poll < 8 && !newErrors.length; poll++) { await cdpDelay(500); newErrors = await readErrors(); }
     if (errorSetUnchanged(prevErrors, newErrors)) {
       LOG(`  remediation made NO PROGRESS (error set unchanged after the action) — halting.`);
       return { advanced: false, reason: "no-progress", attempts: attempt, actions, errors: newErrors };
@@ -2447,7 +2147,7 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
 // the PREPARED profile (sections need the annotated arrays). M38 Part 2: builds the
 // review-summary bundle from the results + persists it (accumulating write-per-page,
 // keyed by the pre-fill cdpPageKey) — "View last summary" in the popup. On page 1 (no
-// repeating sections) this is identical to runCdpFill + a summary; on page 2 it fills
+// repeating sections) this fills the flat fields + persists a summary; on page 2 it fills
 // the whole page in one click. SINGLE page (no advance) — accumulates, reset via the
 // "Clear summary" button. [CDP-PAGE] in the SW console.
 // ============================================================================
@@ -2490,7 +2190,7 @@ async function reportApplication(bundle, jobContext) {
   }
 }
 
-async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
+async function runCdpFillPage(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
   try {
     const attached = await cdpAttach(tabId);
@@ -2498,14 +2198,15 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
       LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
       return { ok: false, error: "attach-failed:" + attached.error };
     }
+    await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so a hidden single-page fill behaves like the walk
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
-    LOG(`attached. Filling NOW${opts && opts.skipLock ? " (NO input-lock — oracle baseline)" : " (input-lock ON)"} — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).`);
+    LOG(`attached. Filling NOW (input-lock ON) — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live. Full-page (flat + every repeating section present).`);
 
     const prepared = prepareProfile(profile); // sections need the annotated arrays (fromParsed/bulletsText/meaningful)
     const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
-    const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts);
+    const { out, bundle, auditFlags } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
     await reportApplication(bundle, jobContext); // fire-and-forget → website Tracker (no-op if not connected)
     return { ok: true, counts: out.counts, needs_review: out.needsReview.length, session_warning: out.sessionWarning || null, summary_total: bundle.total, audit_flagged: auditFlags.length };
   } catch (e) {
@@ -2518,514 +2219,268 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext, opts) {
   }
 }
 
-// ============================================================================
-// DEBUG HARNESS — "How did you hear about us?" ISOLATED to the first half: deterministic fill →
-// AI picks the best CATEGORY → click (drill) it → STOP. No Prompt-2 / leaf / commit, no other fields.
-// Verbose [CDP-SRC-DEBUG] logging so we can pinpoint where the source AI breaks (scrape / AI pick /
-// category click / drill). Drives fillSourceCdp with `{ai:{debugStopAfterCategory:true}}`; candidates =
-// profile.how_did_you_hear.preferred ONLY (fallback dropped → always no-matches → reaches the AI).
-// ============================================================================
-async function runCdpSourceAiDebug(tabId, profile, defaults, jobContext) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-SRC-DEBUG]", ...a);
+// ── M3 (strict-replay SUBMIT — dry harness) ─────────────────────────────────
+// Replay the SAVED, human-approved reviewSummary bundle onto the CURRENT live page — FLAT fields
+// (replayFlatFields) + repeating sections (replayRepeatingSections, strict: no AI, never drop an
+// approved entry). NO Next, NO Submit (dry). Reads the bundle from storage, NOT the profile — that's
+// the point of replay. Load the same page you filled (fresh) + keep it VISIBLE to watch the approved
+// values land; a value the form no longer offers HALTS that field (needs_review), never guesses.
+// [CDP-REPLAY] in the SW console.
+async function runCdpReplayPage(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY]", ...a);
   try {
     const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const prepared = prepareProfile(profile);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      LOG('no reviewSummary bundle in storage — fill a page first (this dry-replays the saved approved values). "View last summary" to confirm one exists.');
+      return { ok: false, error: "no-bundle" };
+    }
+    await cdpInstallPageOverrides();
+    LOG("DRY REPLAY — replaying the SAVED approved bundle onto THIS live page (flat + repeating). NO Next, NO Submit. Keep the tab VISIBLE; a value the form no longer offers HALTS that field (needs_review), never guesses.");
     const act = makeCdpActuation(await getLlmConfig());
-    if (!act.aiEnabled) { LOG("AI toggle is OFF — enable AI (provider/model/key + toggle) in the popup, then rerun."); return { ok: false, error: "ai-off" }; }
-    const hdyh = (prepared && prepared.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
-    if (!hdyh || !Array.isArray(hdyh.preferred) || !hdyh.preferred.length) { LOG("no how_did_you_hear.preferred — set it in the profile."); return { ok: false, error: "no-candidates" }; }
-    const candidates = hdyh.preferred.slice(); // fallback DROPPED on purpose → force the deterministic no-match
-    LOG("candidates (no fallback → forces no-match → AI):", JSON.stringify(candidates));
-    LOG("keep the tab VISIBLE to watch; FULL source AI: deterministic fill → AI category → DRILL → scroll-enumerate leaves → AI leaf → typed commit.");
-    const loc = { wrapperSel: '[data-automation-id="formField-source"]' };
-    const rec = await fillSourceCdp(act, loc, candidates, DEFAULT_BUDGETS, {
-      ai: { profile: prepared, jobContext, isRequired: true, label: "How Did You Hear About Us?", fieldName: "source", sourceTree: true }
-    });
-    LOG("result:", JSON.stringify({ status: rec.status, after: rec.after, verified: rec.verified, flag: rec.flag, confidence: rec.confidence, detail: rec.detail }, null, 2));
-    if (rec.tree_structure) LOG("tree:", JSON.stringify({ chosen: rec.tree_structure.chosen, leaves: rec.tree_structure.leaves }, null, 2));
-    return { ok: true, status: rec.status, after: rec.after || null, flag: rec.flag || null };
+    await installInputLock();
+    const scan = await cdpEval(cdpPageScan);
+    const present = new Set(((scan && scan.fields) || []).map((f) => f.fieldName));
+    const flat = await replayFlatFields(act, bundle.entries, present, DEFAULT_BUDGETS);
+    const rep = await replayRepeatingSections(act, bundle.entries, DEFAULT_BUDGETS);
+    const results = flat.concat(rep);
+    const nr = results.filter((r) => r.status === "needs_review" || r.status === "error");
+    LOG(`replayed ${flat.length} flat + ${rep.length} repeating record(s); ${nr.length} need review/failed.`);
+    if (nr.length) { LOG("NEEDS REVIEW / FAILED:"); nr.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`)); }
+    try { console.table(results.map((r) => ({ field: r.field || r.fieldName, type: r.widgetType, status: r.status, after: r.after, verified: r.verified }))); } catch (e) { results.forEach((r) => LOG(JSON.stringify(r))); }
+    LOG("dry replay complete — NOTHING submitted, no page advance. (Unknown/generic sections + attachments are deferred.)");
+    return { ok: true, flat: flat.length, repeating: rep.length, needs_review: nr.length };
   } catch (e) {
     const msg = String((e && e.message) || e);
-    LOG("source debug aborted:", msg);
+    LOG("replay aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
+    await removeInputLock(); // BEFORE detach
     await cdpDetach();
   }
 }
 
-// ============================================================================
-// AI-4 TEST HARNESS — stage a fixable validation error so AI-4 remediation fires.
-// The form fills correctly (no natural error) and the input-lock blocks the operator
-// from manually breaking a field mid-run, so the SW does it: fill the page → DELIBERATELY
-// clear a required, mapped text field (lock-immune, via the gated clear primitive) → Save &
-// Continue ERRORS → run the remediation loop. FIXABLE (default): Tier-1 clicks the error
-// anchor → focuses the field → re-fills from profile → ADVANCES. UNFIXABLE (opts.unfixable):
-// wrap clickPageNext to RE-CLEAR the target before each click → the error never clears →
-// the no-progress/cap halt fires CLEANLY (never loops, never submits). Run on a fully-
-// fillable page WITHOUT a required upload (page 1 / My Information). [CDP-TEST-AI4] console.
-// ============================================================================
-async function runCdpTestRemediation(tabId, profile, defaults, jobContext, opts) {
-  const unfixable = !!(opts && opts.unfixable);
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-TEST-AI4]", ...a);
+// Re-attach the stored résumé on the CURRENT page (replay path — replayField defers file_upload to
+// this SW step). Mirrors fillAndPersistPage's attach block: read the bytes from IndexedDB, bump
+// window.__apActing so the input-lock passes attachResume's SYNTHETIC delete/attach clicks, run the
+// proven attachResume via cdpEval on the SAME debugger attach, gate on file-upload-successful.
+async function replayAttachResume(LOG) {
+  let resumeRec = null;
+  try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
+  if (!resumeRec || !resumeRec.base64) {
+    LOG("resume: NOT attached — no resume stored (upload one in the popup).");
+    return { attached: false, detail: "no resume stored — upload a PDF in the popup first" };
+  }
+  let ar = null, arErr = null;
+  try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ }
+  try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
+  catch (e) { arErr = String((e && e.message) || e); }
+  finally { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } }
+  if (ar && ar.attached) {
+    LOG(`resume: attached "${ar.fileName || resumeRec.filename}".`);
+    return { attached: true, detail: `attached (cleared ${ar.deletedCount || 0} existing)`, fileName: ar.fileName || resumeRec.filename };
+  }
+  const detail = "resume attach failed — " + (arErr || (ar && ar.detail) || "no confirmation");
+  LOG("resume: NOT attached — " + detail);
+  return { attached: false, detail };
+}
+
+// ── M3: runCdpReplayWalk — the DRY replay WALK (replay → advance → review; NEVER submits) ───────────
+// Replays the SAVED, human-approved reviewSummary bundle page-by-page onto a FRESH application, verifies
+// each field, advances with the SAME guarded clickPageNext the fill walk uses (refuses on the review
+// page), and STOPS at review. NO clickSubmit exists yet (that's M4) — this is the safe dry run. Strict:
+// a value the live form no longer offers HALTS (replay-mismatch); a required field left empty stalls
+// advancement and HALTS (replay-blocked — possibly a cascade-revealed field the bundle doesn't cover);
+// NO AI, NO AI-4 remediation (fill-path only). Reads the bundle from storage, NOT the profile. Keep the
+// tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
+const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
+async function runCdpReplayWalk(tabId, opts) {
+  const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
+  const authorize = !!(opts && opts.authorize); // per-run submit token (M4). false ⇒ DRY (reach review + stop).
   try {
     const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-    LOG(`AI-4 TEST (${unfixable ? "UNFIXABLE — watch the no-progress/cap halt" : "FIXABLE — watch Tier-1 re-fill + advance"}). Filling, then DELIBERATELY clearing a required field to trigger a Save & Continue error. Run on a fully-fillable page WITHOUT a required upload (page 1 / My Information).`);
-
-    const prepared = prepareProfile(profile);
-    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam (Tier-2 needs the AI toggle ON; Tier-1 works either way)
-    const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
-
-    // PERTURB: pick the first REQUIRED, MAPPED text field (Tier-1 can re-fill it from the profile),
-    // then blank it via the gated clear (lock-immune — bypasses the operator, passes the input-lock).
-    const scan = await act.scanPage();
-    const isMapped = (fn) => (typeof FIELD_MAP !== "undefined") && !!FIELD_MAP[fn];
-    const target = scan.fields.find((f) => f.widgetType === "text" && f.isRequired && isMapped(f.fieldName))
-      || scan.fields.find((f) => f.widgetType === "text" && f.isRequired)
-      || scan.fields.find((f) => f.widgetType === "text" && isMapped(f.fieldName));
-    if (!target) { LOG("no perturbable required/mapped text field on this page — run on My Information (page 1)."); return { ok: true, stopped: "no-target" }; }
-    const targetLoc = { wrapperSel: target.wrapperSel };
-    const clearTarget = async () => { await act.focusText(targetLoc, "input"); await act.clearText(); };
-    await clearTarget();
-    LOG(`PERTURBED: cleared "${target.label}" (${target.fieldName}) — Save & Continue should now error.`);
-
-    // UNFIXABLE: a thin wrapper that re-clears the target before EVERY Save & Continue, so the
-    // error never clears no matter what AI-4 re-fills → deterministic no-progress halt. Test-only.
-    const driveAct = unfixable
-      ? Object.assign({}, act, { clickPageNext: async () => { await clearTarget(); return act.clickPageNext(); } })
-      : act;
-
-    const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-    const click = await driveAct.clickPageNext();
-    LOG("initial Save & Continue:", JSON.stringify(click));
-    if (!click.clicked) { LOG(`advance refused (${click.refused}) — cannot test here.`); return { ok: true, stopped: "click-refused:" + (click.refused || "?") }; }
-    const res = await cdpWaitNextPage(prevSig);
-    if (res.advanced) { LOG(`⚠ page ADVANCED without an error — clearing "${target.fieldName}" didn't block Save & Continue (not actually required?). Try another page (My Information has required First/Last/Phone).`); return { ok: true, stopped: "advanced-no-error", target: target.fieldName }; }
-    if (res.sessionDead) { LOG("session dead — cannot test."); return { ok: true, stopped: "session-dead" }; }
-
-    // res.timeout → the EXPECTED validation error. Fire AI-4.
-    LOG(`Save & Continue blocked (expected${res.errorDetected ? ", detected fast via error markers" : ""}) → running AI-4 remediation.`);
-    const rem = await remediatePageErrors(driveAct, prepared, defaults, jobContext, out, pageKey, 1, LOG);
-    if (rem.sessionDead) { LOG("session dead during remediation."); return { ok: true, stopped: "session-dead" }; }
-    if (rem.advanced) { LOG(`✓✓ AI-4 FIXED it — advanced after ${rem.attempts} attempt(s). Actions: ${JSON.stringify(rem.actions)}`); return { ok: true, stopped: "remediated-advanced", attempts: rem.attempts, actions: rem.actions }; }
-    LOG(`AI-4 HALTED CLEANLY (${rem.reason}) after ${rem.attempts} attempt(s) — never looped, never submitted. Actions: ${JSON.stringify(rem.actions)}`);
-    return { ok: true, stopped: "remediation-halted", reason: rem.reason, attempts: rem.attempts, actions: rem.actions };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("test aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await removeInputLock();
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP RE-AUDIT (M40 standalone) — re-read the LIVE page against the persisted
-// expectations (`reviewAudit`, written by the last full-page fill) + report any
-// mismatch. The independent backstop, runnable any time: the operator can fill,
-// then MANUALLY change a committed field, then re-audit → it MUST flag that field
-// (the perturbation gate — proves the audit CATCHES, not just stays quiet). Read-
-// only re-reads; never actuates. Attach → reconcileAudit → report → detach.
-// ============================================================================
-async function runCdpAudit(tabId) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-AUDIT]", ...a);
-  try {
-    const stored = await new Promise((resolve) => chrome.storage.local.get("reviewAudit", (r) => resolve(r && r.reviewAudit)));
-    if (!stored || !Array.isArray(stored.entries) || !stored.entries.length) {
-      LOG("no reviewAudit found — run a full-page CDP fill first (it records the expectations).");
-      return { ok: false, error: "no-audit-data" };
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      LOG('no reviewSummary bundle in storage — fill + review an application first, then replay it.');
+      return { ok: false, error: "no-bundle" };
     }
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    LOG(`re-auditing ${stored.entries.length} field(s) against the live page (recorded ${stored.savedAt}).`);
-    const act = makeCdpActuation();
-    const verdicts = await reconcileAudit(act, stored.entries, DEFAULT_BUDGETS);
-    const bad = verdicts.filter((v) => v.verdict !== "match");
-    LOG(`════ AUDIT (${verdicts.length} checked, ${bad.length} flagged) ════`);
-    for (const v of bad) {
-      LOG(`  ⚠ [${v.verdict}] ${v.key} (${v.widgetType}) — page shows "${v.actual}" ; expected "${v.expected}"`);
-    }
-    if (!bad.length) LOG("  ✓ every field still shows its filled value — page matches the last fill.");
-    return { ok: true, checked: verdicts.length, flagged: bad.length, mismatches: bad };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("re-audit aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
+    await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
+    LOG(authorize
+      ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
+      : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
+    const act = makeCdpActuation(await getLlmConfig()); // AI OFF for replay regardless (replayRepeatingSections passes aiContext:null; flat replayField never calls AI)
+    const pagesReplayed = [];
+    const findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
+    let submitFired = false; // single-fire sentinel
 
-// ============================================================================
-// CDP RESUME-ATTACH RECON (walk prereq 1, recon-first) — the KEY unknowns before
-// wiring the resume into the CDP fill: (1) does the PROVEN page-injection attachResume
-// (rebuild File from base64 → DataTransfer → input.files → change → gate on
-// file-upload-successful) run via cdpEval/Runtime.evaluate on the SAME debugger attach
-// (no chrome.scripting, no second client)? (2) attachResume's clear-loop + confirmation
-// gate use PAGE-SIDE setTimeout — does the confirmation complete under the debugger
-// channel, and how does the throttle bite HIDDEN vs VISIBLE (→ keep its internal poll, or
-// SW-PACE the gate like every other CDP wait)? Run on a page WITH the upload widget
-// (Magna page 2 "Application Documents"); a resume must be stored (popup). Reports the
-// attach result + ELAPSED wall-clock. NOTE: this ATTACHES A REAL FILE to the live form —
-// recon debris (leave it / clear it in the form per the orphan-specialties discipline).
-// Run it VISIBLE and (separately) MINIMIZED and compare the elapsed times.
-// ============================================================================
-async function runCdpResumeRecon(tabId) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-RESUME-RECON]", ...a);
-  try {
-    let rec = null;
-    try { rec = await getResume(); } catch (e) { LOG("IndexedDB read failed:", String(e)); return { ok: false, error: "idb-read-failed" }; }
-    if (!rec || !rec.base64) { LOG("no resume stored — upload a PDF in the popup first, then re-run."); return { ok: false, error: "no-resume" }; }
-
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-
-    // Is the upload widget on this page at all?
-    const hasWidget = await cdpEval(() => !!document.querySelector('[data-automation-id="file-upload-input-ref"]'));
-    const vis = await cdpEval(() => document.visibilityState);
-    LOG(`upload widget present: ${hasWidget}; tab visibilityState: ${vis}. Resume: ${rec.filename} (${rec.size} bytes).`);
-    if (!hasWidget) { LOG("no file-upload-input-ref on this page — run on the page that HAS the required upload (Magna page 2 'Application Documents')."); return { ok: true, widget_present: false }; }
-
-    // PROBE: run the existing self-contained attachResume via cdpEval (awaitPromise) — the
-    // candidate reuse path. Time the whole thing (its internal page-side confirmation poll
-    // is what the throttle would bite). NOTE: cdpEval uses Date.now()-free SW timing here.
-    const t0 = Date.now();
-    let result = null, evalError = null;
-    try { result = await cdpEval(attachResume, rec.base64, rec.filename || "resume.pdf", rec.mime || "application/pdf"); }
-    catch (e) { evalError = String((e && e.message) || e); }
-    const elapsedMs = Date.now() - t0;
-
-    if (evalError) { LOG(`cdpEval(attachResume) THREW after ${elapsedMs}ms: ${evalError} (Runtime.evaluate may not run this fn — fall back to chrome.scripting, or SW-pace a custom probe).`); return { ok: true, widget_present: true, eval_error: evalError, elapsed_ms: elapsedMs }; }
-    LOG(`cdpEval(attachResume) returned after ${elapsedMs}ms:`, JSON.stringify(result, null, 2));
-    LOG(result && result.attached
-      ? `✓ ATTACHED via the debugger channel (confirmation: ${result.confirmationVia}). ⇒ cdpEval-native attach WORKS${vis === "visible" ? " (visible)" : " (HIDDEN — the internal page poll survived the throttle)"}.`
-      : `✗ NOT confirmed (${result && result.detail}). If the File set (filesSetImmediately) but no confirmation row ${vis === "visible" ? "even visible → page didn't process the change" : "while hidden → the throttle bit the page-side poll/XHR → SW-PACE the gate"}.`);
-    LOG("NOTE: a real file is now attached on the live form — clear it in the form if you don't want it, before any walk.");
-    return { ok: true, widget_present: true, attached: !!(result && result.attached), confirmation_via: result && result.confirmationVia, files_set: result && result.filesSetImmediately, elapsed_ms: elapsedMs, visibility: vis, detail: result && result.detail };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("resume recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// TYPEAHEAD STRAY-COMMIT RECON — pin WHEN a stray ("Accounting") commits in the
-// overwrite/keptLowerTier RESTING path. Live bug: fieldOfStudy pre-filled "Other",
-// the M36.1 keptLowerTier path reported KEPT "Other" but the M40 audit found
-// "Accounting" → a stray landed AFTER the brain read the chip. HYPOTHESIS (M25 ghost):
-// clearing the searchBox to EMPTY while the listbox is open ARMS the row-0 highlight
-// (first option "Accounting"); Escape doesn't disarm it; the next field's BLUR commits
-// it. This harness drives the discrete resting steps + reads chip / activeText
-// (aria-activedescendant = the armed highlight) / firstOption between each, so the step
-// where the chip flips "Other"→firstOption IS the trigger. Read-mostly (restore the
-// field after if it strays). Locate the typeahead by label (default "field of study").
-// Pre-set the field to a LOWER tier ("Other") first to match the live keptLowerTier case.
-// ============================================================================
-async function runCdpTaStrayRecon(tabId, labelRegexStr) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-TA-STRAY]", ...a);
-  let re;
-  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-
-    // Locate the typeahead by label — across repeating-section entries, then flat.
-    let loc = null, where = null;
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
-        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
+    for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
+      // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
+      let nav = null;
+      try { nav = await cdpEval(cdpReadSessionState); } catch (e) { /* not-ready → handled below */ }
+      if (nav && isWorkdayMaintenance(nav)) {
+        LOG(`⛔ WORKDAY MAINTENANCE at page ${page} — retry after the window.`);
+        return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
-      if (loc) break;
-    }
-    if (!loc) {
-      const ps = await cdpEval(cdpPageScan);
-      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
-    }
-    if (!loc) { LOG(`no typeahead matching /${re.source}/ on this page — run on the page with the field (page 2 for Field of Study).`); return { ok: true, found: false }; }
-    LOG(`probing ${where} (${loc.wrapperSel}). Pre-set this field to a LOWER tier (e.g. "Other") first for the keptLowerTier case.`);
-
-    // Read after EACH action — distinguish ARMING (activeText→"Accounting", chip stays "Other")
-    // from COMMIT (the CHIP flips). The fix targets the COMMIT step, not arming.
-    const snap = async (tag) => {
-      const s = await act.readTypeahead(loc);
-      const chip = ((s && s.chips) || []).join("; ");
-      const active = (s && s.activeText) || null;
-      LOG(`  [${tag}] chip="${chip}" | armed(activeText)="${active}" | firstOption="${((s && s.pageWide.texts) || [])[0]}" | sbValue="${s && s.searchBox.value}" | sbVisible=${s && s.searchBox.visible} | banner=${!!(s && s.banner)}`);
-      return { chip, active };
-    };
-
-    // Locate the NEXT field's input rect (a text field in the SAME entry — the faithful
-    // "move to next field" production does) + a NEUTRAL empty coordinate (the operator's
-    // safe manual click-outside).
-    let nextRect = null;
-    try {
-      const rs2 = await cdpEval(cdpRepeatingScan);
-      for (const prefix of (rs2 ? rs2.sectionsPresent : [])) {
-        for (const e of rs2.sections[prefix].entries) {
-          const nf = e.fields.find((x) => x.widgetType === "text" && x.wrapperSel !== loc.wrapperSel);
-          if (nf) { const r = await cdpEval(cdpRectOf, nf.wrapperSel + ' input', true); if (r && r.w > 0) { nextRect = r; LOG(`next-field for the faithful blur: "${nf.label}" @ (${r.cx},${r.cy}).`); break; } }
+      if (nav && sessionLooksDead(nav)) {
+        LOG(`⚠⚠ SESSION EXPIRED at page ${page} — refresh, log in, reopen the form, retry.`);
+        return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      if (nav && nav.applyFlowReviewPresent) {
+        LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified.`);
+        // ── REVIEW-PAGE EQUALITY (operator requirement) — the review page must DISPLAY exactly the
+        //    approved values. Scrape its label→value pairs and diff vs the approved bundle
+        //    (reconcileReviewPage — the SAME read-only check as the "review-page CHECK" button). A
+        //    DISAGREE (page shows a different value), a MISSING (approved value not shown), or a scrape
+        //    FAILURE (can't confirm) each becomes a HARD gate blocker. extra-on-page is logged, not
+        //    blocked (review boilerplate is noisy). Runs even DRY — the operator sees the diff preview. ──
+        const reviewDiff = { disagree: [], missing: [], scrapeFailed: false };
+        try {
+          const hints = bundle.entries
+            .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
+            .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
+          const dump = await cdpEval(cdpReadReviewPage, hints);
+          if (dump && dump.ok && Array.isArray(dump.items)) {
+            const rec = reconcileReviewPage(dump.items, bundle.entries);
+            const c = rec.counts;
+            reviewDiff.disagree = rec.disagree || [];
+            reviewDiff.missing = rec.missing_on_review || [];
+            LOG(`review page vs approved: AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING ${c.missing_on_review} · EXTRA ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous} (of ${c.claimed} value-bearing entries).`);
+            rec.disagree.forEach((d) => LOG(`    ≠ "${d.label || d.canonical_field || d.field_id}": approved "${d.value_bundle}" but the page shows "${d.value_review}"`));
+            rec.missing_on_review.forEach((m) => LOG(`    ∅ approved "${m.value_bundle}" ("${m.label || m.canonical_field || m.field_id}") is NOT shown on the review page`));
+            if ((rec.extra_on_review || []).length) { LOG(`    (${rec.extra_on_review.length} extra value(s) on the page not in the bundle — logged, NOT blocking:)`); rec.extra_on_review.slice(0, 6).forEach((x) => LOG(`      + "${x.value_review}" (${x.label || "?"})`)); }
+          } else {
+            LOG(`⚠ could NOT scrape the review page (${(dump && dump.reason) || "no items"}) — cannot confirm it matches the approved values → the gate will block.`);
+            reviewDiff.scrapeFailed = true;
+          }
+        } catch (e) {
+          LOG(`⚠ review-page diff failed: ${String((e && e.message) || e)} → the gate will block.`);
+          reviewDiff.scrapeFailed = true;
         }
-        if (nextRect) break;
+
+        // ── M4 SUBMIT GATE — the ordered precondition check. Run it ALWAYS (even DRY) so the operator
+        //    sees a blocker list; clickSubmit fires ONLY when authorize===true AND every check passes. ──
+        let livePlaceholder = false;
+        try { livePlaceholder = await cdpEval(() => ((document.body && document.body.innerText) || "").indexOf("[NEEDS YOUR ANSWER") !== -1); } catch (e) { /* ignore — bundle check still applies */ }
+        const gate = submitPrecondition(bundle, nav, {
+          mismatches: findings.mismatches, cascadeRevealed: findings.cascadeRevealed, livePlaceholder,
+          reviewDisagree: reviewDiff.disagree, reviewMissing: reviewDiff.missing, reviewScrapeFailed: reviewDiff.scrapeFailed
+        }, { authorize, alreadyFired: submitFired });
+        if (!gate.ok) {
+          LOG(`submit gate: ${gate.blockers.length} blocker(s) — NOT submitting:`);
+          gate.blockers.forEach((b) => LOG(`    ✗ ${b}`));
+          if (!authorize) LOG(`(DRY run — reached review + stopped. When every blocker above is cleared, the armed Submit button will submit once.)`);
+          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        // GATE PASSED + authorized → the ONE irreversible click.
+        LOG(`✓ submit gate PASSED — clicking SUBMIT ONCE (authorized).`);
+        const subSig = cdpPageSig(await cdpEval(cdpPageScan));
+        const sub = await act.clickSubmit(true);
+        submitFired = true; // single-fire — never attempt a second submit this run
+        LOG(`clickSubmit:`, JSON.stringify(sub));
+        if (!sub.clicked) {
+          LOG(`⚠ clickSubmit refused (${sub.refused}${sub.blockedBy ? " — covered by " + sub.blockedBy : ""}) — NOT submitted. Eyeball the review page.`);
+          return { ok: true, stopped: "submit-refused:" + (sub.refused || "?"), reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        const res = await cdpWaitNextPage(subSig);
+        const confirmed = !!(res.advanced && !res.sessionDead && !res.maintenance);
+        LOG(confirmed ? `✓✓✓ SUBMITTED — the review page advanced (confirmation). Application submitted.` : `clickSubmit fired but no confirmed advance yet (${JSON.stringify(res)}) — VERIFY on the page.`);
+        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
-    } catch (e) { /* fall through — skip the next-field click */ }
-    const neutral = await cdpEval((wrapperSel) => {
-      const w = document.querySelector(wrapperSel);
-      const bad = (el) => !el || el === document.documentElement || el === document.body
-        || /^(input|button|a|select|textarea)$/i.test(el.tagName)
-        || el.closest('[role="option"], button, a, input, [data-automation-id="searchBox"]') || (w && w.contains(el));
-      const W = window.innerWidth, H = window.innerHeight;
-      for (const [x, y] of [[W * 0.5, 8], [8, H * 0.5], [W - 8, H * 0.5], [W * 0.5, H - 8], [20, 20]]) {
-        const el = document.elementFromPoint(Math.round(x), Math.round(y));
-        if (!bad(el)) return { cx: Math.round(x), cy: Math.round(y) };
+
+      LOG(`──── REPLAY PAGE ${page} ────`);
+      await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+      const scan = await cdpEval(cdpPageScan);
+      const fields = (scan && scan.fields) || [];
+      const liveNames = fields.map((f) => f.fieldName);
+      // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
+      let rscanLive = null;
+      try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
+      const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
+      if (!sel.entries.length || sel.score <= 0) {
+        const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
+        LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). The bundle never captured this page — HALT (can't replay what wasn't reviewed).`);
+        return { ok: true, stopped: "replay-page-not-in-bundle", page, live_fields: liveNames, live_sections: liveSecs, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
-      return null;
-    }, loc.wrapperSel);
+      LOG(`page ${page} → matched approved page "${(sel.pageKey || "").split("|")[0]}" (${sel.score} flat-field overlap; ${sel.entries.length} approved entr${sel.entries.length === 1 ? "y" : "ies"}).`);
 
-    const probeQuery = "Electrical and Computer Engineering"; // a known-ABSENT higher-tier value
-    const ensureFocused = async () => { let st = await act.readTypeahead(loc); if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); } if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); } };
-    const reproduceArmed = async () => { await ensureFocused(); await act.clearSearch(); await act.delayFull(500); await act.typeInSearch(probeQuery); await act.delayFull(600); await act.pressEnter(); await act.delayFull(1800); };
-    const recommitOther = async () => { // the LIKELY FIX: affirmative re-select, overwrites whatever's armed
-      await ensureFocused(); await act.clearSearch(); await act.delayFull(500); await act.typeInSearch("Other"); await act.delayFull(600); await act.pressEnter(); await act.delayFull(1500);
-      const r = await act.readTypeahead(loc); if (!(r && (r.chips || []).some((c) => /^other$/i.test(c)))) { try { await act.clickTaOption(loc, "Other"); await act.delayFull(900); } catch (e) { /* ignore */ } }
-    };
+      const present = new Set(liveNames);
+      const flat = await replayFlatFields(act, sel.entries, present, DEFAULT_BUDGETS);
+      const rep = await replayRepeatingSections(act, sel.entries, DEFAULT_BUDGETS);
+      const results = flat.concat(rep);
 
-    LOG("════ PHASE A — faithful production reproduction → CLICK NEXT FIELD ════");
-    const a0 = await snap("A0 initial");
-    await reproduceArmed();
-    const a1 = await snap("A1 after no-match search   [ARMING expected here: armed→Accounting, chip stays Other]");
-    await ensureFocused();
-    const a2 = await snap("A2 after RESTING re-focus");
-    await act.clearSearch(); await act.delayFull(900);
-    const a3 = await snap("A3 after RESTING clearSearch→EMPTY   [candidate 2: does the CHIP flip here?]");
-    await act.pressEscape(); await act.delayFull(700);
-    const a4 = await snap("A4 after pressEscape");
-    if (nextRect) { await cdpClickAt(nextRect.cx, nextRect.cy); await act.delayFull(1200); } else LOG("  (no next-field rect — skipped the faithful blur)");
-    const a5 = await snap("A5 after CLICK NEXT FIELD   [candidate 1: does the CHIP flip here? — the faithful exit]");
-
-    LOG("════ RESET — re-commit \"Other\" (also tests the re-commit FIX: recovers a strayed field?) ════");
-    await recommitOther();
-    const rr = await snap("R after re-commit Other   [fix check: chip back to Other?]");
-
-    LOG("════ PHASE B — CONTROL: same reproduction, but CLICK NEUTRAL SPACE (the operator's safe manual blur) ════");
-    await reproduceArmed();
-    await snap("B1 after no-match search");
-    await ensureFocused();
-    await act.clearSearch(); await act.delayFull(900);
-    await act.pressEscape(); await act.delayFull(700);
-    await snap("B2 after resting dismiss");
-    if (neutral) { await cdpClickAt(neutral.cx, neutral.cy); await act.delayFull(1200); LOG(`  (clicked NEUTRAL @ (${neutral.cx},${neutral.cy}))`); } else LOG("  (no neutral coordinate found — skipped the control)");
-    const b3 = await snap("B3 after CLICK NEUTRAL SPACE   [operator says a neutral blur is SAFE — does it stray?]");
-
-    // ── Conclusion: ARMING vs COMMIT; next-field vs neutral ──
-    const flip = (prev, now) => !!(now.chip && prev.chip && now.chip !== prev.chip); // CHIP changed = COMMIT
-    const aSeq = [["A1", a0, a1], ["A2", a1, a2], ["A3 (resting clear→empty)", a2, a3], ["A4 (escape)", a3, a4], ["A5 (click next field)", a4, a5]];
-    let commitStep = null; for (const [tag, prev, now] of aSeq) { if (flip(prev, now)) { commitStep = tag; break; } }
-    const strayedA = !!(a5.chip && a0.chip && a5.chip !== a0.chip);
-    const strayedB = !!(b3.chip && rr.chip && b3.chip !== rr.chip);
-    LOG("════ CONCLUSION ════");
-    LOG(`ARMING: activeText became "${a1.active}" at the no-match search (A1) while chip stayed "${a1.chip}" — EXPECTED arming, not the bug.`);
-    LOG(commitStep ? `COMMIT (the trigger): the CHIP flipped "${a0.chip}"→"${a5.chip}" at step ${commitStep}. The FIX targets THAT action.`
-                   : `Phase A did NOT commit a stray this run (chip "${a5.chip}") — RACE; re-run. (Watch which step flips the CHIP, not activeText.)`);
-    LOG(`CONTROL: next-field click ${strayedA ? "STRAYED" : "clean"} vs neutral-space click ${strayedB ? "STRAYED" : "clean"}. ` +
-      (strayedA && !strayedB ? "⇒ focus-to-NEXT-FIELD is the trigger; a neutral blur is safe (candidate 1) → fix = re-commit Other, or do a safe neutral blur before exiting."
-        : strayedA && strayedB ? "⇒ BOTH stray ⇒ the resting clear-to-empty/dismiss is the trigger (candidate 2), not the click target → fix = don't-clear / re-commit Other."
-          : "⇒ inconclusive this run — re-run."));
-    LOG(`FIX CHECK: re-commit "Other" left chip "${rr.chip}" ${/^other$/i.test(rr.chip) ? "✓ (re-commit recovers — strong fix candidate)" : "✗ (re-commit did NOT land Other — investigate)"}.`);
-    LOG("NOTE: restore Field of Study manually if it isn't \"Other\" now.");
-    return { ok: true, found: true, commit_step: commitStep, strayed_next_field: strayedA, strayed_neutral: strayedB, recommit_chip: rr.chip };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("typeahead-stray recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// FoS OPTION-ENUMERATION RECON (read-only) — does the Field-of-Study typeahead enumerate a
-// BOUNDED option list (on open / a broad search) or is it server-search-only? The answer decides
-// whether a later round can capture entry.options for an editable summary typeahead. READ-MOSTLY:
-// broad multi-match probes (no single-exact autocommit), a chip-guard after each Enter, and a
-// DISARM-verified close + a SETTLED re-read confirming the field is unchanged (FoS is THE stray-
-// prone field — open-then-dismiss + a delayed stray are exactly what bit the earlier recons).
-// ============================================================================
-async function runCdpFosRecon(tabId, labelRegexStr) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-FOS-RECON]", ...a);
-  const eq = (a, b) => String(a == null ? "" : a).trim().toLowerCase() === String(b == null ? "" : b).trim().toLowerCase();
-  let re;
-  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-
-    // Locate the typeahead by label — repeating-section entries first, then flat (mirrors runCdpTaStrayRecon).
-    let loc = null, where = null;
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
-        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
-      }
-      if (loc) break;
-    }
-    if (!loc) {
-      const ps = await cdpEval(cdpPageScan);
-      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
-    }
-    if (!loc) { LOG(`no typeahead matching /${re.source}/ on this page — run on the page with the field (page 2 for Field of Study).`); return { ok: true, found: false }; }
-
-    const ensureFocused = async () => {
-      let st = await act.readTypeahead(loc);
-      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); }
-      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
-      return await act.readTypeahead(loc);
-    };
-
-    const pre = await act.readTypeahead(loc);
-    const preChip = ((pre && pre.chips) || []).join("; ");
-    LOG(`probing ${where} (${loc.wrapperSel}). pre-fill chip = "${preChip}". READ-ONLY (broad multi-match probes; chip-guard + settled unchanged-check).`);
-
-    // (1) ON-OPEN read — no typing. Does FoS render a default option list on open?
-    let st = await ensureFocused();
-    const onOpenCount = st && st.pageWide ? st.pageWide.count : 0;
-    const onOpenSample = (st && st.pageWide && st.pageWide.texts) ? st.pageWide.texts.slice(0, 12) : [];
-    LOG(`ON-OPEN: ${onOpenCount} option(s) rendered (un-capped count; texts sample 40-cap). sample: ${JSON.stringify(onOpenSample)}`);
-
-    // (2) BROAD multi-match probes (many matches → no single-exact autocommit). Read count + sample.
-    const probes = ["a", "e", "s", "engineering", "science", "art"];
-    const results = [];
-    let strayed = false;
-    for (const q of probes) {
-      await ensureFocused();
-      await act.clearSearch(); await act.delayFull(400);
-      await act.typeInSearch(q); await act.delayFull(500);
-      await act.pressEnter(); await act.delayFull(1400);
-      const s = await act.readTypeahead(loc);
-      const count = s && s.pageWide ? s.pageWide.count : 0;
-      const sample = (s && s.pageWide && s.pageWide.texts) ? s.pageWide.texts.slice(0, 10) : [];
-      const chipNow = ((s && s.chips) || []).join("; ");
-      const banner = !!(s && s.banner);
-      results.push({ q, count, banner, sample });
-      LOG(`  q="${q}" → ${count} option(s)${banner ? " [No-matches banner]" : ""} | sample: ${JSON.stringify(sample)}`);
-      if (!eq(chipNow, preChip)) { strayed = true; LOG(`  ⚠ chip CHANGED to "${chipNow}" on q="${q}" — an unintended autocommit; STOPPING probes.`); break; }
-    }
-
-    // (3) SAFE close: clear → DISARM (re-focus + poll activeText null, real-time) → Escape → SETTLED re-read.
-    await act.clearSearch(); await act.delayFull(500);
-    await ensureFocused();
-    const t0 = Date.now();
-    let ds = await act.readTypeahead(loc);
-    while (ds && ds.activeText != null && Date.now() - t0 < 4000) { await act.delayFull(300); ds = await act.readTypeahead(loc); }
-    await act.pressEscape(); await act.delayFull(700);
-    await act.delayFull(1300); // settle: a delayed stray commits AFTER the immediate read (the earlier false-clean)
-    const endChip = ((await act.readTypeahead(loc)).chips || []).join("; ");
-    const unchanged = eq(endChip, preChip);
-
-    // (4) Verdict heuristic (raw counts are the real answer; this is a hint).
-    const maxProbe = results.reduce((m, r) => Math.max(m, r.count), 0);
-    const big = Math.max(onOpenCount, maxProbe);
-    const verdict = big >= 10
-      ? `LIKELY ENUMERABLE — a broad read surfaced ${big} options (size ~${big}; may be a virtualized FLOOR — capture would raise the 40-text cap + scroll). Round 2 can capture entry.options.`
-      : (onOpenCount === 0 && maxProbe > 0 && maxProbe < 10)
-        ? `LIKELY SERVER-SEARCH / NARROW — nothing on open; broad queries returned only ${maxProbe} (server filters per-query). "All options" not cheaply capturable → keep the form-edit note.`
-        : `INCONCLUSIVE — on-open ${onOpenCount}, max broad ${maxProbe}. Re-run / try other probes.`;
-    LOG("════ VERDICT ════");
-    LOG(verdict);
-    LOG(`field left ${unchanged ? "UNCHANGED ✓ (chip still \"" + preChip + "\")" : "⚠ MODIFIED to \"" + endChip + "\" — restore Field of Study manually"}.`);
-    if (strayed) LOG("a stray committed during probing (flagged above) — verify/fix the field on the form.");
-    return { ok: true, found: true, onOpenCount, probes: results, verdict, unchanged, strayed, preChip, endChip };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("FoS option recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// TREE-vs-FLAT RECON (read-only, 0.4) — the structural discriminator probe. The AI typeahead fallback
-// must EXCLUDE tree pickers (source, Magna's certification — a chevron tree mis-tagged "typeahead") and
-// fire ONLY on flat typeaheads (Field of Study, countryPhoneCode). source is already excluded by
-// widgetType "hierarchical"; cert is the ambiguous one (identical multiselect chrome on the wrapper —
-// tree-ness is a POPUP-content property). This opens every typeahead/hierarchical field present, dumps
-// its option-row markers via cdpReadSourceState (the verbose recon reader: isCategory / hasChevron /
-// ariaExpanded / ariaLevel / role per row), and classifies TREE (any category row) vs FLAT. PURE
-// READ-ONLY: open → read → Tab-close (no type / Enter / arrow / option-click → nothing arms, no field
-// changes). Run on page 1 (source, countryPhoneCode) AND page 2 (Field of Study, certification).
-// ============================================================================
-async function runCdpTreeRecon(tabId) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-TREE-RECON]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-
-    // Collect every typeahead + hierarchical field on this page (flat + repeating entries).
-    const targets = [];
-    const ps = await cdpEval(cdpPageScan);
-    for (const f of (ps && ps.fields) || []) {
-      if (f.widgetType === "typeahead" || f.widgetType === "hierarchical")
-        targets.push({ wrapperSel: f.wrapperSel, label: f.label, fieldName: f.fieldName, widgetType: f.widgetType, where: "flat" });
-    }
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      const entries = (rscan.sections[prefix] && rscan.sections[prefix].entries) || [];
-      for (let i = 0; i < entries.length; i++) {
-        for (const f of entries[i].fields || []) {
-          if (f.widgetType === "typeahead" || f.widgetType === "hierarchical")
-            targets.push({ wrapperSel: f.wrapperSel, label: f.label, fieldName: f.fieldName, widgetType: f.widgetType, where: `${prefix}[${i}]` });
+      // Résumé re-attach (replayField defers file_upload). Required upload blocks advance → HALT if it fails.
+      if (fields.some((f) => f.widgetType === "file_upload")) {
+        const ar = await replayAttachResume(LOG);
+        if (!ar.attached) {
+          LOG(`⚠ resume NOT attached on page ${page} (${ar.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
+          return { ok: true, stopped: "resume-not-attached", resume_detail: ar.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
         }
       }
-    }
-    if (!targets.length) {
-      LOG("no typeahead/hierarchical field on this page — run on page 1 (source, countryPhoneCode) and page 2 (Field of Study, certification).");
-      return { ok: true, found: false };
+
+      const failed = results.filter((r) => r.status === "needs_review" || r.status === "error");
+      const changed = results.filter((r) => (r.status === "filled" || r.status === "filled_review") && r.flag !== "replay-already-correct").length;
+      const kept = results.filter((r) => r.flag === "replay-already-correct").length;
+      pagesReplayed.push({ page, matched_key: sel.pageKey, total: results.length, changed, kept, failed: failed.length });
+      LOG(`page ${page} replay: ${results.length} field(s) — ${changed} changed, ${kept} already-correct, ${failed.length} FAILED.`);
+
+      // ── STRICT verify: any field that did NOT replay cleanly HALTS before advancing (never a guess). ──
+      if (failed.length) {
+        LOG(`⚠ page ${page}: ${failed.length} field(s) did not replay cleanly — HALT before advancing (a value the live form no longer offers is never guessed):`);
+        failed.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`));
+        return { ok: true, stopped: "replay-mismatch", page, failed: failed.map((r) => ({ field: r.field || r.fieldName, widget: r.widgetType, status: r.status, detail: r.detail || null })), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+
+      // ── Guarded advance (clickPageNext independently refuses on the review marker — 2nd guard). ──
+      const navAfter = await cdpEval(cdpReadSessionState);
+      if (!navAfter || !navAfter.nextButtonPresent) {
+        LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
+        return { ok: true, stopped: "no-next-button", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      await cdpWakePage(); // wake a frozen hidden tab so the transition can run
+      const click = await act.clickPageNext();
+      LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
+      if (!click.clicked) {
+        LOG(`advance refused on page ${page} (${click.refused}) — stop.`);
+        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+
+      // ── Wait for the transition OR session-death OR a nav-timeout (required field empty → HALT). ──
+      const res = await cdpWaitNextPage(prevSig);
+      if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+      if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+      if (res.timeout) {
+        // CLEAN no-advance fallback first (operator ask): a swallowed Save & Continue re-clicks (up to 2x).
+        // Self-guards on error/session-death, so a real validation block still HALTS (never masked).
+        const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
+        if (reclick.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED during the re-click fallback on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+        if (reclick.advanced) { LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`); continue; }
+        // DRY replay does NOT run AI-4 remediation (fill-path only). Still stuck: a nav-timeout means a
+        // required field is empty — most likely a CASCADE-REVEALED field the approved bundle never
+        // captured → HALT for re-review (re-open the summary, approve the revealed field, re-run).
+        let diag = {};
+        try {
+          const st = await cdpEval(cdpReadSessionState);
+          const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+          if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG("    • " + s)); }
+          diag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null };
+        } catch (e) { /* ignore */ }
+        LOG(`⚠ page ${page} did NOT advance (nav-timeout${reclick.errorsPresent ? ", real error present" : ", re-click fallback exhausted"}) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
+        return { ok: true, stopped: "replay-blocked", nav_timeout_page: page, pages_replayed: pagesReplayed.length, pages: pagesReplayed, ...diag };
+      }
+      LOG(`✓ page ${page} → advanced.`);
     }
 
-    LOG(`found ${targets.length} typeahead/hierarchical field(s). READ-ONLY: open each → dump option-row markers → Tab-close. No type/Enter/click → no field changes.`);
-    const out = [];
-    for (const t of targets) {
-      const loc = { wrapperSel: t.wrapperSel };
-      const opened = t.widgetType === "hierarchical" ? await act.openSource(loc) : await act.openTypeahead(loc);
-      await act.delayFull(700); // let the portaled list render
-      const dump = await cdpEval(cdpReadSourceState, t.wrapperSel); // verbose marker dump (isCategory/hasChevron/ariaExpanded/ariaLevel/role)
-      const rows = dump ? [].concat(dump.promptOptions || [], dump.rows || []) : [];
-      const categoryRows = rows.filter((r) => r.isCategory);
-      const isTree = categoryRows.length > 0;
-      const sample = rows.slice(0, 8).map((r) => ({ label: r.label, role: r.role, automationId: r.automationId, isCategory: r.isCategory, hasChevron: r.hasChevron, ariaExpanded: r.ariaExpanded, ariaLevel: r.ariaLevel }));
-      LOG(`── ${t.where} "${t.label}" (${t.fieldName}, classified=${t.widgetType}) ──`);
-      LOG(`   opened=${opened} searchBox=${dump && dump.searchBox ? !!dump.searchBox.visible : "n/a"} rows=${rows.length} categoryRows=${categoryRows.length} → ${isTree ? "TREE ⛔" : "FLAT ✓"}`);
-      LOG(`   sample rows: ${JSON.stringify(sample)}`);
-      out.push({ where: t.where, label: t.label, fieldName: t.fieldName, widgetType: t.widgetType, opened, rowCount: rows.length, categoryRowCount: categoryRows.length, isTree, sample });
-      await act.pressTab(); // clean non-committing close (no type/Enter/arrow → nothing armed)
-      await act.delayFull(400);
-    }
-
-    LOG("════ SUMMARY ════");
-    for (const r of out) LOG(`   ${r.isTree ? "TREE ⛔" : "FLAT ✓"}  ${r.fieldName}  "${r.label}"  (rows=${r.rowCount}, categoryRows=${r.categoryRowCount})`);
-    LOG("Discriminator marker = any option row with isCategory (chevron svg / aria-expanded / role=treeitem+aria-level / aria-haspopup). EXPECTED: source + certification = TREE; fieldOfStudy + countryPhoneCode = FLAT. If a flat field rendered 0 rows on open (search-only), it is correctly FLAT (no category rows).");
-    return { ok: true, found: true, fields: out };
+    LOG(`⚠ hit the ${REPLAY_MAX_PAGES}-page cap without reaching review — stopping (detection-bug backstop). Eyeball the application.`);
+    return { ok: true, stopped: "max-pages-cap", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
   } catch (e) {
     const msg = String((e && e.message) || e);
-    LOG("tree recon aborted:", msg);
+    LOG("replay walk aborted:", msg);
     return { ok: false, error: "exception:" + msg };
   } finally {
+    await removeInputLock(); // BEFORE detach — never strand the operator behind the lock
     await cdpDetach();
   }
 }
@@ -3067,773 +2522,13 @@ async function runCdpPageRecon(tabId) {
 }
 
 // ============================================================================
-// TREE-DRILL RECON (read-mostly, Step 0 of the tree-AI milestone) — HOW does a Magna cert CATEGORY
-// expand on CDP? Open the cert tree → dump categories → CLICK category[0] (NON-committing) → re-read
-// (did its leaves appear in-place? aria-expanded flip? leaf markers/role/automationId?) → CLICK
-// category[1] (does cat[0] collapse — toggle?) → PROBE a leaf (read-only, NEVER clicked). Reuses
-// cdpReadSourceState (verbose row markers + isCategory), cdpSourceCategoryRect (category rect +
-// ariaExpandedBefore), cdpSourceLeafProbe. Tab-close; chips read on-open vs at-end to catch any
-// unintended commit. Decides the Step-1 drill substrate (act.expandCategory + readTreeRows).
-// ============================================================================
-async function runCdpTreeDrillRecon(tabId, labelRegexStr) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-TREE-DRILL]", ...a);
-  let re;
-  try { re = new RegExp(labelRegexStr || "certification", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-
-    // Locate the tree typeahead/hierarchical field by label — repeating entries first, then flat.
-    let loc = null, where = null;
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      const entries = (rscan.sections[prefix] && rscan.sections[prefix].entries) || [];
-      for (let i = 0; i < entries.length; i++) {
-        const f = entries[i].fields.find((x) => (x.widgetType === "typeahead" || x.widgetType === "hierarchical") && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
-      }
-      if (loc) break;
-    }
-    if (!loc) {
-      const ps = await cdpEval(cdpPageScan);
-      const f = (ps && ps.fields || []).find((x) => (x.widgetType === "typeahead" || x.widgetType === "hierarchical") && (re.test(x.label || "") || re.test(x.fieldName)));
-      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
-    }
-    if (!loc) { LOG(`no typeahead/hierarchical matching /${re.source}/ on this page — run on page 2 (Certification).`); return { ok: true, found: false }; }
-
-    const dump = () => cdpEval(cdpReadSourceState, loc.wrapperSel);
-    const fmt = (d) => {
-      const rows = d ? [].concat(d.promptOptions || [], d.rows || []) : [];
-      return {
-        catCount: rows.filter((r) => r.isCategory).length,
-        leafCount: rows.filter((r) => !r.isCategory).length,
-        cats: rows.filter((r) => r.isCategory).map((r) => ({ label: r.label, role: r.role, aid: r.automationId, ariaExpanded: r.ariaExpanded })),
-        leaves: rows.filter((r) => !r.isCategory).map((r) => ({ label: r.label, role: r.role, aid: r.automationId })),
-        chips: d ? d.chips : [], searchBox: d && d.searchBox ? !!d.searchBox.visible : null
-      };
-    };
-
-    const opened = await act.openTypeahead(loc);
-    await act.delayFull(800);
-    const pre = fmt(await dump());
-    LOG(`probing ${where} (${loc.wrapperSel}). opened=${opened}. READ-MOSTLY (clicks CATEGORIES to expand — non-committing; only PROBES a leaf, never clicks it).`);
-    LOG(`(1) ON OPEN: ${pre.catCount} categories, ${pre.leafCount} leaves, searchBox=${pre.searchBox}, chips=${JSON.stringify(pre.chips)}`);
-    LOG(`    categories: ${JSON.stringify(pre.cats.slice(0, 12))}`);
-    LOG(`    leaves: ${JSON.stringify(pre.leaves.slice(0, 12))}`);
-
-    const stages = [];
-    const catLabels = pre.cats.map((c) => c.label).filter(Boolean);
-    const clickCat = async (label, n) => {
-      const cr = await cdpEval(cdpSourceCategoryRect, label);
-      if (!cr || !cr.found || !cr.rect || cr.rect.w <= 0) { LOG(`(${n}) category "${label}" — rect NOT FOUND, skipping`); return; }
-      LOG(`(${n}) CLICK category "${label}" (rect ${JSON.stringify(cr.rect)}, ariaExpandedBefore=${cr.ariaExpandedBefore})`);
-      await cdpClickAt(cr.rect.cx, cr.rect.cy);
-      await act.delayFull(900);
-      const after = fmt(await dump());
-      LOG(`    AFTER: ${after.catCount} categories, ${after.leafCount} leaves (on-open had ${pre.leafCount}). chips=${JSON.stringify(after.chips)}`);
-      LOG(`    leaves now: ${JSON.stringify(after.leaves.slice(0, 20))}`);
-      LOG(`    category states now: ${JSON.stringify(after.cats.slice(0, 12))}`);
-      stages.push({ stage: "expand:" + label, leafCount: after.leafCount, leaves: after.leaves.slice(0, 40), cats: after.cats });
-    };
-    if (catLabels[0]) await clickCat(catLabels[0], 2);
-    if (catLabels[1]) await clickCat(catLabels[1], 3);
-
-    const probeLeaf = (stages[0] && stages[0].leaves[0] && stages[0].leaves[0].label) || (pre.leaves[0] && pre.leaves[0].label);
-    if (probeLeaf) { const probe = await cdpEval(cdpSourceLeafProbe, probeLeaf); LOG(`(4) PROBE leaf "${probeLeaf}" (read-only, NOT clicked): ${JSON.stringify(probe)}`); }
-    else LOG(`(4) no leaf to probe (no leaves revealed by the expands).`);
-
-    await act.pressTab();
-    await act.delayFull(400);
-    const end = fmt(await dump());
-    LOG(`════ DONE ════ chips at end=${JSON.stringify(end.chips)} (vs on-open ${JSON.stringify(pre.chips)} — should be UNCHANGED; if changed, a category click committed → restore the field). Paste this whole block.`);
-    return { ok: true, found: true, where, onOpen: pre, stages, endChips: end.chips };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("tree-drill recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// FoS OPTION CAPTURE-PROBE (read-only) — prove the FAST in-page scroll-accumulate scrape gets the
-// COMPLETE bounded option list (the Round-1 verdict was "enumerable but virtualized"). Open FoS →
-// cdpScrapeTaOptions (one in-page eval, frame-paced, <1s) → log the full list + scroll metrics →
-// stray-safe close + SETTLED unchanged-check. Read-only (the scrape only scrolls + reads).
-// ============================================================================
-async function runCdpFosCapture(tabId, labelRegexStr) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-FOS-CAPTURE]", ...a);
-  const eq = (a, b) => String(a == null ? "" : a).trim().toLowerCase() === String(b == null ? "" : b).trim().toLowerCase();
-  let re;
-  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-
-    // Locate the typeahead by label — repeating entries first, then flat (mirrors runCdpFosRecon).
-    let loc = null, where = null;
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
-        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
-      }
-      if (loc) break;
-    }
-    if (!loc) {
-      const ps = await cdpEval(cdpPageScan);
-      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
-    }
-    if (!loc) { LOG(`no typeahead matching /${re.source}/ on this page — run on page 2 (Field of Study).`); return { ok: true, found: false }; }
-
-    const ensureFocused = async () => {
-      let st = await act.readTypeahead(loc);
-      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); }
-      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
-      return await act.readTypeahead(loc);
-    };
-
-    const pre = await act.readTypeahead(loc);
-    const preChip = ((pre && pre.chips) || []).join("; ");
-    LOG(`capturing ${where} (${loc.wrapperSel}). pre-fill chip = "${preChip}". READ-ONLY scroll-scrape (in-page, fast).`);
-
-    await ensureFocused(); // open the list
-
-    const t0 = Date.now();
-    const scrape = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-    const ms = Date.now() - t0;
-    if (!scrape || !scrape.ok) { LOG("scrape failed:", JSON.stringify(scrape)); }
-    else {
-      LOG(`scraped ${scrape.count} option(s) in ${ms}ms (${scrape.steps} scroll step(s); scroller ${scrape.scrollerFound ? "found" : "NOT found"}; ` +
-        `${scrape.atBottom ? "reached bottom ✓" : "did NOT reach bottom"}${scrape.cappedOut ? " ⚠ HIT STEP CAP (likely truncated)" : ""}; ` +
-        `scrollTop ${scrape.scrollTop}/${scrape.scrollHeight}, window ${scrape.clientHeight}).`);
-      LOG("FULL option list:");
-      (scrape.options || []).forEach((o, i) => LOG(`    ${i + 1}. ${o}`));
-    }
-
-    // Stray-safe close: disarm any armed highlight (none should arm — no type/Enter/arrow) + Escape + settled re-read.
-    await ensureFocused();
-    const tD = Date.now();
-    let ds = await act.readTypeahead(loc);
-    while (ds && ds.activeText != null && Date.now() - tD < 4000) { await act.delayFull(300); ds = await act.readTypeahead(loc); }
-    await act.pressEscape(); await act.delayFull(700);
-    await act.delayFull(1300); // settle: catch a delayed stray AFTER the immediate read
-    const endChip = ((await act.readTypeahead(loc)).chips || []).join("; ");
-    const unchanged = eq(endChip, preChip);
-    LOG(`field left ${unchanged ? "UNCHANGED ✓ (chip still \"" + preChip + "\")" : "⚠ MODIFIED to \"" + endChip + "\" — restore Field of Study manually"}.`);
-    LOG(scrape && scrape.ok && scrape.atBottom && !scrape.cappedOut
-      ? "VERDICT: complete bounded list captured — Round 3 can store this as entry.options for the summary typeahead."
-      : "VERDICT: scrape INCOMPLETE (no bottom / cap hit / failed) — fix the scroll loop before integrating.");
-    return { ok: true, found: true, count: scrape ? scrape.count : 0, options: scrape ? scrape.options : [], scrape, ms, unchanged, preChip, endChip };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("FoS capture-probe aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// FoS FOCUS-RECON (read-mostly) — confirm the two page facts the keptLowerTier re-commit fix depends on:
-//   (2) cand-1 "Electrical and Computer Engineering" → Enter → empty-results DROPS searchBox focus AND ARMS
-//       listbox row-0 (the alphabetical "Accounting" — the stray source).
-//   (3) RE-FOCUSING the searchBox RESTORES focus AND DISARMS the highlight (activeText→null) — the page fact
-//       the focus-safe loop's ensureSearchFocused relies on.
-// The FIX itself does NOT poll-disarm (operator: it SETTLES then affirmatively clicks the "Other" leaf, which
-// overwrites any armed row — verified by the full-page fill + M40, not here). This recon only confirms the
-// drop is real (snap 2) and recoverable (snap 3). READ-MOSTLY: cand-1's Enter filters to 0 (no commit);
-// "Other" is NEVER typed/Enter'd; safe-close. [CDP-FOS-FOCUS].
-// ============================================================================
-async function runCdpFosFocusRecon(tabId, labelRegexStr) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-FOS-FOCUS]", ...a);
-  let re;
-  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-  const CAND1 = "Electrical and Computer Engineering"; // a higher-tier no-match → 0 options (empty-results)
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-    // Locate FoS by label — repeating entries first, then flat (mirrors runCdpFosCapture).
-    let loc = null, where = null;
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
-        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
-      }
-      if (loc) break;
-    }
-    if (!loc) {
-      const ps = await cdpEval(cdpPageScan);
-      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
-    }
-    if (!loc) { LOG(`no typeahead matching /${re.source}/ — run on My Experience (page 2, Field of Study).`); return { ok: true, found: false }; }
-
-    const activeEl = async () => {
-      try { return await cdpEval(() => { const a = document.activeElement; if (!a) return "null"; const aid = a.getAttribute && a.getAttribute("data-automation-id"); const role = a.getAttribute && a.getAttribute("role"); return a.tagName + (aid ? "#" + aid : "") + (role ? "[" + role + "]" : "") + (a === document.body ? " ←BODY" : ""); }); } catch (e) { return "?"; }
-    };
-    const snap = async (lbl) => { const s = await act.readTypeahead(loc); LOG(`${lbl}: focused=${!!(s && s.searchBox && s.searchBox.focused)} activeEl=${await activeEl()} count=${s && s.pageWide ? s.pageWide.count : "?"} highlight=${(s && s.activeText) || null} chip="${((s && s.chips) || []).join("; ")}"`); return s; };
-    const ensureFocused = async () => {
-      let st = await act.readTypeahead(loc);
-      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(400); st = await act.readTypeahead(loc); }
-      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
-      return await act.readTypeahead(loc);
-    };
-
-    const pre = await act.readTypeahead(loc);
-    LOG(`probing ${where} (${loc.wrapperSel}). pre-fill chip="${((pre && pre.chips) || []).join("; ")}". READ-MOSTLY (cand-1 Enter→0 no-commit; "Other" NEVER typed/Enter'd; re-focus disarm-probe only).`);
-    await ensureFocused(); await snap("(1) opened");
-    // cand-1: a higher-tier no-match → 0 options. DOES THE EMPTY-RESULTS DROP FOCUS?
-    await act.clearSearch(); await act.delayFull(400);
-    await act.typeInSearch(CAND1); await act.delayFull(500);
-    await act.pressEnter(); await act.delayFull(1500);
-    await snap(`(2) cand-1 "${CAND1}" → Enter → empty-results  ⟵ FOCUS DROPPED? armed highlight (the stray source)?`);
-    // (3) RE-FOCUS + DISARM-POLL (operator verify): re-focusing the searchBox should RESTORE focus AND clear
-    // the armed row-0 (activeText→null, the disarm pattern from the other recons). This is the page fact the
-    // focus-safe loop's ensureSearchFocused relies on; the fix's re-commit settles + affirmatively clicks
-    // rather than poll-disarming — this snap just confirms the drop is recoverable.
-    await act.focusSearchBox(loc); await act.delayFull(400);
-    let ds = await act.readTypeahead(loc); const t0 = Date.now();
-    while (ds && ds.activeText != null && Date.now() - t0 < 4000) { await act.delayFull(300); ds = await act.readTypeahead(loc); }
-    await snap("(3) after RE-FOCUS + disarm-poll  ⟵ focus RESTORED? highlight=null (disarmed)?");
-    // safe close: clear + Escape (NO Enter — no commit; "Other" never typed).
-    await act.clearSearch(); await act.delayFull(400); await act.pressEscape(); await act.delayFull(700);
-    const endChip = ((await act.readTypeahead(loc)).chips || []).join("; ");
-    LOG(`field left chip="${endChip}" (pre-fill was "${((pre && pre.chips) || []).join("; ")}").`);
-    return { ok: true, found: true, endChip };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("FoS focus-recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// RESULTS-BANNER RECON (read-only) — capture the exact markup of the typeahead's TWO banners so the
-// terminal-state gate (next round) can distinguish them: the RESULTS banner ("Search Results (N)" — NOT
-// currently surfaced anywhere) vs the NO-MATCH banner ("No matches found" — the existing detection). Drives
-// FoS into both states (a MATCHING query → results; a NON-matching query → no-match) and dumps every visible
-// promptTitle + banner-ish node + the option count via cdpResultsBannerScan. NEVER commits a value (clears +
-// Escape; the matching query is broad → multi-match → filters WITHOUT autocommitting). [CDP-RESULTS-BANNER].
-// ============================================================================
-async function runCdpResultsBannerRecon(tabId, labelRegexStr, matchQuery) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-RESULTS-BANNER]", ...a);
-  let re;
-  try { re = new RegExp(labelRegexStr || "field of study", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-  const MATCH = (matchQuery && matchQuery.trim()) || "a"; // a broad query → MULTI-match → the results banner (no autocommit)
-  const NOMATCH = "Zxqwbogus";                            // definitely no-match → the no-match banner
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const act = makeCdpActuation();
-    // Locate FoS by label — repeating entries first, then flat (mirrors runCdpFosFocusRecon).
-    let loc = null, where = null;
-    const rscan = await cdpEval(cdpRepeatingScan);
-    for (const prefix of (rscan ? rscan.sectionsPresent : [])) {
-      for (let i = 0; i < rscan.sections[prefix].entries.length; i++) {
-        const f = rscan.sections[prefix].entries[i].fields.find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { loc = { wrapperSel: f.wrapperSel }; where = `${prefix}[${i}] "${f.label}"`; break; }
-      }
-      if (loc) break;
-    }
-    if (!loc) {
-      const ps = await cdpEval(cdpPageScan);
-      const f = (ps && ps.fields || []).find((x) => x.widgetType === "typeahead" && (re.test(x.label || "") || re.test(x.fieldName)));
-      if (f) { loc = { wrapperSel: f.wrapperSel }; where = `flat "${f.label}"`; }
-    }
-    if (!loc) { LOG(`no typeahead matching /${re.source}/ — run on My Experience (page 2, Field of Study).`); return { ok: true, found: false }; }
-
-    const ensureFocused = async () => {
-      let st = await act.readTypeahead(loc);
-      if (!st || !st.searchBox.visible) { await act.openTypeahead(loc); await act.delayFull(600); st = await act.readTypeahead(loc); }
-      if (st && st.searchBox.visible && !st.searchBox.focused) { await act.focusSearchBox(loc); await act.delayFull(300); }
-    };
-    const dump = async (lbl) => {
-      const r = await cdpEval(cdpResultsBannerScan, loc.wrapperSel);
-      if (!r || !r.ok) { LOG(`${lbl}: scan FAILED — ${r && r.error}`); return r; }
-      LOG(`${lbl}: optionCount=${r.optionCount} sbValue=${JSON.stringify(r.searchBoxValue)} sbVisible=${r.searchBoxVisible} focused=${r.focused} chips=${JSON.stringify(r.chips)}`);
-      LOG(`    promptTitles=${JSON.stringify(r.promptTitles)}`);
-      LOG(`    bannerish=${JSON.stringify(r.bannerish)}`);
-      return r;
-    };
-
-    LOG(`probing ${where} (${loc.wrapperSel}). READ-ONLY: types "${MATCH}" (match) + "${NOMATCH}" (no-match), NEVER commits. Compare promptTitles/bannerish across (1) results vs (2) no-match to find the distinct "Search Results (N)" node.`);
-    await ensureFocused();
-    await act.delayFull(800); // let the initial list settle before the first dump
-    await dump("(0) initial (opened)");
-    // (1) MATCHING query → the RESULTS state ("Search Results (N)")
-    await act.clearSearch(); await act.delayFull(500);
-    await act.typeInSearch(MATCH); await act.delayFull(600);
-    await act.pressEnter(); await act.delayFull(2500);
-    const r1 = await dump(`(1) after MATCHING "${MATCH}" → Enter  ⟵ the RESULTS banner ("Search Results (N)")?`);
-    if (r1 && r1.ok && r1.chips && r1.chips.length) LOG(`  ⚠ a chip committed ("${r1.chips.join("; ")}") — "${MATCH}" single-exact-matched (no results banner). Re-run with a BROADER multi-match query in the input, and RESTORE Field of Study manually.`);
-    // (2) NON-matching query → the NO-MATCH state ("No matches found")
-    await ensureFocused();
-    await act.clearSearch(); await act.delayFull(500);
-    await act.typeInSearch(NOMATCH); await act.delayFull(600);
-    await act.pressEnter(); await act.delayFull(2500);
-    await dump(`(2) after NON-matching "${NOMATCH}" → Enter  ⟵ the NO-MATCH banner ("No matches found")?`);
-    // safe close: clear + Escape — NEVER commit a value.
-    await act.clearSearch(); await act.delayFull(400); await act.pressEscape(); await act.delayFull(500);
-    const endChips = ((await act.readTypeahead(loc)).chips || []);
-    LOG(`done. field left chips=${JSON.stringify(endChips)}. Compare (1) vs (2): which promptTitle/bannerish node + text carries "Search Results (N)" vs "No matches found"? Are they DISTINCT? (restore FoS manually if a chip committed.)`);
-    return { ok: true, found: true, results: r1 || null };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("results-banner recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// INPUT-LOCK RECON — resolve the 3 unknowns before building the operator input-lock
-// (block the operator's pointer/keyboard while the bot's CDP input proceeds). The bot's
-// CDP input is isTrusted through the SAME pipeline as the operator's, so "block user,
-// allow bot" is non-trivial. Probes (each restored after):
-//   (1) does a pointer-events:auto overlay INTERCEPT the bot's cdpClickAt? (static
-//       overlay viable, or must flag-gate?)
-//   (2) does a capture keydown-blocker eat cdpInsertText vs cdpTypeChars/cdpKeyTap?
-//   (3) the __apActing flag-gate: cost + the TOGGLE-TIMING self-block — clearing the
-//       flag right after the dispatch CALL returns may self-block the bot's still-
-//       propagating event (clear-after-dispatch vs clear-after-confirm). [INPUTLOCK-RECON]
-// ============================================================================
-async function runCdpInputlockRecon(tabId) {
-  const LOG = (...a) => console.log("[ApplyPilot][INPUTLOCK-RECON]", ...a);
-  const TSEL = '[data-ap-recon-target="1"]';
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) { LOG("attach FAILED —", attached.error); return { ok: false, error: "attach-failed:" + attached.error }; }
-
-    // Tag a text input as the probe target — PREFER one already in the viewport (RECON 1 picked an
-    // off-screen field at y=-4807 → clicks hit nothing → artifacts). freshTargetRect() scrollIntoViews
-    // + returns the POST-scroll center rect + an in-viewport check (mirrors the bot's cdpRectOf(sel,true));
-    // re-fresh before EVERY click so coords are always valid.
-    const tagged = await cdpEval(() => {
-      const cands = Array.from(document.querySelectorAll("input")).filter((i) => {
-        const t = (i.getAttribute("type") || "").toLowerCase();
-        const ok = t === "" || t === "text" || t === "tel" || t === "email";
-        const r = i.getBoundingClientRect();
-        return ok && r.width > 0 && r.height > 0;
-      });
-      if (!cands.length) return null;
-      const inView = cands.find((i) => { const r = i.getBoundingClientRect(); return r.top >= 0 && r.bottom <= window.innerHeight; });
-      const el = inView || cands[0];
-      el.setAttribute("data-ap-recon-target", "1");
-      return { id: el.getAttribute("data-automation-id") || el.name || "(input)" };
-    });
-    if (!tagged) { LOG("no visible text input on this page to probe — run on a form page."); return { ok: true, no_target: true }; }
-    const freshTargetRect = async () => cdpEval((sel) => {
-      const el = document.querySelector(sel); if (!el) return null;
-      if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
-      const r = el.getBoundingClientRect();
-      const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
-      return { cx, cy, inViewport: cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight };
-    }, TSEL);
-    const tr0 = await freshTargetRect();
-    LOG(`probe target: ${tagged.id} @ (${tr0 && tr0.cx},${tr0 && tr0.cy}) inViewport=${tr0 && tr0.inViewport}.`);
-
-    // ── (1) Overlay vs CDP coordinate click ──
-    const r1 = await freshTargetRect();
-    if (r1 && r1.inViewport) {
-      await cdpEval(() => {
-        const o = document.createElement("div");
-        o.id = "__ap_ovl"; o.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.02);pointer-events:auto;";
-        window.__ap_ovl_hit = false;
-        o.addEventListener("mousedown", () => { window.__ap_ovl_hit = true; }, true);
-        o.addEventListener("click", () => { window.__ap_ovl_hit = true; }, true);
-        document.body.appendChild(o);
-        const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) t.blur();
-      });
-      await cdpClickAt(r1.cx, r1.cy); await cdpDelay(200);
-      const p1 = await cdpEval((sel) => ({ overlayHit: !!window.__ap_ovl_hit, targetFocused: document.activeElement === document.querySelector(sel) }), TSEL);
-      await cdpEval(() => { const o = document.getElementById("__ap_ovl"); if (o) o.remove(); });
-      var overlayBlocks = p1.overlayHit;
-      LOG(`(1) pointer-events:auto overlay + cdpClickAt @ (${r1.cx},${r1.cy}) → overlayHit=${p1.overlayHit}, targetFocused=${p1.targetFocused} ⇒ ${p1.overlayHit ? "a STATIC overlay BLOCKS the bot's own click → must FLAG-GATE/toggle." : (p1.targetFocused ? "overlay did NOT intercept the CDP click (target focused THROUGH it) → a static overlay may suffice." : "neither hit — re-run (click may not have landed).")}`);
-    } else { LOG(`(1) SKIPPED — target not in viewport after scroll (${r1 && r1.cx},${r1 && r1.cy}).`); }
-
-    // ── (2) Capture keydown-blocker vs insertText / per-char keys (no coords — focus()+keys) ──
-    await cdpEval(() => {
-      window.__ap_kd = 0;
-      window.__ap_kdh = (e) => { window.__ap_kd++; e.preventDefault(); e.stopPropagation(); };
-      document.addEventListener("keydown", window.__ap_kdh, true);
-      const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) { t.focus(); t.value = ""; }
-    });
-    await cdpInsertText("AP"); await cdpDelay(120);
-    await cdpTypeChars("XY", 40); await cdpDelay(120);
-    const p2 = await cdpEval((sel) => { const t = document.querySelector(sel); const v = t ? t.value : null; document.removeEventListener("keydown", window.__ap_kdh, true); if (t) t.value = ""; return { value: v, kd: window.__ap_kd }; }, TSEL);
-    LOG(`(2) capture keydown-blocker ON → cdpInsertText "AP" + cdpTypeChars "XY" → field="${p2.value}" (keydowns blocked: ${p2.kd}) ⇒ insertText ${(p2.value || "").includes("AP") ? "BYPASSES keydown (lands)" : "BLOCKED"}; per-char keys ${(p2.value || "").includes("X") ? "land" : "BLOCKED by the keydown handler"}.`);
-
-    // ── (3) __apActing flag-gate: COST + TOGGLE-TIMING self-block, with a CONTROL ──
-    const t0 = Date.now(); for (let i = 0; i < 10; i++) await cdpEval(() => 1);
-    const perEval = (Date.now() - t0) / 10;
-    LOG(`(3a) cdpEval round-trip ≈ ${perEval.toFixed(1)}ms each (a per-primitive toggle = ~2 of these).`);
-    await cdpEval(() => {
-      window.__apActing = false; window.__ap_gblk = 0;
-      window.__ap_g = (e) => { if (!window.__apActing) { window.__ap_gblk++; e.preventDefault(); e.stopPropagation(); } };
-      ["mousedown", "click", "keydown"].forEach((t) => document.addEventListener(t, window.__ap_g, true));
-    });
-    // gatedClick: re-fresh the rect (re-scroll) → flag true → click → clear per `mode` → read.
-    // mode "control": NEVER clear (flag true throughout) → the click MUST land if the mechanism works
-    // (so a "self-blocked" in A/B is REAL, not a click-that-never-landed artifact — the hold).
-    const gatedClick = async (mode) => {
-      const r = await freshTargetRect();
-      if (!r || !r.inViewport) return { skipped: true };
-      await cdpEval(() => { window.__apActing = true; window.__ap_gblk = 0; const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) t.blur(); });
-      await cdpClickAt(r.cx, r.cy);
-      if (mode === "dispatch") { await cdpEval(() => { window.__apActing = false; }); await cdpDelay(250); }
-      else if (mode === "settle") { await cdpDelay(250); await cdpEval(() => { window.__apActing = false; }); }
-      else { await cdpDelay(250); } // control: leave the flag true
-      const s = await cdpEval((sel) => ({ focused: document.activeElement === document.querySelector(sel), blocked: window.__ap_gblk }), TSEL);
-      await cdpEval(() => { window.__apActing = false; }); // reset for the next sub-probe
-      return s;
-    };
-    const ctl = await gatedClick("control");
-    const vA = await gatedClick("dispatch");
-    const vB = await gatedClick("settle");
-    await cdpEval(() => { ["mousedown", "click", "keydown"].forEach((t) => document.removeEventListener(t, window.__ap_g, true)); });
-    const controlLanded = !ctl.skipped && ctl.focused;
-    if (!controlLanded) {
-      LOG(`(3b) CONTROL (flag true throughout) → ${ctl.skipped ? "SKIPPED (target not in viewport)" : "click did NOT land (blocked=" + ctl.blocked + ")"} ⇒ the click mechanism isn't landing → probe 3 INCONCLUSIVE (artifact). Re-run on a page where the target stays in view.`);
-    } else {
-      LOG(`(3b) CONTROL landed (the blocker genuinely has a bot event to gate). TOGGLE-TIMING: clear-after-dispatch → ${vA.focused ? "LANDED" : "SELF-BLOCKED (blocked=" + vA.blocked + ")"}; clear-after-settle → ${vB.focused ? "LANDED" : "SELF-BLOCKED (blocked=" + vB.blocked + ")"}. ⇒ ` +
-        ((!vA.focused && vB.focused) ? "MUST clear-after-CONFIRM — clear-after-dispatch SELF-BLOCKS (the inverse race is REAL)."
-          : (vA.focused && vB.focused) ? "clear-after-dispatch is SAFE (dispatch resolves after propagation)."
-            : (!vA.focused && !vB.focused) ? "BOTH self-block despite the control landing → the flag clears too early both ways; clear only on a read-back CONFIRMATION (focus/value changed)."
-              : "A landed but B didn't — unexpected; re-run."));
-    }
-
-    await cdpEval(() => { const t = document.querySelector('[data-ap-recon-target="1"]'); if (t) t.removeAttribute("data-ap-recon-target"); });
-    LOG("done. (No overlay/listener left; the probe typed into + cleared the target.)");
-    return { ok: true, overlay_blocks_bot: typeof overlayBlocks === "undefined" ? null : overlayBlocks, insertText_value: p2.value, keydowns_blocked: p2.kd, ms_per_eval: perEval, control_landed: controlLanded, clear_after_dispatch_lands: vA.focused, clear_after_settle_lands: vB.focused };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("input-lock recon aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP FILL WEBSITES (M32b) — the FIRST repeating-section fill on the CDP path.
-// Prove driveRepeatingSectionCdp on the date-free Websites section (one url text
-// field per entry): attach → hidden-gate → reconcile to N + fill each entry's url →
-// NEEDS-REVIEW-first report → detach in finally. Dates are deferred (recon: CDP
-// can't actuate spinbuttons); Websites has none. Other sections follow in later
-// rounds reusing the same driver. Standalone — RUN_FILL/RUN_CDP_FILL untouched.
-// ============================================================================
-async function runCdpFillWebsites(tabId, profile) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-WEB]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    const prepared = prepareProfile(profile);
-    const items = Array.isArray(prepared.websites) ? prepared.websites : [];
-    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful website(s).`);
-
-    const act = makeCdpActuation();
-    const out = await driveRepeatingSectionCdp(act, {
-      name: "website", headingRegex: "websites?|web ?address", containerPrefix: "webAddress-",
-      items, fieldMap: WEBSITE_MAP, deleteOnNoMatch: false
-    }, DEFAULT_BUDGETS);
-
-    LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, flag: r.flag, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("websites fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP FILL LANGUAGES (M35) — reuse driveRepeatingSectionCdp for the date-free Languages
-// section: language dropdown + 3 proficiency dropdowns resolved BY LABEL (hashed ids,
-// IDENTICAL across entries → resolution stays entry-scoped) + the "I am fluent" checkbox.
-// deleteOnNoMatch:true (a required pick that can't match blocks Next → delete the entry).
-// FIRST live exercise of the labelRegex/hashed-id resolve path. [CDP-LANG] in the SW console.
-// ============================================================================
-async function runCdpFillLanguages(tabId, profile) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-LANG]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    const prepared = prepareProfile(profile);
-    const items = Array.isArray(prepared.languages) ? prepared.languages : [];
-    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful language(s).`);
-
-    const act = makeCdpActuation();
-    const out = await driveRepeatingSectionCdp(act, {
-      name: "language", headingRegex: "languages?", containerPrefix: "language-",
-      items, fieldMap: LANGUAGE_MAP, deleteOnNoMatch: true
-    }, DEFAULT_BUDGETS);
-
-    LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, flag: r.flag, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("languages fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP FILL WORK EXPERIENCE (M37 Part 1) — the bespoke section via the SAME
-// driveRepeatingSectionCdp. WORK_EXPERIENCE_MAP fills jobTitle/companyName/location
-// (text), currentlyWorkHere FIRST (checkbox — controls the To box), from/to M/Y dates,
-// and roleDescription (<textarea> ← bulletsText, recon 2026-06-18). endDate is skipWhen
-// currently_work_here + waitForPresence (remount poll, never a fixed wait). deleteOnNoMatch
-// OFF (WE flags, never deletes). Run on My Experience (page 2). [CDP-WE] in the SW console.
-// ============================================================================
-async function runCdpFillWorkExperience(tabId, profile) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-WE]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    const prepared = prepareProfile(profile);
-    const items = Array.isArray(prepared.work_experience) ? prepared.work_experience : [];
-    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful entr(y/ies).`);
-
-    const act = makeCdpActuation();
-    const out = await driveRepeatingSectionCdp(act, {
-      name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
-      items, fieldMap: WORK_EXPERIENCE_MAP, deleteOnNoMatch: false
-    }, DEFAULT_BUDGETS);
-
-    LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, flag: r.flag, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("work-experience fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP FILL EDUCATION (M36) — reuse driveRepeatingSectionCdp for the Education section:
-// schoolName text / degree dropdown (tiered) / fieldOfStudy typeahead / gradeAverage→gpa text /
-// from+to YEAR dates (the M34 composite, now un-deferred via fillEntryCdp). NOT deleteOnNoMatch
-// (flag for review, never delete). The clean dates-in-section proof (year dates, entry survives).
-// [CDP-EDU] in the SW console. Detaches in finally.
-// ============================================================================
-async function runCdpFillEducation(tabId, profile) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-EDU]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    const prepared = prepareProfile(profile);
-    const items = Array.isArray(prepared.education) ? prepared.education : [];
-    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful entr(y/ies).`);
-
-    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
-    LOG("AI typeahead fallback:", act.aiEnabled ? "ON (a Field-of-Study no-match → LLM picks from the scraped list, INLINE on the open field)" : "OFF (enable the AI toggle + set a provider/model/key in the popup to test the FoS rescue)");
-    // Option B: the AI rescue is now INLINE (inside fillTypeaheadCdp, on the open field at no-match) — driven
-    // by section.aiContext. driveRepeatingSectionCdp's finalize() runs AFTER the inline AI, so out.needsReview
-    // / out.counts already reflect the rescued recs (no separate end-of-page pass / recompute).
-    const out = await driveRepeatingSectionCdp(act, {
-      name: "education", headingRegex: "education", containerPrefix: "education-",
-      items, fieldMap: EDUCATION_MAP, deleteOnNoMatch: false,
-      aiContext: { profile: prepared, jobContext: {} }
-    }, DEFAULT_BUDGETS);
-
-    LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, flag: r.flag, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("education fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// CDP FILL CERTIFICATIONS (M36) — reuse driveRepeatingSectionCdp for the Certifications
-// section: certification typeahead (required) / certificationNumber text / issued+expiration
-// M/D/Y dates (the M34 composite, un-deferred). deleteOnNoMatch:true (optional pick section).
-// The M/D/Y-in-section proof (3-segment auto-advance) — needs a MATCHING cert name to render.
-// [CDP-CERT] in the SW console. Detaches in finally.
-// ============================================================================
-async function runCdpFillCertifications(tabId, profile) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-CERT]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    const prepared = prepareProfile(profile);
-    const items = Array.isArray(prepared.certifications) ? prepared.certifications : [];
-    LOG(`attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2). ${items.length} meaningful cert(s).`);
-
-    const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
-    LOG("AI cert tree fallback:", act.aiEnabled ? "ON (a certification no-match → two-prompt category→leaf TREE drill, INLINE on the open field)" : "OFF (enable the AI toggle + set a provider/model/key in the popup to test the cert tree drill)");
-    const out = await driveRepeatingSectionCdp(act, {
-      name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
-      items, fieldMap: CERTIFICATION_MAP, deleteOnNoMatch: true,
-      aiContext: { profile: prepared, jobContext: {} }
-    }, DEFAULT_BUDGETS);
-
-    LOG("page:", out.url);
-    LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
-    for (const r of out.needsReview) {
-      LOG(`  ⚠ [${r.status}] ${r.fieldName} (${r.widgetType}) — "${r.label}" → ${r.detail}${r.after ? ` | currently: "${r.after}"` : ""}`);
-    }
-    console.table(out.results.map((r) => ({
-      field: r.fieldName, type: r.widgetType, status: r.status, after: r.after,
-      verified: r.verified, flag: r.flag, detail: r.detail
-    })));
-    LOG("counts:", JSON.stringify(out.counts));
-    return { ok: true, counts: out.counts, needs_review: out.needsReview.length };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("certifications fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
-// TARGETED DATE FILL (M34 verify harness) — fill ONE date composite located by
-// label regex (entry-scoped) via fillDateCompositeCdp HIDDEN, to prove the date
-// handler on all three shapes (WE M/Y, Education year-only, Certs M/D/Y) BEFORE
-// wiring dates into the section fill (M35). Values come from prepareProfile's
-// parsed annotations (NOT FIELD_MAP — that's the flat-page contract). The result's
-// `detail` shows the per-segment focusRung/inputMethod (esp. the standalone year).
-// [CDP-DATE] in the SW console. Detaches in finally.
-// ============================================================================
-const DATE_ENTRY_VALUES = {
-  startDate: (p) => p && p.work_experience && p.work_experience[0] ? p.work_experience[0].fromParsed : undefined,
-  endDate: (p) => p && p.work_experience && p.work_experience[0] ? p.work_experience[0].toParsed : undefined,
-  firstYearAttended: (p) => p && p.education && p.education[0] ? p.education[0].fromYearParsed : undefined,
-  lastYearAttended: (p) => p && p.education && p.education[0] ? p.education[0].toYearParsed : undefined,
-  issuedDate: (p) => p && p.certifications && p.certifications[0] ? p.certifications[0].issuedDateParsed : undefined,
-  expirationDate: (p) => p && p.certifications && p.certifications[0] ? p.certifications[0].expirationDateParsed : undefined
-};
-
-async function runCdpFillDate(tabId, profile, labelRegexStr) {
-  const LOG = (...a) => console.log("[ApplyPilot][CDP-DATE]", ...a);
-  try {
-    const attached = await cdpAttach(tabId);
-    if (!attached.ok) {
-      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
-      return { ok: false, error: "attach-failed:" + attached.error };
-    }
-    LOG("attached. Filling NOW — keep the tab VISIBLE for a fast fill (watch it) or MINIMIZE for slow/background; it adapts live (M39). Run on My Experience (page 2).");
-    let re;
-    try { re = new RegExp(labelRegexStr || ".", "i"); } catch (e) { LOG("bad label regex:", JSON.stringify(labelRegexStr)); return { ok: false, error: "bad-regex" }; }
-
-    const scan = await cdpEval(cdpRepeatingScan);
-    let target = null;
-    for (const prefix of (scan ? scan.sectionsPresent : [])) {
-      for (const e of scan.sections[prefix].entries) {
-        const f = e.fields.find((x) => x.dateSegments.length > 0 && (re.test(x.label || "") || re.test(x.fieldName)));
-        if (f) { target = { prefix, field: f }; break; }
-      }
-      if (target) break;
-    }
-    if (!target) {
-      LOG("no date field matching", JSON.stringify(labelRegexStr), "— date fields on this page:",
-        JSON.stringify((scan ? scan.sectionsPresent : []).flatMap((p) => scan.sections[p].entries.flatMap((e) => e.fields.filter((f) => f.dateSegments.length > 0).map((f) => ({ field: f.fieldName, label: f.label }))))));
-      return { ok: false, error: "no-match" };
-    }
-    LOG("target:", target.field.fieldName, "—", JSON.stringify(target.field.label), "| sel:", target.field.wrapperSel);
-
-    const prepared = prepareProfile(profile);
-    const getter = DATE_ENTRY_VALUES[target.field.fieldName];
-    const parsed = getter ? getter(prepared) : undefined;
-    if (!parsed) {
-      LOG("no parsed date value for", target.field.fieldName, "— check the profile (work_experience/education/certifications entry 0).");
-      return { ok: false, error: "no-value" };
-    }
-    LOG("value (parsed):", JSON.stringify(parsed));
-    LOG("date fill starting. (visible = fast; minimized = slow/background, adapts live.)");
-
-    const act = makeCdpActuation();
-    const rec = await fillDateCompositeCdp(act, { wrapperSel: target.field.wrapperSel }, parsed, DEFAULT_BUDGETS);
-    LOG("result:", JSON.stringify({ field: target.field.fieldName, status: rec.status, after: rec.after, verified: rec.verified, detail: rec.detail }, null, 2));
-    return { ok: true, status: rec.status, after: rec.after || null, verified: rec.verified === true };
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    LOG("date fill aborted:", msg);
-    return { ok: false, error: "exception:" + msg };
-  } finally {
-    await cdpDetach();
-  }
-}
-
-// ============================================================================
 // CDP WALK (M38 Part 3) — the N-PAGE LOOP. Generalizes the M31 ONE-transition walk:
 // for each page, fold-fill + audit + accumulate (fillAndPersistPage) → GUARDED Save &
 // Continue → wait for the transition (or session-death) → repeat, until the REVIEW
 // page (STOP — never submit), a terminal page, session death, a nav-timeout, or the
-// MAX_PAGES cap. The CDP attach SURVIVES navigation (only Runtime+DOM enabled, no Page
-// domain) — no re-injection; we re-read via cdpEval on the same attach. Detaches in
+// MAX_PAGES cap. The CDP attach SURVIVES navigation — no re-injection; we re-read via
+// cdpEval on the same attach (Page is now enabled only for the hidden-tab rAF override
+// installer — cdpInstallPageOverrides — which does not affect nav survival). Detaches in
 // finally. SUBMIT-NEVER (double guard, reused verbatim from M31): the review terminal
 // is checked at the TOP of each iteration BEFORE any fill/click, AND clickPageNext
 // refuses on the review marker. Review-page reached = SUCCESS (walked the whole app).
@@ -3846,6 +2541,33 @@ function cdpPageSig(scan) {
   return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
 }
 
+// A CLEAN no-advance fallback (operator ask, 2026-07-10, Magna page 1): Save & Continue registered
+// (clicked:true) but the page neither advanced nor showed a validation error — a SWALLOWED / no-op click
+// (a Workday debounce/timing miss). Re-click Save & Continue up to `tries` more times, re-waiting each
+// time. SAFETY: it re-clicks ONLY when the page is CLEAN — no error markers, not session-dead, not
+// already at review — so a real validation error is NEVER masked by a blind re-click (a real block
+// halts, as before). Used by BOTH walks after their normal timeout handling, before the give-up halt.
+async function reclickNextWhenClean(act, prevSig, tries, LOG) {
+  for (let i = 1; i <= tries; i++) {
+    let st = null;
+    try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* not-ready → treat as no-error, try the click */ }
+    if (st && st.applyFlowReviewPresent) return { advanced: true, reachedReview: true };  // it DID reach review
+    if (st && sessionLooksDead(st)) return { advanced: false, sessionDead: true, state: st };
+    const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
+    if (samples.length || (st && st.errorPageText)) { LOG(`  re-click fallback: error text present — NOT re-clicking (a real validation block, not a swallowed click).`); return { advanced: false, errorsPresent: true }; }
+    LOG(`  re-click fallback ${i}/${tries}: clicked but no advance + no error/session-death — re-clicking Save & Continue.`);
+    await cdpWakePage();
+    const click = await act.clickPageNext();
+    if (!click.clicked) { LOG(`  re-click refused (${click.refused || "?"}) — stopping the fallback.`); return { advanced: false, refused: click.refused }; }
+    const res = await cdpWaitNextPage(prevSig);
+    if (res.advanced) return { advanced: true, attempts: i };
+    if (res.sessionDead) return { advanced: false, sessionDead: true, state: res.state };
+    if (res.maintenance) return { advanced: false, maintenance: true };
+    // still timeout → loop and try again
+  }
+  return { advanced: false, attempts: tries };
+}
+
 // Poll SW-side after Save & Continue: a fresh dead-session read FIRST (a dead session
 // shows VPS banners on the SAME page — no transition — so sessionLooksDead is what
 // fires), else a hydrated page-signature change (steady across two reads). Mid-nav
@@ -3855,6 +2577,9 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
   let steady = -1, errSteady = 0;
   while (Date.now() - start < timeoutMs) {
     await cdpDelay(intervalMs);
+    // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
+    // hidden page-2→3 stall (2026-07-03). No-op when visible/not-frozen. See cdpWakePage.
+    await cdpWakePage();
     let state = null;
     try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
     if (state && isWorkdayMaintenance(state)) return { advanced: false, maintenance: true, state }; // transient, retry-later — NOT dead (checked first)
@@ -3870,7 +2595,10 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
       // can't skip a real advance (a successful re-fill clears the errors AND changes sig → the
       // advanced path below fires instead). Two consecutive reads guard a transient flicker during a
       // real transition → ~1s instead of burning the full ceiling. sessionLooksDead is checked first.
-      const errCount = (state && state.errorMarkers && state.errorMarkers.count) || 0;
+      // Count EXPANDED errors, not raw markers: the raw count includes [role=alert] SUCCESS toasts
+      // ("resume successfully uploaded"), which persist through a slow clean transition — a toast-only
+      // page must never fast-exit as a validation error (2026-07-02).
+      const errCount = state ? expandErrorSamples((state.errorMarkers && state.errorMarkers.samples) || []).length : 0;
       errSteady = errCount > 0 ? errSteady + 1 : 0;
       if (errSteady >= 2) return { advanced: false, timeout: true, errorDetected: true, errors: (state.errorMarkers.samples || []) };
       continue;
@@ -3893,10 +2621,22 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   const reportPageErrors = async (pageOut) => {
     let st = null;
     try { st = await cdpEval(cdpReadSessionState); } catch (e) { /* ignore */ }
-    const samples = (st && st.errorMarkers && st.errorMarkers.samples) || [];
+    // expanded: the top banner concatenates every error into one element — split so each
+    // error is its own bullet (and success toasts don't masquerade as errors).
+    const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
     if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
     if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
     if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
+    // Hidden-tab hint: when the page won't advance AND the tab is really hidden AND there's no error
+    // text, the likely cause is Chrome freezing/throttling the background tab so Workday's SPA
+    // transition stalls (advances fine when visible). The rAF-override fix (cdpInstallPageOverrides)
+    // aims to unblock this while hidden; if we STILL land here, that override was insufficient — bring
+    // the tab to the FOREGROUND as a fallback and re-run. Reads REAL visibility (SW-side), not the
+    // page's (possibly-spoofed) document.visibilityState.
+    let _visLabel = "?"; try { _visLabel = await cdpVisibilityLabel(); } catch (e) { /* ignore */ }
+    if (_visLabel === "hidden" && !samples.length && !(st && st.errorPageText)) {
+      LOG("⚠ the tab is HIDDEN and the page shows no errors but won't advance — the rAF-override fix did not unblock the transition this time. Bring the tab to the FOREGROUND (visible) and re-run; the fill itself works hidden, but page-to-page advancement may still need a visible tab as a fallback.");
+    }
     const empties = (pageOut && pageOut.results || []).filter((r) => r.status === "skipped");
     if (empties.length) {
       LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
@@ -3908,10 +2648,11 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so page-to-page advancement runs while backgrounded
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
-    LOG("PREREQ: clear any recon-mounted orphan cert Specialties first — an empty REQUIRED specialty blocks Save & Continue (a false nav-timeout halt at the cert page).");
+    LOG("note: orphan EMPTY cert Specialties are auto-reconciled during the cert fill (deleted when the profile has none) — no manual pre-clean needed; a blocked page also gets an AI-4 Tier-1.5 section re-fill.");
 
     // CLEAR the accumulated summary ONCE at walk START, OUTSIDE the loop (its own guard):
     // a fresh application starts clean. The loop only calls the ACCUMULATING persist — a
@@ -3945,7 +2686,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG);
+      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length });
 
       // ── (c.1) Required-upload guard (walk prereq 1, hold #1): a file_upload that didn't
@@ -3968,11 +2709,13 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──
+      await cdpWakePage(); // wake a frozen hidden tab so the Save & Continue transition can run (hidden page-N→N+1 stall)
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
       if (!click.clicked) {
-        LOG(`advance refused on page ${page} (${click.refused}) — stop.`);
-        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), pages_filled: pagesFilled.length, pages: pagesFilled };
+        const blockNote = click.blockedBy ? ` — a popup/overlay is COVERING the button: ${click.blockedBy}. Close it, then re-run.` : "";
+        LOG(`advance refused on page ${page} (${click.refused})${blockNote} — stop.`);
+        return { ok: true, stopped: "click-refused:" + (click.refused || "?"), blocked_by: click.blockedBy || null, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
 
       // ── (f) Wait for the transition OR session-death OR a nav-timeout (dirty halt). ──
@@ -4003,7 +2746,21 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after AI-4 remediation (${rem.attempts} attempt(s)).`);
           continue; // top-of-loop re-checks review/session on the new page
         }
-        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        // Operator ask (2026-07-10): a CLEAN no-advance (clicked:true but the page didn't move AND AI-4
+        // found NO error to fix) is a SWALLOWED Save & Continue → RE-CLICK it (up to 2x). Runs only after
+        // remediation confirmed there's nothing to remediate; reclickNextWhenClean self-guards on
+        // error/session-death, so a real validation block is never masked (it halts as before).
+        const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
+        if (reclick.sessionDead) {
+          LOG(`⚠⚠ SESSION EXPIRED during the re-click fallback on page ${page} — refresh, log in, reopen, retry.`);
+          const diag = await reportPageErrors(out);
+          return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+        }
+        if (reclick.advanced) {
+          LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
+          continue;
+        }
+        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
@@ -4019,6 +2776,457 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     return { ok: false, error: "exception:" + msg };
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — never strand the operator behind the lock
+    await cdpDetach();
+  }
+}
+
+// ============================================================================
+// GMAIL SMOKE TEST — the FIRST thing to run after pinning the key + creating the
+// OAuth client (the operator's build-order step): prove chrome.identity.getAuthToken
+// returns a gmail.readonly token AND a users/me/profile readonly call succeeds, BEFORE
+// wiring it into the onboarding flow. Shows the CONNECTED account email so the operator
+// confirms it's the inbox their Workday +alias delivers to. Client-side only — the token
+// and the profile response never leave the extension. [GMAIL-TEST] in the SW console.
+// ============================================================================
+async function runGmailSmokeTest(interactive) {
+  const LOG = (...a) => console.log("[ApplyPilot][GMAIL-TEST]", ...a);
+  let tok = await gmailGetToken(interactive !== false);
+  if (!tok.ok) { LOG("getAuthToken FAILED —", tok.error, "(manifest oauth2.client_id set to your Chrome-Extension OAuth client? identity permission present? extension ID matches the client?)"); return { ok: false, error: tok.error }; }
+  LOG("got a gmail.readonly token — calling users/me/profile (readonly)…");
+  let prof = await gmailApiGet(tok.token, "/profile");
+  if (!prof.ok && (prof.status === 401 || prof.status === 403)) {
+    LOG("profile call 401/403 — refreshing the token once and retrying.");
+    await gmailRemoveCachedToken(tok.token);
+    tok = await gmailGetToken(true);
+    if (tok.ok) prof = await gmailApiGet(tok.token, "/profile");
+  }
+  if (!prof.ok) { LOG("profile call FAILED —", prof.error); return { ok: false, error: prof.error }; }
+  LOG(`✓ connected to Gmail: ${prof.data.emailAddress} (messagesTotal ${prof.data.messagesTotal}). Readonly access confirmed.`);
+  return { ok: true, email: prof.data.emailAddress, messagesTotal: prof.data.messagesTotal };
+}
+
+// ============================================================================
+// ONBOARDING STAGE (the pre-form walk) — JD page → Apply → Apply Manually →
+// sign-in / create-account → email verification (Gmail) → land on the form. Port of
+// the Playwright repo's workday.py (navigate_to_first_form_page → handle_application_modal
+// → handle_auth_screen → _handle_email_verification), on the CDP substrate, hardened.
+//
+// Substrate: drives the ACTIVE tab via the cdp.js primitives (same "SW drives, page
+// returns" discipline as the walk). Detaches in finally. The FILL WALK is a SEPARATE
+// attach (chained by the RUN_CDP_ONBOARD handler only if the operator opts in) — so
+// this stage lands on the form and STOPS there by default (conservative: the fill walk
+// ADVANCES a live application). No input-lock here — a takeover halt (SSO/2FA/CAPTCHA)
+// must leave the operator free to act.
+//
+// SAFETY: never submits an application; never clicks "Use My Last Application" / any
+// affirmative consent-popup control; refuses SSO (halts for manual login). Every halt
+// that needs a human returns needs_operator with a self-explaining reason.
+// ============================================================================
+async function runCdpOnboard(tabId, opts) {
+  const LOG = (...a) => console.log("[ApplyPilot][ONBOARD]", ...a);
+  const o = opts || {};
+  const creds = o.credentials || null;
+  const gmailEnabled = !!o.gmailEnabled;
+  const startUrl = o.startUrl || null;
+  let accountCreated = false, verified = false, softReloads = 0;
+
+  // Adaptive pacing — mirrors the fill's act.delay: ~10× faster when the tab is VISIBLE (or its
+  // worker-timers measure fast), FULL (throttle-safe) when hidden/backgrounded. Used for ALL
+  // click/type/transition pacing here, so an onboarding run is snappy in the foreground yet safe
+  // hidden (a throttled tab never gets raced). The ONE genuine server-commit wait — the 5s
+  // post-activation settle — stays a fixed cdpDelay (it must be real wall-clock regardless of
+  // visibility). Every pace() site is gated by a subsequent state check (read-back / poll / scan),
+  // so a too-short fast wait can only cost a retry, never a silent wrong action.
+  const pace = (ms) => cdpAdaptiveDelay(ms);
+
+  const scan = async () => { try { return await cdpEval(cdpOnboardScan); } catch (e) { return null; } };
+  const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
+  const presentApply = (s) => {
+    const out = [];
+    if (s.markers.adventureButton) out.push('[data-automation-id="adventureButton"]');
+    if (s.markers.continueButton) out.push('[data-automation-id="continueButton"]');
+    if (s.markers.applyManually) out.push('[data-automation-id="applyManually"]');
+    return out;
+  };
+
+  // Wait for the DOM to settle after a navigation/reload (readyState complete + a small
+  // React-hydration beat). Poll-based; mid-nav eval errors are "keep polling".
+  const settlePage = async (timeoutMs) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await pace(400);
+      await cdpWakePage();
+      let ready = null;
+      try { ready = await cdpEval(() => document.readyState); } catch (e) { continue; }
+      if (ready === "complete") { await pace(700); return true; }
+    }
+    return false;
+  };
+
+  // Workday's transient "Something went wrong / please refresh" soft-error → reload ONCE
+  // (capped at 2 across the run) and re-scan. Returns true if it reloaded (caller re-scans).
+  const maybeRefresh = async (st) => {
+    if (!st || !isWorkdaySoftError(st.bodyText)) return false;
+    if (softReloads >= 2) { LOG(`⚠ Workday soft-error persists after ${softReloads} reload(s) — not reloading again.`); return false; }
+    softReloads++;
+    LOG(`Workday soft-error ("Something went wrong / please refresh") — reloading the page (reload #${softReloads}) and retrying.`);
+    await cdpReload();
+    await settlePage(9000);
+    return true;
+  };
+
+  // Poll scan() until pred(scan) is true or a timeout; runs the soft-error reload guard
+  // each tick. Returns { matched, scan }.
+  const waitFor = async (pred, timeoutMs, label) => {
+    const start = Date.now();
+    let st = null;
+    while (Date.now() - start < timeoutMs) {
+      await pace(500);
+      await cdpWakePage();
+      st = await scan();
+      if (!st) continue;
+      if (await maybeRefresh(st)) { st = await scan(); if (!st) continue; }
+      if (pred(st)) return { matched: true, scan: st };
+    }
+    LOG(`waitFor(${label}) timed out after ${timeoutMs}ms`);
+    return { matched: false, scan: st };
+  };
+
+  // Click the first present selector, auto-dismissing a covering popup ONCE (consent-safe,
+  // shadow-DOM aware — reuses the clickPageNext machinery). { clicked, sel } / { clicked:false, blockedBy }.
+  const clickTarget = async (selectors, label) => {
+    for (const sel of selectors) {
+      const rect = await cdpRectReady(sel, true);
+      if (!rect) continue;
+      let cover = await cdpEval(cdpCoverCheck, sel, rect.cx, rect.cy);
+      if (cover && cover.blocked) {
+        const d = await cdpEval(cdpFindDismissControl, rect.cx, rect.cy);
+        if (d && d.found) {
+          LOG(`"${label}" covered by ${cover.by} — clicking its dismiss control ${JSON.stringify(d.label)}.`);
+          await cdpClickAt(d.cx, d.cy);
+          await pace(800);
+          cover = await cdpEval(cdpCoverCheck, sel, rect.cx, rect.cy);
+        }
+      }
+      if (cover && cover.blocked) { LOG(`"${label}" is covered by ${cover.by} — refusing a blind click.`); return { clicked: false, blockedBy: cover.by, sel }; }
+      await cdpClickAt(rect.cx, rect.cy);
+      LOG(`clicked "${label}".`);
+      return { clicked: true, sel };
+    }
+    return { clicked: false };
+  };
+
+  // Focus → clear → insertText → read-back a text/email/password input by the first
+  // matching selector. Trusted CDP path (survives blur), same technique as the fill's focusText.
+  const fillField = async (selectors, value, label) => {
+    for (const sel of selectors) {
+      const rect = await cdpRectReady(sel, true);
+      if (!rect) continue;
+      await cdpClickAt(rect.cx, rect.cy);
+      await pace(200);
+      let s = await cdpEval(cdpReadInputBySel, sel);
+      if (!s || !s.focused) { try { await cdpDomFocus(sel); } catch (e) { /* fall through */ } }
+      await cdpSelectAllDelete();
+      await pace(120);
+      await cdpInsertText(String(value));
+      await pace(300);
+      s = await cdpEval(cdpReadInputBySel, sel);
+      const ok = !!s && String(s.value) === String(value);
+      LOG(`filled "${label}" — ${ok ? "read-back ok" : "read-back MISMATCH (got " + JSON.stringify(s && s.value) + ")"}.`);
+      return { ok, sel };
+    }
+    LOG(`could not find an input for "${label}" (${selectors.join(", ")}).`);
+    return { ok: false };
+  };
+
+  const fillVerifyPassword = async (value) => {
+    const vp = await fillField(['[data-automation-id="verifyPassword"]'], value, "verify password");
+    if (vp.ok) return vp;
+    const rect = await cdpEvalRectReady(cdpNthPasswordRect, 1); // 2nd password input
+    if (!rect) return { ok: false };
+    await cdpClickAt(rect.cx, rect.cy); await pace(200);
+    await cdpSelectAllDelete(); await pace(120);
+    await cdpInsertText(String(value)); await pace(300);
+    LOG("filled verify password (2nd password-input fallback).");
+    return { ok: true };
+  };
+
+  const checkConsent = async () => {
+    let c = await cdpEval(cdpConsentRect);
+    if (!c) { LOG("no consent checkbox detected — proceeding (some tenants have none)."); return; }
+    if (c.checked) { LOG("consent already checked."); return; }
+    await cdpClickAt(c.cx, c.cy);
+    await pace(300);
+    c = await cdpEval(cdpConsentRect);
+    LOG(`consent checkbox — ${c && c.checked ? "checked" : "still unchecked (proceeding anyway)"}.`);
+  };
+
+  // Click a submit button and wait for the auth outcome — with a re-click FALLBACK. If the wait
+  // times out AND the form is still up (`formStillUp` → the submit control is still present, so we
+  // did NOT navigate → the click raced a not-yet-enabled button, or a throttled/hidden page never
+  // reacted), RE-CLICK and wait again, bounded by `tries`. The re-click is gated on the form still
+  // being up so a retry can never click into a page that already advanced. `done(s)` = the page
+  // moved on. Returns { scan } (final scan) or { notFound, blockedBy } if the button was never clickable.
+  // tries = 3 → the initial click + up to TWO re-clicks, so a Sign In / Create Account that "does
+  // nothing" keeps getting retried (operator ask 2026-07-10). Both submits go through this.
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000 }) => {
+    let st = null;
+    for (let t = 1; t <= tries; t++) {
+      const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
+      if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
+      const w = await waitFor((s) => done(s) || isWorkdaySoftError(s.bodyText), timeoutMs, `${label} outcome`);
+      st = w.scan || st;
+      if (st && await maybeRefresh(st)) st = await scan() || st;
+      if (st && done(st)) return { scan: st };
+      // Timed out. Re-click ONLY if still on this submit form; else the page advanced (done just
+      // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
+      if (t < tries && st && formStillUp(st)) { LOG(`${label}: no outcome after ${Math.round(timeoutMs / 1000)}s and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
+      return { scan: st };
+    }
+    return { scan: st };
+  };
+
+  // Gmail email-verification: find the workday.com link containing the tenant host and
+  // navigate the tab to it. Returns { ok } or a needs_operator halt object.
+  const doVerify = async (st) => {
+    if (!gmailEnabled) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-required-gmail-off", detail: "Workday requires email verification but Gmail auto-verify is OFF. Enable it (and Connect Gmail) in the popup, or click the link in the email yourself and re-run." };
+    const host = st.host || "";
+    // Account-exists-but-UNVERIFIED (a prior run created it, verification never completed): Workday's
+    // sign-in page shows a "Resend Account Verification" button, and the ORIGINAL email may be stale
+    // or expired (past the freshness window / link no longer valid). Click Resend to dispatch a FRESH
+    // email BEFORE polling (operator-confirmed on altasciences, 2026-07-10). Harmless when a fresh
+    // email already exists (this run just created the account) — the poll takes the newest match.
+    try {
+      const resend = await cdpEval(cdpResendVerifyRect);
+      if (resend) { LOG(`account is unverified — clicking "${resend.label}" to request a FRESH verification email before polling.`); await cdpClickAt(resend.cx, resend.cy); await cdpDelay(2500); }
+    } catch (e) { /* best-effort — poll anyway */ }
+    LOG(`email verification required — polling Gmail (readonly) for a workday.com link containing "${host}" (up to 120s)…`);
+    let tok = await gmailGetToken(true);
+    if (!tok.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "gmail-auth-failed", detail: tok.error };
+    const args = { token: tok.token, senderContains: "workday.com", urlMustContain: host, timeoutMs: 120000, pollMs: 5000 };
+    let find = await gmailFindVerificationEmail(args);
+    if (!find.ok && (find.status === 401 || find.status === 403)) {
+      LOG("Gmail token 401/403 — refreshing once and retrying.");
+      await gmailRemoveCachedToken(tok.token);
+      tok = await gmailGetToken(true);
+      if (tok.ok) find = await gmailFindVerificationEmail({ ...args, token: tok.token });
+    }
+    if (!find.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-email-not-found", detail: find.error };
+    LOG(`verification link found — navigating the tab to it: ${String(find.url).slice(0, 90)}…`);
+    const nav = await cdpNavigate(find.url);
+    if (!nav.ok) return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-nav-failed", detail: nav.error };
+    await settlePage(15000);
+    // Workday's activate link ACTIVATES the account then lands on / redirects to the sign-in page,
+    // and that redirect takes a beat. WAIT for the sign-in page (or the form, if a tenant auto-signs-in)
+    // to actually render before the loop re-attempts sign-in — mirrors the reference's
+    // _wait_for_sign_in_page. Without this, the loop re-scanned a transitional page, found no form, and
+    // bailed silently ("activated correctly but didn't sign in" — altasciences wd1, 2026-07-09).
+    const w = await waitFor(
+      (s) => s.passwordInput || s.emailInput || s.signInWithEmail || s.markers.signInLink || s.markers.signInSubmit || s.formFieldCount > 0,
+      20000, "post-activation sign-in page");
+    let post = w.scan || await scan();
+    if (post && await maybeRefresh(post)) post = await scan();
+    // Operator's flag: a verify link CAN be session-bound. If the landed page says the link
+    // was rejected, surface it (no auth mechanism fixes a session-bound link — verify manually).
+    if (post && /this link (has )?expired|no longer valid|link is invalid|unable to verify|link was not recognized/i.test(post.bodyText || "")) {
+      return { ok: false, reached_form: false, needs_operator: true, stopped: "verify-link-invalid", detail: "the verification link was rejected — it may be session-bound; open it manually in this browser, then re-run." };
+    }
+    // Let the server COMMIT the activation before the loop re-signs-in. Signing in the instant after
+    // the activate link can leave the account still reading "pending verification" → Workday re-issues
+    // a SECOND verification email and the whole cycle repeats (PANW needed two cycles otherwise,
+    // 2026-07-09 — "maybe it did it too fast"). A fixed wall-clock settle (once per verify, cheap).
+    await cdpDelay(5000);
+    LOG(`navigated to the verification link — account activated; sign-in page ${w.matched ? "is up" : "wait timed out, trying anyway"}; settled 5s for activation to commit; re-attempting sign-in.`);
+    return { ok: true };
+  };
+
+  // Create a Workday account (workday.py _create_account_flow), then let the auth loop
+  // re-check outcome (past-auth / verify / already-exists→sign-in).
+  const doCreateAccount = async (st) => {
+    LOG(`creating a Workday account as ${creds.email}…`);
+    if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await pace(900); st = await scan() || st; }
+    await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
+    await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
+    await fillVerifyPassword(creds.password);
+    await checkConsent();
+    await cdpDelay(500); // FIXED (not paced) — same as the Sign In submit: the Create Account button enables a beat after the fields fill; don't race it.
+    // Submit + wait, with the re-click fallback (raced/not-ready button or a throttled page). "Moved
+    // on" = an outcome (verify/wrong/success), a sign-in submit, an already-exists message, OR the
+    // social-login CHOOSER reappearing (PANW routes back to it after create-account; signInWithEmail
+    // is absent on the create form we submitted, so it only turns true on a genuine re-route). Re-click
+    // only while the create form is still up (createAccountSubmit present) — never into an advanced page.
+    const r = await submitAndWait({
+      selectors: ['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'],
+      label: "Create Account submit",
+      done: (s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || s.signInWithEmail || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""),
+      formStillUp: (s) => !!s.markers.createAccountSubmit
+    });
+    if (r.notFound) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: r.blockedBy || "no Create Account button" };
+    let post = r.scan || st;
+    if (post && /already (exists|in use)|an account (already )?exists|email is already (in use|registered)/i.test(post.bodyText || "")) {
+      LOG("Workday says the account already exists — will sign in instead.");
+      return { ok: true, alreadyExists: true };
+    }
+    return { ok: true };
+  };
+
+  // Auth loop: try sign-in first; verify→re-sign-in; wrong→create-account→loop.
+  const doAuth = async () => {
+    // Headroom: on a chooser tenant every real step (chooser reveal, sign-in, create-account, verify,
+    // re-sign-in) consumes an iteration, and a stray SECOND verify cycle doubles that — PANW hit
+    // exactly 8 with a double-cycle (2026-07-09), i.e. no margin. 12 comfortably survives a
+    // chooser→create→verify→(re-verify)→re-sign-in chain while still backstopping a genuinely stuck page.
+    const maxAttempts = 12;
+    let revealStalls = 0; // consecutive "Sign in with email" reveals where the form never rendered (hidden-tab repaint stall)
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let st = await scan();
+      if (!st) { await settlePage(6000); st = await scan(); }
+      if (!st) return { ok: false, error: "no-page-state-in-auth" };
+      if (await maybeRefresh(st)) st = await scan() || st;
+
+      const oc = classifyAuthOutcome(st);
+      if (oc === "success" || isPastAuth(st)) { LOG("reached the application form."); return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified }; }
+      // doVerify/doCreateAccount use their `ok` as an INTERNAL success signal; a halt object
+      // (needs_operator) is a SUCCESSFUL onboarding run that needs a human, so surface it as
+      // ok:true (the outer contract: ok:false ⇒ a crash only). The popup keys off needs_operator/detail.
+      if (oc === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
+
+      // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
+      // "Sign in with email" button (alongside federated Apple/Google/LinkedIn buttons we NEVER
+      // click). Click it to reveal the normal sign-in screen, then re-loop. Done BEFORE the SSO
+      // check so the chooser isn't mistaken for a forced SSO redirect.
+      if (!st.passwordInput && !st.emailInput && st.signInWithEmail) {
+        LOG('auth is a social-login chooser — clicking "Sign in with email" to reveal the form.');
+        const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]'], "Sign in with email");
+        if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-with-email-blocked", detail: c.blockedBy || "could not click Sign in with email" };
+        await cdpWakePage();
+        const w = await waitFor((s) => s.passwordInput || s.emailInput || s.markers.createAccountLink || s.markers.signInSubmit, 15000, "email-sign-in-form");
+        st = w.scan || st;
+        // Hidden-render stall: the chooser→form reveal defers on rAF, which is paused when the tab is
+        // backgrounded (and this page's CSP evidently blocks the worker-timer workaround). Rather than
+        // re-reveal forever (PANW hidden looped to the cap, 2026-07-09), halt after 2 misses with an
+        // ACTIONABLE message. The account is already created/activated by now, so a foreground re-run
+        // signs straight in. focus-emulation (cdpSetFocusEmulation) is the attempted fix; this is the net.
+        if (w.matched) { revealStalls = 0; }
+        else if (++revealStalls >= 2) {
+          return { ok: true, reached_form: false, needs_operator: true, stopped: "hidden-render-stalled", detail: 'the sign-in form did not render after "Sign in with email" — this Workday page does not repaint while the tab is hidden/backgrounded. Bring the tab to the FOREGROUND (visible) and re-run; the account is already created, so it will sign straight in.' };
+        }
+        continue;
+      }
+
+      if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
+      if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/credentials.json) in the popup, or sign in manually then re-run." };
+
+      // Prefer the sign-in path (switch to its tab if a link is showing).
+      if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await pace(800); st = await scan() || st; }
+
+      if (st.passwordInput || st.emailInput) {
+        LOG(`sign-in attempt ${attempt} as ${creds.email}.`);
+        // data-automation-id FIRST (Workday-canonical + present on observed tenants); the generic
+        // input[type=email] is the fallback. Ordering matters only for speed — a missing first
+        // selector burns the ~2.5s cdpRectReady ceiling before falling through (live: Comcast has
+        // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
+        await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
+        await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
+        // FIXED (not paced) — a real page-reaction wait, like the 5s activation settle: Workday
+        // ENABLES/validates the Sign In submit a beat AFTER the fields fill, and a submit click has
+        // no self-correcting gate (unlike fills/tab-clicks, which cdpRectReady/waitFor re-poll). A
+        // scaled ~50ms wait on a visible tab clicked the not-yet-ready button and no-op'd ("it
+        // doesn't click the sign in", 2026-07-09). 500ms is the reference-proven value.
+        await cdpDelay(500);
+        // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
+        // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
+        // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
+        const r = await submitAndWait({
+          selectors: ['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'],
+          label: "Sign In submit",
+          done: (s) => classifyAuthOutcome(s) !== "unknown",
+          formStillUp: (s) => !!s.markers.signInSubmit
+        });
+        if (r.notFound) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: r.blockedBy || "no Sign In button" };
+        st = r.scan || st;
+        const out = classifyAuthOutcome(st);
+        LOG(`sign-in outcome: ${out}.`);
+        if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
+        if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
+        if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
+        return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unknown", detail: `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}` };
+      }
+
+      // No sign-in form but a create-account affordance → create directly.
+      if (st.markers.createAccountLink || st.markers.createAccountSubmit || st.markers.verifyPassword) {
+        const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue;
+      }
+
+      return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unrecognized", detail: st.title };
+    }
+    return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-max-attempts", detail: `exceeded ${maxAttempts} auth attempts` };
+  };
+
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    await cdpInstallPageOverrides();
+    await cdpSetFocusEmulation(true); // best-effort: keep a hidden/backgrounded tab repainting (SPA sub-view transitions defer on rAF, paused when hidden)
+    LOG("attached. Onboarding: JD → Apply → Apply Manually → sign-in/create-account → verify → land on the form. Keep the tab VISIBLE to watch. Never submits.");
+
+    if (startUrl) {
+      LOG("navigating to the start URL:", startUrl);
+      const nav = await cdpNavigate(startUrl);
+      if (!nav.ok) return { ok: false, error: "navigate-failed:" + nav.error };
+      await settlePage(15000);
+    }
+
+    let st = await scan();
+    if (!st) { await settlePage(9000); st = await scan(); }
+    if (!st) return { ok: false, error: "no-page-state (is the tab on a Workday page?)" };
+    if (await maybeRefresh(st)) st = await scan() || st;
+
+    if (isPastAuth(st)) { LOG("already on the application form — nothing to onboard."); return { ok: true, reached_form: true, stopped: "already-on-form" }; }
+    if (isWorkdayMaintenance({ title: st.title, bodyText: st.bodyText, formFieldCount: st.formFieldCount, passwordInputPresent: st.passwordInput, signInButtonPresent: st.signInButtonPresent })) {
+      LOG("⛔ Workday planned-maintenance page — retry after the maintenance window.");
+      return { ok: true, reached_form: false, needs_operator: true, stopped: "workday-maintenance" };
+    }
+
+    // ── STAGE 1: Apply ──
+    const applyChain = presentApply(st);
+    const target = pickApplyTarget(applyChain);
+    if (target) {
+      LOG(`Stage 1 — clicking "${target.label}".`);
+      const c = await clickTarget([target.sel], target.label);
+      if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-click-blocked", detail: c.blockedBy || "Apply button not clickable" };
+      const w = await waitFor((s) => s.markers.applyManually || s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply");
+      st = w.scan || st;
+    } else if (st.markers.useMyLastApplication && !st.markers.applyManually) {
+      LOG('only "Use My Last Application" is offered on this page — refusing to reuse a prior application; waiting for a manual-apply/auth path…');
+    }
+
+    // ── STAGE 2: Apply Manually ──
+    st = await scan() || st;
+    if (st.markers.applyManually) {
+      LOG('Stage 2 — clicking "Apply Manually".');
+      const c = await clickTarget(['[data-automation-id="applyManually"]'], "Apply Manually");
+      if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-manually-blocked", detail: c.blockedBy || "Apply Manually not clickable" };
+      const w = await waitFor((s) => s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply-manually");
+      st = w.scan || st;
+    }
+
+    // ── STAGE 3: Auth (+ create-account + verify) ──
+    st = await scan() || st;
+    if (isPastAuth(st)) { LOG("reached the form (no auth needed)."); return { ok: true, reached_form: true, stopped: "reached-form" }; }
+    if (!st.hasAuthEl && !st.signInButtonPresent && st.formFieldCount === 0) {
+      const w = await waitFor((s) => s.hasAuthEl || s.signInButtonPresent || s.formFieldCount > 0, 12000, "auth-or-form");
+      st = w.scan || st;
+      if (isPastAuth(st)) return { ok: true, reached_form: true, stopped: "reached-form" };
+    }
+    if (st.hasAuthEl || st.signInButtonPresent) { LOG("Stage 3 — auth screen detected."); return await doAuth(); }
+    if (st.formFieldCount > 0) return { ok: true, reached_form: true, stopped: "reached-form" };
+    return { ok: true, reached_form: false, needs_operator: true, stopped: "unknown-page", detail: `title="${st.title}" — could not find Apply/auth/form. Navigate to the job posting and re-run.` };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("onboarding aborted:", msg);
+    return { ok: false, error: "exception:" + msg };
+  } finally {
     await cdpDetach();
   }
 }
@@ -4754,6 +3962,9 @@ async function fillEngine(profile, defaults, jobContext) {
   const FIELD_MAP = {
     "legalName--firstName": "personal_info.first_name",
     "legalName--lastName": "personal_info.last_name",
+    "preferredCheck": "personal_info.has_preferred_name", // "I have a preferred name" checkbox — true CHECKS it (reveals the preferred first/last fields, a cascade)
+    "preferredName--firstName": "personal_info.preferred_first_name", // revealed by preferredCheck; cascade re-scan fills it
+    "preferredName--lastName": "personal_info.preferred_last_name",   // revealed by preferredCheck
     "addressLine1": "personal_info.address_line_1",
     "city": "personal_info.city",
     "postalCode": "personal_info.postal_code",
@@ -5463,7 +4674,7 @@ async function fillEngine(profile, defaults, jobContext) {
   //    The engine computes the bundle and RETURNS it; the service worker writes it
   //    to chrome.storage. The injected function never touches storage itself.
   // ============================================================
-  const SCHEMA_VERSION = "1.0";
+  const SCHEMA_VERSION = "1.1"; // Plan 2 lockstep with fill-driver REVIEW_SCHEMA_VERSION (page-qualified field_id, page_label, is_approved)
 
   // Page-container automation-id (e.g. "applyFlowMyInfoPage"); URL-path fallback.
   const pageEl =
@@ -5472,6 +4683,13 @@ async function fillEngine(profile, defaults, jobContext) {
   const pageId = pageEl
     ? pageEl.getAttribute("data-automation-id")
     : (location.pathname.split("/").filter(Boolean).pop() || location.pathname);
+  // Plan 2: a STABLE page key for accumulation + a page-qualified field_id. The M31 lesson —
+  // pageId (applyFlowPage) is SHARED across pages on some tenants (LiveRamp), so the formField
+  // SET is the load-bearing distinguisher. Mirrors cdpPageKey (pathname | sorted field names).
+  // This is why "My-Experience showed under page 1": the old page=pageId collapsed pages.
+  const pageKey = (location.pathname || pageId) + "|" + wrappers
+    .map((w) => (w.getAttribute("data-automation-id") || "").slice("formField-".length))
+    .filter(Boolean).sort().join(",");
 
   // Mechanical outcome, decoupled from the review flag.
   //   filled/filled_review → filled · needs_review → not_filled · skipped → skipped · error → error
@@ -5525,10 +4743,14 @@ async function fillEngine(profile, defaults, jobContext) {
     const { confidence, confidence_source } = deriveConfidence(rec);
     const { needs_review, needs_review_reason } = deriveReview(rec);
     // The value actually filled (selected option text for choice widgets), only when filled.
-    const current_value = fill_status === "filled" && rec.after != null ? rec.after : null;
+    // LOCKSTEP ↔ fill-driver.js buildReviewBundle: `after` is only ever a LIVE page value → shows
+    // in the editor for ANY status (a needs_review kept-original renders in the field, not empty).
+    const current_value = rec.after != null ? rec.after : null;
     return {
-      field_id: "formField-" + rec.fieldName,
-      page: pageId,
+      field_id: pageKey + "::formField-" + rec.fieldName, // PAGE-QUALIFIED (Plan 2) — globally unique across the accumulated bundle
+      page: pageKey,                    // the STABLE merge key (field-set), NOT pageId (shared across pages)
+      page_number: null,                // stamped by runWalk (the SW knows the 1..N ordinal; the engine doesn't)
+      page_label: pageId,               // friendly caption (e.g. "applyFlowMyInfoPage") until runWalk stamps "Page N"
       field_index: index,
       question_label: rec.label != null ? rec.label : null,
       widget_type: rec.widgetType,
@@ -5538,6 +4760,8 @@ async function fillEngine(profile, defaults, jobContext) {
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,                 // human changed the effective value (set by the summary editor)
       edit_kind: null,                  // provenance for replay: override | filled_blank | cleared | null
+      is_approved: false,               // Plan 2: explicit human sign-off (flagged fields)
+      approved_at: null,
       confidence,
       confidence_source,
       needs_review,
@@ -5555,7 +4779,9 @@ async function fillEngine(profile, defaults, jobContext) {
   const entries = results.map((rec, i) => buildEntry(rec, i));
   const bundle = {
     schema_version: SCHEMA_VERSION,
-    page: pageId,
+    page: pageKey,           // the stable merge key (runWalk stamps page_number/page_label per page)
+    page_number: null,
+    page_label: pageId,      // friendly until runWalk stamps "Page N"
     url: location.href,
     tenant: location.hostname,
     captured_at: new Date().toISOString(),
@@ -5673,7 +4899,7 @@ function probePage() {
 //   3. GATE on file-upload-successful specifically — file-upload-item also renders
 //      mid-upload / on error, so the row alone is not a confident success.
 // ============================================================================
-async function attachResume(base64, filename, mime) {
+async function attachResume(base64, filename, mime, sectionSel) {
   if (!base64) return { attached: false, detail: "no resume bytes passed (empty base64)" };
 
   // Re-resolve EVERYTHING fresh from the document on each read. Workday REPLACES the
@@ -5683,7 +4909,9 @@ async function attachResume(base64, filename, mime) {
   // attachments only cleared 2). These closures re-query each call → immune to the
   // subtree being swapped out. (The section's wrapper automation-id is the empty
   // "formField-", so we anchor on the stable data-fkit-id.)
-  const findSection = () => document.querySelector('[data-fkit-id="resumeAttachments--attachments"]') || document;
+  // sectionSel scopes the attach to a specific attachment area (e.g. a cert's "…--attachments"); default
+  // = the top-level résumé area. Passed as a plain string across the injection boundary (never a node).
+  const findSection = () => document.querySelector(sectionSel || '[data-fkit-id="resumeAttachments--attachments"]') || document;
   const countItems = () => findSection().querySelectorAll('[data-automation-id="file-upload-item"]').length;
   const firstDelete = () => findSection().querySelector('[data-automation-id="delete-file"]');
   const findInput = () =>

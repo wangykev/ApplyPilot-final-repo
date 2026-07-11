@@ -117,13 +117,16 @@
     }
   ],
 
-  "_certifications_note": "Top-level certifications fill the Workday Certifications section (separate from application_questions.role_specific.certifications). `certification` is a typeahead PICK from the tenant's list — give it the exact option text (string, or a tiered most-specific-first array like degree). Dates are FULL `YYYY-MM-DD`; a partial (`YYYY-MM`) or placeholder date is skipped (not half-filled). An entry whose `certification` can't match an option is DROPPED (delete-on-no-match) rather than blocking submit, since the section is optional.",
+  "_certifications_note": "Top-level certifications fill the Workday Certifications section (separate from application_questions.role_specific.certifications). `certification` is a typeahead PICK from the tenant's list — give it the exact option text (string, or a tiered most-specific-first array like degree). Dates are FULL `YYYY-MM-DD`; a partial (`YYYY-MM`) or placeholder date is skipped (not half-filled). An entry whose `certification` can't match an option is DROPPED (delete-on-no-match) rather than blocking submit, since the section is optional. `specialties` is an OPTIONAL nested repeating sub-section INSIDE each cert entry — each has a `specialty` typeahead PICK (same tiered-array/AI-typo behavior as `certification`) plus optional `start_date`/`end_date` (`YYYY-MM-DD`, skipped when absent). Per-cert Attachments are NOT auto-filled (upload on the form / the review picker) — the résumé only ever attaches to the top-level Documents field.",
   "certifications": [
     {
       "certification": "",
       "certification_number": "",
       "issued_date": "YYYY-MM-DD",
-      "expiration_date": "YYYY-MM-DD"
+      "expiration_date": "YYYY-MM-DD",
+      "specialties": [
+        { "specialty": "", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }
+      ]
     }
   ],
 

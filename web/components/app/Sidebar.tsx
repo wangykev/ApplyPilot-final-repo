@@ -26,9 +26,10 @@ const PRIMARY = [
   { href: "/app/connect", label: "Connect", icon: Cable },
   { href: "/app/queue", label: "Queue", icon: ListChecks },
   { href: "/app/tracker", label: "Tracker", icon: Activity },
+  { href: "/app/analytics", label: "Analytics", icon: BarChart3 },
 ];
 
-const SOON = [{ label: "Analytics", icon: BarChart3 }];
+const SOON: { label: string; icon: typeof BarChart3 }[] = [];
 
 export function Sidebar({ email }: { email: string }) {
   const pathname = usePathname();
@@ -70,11 +71,13 @@ export function Sidebar({ email }: { email: string }) {
           );
         })}
 
-        <div className="hidden px-3 pb-1 pt-5 md:block">
-          <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">
-            Coming soon
-          </span>
-        </div>
+        {SOON.length > 0 && (
+          <div className="hidden px-3 pb-1 pt-5 md:block">
+            <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">
+              Coming soon
+            </span>
+          </div>
+        )}
         {SOON.map((item) => (
           <div
             key={item.label}

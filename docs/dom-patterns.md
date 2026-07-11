@@ -254,8 +254,13 @@ Driven for the first time in M11. `fillSource` reported `opener: "BUTTON"`,
 the earlier "same searchBox container as countryPhoneCode" note was wrong.
 
 ### Two previously-uncatalogued fields identified (via the new `label` column)
-- `preferredCheck` → label **"I have a preferred name"** — a checkbox
-  (would map to `personal_info.has_preferred_name`). Currently `skipped (no mapping)`.
+- `preferredCheck` → label **"I have a preferred name"** — a checkbox, **now MAPPED to
+  `personal_info.has_preferred_name`** (2026-06-30). Checking it (`has_preferred_name:true`)
+  is a **CASCADE**: it reveals `formField-preferredName--firstName` +
+  `formField-preferredName--lastName`, which the M1 cascade re-scan then fills (those two are
+  mapped to `personal_info.preferred_first_name`/`preferred_last_name`). Live-verified on
+  Magna page 1 → "John"/"Doe" filled deterministically (mapped ⇒ no AI). The reveal mounts a
+  few seconds after the box is checked (same latency class as the Country→Local-Name cascade).
 - `regionSubdivision1` → label **"County"** — a conditional text field (not a
   state subdivision as the name suggests). Currently `skipped (no mapping)`.
 
@@ -1900,3 +1905,367 @@ dispatch runs the unified filler with NO candidates → the inline AI has no sta
 and FORCES a pick (required never declines) + flags. Flat loop + `fillEntryCdp`. AI OFF / OPTIONAL → still `skipped`.
 
 315 unit tests; live-verified on Magna. Committed `ad1b34c` (merge) + the follow-ups.
+
+**2026-07-01 — Workday PLATFORM maintenance page (`community.workday.com/maintenance-page`) — observed, + a start-of-fill wiring gap to close.**
+A CDP page-recon (`RUN_CDP_PAGE_RECON`) landed on `https://community.workday.com/maintenance-page?d=3&s=1&e=1&o=`. **Note the HOST: `community.workday.com`** (the Workday platform), NOT the tenant's `*.myworkdayjobs.com` — a whole-platform outage, not a tenant page. Observed:
+- title & H2 = `"Workday is currently unavailable."`; `readyState: complete`; **httpStatus(nav) = 200** (status is useless — same lesson as the 2026-06-27 planned-maintenance page; a maintenance page is NOT 503).
+- **0 form fields, 0 distinct automation-ids**, no password field.
+- MARKERS `{apology:true, maintenance:true, workdayAdmin:true, noForm:true, login:false, sessionExpired:false, vpsError:false}`.
+- body: *"…We are experiencing a service interruption. Your service will be restored as quickly as possible. We apologize for the inconvenience. If you are a Workday customer and require additional assistance please contact the Workday Administrator within your organization. Otherwise, please check back later. © 2026 Workday, Inc."*
+
+This is a **TRANSIENT retry-later** state (like the 2026-06-27 planned-maintenance page), **NOT a dead session** — no re-login. `isWorkdayMaintenance(state)` (lib.js) ALREADY detects it (its `/workday is currently unavailable/i` branch + the `maintenancePresent` marker; unit-tested in `test/session.test.js`).
+
+**Gap (why the operator saw "some random error"):** `isWorkdayMaintenance` is wired ONLY into the WALK transition — `cdpWaitNextPage` / `runCdpWalk` (background.js ~4047/4118) — so it catches maintenance that appears *mid-walk*. It is NOT checked at the **START** of `runCdpFillPage` / `runCdpWalk` / the single-widget + section harnesses. So STARTING a fill on an already-maintenance page (0 form fields) runs the fill logic against an empty page → downstream errors instead of a clean halt.
+**TODO (future handler):** at the start of every CDP entry point (`runCdpFillPage`, `runCdpWalk`, the section/single-widget harnesses), read the identity/session state ONCE (`cdpReadSessionState`) and, if `isWorkdayMaintenance(state)`, **HALT immediately with a clear "Workday is under maintenance — retry later" status (zero actuation)** — the same treatment the walk already gives a mid-transition maintenance page. (Also consider: the recon is read-only and already surfaces this; the fill path just needs the same up-front gate before it touches the DOM.)
+
+## 2026-07-01 — Magna wd3: nested specialty fkit node does NOT wrap the formField (the fill's selector fix)
+
+The first live run of the nested Specialties fill errored `"typeahead wrapper not found"` on
+`certification[0].specialties[0].specialtyParent`. The scan HAD found the child (fkit nodes
+`certification-<N>--specialties-<M>--<field>` exist — reconcile ran), so the failure isolates to the
+composed selector `[data-fkit-id="…--specialtyParent"] [data-automation-id="formField-specialtyParent"]`:
+**the fkit node is NOT an ancestor of the formField node on nested specialty fields** (unlike the top-level
+`--null` entry containers, which DO wrap their formFields — the WE/Education/Languages composed-selector
+pattern doesn't transfer). Operator devtools facts: the specialty widget is a Workday multiselect typeahead
+carrying **`data-uxi-widget-type="selectinput"`** (no `multiselect` marker node), and the search input's
+**`id` IS the fkit string** (`certification-172--specialties-{n}--specialtyParent`).
+
+- **Fix — probe the relationship, don't assume it** (`cdpNestedFieldSel`, cdp.js + `act.nestedFieldSel`;
+  `fillNestedSpecialtiesCdp` consumes it): at fill time, resolve the fkit node and return whichever SINGLE
+  suffix-composable selector actually works — fkit-wraps-formField → the classic descendant compose; same
+  node → the fkit selector alone; fkit INSIDE the formField (e.g. on the input) → `formField:has(fkit)`;
+  no `data-fkit-id` at all → key on the element **id** carrying the fkit string (`formField:has([id=…])`).
+  Null → an honest per-field `error` record, zero blind actuation (unit-pinned). NO comma-list selectors —
+  the substrate string-appends suffixes (`loc.wrapperSel + ' input…'`), so a selector list would bind the
+  suffix to only the last alternative.
+- **Portability rules held:** every fkit string is composed from runtime-scanned indices (`parentOrder`,
+  the nested-scan child enumeration) — audit confirmed zero hardcoded numeric fkit ids / element ids /
+  GUIDs in shipping code (Workday's `-<N>--` counters are per-application random).
+- **`cdpGenericNestedScan` classify + wrapperSel fixed in lockstep:** the scan's field `wrapperSel` now
+  records via the same relationship ladder (it previously composed the blind descendant selector), and its
+  typeahead rung now also matches `selectinput` (self-or-descendant) — a selectinput-only nested typeahead
+  no longer misclassifies as text/unknown.
+- **`cdpNestedDeleteRect` hardened for tenant variance:** the Delete finder now matches text
+  "Delete"/"Remove", aria-label/title/automation-id variants, AND **icon-only trash buttons**
+  (`svg[class*="trash"]`, e.g. `wd-icon-trash`) — the ancestor-scoping guard (never spanning the parent's
+  own fields) is what keeps an icon-only match safe. Top-level `cdpDeleteEntryRect` (panel-header text
+  "Delete") left as-is — live-proven on Magna/LiveRamp.
+
+## 2026-07-01 — Workday error banner CONCATENATES all errors into ONE element (AI-4 remediation blind spot)
+
+Live walk halt (Magna page 2, "Junior Full Stack Developer Coop"): Save & Continue blocked with a
+Specialty-required error + the dup-language error; AI-4 remediation returned `no-action` and dirty-halted.
+Three independent gaps lined up — the log is a keeper:
+
+- **The top error-summary banner is ONE element whose textContent concatenates EVERY error**, each
+  prefixed `Error-<FieldName>`:
+  `Error-SpecialtyThe field Specialty is required and must have a value.Error-LanguageDuplicate language entries are not allowed.`
+  The M31 `errorMarkers.samples` read sliced each element to 120 chars — fine as a diagnostic, but AI-4
+  later made samples DECISION inputs, so any error past the first ~2 in the banner was INVISIBLE to the
+  tiers. Live: two Specialty errors sat ahead of the language error → "Duplicate language entr…" fell past
+  the cut → the Tier-0 dup-language hardcode never fired on a page that plainly showed its error.
+  **Fix:** slice raised to 600 (cdp.js) + `expandErrorSamples` (lib.js) splits samples on the `Error-`
+  prefix into individual error texts before ANY tier/AI-prompt/no-progress comparison sees them.
+- **`[role="alert"]` catches success toasts too** — "Kevin's Resume 2.pdf successfully uploaded" counted
+  as 2 of the "4 errors" and fed noise into the AI prompt. `expandErrorSamples` drops
+  success-toast pieces (no "error" text + /successfully uploaded/). The fast-exit COUNT in
+  `cdpWaitNextPage` is unchanged (errors-present ⟺ won't-advance still holds — the toasts only appear
+  alongside real state).
+- **Nested section fields are invisible to the remediation executor.** Tier 2's AI correctly named
+  `specialtyParent`, but the refill executor looks fields up in the FLAT `act.scanPage()` — which
+  deliberately excludes every field inside an indexed fkit entry — so it logged "not on the page" and
+  skipped. Tier 1 (`mappedFieldsFromErrors`) is flat-FIELD_MAP-only by construction.
+  **Fix — Tier 1.5 section re-fill:** `sectionsFromErrorNames` (fill-driver.js) maps parsed error titles
+  to their OWNING `PAGE_SECTIONS` entry (heading regex / fieldMap labelRegex / camelCase field words /
+  nested sub-section field labels — "Specialty" → certification), and `remediatePageErrors` re-runs JUST
+  those sections via the new `drivePageFill({onlySections})` mode (flat loop skipped; reconcile-to-N +
+  re-fill incl. nested specialties; same targeted-mode skips as `onlyFieldNames`).
+- **Error-title quirk:** a blank nested template slot renders its error title with EMPTY parens —
+  "The field Specialty () is required…" (alongside a plain "Specialty" for another row).
+  `sectionsFromErrorNames` normalizes `()` away.
+- **Orphan empty specialties are now reconciled away at N=0:** `fillNestedSpecialtiesCdp`'s old `!N`
+  early-return meant a cert whose profile has NO specialties never deleted recon-mounted empty child rows
+  (an empty REQUIRED specialtyParent blocks Save & Continue — this walk's actual blocker). The call site
+  now always invokes the nested fill (childItems may be empty) and the reconcile-down loop runs at N=0 —
+  the same reconcile-to-exactly-N semantics as the M21 top-level sections. The runCdpWalk "clear orphan
+  specialties first" PREREQ log is retired.
+
+## 2026-07-02 — AI-4 live round 2: blind Tier-2 delete + the refill-vs-delete rule for repeating rows
+
+Second live walk with remediation (Magna, operator manually added an EMPTY extra Specialty row to
+stage the error). What the log showed, in order:
+
+- **Remediation entered with "0 error(s)" and Tier 2 acted BLIND.** The error-summary banner renders
+  LATER than the ~1s fast-exit that triggers remediation, so the entry read found no error text; all
+  deterministic tiers no-op'd (nothing to match) and the ladder fell through to Tier 2, whose AI —
+  with an empty error list — chose `delete_entry certification-#0` (reason empty) and DELETED the
+  correctly-filled cert entry. Every subsequent error (phantom dup-language fired next, then
+  Specialty-required on the re-created entry) cascaded from that.
+  **Fixes:** (1) `remediatePageErrors` POLLS for the banner (500ms × 8) before reading; (2) every
+  attempt is HARD-GATED on non-empty expanded error text — no tier, including the AI, ever acts
+  without an error to anchor on (`no-error-text` / `errors-cleared-not-advancing` clean halts);
+  (3) `cdpWaitNextPage`'s fast-exit now counts EXPANDED errors, not raw markers — the raw count
+  includes `[role=alert]` SUCCESS toasts ("resume successfully uploaded"), which persist through a
+  slow clean transition.
+- **Operator rule — repeating ⇒ optional ⇒ delete the blocking row, don't re-fill the section.**
+  The old Tier 1.5 answered a "Specialty is required" error by re-running the WHOLE certification
+  section: reconcile-to-profile-N + re-fill — which re-mounts profile specialties AND (via
+  reconcile-DOWN) deletes entries the operator added by hand. New ladder:
+  - **Tier 1.5 = deterministic DELETE** (`deleteTargetsFromErrorNames` + `deleteEmptyErrorRows`,
+    fill-driver.js): map the error-named titles to repeating-section fields; delete every row whose
+    named field reads EMPTY on the live page ("is required and must have a value" = an empty slot;
+    a hand-FILLED row never reads empty → never deleted). A NESTED (layer-2) name (Specialty)
+    deletes ONLY the inner rows via `clickNestedDelete` — the parent cert entry is never touched.
+    Top-level rows read emptiness from the repeating scan's `value`; nested rows via the PROBED
+    `nestedFieldSel` selector + `readLiveValueByWidget` — an unresolvable probe means the row is
+    UNTOUCHED (never a blind delete). Cross-section-ambiguous names ("Start Date" = WE + nested
+    specialties) target both — safe, the empty-only rule self-limits.
+  - **Tier 1.6 = the section re-fill**, demoted behind the delete tier and now `preserveExtras`:
+    the remediation re-run NEVER reconciles DOWN (top-level `driveRepeatingSectionCdp` skip + the
+    nested `fillNestedSpecialtiesCdp` skip), so manual entries survive. The MAIN fill's M21
+    reconcile-to-exactly-N is unchanged.
+  - Tier 0 (dup-language hardcode) kept as the fast path — it live-verified this round (phantom
+    mode deleted both languages correctly).
+
+## 2026-07-02 — Magna wd3: nested fields contaminate every PARENT-entry scan (three stacked bugs, one fact)
+
+The one DOM fact: **a cert's nested Specialties fields (`formField-specialtyParent`/`startDate`/`endDate`)
+and its per-entry Attachments input live INSIDE the cert `--null` container** — so ANY scan that
+enumerates a cert entry's `formField-*` descendants sees them as if they were the cert's own fields.
+Three separate consumers tripped over it:
+
+- **m3b reveal-by-add clicked the nested Specialties Add.** `cdpRepeatingScan.addButtons` is
+  page-wide; "Specialties" matches no PAGE_SECTIONS heading and has no `--null` container → it passed
+  every unknown-empty-section guard → reveal-by-add MOUNTED an empty specialty row it then could
+  neither detect (no new `--null` prefix; the cert count unchanged — the row is INSIDE the entry) nor
+  delete → a leftover phantom row on EVERY full-page fill (its required pick then blocked Save &
+  Continue until Tier-1.5 cleaned it). Fix: addButtons carry **`insideEntry`** (any ancestor fkit
+  with the `-<digits>--` infix — the cdpPageScan isRepeating idiom); m3b skips them;
+  `revealUnknownSection` diffs `nestedScan` around its Add and deletes whatever a mis-click mounts.
+- **The add-entry SHAPE leak.** `detectSectionShapes` runs on the PRE-FILL scan (the page's original
+  state) and persists `section_shapes` for the viewer's "+ Add entry"; `captureDetectedShape` feeds
+  the emptied-section stub. Both mapped `entries[0].fields` raw → with a specialty mounted at page
+  load the cert template showed Specialty*/Start/End FLAT plus a second Attachments row. Both now
+  exclude a known section's nested child field names (from its nested config), its attachments
+  input, and ANY field with an EMPTY fieldName. Timing was never the cure — by end-of-page the fill
+  itself mounts a specialty; the exclusion (config knowledge) is.
+- **The Attachments wrapper is `formField-` with an EMPTY suffix** (fieldName ""), and
+  `cdpRepeatingScan.classify` had NO `input[type=file]` rung → the attachments field typed "unknown"
+  and evaded every `file_upload` exclusion (→ a text-box "Attachments" row in review). classify now
+  has the file rung + the `selectinput` rung (the nested specialty typeahead carries NO "multiselect"
+  node — only `data-uxi-widget-type="selectinput"`), LOCKSTEP with cdpPageScan/cdpGenericNestedScan.
+  Empty-fieldName wrappers are additionally skipped by the sweep + the m3a already-filled emit.
+
+**Also settled this round (fill-driver, not DOM):** a FAILED inline-AI rescue (needs_review,
+after:null) must never pre-empt the resting honesty read — the live "summary showed nothing while
+the page held 'Other - OTH'" bug: the AI record wins only when the page is genuinely blank (its
+ai-* flag drives review reasons + the delete-sweep), else the kept-chip record wins with the AI
+failure appended. And the PROACTIVE nested deleteOnNoMatch: a nested row whose required pick ends
+BLANK on a definitive negative is deleted at fill time (value-holders/transients never; the
+sub-section stub notes the removal).
+- **Follow-up (same day) — keptLowerTier must never reach the inline AI.** With FoS PRE-FILLED
+  "Electrical Engineering" (tier 1 of the profile's 4-tier list), the M36.1 guard walks only tier 0
+  ("Electrical and Computer Engineering") → genuine no-match → the overwrite exit handed the field
+  to `tryInlineAi`, which re-picked the SAME value and re-flagged it `ai-choice`/`filled_review`.
+  The kept chip EXACT-matches a lower PROFILE tier — a STATED value with nothing to rescue; the AI
+  rescue exists for the MISMATCHED pre-fill (`preTierIndex === -1`) only. Fix: the overwrite
+  no-match exit gates the AI on `preTierIndex <= 0` → the deterministic keep (recommit →
+  `filled`/`prefilled-better-tier-unavailable`) wins, zero LLM calls (invariant unit-pinned).
+- **Follow-up 2 (same day, operator speed rule) — the keptLowerTier re-commit is RETIRED; Tab-close
+  instead.** The affirmative re-type/Enter/click re-commit (the 2026-06-22 stray fix) predates the
+  Tab-blur exit model, which established (live-proven) that Tab abandons an armed row WITHOUT
+  committing. Since the kept chip is already correctly committed, the re-commit was a wasted ~4
+  round-trips per field. `overwriteNoMatchResting` now Tab-closes on BOTH paths; keptLowerTier just
+  VERIFIES the post-Tab chip: still == original → `filled`/`prefilled-better-tier-unavailable`;
+  differs → `overwrite-stray` with the honest live value; vanished → honest needs_review. The
+  recommitFn closure + TYPEAHEAD_SELF_VERIFY are deleted.
+
+## 2026-07-04..06 — Hidden-tab SPEED: worker-timers, the virtualized-list scroll mechanics, and the dropdown close race
+
+The rapidfire work surfaced four load-bearing DOM/runtime facts (all live-verified on Magna wd3):
+
+- **A hidden tab throttles `setTimeout`/`setInterval` to ~1Hz and PAUSES rAF — but timers in a Web
+  Worker DON'T.** A `blob:` Worker whose callback returns via `postMessage` escapes the main-thread
+  background throttle. Injecting a worker-timers polyfill (`buildOverrideSrc`) that reroutes the page's
+  `setTimeout`/`setInterval` (and rAF) through it makes a hidden fill run at page-speed. CAVEAT: this can't
+  be ASSUMED (Workday CSP could block `blob:` workers, though Magna does NOT) — pace fast only on a MEASURED
+  in-page `setTimeout(0)` round-trip (`cdpTimersFast`), never on install-success alone; a blocked/slow probe
+  ⇒ the old slow-but-correct path, unchanged.
+
+- **A react virtualizer does NOT re-render its rows on a programmatic `scrollTop` change when the tab is
+  HIDDEN.** Live diag: `scrollTop` climbed 0→1772 over `scrollHeight 1984`, but the mounted `[role=option]`
+  set stayed a FROZEN 17 rows — so the virtualized option scrape (`cdpScrapeTaOptions`) truncated the
+  Field-of-Study list to the on-open window (~17 of 65). FIX: **dispatch an explicit `scroll` event**
+  (`el.dispatchEvent(new Event("scroll"))`) after each `scrollTop` set → the virtualizer's scroll listener
+  runs and mounts the new window even hidden. (Visible tabs re-render on the native scroll, so this was
+  invisible until hidden fills became usable.)
+
+- **A virtualizer keeps a MUCH larger window MOUNTED than the viewport** (viewport + overscan — ~17 rows
+  mounted for a ~7-row / 211px viewport, i.e. the mounted span is ~2–3× `clientHeight`). So the scrape hops
+  by the MEASURED mounted-window pixel span (`getBoundingClientRect` of the mounted rows), not by a
+  viewport, with ~30–40% overlap — cutting a 65-item enumeration from ~12 hops to ~5 while never skipping a
+  row. Per-hop it breaks the instant the mounted set changes (render-completion), not on a fixed frame.
+
+- **A dropdown's trigger `aria-expanded` flips to "false" the instant Escape fires, but the PORTALED
+  listbox lingers a beat still mounted and CLICKABLE.** So a fast close that returned on `aria-expanded`
+  alone let the NEXT recon field's open-click land on a lingering option — the live "Landline committed to
+  Phone Device Type" stray (Phone Device Type's dropdown overlapped where the Country-Phone-Code box sits).
+  FIX: gate every read-only recon close on the LISTBOX/LEAVES being GONE — `optionCount === 0` (dropdown,
+  `closeAndVerifyBlank`) / `leafCount === 0` (typeahead, `awaitTypeaheadClosed`; leaves = `promptOption`s) —
+  before the next field opens. `listboxPresent`/`leafCount` come from `cdpReadDropdownState`/`cdpReadHierState`.
+
+## 2026-07-06 — Typeahead option scrape: chips carry role=option + the list mounts a beat AFTER the searchBox opens
+
+Live on Magna wd3, page 1, `countryPhoneCode` (a flat, prefilled-kept typeahead). The end-of-page review
+recon (`captureFieldOptions` → `cdpScrapeTaOptions`) logged `0 options [role=2 prompt=2]` while the widget
+VISIBLY opened a full country-code list. Two stacked facts, both now handled in `cdpScrapeTaOptions`:
+
+- **Selected-value CHIPS carry `role="option"` markup** (the same chip-contamination seen in dropdown scrapes
+  — `<li role="option" data-automation-id="selectedItem">` inside `selectedItemList`). A prefilled typeahead
+  shows its value as ~1–2 such chips. The scrape counted them (`role=2`), which (a) LOCKED the option-selector
+  to `role=option` and (b) were then filtered out by the visible/not-in-selectedItemList guard → **0 real
+  options**. Fix: exclude `selectedItemList` descendants BEFORE choosing the selector (`nonChip`), so chips
+  can neither mask nor lock the real list.
+- **The virtualized option rows mount a beat AFTER the searchBox becomes visible.** `ensureFocused` gates on
+  `searchBox.visible`, which flips true before the leaves render, so a single immediate scrape reads 0. Fix:
+  `cdpScrapeTaOptions` frame-polls (rAF, ~24-frame ceiling, bails on a "No matches found" banner) until
+  NON-CHIP leaves appear, THEN scrapes. Field-of-Study is scraped mid-fill when its list is already rendered,
+  so it resolves at frame 0 — unchanged (still 65).
+- **Selector divergence confirmed:** `countryPhoneCode`'s real leaves are `data-automation-id="promptOption"`
+  (NOT `role=option`), matching the hierarchical-typeahead model (`cdpReadHierState`); FoS's are `role=option`.
+  `cdpScrapeTaOptions` now tries `role=option` first, falls back to `promptOption`, picking whichever finds
+  non-chip leaves (returns `roleCount`/`promptCount`/`usedSel` in the `[CDP-SCRAPE-TA]` log for future triage).
+
+## 2026-07-06 — dup-language recon: a repeating-dropdown commit can MIS-CLICK a neighbor (coordinate click on a stale rect)
+
+Live on a Magna walk: `language[0].language` (profile English) came back `needs_review` "commit failed for
+\"English\" (trigger shows \"Chinese\")", and `language[1]` was Chinese → Workday flagged a DUPLICATE language
+and AI-4 Tier-0 deleted one. The read-back CAUGHT it (flagged, not silent — the safety contract held), but
+the value was wrong. Two independent hazards in the dropdown commit (`cdpDropdownOptionRectByText` +
+`clickDropdownOptionByText`, cdp.js):
+
+- **Vector A (the likely cause) — the option COMMIT is a coordinate click on a rect captured in a SEPARATE
+  round-trip.** `cdpDropdownOptionRectByText` scrolls the matched option into view and returns its center
+  `(cx,cy)`; `clickDropdownOptionByText` then issues a separate `cdpClickAt(cx,cy)`. Nothing re-verified the
+  option was STILL at those coords. A still-settling / virtualizing portaled listbox shifts the row between
+  the two round-trips, so the click for "English" lands on a NEIGHBOR ("Chinese" is a few rows away in an
+  alphabetical language list). Intermittent, and AGGRAVATED by the fast-timer `delayRender` (shorter settle).
+  **CORRECTION (operator clarified 2026-07-06):** this was the WRONG diagnosis. The two languages start
+  **pre-filled and FLIPPED** (entry 0=Chinese, entry 1=English) and the fill must OVERWRITE each to the
+  profile value; the overwrite click is not taking, leaving them flipped. It is NOT a neighbor mis-click. The
+  `elementFromPoint` RE-CAPTURE that was added here was **REVERTED** — it regressed a previously-working
+  overwrite (entry 1 had been committing; with the re-capture, BOTH entries failed). What's kept:
+  `cdpDropdownOptionRectByText` still returns `hitTarget`/`atPointText`/`collisions`, and
+  `clickDropdownOptionByText` clicks ONCE (prior behavior) but now LOGS `[ApplyPilot][CDP-DD-COMMIT] "<opt>"
+  hitTarget=… atPoint=… collisions=… rect=…` per commit — a read-only diagnostic to capture WHY a pre-filled
+  overwrite click fails (off-target click vs wrong-entry routing vs click-lands-but-no-recommit).
+  **CONFIRMED by the `[CDP-DD-COMMIT]` log (2026-07-06):** VISIBLE and HIDDEN are byte-identical —
+  `hitTarget=true atPoint="English" collisions=1 rect=456,298` — yet VISIBLE commits and HIDDEN does not
+  (`language[0]` "English" never leaves "Chinese", persistence-poll to the ceiling; even the re-open retry's
+  coordinate click fails). So a TRUSTED CDP COORDINATE click lands on the correct portaled option but does NOT
+  fire its onClick when the tab is HIDDEN — the coordinate hit-test doesn't reach the non-composited overlay.
+  (Not id-collision, not neighbor, not scroll — coords/target verified correct.) A DIRECT element-dispatch
+  retry (synthetic robustClick on the option element) was tried — it **also failed** hidden, so it's NOT the
+  click method. **ROOT CAUSE (confirmed via `forceWorkerTimersOff`):** it's the FAST PACING. Forcing the slow
+  (all-`delayFull`) path commits BOTH languages correctly on the first coordinate click (`text-click-commit`).
+  So committing a dropdown RE-SELECTION needs the just-opened dropdown to be INTERACTIVE before the click, and
+  fast pacing (~70ms option-settle) clicks before it is — the click lands (hitTarget=true) but doesn't fire
+  the selection, so it never commits. **FIX:** for an OVERWRITE (`before` is a real enabled option ≠ target),
+  `fillDropdownCdp` inserts a NON-ADAPTIVE `act.delayFull(~700ms)` before the commit click (replicates the
+  slow path's option-settle duration). EMPTY fills (`before` = the disabled placeholder, not an enabled
+  option) don't race → stay fast, no beat. Net FASTER on the failing case (commits instead of burning two
+  ~10s fail-poll+retry cycles). Proficiency dropdowns fill fine hidden because they're EMPTY (not overwrites).
+  (The element-dispatch retry is now moot — the primary commits — but left as a harmless fallback.)
+  **REFINEMENT (2026-07-06, `[DD-READY]` recon → made adaptive):** the hardcoded 700ms was live-verified but
+  paid on every overwrite. Before removing it, a temp read-only sampler (`cdpDropdownReadinessSample`) logged
+  the just-opened list's readiness signals every 100ms across the window — `aria-expanded`, listbox present,
+  enabled-option count, `opacity`/`visibility`/`pointer-events`/`transition`, `aria-activedescendant`,
+  selected-option, and the listbox rect. **Result: NOTHING flips 0→700ms — every signal is at its settled
+  value from t=0.** So the list is fully DOM-READY immediately and there is **NO pollable readiness signal**;
+  the ~700ms is a Workday-internal option-click DEBOUNCE with no DOM correlate. The only honest adaptivity is
+  therefore ELAPSED-TIME. The sampler was removed after the recon.
+  **FINAL SHAPE (2026-07-06, operator ask — "fill fast, refill slower only if it misses; log the refill rate
+  to tune", then "make visible and hidden different"): FAST-FIRST with a slow refill fallback, VISIBILITY-
+  SPLIT beats.** `fillDropdownCdp` records `openedAt` when the trigger reads `aria-expanded="true"`. For an
+  OVERWRITE it runs **attempt 1 FAST**: wait only up to the fast beat since open, click, and confirm with a
+  SHORT failure deadline (`min(overwriteFailFastMs, commitCeilingMs)`, default 600ms) so a miss is detected
+  cheaply. If the fast click MISSES (didn't clear the debounce), **attempt 2 refills SLOW**: re-open if the
+  list closed, wait the slow beat since the (re-)open, and commit with the full ceiling.
+  **The beats SPLIT on REAL tab visibility** (`act.visible` = `cdpVisible`, tab active + window not minimized —
+  NOT `cdpFast`, which is true for hidden+worker-timers): the debounce is a PAINT thing, so a VISIBLE tab needs
+  a tiny beat and a HIDDEN tab needs ~700ms. Live-tuned + verified: **VISIBLE = fast `30` / slow `100`; HIDDEN =
+  fast `120` / slow `700`** (`overwriteFastBeatMs`/`overwriteSlowBeatMs` + the `*VisibleMs` pair). 70ms hidden
+  refilled both languages (proving the fallback); 100ms hidden committed fast (120 keeps a small margin); 30ms
+  visible committed fast. A
+  `[CDP-DD-REFILL]` line logs `"<before>"→"<target>" VISIBLE|hidden fastBeat=Nms → committed on FAST attempt |
+  MISSED fast → refilled slow(~Nms): OK/FAILED` per overwrite, so the operator retunes from the log. The
+  commit-PERSISTENCE re-read still gates every accept, so a fast miss can only cost a slow refill — never a
+  wrong/silent fill (unit-pinned: a fast-miss dropdown re-opens and commits on the refill ending `filled` never
+  left flipped; and the visible fast beat < hidden's). EMPTY fills (`before` = the disabled placeholder) never
+  race → single fast commit, no beat. (`node -c` + 485 tests green.)
+- **Vector B (latent) — the listbox is resolved by a GLOBAL `document.getElementById(aria-controls)`.** If the
+  aria-controls id COLLIDES across repeating entries (unverified — the `formField-*` ids ARE duplicated
+  across entries), getElementById returns the first-in-DOM listbox, which could be the WRONG entry's. The
+  portaled listbox lives outside the entry subtree, so a `closest()` owner-check is unreliable; instead the
+  commit now logs `collisions` (count of elements sharing the id) — `[CDP-DD-COMMIT] ⚠ aria-controls id
+  collides…` — so the next occurrence confirms or rules out cross-entry routing. (Per-field ids ARE distinct —
+  M14.1 `ctny0/1/2` — but per-ENTRY uniqueness for the same repeating field is still to be confirmed live.)
+- **AI-4 dup-language dedups on the OBSERVED `.after`** (`lib.js` `languageEntriesFromResults`/`languageDeletionPlan`),
+  so two-Chinese (one mis-filled) reads as a "real" duplicate → it deletes an entry and MASKS the mis-commit.
+  It's a safety net, not a diagnosis — the real fix is preventing the mis-click above.
+
+## 2026-07-06 — Dropdown CLOSE race in the FILL path: gate on options-GONE, not aria-expanded (and close-confirm the successful commit)
+
+Operator report on this branch: "dropdowns don't close instantly — you must wait for the listbox to be closed
+and options to be 0 before the next action or the dropdowns race." The recon close was already hardened to
+gate on listbox-GONE (`closeAndVerifyBlank` / `awaitTypeaheadClosed`, `optionCount`/`leafCount === 0`), but the
+FILL path had two gaps:
+
+- **`closeDropdownConfirmed` (the fill-path close used by the tier-KEEP + genuine-no-match returns) gated on
+  `ariaExpanded === "true"`.** aria flips to `"false"` the INSTANT a commit/Escape fires, but the portaled
+  option list lingers a beat while it unmounts and its options STAY CLICKABLE — so it returned while options
+  were still up, and the next field's open-click strayed onto a lingering option (the degree→"Associates" /
+  "Landline → Phone Device Type" cross-field stray). Fixed to the SAME gate as the recon close: `stillOpen =
+  listboxPresent && optionCount > 0`; poll (re-Escaping) until the options are gone, bounded by iterations.
+  (Not a main-vs-branch drift — `closeDropdownConfirmed` is byte-identical on main; the recon-close hardening
+  simply never reached this helper.)
+- **The SUCCESSFUL COMMIT return didn't close-confirm at all** — it returned `filled` the moment the commit
+  verified, while the just-committed list was still unmounting. Now every `fillDropdownCdp` return that opened
+  the list — successful commit, commit-failed, tier-keep, no-match — calls `closeDropdownConfirmed` before
+  returning, so the next field never opens over a lingering list.
+
+`closeDropdownConfirmed` is now exported + unit-pinned (aria always `"false"` yet options linger 2 reads → the
+gate must keep polling/Escaping until `optionCount === 0`; an aria-only gate would Escape zero times). Happy
+path adds ~1 read (options already gone → returns immediately). `node -c` clean; 484 tests green.
+
+## 2026-07-07 — Magna wd3 REVIEW page (the final application page) — observed for the review-page CHECK
+
+The final review page is marked `[data-automation-id="applyFlowReviewPage"]` and groups the whole
+application into sections (`<h3>`/`<h4>`: My Information → Legal Name / Preferred Name / Address / Email /
+Phone; My Experience → Work Experience / Education / Certifications / Languages / Application Documents /
+Websites; Application Questions; Voluntary Disclosures; Terms and Conditions). What the review-page CHECK's
+scraper had to learn from tracing it:
+
+- **NO reliable field labels.** Each field's value is a bare `<span>`/`<div>` with `data-automation-id=null`
+  and NO associated `<label>`/`<dt>` — the label↔value pairing that works on the *form* pages is absent
+  here. A label-first scrape mislabels wholesale (an ancestor/nearest-leaf fallback tagged address, phone,
+  and screening values all as "How Did You Hear About Us?"). Lesson: reconcile by VALUE PRESENCE, not label.
+- **Address is ONE blob.** Address Line 1 + City + region + postal + country render as a single span
+  ("715 Middlebrooks Circle Tallahassee, FL 32312 United States of America"), so the individual fields are
+  found by substring containment. The region is the **abbreviation** ("FL"), not the stored dropdown value
+  ("Florida") → needs a name↔abbrev map.
+- **Phone is formatted** ("+1 850-666-0266 (Mobile)") — the stored "8506660266" only matches on a
+  digits-only comparison; the device type shows in the "(Mobile)" suffix.
+- **File uploads** render as `data-automation-id="file-upload-item-name"` (the filename) inside an
+  `attachments-FileUpload`/`file-upload-item` subtree, with an `ariaLiveMessage` "…successfully uploaded"
+  sibling — match the résumé by filename containment.
+- **Screening-question labels carry a trailing required marker** ("… please select No.*", "… age of 18?*",
+  a double `**` on some) that the page's value/question leaf does NOT — so a label match must strip a
+  trailing `*`/`**` (`normL`). Short answers ("Yes"/"No") appear as the next leaf after the question text →
+  captured by label-anchoring on the (asterisk-stripped) question text, read the following value leaf.
+- **Repeated identical values** (two work-experience "Tallahassee, FL" locations) collapse under any
+  dedup → value-presence agrees for each bundle entry regardless (both are present), so no false "missing".
+
+Approach that fell out: pass the bundle's claimed values as HINTS, value-anchor each onto the page, and
+reconcile by presence (distinctive values) + label-anchoring (short values / checkboxes). See
+`cdpReadReviewPage` / `reconcileReviewPage` and progress-log 2026-07-07.

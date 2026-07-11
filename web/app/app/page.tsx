@@ -74,7 +74,7 @@ export default function OverviewPage() {
 
       <div>
         <p className="eyebrow">Run &amp; track</p>
-        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+        <div className="mt-4 grid gap-4 sm:grid-cols-3">
           <Link href="/app/queue" className="group bezel flex flex-col p-6 transition-colors hover:border-amber/40">
             <ListChecks className="h-5 w-5 text-amber" strokeWidth={1.75} />
             <h2 className="mt-4 font-display text-lg font-medium">Job queue</h2>
@@ -95,12 +95,16 @@ export default function OverviewPage() {
               Open <ArrowRight className="h-3.5 w-3.5" />
             </span>
           </Link>
-        </div>
-        <div className="mt-4 flex items-center gap-2 rounded-xl border border-dashed border-hairline px-6 py-4">
-          <BarChart3 className="h-4 w-4 text-ink-faint" strokeWidth={1.75} />
-          <span className="text-sm text-ink-dim">
-            Analytics — response rates and pipeline charts — is coming next.
-          </span>
+          <Link href="/app/analytics" className="group bezel flex flex-col p-6 transition-colors hover:border-amber/40">
+            <BarChart3 className="h-5 w-5 text-amber" strokeWidth={1.75} />
+            <h2 className="mt-4 font-display text-lg font-medium">Analytics</h2>
+            <p className="mt-2 flex-1 text-sm leading-relaxed text-ink-dim">
+              Volume over time, pipeline distribution, and your interview and offer rates.
+            </p>
+            <span className="mt-4 inline-flex items-center gap-1.5 text-sm text-ink-dim transition-colors group-hover:text-amber">
+              Open <ArrowRight className="h-3.5 w-3.5" />
+            </span>
+          </Link>
         </div>
       </div>
     </div>
