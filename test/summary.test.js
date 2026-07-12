@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
 
 // ── 2b: operator-added repeating-section entries ──
 test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
@@ -107,6 +107,21 @@ test("requiresApproval: flagged yes; un-flagged approved-by-default (no); delete
   assert.strictEqual(requiresApproval({ needs_review: true }), true);
   assert.strictEqual(requiresApproval({ needs_review: false }), false);          // un-flagged → approved by default
   assert.strictEqual(requiresApproval({ needs_review: true, is_deleted: true }), false);
+});
+
+test("#3: preferred first/last are HIDDEN when 'I have a preferred name' is unchecked (mirror the form)", () => {
+  const check = (val) => ({ field_id: "P1::formField-preferredCheck", canonical_field: "personal_info.has_preferred_name", widget_type: "checkbox", current_value: val, page: "P1" });
+  const fName = { field_id: "P1::formField-preferredName--firstName", canonical_field: "personal_info.preferred_first_name", widget_type: "text", current_value: "John", page: "P1" };
+  // unchecked → hidden
+  let es = [check("false"), fName];
+  assert.strictEqual(isHiddenPreferredName(fName, es), true);
+  // checked → shown
+  es = [check("true"), fName];
+  assert.strictEqual(isHiddenPreferredName(fName, es), false);
+  // no controlling checkbox present → shown (don't hide blindly)
+  assert.strictEqual(isHiddenPreferredName(fName, [fName]), false);
+  // a non-preferred field is never hidden by this rule
+  assert.strictEqual(isHiddenPreferredName({ field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", page: "P1" }, [check("false")]), false);
 });
 
 test("M6: a cascade-REVEALED field FORCES approval even if it filled cleanly (needs_review false)", () => {

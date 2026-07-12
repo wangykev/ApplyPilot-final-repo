@@ -93,6 +93,18 @@ const _idstr = (e) => String((e && e.field_id) || "") + "|" + String((e && e.can
 const isCurrentlyWorkHere = (e) => !!e && e.widget_type === "checkbox" && /currentlyworkhere|currently_work_here/i.test(_idstr(e));
 const isWorkExpEndDate = (e) => !!e && /workexperience\[\d+\]\.(to|enddate)\b/i.test(_idstr(e));
 
+// #3 (UI): "I have a preferred name" reveals the preferred first/last fields (a cascade). When that
+// checkbox is UNCHECKED the form hides them, so the review should too. Hide a preferred-name field when
+// its controlling preferredCheck (same page) is present AND unchecked. Mirrors the visibleEntryItems
+// "currently work here → hide the To date" pattern, but for these two flat fields. Pure → unit-tested.
+const isPreferredNameField = (e) => !!e && /preferred_?name--|preferred_(first|last)_name/i.test(_idstr(e));
+const isPreferredCheckField = (e) => !!e && e.widget_type === "checkbox" && /preferredcheck|has_preferred_name/i.test(_idstr(e));
+function isHiddenPreferredName(e, entries) {
+  if (!isPreferredNameField(e)) return false;
+  const ctrl = (entries || []).find((x) => isPreferredCheckField(x) && x.page === e.page);
+  return !!ctrl && !checkedOf(ctrl.current_value); // controlling checkbox present + UNCHECKED → hide the field
+}
+
 // Given one repeating-entry's fields, return the ones to SHOW: when "I currently work here" is
 // CHECKED, drop the endDate ("To") field — EXCEPT keep it if it's flagged needs_review (e.g. the
 // today's-date fallback when the box stayed required), so a flagged value is never hidden.
@@ -154,5 +166,5 @@ function newEntryRecords(shape, meta) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, visibleEntryItems, newEntryRecords };
 }

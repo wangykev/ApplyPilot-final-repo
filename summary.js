@@ -674,7 +674,7 @@ const render = () => {
   }
   if (!bundle || !Array.isArray(bundle.entries)) { root.appendChild(el("div", { class: "empty", text: "No summary yet — run a fill, then open “View last summary”." })); return; }
   const entries = bundle.entries;
-  const live = entries.filter((e) => !e.is_deleted);           // deleted entries drop out of counts/list
+  const live = entries.filter((e) => !e.is_deleted && !isHiddenPreferredName(e, entries)); // deleted + hidden-preferred-name (unchecked) drop out of counts/list
   const removed = entries.length - live.length;
   const editedCount = live.filter((e) => editKindOf(e)).length;
   const reviewCount = live.filter((e) => e.needs_review).length;
@@ -777,7 +777,7 @@ const pageCaptionOf = (items, pg) => { const e = items.find((x) => x.page_label 
 
 const renderFieldList = (mount) => {
   mount.textContent = "";
-  const entries = currentBundle.entries;
+  const entries = currentBundle.entries.filter((e) => !isHiddenPreferredName(e, currentBundle.entries)); // #3: hide preferred first/last when the "I have a preferred name" box is unchecked (mirror the form)
   const pageOrder = [], pages = {};
   for (const e of entries) { if (!pages[e.page]) { pages[e.page] = []; pageOrder.push(e.page); } pages[e.page].push(e); }
   // Plan 2: order pages by page_number (the walk's ordinal) when present, else keep first-
