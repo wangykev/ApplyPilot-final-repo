@@ -124,6 +124,22 @@ test("#3: preferred first/last are HIDDEN when 'I have a preferred name' is unch
   assert.strictEqual(isHiddenPreferredName({ field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", page: "P1" }, [check("false")]), false);
 });
 
+test("#3 (bug fix): a REALISTIC field_id whose page-key prefix LISTS preferredName--* must not hide the whole page", () => {
+  // The real field_id embeds cdpPageKey = "pathname|sorted-field-names", which contains preferredName--firstName
+  // etc. Testing the WHOLE field_id matched every page-1 field → the entire page vanished. Match the tail only.
+  const pk = "/apply|country,legalName--firstName,preferredCheck,preferredName--firstName,preferredName--lastName,source";
+  const mk = (name, cf, wt, val) => ({ field_id: pk + "::formField-" + name, canonical_field: cf, widget_type: wt || "text", current_value: val, page: pk });
+  const check = mk("preferredCheck", "personal_info.has_preferred_name", "checkbox", "false");
+  const pref = mk("preferredName--firstName", "personal_info.preferred_first_name", "text", "John");
+  const legal = mk("legalName--firstName", "personal_info.first_name", "text", "Kevin");
+  const src = mk("source", "personal_info.how_did_you_hear", "hierarchical", "LinkedIn");
+  const all = [check, pref, legal, src];
+  assert.strictEqual(isHiddenPreferredName(pref, all), true, "the preferred-name field IS hidden");
+  assert.strictEqual(isHiddenPreferredName(legal, all), false, "legalName must NOT be hidden (this was the whole-page bug)");
+  assert.strictEqual(isHiddenPreferredName(src, all), false, "source must NOT be hidden");
+  assert.strictEqual(isHiddenPreferredName(check, all), false, "the checkbox itself is not a preferred-name field");
+});
+
 test("M6: a cascade-REVEALED field FORCES approval even if it filled cleanly (needs_review false)", () => {
   assert.strictEqual(isCascadeRevealed({ cascade_revealed: true }), true);
   assert.strictEqual(isCascadeRevealed({ cascade_revealed: false }), false);

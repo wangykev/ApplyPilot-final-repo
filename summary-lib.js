@@ -97,8 +97,12 @@ const isWorkExpEndDate = (e) => !!e && /workexperience\[\d+\]\.(to|enddate)\b/i.
 // checkbox is UNCHECKED the form hides them, so the review should too. Hide a preferred-name field when
 // its controlling preferredCheck (same page) is present AND unchecked. Mirrors the visibleEntryItems
 // "currently work here → hide the To date" pattern, but for these two flat fields. Pure → unit-tested.
-const isPreferredNameField = (e) => !!e && /preferred_?name--|preferred_(first|last)_name/i.test(_idstr(e));
-const isPreferredCheckField = (e) => !!e && e.widget_type === "checkbox" && /preferredcheck|has_preferred_name/i.test(_idstr(e));
+// Match the FIELD-NAME tail (after the last "formField-") + the canonical path — NOT the whole field_id.
+// The field_id's PAGE-KEY prefix (cdpPageKey = "pathname|sorted-field-names") LISTS every flat field name,
+// so testing "preferredName--" against the full field_id matched EVERY page-1 field → it hid the ENTIRE page.
+const _ffName = (e) => { const id = String((e && e.field_id) || ""); const i = id.lastIndexOf("formField-"); return i !== -1 ? id.slice(i + "formField-".length) : id; };
+const isPreferredNameField = (e) => !!e && (/^preferred_?name--/i.test(_ffName(e)) || /preferred_(first|last)_name/i.test(sumNorm(e.canonical_field)));
+const isPreferredCheckField = (e) => !!e && e.widget_type === "checkbox" && (/^preferredcheck$/i.test(_ffName(e)) || /has_preferred_name/i.test(sumNorm(e.canonical_field)));
 function isHiddenPreferredName(e, entries) {
   if (!isPreferredNameField(e)) return false;
   const ctrl = (entries || []).find((x) => isPreferredCheckField(x) && x.page === e.page);
