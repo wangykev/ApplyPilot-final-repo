@@ -2195,7 +2195,7 @@ async function replayAttachResume(LOG) {
 // NO AI, NO AI-4 remediation (fill-path only). Reads the bundle from storage, NOT the profile. Keep the
 // tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
 const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
-const MAX_PAGE_RELOADS = 2; // reload-retry cap per page (mirror maybeRefresh's cap) — a transient render-flake gets ≤2 reloads, then halts honestly.
+const MAX_RELOAD_RETRIES = 2; // reload-retry cap per RUN (a reload returns Workday to page 1, so a transient render-flake RESTARTS the whole walk) — ≤2 restarts, then halts honestly.
 
 // Reload the attached tab (Page.reload) and wait for it to be INTERACTIVE again — the transient-failure
 // retry for both walks (operator ask 2026-07-11). Polls document.readyState==="complete" + a live form
@@ -2232,10 +2232,13 @@ async function runCdpReplayWalk(tabId, opts) {
       ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
       : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
     const act = makeCdpActuation(await getLlmConfig()); // AI OFF for replay regardless (replayRepeatingSections passes aiContext:null; flat replayField never calls AI)
-    const pagesReplayed = [];
-    const findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
+    let pagesReplayed = [];
+    let findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
     let submitFired = false; // single-fire sentinel
+    let reloadsUsed = 0; // RUN-level reload-retry budget: a reload returns Workday to page 1, so a transient render-flake RESTARTS the whole walk (bounded by MAX_RELOAD_RETRIES)
 
+    restartWalk: while (true) { // a transient-flake reload restarts here from page 1; a clean finish / halt / review-terminal returns out of the function
+    pagesReplayed = []; findings = { mismatches: [], cascadeRevealed: [] }; submitFired = false; // reset per attempt
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
       let nav = null;
@@ -2319,63 +2322,56 @@ async function runCdpReplayWalk(tabId, opts) {
         return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
 
-      LOG(`──── REPLAY PAGE ${page} ────`);
+      LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
       await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan)); // stable across a reload (same page) — for the later advance
-      let sel = null, results = [], failed = [], changed = 0, kept = 0, pageReloads = 0;
-      while (true) { // reload-retry loop: re-replay the page after a reload while failures are transient render-flakes
-        const scan = await cdpEval(cdpPageScan);
-        const fields = (scan && scan.fields) || [];
-        const liveNames = fields.map((f) => f.fieldName);
-        // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
-        let rscanLive = null;
-        try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
-        sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
-        if (!sel.entries.length || sel.score <= 0) {
-          const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
-          LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). The bundle never captured this page — HALT (can't replay what wasn't reviewed).`);
-          return { ok: true, stopped: "replay-page-not-in-bundle", page, live_fields: liveNames, live_sections: liveSecs, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
-        }
-        LOG(`page ${page} → matched approved page "${(sel.pageKey || "").split("|")[0]}" (${sel.score} flat-field overlap; ${sel.entries.length} approved entr${sel.entries.length === 1 ? "y" : "ies"})${pageReloads ? ` [reload-retry ${pageReloads}]` : ""}.`);
-
-        const present = new Set(liveNames);
-        const flat = await replayFlatFields(act, sel.entries, present, DEFAULT_BUDGETS);
-        const rep = await replayRepeatingSections(act, sel.entries, DEFAULT_BUDGETS);
-        results = flat.concat(rep);
-
-        // Résumé re-attach (replayField defers file_upload). Required upload blocks advance → HALT if it fails.
-        if (fields.some((f) => f.widgetType === "file_upload")) {
-          const ar = await replayAttachResume(LOG);
-          if (!ar.attached) {
-            LOG(`⚠ resume NOT attached on page ${page} (${ar.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
-            return { ok: true, stopped: "resume-not-attached", resume_detail: ar.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
-          }
-        }
-
-        failed = results.filter((r) => r.status === "needs_review" || r.status === "error");
-        changed = results.filter((r) => (r.status === "filled" || r.status === "filled_review") && r.flag !== "replay-already-correct").length;
-        kept = results.filter((r) => r.flag === "replay-already-correct").length;
-
-        // ── RELOAD-RETRY (operator ask 2026-07-11): a TRANSIENT render-flake (a choice widget whose option
-        //    list never rendered) usually clears on a page reload → reload + re-replay this page, bounded.
-        //    A TERMINAL failure (a genuine no-match — value not offered) is NEVER retried
-        //    (isTransientRenderFailure=false) → straight to the strict-verify halt below. ──
-        if (failed.length && isTransientRenderFailure(failed) && pageReloads < MAX_PAGE_RELOADS) {
-          pageReloads++;
-          LOG(`⟳ page ${page}: ${failed.length} field(s) failed with a TRANSIENT render-flake — reloading + retrying (reload ${pageReloads}/${MAX_PAGE_RELOADS}): ${failed.map((r) => r.field || r.fieldName).join(", ")}`);
-          const ready = await reloadAndSettle(LOG);
-          await installInputLock(); // the reload tore the injected overlay down
-          if (ready) continue; // re-replay from a fresh scan
-          LOG(`⚠ page ${page}: reload did not settle in time — proceeding to the halt.`);
-        }
-        break; // clean, terminal failure, or reloads exhausted
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
+      const scan = await cdpEval(cdpPageScan);
+      const fields = (scan && scan.fields) || [];
+      const liveNames = fields.map((f) => f.fieldName);
+      // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
+      let rscanLive = null;
+      try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
+      const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
+      if (!sel.entries.length || sel.score <= 0) {
+        const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
+        LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). The bundle never captured this page — HALT (can't replay what wasn't reviewed).`);
+        return { ok: true, stopped: "replay-page-not-in-bundle", page, live_fields: liveNames, live_sections: liveSecs, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
-      pagesReplayed.push({ page, matched_key: sel.pageKey, total: results.length, changed, kept, failed: failed.length, reloads: pageReloads });
-      LOG(`page ${page} replay: ${results.length} field(s) — ${changed} changed, ${kept} already-correct, ${failed.length} FAILED${pageReloads ? ` (after ${pageReloads} reload-retry)` : ""}.`);
+      LOG(`page ${page} → matched approved page "${(sel.pageKey || "").split("|")[0]}" (${sel.score} flat-field overlap; ${sel.entries.length} approved entr${sel.entries.length === 1 ? "y" : "ies"}).`);
 
-      // ── STRICT verify: any field that did NOT replay cleanly HALTS before advancing (never a guess). ──
+      const present = new Set(liveNames);
+      const flat = await replayFlatFields(act, sel.entries, present, DEFAULT_BUDGETS);
+      const rep = await replayRepeatingSections(act, sel.entries, DEFAULT_BUDGETS);
+      const results = flat.concat(rep);
+
+      // Résumé re-attach (replayField defers file_upload). Required upload blocks advance → HALT if it fails.
+      if (fields.some((f) => f.widgetType === "file_upload")) {
+        const ar = await replayAttachResume(LOG);
+        if (!ar.attached) {
+          LOG(`⚠ resume NOT attached on page ${page} (${ar.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
+          return { ok: true, stopped: "resume-not-attached", resume_detail: ar.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+      }
+
+      const failed = results.filter((r) => r.status === "needs_review" || r.status === "error");
+      const changed = results.filter((r) => (r.status === "filled" || r.status === "filled_review") && r.flag !== "replay-already-correct").length;
+      const kept = results.filter((r) => r.flag === "replay-already-correct").length;
+      pagesReplayed.push({ page, matched_key: sel.pageKey, total: results.length, changed, kept, failed: failed.length });
+      LOG(`page ${page} replay: ${results.length} field(s) — ${changed} changed, ${kept} already-correct, ${failed.length} FAILED.`);
+
+      // ── STRICT verify: any field that did NOT replay cleanly HALTS before advancing (never a guess) —
+      //    UNLESS every failure is a TRANSIENT render-flake (options-did-not-render). Then RELOAD (which
+      //    returns Workday to page 1) + RESTART the whole walk from page 1, bounded. skip-if-correct makes
+      //    the already-good pages fast on the restart. A TERMINAL failure (genuine no-match) never retries. ──
       if (failed.length) {
-        LOG(`⚠ page ${page}: ${failed.length} field(s) did not replay cleanly${pageReloads ? ` (persisted through ${pageReloads} reload-retry)` : ""} — HALT before advancing (a value the live form no longer offers is never guessed):`);
+        if (isTransientRenderFailure(failed) && reloadsUsed < MAX_RELOAD_RETRIES) {
+          reloadsUsed++;
+          LOG(`⟳ page ${page}: ${failed.length} field(s) failed with a TRANSIENT render-flake — reloading (Workday returns to page 1) + RESTARTING the walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}): ${failed.map((r) => r.field || r.fieldName).join(", ")}`);
+          const ready = await reloadAndSettle(LOG);
+          if (ready) continue restartWalk; // re-run the whole walk from page 1
+          LOG(`⚠ page ${page}: reload did not settle in time — halting.`);
+        }
+        LOG(`⚠ page ${page}: ${failed.length} field(s) did not replay cleanly${reloadsUsed ? ` (persisted through ${reloadsUsed} reload-restart)` : ""} — HALT before advancing (a value the live form no longer offers is never guessed):`);
         failed.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`));
         return { ok: true, stopped: "replay-mismatch", page, failed: failed.map((r) => ({ field: r.field || r.fieldName, widget: r.widgetType, status: r.status, detail: r.detail || null })), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
@@ -2419,6 +2415,8 @@ async function runCdpReplayWalk(tabId, opts) {
       }
       LOG(`✓ page ${page} → advanced.`);
     }
+    break restartWalk; // the for-loop completed all pages without a transient-flake restart → exit the retry loop
+    } // restartWalk
 
     LOG(`⚠ hit the ${REPLAY_MAX_PAGES}-page cap without reaching review — stopping (detection-bug backstop). Eyeball the application.`);
     return { ok: true, stopped: "max-pages-cap", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
@@ -2609,8 +2607,11 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
     const prepared = prepareProfile(profile); // once — each page fills what its own scan presents
     const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
-    const pagesFilled = [];
+    let pagesFilled = [];
+    let reloadsUsed = 0; // RUN-level reload-retry budget: a transient render-flake reloads (→ page 1) + RESTARTS the walk
 
+    restartWalk: while (true) { // a transient-flake reload restarts here from page 1 (the bundle clear stays ABOVE, once per run)
+    pagesFilled = []; // reset per attempt
     for (let page = 1; page <= WALK_MAX_PAGES; page++) {
       // ── (a/b) TOP-OF-ITERATION guards: session-death + the REVIEW terminal (SUBMIT-NEVER —
       // checked BEFORE any fill/click, so we never fill or advance the review page). ──
@@ -2633,23 +2634,22 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-      let out, pageKey, fillReloads = 0;
-      while (true) { // reload-retry: a page whose ONLY fill failures are transient render-flakes gets a reload + re-fill (bounded)
-        ({ out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page }));
-        const failed = (out.results || []).filter((r) => r.status === "needs_review" || r.status === "error");
-        // Only reload when EVERY failure is a render-flake (isTransientRenderFailure) — a mix with a real
-        // needs-review field won't reload (those go to review as usual); fillAndPersistPage re-installs the
-        // input-lock + accumulate-replaces this page, so a re-fill is idempotent.
-        if (failed.length && isTransientRenderFailure(failed) && fillReloads < MAX_PAGE_RELOADS) {
-          fillReloads++;
-          LOG(`⟳ page ${page}: fill failure(s) are all TRANSIENT render-flakes — reloading + re-filling (reload ${fillReloads}/${MAX_PAGE_RELOADS}): ${failed.map((r) => r.fieldName).join(", ")}`);
+      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
+      // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
+      //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
+      //    field does NOT reload (those go to review as usual). Each page accumulate-replaces, so the
+      //    re-walk is idempotent (the already-filled sweep makes the good pages fast). ──
+      {
+        const flakes = (out.results || []).filter((r) => r.status === "needs_review" || r.status === "error");
+        if (flakes.length && isTransientRenderFailure(flakes) && reloadsUsed < MAX_RELOAD_RETRIES) {
+          reloadsUsed++;
+          LOG(`⟳ page ${page}: fill failure(s) are all TRANSIENT render-flakes — reloading (Workday returns to page 1) + RESTARTING the fill walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}): ${flakes.map((r) => r.fieldName).join(", ")}`);
           const ready = await reloadAndSettle(LOG);
-          if (ready) continue;
+          if (ready) continue restartWalk;
           LOG(`⚠ page ${page}: reload did not settle — proceeding with the last fill.`);
         }
-        break;
       }
-      pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length, reloads: fillReloads });
+      pagesFilled.push({ page, url: out.url, counts: out.counts, needs_review: out.needsReview.length, audit_flagged: out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable").length, reloads: reloadsUsed });
 
       // ── (c.1) Required-upload guard (walk prereq 1, hold #1): a file_upload that didn't
       // attach (no resume / failed) WILL block Save & Continue → HALT here, self-explaining,
@@ -2729,6 +2729,8 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       LOG(`✓ page ${page} → advanced.`);
       // res.advanced → next iteration (top-of-loop re-checks review/session on the new page).
     }
+    break restartWalk; // the for-loop completed all pages without a transient-flake restart → exit the retry loop
+    } // restartWalk
 
     LOG(`⚠ hit the ${WALK_MAX_PAGES}-page cap without reaching review — stopping (a detection-bug backstop). Eyeball the application.`);
     return { ok: true, stopped: "max-pages-cap", pages_filled: pagesFilled.length, pages: pagesFilled };
