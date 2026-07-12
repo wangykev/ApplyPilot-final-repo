@@ -56,10 +56,15 @@ function effectiveValue(entry) {
   };
 }
 
-// Which entries demand an EXPLICIT human approval before submit: the flagged ones (needs_review),
-// minus soft-deleted. Un-flagged fields are approved-by-default (lower friction — the operator
-// decision). super-hard / sensitive / needs-answer are ALL needs_review, so they're covered here.
-const requiresApproval = (e) => !e.is_deleted && !!e.needs_review;
+// A cascade-REVEALED field (M6): it appeared only after another value committed, so it never went
+// through the operator's eyes on the first pass — force a second review even if it filled cleanly.
+const isCascadeRevealed = (e) => !!(e && e.cascade_revealed);
+
+// Which entries demand an EXPLICIT human approval before submit: the flagged ones (needs_review) AND
+// any cascade-revealed field, minus soft-deleted. Un-flagged fields are approved-by-default (lower
+// friction — the operator decision). super-hard / sensitive / needs-answer are ALL needs_review, so
+// they're covered here; cascade-revealed is added so a cleanly-filled revealed field still forces review.
+const requiresApproval = (e) => !e.is_deleted && (!!e.needs_review || isCascadeRevealed(e));
 
 // Approval roll-up for the envelope + the viewer's progress UI. PURE over the entries.
 // submit_ready = every field that requires approval IS approved AND no required field still
@@ -149,5 +154,5 @@ function newEntryRecords(shape, meta) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords };
 }

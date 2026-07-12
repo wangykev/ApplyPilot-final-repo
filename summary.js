@@ -569,6 +569,7 @@ const fieldRow = (e, opts = {}) => {
   if (opts.review) {
     // super-hard shows ALONGSIDE legally-loaded/demographic/needs-answer (never hides them — safety-first)
     if (isSuperHard(e)) lab.appendChild(el("span", { class: "lb superhard", text: e.flag === "ai-closest-forced" ? "AI FORCED" : "LOW-CONF AI" }));
+    if (isCascadeRevealed(e)) lab.appendChild(el("span", { class: "lb cascade", text: "⤴ REVEALED", title: "This field appeared only after an earlier value committed — confirm it." })); // M6: shows ALONGSIDE any AI/sensitive badge
     if (isSensitive(e)) lab.appendChild(el("span", { class: "lb crit", text: "LEGALLY-LOADED" }));
     else if (isEeoGuess(e)) lab.appendChild(el("span", { class: "lb eeo", text: "DEMOGRAPHIC" }));
     else if (needsAnswer(e)) lab.appendChild(el("span", { class: "lb crit", text: "NEEDS ANSWER" }));

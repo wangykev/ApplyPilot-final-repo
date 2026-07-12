@@ -6120,7 +6120,15 @@ test("submitPrecondition: a maintenance page BLOCKS", () => {
 test("NAMED INVARIANT — submitPrecondition NEVER passes with an unresolved flagged/needs_review field", () => {
   const r = gate((i) => { i.bundle.entries[1].is_approved = false; }); // a needs_review field left unapproved
   assert.strictEqual(r.ok, false, "an unapproved flagged field MUST block submit");
-  assert.ok(r.blockers.some((b) => /flagged field\(s\) not approved/.test(b)));
+  assert.ok(r.blockers.some((b) => /not approved/.test(b)));
+});
+
+test("submitPrecondition (M6): an unapproved CASCADE-REVEALED field blocks even if it filled cleanly (needs_review false)", () => {
+  const r = gate((i) => { i.bundle.entries.push({ field_id: "P::formField-localName", cascade_revealed: true, needs_review: false, is_approved: false }); });
+  assert.strictEqual(r.ok, false, "a revealed field forces a second review — blocks until approved");
+  assert.ok(r.blockers.some((b) => /not approved/.test(b)));
+  const ok = gate((i) => { i.bundle.entries.push({ field_id: "P::formField-localName", cascade_revealed: true, needs_review: false, is_approved: true }); });
+  assert.strictEqual(ok.ok, true, "once approved, it no longer blocks: " + ok.blockers.join("; "));
 });
 
 test("submitPrecondition: an unreplaced AI placeholder in the BUNDLE blocks", () => {

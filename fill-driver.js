@@ -4520,8 +4520,10 @@ function submitPrecondition(bundle, liveState, findings, opts) {
   // 5. every field that requires approval IS approved. requiresApproval = needs_review && !deleted
   //    (mirrors summary-lib requiresApproval); super-hard / legally-loaded / needs-answer / eeo-guess
   //    are ALL needs_review, so this single check covers the whole mustReplace class.
-  const unapproved = entries.filter((e) => e.needs_review && !e.is_approved);
-  if (unapproved.length) blockers.push(`${unapproved.length} flagged field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
+  // needs_review OR cascade_revealed (M6: a revealed field forces a second review even if it filled
+  // cleanly) must be human-approved — mirrors summary-lib requiresApproval so the gate and the viewer agree.
+  const unapproved = entries.filter((e) => (e.needs_review || e.cascade_revealed) && !e.is_approved);
+  if (unapproved.length) blockers.push(`${unapproved.length} flagged/revealed field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
   // 6. no unreplaced AI placeholder — in the BUNDLE, and (belt-and-suspenders) on the LIVE page.
   const bundlePh = apMatch.unreplacedPlaceholders(entries) || [];
   if (bundlePh.length) blockers.push(`${bundlePh.length} unreplaced AI placeholder(s) in the bundle`);
@@ -4872,6 +4874,7 @@ function buildReviewBundle(results, meta) {
       detail: rec.detail != null ? rec.detail : null,
       match_tier: rec.matchTier != null ? rec.matchTier : null,
       flag: rec.flag != null ? rec.flag : null, // PROVENANCE (was dropped) — the viewer badges "AI-INFERRED" off flag.startsWith("ai-")
+      cascade_revealed: !!rec.cascadeRevealed, // M6: this field appeared only AFTER an earlier value committed (cascade re-scan) → the viewer badges it + it FORCES a second review before submit
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary

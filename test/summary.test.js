@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
 
 // ── 2b: operator-added repeating-section entries ──
 test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
@@ -107,6 +107,17 @@ test("requiresApproval: flagged yes; un-flagged approved-by-default (no); delete
   assert.strictEqual(requiresApproval({ needs_review: true }), true);
   assert.strictEqual(requiresApproval({ needs_review: false }), false);          // un-flagged → approved by default
   assert.strictEqual(requiresApproval({ needs_review: true, is_deleted: true }), false);
+});
+
+test("M6: a cascade-REVEALED field FORCES approval even if it filled cleanly (needs_review false)", () => {
+  assert.strictEqual(isCascadeRevealed({ cascade_revealed: true }), true);
+  assert.strictEqual(isCascadeRevealed({ cascade_revealed: false }), false);
+  assert.strictEqual(isCascadeRevealed({}), false);
+  assert.strictEqual(requiresApproval({ needs_review: false, cascade_revealed: true }), true, "revealed → must be reviewed");
+  assert.strictEqual(requiresApproval({ needs_review: false, cascade_revealed: true, is_deleted: true }), false, "deleted → excluded");
+  // and it blocks submit until approved (approvalEnvelope counts it via requiresApproval)
+  const ap = approvalEnvelope([{ needs_review: false, cascade_revealed: true, is_approved: false, is_deleted: false }]);
+  assert.strictEqual(ap.submit_ready, false, "an unapproved revealed field blocks submit");
 });
 
 // ── approvalEnvelope / submitReady ──
