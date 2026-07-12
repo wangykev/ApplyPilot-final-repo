@@ -123,10 +123,9 @@ const commit = (entry, val) => {
   persist();
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
   updateApprovalUI();
-  // A VISIBILITY-controlling checkbox toggled → re-render so the dependent rows show/hide live
-  // (render() preserves collapsed state): "I currently work here" controls the entry's "To" row;
-  // "I have a preferred name" controls the preferred first/last rows (mirrors the form revealing/hiding them).
-  if (isCurrentlyWorkHere(entry) || isPreferredCheckField(entry)) render();
+  // "I currently work here" controls whether the entry's "To" row shows — re-render to apply
+  // (mirrors the form removing the To box). render() preserves collapsed state.
+  if (isCurrentlyWorkHere(entry)) render();
 };
 
 // Plan 2: per-field approval toggle. Sets is_approved + approved_at, persists, refreshes the
