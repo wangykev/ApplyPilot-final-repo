@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6121,6 +6121,21 @@ test("NAMED INVARIANT — submitPrecondition NEVER passes with an unresolved fla
   const r = gate((i) => { i.bundle.entries[1].is_approved = false; }); // a needs_review field left unapproved
   assert.strictEqual(r.ok, false, "an unapproved flagged field MUST block submit");
   assert.ok(r.blockers.some((b) => /not approved/.test(b)));
+});
+
+// ── reload-retry: is a set of failures TRANSIENT (render-flake, retryable) vs TERMINAL (must halt)? ──
+test("isTransientRenderFailure: all render-flakes → true; any terminal → false; no failures → false", () => {
+  const flake = { status: "needs_review", detail: "options did not render (skipped_no_option_match)" };
+  const flakeByFlag = { status: "needs_review", flag: "skipped_no_option_match", detail: "" };
+  const terminal = { status: "needs_review", detail: "no candidate matched — value not offered" };
+  const ok = { status: "filled", detail: "overwrote x" };
+  assert.strictEqual(isTransientRenderFailure([flake]), true);
+  assert.strictEqual(isTransientRenderFailure([flake, flakeByFlag]), true);
+  assert.strictEqual(isTransientRenderFailure([flake, terminal]), false, "a mix with a genuine no-match is NOT retryable");
+  assert.strictEqual(isTransientRenderFailure([terminal]), false);
+  assert.strictEqual(isTransientRenderFailure([ok]), false, "no failures → nothing to retry");
+  assert.strictEqual(isTransientRenderFailure([]), false);
+  assert.strictEqual(isTransientRenderFailure(null), false);
 });
 
 test("submitPrecondition (M6): an unapproved CASCADE-REVEALED field blocks even if it filled cleanly (needs_review false)", () => {

@@ -4493,6 +4493,19 @@ async function captureChoiceOptions(act, results, budgets) {
 const REVIEW_SCHEMA_VERSION = "1.1"; // 1.1 (Plan 2): + page_number/page_label, is_approved/approved_at. The viewer tolerates 1.0 (missing fields default).
 const ACCEPTED_SCHEMA_VERSIONS = ["1.0", "1.1"]; // M4 submit gate accepts these (the viewer's documented tolerance); anything else = stale build → block.
 
+// isTransientRenderFailure — are ALL these failing records TRANSIENT render-flakes (retryable via a page
+// RELOAD) rather than terminal (a genuine no-match / real error / session death, which must halt)? The
+// flake: a choice widget whose option list never rendered ("options did not render" /
+// "skipped_no_option_match" — a Workday render race a reload clears; live-seen on Magna page-2 language
+// proficiencies). Returns false when there are NO failures, or when ANY failure is terminal — so a reload
+// can NEVER mask a real problem. Used by both walks' bounded reload-retry (operator ask 2026-07-11). PURE.
+const RENDER_FLAKE_RX = /options did not render|skipped_no_option_match/i;
+function isTransientRenderFailure(records) {
+  const fails = (records || []).filter((r) => r && (r.status === "needs_review" || r.status === "error"));
+  if (!fails.length) return false;
+  return fails.every((r) => RENDER_FLAKE_RX.test(String((r && r.detail) || "") + " " + String((r && r.flag) || "")));
+}
+
 // submitPrecondition (M4) — the ORDERED gate for the ONE irreversible click (act.clickSubmit). PURE:
 // every input is passed in; returns { ok, blockers[] } (blockers = human-readable reasons, logged for
 // the operator). ALL conditions must pass. This is the safety surface — clickSubmit fires ONLY when
@@ -4929,5 +4942,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }
