@@ -1415,6 +1415,20 @@ function cdpReadReviewPage(valueHints) { // valueHints IGNORED (matching is now 
            counts: { records: records.length, entries: Object.keys(entrySet).length, attachments: records.filter((r) => r.isAttachment).length } };
 }
 
+// The emails Workday may pre-fill on the review page from the ACCOUNT you signed up with (NOT recorded
+// in the bundle): the login credentials email + the profile's auth_strategy.account_email +
+// personal_info.email. Passed to reconcileReviewPage so the displayed email is VERIFIED (a match = a
+// positive "account-email" agree; a mismatch = a real disagree that blocks submit). Deduped + lowercased.
+async function getAccountEmails() {
+  return new Promise((resolve) => chrome.storage.local.get(["credentials", "profile"], (r) => {
+    const out = [];
+    const push = (e) => { if (e != null && String(e).trim()) out.push(String(e).trim().toLowerCase()); };
+    if (r && r.credentials) push(r.credentials.email);
+    if (r && r.profile) { push(r.profile.auth_strategy && r.profile.auth_strategy.account_email); push(r.profile.personal_info && r.profile.personal_info.email); }
+    resolve(Array.from(new Set(out)));
+  }));
+}
+
 // REVIEW-PAGE CHECK (end-to-end fill-verify): scrape the Workday review page (ground truth) via
 // cdpReadReviewPage and reconcile it against the saved reviewSummary bundle (reconcileReviewPage, PURE).
 // Disagreements ⇒ a fill bug to investigate. READ-ONLY — attaches, reads, detaches; NEVER clicks Next
@@ -1446,7 +1460,7 @@ async function runCdpReviewReconcile(tabId) {
       return { ok: true, url: dump.url, scraped: dump.counts.records, reconciled: false, note: "no-bundle" };
     }
 
-    const rec = reconcileReviewPage(dump.items, entries);
+    const rec = reconcileReviewPage(dump.items, entries, { accountEmails: await getAccountEmails() });
     const c = rec.counts;
     LOG(`── RECONCILIATION (bundle ${entries.length} entries · ${c.claimed} claimed value-bearing · ${c.skipped} skipped unchecked-box · ${c.placeholders} unreplaced AI) ──`);
     LOG(`AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING-ON-REVIEW ${c.missing_on_review} · EXTRA-ON-REVIEW ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous}`);
@@ -2229,7 +2243,7 @@ async function runCdpReplayWalk(tabId, opts) {
             .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
           const dump = await cdpEval(cdpReadReviewPage, hints);
           if (dump && dump.ok && Array.isArray(dump.items)) {
-            const rec = reconcileReviewPage(dump.items, bundle.entries);
+            const rec = reconcileReviewPage(dump.items, bundle.entries, { accountEmails: await getAccountEmails() });
             const c = rec.counts;
             reviewDiff.disagree = rec.disagree || [];
             reviewDiff.missing = rec.missing_on_review || [];

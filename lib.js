@@ -465,13 +465,17 @@ const CANONICAL_TO_FKIT = { website: "webAddress" };
 //   bundleEntries : reviewSummary.entries[]     (question_label, current_value, fill_status,
 //                   widget_type, canonical_field, is_required, page_number, field_id)
 // Returns { agree, disagree, missing_on_review, extra_on_review, ambiguous, counts }.
-function reconcileReviewPage(reviewItems, bundleEntries) {
+function reconcileReviewPage(reviewItems, bundleEntries, opts) {
   const TRUEISH = /^(true|yes|checked|selected|on|1)$/i;
   // Values that are too generic to trust by page-presence (they appear all over the page) — these ride
   // the label-anchored path instead, so "yes"/"no" verify the RIGHT question, not any stray "no".
   const AMBIGUOUS_SHORT = /^(yes|no|n\/?a|true|false)$/i;
+  // Emails Workday may pre-fill from the ACCOUNT you signed up with (login / auth_strategy.account_email /
+  // personal_info.email) — lowercased. Used by the email-verify pass below; empty ⇒ that pass is skipped.
+  const accountEmails = (((opts && opts.accountEmails) || [])).map((s) => String(s == null ? "" : s).trim().toLowerCase()).filter(Boolean);
   const items = (Array.isArray(reviewItems) ? reviewItems : [])
     .map((it) => ({ label: String((it && it.label) || ""), value: String((it && it.value) || ""), used: false,
+                    section: it && it.section != null ? String(it.section) : "", // structured record's section (h3/h4) — for the email-verify pass
                     key: it && it.key != null ? String(it.key) : null,
                     entryOrdinal: it && it.entryOrdinal != null ? it.entryOrdinal : null,
                     fkitPrefix: it && it.fkitPrefix != null ? String(it.fkitPrefix) : null }))
@@ -628,14 +632,35 @@ function reconcileReviewPage(reviewItems, bundleEntries) {
     missing_on_review.push(base); // recorded but nowhere on the page — the fill-didn't-stick signal
   }
 
+  // ── EMAIL VERIFY (operator ask 2026-07-12): Workday pre-fills the applicant email from the ACCOUNT you
+  //    signed up with, so it's NOT in the bundle and would otherwise surface as EXTRA noise. Confirm the
+  //    displayed email IS one of your account emails — a MATCH is a positive verification (agree, no longer
+  //    noise); a MISMATCH is a real problem (disagree → BLOCKS submit: you'd apply with the wrong contact
+  //    email). Keyed off the "Email Address" section/label. Skipped when no accountEmails supplied (bare
+  //    {label,value} callers behave exactly as before; the email just stays EXTRA as it did). ──
+  const isEmailValue = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v == null ? "" : v).trim());
+  if (accountEmails.length) {
+    const er = items.find((it) => !it.used && isEmailValue(it.value) && (/e-?mail/i.test(it.section) || /e-?mail/i.test(it.label)));
+    if (er) {
+      er.used = true; claimed++;
+      const b = { label: "Email Address", field_id: null, widget_type: "text", canonical_field: "personal_info.email", is_required: false, page_number: null };
+      if (accountEmails.includes(er.value.trim().toLowerCase())) {
+        claimedValues.push(normalize(er.value)); // verified → not "extra"
+        agree.push({ ...b, value_bundle: er.value, value_review: er.value, tier: "account-email" });
+      } else {
+        disagree.push({ ...b, value_bundle: accountEmails.join(" / "), value_review: er.value }); // wrong email → real flag
+      }
+    }
+  }
+
   // EXTRA = a DISTINCTIVE page value (≥4 chars) not explained by ANY recorded value (either contains the
   // other). Surfaces a value the form holds that the bundle doesn't — e.g. a language the summary deleted
-  // but the form kept. Short/ambiguous values ("Yes"/"No") are never "extra".
+  // but the form kept. Short/ambiguous values ("Yes"/"No") are never "extra"; a matched/used record isn't either.
   const explained = (nv) => claimedValues.some((cvn) => cvn && Math.min(cvn.length, nv.length) >= 4 && (cvn.includes(nv) || nv.includes(cvn)));
   const seenExtra = new Set(), extra_on_review = [];
   for (const it of items) {
     const nv = it.nval;
-    if (nv.length < 4 || explained(nv) || seenExtra.has(nv)) continue;
+    if (nv.length < 4 || it.used || explained(nv) || seenExtra.has(nv)) continue;
     seenExtra.add(nv);
     extra_on_review.push({ label: it.label || null, value_review: it.value });
   }
