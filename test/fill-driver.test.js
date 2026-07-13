@@ -6354,3 +6354,60 @@ test("replayRepeatingSections: a DELETED section (is_deleted entries) reconciles
   assert.strictEqual(state.entries.length, 0, "a deleted section is reconciled to 0 on the live form (not left as-is)");
   assert.ok(act.log.some(([m]) => m === "clickDeleteEntry"), "the live rows were deleted");
 });
+
+// ── Profile Learning M3: answer-bank consult (remembered answers re-fill unmapped fields) ──
+test("M3 bank: a remembered answer fills an UNMAPPED dropdown (exact match) → filled (trusted), flag 'remembered', NO LLM", async () => {
+  const bank = { "are you over the age of 18?": { value: "Yes", widgetType: "dropdown" } };
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' }); // AI would say "No" — but the bank wins, first
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "an EXACT remembered match fills trusted (not review)");
+  assert.strictEqual(rec.after, "Yes", "the remembered value was committed");
+  assert.strictEqual(rec.flag, "remembered", "provenance flag");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "a bank hit means the LLM is NEVER consulted");
+  const e = buildReviewBundle(out.results, {}).entries[0];
+  assert.strictEqual(e.needs_review, false, "an exact remembered match is NOT in NEEDS REVIEW (trusted)");
+  assert.strictEqual(e.flag, "remembered");
+});
+
+test("M3 bank: a remembered answer fills even with AI OFF (deterministic replay)", async () => {
+  const bank = { "are you over the age of 18?": { value: "No", widgetType: "dropdown" } };
+  const act = makeFakeAct([aiDd()], {}); // AI off
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "No");
+});
+
+test("M3 bank: no remembered answer → the AI fallback still runs (behavior unchanged)", async () => {
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: {} });
+  assert.strictEqual(out.results[0].after, "Yes");
+  assert.ok(act.log.some(([m]) => m === "llm"), "no bank hit → AI still consulted");
+});
+
+test("M3 bank: a remembered value matching NO live option is NEVER blind-committed (falls through)", async () => {
+  const bank = { "are you over the age of 18?": { value: "Maybe", widgetType: "dropdown" } };
+  const act = makeFakeAct([aiDd()], {}); // AI off → nothing to catch it after the bank misses
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  const rec = out.results[0];
+  assert.notStrictEqual(rec.after, "Maybe", "never commits a value the live options don't contain");
+  assert.notStrictEqual(rec.status, "filled");
+});
+
+test("M3 bank: an OPTIONAL unmapped field IS filled from the bank (AI never fills optional)", async () => {
+  const bank = { "favorite color?": { value: "Blue", widgetType: "dropdown" } };
+  const optDd = aiDd({ fieldName: "fav_color", label: "Favorite color?", isRequired: false,
+    options: [{ text: "Select One", disabled: true }, { text: "Blue" }, { text: "Red" }] });
+  const act = makeFakeAct([optDd], { aiEnabled: true, ai: '{"choice":"Red"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  assert.strictEqual(out.results[0].after, "Blue", "the remembered value fills the optional field");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "AI not consulted (bank hit); AI would have left it blank anyway");
+});
+
+test("M3 bank: a MAPPED field ignores the bank (the question-keyed bank is for UNMAPPED fields only)", async () => {
+  const bank = { "city": { value: "Chicago", widgetType: "text" } };
+  const cityF = { wrapperSel: "[w-city]", fieldName: "city", widgetType: "text", isRequired: false, label: "City", value: "" };
+  const act = makeFakeAct([cityF], {}); // AI off, no profile city
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  assert.notStrictEqual(out.results[0].after, "Chicago", "mapped 'city' uses the profile path (empty here), never the bank");
+});

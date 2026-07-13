@@ -1688,6 +1688,9 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // (not every fill — the "fast, especially hidden" constraint). headingToBase lets the pre-mount
   // cache check work for an empty section (base unknown until mounted → matched by heading).
   const priorSum = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+  // Profile Learning (M3): the remembered-answer bank (human-confirmed answers to UNMAPPED fields on
+  // prior applications, keyed by question text). drivePageFill consults it before the AI fallback.
+  const answerBank = await new Promise((resolve) => chrome.storage.local.get("answerBank", (r) => resolve((r && r.answerBank && typeof r.answerBank === "object") ? r.answerBank : {})));
   const cachedShapes = (priorSum && priorSum.section_shapes) || {};
   const headingToBase = {};
   for (const e of ((priorSum && priorSum.entries) || [])) {
@@ -1696,7 +1699,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // (The act.attachStoredResume seam — the TEST-ONLY per-cert résumé attach — was verified live
   // 2026-07-02 and then REMOVED with the profile test data. The résumé attaches ONLY to the
   // top-level Documents field, via the post-fill step below.)
-  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
+  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, answerBank });
 
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report

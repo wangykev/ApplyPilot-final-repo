@@ -30,7 +30,8 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
-      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders };
+      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
+      getRememberedAnswer: getRememberedAnswer }; // Profile Learning: the answer-bank consult (M3)
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -2190,10 +2191,37 @@ function makeStartCapture(act, loc) {
 // reach (the live nested-Specialty miss, 2026-07-01). Same targeted-mode skips as onlyFieldNames
 // (no unknown-section stubs / cascade / sweep / inline audit — the Save & Continue retry verifies).
 // Default (no opts) = the full page fill, unchanged.
+// Profile Learning (M3): fill a field from a REMEMBERED answer-bank entry. The remembered value is
+// a CANDIDATE run through the SAME deterministic fill (match ladder vs the LIVE options) — never a
+// blind commit. Returns the fill result tagged `remembered` (provenance) ONLY on a real commit; a
+// no-match / failure returns null so the caller falls through to the AI post-pass / blank exactly as
+// today. Trusted: an EXACT match stays `filled` (unflagged, not in review); an ambiguous containment/
+// fuzzy match keeps the fill's `filled_review` (the live option set may differ from where it was
+// remembered — that ambiguity still warrants a look). Checkbox is handled by the M0 checkbox rule.
+const fillFromRemembered = async (act, loc, f, remembered, budgets) => {
+  const value = String(remembered && remembered.value != null ? remembered.value : "");
+  if (value.trim() === "") return null;
+  let res = null;
+  if (f.widgetType === "dropdown") res = await fillDropdownCdp(act, loc, [value], budgets);
+  else if (f.widgetType === "radio") res = await fillRadioCdp(act, loc, [value], budgets);
+  else if (f.widgetType === "text") res = await fillTextCdp(act, loc, value, budgets);
+  else if (f.widgetType === "textarea") res = await fillTextCdp(act, loc, value, budgets, "textarea");
+  else if (f.widgetType === "typeahead") {
+    const cap = makeStartCapture(act, loc);
+    res = await fillTypeaheadCdp(act, loc, [value], budgets, { onCapture: cap.onCapture }); // NO opts.ai → deterministic candidate only, no AI rescue
+    if (res && (res.status === "filled" || res.status === "filled_review")) { const ro = cap.reviewOptions(); if (ro && ro.length) res.options = ro; }
+  } else return null;
+  if (!res || (res.status !== "filled" && res.status !== "filled_review")) return null; // no commit → fall through to AI/blank
+  res.flag = "remembered"; // provenance — NOT an ai-* flag, so the viewer shows a "remembered" badge, not an AI one
+  res.detail = "Remembered from a prior application" + (res.detail ? " · " + res.detail : "");
+  return res;
+};
+
 async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
   const only = opts && opts.onlyFieldNames ? opts.onlyFieldNames : null; // AI-4 targeted re-fill
   const onlySec = opts && opts.onlySections ? opts.onlySections : null;  // AI-4 Tier-1.5 section re-fill
+  const answerBank = (opts && opts.answerBank && typeof opts.answerBank === "object") ? opts.answerBank : {}; // Profile Learning (M3): remembered answers for unmapped fields
   const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
   const scan = await act.scanPage();
   const results = [];
@@ -2317,6 +2345,24 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     } catch (e) {
       record.status = "error";
       record.detail = String(e);
+    }
+
+    // ── ANSWER-BANK CONSULT (Profile Learning M3) ── BEFORE any AI: if the deterministic pass
+    // produced nothing usable and this UNMAPPED field has a REMEMBERED answer (a human confirmed it
+    // on a prior application, keyed by question text), fill it. The remembered value is a CANDIDATE
+    // through the SAME match ladder vs the LIVE options (never blind) — a no-match falls through to
+    // the AI post-pass / blank below, exactly as today. Runs for REQUIRED **and OPTIONAL** fields
+    // (unlike AI): the human explicitly chose to remember it, so an optional remembered answer fills
+    // too. A human-confirmed memory beats a fresh AI guess → this runs first. `!mappedPath` so a
+    // mapped-but-no-match field goes to CANONICALIZE (below), not the question-keyed bank.
+    if (producedNothing(record) && !mappedPath) {
+      const remembered = apMatch.getRememberedAnswer(answerBank, f.label);
+      if (remembered) {
+        try {
+          const bankRes = await fillFromRemembered(act, loc, f, remembered, budgets);
+          if (bankRes) Object.assign(record, bankRes);
+        } catch (e) { /* leave the record as-is → the AI post-pass / blank handles it */ }
+      }
     }
 
     // ── AI FALLBACK ── if AI is ON and the deterministic pass produced NOTHING usable. Additive +
