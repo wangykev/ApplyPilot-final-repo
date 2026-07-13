@@ -166,6 +166,25 @@ function rememberTarget(entry) {
   return { eligible: true, target: "profile" };
 }
 
+// Profile Learning (M2b): dotted-path get/set for the flat mapped-field profile write-back — save a
+// human's CORRECTION to a mapped field (e.g. "personal_info.state_province") back into the profile so
+// it fills right next time. PURE; setByPath mutates + returns the root (creating intermediate
+// objects). Only used for FLAT scalar paths (repeating [index] entries aren't offered write-back).
+function getByPath(obj, path) {
+  return String(path == null ? "" : path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+function setByPath(obj, path, value) {
+  const keys = String(path == null ? "" : path).split(".");
+  const root = (obj && typeof obj === "object") ? obj : {};
+  let o = root;
+  for (let i = 0; i < keys.length - 1; i++) {
+    if (o[keys[i]] == null || typeof o[keys[i]] !== "object") o[keys[i]] = {};
+    o = o[keys[i]];
+  }
+  o[keys[keys.length - 1]] = value;
+  return root;
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords, rememberTarget };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords, rememberTarget, getByPath, setByPath };
 }

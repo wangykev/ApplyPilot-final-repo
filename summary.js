@@ -24,6 +24,7 @@
 const root = document.getElementById("root");
 let currentBundle = null;            // the loaded reviewSummary, mutated in place on edit
 let currentBank = {};                // Profile Learning: the answerBank (remembered unmapped answers), loaded alongside the bundle
+let currentProfile = {};             // Profile Learning: the profile, for the flat mapped-field write-back (M2b)
 let lastRunAbort = null;             // { reason, detachReason, at } if the last run was cut short (operator Cancel/X → debugger detach)
 let currentFilter = "all";           // all | review | edited
 const collapsed = new Set();         // section keys the user collapsed
@@ -68,6 +69,8 @@ const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle })
 // answers persist across applications, the bundle is per-run. The viewer writes it directly (same
 // as reviewSummary); the SW reads it into the fill (the consume tier).
 const persistBank = () => chrome.storage.local.set({ answerBank: currentBank });
+// Profile Learning (M2b): persist a mapped-field CORRECTION saved back into the profile.
+const persistProfile = () => chrome.storage.local.set({ profile: currentProfile });
 // Profile Learning: if a field is currently REMEMBERED and its value is edited, keep the bank in
 // sync — re-save the new value, or forget it if the edit cleared the field. No-op for a field that
 // isn't a bank-remember target or isn't currently remembered. (rememberTarget = summary-lib global;
@@ -585,28 +588,42 @@ const statusOf = (e) => {
 // summary-lib global; isRememberableWidget/getRememberedAnswer/put/deleteRememberedAnswer =
 // lib.js globals (lib.js is loaded before this script in summary.html).
 const rememberControl = (e) => {
-  if (rememberTarget(e).target !== "bank" || !isRememberableWidget(e.widget_type)) return null;
+  const plan = rememberTarget(e);
+  if (!plan.eligible || !isRememberableWidget(e.widget_type)) return null;
+  if (plan.target === "profile") {
+    // A mapped field's value already lives in the profile — only offer a write-back for an EDITED
+    // scalar (a human CORRECTION), and never clobber a TIERED (array) profile value with a string. [M2b]
+    const kind = editKindOf(e);
+    if (kind !== "override" && kind !== "filled_blank") return null;
+    if (Array.isArray(getByPath(currentProfile, plan.path))) return null;
+  }
   const wrap = el("div", { class: "remember" });
   const lb = el("label", { class: "rem-lb" });
   const cb = el("input", { type: "checkbox", class: "rem-cb" });
-  cb.checked = !!getRememberedAnswer(currentBank, e.question_label);
-  wrap.classList.toggle("on", cb.checked);
   lb.appendChild(cb);
-  lb.appendChild(document.createTextNode("Remember this answer"));
+  lb.appendChild(document.createTextNode(plan.target === "profile" ? "Save this correction to my profile" : "Remember this answer"));
   wrap.appendChild(lb);
-  if (e.sensitive) wrap.appendChild(el("span", { class: "rem-warn", text: "⚠ demographic/legal — reused verbatim on future applications" }));
+  if (e.sensitive && plan.target === "bank") wrap.appendChild(el("span", { class: "rem-warn", text: "⚠ demographic/legal — reused verbatim on future applications" }));
+  // checked state derived live: bank → an entry exists; profile → the profile holds this exact value.
+  const isOn = () => plan.target === "bank"
+    ? !!getRememberedAnswer(currentBank, e.question_label)
+    : getByPath(currentProfile, plan.path) === e.current_value;
+  const sync = () => { cb.checked = isOn(); wrap.classList.toggle("on", cb.checked); };
+  sync();
   cb.addEventListener("change", () => {
-    if (cb.checked) {
-      currentBank = putRememberedAnswer(currentBank, {
-        label: e.question_label, value: e.current_value, widgetType: e.widget_type,
-        questionText: e.question_label, sensitive: !!e.sensitive, savedAt: Date.now()
-      });
-    } else {
-      currentBank = deleteRememberedAnswer(currentBank, e.question_label);
+    if (plan.target === "bank") {
+      currentBank = cb.checked
+        ? putRememberedAnswer(currentBank, { label: e.question_label, value: e.current_value, widgetType: e.widget_type, questionText: e.question_label, sensitive: !!e.sensitive, savedAt: Date.now() })
+        : deleteRememberedAnswer(currentBank, e.question_label);
+      persistBank();
+    } else { // profile write-back — save the correction, or revert to the pre-save value on untick
+      if (cb.checked) { e._profile_prev = getByPath(currentProfile, plan.path); setByPath(currentProfile, plan.path, e.current_value); }
+      else { setByPath(currentProfile, plan.path, e._profile_prev !== undefined ? e._profile_prev : e.original_ai_value); }
+      persistProfile();
     }
     wrap.classList.toggle("on", cb.checked);
-    persistBank();
   });
+  addRefresher(e.field_id, sync); // keep the checked state fresh when the value is edited (commit fires refreshers)
   return wrap;
 };
 
@@ -940,5 +957,6 @@ const load = () => {
     currentBank = (answerBank && typeof answerBank === "object") ? answerBank : {};
     render();
   });
+  chrome.storage.local.get("profile", ({ profile }) => { currentProfile = (profile && typeof profile === "object") ? profile : {}; });
 };
 load();

@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords, rememberTarget } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords, rememberTarget, getByPath, setByPath } = require("../summary-lib.js");
 
 // ── 2b: operator-added repeating-section entries ──
 test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
@@ -215,4 +215,22 @@ test("rememberTarget: empty / deleted / operator-added → not eligible", () => 
   assert.strictEqual(rememberTarget({ canonical_field: null, current_value: null }).eligible, false, "null value");
   assert.strictEqual(rememberTarget({ canonical_field: null, current_value: "Yes", is_deleted: true }).eligible, false, "soft-deleted");
   assert.strictEqual(rememberTarget({ canonical_field: null, current_value: "Yes", is_added: true }).eligible, false, "operator-added stub");
+});
+
+// ── Profile Learning M2b: dotted-path get/set for the profile write-back ──
+test("getByPath: reads a nested dotted path; undefined for a missing branch", () => {
+  const p = { personal_info: { city: "Chicago" }, self_identification: { gender: "Male" } };
+  assert.strictEqual(getByPath(p, "personal_info.city"), "Chicago");
+  assert.strictEqual(getByPath(p, "self_identification.gender"), "Male");
+  assert.strictEqual(getByPath(p, "personal_info.state"), undefined);
+  assert.strictEqual(getByPath(p, "missing.deep.path"), undefined);
+});
+test("setByPath: sets a value, creating intermediate objects; mutates + returns the root", () => {
+  const p = { personal_info: { city: "Chicago" } };
+  const r = setByPath(p, "personal_info.state_province", "Illinois");
+  assert.strictEqual(r, p, "returns the same root (mutates in place)");
+  assert.strictEqual(p.personal_info.state_province, "Illinois");
+  assert.strictEqual(p.personal_info.city, "Chicago", "siblings untouched");
+  setByPath(p, "self_identification.gender", "Male"); // intermediate object created
+  assert.strictEqual(p.self_identification.gender, "Male");
 });
