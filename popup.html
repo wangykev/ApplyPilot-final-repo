@@ -10,6 +10,14 @@
       hr { margin: 10px 0; border: none; border-top: 1px solid #ddd; }
       .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin: 2px 0 6px; }
       #status { font-size: 12px; color: #333; white-space: pre-wrap; min-height: 1.4em; }
+      /* Profile Learning: remembered-answers manager */
+      .saved-answers { max-height: 180px; overflow-y: auto; margin: 2px 0 6px; }
+      .saved-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 6px; padding: 5px 0; border-bottom: 1px solid #eee; font-size: 11px; }
+      .saved-q { font-weight: 560; color: #333; }
+      .saved-v { color: #666; grid-column: 1; }
+      .saved-badge { font-size: 9px; font-weight: 700; color: #b4451f; border: 1px solid #e6c3b6; border-radius: 3px; padding: 0 3px; }
+      .saved-rm { width: auto; margin: 0; padding: 2px 8px; grid-row: 1 / span 2; grid-column: 2; align-self: center; font-size: 11px; }
+      .saved-empty { font-size: 11px; color: #999; padding: 4px 0; }
     </style>
   </head>
   <body>
@@ -123,6 +131,12 @@
     <label for="company">Company for this application (temporary):</label>
     <input id="company" type="text" placeholder="e.g. Cambium Learning">
     <button id="set-company">Set company</button>
+    <hr>
+    <!-- Profile Learning: the answerBank — questions the operator chose to "Remember" in the review
+         page, reused on future applications. This is the manager: list + per-item forget + clear all. -->
+    <div class="section-title">Remembered answers <span id="saved-count"></span></div>
+    <div id="saved-answers" class="saved-answers"></div>
+    <button id="saved-clear">Forget all remembered answers</button>
     <div id="status"></div>
     <script src="db.js"></script>
     <script src="llm.js"></script>

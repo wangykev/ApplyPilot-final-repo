@@ -468,3 +468,38 @@ document.getElementById("cdp-onboard").addEventListener("click", () => {
     }
   });
 });
+
+// ── Profile Learning: the "remembered answers" manager (the answerBank) ──────────
+// List every answer the operator chose to "Remember" on the review page (keyed by question text),
+// with a per-item Forget and a clear-all. Read/write chrome.storage.local.answerBank directly (the
+// bank is a flat { normKey → {value, questionText, sensitive, ...} } map — deleting is `delete
+// bank[key]`, no helper needed here). Renders on popup open + after every mutation.
+const savedAnswersEl = document.getElementById("saved-answers");
+const savedCountEl = document.getElementById("saved-count");
+const renderSavedAnswers = () => {
+  chrome.storage.local.get("answerBank", ({ answerBank }) => {
+    const bank = (answerBank && typeof answerBank === "object") ? answerBank : {};
+    const keys = Object.keys(bank).sort();
+    savedCountEl.textContent = keys.length ? "(" + keys.length + ")" : "";
+    savedAnswersEl.textContent = "";
+    if (!keys.length) {
+      savedAnswersEl.appendChild(Object.assign(document.createElement("div"), { className: "saved-empty", textContent: "Nothing remembered yet. Tick “Remember this answer” on a field in the review page." }));
+      return;
+    }
+    for (const k of keys) {
+      const entry = bank[k] || {};
+      const row = document.createElement("div"); row.className = "saved-row";
+      const q = document.createElement("div"); q.className = "saved-q"; q.textContent = entry.questionText || k;
+      if (entry.sensitive) { q.appendChild(document.createTextNode(" ")); q.appendChild(Object.assign(document.createElement("span"), { className: "saved-badge", textContent: "sensitive" })); }
+      const v = document.createElement("div"); v.className = "saved-v"; v.textContent = "→ " + (entry.value == null ? "" : String(entry.value));
+      const rm = Object.assign(document.createElement("button"), { className: "saved-rm", textContent: "Forget" });
+      rm.addEventListener("click", () => { delete bank[k]; chrome.storage.local.set({ answerBank: bank }, renderSavedAnswers); });
+      row.appendChild(q); row.appendChild(v); row.appendChild(rm);
+      savedAnswersEl.appendChild(row);
+    }
+  });
+};
+document.getElementById("saved-clear").addEventListener("click", () => {
+  chrome.storage.local.set({ answerBank: {} }, () => { setStatus("Forgot all remembered answers."); renderSavedAnswers(); });
+});
+renderSavedAnswers();
