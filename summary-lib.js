@@ -56,10 +56,15 @@ function effectiveValue(entry) {
   };
 }
 
-// Which entries demand an EXPLICIT human approval before submit: the flagged ones (needs_review),
-// minus soft-deleted. Un-flagged fields are approved-by-default (lower friction — the operator
-// decision). super-hard / sensitive / needs-answer are ALL needs_review, so they're covered here.
-const requiresApproval = (e) => !e.is_deleted && !!e.needs_review;
+// A cascade-REVEALED field (M6): it appeared only after another value committed, so it never went
+// through the operator's eyes on the first pass — force a second review even if it filled cleanly.
+const isCascadeRevealed = (e) => !!(e && e.cascade_revealed);
+
+// Which entries demand an EXPLICIT human approval before submit: the flagged ones (needs_review) AND
+// any cascade-revealed field, minus soft-deleted. Un-flagged fields are approved-by-default (lower
+// friction — the operator decision). super-hard / sensitive / needs-answer are ALL needs_review, so
+// they're covered here; cascade-revealed is added so a cleanly-filled revealed field still forces review.
+const requiresApproval = (e) => !e.is_deleted && (!!e.needs_review || isCascadeRevealed(e));
 
 // Approval roll-up for the envelope + the viewer's progress UI. PURE over the entries.
 // submit_ready = every field that requires approval IS approved AND no required field still
@@ -87,6 +92,22 @@ const submitReady = (entries) => approvalEnvelope(entries).submit_ready;
 const _idstr = (e) => String((e && e.field_id) || "") + "|" + String((e && e.canonical_field) || "");
 const isCurrentlyWorkHere = (e) => !!e && e.widget_type === "checkbox" && /currentlyworkhere|currently_work_here/i.test(_idstr(e));
 const isWorkExpEndDate = (e) => !!e && /workexperience\[\d+\]\.(to|enddate)\b/i.test(_idstr(e));
+
+// #3 (UI): "I have a preferred name" reveals the preferred first/last fields (a cascade). When that
+// checkbox is UNCHECKED the form hides them, so the review should too. Hide a preferred-name field when
+// its controlling preferredCheck (same page) is present AND unchecked. Mirrors the visibleEntryItems
+// "currently work here → hide the To date" pattern, but for these two flat fields. Pure → unit-tested.
+// Match the FIELD-NAME tail (after the last "formField-") + the canonical path — NOT the whole field_id.
+// The field_id's PAGE-KEY prefix (cdpPageKey = "pathname|sorted-field-names") LISTS every flat field name,
+// so testing "preferredName--" against the full field_id matched EVERY page-1 field → it hid the ENTIRE page.
+const _ffName = (e) => { const id = String((e && e.field_id) || ""); const i = id.lastIndexOf("formField-"); return i !== -1 ? id.slice(i + "formField-".length) : id; };
+const isPreferredNameField = (e) => !!e && (/^preferred_?name--/i.test(_ffName(e)) || /preferred_(first|last)_name/i.test(sumNorm(e.canonical_field)));
+const isPreferredCheckField = (e) => !!e && e.widget_type === "checkbox" && (/^preferredcheck$/i.test(_ffName(e)) || /has_preferred_name/i.test(sumNorm(e.canonical_field)));
+function isHiddenPreferredName(e, entries) {
+  if (!isPreferredNameField(e)) return false;
+  const ctrl = (entries || []).find((x) => isPreferredCheckField(x) && x.page === e.page);
+  return !!ctrl && !checkedOf(ctrl.current_value); // controlling checkbox present + UNCHECKED → hide the field
+}
 
 // Given one repeating-entry's fields, return the ones to SHOW: when "I currently work here" is
 // CHECKED, drop the endDate ("To") field — EXCEPT keep it if it's flagged needs_review (e.g. the
@@ -149,5 +170,5 @@ function newEntryRecords(shape, meta) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, isPreferredCheckField, visibleEntryItems, newEntryRecords };
 }

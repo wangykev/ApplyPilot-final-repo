@@ -343,3 +343,46 @@ test("STRUCTURED: a generated-id My-Info span (key matches no form-field name) f
   assert.strictEqual(r.counts.agree, 1);
   assert.strictEqual(r.agree[0].tier, "text", "value-presence fallback, not a keyed match");
 });
+
+// ── EMAIL VERIFY: Workday pre-fills the applicant email from the signup ACCOUNT (not in the bundle). ──
+test("EMAIL: a displayed email matching an account email → agree (account-email tier), NOT extra", () => {
+  const r = reconcileReviewPage(
+    [rrec({ value: "wangykev@gmail.com", section: "Email Address" })],
+    [], // no bundle entry claims it (the pre-filled account email)
+    { accountEmails: ["wangykev@gmail.com", "wangykev+magna@gmail.com"] }
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "account-email");
+  assert.strictEqual(r.counts.disagree, 0);
+  assert.strictEqual(r.counts.extra_on_review, 0, "a verified account email is not EXTRA noise");
+});
+
+test("EMAIL: a displayed email that is NOT an account email → disagree (wrong contact email blocks submit)", () => {
+  const r = reconcileReviewPage(
+    [rrec({ value: "someone.else@example.com", section: "Email Address" })],
+    [],
+    { accountEmails: ["wangykev@gmail.com"] }
+  );
+  assert.strictEqual(r.counts.disagree, 1);
+  assert.strictEqual(r.disagree[0].value_review, "someone.else@example.com");
+});
+
+test("EMAIL: match is case-insensitive", () => {
+  const r = reconcileReviewPage(
+    [rrec({ value: "WangYKev@Gmail.com", section: "Email Address" })],
+    [],
+    { accountEmails: ["wangykev@gmail.com"] }
+  );
+  assert.strictEqual(r.counts.agree, 1);
+  assert.strictEqual(r.agree[0].tier, "account-email");
+});
+
+test("EMAIL: with NO accountEmails supplied the pass is skipped (email stays EXTRA — prior behavior, backward-compat)", () => {
+  const r = reconcileReviewPage(
+    [rrec({ value: "wangykev@gmail.com", section: "Email Address" })],
+    []
+  );
+  assert.strictEqual(r.counts.agree, 0);
+  assert.strictEqual(r.counts.disagree, 0);
+  assert.strictEqual(r.counts.extra_on_review, 1);
+});

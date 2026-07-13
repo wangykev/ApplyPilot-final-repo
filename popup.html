@@ -71,6 +71,11 @@
          page, verifying each field and advancing with the guarded Save & Continue — NEVER submits.
          Load page 1 of a filled+reviewed application (fresh), keep it VISIBLE. [CDP-REPLAY-WALK]. -->
     <button id="cdp-replay-walk">CDP replay WALK to review — DRY (all pages; never submits)</button>
+    <!-- M5 ARMED SUBMIT (SIMULATED): replays to review + runs the FULL precondition gate (authorize=true),
+         then — if every check passes — LOGS "▶▶ WOULD CLICK SUBMIT ◀◀" and STOPS. ⚠ Does NOT actually
+         submit yet (simulateSubmit hardcoded on). Load page 1 of a filled+reviewed app, keep VISIBLE.
+         [CDP-REPLAY-WALK]. Flip to a real submit later in the RUN_CDP_SUBMIT handler. -->
+    <button id="cdp-submit">Replay + SUBMIT (armed — SIMULATED: logs "would submit", no real click)</button>
     <hr>
     <div class="section-title">New-tenant recon (read-only)</div>
     <!-- Run FIRST on any new Workday tenant before relying on the fill path. Each dumps

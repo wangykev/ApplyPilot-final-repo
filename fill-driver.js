@@ -4493,6 +4493,19 @@ async function captureChoiceOptions(act, results, budgets) {
 const REVIEW_SCHEMA_VERSION = "1.1"; // 1.1 (Plan 2): + page_number/page_label, is_approved/approved_at. The viewer tolerates 1.0 (missing fields default).
 const ACCEPTED_SCHEMA_VERSIONS = ["1.0", "1.1"]; // M4 submit gate accepts these (the viewer's documented tolerance); anything else = stale build → block.
 
+// isTransientRenderFailure — are ALL these failing records TRANSIENT render-flakes (retryable via a page
+// RELOAD) rather than terminal (a genuine no-match / real error / session death, which must halt)? The
+// flake: a choice widget whose option list never rendered ("options did not render" /
+// "skipped_no_option_match" — a Workday render race a reload clears; live-seen on Magna page-2 language
+// proficiencies). Returns false when there are NO failures, or when ANY failure is terminal — so a reload
+// can NEVER mask a real problem. Used by both walks' bounded reload-retry (operator ask 2026-07-11). PURE.
+const RENDER_FLAKE_RX = /options did not render|skipped_no_option_match/i;
+function isTransientRenderFailure(records) {
+  const fails = (records || []).filter((r) => r && (r.status === "needs_review" || r.status === "error"));
+  if (!fails.length) return false;
+  return fails.every((r) => RENDER_FLAKE_RX.test(String((r && r.detail) || "") + " " + String((r && r.flag) || "")));
+}
+
 // submitPrecondition (M4) — the ORDERED gate for the ONE irreversible click (act.clickSubmit). PURE:
 // every input is passed in; returns { ok, blockers[] } (blockers = human-readable reasons, logged for
 // the operator). ALL conditions must pass. This is the safety surface — clickSubmit fires ONLY when
@@ -4520,8 +4533,10 @@ function submitPrecondition(bundle, liveState, findings, opts) {
   // 5. every field that requires approval IS approved. requiresApproval = needs_review && !deleted
   //    (mirrors summary-lib requiresApproval); super-hard / legally-loaded / needs-answer / eeo-guess
   //    are ALL needs_review, so this single check covers the whole mustReplace class.
-  const unapproved = entries.filter((e) => e.needs_review && !e.is_approved);
-  if (unapproved.length) blockers.push(`${unapproved.length} flagged field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
+  // needs_review OR cascade_revealed (M6: a revealed field forces a second review even if it filled
+  // cleanly) must be human-approved — mirrors summary-lib requiresApproval so the gate and the viewer agree.
+  const unapproved = entries.filter((e) => (e.needs_review || e.cascade_revealed) && !e.is_approved);
+  if (unapproved.length) blockers.push(`${unapproved.length} flagged/revealed field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
   // 6. no unreplaced AI placeholder — in the BUNDLE, and (belt-and-suspenders) on the LIVE page.
   const bundlePh = apMatch.unreplacedPlaceholders(entries) || [];
   if (bundlePh.length) blockers.push(`${bundlePh.length} unreplaced AI placeholder(s) in the bundle`);
@@ -4872,6 +4887,7 @@ function buildReviewBundle(results, meta) {
       detail: rec.detail != null ? rec.detail : null,
       match_tier: rec.matchTier != null ? rec.matchTier : null,
       flag: rec.flag != null ? rec.flag : null, // PROVENANCE (was dropped) — the viewer badges "AI-INFERRED" off flag.startsWith("ai-")
+      cascade_revealed: !!rec.cascadeRevealed, // M6: this field appeared only AFTER an earlier value committed (cascade re-scan) → the viewer badges it + it FORCES a second review before submit
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
@@ -4926,5 +4942,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
 }

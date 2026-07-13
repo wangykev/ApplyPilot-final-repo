@@ -369,3 +369,81 @@ Live-verified on Magna wd3: after the value-presence + label-anchor + region/dig
 the fill committed reconciles as AGREE (My Information, work/education/certification, screening
 questions, résumé), with the check going quiet except for genuinely-unrecorded page values. Unit suite
 green.
+
+## 2026-07-12 — Strict-replay SUBMIT pipeline (M2–M6) + review-check section-scoped rewrite + reload-retry
+
+The third pipeline stage — **fill → review → submit** — built end-to-end and live-verified in SIMULATE
+mode on Magna wd3 (a 4-page application). Source of truth at submit = the human-approved `reviewSummary`
+bundle, NEVER the profile. Unit suite 587 green (`node:test`).
+
+**M2 — `replayField` + repeating replay + skip-if-correct.** `replayField(act, entry, budgets)` replays one
+approved bundle entry via the correct per-widget handler; the value is a SINGLE candidate through the match
+ladder, so a live no-match → `needs_review` (STOP, never guess). Repeating sections: `bundleToSectionItems`
+reconstructs the profile-shaped `items` from the bundle (drops `is_deleted`, re-indexes, reconstructs nested
+cert specialties, includes Feature-B added entries), fed into `driveRepeatingSectionCdp` with STRICT
+overrides (`deleteOnNoMatch:false`, `aiContext:null`). A section the operator DELETED in review reconciles
+the live form DOWN TO 0 (was skipped → the "cert did not delete" bug). **skip-if-correct** (`budgets.skipIfCorrect`,
+on for replay): every handler reads the live value first and leaves an already-correct field UNTOUCHED
+(zero actuation) — `textValuesMatch` is phone-format-tolerant so Workday's `(850) 666-0266` == stored
+`8506660266`; wired into `fillTextCdp`/`fillRadioCdp`/`fillDateCompositeCdp` (checkbox/dropdown/typeahead
+self-skip via their keep-guards) so page-2 repeating entries no longer fully re-fill.
+
+**M3 — `runCdpReplayWalk` (DRY replay walk).** Clones the fill walk (maintenance / session-dead /
+review-terminal guards, `cdpWaitNextPage`, guarded `clickPageNext`, input-lock, detach-in-finally) but reads
+the APPROVED bundle, runs NO AI / NO AI-4 remediation, and HALTS rather than guessing. Per page:
+`selectPageBundleEntries` (pure) matches the live page to ONE bundle page-group by FLAT-field-name overlap +
+live-SECTION overlap (repeating pages have no flat fields) — robust to a cascade reveal having changed the
+field-set key (max overlap, not exact); entry ordinal comes from the `-N-panel` heading, never the global
+fkitNum. Strict per-field verify: any field that didn't replay cleanly HALTS (`replay-mismatch`); a
+nav-timeout = a required field empty (likely a cascade-revealed field the bundle doesn't cover) → HALT
+(`replay-blocked`). Résumé re-attached (`replayField` defers file_upload). Stops at review; NEVER submits.
+
+**M4 — `clickSubmit(authorize)` + `submitPrecondition` gate.** `act.clickSubmit(authorize)` (cdp.js) is the
+EXACT inverse of `clickPageNext`: fires only when the review marker is present AND `authorize===true`, then
+clicks `pageFooterNextButton` (which IS Submit on review). Pure `submitPrecondition(bundle, liveState,
+findings, opts)` → `{ok, blockers[]}`, ALL must pass: authorize · on review · session alive / not maintenance
+· accepted `schema_version` (1.0/1.1) · every `needs_review` OR `cascade_revealed` field approved · no
+unreplaced AI placeholder (bundle + a live page-text scan) · **review-page EQUALITY** (see below) · zero
+cascade-revealed / replay-mismatch · single-fire. Heaviest unit coverage — the safety surface.
+
+**M5 — armed "Replay + SUBMIT" popup button.** `RUN_CDP_SUBMIT` → `runCdpReplayWalk({authorize:true,
+simulateSubmit:true})`. ⚠ `simulateSubmit:true` is HARDCODED in the handler: at the review terminal the walk
+runs the FULL gate and logs `▶▶ WOULD CLICK SUBMIT ◀◀` but NEVER calls `clickSubmit` (the simulate branch
+returns before it). Going live = flip that ONE flag + the eyes-on disposable-app hard gate. Live-verified:
+4 pages replayed (skip-if-correct kept the correct fields) → review-check AGREE all / DISAGREE 0 / MISSING 0
+→ gate passed → would-submit, nothing submitted.
+
+**M6 — cascade-revealed review polish.** A field revealed AFTER another value committed (M1 cascade, e.g.
+Country → the Cyrillic-name fields) never passed the operator's eyes on the first fill, so it must be
+reviewed before submit even if it filled cleanly. `buildReviewBundle` now carries `cascade_revealed` onto the
+entry (was dropped); summary.js shows a "⤴ REVEALED" badge; summary-lib `requiresApproval` AND the M4 gate
+force its approval. The cascade re-scan loop is multi-round (`maxCascadeRounds`), so a chained reveal during a
+re-fill is caught; a reveal during the submit REPLAY halts safely (`replay-blocked`).
+
+**Review-page CHECK — section/entry-scoped rewrite + account-email verify.** The flat, heuristic scraper
+mislabeled and missed repeats, giving 3 false positives on a correct page (the two-language "I am fluent"
+checkbox, the hashed screening questions). Rewrote `cdpReadReviewPage` to emit STRUCTURED records off the
+review DOM's clean hooks (value-span `id` = form-field name; `label[for]`/richText ENTRY/ROW-scoped — never
+document-wide; entry ordinal from the `role="group"` `-N-panel` heading, NOT the global `data-fkit-id` num;
+section from h3/h4). `reconcileReviewPage` matches id/entry-scoped first — (a) flat: `field_id` tail ===
+value-span id; (b) repeating: section (via `CANONICAL_TO_FKIT`, website↔webAddress) + ordinal, THEN
+key-or-label WITHIN the entry — with the legacy value-presence preserved as fallback for the generated-id
+My-Information fields. **Account-email verify** (operator ask): the pre-filled signup email is checked vs the
+login credentials / `auth_strategy.account_email` / `personal_info.email` — a match → agree (`account-email`
+tier, no longer EXTRA noise), a mismatch → disagree (BLOCKS the gate). Both consumers (the read-only CHECK
+button + the M4 submit gate) feed it `accountEmails`.
+
+**Reload-retry on a transient render-flake (fill + submit walks).** A choice widget whose option list never
+renders (`options did not render` / `skipped_no_option_match`) is a Workday RENDER FLAKE, not a real no-match
+(live-seen on Magna page-2 language proficiencies — the replay correctly halted, a manual reload+re-run then
+completed). `isTransientRenderFailure` (pure) is true iff there ARE failures and EVERY one is a render-flake
+(any terminal failure → false → still halts). Because a Workday reload returns to PAGE 1, on a transient the
+walk `reloadAndSettle`s + RESTARTS the whole walk from page 1 via a labeled `restartWalk` loop, bounded per
+run (`MAX_RELOAD_RETRIES=2`); skip-if-correct / the already-filled sweep make the good pages fast on the
+restart. Terminal failures still halt for the operator.
+
+**Review UI — hide preferred first/last when the checkbox is unchecked.** "I have a preferred name" reveals
+the preferred first/last fields; unchecked → the form hides them, so the review does too (`isHiddenPreferredName`
+— match the field-NAME tail + canonical, NOT the whole `field_id`, whose cdpPageKey prefix lists every flat
+field name and would hide the ENTIRE page). Toggling it in the viewer re-renders (like "I currently work
+here") so the rows hide/show live.

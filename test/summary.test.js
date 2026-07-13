@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
 
 // ── 2b: operator-added repeating-section entries ──
 test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
@@ -107,6 +107,48 @@ test("requiresApproval: flagged yes; un-flagged approved-by-default (no); delete
   assert.strictEqual(requiresApproval({ needs_review: true }), true);
   assert.strictEqual(requiresApproval({ needs_review: false }), false);          // un-flagged → approved by default
   assert.strictEqual(requiresApproval({ needs_review: true, is_deleted: true }), false);
+});
+
+test("#3: preferred first/last are HIDDEN when 'I have a preferred name' is unchecked (mirror the form)", () => {
+  const check = (val) => ({ field_id: "P1::formField-preferredCheck", canonical_field: "personal_info.has_preferred_name", widget_type: "checkbox", current_value: val, page: "P1" });
+  const fName = { field_id: "P1::formField-preferredName--firstName", canonical_field: "personal_info.preferred_first_name", widget_type: "text", current_value: "John", page: "P1" };
+  // unchecked → hidden
+  let es = [check("false"), fName];
+  assert.strictEqual(isHiddenPreferredName(fName, es), true);
+  // checked → shown
+  es = [check("true"), fName];
+  assert.strictEqual(isHiddenPreferredName(fName, es), false);
+  // no controlling checkbox present → shown (don't hide blindly)
+  assert.strictEqual(isHiddenPreferredName(fName, [fName]), false);
+  // a non-preferred field is never hidden by this rule
+  assert.strictEqual(isHiddenPreferredName({ field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", page: "P1" }, [check("false")]), false);
+});
+
+test("#3 (bug fix): a REALISTIC field_id whose page-key prefix LISTS preferredName--* must not hide the whole page", () => {
+  // The real field_id embeds cdpPageKey = "pathname|sorted-field-names", which contains preferredName--firstName
+  // etc. Testing the WHOLE field_id matched every page-1 field → the entire page vanished. Match the tail only.
+  const pk = "/apply|country,legalName--firstName,preferredCheck,preferredName--firstName,preferredName--lastName,source";
+  const mk = (name, cf, wt, val) => ({ field_id: pk + "::formField-" + name, canonical_field: cf, widget_type: wt || "text", current_value: val, page: pk });
+  const check = mk("preferredCheck", "personal_info.has_preferred_name", "checkbox", "false");
+  const pref = mk("preferredName--firstName", "personal_info.preferred_first_name", "text", "John");
+  const legal = mk("legalName--firstName", "personal_info.first_name", "text", "Kevin");
+  const src = mk("source", "personal_info.how_did_you_hear", "hierarchical", "LinkedIn");
+  const all = [check, pref, legal, src];
+  assert.strictEqual(isHiddenPreferredName(pref, all), true, "the preferred-name field IS hidden");
+  assert.strictEqual(isHiddenPreferredName(legal, all), false, "legalName must NOT be hidden (this was the whole-page bug)");
+  assert.strictEqual(isHiddenPreferredName(src, all), false, "source must NOT be hidden");
+  assert.strictEqual(isHiddenPreferredName(check, all), false, "the checkbox itself is not a preferred-name field");
+});
+
+test("M6: a cascade-REVEALED field FORCES approval even if it filled cleanly (needs_review false)", () => {
+  assert.strictEqual(isCascadeRevealed({ cascade_revealed: true }), true);
+  assert.strictEqual(isCascadeRevealed({ cascade_revealed: false }), false);
+  assert.strictEqual(isCascadeRevealed({}), false);
+  assert.strictEqual(requiresApproval({ needs_review: false, cascade_revealed: true }), true, "revealed → must be reviewed");
+  assert.strictEqual(requiresApproval({ needs_review: false, cascade_revealed: true, is_deleted: true }), false, "deleted → excluded");
+  // and it blocks submit until approved (approvalEnvelope counts it via requiresApproval)
+  const ap = approvalEnvelope([{ needs_review: false, cascade_revealed: true, is_approved: false, is_deleted: false }]);
+  assert.strictEqual(ap.submit_ready, false, "an unapproved revealed field blocks submit");
 });
 
 // ── approvalEnvelope / submitReady ──

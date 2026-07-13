@@ -123,9 +123,10 @@ const commit = (entry, val) => {
   persist();
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
   updateApprovalUI();
-  // "I currently work here" controls whether the entry's "To" row shows — re-render to apply
-  // (mirrors the form removing the To box). render() preserves collapsed state.
-  if (isCurrentlyWorkHere(entry)) render();
+  // A VISIBILITY-controlling checkbox toggled → re-render so the dependent rows show/hide live
+  // (render() preserves collapsed state): "I currently work here" controls the entry's "To" row;
+  // "I have a preferred name" controls the preferred first/last rows (mirrors the form revealing/hiding them).
+  if (isCurrentlyWorkHere(entry) || isPreferredCheckField(entry)) render();
 };
 
 // Plan 2: per-field approval toggle. Sets is_approved + approved_at, persists, refreshes the
@@ -569,6 +570,7 @@ const fieldRow = (e, opts = {}) => {
   if (opts.review) {
     // super-hard shows ALONGSIDE legally-loaded/demographic/needs-answer (never hides them — safety-first)
     if (isSuperHard(e)) lab.appendChild(el("span", { class: "lb superhard", text: e.flag === "ai-closest-forced" ? "AI FORCED" : "LOW-CONF AI" }));
+    if (isCascadeRevealed(e)) lab.appendChild(el("span", { class: "lb cascade", text: "⤴ REVEALED", title: "This field appeared only after an earlier value committed — confirm it." })); // M6: shows ALONGSIDE any AI/sensitive badge
     if (isSensitive(e)) lab.appendChild(el("span", { class: "lb crit", text: "LEGALLY-LOADED" }));
     else if (isEeoGuess(e)) lab.appendChild(el("span", { class: "lb eeo", text: "DEMOGRAPHIC" }));
     else if (needsAnswer(e)) lab.appendChild(el("span", { class: "lb crit", text: "NEEDS ANSWER" }));
@@ -673,7 +675,7 @@ const render = () => {
   }
   if (!bundle || !Array.isArray(bundle.entries)) { root.appendChild(el("div", { class: "empty", text: "No summary yet — run a fill, then open “View last summary”." })); return; }
   const entries = bundle.entries;
-  const live = entries.filter((e) => !e.is_deleted);           // deleted entries drop out of counts/list
+  const live = entries.filter((e) => !e.is_deleted && !isHiddenPreferredName(e, entries)); // deleted + hidden-preferred-name (unchecked) drop out of counts/list
   const removed = entries.length - live.length;
   const editedCount = live.filter((e) => editKindOf(e)).length;
   const reviewCount = live.filter((e) => e.needs_review).length;
@@ -776,7 +778,7 @@ const pageCaptionOf = (items, pg) => { const e = items.find((x) => x.page_label 
 
 const renderFieldList = (mount) => {
   mount.textContent = "";
-  const entries = currentBundle.entries;
+  const entries = currentBundle.entries.filter((e) => !isHiddenPreferredName(e, currentBundle.entries)); // #3: hide preferred first/last when the "I have a preferred name" box is unchecked (mirror the form)
   const pageOrder = [], pages = {};
   for (const e of entries) { if (!pages[e.page]) { pages[e.page] = []; pageOrder.push(e.page); } pages[e.page].push(e); }
   // Plan 2: order pages by page_number (the walk's ordinal) when present, else keep first-
