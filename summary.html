@@ -164,6 +164,12 @@
       .afref:empty { display: none; }
       .afref b { font-weight: 600; }
       .partial-note { font-size: 10px; color: var(--warn); margin-top: 1px; }
+      /* Profile Learning: the per-field "Remember this answer" opt-in */
+      .remember { display: flex; align-items: center; gap: 5px; margin-top: 3px; font-size: 10.5px; color: var(--ink-2); }
+      .remember .rem-lb { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+      .remember input.rem-cb { cursor: pointer; }
+      .remember .rem-warn { color: #b4451f; font-weight: 560; }
+      .remember.on .rem-lb { color: var(--ok); }
       .reason { grid-column: 1 / -1; font-size: 11px; color: var(--muted); margin: 1px 0 2px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
       .jump { appearance: none; border: none; background: transparent; color: var(--accent); font-size: 11px; font-weight: 560; cursor: pointer; padding: 0; white-space: nowrap; }
       .jump:hover { text-decoration: underline; }
@@ -227,6 +233,7 @@
   <body>
     <div class="app"><div id="root"></div></div>
     <script src="db.js"></script>
+    <script src="lib.js"></script>
     <script src="summary-lib.js"></script>
     <script src="summary.js"></script>
   </body>

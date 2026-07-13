@@ -23,6 +23,7 @@
 
 const root = document.getElementById("root");
 let currentBundle = null;            // the loaded reviewSummary, mutated in place on edit
+let currentBank = {};                // Profile Learning: the answerBank (remembered unmapped answers), loaded alongside the bundle
 let lastRunAbort = null;             // { reason, detachReason, at } if the last run was cut short (operator Cancel/X → debugger detach)
 let currentFilter = "all";           // all | review | edited
 const collapsed = new Set();         // section keys the user collapsed
@@ -63,6 +64,22 @@ const cleanPageName = (b) => {
 const PARTIAL_NOTE = "Options the search surfaced — not the full list. Edit on the form for other values.";
 const TIER_NOTE = "Add candidate values, most specific first. On submit the fill tries each in order and uses the first that matches this field's options on the form.";
 const persist = () => chrome.storage.local.set({ reviewSummary: currentBundle });
+// Profile Learning: the answerBank is a SEPARATE storage key (not part of the bundle) — remembered
+// answers persist across applications, the bundle is per-run. The viewer writes it directly (same
+// as reviewSummary); the SW reads it into the fill (the consume tier).
+const persistBank = () => chrome.storage.local.set({ answerBank: currentBank });
+// Profile Learning: if a field is currently REMEMBERED and its value is edited, keep the bank in
+// sync — re-save the new value, or forget it if the edit cleared the field. No-op for a field that
+// isn't a bank-remember target or isn't currently remembered. (rememberTarget = summary-lib global;
+// getRememberedAnswer/put/deleteRememberedAnswer = lib.js globals.)
+const syncRememberedOnCommit = (entry) => {
+  if (rememberTarget(entry).target !== "bank" || !getRememberedAnswer(currentBank, entry.question_label)) return;
+  const hasVal = entry.current_value != null && String(entry.current_value).trim() !== "";
+  currentBank = hasVal
+    ? putRememberedAnswer(currentBank, { label: entry.question_label, value: entry.current_value, widgetType: entry.widget_type, questionText: entry.question_label, sensitive: !!entry.sensitive, savedAt: Date.now() })
+    : deleteRememberedAnswer(currentBank, entry.question_label);
+  persistBank();
+};
 
 // Section grouping. Keys = the REAL canonical-field prefixes the fill engine emits
 // (FIELD_MAP flat paths like personal_info.* + PAGE_SECTIONS names, which are camelCase).
@@ -121,6 +138,7 @@ const commit = (entry, val) => {
   entry.edit_kind = editKindOf(entry); entry.is_edited = entry.edit_kind !== null;
   if (entry.is_approved) { entry.is_approved = false; entry.approved_at = null; }
   persist();
+  syncRememberedOnCommit(entry); // Profile Learning: keep a remembered bank answer in sync with the edit
   for (const fn of fieldRefreshers.get(entry.field_id) || []) fn();
   updateApprovalUI();
   // "I currently work here" controls whether the entry's "To" row shows — re-render to apply
@@ -559,6 +577,39 @@ const statusOf = (e) => {
   return "ok";
 };
 
+// Profile Learning (M2): a per-field "Remember this answer" opt-in on eligible UNMAPPED fields
+// (the answer bank). Ticked → the confirmed value is saved keyed by the question text so a future
+// application auto-fills the same question; unticked → forgotten. EEO/legal fields show a warning
+// (entry.sensitive, stamped at fill time). Returns the control node, or null when the field isn't
+// a bank-remember target (mapped-field profile write-back is handled separately). rememberTarget =
+// summary-lib global; isRememberableWidget/getRememberedAnswer/put/deleteRememberedAnswer =
+// lib.js globals (lib.js is loaded before this script in summary.html).
+const rememberControl = (e) => {
+  if (rememberTarget(e).target !== "bank" || !isRememberableWidget(e.widget_type)) return null;
+  const wrap = el("div", { class: "remember" });
+  const lb = el("label", { class: "rem-lb" });
+  const cb = el("input", { type: "checkbox", class: "rem-cb" });
+  cb.checked = !!getRememberedAnswer(currentBank, e.question_label);
+  wrap.classList.toggle("on", cb.checked);
+  lb.appendChild(cb);
+  lb.appendChild(document.createTextNode("Remember this answer"));
+  wrap.appendChild(lb);
+  if (e.sensitive) wrap.appendChild(el("span", { class: "rem-warn", text: "⚠ demographic/legal — reused verbatim on future applications" }));
+  cb.addEventListener("change", () => {
+    if (cb.checked) {
+      currentBank = putRememberedAnswer(currentBank, {
+        label: e.question_label, value: e.current_value, widgetType: e.widget_type,
+        questionText: e.question_label, sensitive: !!e.sensitive, savedAt: Date.now()
+      });
+    } else {
+      currentBank = deleteRememberedAnswer(currentBank, e.question_label);
+    }
+    wrap.classList.toggle("on", cb.checked);
+    persistBank();
+  });
+  return wrap;
+};
+
 // One field row, used in BOTH the review list and the section list (editors kept in sync
 // via the field_id refresher). opts.review → loud flag label + reason line + "go to field".
 const fieldRow = (e, opts = {}) => {
@@ -622,6 +673,7 @@ const fieldRow = (e, opts = {}) => {
   }
   const afref = el("div", { class: "afref" });
   val.appendChild(afref);
+  const rem = rememberControl(e); if (rem) val.appendChild(rem); // Profile Learning: "Remember this answer" opt-in (eligible unmapped fields)
   row.appendChild(val);
 
   const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence].filter(Boolean).join("  ·  ");
@@ -882,9 +934,10 @@ const jumpToField = (e) => {
 const relTime = (iso) => { if (!iso) return "—"; const t = Date.parse(iso); if (isNaN(t)) return String(iso); const s = Math.round((Date.now() - t) / 1000); if (s < 45) return "just now"; if (s < 3600) return `${Math.round(s / 60)} min ago`; if (s < 86400) return `${Math.round(s / 3600)} h ago`; return new Date(t).toLocaleString(); };
 
 const load = () => {
-  chrome.storage.local.get(["reviewSummary", "lastRunAbort"], ({ reviewSummary, lastRunAbort: abort }) => {
+  chrome.storage.local.get(["reviewSummary", "lastRunAbort", "answerBank"], ({ reviewSummary, lastRunAbort: abort, answerBank }) => {
     currentBundle = reviewSummary || null;
     lastRunAbort = abort || null;
+    currentBank = (answerBank && typeof answerBank === "object") ? answerBank : {};
     render();
   });
 };

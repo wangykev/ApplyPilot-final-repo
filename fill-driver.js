@@ -4857,6 +4857,7 @@ function buildReviewBundle(results, meta) {
       widget_type: rec.widgetType,
       canonical_field: rec.mappedPath != null ? rec.mappedPath : null,
       is_required: !!rec.isRequired,
+      sensitive: !!(legallyLoaded(rec.label) || isEeoField(rec)), // Profile Learning: EEO/legal question → the review viewer shows a "reused verbatim" warning on the Remember toggle
       current_value,
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,

@@ -148,6 +148,24 @@ function newEntryRecords(shape, meta) {
   }));
 }
 
+// Profile Learning: which store a per-field "Remember this answer" opt-in would write to, and
+// whether the entry is even eligible. PURE — the viewer wires the chrome.storage I/O + the DOM,
+// and separately gates on the widget type (lib.js isRememberableWidget). Eligibility here =
+// a non-empty current value, not soft-deleted, not an operator-added stub (nothing to remember
+// yet). Target: "bank" for an UNMAPPED field (no canonical_field) → answerBank keyed by question
+// text; "profile" for a FLAT mapped field (canonical_field, no [index]) → profile.<path>;
+// "none" for a repeating-section field (canonical_field with [index] — already profile-sourced as
+// an array entry, not a simple remember target). See docs/profile-learning-plan.md.
+function rememberTarget(entry) {
+  const e = entry || {};
+  const hasVal = e.current_value != null && String(e.current_value).trim() !== "";
+  if (!hasVal || e.is_deleted || e.is_added) return { eligible: false, target: "none" };
+  const cf = e.canonical_field;
+  if (cf == null || cf === "") return { eligible: true, target: "bank" };
+  if (/\[\d+\]/.test(String(cf))) return { eligible: false, target: "none" }; // repeating entry — already profile-sourced
+  return { eligible: true, target: "profile" };
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords };
+  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords, rememberTarget };
 }

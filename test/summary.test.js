@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, visibleEntryItems, newEntryRecords, rememberTarget } = require("../summary-lib.js");
 
 // ── 2b: operator-added repeating-section entries ──
 test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
@@ -188,4 +188,31 @@ test("visibleEntryItems: a FLAGGED endDate (today's-date fallback) is NOT hidden
 test("visibleEntryItems: a non-WE entry set is returned unchanged", () => {
   const items = [{ widget_type: "dropdown", canonical_field: "education[0].degree" }];
   assert.deepStrictEqual(visibleEntryItems(items), items);
+});
+
+// ── Profile Learning M2: rememberTarget (which store a "Remember" writes to) ──
+test("rememberTarget: an UNMAPPED field with a value → bank (eligible)", () => {
+  assert.deepStrictEqual(
+    rememberTarget({ canonical_field: null, current_value: "Yes", widget_type: "radio" }),
+    { eligible: true, target: "bank" }
+  );
+});
+test("rememberTarget: a FLAT mapped field → profile (eligible)", () => {
+  assert.deepStrictEqual(
+    rememberTarget({ canonical_field: "personal_info.state_province", current_value: "Illinois", widget_type: "dropdown" }),
+    { eligible: true, target: "profile" }
+  );
+});
+test("rememberTarget: a REPEATING-section field (canonical has [index]) → none (already profile-sourced)", () => {
+  assert.deepStrictEqual(
+    rememberTarget({ canonical_field: "work_experience[0].jobTitle", current_value: "Engineer", widget_type: "text" }),
+    { eligible: false, target: "none" }
+  );
+});
+test("rememberTarget: empty / deleted / operator-added → not eligible", () => {
+  assert.strictEqual(rememberTarget({ canonical_field: null, current_value: "" }).eligible, false, "empty value");
+  assert.strictEqual(rememberTarget({ canonical_field: null, current_value: "   " }).eligible, false, "whitespace value");
+  assert.strictEqual(rememberTarget({ canonical_field: null, current_value: null }).eligible, false, "null value");
+  assert.strictEqual(rememberTarget({ canonical_field: null, current_value: "Yes", is_deleted: true }).eligible, false, "soft-deleted");
+  assert.strictEqual(rememberTarget({ canonical_field: null, current_value: "Yes", is_added: true }).eligible, false, "operator-added stub");
 });
