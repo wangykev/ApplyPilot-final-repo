@@ -6411,3 +6411,29 @@ test("M3 bank: a MAPPED field ignores the bank (the question-keyed bank is for U
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { answerBank: bank });
   assert.notStrictEqual(out.results[0].after, "Chicago", "mapped 'city' uses the profile path (empty here), never the bank");
 });
+
+// ── Profile Learning M4: checkbox remember + consume ──
+const bankCb = (flags) => Object.assign({ wrapperSel: "[w-cb]", fieldName: "opt_survey", widgetType: "checkbox", isRequired: false, label: "Add me to the talent community", inputId: "cb-1", checked: false }, flags || {});
+
+test("M4 bank: a remembered checkbox 'true' CHECKS an unmapped optional checkbox → filled, remembered", async () => {
+  const bank = { "add me to the talent community": { value: "true", widgetType: "checkbox" } };
+  const f = bankCb({ checked: false });
+  const out = await drivePageFill(makeFakeAct([f], {}), {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  assert.strictEqual(f.checked, true, "the remembered true checks the box");
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].flag, "remembered");
+});
+
+test("M4 bank: a remembered checkbox 'false' UNCHECKS a dirty box (reconciles to the remembered state)", async () => {
+  const bank = { "add me to the talent community": { value: "false", widgetType: "checkbox" } };
+  const f = bankCb({ checked: true });
+  await drivePageFill(makeFakeAct([f], {}), {}, {}, {}, T_BUDGETS, { answerBank: bank });
+  assert.strictEqual(f.checked, false, "the remembered false unchecks it");
+});
+
+test("M4 bank: no remembered answer → an unmapped optional checkbox is left at its default (M0)", async () => {
+  const f = bankCb({ checked: false });
+  const out = await drivePageFill(makeFakeAct([f], {}), {}, {}, {}, T_BUDGETS, { answerBank: {} });
+  assert.strictEqual(f.checked, false, "untouched — no remembered value");
+  assert.strictEqual(out.results[0].status, "skipped");
+});

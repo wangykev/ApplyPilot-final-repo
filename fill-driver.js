@@ -2210,6 +2210,12 @@ const fillFromRemembered = async (act, loc, f, remembered, budgets) => {
     const cap = makeStartCapture(act, loc);
     res = await fillTypeaheadCdp(act, loc, [value], budgets, { onCapture: cap.onCapture }); // NO opts.ai → deterministic candidate only, no AI rescue
     if (res && (res.status === "filled" || res.status === "filled_review")) { const ro = cap.reviewOptions(); if (ro && ro.length) res.options = ro; }
+  } else if (f.widgetType === "checkbox") {
+    // M4: apply the remembered boolean (bank stores "true"/"false"; token families tolerated). Only
+    // reachable for an UNMAPPED OPTIONAL checkbox (M0 always-checks REQUIRED ones, and this consult
+    // only fires on producedNothing) — so a remembered answer decides an otherwise-default box.
+    const want = /^(true|yes|checked|1|on)$/i.test(value);
+    res = await fillCheckboxCdp(act, loc, want, budgets);
   } else return null;
   if (!res || (res.status !== "filled" && res.status !== "filled_review")) return null; // no commit → fall through to AI/blank
   res.flag = "remembered"; // provenance — NOT an ai-* flag, so the viewer shows a "remembered" badge, not an AI one
