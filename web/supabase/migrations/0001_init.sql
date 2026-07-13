@@ -150,18 +150,21 @@ insert into storage.buckets (id, name, public)
 values ('resumes', 'resumes', false)
 on conflict (id) do nothing;
 
+-- Path-based ownership (Supabase's canonical pattern): objects are namespaced
+-- under the user id folder — resumes/<auth.uid()>/<file>. More robust than the
+-- storage `owner` column (which the client must set correctly on upload).
 drop policy if exists "resume objects owner read" on storage.objects;
 create policy "resume objects owner read" on storage.objects
-  for select using (bucket_id = 'resumes' and owner = auth.uid());
+  for select using (bucket_id = 'resumes' and (storage.foldername(name))[1] = auth.uid()::text);
 
 drop policy if exists "resume objects owner write" on storage.objects;
 create policy "resume objects owner write" on storage.objects
-  for insert with check (bucket_id = 'resumes' and owner = auth.uid());
+  for insert with check (bucket_id = 'resumes' and (storage.foldername(name))[1] = auth.uid()::text);
 
 drop policy if exists "resume objects owner update" on storage.objects;
 create policy "resume objects owner update" on storage.objects
-  for update using (bucket_id = 'resumes' and owner = auth.uid());
+  for update using (bucket_id = 'resumes' and (storage.foldername(name))[1] = auth.uid()::text);
 
 drop policy if exists "resume objects owner delete" on storage.objects;
 create policy "resume objects owner delete" on storage.objects
-  for delete using (bucket_id = 'resumes' and owner = auth.uid());
+  for delete using (bucket_id = 'resumes' and (storage.foldername(name))[1] = auth.uid()::text);
