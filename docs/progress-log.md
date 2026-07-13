@@ -369,3 +369,30 @@ Live-verified on Magna wd3: after the value-presence + label-anchor + region/dig
 the fill committed reconciles as AGREE (My Information, work/education/certification, screening
 questions, résumé), with the check going quiet except for genuinely-unrecorded page values. Unit suite
 green.
+
+## 2026-07-13 — Profile Learning M0: checkbox rule refactor (required → ALWAYS check; drop the `refused` opt-out)
+
+First milestone of the **Profile Learning** initiative (self-completing profile; full scope in
+`docs/profile-learning-plan.md`). This is the prerequisite "fork in the road" the remember-checkboxes
+model builds on — landed on its own so the main learning work starts from a clean checkbox rule.
+
+- **The rule.** Standalone-checkbox handling in `drivePageFill` (`fill-driver.js`) is now: **REQUIRED
+  → always checked** (silent `filled`, not flagged); **OPTIONAL + mapped + value** → reconcile
+  (true→check / false→uncheck); **OPTIONAL + unmapped/empty** → leave the page default (don't touch).
+- **What changed.** Deleted the `refused` computation and the `!refused` guard — `if (f.isRequired
+  && !refused)` → `if (f.isRequired)`. The one behavior change: an explicit profile `false` no longer
+  keeps a REQUIRED checkbox unchecked (the old "refuse and don't submit" escape hatch is gone). The
+  real gate remains that the walk NEVER submits (human-gated at the review page), so a ticked box
+  mid-walk is not a submission.
+- **Not touched.** The onboarding account-creation consent checkbox runs through its own path
+  (`checkConsent` → `cdpConsentRect`, `background.js`) on the pre-form auth screen and is unaffected.
+  Repeating-section checkboxes (`currentlyWorkHere`, "I am fluent") keep their per-entry mapped-boolean
+  handling. The page engine (`background.js`) has **no** flat standalone-checkbox fill branch, so there
+  was nothing to mirror (verified) — M0 is `fill-driver.js` + tests + doc-sync only.
+- **Docs.** Fixed the stale `acceptTermsAndAgreements` FIELD_MAP comment (it described a
+  `consent-not-granted` halt that the code never did) and updated the CLAUDE.md AI-safety line to state
+  how checkboxes fill deterministically.
+- **Verified.** Rewrote the consent unit test to pin the new rule (required + explicit `false` now
+  CHECKS; required + `null` still auto-checks; no LLM). `npm test` green — 578 tests. Behavior is
+  unit-pinned; a bespoke live-verify (required box + explicit-`false` profile on a real page) is
+  impractical to construct on demand and gets exercised on the next real run.

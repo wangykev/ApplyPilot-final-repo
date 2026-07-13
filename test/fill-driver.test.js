@@ -1217,18 +1217,19 @@ test("AI-3: gender fills DETERMINISTICALLY from self_identification (exact-match
   assert.ok(!act.log.some(([m]) => m === "llm"), "an EEO field that matches deterministically NEVER calls the LLM");
 });
 
-test("AI-3: a REQUIRED consent AUTO-CHECKS silently (filled, NOT flagged) even when the profile is null; an explicit profile `false` is respected", async () => {
+test("checkbox rule (M0): a REQUIRED checkbox ALWAYS auto-checks silently (filled, NOT flagged) — when the profile is null AND when it's explicitly `false` (no per-checkbox opt-out; the walk never submits)", async () => {
   const f1 = consentField();
   const a1 = makeFakeAct([f1], { aiEnabled: true });
   const r1 = (await drivePageFill(a1, { agreements: { terms_and_conditions_acceptance: null } }, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(r1.status, "filled", "required consent auto-checks even when the profile is null");
+  assert.strictEqual(r1.status, "filled", "required checkbox auto-checks even when the profile is null");
   assert.notStrictEqual(r1.status, "filled_review", "NOT flagged for review (silent)");
   assert.strictEqual(f1.checked, true, "the box is actually checked");
   const f2 = consentField();
   const a2 = makeFakeAct([f2], { aiEnabled: true });
-  await drivePageFill(a2, { agreements: { terms_and_conditions_acceptance: false } }, {}, {}, T_BUDGETS);
-  assert.strictEqual(f2.checked, false, "an explicit profile `false` is respected — the consent is NOT auto-checked");
-  assert.ok(!a1.log.concat(a2.log).some(([m]) => m === "llm"), "consents never involve the LLM");
+  const r2 = (await drivePageFill(a2, { agreements: { terms_and_conditions_acceptance: false } }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(r2.status, "filled", "required checkbox still fills when the profile is explicitly false");
+  assert.strictEqual(f2.checked, true, "required → ALWAYS checks; an explicit `false` no longer keeps it unchecked (the `refused` opt-out was removed in M0)");
+  assert.ok(!a1.log.concat(a2.log).some(([m]) => m === "llm"), "checkboxes never involve the LLM");
 });
 
 test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it (reveals the preferred-name fields); false leaves it unchecked", async () => {

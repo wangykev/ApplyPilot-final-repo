@@ -368,9 +368,10 @@ const FIELD_MAP = {
   //   AI-inferred). `gender` live-recon'd on Magna (options Female/Male/Other/Undeclared);
   //   race/veteran/disability map the same way once their automation-ids are observed.
   "gender": "self_identification.gender",
-  // AI-3: agreements — legal consent checkbox; checked ONLY if the operator pre-set the
-  //   boolean to true (fillCheckboxCdp reconciles to it). null/false → skipped → if REQUIRED
-  //   the walk halts with a clean `consent-not-granted` message (never fabricates consent).
+  // agreements — legal consent checkbox. Mapped so an OPTIONAL agreement reconciles to the profile
+  //   boolean (true→check / false→uncheck); a REQUIRED one is ALWAYS checked by the checkbox rule
+  //   (see the checkbox branch in drivePageFill), regardless of the mapped value. The walk never
+  //   submits, so a ticked box mid-walk is not a submission.
   "acceptTermsAndAgreements": "agreements.terms_and_conditions_acceptance"
   // "candidateIsPreviousWorker" — NOT mapped here; answered by the safety-first
   //   employer-match special case in the driver (jobContext.company vs
@@ -2266,16 +2267,17 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         record.status = "skipped";
         record.detail = "file upload — not attached by this harness (CDP milestone scope)";
       } else if (f.widgetType === "checkbox") {
-        // AI-3 (operator-decided): a REQUIRED checkbox is a consent / acknowledgment → AUTO-CHECK it
-        // (status `filled`, SILENT, NOT flagged) so the walk advances — UNLESS the profile EXPLICITLY
-        // refuses it (mapped + false), which is respected as a deliberate refusal. Optional checkboxes
-        // keep the profile-mapped reconcile (true→check / false→uncheck / empty→skip).
-        // ⚠ This silently accepts Terms / certifies truthfulness / consents to background+drug checks
-        //   with NO human review (operator-accepted; an explicit profile `false` is the only opt-out).
-        const refused = !!mappedPath && (rawValue === false || /^(false|no)$/i.test(String(rawValue == null ? "" : rawValue)));
-        if (f.isRequired && !refused) {
+        // Checkbox rule (M0): a REQUIRED checkbox is ALWAYS checked (status `filled`, SILENT, NOT
+        // flagged) so the walk advances — a required box left empty blocks Save & Continue, and the
+        // walk NEVER submits (human-gated at the review page), so a ticked box mid-walk is not a
+        // submission. An OPTIONAL checkbox reconciles to its mapped value (true→check / false→uncheck);
+        // unmapped/empty → LEFT in its page default (don't touch). [M4 will add: an unmapped optional
+        // checkbox with a REMEMBERED boolean applies it.]
+        // ⚠ No per-checkbox opt-out: an explicit profile `false` no longer keeps a REQUIRED box
+        //   unchecked (the old `refused` escape hatch was removed in M0). The real gate is the never-submit.
+        if (f.isRequired) {
           record.resolved = true;
-          Object.assign(record, await fillCheckboxCdp(act, loc, true, budgets)); // auto-consent
+          Object.assign(record, await fillCheckboxCdp(act, loc, true, budgets)); // required → always check
         } else if (!mappedPath) {
           record.status = "skipped";
           record.detail = "no mapping";
