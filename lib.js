@@ -340,6 +340,69 @@ function mappedFieldsFromErrors(errorTexts, scanFields, fieldMap) {
   return [...out];
 }
 
+// ─── Answer bank (Profile Learning) ──────────────────────────────────────────────────────────
+// The answerBank remembers human-confirmed answers to UNMAPPED fields, keyed by the normalized
+// question label (tenant-agnostic), so a future application auto-fills the same question.
+//   shape: { <answerKey> : { value, questionText, widgetType, sensitive, savedAt } }
+// These helpers are PURE (operate on a plain bank object + return a NEW one); chrome.storage I/O
+// lives in the SW (read, for the fill consume tier) and the review viewer (write, on the
+// per-field "Remember" toggle). Full design: docs/profile-learning-plan.md.
+
+// The bank key IS the normalized label (same transform as normalizeLabel): lowercase, strip a
+// trailing required marker (*/**) + whitespace, collapse internal whitespace. Aliased so bank
+// call sites read intent-first and to honor the plan's naming.
+const answerKey = normalizeLabel;
+
+// Widget types eligible to be remembered. EXCLUDES textarea (essays — role/company-specific, a
+// verbatim reuse would be wrong), file_upload (résumés — own IndexedDB store), and anything
+// unclassified. Checkboxes ARE remembered (as booleans). See the fill×remember matrix.
+const REMEMBERABLE_WIDGETS = new Set(["text", "dropdown", "radio", "typeahead", "checkbox"]);
+function isRememberableWidget(widgetType) {
+  return REMEMBERABLE_WIDGETS.has(String(widgetType || ""));
+}
+
+// Look up a remembered answer by question label → the entry, or null. A blank label never keys
+// (guards a page with no label from collapsing every lookup into the "" bucket).
+function getRememberedAnswer(bank, label) {
+  const k = answerKey(label);
+  if (!k || !bank || typeof bank !== "object") return null;
+  const e = bank[k];
+  return (e && typeof e === "object") ? e : null;
+}
+
+// Return a NEW bank with `entry` stored under its label's key. entry = { label, value,
+// widgetType?, questionText?, sensitive?, savedAt? }. A blank label OR a null/empty-string value
+// is a no-op (never persist a keyless or valueless answer). A boolean value is stored as
+// "true"/"false" (checkbox state).
+function putRememberedAnswer(bank, entry) {
+  const base = (bank && typeof bank === "object") ? bank : {};
+  if (!entry || typeof entry !== "object") return base;
+  const k = answerKey(entry.label);
+  const value = entry.value;
+  const blank = value == null || (typeof value === "string" && value.trim() === "");
+  if (!k || blank) return base;
+  return Object.assign({}, base, {
+    [k]: {
+      value: String(value),
+      questionText: entry.questionText != null ? String(entry.questionText)
+                    : (entry.label != null ? String(entry.label) : ""),
+      widgetType: entry.widgetType != null ? String(entry.widgetType) : null,
+      sensitive: !!entry.sensitive,
+      savedAt: Number.isFinite(entry.savedAt) ? entry.savedAt : 0
+    }
+  });
+}
+
+// Return a NEW bank without the entry for `label`. No-op (returns the same-shaped bank) if absent.
+function deleteRememberedAnswer(bank, label) {
+  const base = (bank && typeof bank === "object") ? bank : {};
+  const k = answerKey(label);
+  if (!k || !(k in base)) return base;
+  const out = Object.assign({}, base);
+  delete out[k];
+  return out;
+}
+
 // AI-4 error-sample PREPROCESS (the 2026-07-01 live Tier-0 miss): Workday's top error-summary
 // banner CONCATENATES every error into ONE element ("Error-SpecialtyThe field Specialty is
 // required…Error-LanguageDuplicate language entries are not allowed."), and the M31 diagnostic
@@ -729,5 +792,5 @@ function looksLikeSso(state) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, answerKey, isRememberableWidget, getRememberedAnswer, putRememberedAnswer, deleteRememberedAnswer, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
 }
