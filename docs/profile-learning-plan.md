@@ -184,6 +184,11 @@ the bank stays local.
 
 ## 11. Milestones (one focused change, one commit, unit + live-verified)
 
+> **Build status (2026-07-13): M0–M5 + M2b are BUILT and unit-pinned** (`npm test` green, 601).
+> Live-verify of the end-to-end loop (remember on one application → auto-fill on the next, on a
+> real Workday page) is the remaining step. The viewer/popup DOM wiring isn't unit-tested (consistent
+> with the existing summary.js/popup.js pattern) — it's exercised in the live pass.
+
 | # | Milestone | Files |
 |---|---|---|
 | **M0** | Checkbox rule refactor (the fork) | `fill-driver.js` + `background.js` (lockstep) + units |

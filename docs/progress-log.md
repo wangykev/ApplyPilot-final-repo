@@ -396,3 +396,37 @@ model builds on — landed on its own so the main learning work starts from a cl
   CHECKS; required + `null` still auto-checks; no LLM). `npm test` green — 578 tests. Behavior is
   unit-pinned; a bespoke live-verify (required box + explicit-`false` profile on a real page) is
   impractical to construct on demand and gets exercised on the next real run.
+
+## 2026-07-13 — Profile Learning M1–M5 + M2b: remembered answers (unit-pinned; live-verify pending)
+
+The self-completing-profile feature (design: `docs/profile-learning-plan.md`) — remembering
+human-confirmed answers so future applications auto-fill. Built on M0's checkbox rule. Each milestone
+is its own commit; the whole loop is unit-pinned and awaits one end-to-end live pass.
+
+- **M1 — answerBank data layer (`lib.js`).** Pure, unit-pinned helpers: `answerKey` (the
+  tenant-agnostic bank key; aliases `normalizeLabel`), `isRememberableWidget`
+  (text/dropdown/radio/typeahead/checkbox yes; textarea/file_upload no), and
+  `getRememberedAnswer`/`putRememberedAnswer`/`deleteRememberedAnswer` (operate on a plain bank
+  object, return a new one). `test/answer-bank.test.js`.
+- **M2 — "Remember this answer" save UI (bank).** Stamp `entry.sensitive`
+  (`legallyLoaded || isEeoField`) in `buildReviewBundle` + `buildEntry` (lockstep). `summary-lib.js`
+  `rememberTarget` (bank / profile / none). Load `lib.js` in `summary.html`; a per-field opt-in
+  toggle on eligible UNMAPPED fields (default off) with the sensitive warning, writing `answerBank`;
+  a value edit re-syncs the bank.
+- **M3 — consume tier (`drivePageFill`).** Before the AI fallback, an UNMAPPED field that produced
+  nothing consults `answerBank[answerKey(label)]`; `fillFromRemembered` runs the remembered value as
+  a CANDIDATE through the SAME match ladder (never blind) → trusted `filled` on exact / surfaced
+  `filled_review` on ambiguous / falls through on a miss. Runs for required AND optional (unlike AI).
+  SW reads the bank into `fillAndPersistPage`. 6 tests.
+- **M4 — checkbox remember + consume.** `fillFromRemembered` gains a checkbox branch (apply the
+  remembered boolean); the M3 consult already fires for unmapped optional checkboxes, so no M0 branch
+  change. Required checkboxes stay always-checked (never reach the consult). 3 tests.
+- **M2b — profile write-back.** `summary-lib.js` `getByPath`/`setByPath`; `rememberControl` gains a
+  "Save this correction to my profile" toggle for EDITED flat-mapped scalars (never a tiered array),
+  writing `profile.<path>` with revert-on-untick. 2 tests.
+- **M5 — popup manager.** A "Remembered answers" section in the popup: list (question → value +
+  sensitive badge), per-item Forget, clear-all.
+
+`npm test` green (601). NEXT: live-verify — with AI off, on a screening page: answer + "Remember",
+re-run, confirm the field auto-fills from the bank (SW records the fill flag `remembered`); check the
+popup lists it and Forget removes it. Then the mapped-correction write-back and the sensitive warning.
