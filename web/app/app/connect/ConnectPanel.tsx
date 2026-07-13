@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Cable, RefreshCw, ArrowUpFromLine, Check, X, Minus, ChevronDown } from "lucide-react";
+import { Cable, RefreshCw, ArrowUpFromLine, Link2, Check, X, Minus, ChevronDown } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { pingExtension, sendToExtension, type ExtResponse } from "@/lib/extension";
-import { getSyncBundle } from "./actions";
+import { getSyncBundle, getSession } from "./actions";
 import { clsx } from "@/lib/clsx";
 
 type Conn =
@@ -119,6 +119,32 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
     check();
   }
 
+  // Send ONLY the reporting credential — leaves the extension's own profile /
+  // resume / AI config alone. For testing fills with the profile you loaded in
+  // the extension while still getting Tracker reports.
+  async function linkTracking() {
+    if (!extId.trim()) {
+      setConn({ state: "error", error: "Enter your extension ID first." });
+      return;
+    }
+    setSyncing(true);
+    setSteps([]);
+    const res = await getSession();
+    if (!res.ok) {
+      setSteps([{ label: "Get reporting credential", ok: false, msg: res.error }]);
+      setSyncing(false);
+      return;
+    }
+    const r = await sendToExtension(extId.trim(), {
+      type: "AP_SET_SESSION",
+      ingestUrl: res.session.ingestUrl,
+      ingestKey: res.session.ingestKey,
+    });
+    setSteps([rowFor("Reporting link (profile untouched)", r)]);
+    setSyncing(false);
+    check();
+  }
+
   return (
     <div className="space-y-6">
       <SectionCard
@@ -174,12 +200,23 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
 
       <SectionCard
         title="Sync to extension"
-        subtitle="Pushes your profile, defaults, job context, AI config, and resume into the extension — overwriting what it had."
+        subtitle="Push your website data into the extension, or just link reporting so your fills show up in the Tracker."
       >
-        <button onClick={sync} disabled={syncing} className="btn-primary">
-          <ArrowUpFromLine className="h-4 w-4" />
-          {syncing ? "Syncing…" : "Sync to extension"}
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button onClick={sync} disabled={syncing} className="btn-primary">
+            <ArrowUpFromLine className="h-4 w-4" />
+            {syncing ? "Working…" : "Sync everything"}
+          </button>
+          <button onClick={linkTracking} disabled={syncing} className="btn-ghost">
+            <Link2 className="h-4 w-4" />
+            Link for tracking only
+          </button>
+        </div>
+        <p className="mt-3 text-xs leading-relaxed text-ink-dim">
+          <span className="text-ink">Sync everything</span> overwrites the extension&apos;s profile, resume, and AI config
+          with the website&apos;s. <span className="text-ink">Link for tracking only</span> sends just the reporting
+          credential — use this to keep the profile you loaded in the extension and still have fills land in the Tracker.
+        </p>
 
         {steps.length > 0 && (
           <ul className="mt-5 space-y-2">

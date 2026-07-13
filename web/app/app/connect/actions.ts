@@ -82,3 +82,29 @@ export async function getSyncBundle(): Promise<BundleResult> {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }
 }
+
+export type SessionResult =
+  | { ok: true; session: { ingestUrl: string; ingestKey: string } }
+  | { ok: false; error: string };
+
+/** Mint ONLY the reporting credential — for linking the extension's tracker
+ *  reporting without touching its profile / resume / AI config. */
+export async function getSession(): Promise<SessionResult> {
+  if (!isSupabaseConfigured()) {
+    return { ok: false, error: "Backend not connected — set Supabase env vars (see WEBSITE.md)." };
+  }
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "You're not signed in." };
+
+    const key = generateApiKey();
+    await supabase.from("api_keys").delete().eq("user_id", user.id);
+    await supabase.from("api_keys").insert({ user_id: user.id, key_hash: hashApiKey(key), label: "extension" });
+    return { ok: true, session: { ingestUrl: `${SITE_URL}/api/extension/report`, ingestKey: key } };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
