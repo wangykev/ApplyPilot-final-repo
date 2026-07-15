@@ -51,6 +51,9 @@ export const languageSchema = z.object({
   reading: str,
   speaking: str,
   writing: str,
+  // Human-controlled "I am fluent" box, decoupled from the three proficiencies.
+  // null = unset → the extension falls back to deriving it (all three Fluent).
+  fluent: triBool,
 });
 
 export const certificationSchema = z.object({

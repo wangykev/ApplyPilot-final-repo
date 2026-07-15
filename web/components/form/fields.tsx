@@ -457,3 +457,29 @@ export function DateField({
     </div>
   );
 }
+
+/** A single labeled checkbox (e.g. "I am fluent") — a human-controlled boolean. */
+export function CheckboxField({
+  label,
+  checked,
+  onChange,
+  hint,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  hint?: string;
+}) {
+  return (
+    <label className="flex cursor-pointer select-none items-center gap-2.5">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-4 w-4 shrink-0 accent-amber"
+      />
+      <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{label}</span>
+      {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
+    </label>
+  );
+}

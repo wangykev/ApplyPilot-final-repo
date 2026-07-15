@@ -406,7 +406,11 @@ function prepareProfile(profile) {
   }
   if (Array.isArray(profile.languages)) {
     const langs = meaningfulEntries(profile.languages, ["language"]).map((e) => ({
-      ...e, _allFluent: isFluent(e.reading) && isFluent(e.speaking) && isFluent(e.writing) // → check the "I am fluent" box
+      // Explicit human-set `fluent` (true/false) WINS; a null/unset value falls back to the
+      // reading+speaking+writing all-fluent derivation (back-compat for profiles predating the box).
+      ...e, _allFluent: (e.fluent == null)
+        ? (isFluent(e.reading) && isFluent(e.speaking) && isFluent(e.writing))
+        : !!e.fluent // → check the "I am fluent" box
     }));
     // English LAST (operator, 2026-07-06): filling English as the last language entry reduces Workday's
     // spurious "duplicate languages not allowed" ghost error on Save & Continue. Stable partition — the

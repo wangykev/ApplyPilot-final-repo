@@ -10,6 +10,7 @@ import {
   TieredField,
   CountryField,
   DateField,
+  CheckboxField,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
@@ -26,6 +27,11 @@ import { clsx } from "@/lib/clsx";
 
 const opt = (vals: string[], blank = "—") =>
   vals.map((v) => ({ value: v, label: v === "" ? blank : v }));
+// Mirrors the extension's isFluent (=== "fluent") so an untouched "I am fluent"
+// box reflects what the extension would derive; a human toggle overrides it.
+const isFluentLevel = (p: string) => p.trim().toLowerCase() === "fluent";
+const allFluent = (l: { reading: string; speaking: string; writing: string }) =>
+  isFluentLevel(l.reading) && isFluentLevel(l.speaking) && isFluentLevel(l.writing);
 const PROFICIENCY = opt(["", "None", "Basic", "Intermediate", "Advanced", "Fluent"]);
 const PHONE_TYPE = opt(["", "Mobile", "Home", "Work"]);
 const WEBSITE_TYPE = opt(["linkedin", "github", "portfolio", "other"]);
@@ -184,7 +190,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
       {/* Languages */}
       <SectionCard
         title="Languages"
-        subtitle="When reading, speaking, and writing are all Fluent, the extension checks the native box."
+        subtitle={'Set a proficiency per skill. Check "I am fluent" to tick the form’s fluent/native box — independent of the three levels.'}
         actions={<AddButton onClick={() => update((p) => { p.languages.push(languageSchema.parse({})); })} />}
       >
         {profile.languages.length === 0 && <Empty>No languages yet.</Empty>}
@@ -196,6 +202,13 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                 <SelectField label="Reading" value={l.reading} options={PROFICIENCY} onChange={(v) => update((p) => { p.languages[i].reading = v; })} />
                 <SelectField label="Speaking" value={l.speaking} options={PROFICIENCY} onChange={(v) => update((p) => { p.languages[i].speaking = v; })} />
                 <SelectField label="Writing" value={l.writing} options={PROFICIENCY} onChange={(v) => update((p) => { p.languages[i].writing = v; })} />
+              </div>
+              <div className="mt-3">
+                <CheckboxField
+                  label="I am fluent"
+                  checked={l.fluent ?? allFluent(l)}
+                  onChange={(v) => update((p) => { p.languages[i].fluent = v; })}
+                />
               </div>
             </EntryCard>
           ))}
