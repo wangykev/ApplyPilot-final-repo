@@ -11,6 +11,7 @@ import {
   CountryField,
   DateField,
   CheckboxField,
+  FieldLabel,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
@@ -22,6 +23,7 @@ import {
   workExperienceSchema,
   languageSchema,
   certificationSchema,
+  specialtySchema,
 } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
 
@@ -229,6 +231,45 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                 <TextField label="Number" value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
                 <DateField label="Issued date" granularity="month-day-year" value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
                 <DateField label="Expiration date" granularity="month-day-year" value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
+              </div>
+              {/* Nested specialties (matches the extension's CERT_NESTED sub-section) */}
+              <div className="mt-4 border-t border-hairline/60 pt-4">
+                <div className="mb-2 flex items-center justify-between">
+                  <FieldLabel>Specialties</FieldLabel>
+                  <button
+                    type="button"
+                    onClick={() => update((p) => { p.certifications[i].specialties.push(specialtySchema.parse({})); })}
+                    className="btn-ghost px-2.5 py-1 text-[11px]"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Add specialty
+                  </button>
+                </div>
+                {c.specialties.length === 0 && <p className="py-1 text-xs text-ink-faint">No specialties.</p>}
+                <div className="space-y-3">
+                  {c.specialties.map((s, j) => (
+                    <div key={j} className="rounded-lg border border-hairline/70 bg-panel-raised/30 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">
+                          Specialty {String(j + 1).padStart(2, "0")}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => update((p) => { p.certifications[i].specialties.splice(j, 1); })}
+                          className="text-ink-faint transition-colors hover:text-signal"
+                          aria-label="Remove specialty"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                        <TextField label="Specialty" value={s.specialty} onChange={(v) => update((p) => { p.certifications[i].specialties[j].specialty = v; })} />
+                        <DateField label="Start date" granularity="month-day-year" value={s.start_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].start_date = v; })} />
+                        <DateField label="End date" granularity="month-day-year" value={s.end_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].end_date = v; })} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             </EntryCard>
           ))}

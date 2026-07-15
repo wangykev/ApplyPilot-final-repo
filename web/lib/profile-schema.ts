@@ -56,11 +56,19 @@ export const languageSchema = z.object({
   fluent: triBool,
 });
 
+export const specialtySchema = z.object({
+  specialty: str,
+  start_date: str, // "YYYY-MM-DD"
+  end_date: str, // "YYYY-MM-DD"
+});
+
 export const certificationSchema = z.object({
   certification: tiered,
   certification_number: str,
   issued_date: str, // "YYYY-MM-DD"
   expiration_date: str, // "YYYY-MM-DD"
+  // Nested repeating sub-section (matches the extension's CERT_NESTED fill).
+  specialties: z.array(specialtySchema).default([]),
 });
 
 export const personalInfoSchema = z
