@@ -45,10 +45,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // extension's `defaults` also holds field_of_study/degree/gpa_range (from
     // application_defaults.json). A wholesale overwrite would wipe those, degrading the
     // default-matching ladder — so shallow-merge the incoming keys over the existing object.
+    // `buckets` (answer buckets, Profile v2) are fully website-managed → stored wholesale.
     chrome.storage.local.get("defaults", ({ defaults: existingDefaults }) => {
       const data = {};
       if (message.profile !== undefined) data.profile = message.profile;
       if (message.jobContext !== undefined) data.jobContext = message.jobContext;
+      if (message.buckets !== undefined) data.buckets = message.buckets;
       if (message.defaults !== undefined) {
         data.defaults = { ...(existingDefaults || {}), ...message.defaults };
       }
@@ -1833,7 +1835,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // (The act.attachStoredResume seam — the TEST-ONLY per-cert résumé attach — was verified live
   // 2026-07-02 and then REMOVED with the profile test data. The résumé attaches ONLY to the
   // top-level Documents field, via the post-fill step below.)
-  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
+  // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
+  // SW does I/O) and hands them to the driver, which consults them before the AI pass.
+  const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
+  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
