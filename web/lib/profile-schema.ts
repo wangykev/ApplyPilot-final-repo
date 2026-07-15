@@ -42,7 +42,7 @@ export const workExperienceSchema = z.object({
   currently_work_here: triBool,
   from: str, // "YYYY-MM"
   to: str, // "YYYY-MM"
-  bullets: z.array(z.string()).default([]),
+  role_description: str, // one textarea — how Workday renders the role description
   tech_stack: z.array(z.string()).default([]),
 });
 
@@ -190,6 +190,20 @@ export function coerceProfile(raw: unknown): Profile {
   };
   obj.education = fixTieredIn(obj.education, ["degree", "field_of_study"]);
   obj.certifications = fixTieredIn(obj.certifications, ["certification"]);
+
+  // Migrate legacy work-experience bullets[] → role_description (one textarea), joined line
+  // by line, so switching away from bullets never loses text.
+  if (Array.isArray(obj.work_experience)) {
+    obj.work_experience = obj.work_experience.map((e) => {
+      if (!e || typeof e !== "object") return e;
+      const rec = { ...(e as Record<string, unknown>) };
+      const rd = rec.role_description;
+      if ((rd == null || rd === "") && Array.isArray(rec.bullets) && rec.bullets.length) {
+        rec.role_description = (rec.bullets as unknown[]).filter(Boolean).map(String).join("\n");
+      }
+      return rec;
+    });
+  }
 
   const wa = (obj.work_authorization as Record<string, unknown>) ?? {};
   if (typeof wa.citizenship_country === "string") {

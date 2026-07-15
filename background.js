@@ -404,7 +404,10 @@ function prepareProfile(profile) {
     out.work_experience = sortWorkExperienceByRecency(
       meaningfulEntries(profile.work_experience, ["job_title", "company"])
     ).map((e) => ({
-      ...e, fromParsed: parseYearMonth(e.from), toParsed: parseYearMonth(e.to), bulletsText: joinBullets(e.bullets)
+      // roleDescription is now a single textarea (profile v2); fall back to legacy bullets[] for
+      // older profiles. WORK_EXPERIENCE_MAP still reads `bulletsText` → the Workday role description.
+      ...e, fromParsed: parseYearMonth(e.from), toParsed: parseYearMonth(e.to),
+      bulletsText: (e.role_description != null && String(e.role_description).trim() !== "") ? String(e.role_description) : joinBullets(e.bullets)
     }));
   }
   if (Array.isArray(profile.education)) {

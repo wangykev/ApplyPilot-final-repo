@@ -23,8 +23,8 @@ export function buildCoverLetterPrompt(
   const work = (profile.work_experience ?? [])
     .slice(0, 3)
     .map((w) => {
-      const bullets = (w.bullets ?? []).slice(0, 3).join("; ");
-      return `- ${w.job_title || "Role"} at ${w.company || "a company"}${bullets ? `: ${bullets}` : ""}`;
+      const desc = (w.role_description ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+      return `- ${w.job_title || "Role"} at ${w.company || "a company"}${desc ? `: ${desc}` : ""}`;
     })
     .join("\n");
   const edu = (profile.education ?? [])

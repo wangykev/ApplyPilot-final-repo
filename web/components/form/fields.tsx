@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { X, ArrowUp, ArrowDown, Plus } from "lucide-react";
+import { useState, useEffect } from "react";
+import { X, ArrowUp, ArrowDown, Plus, SlidersHorizontal } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 
 const inputCls =
@@ -105,7 +105,8 @@ export function SelectField({
   );
 }
 
-/** Tri-state: Yes / No / unanswered (null). */
+/** Yes / No toggle. Starts unselected (null) — there is no blank option in the
+ *  list; press Escape (while a choice is focused) to clear back to blank. */
 export function TriBoolField({
   label,
   value,
@@ -117,15 +118,23 @@ export function TriBoolField({
   onChange: (v: boolean | null) => void;
   hint?: string;
 }) {
-  const opts: { v: boolean | null; t: string }[] = [
+  const opts: { v: boolean; t: string }[] = [
     { v: true, t: "Yes" },
     { v: false, t: "No" },
-    { v: null, t: "—" },
   ];
+  const escHint = value !== null ? (hint ? hint + " · Esc clears" : "Esc clears") : hint;
   return (
     <div>
-      <FieldLabel hint={hint}>{label}</FieldLabel>
-      <div className="mt-1.5 grid grid-cols-3 gap-1 rounded-lg border border-hairline p-1">
+      <FieldLabel hint={escHint}>{label}</FieldLabel>
+      <div
+        className="mt-1.5 grid grid-cols-2 gap-1 rounded-lg border border-hairline p-1"
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && value !== null) {
+            e.preventDefault();
+            onChange(null);
+          }
+        }}
+      >
         {opts.map((o) => {
           const active = value === o.v;
           return (
@@ -313,59 +322,145 @@ export function TieredField({
 type CountryLike = { name: string; dial: string; candidates?: string[] };
 
 /**
- * Country / dial-code picker. Pick one country from the dropdown; it EXPANDS
- * into the tiered candidate list the extension matches against (see
- * lib/countries.ts). A subtle reveal shows that list so the user can edit it if
- * a tenant words the option differently. Stored value stays a string[].
+ * A tiered-candidate field with a compact primary control + a small "Advanced"
+ * button that opens a popup for the ordered fallback list — so the page isn't
+ * cluttered with tiers most people won't touch. Two modes:
+ *   - "dropdown": pick from `countries`; the pick EXPANDS (via `expand`) into the
+ *     stored candidate list (country / phone-code / citizenship).
+ *   - "text": a free-text box bound to the primary (most-specific) candidate
+ *     (degree / major / certification); the popup edits the full ordered list.
+ * Stored value is always the candidate string[].
  */
-export function CountryField({
+export function CandidateField({
   label,
   value,
   onChange,
+  mode = "text",
   countries,
   expand,
-  mode = "country",
+  dropdownMode = "country",
+  placeholder,
 }: {
   label: string;
   value: string[];
   onChange: (v: string[]) => void;
-  countries: CountryLike[];
-  expand: (c: CountryLike) => string[];
-  mode?: "country" | "phone";
+  mode?: "text" | "dropdown";
+  countries?: CountryLike[];
+  expand?: (c: CountryLike) => string[];
+  dropdownMode?: "country" | "phone";
+  placeholder?: string;
 }) {
-  // Reflect the current selection when the stored candidates still match a
-  // known country's expansion; a hand-edited list falls back to "Choose…".
-  const selected = countries.find((c) => expand(c).some((cand) => cand === value[0]))?.name ?? "";
+  const [open, setOpen] = useState(false);
+  const selected =
+    mode === "dropdown" && countries && expand
+      ? countries.find((c) => expand(c).some((cand) => cand === value[0]))?.name ?? ""
+      : "";
+  const setPrimary = (v: string) => {
+    const rest = value.slice(1);
+    if (!v.trim() && rest.length === 0) onChange([]);
+    else onChange([v, ...rest]);
+  };
+  const extra = value.length - 1; // fallbacks beyond the primary
   return (
     <div>
-      <FieldLabel hint="pick one; edit the candidates below if a tenant words it differently">
-        {label}
-      </FieldLabel>
-      <select
-        value={selected}
-        onChange={(e) => {
-          const c = countries.find((x) => x.name === e.target.value);
-          if (c) onChange(expand(c));
-        }}
-        className={clsx(inputCls, "mt-1.5 appearance-none")}
+      <FieldLabel hint={mode === "dropdown" ? "pick one" : undefined}>{label}</FieldLabel>
+      <div className="mt-1.5 flex items-center gap-2">
+        {mode === "dropdown" && countries && expand ? (
+          <select
+            value={selected}
+            onChange={(e) => {
+              const c = countries.find((x) => x.name === e.target.value);
+              if (c) onChange(expand(c));
+            }}
+            className={clsx(inputCls, "appearance-none")}
+          >
+            <option value="">Choose a country…</option>
+            {countries.map((c) => (
+              <option key={c.name} value={c.name} className="bg-panel">
+                {dropdownMode === "phone" ? `${c.name} (${c.dial})` : c.name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            value={value[0] || ""}
+            placeholder={placeholder}
+            onChange={(e) => setPrimary(e.target.value)}
+            className={inputCls}
+          />
+        )}
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          title="Advanced choices — fallback wordings the extension tries"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-hairline px-2.5 py-2 text-[11px] text-ink-dim transition-colors hover:border-amber hover:text-ink"
+        >
+          <SlidersHorizontal className="h-3.5 w-3.5" />
+          {extra > 0 ? `+${extra}` : "Advanced"}
+        </button>
+      </div>
+      {open && <AdvancedChoices label={label} value={value} onChange={onChange} onClose={() => setOpen(false)} />}
+    </div>
+  );
+}
+
+/** Modal for the ordered fallback candidate list. Backdrop click or Escape closes. */
+function AdvancedChoices({
+  label,
+  value,
+  onChange,
+  onClose,
+}: {
+  label: string;
+  value: string[];
+  onChange: (v: string[]) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [onClose]);
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
       >
-        <option value="">Choose a country…</option>
-        {countries.map((c) => (
-          <option key={c.name} value={c.name} className="bg-panel">
-            {mode === "phone" ? `${c.name} (${c.dial})` : c.name}
-          </option>
-        ))}
-      </select>
-      {value.length > 0 && (
-        <div className="mt-2 rounded-lg border border-hairline/70 bg-panel-raised/30 p-2.5">
-          <TieredField label="Candidates the extension tries" value={value} onChange={onChange} />
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{label} — advanced choices</h3>
+          <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
         </div>
-      )}
+        <p className="mb-3 text-xs leading-relaxed text-ink-dim">
+          Ordered fallbacks the extension tries if the main value isn&apos;t on the form — most-specific first.
+        </p>
+        <TieredField label="Candidates" value={value} onChange={onChange} />
+        <div className="mt-4 flex justify-end">
+          <button type="button" onClick={onClose} className="btn-primary">
+            Done
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Display form for a typed month: "5" or "05" → "05 — May" (raw when invalid). */
+function monthLabel(m: string): string {
+  if (!m) return "";
+  const n = Number(m);
+  return n >= 1 && n <= 12 ? `${String(n).padStart(2, "0")} — ${MONTHS[n - 1]}` : m;
+}
 
 export type DateGranularity = "year" | "month-year" | "month-day-year";
 type DateParts = { year: string; month: string; day: string };
@@ -409,6 +504,7 @@ export function DateField({
   hint?: string;
 }) {
   const [parts, setParts] = useState<DateParts>(() => parseDateValue(value, granularity));
+  const [monthFocused, setMonthFocused] = useState(false);
   const set = (patch: Partial<DateParts>) => {
     const next = { ...parts, ...patch };
     setParts(next);
@@ -421,19 +517,20 @@ export function DateField({
       <FieldLabel hint={hint}>{label}</FieldLabel>
       <div className="mt-1.5 flex gap-2">
         {granularity !== "year" && (
-          <select
+          <input
             aria-label={`${label} month`}
-            value={parts.month}
-            onChange={(e) => set({ month: e.target.value })}
-            className={clsx(seg, "flex-1 appearance-none")}
-          >
-            <option value="">Month</option>
-            {MONTHS.map((m, i) => (
-              <option key={m} value={String(i + 1)} className="bg-panel">
-                {String(i + 1).padStart(2, "0")} — {m}
-              </option>
-            ))}
-          </select>
+            inputMode="numeric"
+            value={monthFocused ? parts.month : monthLabel(parts.month)}
+            placeholder="MM"
+            onFocus={() => setMonthFocused(true)}
+            onChange={(e) => set({ month: e.target.value.replace(/\D/g, "").slice(0, 2) })}
+            onBlur={() => {
+              setMonthFocused(false);
+              const n = Number(parts.month);
+              if (!(n >= 1 && n <= 12)) set({ month: "" }); // invalid → clear
+            }}
+            className={clsx(seg, "flex-1")}
+          />
         )}
         {granularity === "month-day-year" && (
           <input

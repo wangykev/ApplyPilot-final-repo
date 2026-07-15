@@ -4,11 +4,11 @@ import { useState, useTransition } from "react";
 import { Plus, Trash2, Save, ShieldAlert } from "lucide-react";
 import {
   TextField,
+  TextAreaField,
   SelectField,
   TriBoolField,
   TagListField,
-  TieredField,
-  CountryField,
+  CandidateField,
   DateField,
   CheckboxField,
   FieldLabel,
@@ -106,8 +106,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           <TextField label="Postal code" value={pi.postal_code} onChange={(v) => update((p) => { p.personal_info.postal_code = v; })} />
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <CountryField label="Country" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
-          <CountryField label="Country phone code" mode="phone" value={pi.country_phone_code} countries={COUNTRIES} expand={phoneCandidates} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
+          <CandidateField label="Country" mode="dropdown" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
+          <CandidateField label="Country phone code" mode="dropdown" dropdownMode="phone" value={pi.country_phone_code} countries={COUNTRIES} expand={phoneCandidates} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
         </div>
       </SectionCard>
 
@@ -149,7 +149,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                 <DateField label="To" granularity="month-year" value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
               </div>
               <div className="mt-4 space-y-4">
-                <TagListField label="Bullets" value={w.bullets} placeholder="Add an accomplishment, press Enter" onChange={(v) => update((p) => { p.work_experience[i].bullets = v; })} />
+                <TextAreaField label="Role description" hint="one box — how Workday shows it" value={w.role_description} rows={5} placeholder="What you did in this role…" onChange={(v) => update((p) => { p.work_experience[i].role_description = v; })} />
                 <TagListField label="Tech stack" value={w.tech_stack} onChange={(v) => update((p) => { p.work_experience[i].tech_stack = v; })} />
               </div>
             </EntryCard>
@@ -176,8 +176,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                 <DateField label="To year" granularity="year" value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <TieredField label="Degree" value={e.degree} onChange={(v) => update((p) => { p.education[i].degree = v; })} />
-                <TieredField label="Major / Field of Study" value={e.field_of_study} onChange={(v) => update((p) => { p.education[i].field_of_study = v; })} />
+                <CandidateField label="Degree" value={e.degree} placeholder="e.g. Bachelor of Science" onChange={(v) => update((p) => { p.education[i].degree = v; })} />
+                <CandidateField label="Major / Field of Study" value={e.field_of_study} placeholder="e.g. Computer Science" onChange={(v) => update((p) => { p.education[i].field_of_study = v; })} />
               </div>
             </EntryCard>
           ))}
@@ -226,7 +226,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
         <div className="space-y-4">
           {profile.certifications.map((c, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.certifications.splice(i, 1); })}>
-              <TieredField label="Certification" value={c.certification} onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
+              <CandidateField label="Certification" value={c.certification} placeholder="Certification name" onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <TextField label="Number" value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
                 <DateField label="Issued date" granularity="month-day-year" value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
@@ -286,7 +286,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           <TextField label="Current visa status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
         <div className="mt-4">
-          <CountryField label="Citizenship country" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
+          <CandidateField label="Citizenship country" mode="dropdown" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
         </div>
       </SectionCard>
 
@@ -303,9 +303,6 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           </p>
         </div>
         <TagListField label="Fallback sources (in order)" value={profile.how_did_you_hear.preferred} placeholder="LinkedIn, Handshake, …" onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })} />
-        <div className="mt-4">
-          <TextField label="Last-resort answer" value={profile.how_did_you_hear.fallback} placeholder="Other" onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })} />
-        </div>
       </SectionCard>
 
       {/* Employment history companies — safety-critical */}
