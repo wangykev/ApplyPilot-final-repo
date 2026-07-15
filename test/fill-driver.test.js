@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6375,4 +6375,69 @@ test("replayRepeatingSections: a DELETED section (is_deleted entries) reconciles
   await replayRepeatingSections(act, entries, T_BUDGETS);
   assert.strictEqual(state.entries.length, 0, "a deleted section is reconciled to 0 on the live form (not left as-is)");
   assert.ok(act.log.some(([m]) => m === "clickDeleteEntry"), "the live rows were deleted");
+});
+
+// ── Answer buckets (Profile v2) ──────────────────────────────────────────────
+// The consume tier: an UNMAPPED field whose question matches a bucket wording
+// fills from the bucket — a candidate through the match ladder (never blind) —
+// BEFORE the AI pass, for required and optional fields alike.
+
+test("buildBucketIndex: normalizes wordings, skips blanks/malformed, maps to the bucket", () => {
+  const b1 = { id: "a", questions: ["Are you 18?  ", "OVER 18*"] };
+  const b2 = { id: "b", questions: ["", "Gender"] };
+  const idx = buildBucketIndex([b1, b2, null, {}, { questions: "nope" }]);
+  assert.equal(idx.get("are you 18?"), b1);
+  assert.equal(idx.get("over 18"), b1); // trailing required marker + case stripped
+  assert.equal(idx.get("gender"), b2);
+  assert.equal(idx.has(""), false);
+});
+
+test("bucket Mode B: an unmapped field whose label matches a wording fills from the saved value, flagged 'bucket'", async () => {
+  const field = { wrapperSel: "#b1", fieldName: "customColorQ", widgetType: "text", label: "What is your favorite color?", value: "" };
+  const bucket = { id: "color", profile_path: "", value: "Blue", widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
+  const out = await drivePageFill(makeFakeAct([field]), {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "customColorQ");
+  assert.equal(rec.status, "filled");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(field.value, "Blue");
+  assert.match(rec.detail, /answer bucket/);
+});
+
+test("bucket Mode A: reads the bound profile field", async () => {
+  const field = { wrapperSel: "#b2", fieldName: "legalGiven", widgetType: "text", label: "Legal given name", value: "" };
+  const bucket = { id: "fn", profile_path: "personal_info.first_name", value: "", widget_hint: "text", questions: ["Legal given name"], selectors: {} };
+  const out = await drivePageFill(makeFakeAct([field]), { personal_info: { first_name: "Ada" } }, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "legalGiven");
+  assert.equal(rec.status, "filled");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(field.value, "Ada");
+  assert.match(rec.detail, /personal_info\.first_name/);
+});
+
+test("bucket Mode A: an EMPTY bound profile value produces nothing (falls through, never blind-fills)", async () => {
+  const field = { wrapperSel: "#b6", fieldName: "legalGiven", widgetType: "text", label: "Legal given name", value: "" };
+  const bucket = { id: "fn", profile_path: "personal_info.first_name", value: "", widget_hint: "text", questions: ["Legal given name"], selectors: {} };
+  const out = await drivePageFill(makeFakeAct([field]), { personal_info: {} }, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "legalGiven");
+  assert.notEqual(rec.flag, "bucket");
+});
+
+test("bucket: an unmapped field with NO matching wording is not bucket-filled", async () => {
+  const field = { wrapperSel: "#b3", fieldName: "customX", widgetType: "text", label: "Some unmapped question", value: "" };
+  const bucket = { id: "color", profile_path: "", value: "Blue", widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
+  const out = await drivePageFill(makeFakeAct([field]), {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "customX");
+  assert.notEqual(rec.flag, "bucket");
+  assert.equal(rec.status, "skipped");
+});
+
+test("bucket: a match fills BEFORE the AI pass — the LLM is never consulted", async () => {
+  const field = { wrapperSel: "#b4", fieldName: "customColorQ", widgetType: "text", label: "What is your favorite color?", isRequired: true, value: "" };
+  const bucket = { id: "color", profile_path: "", value: "Blue", widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"answer":"Green"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "customColorQ");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(field.value, "Blue");
+  assert.ok(!act.log.some((e) => e[0] === "llm"), "the bucket won → the AI pass never ran");
 });
