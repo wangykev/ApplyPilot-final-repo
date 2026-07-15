@@ -56,10 +56,24 @@ export const languageSchema = z.object({
   fluent: triBool,
 });
 
+/** A stored file reference (bytes live in the private `attachments` bucket). */
+export const fileRefSchema = z.object({
+  path: str,
+  filename: str,
+  size: z.number().default(0),
+  mime: str,
+});
+/** An additional document = a human label + a file reference. */
+export const additionalFileSchema = z.object({
+  label: str,
+  file: fileRefSchema.nullable().default(null),
+});
+
 export const specialtySchema = z.object({
   specialty: str,
   start_date: str, // "YYYY-MM-DD"
   end_date: str, // "YYYY-MM-DD"
+  attachment: fileRefSchema.nullable().default(null), // optional per-specialty file
 });
 
 export const certificationSchema = z.object({
@@ -147,6 +161,7 @@ export const profileSchema = z.object({
   employment_history_companies: z.array(z.string()).default([]),
   self_identification: selfIdentificationSchema,
   screening: screeningSchema,
+  additional_files: z.array(additionalFileSchema).default([]),
 });
 
 export type Profile = z.infer<typeof profileSchema>;
@@ -155,6 +170,8 @@ export type Education = z.infer<typeof educationSchema>;
 export type WorkExperience = z.infer<typeof workExperienceSchema>;
 export type Language = z.infer<typeof languageSchema>;
 export type Certification = z.infer<typeof certificationSchema>;
+export type FileRef = z.infer<typeof fileRefSchema>;
+export type AdditionalFile = z.infer<typeof additionalFileSchema>;
 
 /** A fully-defaulted empty profile. */
 export function emptyProfile(): Profile {

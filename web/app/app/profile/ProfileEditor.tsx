@@ -12,6 +12,7 @@ import {
   DateField,
   CheckboxField,
   FieldLabel,
+  FileField,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
@@ -24,6 +25,7 @@ import {
   languageSchema,
   certificationSchema,
   specialtySchema,
+  additionalFileSchema,
 } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
 
@@ -267,9 +269,31 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                         <DateField label="Start date" granularity="month-day-year" value={s.start_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].start_date = v; })} />
                         <DateField label="End date" granularity="month-day-year" value={s.end_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].end_date = v; })} />
                       </div>
+                      <div className="mt-3">
+                        <FileField label="Attachment" value={s.attachment} onChange={(v) => update((p) => { p.certifications[i].specialties[j].attachment = v; })} />
+                      </div>
                     </div>
                   ))}
                 </div>
+              </div>
+            </EntryCard>
+          ))}
+        </div>
+      </SectionCard>
+
+      {/* Additional documents */}
+      <SectionCard
+        title="Additional documents"
+        subtitle="Extra files (transcripts, portfolios, writing samples) to attach where a form asks for them."
+        actions={<AddButton onClick={() => update((p) => { p.additional_files.push(additionalFileSchema.parse({})); })} />}
+      >
+        {profile.additional_files.length === 0 && <Empty>No documents yet.</Empty>}
+        <div className="space-y-4">
+          {profile.additional_files.map((f, i) => (
+            <EntryCard key={i} index={i} onRemove={() => update((p) => { p.additional_files.splice(i, 1); })}>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <TextField label="Label" value={f.label} placeholder="e.g. Transcript" onChange={(v) => update((p) => { p.additional_files[i].label = v; })} />
+                <FileField label="File" value={f.file} onChange={(v) => update((p) => { p.additional_files[i].file = v; })} />
               </div>
             </EntryCard>
           ))}

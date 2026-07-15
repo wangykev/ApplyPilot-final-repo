@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { X, ArrowUp, ArrowDown, Plus, SlidersHorizontal } from "lucide-react";
+import { X, ArrowUp, ArrowDown, Plus, SlidersHorizontal, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 
 const inputCls =
@@ -578,5 +578,82 @@ export function CheckboxField({
       <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{label}</span>
       {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
     </label>
+  );
+}
+
+type StoredFile = { path: string; filename: string; size: number; mime: string };
+
+/** Upload a file to the private attachments bucket, then show it with a remove
+ *  control. `value` is the stored file reference (or null). */
+export function FileField({
+  label,
+  value,
+  onChange,
+  hint,
+}: {
+  label: string;
+  value: StoredFile | null;
+  onChange: (v: StoredFile | null) => void;
+  hint?: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const pick = async (file: File) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/attachments/upload", { method: "POST", body: fd });
+      const j = await res.json();
+      if (!res.ok || !j.ok) setErr(j.error || "Upload failed.");
+      else onChange(j.file);
+    } catch {
+      setErr("Upload failed — is the backend connected?");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div>
+      <FieldLabel hint={hint}>{label}</FieldLabel>
+      <div className="mt-1.5">
+        {value && value.path ? (
+          <div className="flex items-center gap-2 rounded-lg border border-hairline bg-panel-raised px-3 py-2 text-sm">
+            <Paperclip className="h-4 w-4 shrink-0 text-ink-faint" />
+            <span className="flex-1 truncate text-ink">{value.filename}</span>
+            <button
+              type="button"
+              onClick={() => onChange(null)}
+              className="text-ink-faint transition-colors hover:text-signal"
+              aria-label="Remove file"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        ) : (
+          <label
+            className={clsx(
+              "inline-flex cursor-pointer items-center gap-2 rounded-lg border border-hairline px-3 py-2 text-sm transition-colors",
+              busy ? "text-ink-faint" : "text-ink-dim hover:border-amber hover:text-ink"
+            )}
+          >
+            <Upload className="h-4 w-4" />
+            {busy ? "Uploading…" : "Upload file"}
+            <input
+              type="file"
+              className="hidden"
+              disabled={busy}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.currentTarget.value = "";
+                if (f) pick(f);
+              }}
+            />
+          </label>
+        )}
+        {err && <p className="mt-1 text-xs text-signal">{err}</p>}
+      </div>
+    </div>
   );
 }
