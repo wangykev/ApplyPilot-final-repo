@@ -91,6 +91,8 @@ export const personalInfoSchema = z
     last_name: str,
     preferred_name: str,
     has_preferred_name: triBool,
+    preferred_first_name: str,
+    preferred_last_name: str,
     email: str,
     phone_number: str,
     phone_extension: str,

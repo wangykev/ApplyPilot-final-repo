@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { Plus, Trash2, Save, ShieldAlert } from "lucide-react";
+import { useState, useTransition, useEffect } from "react";
+import { Plus, Trash2, Save, ShieldAlert, X } from "lucide-react";
 import {
   TextField,
   TextAreaField,
@@ -13,10 +13,12 @@ import {
   CheckboxField,
   FieldLabel,
   FileField,
+  BucketLabelContext,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
-import { saveProfile } from "./actions";
+import { saveProfile, saveBuckets } from "./actions";
+import { type Bucket } from "@/lib/buckets";
 import {
   type Profile,
   websiteSchema,
@@ -67,8 +69,10 @@ const DISABILITY_STATUS = opt([
   "I do not wish to answer",
 ]);
 
-export function ProfileEditor({ initial }: { initial: Profile }) {
+export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
   const [profile, setProfile] = useState<Profile>(initial);
+  const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
+  const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
   const [pending, startTransition] = useTransition();
   const [status, setStatus] = useState<{ kind: "idle" | "ok" | "err"; msg?: string }>({
     kind: "idle",
@@ -81,31 +85,42 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
       return next;
     });
 
+  // One Save persists both the profile and the answer buckets edited via the labels.
   const save = () =>
     startTransition(async () => {
       setStatus({ kind: "idle" });
-      const res = await saveProfile(profile);
-      setStatus(res.ok ? { kind: "ok", msg: "Saved" } : { kind: "err", msg: res.error });
+      const [pr, br] = await Promise.all([saveProfile(profile), saveBuckets(buckets)]);
+      if (pr.ok && br.ok) setStatus({ kind: "ok", msg: "Saved" });
+      else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
     });
 
   const pi = profile.personal_info;
 
   return (
+    <BucketLabelContext.Provider value={(path, label, widget) => setBucketOpen({ path, label, widget })}>
     <div className="space-y-6 pb-24">
       {/* Personal info */}
       <SectionCard title="Personal information" subtitle="The basics ApplyPilot maps onto the form's contact fields.">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TextField label="First name" value={pi.first_name} onChange={(v) => update((p) => { p.personal_info.first_name = v; })} />
-          <TextField label="Last name" value={pi.last_name} onChange={(v) => update((p) => { p.personal_info.last_name = v; })} />
-          <TextField label="Email" type="email" value={pi.email} onChange={(v) => update((p) => { p.personal_info.email = v; })} />
-          <TextField label="Phone number" value={pi.phone_number} onChange={(v) => update((p) => { p.personal_info.phone_number = v; })} />
-          <SelectField label="Phone type" value={pi.phone_device_type} options={PHONE_TYPE} onChange={(v) => update((p) => { p.personal_info.phone_device_type = v; })} />
-          <TextField label="Preferred name" value={pi.preferred_name} onChange={(v) => update((p) => { p.personal_info.preferred_name = v; })} />
-          <TextField label="Address line 1" value={pi.address_line_1} onChange={(v) => update((p) => { p.personal_info.address_line_1 = v; })} />
-          <TextField label="Address line 2" value={pi.address_line_2} onChange={(v) => update((p) => { p.personal_info.address_line_2 = v; })} />
-          <TextField label="City" value={pi.city} onChange={(v) => update((p) => { p.personal_info.city = v; })} />
-          <TextField label="State / Province" value={pi.state_province} onChange={(v) => update((p) => { p.personal_info.state_province = v; })} />
-          <TextField label="Postal code" value={pi.postal_code} onChange={(v) => update((p) => { p.personal_info.postal_code = v; })} />
+          <TextField label="First name" bucketPath="personal_info.first_name" value={pi.first_name} onChange={(v) => update((p) => { p.personal_info.first_name = v; })} />
+          <TextField label="Last name" bucketPath="personal_info.last_name" value={pi.last_name} onChange={(v) => update((p) => { p.personal_info.last_name = v; })} />
+          <TextField label="Email" type="email" bucketPath="personal_info.email" value={pi.email} onChange={(v) => update((p) => { p.personal_info.email = v; })} />
+          <TextField label="Phone number" bucketPath="personal_info.phone_number" value={pi.phone_number} onChange={(v) => update((p) => { p.personal_info.phone_number = v; })} />
+          <SelectField label="Phone type" bucketPath="personal_info.phone_device_type" value={pi.phone_device_type} options={PHONE_TYPE} onChange={(v) => update((p) => { p.personal_info.phone_device_type = v; })} />
+          <TextField label="Address line 1" bucketPath="personal_info.address_line_1" value={pi.address_line_1} onChange={(v) => update((p) => { p.personal_info.address_line_1 = v; })} />
+          <TextField label="Address line 2" bucketPath="personal_info.address_line_2" value={pi.address_line_2} onChange={(v) => update((p) => { p.personal_info.address_line_2 = v; })} />
+          <TextField label="City" bucketPath="personal_info.city" value={pi.city} onChange={(v) => update((p) => { p.personal_info.city = v; })} />
+          <TextField label="State / Province" bucketPath="personal_info.state_province" value={pi.state_province} onChange={(v) => update((p) => { p.personal_info.state_province = v; })} />
+          <TextField label="Postal code" bucketPath="personal_info.postal_code" value={pi.postal_code} onChange={(v) => update((p) => { p.personal_info.postal_code = v; })} />
+        </div>
+        <div className="mt-4">
+          <CheckboxField label="I have a preferred name" checked={pi.has_preferred_name === true} onChange={(v) => update((p) => { p.personal_info.has_preferred_name = v; })} />
+          {pi.has_preferred_name === true && (
+            <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <TextField label="Preferred first name" bucketPath="personal_info.preferred_first_name" value={pi.preferred_first_name} onChange={(v) => update((p) => { p.personal_info.preferred_first_name = v; })} />
+              <TextField label="Preferred last name" bucketPath="personal_info.preferred_last_name" value={pi.preferred_last_name} onChange={(v) => update((p) => { p.personal_info.preferred_last_name = v; })} />
+            </div>
+          )}
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <CandidateField label="Country" mode="dropdown" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
@@ -303,11 +318,11 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
       {/* Work authorization */}
       <SectionCard title="Work authorization">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TriBoolField label="Authorized to work in the US" value={profile.work_authorization.authorized_to_work_in_us} onChange={(v) => update((p) => { p.work_authorization.authorized_to_work_in_us = v; })} />
-          <TriBoolField label="Need sponsorship now" value={profile.work_authorization.requires_sponsorship_now} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_now = v; })} />
-          <TriBoolField label="Need sponsorship in future" value={profile.work_authorization.requires_sponsorship_future} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_future = v; })} />
-          <TriBoolField label="Permanent resident" value={profile.work_authorization.permanent_resident} onChange={(v) => update((p) => { p.work_authorization.permanent_resident = v; })} />
-          <TextField label="Current visa status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
+          <TriBoolField label="Authorized to work in the US" bucketPath="work_authorization.authorized_to_work_in_us" value={profile.work_authorization.authorized_to_work_in_us} onChange={(v) => update((p) => { p.work_authorization.authorized_to_work_in_us = v; })} />
+          <TriBoolField label="Need sponsorship now" bucketPath="work_authorization.requires_sponsorship_now" value={profile.work_authorization.requires_sponsorship_now} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_now = v; })} />
+          <TriBoolField label="Need sponsorship in future" bucketPath="work_authorization.requires_sponsorship_future" value={profile.work_authorization.requires_sponsorship_future} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_future = v; })} />
+          <TriBoolField label="Permanent resident" bucketPath="work_authorization.permanent_resident" value={profile.work_authorization.permanent_resident} onChange={(v) => update((p) => { p.work_authorization.permanent_resident = v; })} />
+          <TextField label="Current visa status" bucketPath="work_authorization.current_visa_status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
         <div className="mt-4">
           <CandidateField label="Citizenship country" mode="dropdown" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
@@ -352,26 +367,26 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
         subtitle="Used only if you provide it. Left blank, the extension flags these for your review rather than guessing."
       >
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <SelectField label="Gender" value={profile.self_identification.gender} options={GENDER} onChange={(v) => update((p) => { p.self_identification.gender = v; })} />
-          <SelectField label="Hispanic or Latino" value={profile.self_identification.hispanic_or_latino} options={YES_NO_DECLINE} onChange={(v) => update((p) => { p.self_identification.hispanic_or_latino = v; })} />
-          <SelectField label="Race / Ethnicity" value={profile.self_identification.race_ethnicity} options={RACE_ETHNICITY} onChange={(v) => update((p) => { p.self_identification.race_ethnicity = v; })} />
-          <SelectField label="Veteran status" value={profile.self_identification.veteran_status} options={VETERAN_STATUS} onChange={(v) => update((p) => { p.self_identification.veteran_status = v; })} />
-          <SelectField label="Disability status" value={profile.self_identification.disability_status} options={DISABILITY_STATUS} onChange={(v) => update((p) => { p.self_identification.disability_status = v; })} />
+          <SelectField label="Gender" bucketPath="self_identification.gender" value={profile.self_identification.gender} options={GENDER} onChange={(v) => update((p) => { p.self_identification.gender = v; })} />
+          <SelectField label="Hispanic or Latino" bucketPath="self_identification.hispanic_or_latino" value={profile.self_identification.hispanic_or_latino} options={YES_NO_DECLINE} onChange={(v) => update((p) => { p.self_identification.hispanic_or_latino = v; })} />
+          <SelectField label="Race / Ethnicity" bucketPath="self_identification.race_ethnicity" value={profile.self_identification.race_ethnicity} options={RACE_ETHNICITY} onChange={(v) => update((p) => { p.self_identification.race_ethnicity = v; })} />
+          <SelectField label="Veteran status" bucketPath="self_identification.veteran_status" value={profile.self_identification.veteran_status} options={VETERAN_STATUS} onChange={(v) => update((p) => { p.self_identification.veteran_status = v; })} />
+          <SelectField label="Disability status" bucketPath="self_identification.disability_status" value={profile.self_identification.disability_status} options={DISABILITY_STATUS} onChange={(v) => update((p) => { p.self_identification.disability_status = v; })} />
         </div>
       </SectionCard>
 
       {/* Screening defaults */}
       <SectionCard title="Screening defaults" subtitle="Common yes/no questions and preferences the extension fills when asked.">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TriBoolField label="At least 18 years old" value={profile.screening.at_least_18_years_old} onChange={(v) => update((p) => { p.screening.at_least_18_years_old = v; })} />
-          <TriBoolField label="Willing to do a background check" value={profile.screening.willing_background_check} onChange={(v) => update((p) => { p.screening.willing_background_check = v; })} />
-          <TriBoolField label="Willing to do a drug test" value={profile.screening.willing_drug_test} onChange={(v) => update((p) => { p.screening.willing_drug_test = v; })} />
-          <TriBoolField label="Valid driver's license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} />
-          <TriBoolField label="Willing to relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} />
-          <TriBoolField label="Open to remote" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} />
+          <TriBoolField label="At least 18 years old" bucketPath="screening.at_least_18_years_old" value={profile.screening.at_least_18_years_old} onChange={(v) => update((p) => { p.screening.at_least_18_years_old = v; })} />
+          <TriBoolField label="Willing to do a background check" bucketPath="screening.willing_background_check" value={profile.screening.willing_background_check} onChange={(v) => update((p) => { p.screening.willing_background_check = v; })} />
+          <TriBoolField label="Willing to do a drug test" bucketPath="screening.willing_drug_test" value={profile.screening.willing_drug_test} onChange={(v) => update((p) => { p.screening.willing_drug_test = v; })} />
+          <TriBoolField label="Valid driver's license" bucketPath="screening.has_valid_drivers_license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} />
+          <TriBoolField label="Willing to relocate" bucketPath="screening.willing_to_relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} />
+          <TriBoolField label="Open to remote" bucketPath="screening.remote_ok" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} />
           <DateField label="Earliest start date" granularity="month-day-year" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
-          <TextField label="Total years of experience" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
-          <TextField label="Salary expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
+          <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
+          <TextField label="Salary expectation" bucketPath="screening.salary_expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
         </div>
       </SectionCard>
 
@@ -394,7 +409,19 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           </button>
         </div>
       </div>
+
+      {bucketOpen && (
+        <BucketFieldPopup
+          path={bucketOpen.path}
+          label={bucketOpen.label}
+          widget={bucketOpen.widget}
+          buckets={buckets}
+          onBucketsChange={setBuckets}
+          onClose={() => setBucketOpen(null)}
+        />
+      )}
     </div>
+    </BucketLabelContext.Provider>
   );
 }
 
@@ -438,4 +465,76 @@ function EntryCard({
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="py-2 text-sm text-ink-faint">{children}</p>;
+}
+
+/** Popup that opens when a field label is clicked: edit the question wordings that
+ *  map to that field's answer (creating the bucket on first use). Backdrop / Esc / Done close. */
+function BucketFieldPopup({
+  path,
+  label,
+  widget,
+  buckets,
+  onBucketsChange,
+  onClose,
+}: {
+  path: string;
+  label: string;
+  widget: string;
+  buckets: Bucket[];
+  onBucketsChange: (b: Bucket[]) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  const idx = buckets.findIndex((b) => b.profile_path === path);
+  const bucket = idx >= 0 ? buckets[idx] : null;
+  const questions = bucket ? bucket.questions : [];
+  const sensitive = bucket ? bucket.sensitive : false;
+  const upsert = (patch: Partial<Bucket>) => {
+    const next = buckets.map((b) => ({ ...b }));
+    let i = idx;
+    if (i < 0) {
+      next.push({ id: "field_" + path.replace(/[^\w]+/g, "_"), profile_path: path, value: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} });
+      i = next.length - 1;
+    }
+    next[i] = { ...next[i], ...patch };
+    onBucketsChange(next);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
+      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{label} — question bucket</h3>
+          <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <p className="mb-3 text-xs leading-relaxed text-ink-dim">
+          Every wording here fills from this one field — add the phrasings a form might use, and editing the field updates them all.
+          <span className="mt-1 block font-mono text-[10px] text-ink-faint">{path}</span>
+        </p>
+        <TagListField
+          label="Question wordings"
+          value={questions}
+          placeholder="Add a wording a form might use, press Enter"
+          onChange={(v) => upsert({ questions: v })}
+        />
+        <div className="mt-3">
+          <CheckboxField label="Sensitive (EEO / legal)" checked={sensitive} onChange={(v) => upsert({ sensitive: v })} />
+        </div>
+        <div className="mt-4 flex justify-end">
+          <button type="button" onClick={onClose} className="btn-primary">
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }

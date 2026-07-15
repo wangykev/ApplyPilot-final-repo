@@ -3,7 +3,6 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile, emptyProfile, type Profile } from "@/lib/profile-schema";
 import { ProfileEditor } from "./ProfileEditor";
-import { BucketsPanel } from "@/components/app/BucketsPanel";
 import { loadBuckets } from "./actions";
 
 export const dynamic = "force-dynamic";
@@ -36,8 +35,7 @@ export default async function ProfilePage() {
         title="Profile"
         description="The details ApplyPilot fills applications from. Stored as raw fields — the extension derives dates, joined bullets, and fluency from these."
       />
-      <ProfileEditor initial={initial} />
-      <BucketsPanel initial={buckets} />
+      <ProfileEditor initial={initial} initialBuckets={buckets} />
     </div>
   );
 }

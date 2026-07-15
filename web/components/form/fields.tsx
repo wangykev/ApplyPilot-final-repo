@@ -1,16 +1,48 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { X, ArrowUp, ArrowDown, Plus, SlidersHorizontal, Paperclip, Upload } from "lucide-react";
+import { useState, useEffect, createContext, useContext } from "react";
+import { X, ArrowUp, ArrowDown, Plus, ChevronDown, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
+
+/**
+ * Optional hook: when a provider supplies an opener, a FieldLabel given a
+ * `bucketPath` renders as a clickable link that opens that field's answer-bucket
+ * popup. Absent a provider it stays a plain label (unchanged elsewhere).
+ */
+export const BucketLabelContext = createContext<((path: string, label: string, widget: string) => void) | null>(null);
 
 const inputCls =
   "w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
 
-export function FieldLabel({ children, hint }: { children: React.ReactNode; hint?: string }) {
+export function FieldLabel({
+  children,
+  hint,
+  bucketPath,
+  bucketWidget,
+}: {
+  children: React.ReactNode;
+  hint?: string;
+  bucketPath?: string;
+  bucketWidget?: string;
+}) {
+  const openBucket = useContext(BucketLabelContext);
+  const clickable = !!bucketPath && !!openBucket;
   return (
     <span className="flex items-baseline gap-2">
-      <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{children}</span>
+      {clickable ? (
+        <button
+          type="button"
+          onClick={() =>
+            openBucket!(bucketPath!, typeof children === "string" ? children : String(bucketPath), bucketWidget || "text")
+          }
+          title="Edit the questions that map to this answer"
+          className="font-mono text-[10px] uppercase tracking-label text-ink-dim underline decoration-dotted decoration-ink-faint/50 underline-offset-4 transition-colors hover:text-amber hover:decoration-amber"
+        >
+          {children}
+        </button>
+      ) : (
+        <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{children}</span>
+      )}
       {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
     </span>
   );
@@ -23,6 +55,7 @@ export function TextField({
   placeholder,
   type = "text",
   hint,
+  bucketPath,
 }: {
   label: string;
   value: string;
@@ -30,10 +63,11 @@ export function TextField({
   placeholder?: string;
   type?: string;
   hint?: string;
+  bucketPath?: string;
 }) {
   return (
     <label className="block">
-      <FieldLabel hint={hint}>{label}</FieldLabel>
+      <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="text">{label}</FieldLabel>
       <input
         type={type}
         value={value}
@@ -80,16 +114,18 @@ export function SelectField({
   onChange,
   options,
   hint,
+  bucketPath,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
   hint?: string;
+  bucketPath?: string;
 }) {
   return (
     <label className="block">
-      <FieldLabel hint={hint}>{label}</FieldLabel>
+      <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="dropdown">{label}</FieldLabel>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -112,11 +148,13 @@ export function TriBoolField({
   value,
   onChange,
   hint,
+  bucketPath,
 }: {
   label: string;
   value: boolean | null;
   onChange: (v: boolean | null) => void;
   hint?: string;
+  bucketPath?: string;
 }) {
   const opts: { v: boolean; t: string }[] = [
     { v: true, t: "Yes" },
@@ -125,9 +163,9 @@ export function TriBoolField({
   const escHint = value !== null ? (hint ? hint + " · Esc clears" : "Esc clears") : hint;
   return (
     <div>
-      <FieldLabel hint={escHint}>{label}</FieldLabel>
+      <FieldLabel hint={escHint} bucketPath={bucketPath} bucketWidget="radio">{label}</FieldLabel>
       <div
-        className="mt-1.5 grid grid-cols-2 gap-1 rounded-lg border border-hairline p-1"
+        className="mt-1.5 flex overflow-hidden rounded-lg border border-hairline"
         onKeyDown={(e) => {
           if (e.key === "Escape" && value !== null) {
             e.preventDefault();
@@ -135,7 +173,7 @@ export function TriBoolField({
           }
         }}
       >
-        {opts.map((o) => {
+        {opts.map((o, idx) => {
           const active = value === o.v;
           return (
             <button
@@ -143,8 +181,11 @@ export function TriBoolField({
               type="button"
               onClick={() => onChange(o.v)}
               className={clsx(
-                "rounded-md py-1.5 text-sm transition-colors",
-                active ? "bg-panel-raised text-ink" : "text-ink-dim hover:text-ink"
+                "flex-1 py-1.5 text-sm transition-colors",
+                idx === 0 && "border-r border-hairline", // divider bar between Yes and No
+                active
+                  ? "bg-amber/15 font-semibold text-amber" // clearly selected
+                  : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
               )}
             >
               {o.t}
@@ -364,7 +405,7 @@ export function CandidateField({
   return (
     <div>
       <FieldLabel hint={mode === "dropdown" ? "pick one" : undefined}>{label}</FieldLabel>
-      <div className="mt-1.5 flex items-center gap-2">
+      <div className="relative mt-1.5">
         {mode === "dropdown" && countries && expand ? (
           <select
             value={selected}
@@ -372,7 +413,7 @@ export function CandidateField({
               const c = countries.find((x) => x.name === e.target.value);
               if (c) onChange(expand(c));
             }}
-            className={clsx(inputCls, "appearance-none")}
+            className={clsx(inputCls, "appearance-none pr-9")}
           >
             <option value="">Choose a country…</option>
             {countries.map((c) => (
@@ -386,17 +427,21 @@ export function CandidateField({
             value={value[0] || ""}
             placeholder={placeholder}
             onChange={(e) => setPrimary(e.target.value)}
-            className={inputCls}
+            className={clsx(inputCls, "pr-9")}
           />
         )}
+        {/* subtle in-field arrow → the fallback-candidates popup (amber when fallbacks exist) */}
         <button
           type="button"
           onClick={() => setOpen(true)}
-          title="Advanced choices — fallback wordings the extension tries"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-hairline px-2.5 py-2 text-[11px] text-ink-dim transition-colors hover:border-amber hover:text-ink"
+          title={extra > 0 ? `${extra} fallback${extra === 1 ? "" : "s"} — more choices` : "More choices — fallback wordings"}
+          aria-label="More choices"
+          className={clsx(
+            "absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors",
+            extra > 0 ? "text-amber" : "text-ink-faint hover:text-amber"
+          )}
         >
-          <SlidersHorizontal className="h-3.5 w-3.5" />
-          {extra > 0 ? `+${extra}` : "Advanced"}
+          <ChevronDown className="h-4 w-4" />
         </button>
       </div>
       {open && <AdvancedChoices label={label} value={value} onChange={onChange} onClose={() => setOpen(false)} />}
