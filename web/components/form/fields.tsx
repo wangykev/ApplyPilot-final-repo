@@ -36,7 +36,7 @@ export function FieldLabel({
             openBucket!(bucketPath!, typeof children === "string" ? children : String(bucketPath), bucketWidget || "text")
           }
           title="Edit the questions that map to this answer"
-          className="font-mono text-[10px] uppercase tracking-label text-ink-dim underline decoration-dotted decoration-ink-faint/50 underline-offset-4 transition-colors hover:text-amber hover:decoration-amber"
+          className="font-mono text-[10px] uppercase tracking-label text-ink-dim underline decoration-dotted decoration-ink-faint/50 underline-offset-4 transition-colors hover:text-amber hover:decoration-amber group-hover:text-amber group-hover:decoration-amber"
         >
           {children}
         </button>
@@ -66,7 +66,7 @@ export function TextField({
   bucketPath?: string;
 }) {
   return (
-    <label className="block">
+    <label className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="text">{label}</FieldLabel>
       <input
         type={type}
@@ -124,7 +124,7 @@ export function SelectField({
   bucketPath?: string;
 }) {
   return (
-    <label className="block">
+    <label className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="dropdown">{label}</FieldLabel>
       <select
         value={value}
@@ -162,7 +162,7 @@ export function TriBoolField({
   ];
   const escHint = value !== null ? (hint ? hint + " · Esc clears" : "Esc clears") : hint;
   return (
-    <div>
+    <div className="group">
       <FieldLabel hint={escHint} bucketPath={bucketPath} bucketWidget="radio">{label}</FieldLabel>
       <div
         className="mt-1.5 flex overflow-hidden rounded-lg border border-hairline"
@@ -181,14 +181,13 @@ export function TriBoolField({
               type="button"
               onClick={() => onChange(o.v)}
               className={clsx(
-                "flex-1 py-1.5 text-sm transition-colors",
+                "flex flex-1 items-center justify-center py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
-                active
-                  ? "bg-amber/15 font-semibold text-amber" // clearly selected
-                  : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
+                active ? "text-ink" : "text-ink-dim hover:text-ink"
               )}
             >
-              {o.t}
+              {/* tight, subtle white box around the selected option */}
+              <span className={clsx("rounded px-2 py-0.5 transition-colors", active && "bg-ink/10")}>{o.t}</span>
             </button>
           );
         })}

@@ -150,7 +150,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       {/* Work experience */}
       <SectionCard
         title="Work experience"
-        subtitle="Most-recent first. Bullets become the role description, joined line by line."
+        subtitle="Most-recent first. Click a field's label to add the wordings other forms use for it."
         actions={<AddButton onClick={() => update((p) => { p.work_experience.push(workExperienceSchema.parse({})); })} />}
       >
         {profile.work_experience.length === 0 && <Empty>No roles yet.</Empty>}
@@ -158,9 +158,9 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           {profile.work_experience.map((w, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.work_experience.splice(i, 1); })}>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <TextField label="Job title" value={w.job_title} onChange={(v) => update((p) => { p.work_experience[i].job_title = v; })} />
-                <TextField label="Company" value={w.company} onChange={(v) => update((p) => { p.work_experience[i].company = v; })} />
-                <TextField label="Location" value={w.location} onChange={(v) => update((p) => { p.work_experience[i].location = v; })} />
+                <TextField label="Job title" bucketPath={i === 0 ? "work_experience.0.job_title" : undefined} value={w.job_title} onChange={(v) => update((p) => { p.work_experience[i].job_title = v; })} />
+                <TextField label="Company" bucketPath={i === 0 ? "work_experience.0.company" : undefined} value={w.company} onChange={(v) => update((p) => { p.work_experience[i].company = v; })} />
+                <TextField label="Location" bucketPath={i === 0 ? "work_experience.0.location" : undefined} value={w.location} onChange={(v) => update((p) => { p.work_experience[i].location = v; })} />
                 <TriBoolField label="Currently work here" value={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; })} />
                 <DateField label="From" granularity="month-year" value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
                 <DateField label="To" granularity="month-year" value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
@@ -185,10 +185,10 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           {profile.education.map((e, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.education.splice(i, 1); })}>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <TextField label="School / University" value={e.school_or_university} onChange={(v) => update((p) => { p.education[i].school_or_university = v; })} />
-                <TextField label="Minor(s)" hint="comma-separate multiple" value={e.minor} onChange={(v) => update((p) => { p.education[i].minor = v; })} />
-                <TextField label="GPA" value={e.gpa} onChange={(v) => update((p) => { p.education[i].gpa = v; })} />
-                <TextField label="GPA scale" value={e.gpa_scale} placeholder="4.0" onChange={(v) => update((p) => { p.education[i].gpa_scale = v; })} />
+                <TextField label="School / University" bucketPath={i === 0 ? "education.0.school_or_university" : undefined} value={e.school_or_university} onChange={(v) => update((p) => { p.education[i].school_or_university = v; })} />
+                <TextField label="Minor(s)" hint="comma-separate multiple" bucketPath={i === 0 ? "education.0.minor" : undefined} value={e.minor} onChange={(v) => update((p) => { p.education[i].minor = v; })} />
+                <TextField label="GPA" bucketPath={i === 0 ? "education.0.gpa" : undefined} value={e.gpa} onChange={(v) => update((p) => { p.education[i].gpa = v; })} />
+                <TextField label="GPA scale" bucketPath={i === 0 ? "education.0.gpa_scale" : undefined} value={e.gpa_scale} placeholder="4.0" onChange={(v) => update((p) => { p.education[i].gpa_scale = v; })} />
                 <DateField label="From year" granularity="year" value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
                 <DateField label="To year" granularity="year" value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
               </div>
@@ -217,7 +217,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           {profile.languages.map((l, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.languages.splice(i, 1); })}>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <TextField label="Language" value={l.language} onChange={(v) => update((p) => { p.languages[i].language = v; })} />
+                <TextField label="Language" bucketPath={i === 0 ? "languages.0.language" : undefined} value={l.language} onChange={(v) => update((p) => { p.languages[i].language = v; })} />
                 <SelectField label="Reading" value={l.reading} options={PROFICIENCY} onChange={(v) => update((p) => { p.languages[i].reading = v; })} />
                 <SelectField label="Speaking" value={l.speaking} options={PROFICIENCY} onChange={(v) => update((p) => { p.languages[i].speaking = v; })} />
                 <SelectField label="Writing" value={l.writing} options={PROFICIENCY} onChange={(v) => update((p) => { p.languages[i].writing = v; })} />
@@ -245,7 +245,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.certifications.splice(i, 1); })}>
               <CandidateField label="Certification" value={c.certification} placeholder="Certification name" onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
-                <TextField label="Number" value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
+                <TextField label="Number" bucketPath={i === 0 ? "certifications.0.certification_number" : undefined} value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
                 <DateField label="Issued date" granularity="month-day-year" value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
                 <DateField label="Expiration date" granularity="month-day-year" value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
               </div>
