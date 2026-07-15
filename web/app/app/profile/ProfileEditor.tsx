@@ -169,7 +169,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.education.splice(i, 1); })}>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <TextField label="School / University" value={e.school_or_university} onChange={(v) => update((p) => { p.education[i].school_or_university = v; })} />
-                <TextField label="Minor" value={e.minor} onChange={(v) => update((p) => { p.education[i].minor = v; })} />
+                <TextField label="Minor(s)" hint="comma-separate multiple" value={e.minor} onChange={(v) => update((p) => { p.education[i].minor = v; })} />
                 <TextField label="GPA" value={e.gpa} onChange={(v) => update((p) => { p.education[i].gpa = v; })} />
                 <TextField label="GPA scale" value={e.gpa_scale} placeholder="4.0" onChange={(v) => update((p) => { p.education[i].gpa_scale = v; })} />
                 <DateField label="From year" granularity="year" value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
