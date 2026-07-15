@@ -38,14 +38,24 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
   // The handoff bundle: profile + defaults + jobContext (RAW fields only).
   if (type === "AP_SYNC_PROFILE") {
-    const data = {};
-    if (message.profile !== undefined) data.profile = message.profile;
-    if (message.defaults !== undefined) data.defaults = message.defaults;
-    if (message.jobContext !== undefined) data.jobContext = message.jobContext;
-    if (Object.keys(data).length === 0) { sendResponse({ ok: false, error: "nothing to sync" }); return true; }
-    chrome.storage.local.set(data, () => {
-      const err = chrome.runtime.lastError;
-      sendResponse(err ? { ok: false, error: err.message } : { ok: true, keys: Object.keys(data) });
+    if (message.profile === undefined && message.defaults === undefined && message.jobContext === undefined) {
+      sendResponse({ ok: false, error: "nothing to sync" }); return true;
+    }
+    // MERGE defaults, don't clobber: the website manages only `how_did_you_hear`, but the
+    // extension's `defaults` also holds field_of_study/degree/gpa_range (from
+    // application_defaults.json). A wholesale overwrite would wipe those, degrading the
+    // default-matching ladder — so shallow-merge the incoming keys over the existing object.
+    chrome.storage.local.get("defaults", ({ defaults: existingDefaults }) => {
+      const data = {};
+      if (message.profile !== undefined) data.profile = message.profile;
+      if (message.jobContext !== undefined) data.jobContext = message.jobContext;
+      if (message.defaults !== undefined) {
+        data.defaults = { ...(existingDefaults || {}), ...message.defaults };
+      }
+      chrome.storage.local.set(data, () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true, keys: Object.keys(data) });
+      });
     });
     return true;
   }

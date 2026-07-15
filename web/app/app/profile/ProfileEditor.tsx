@@ -293,11 +293,18 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
       {/* How did you hear */}
       <SectionCard
         title="How did you hear about us?"
-        subtitle="Candidates the extension tries for the source picker; the fallback is the last resort."
+        subtitle="A fallback list for the source question when the real source isn't known."
       >
-        <TagListField label="Preferred sources" value={profile.how_did_you_hear.preferred} placeholder="LinkedIn, Handshake, …" onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })} />
+        <div className="mb-4 rounded-lg border border-hairline bg-panel-raised/40 p-3">
+          <p className="text-xs leading-relaxed text-ink-dim">
+            The extension fills the <span className="text-ink">real source</span> when it&apos;s known
+            (from how the job was queued). For a manually pasted link, or when no source is available, it
+            works down this fallback list in order.
+          </p>
+        </div>
+        <TagListField label="Fallback sources (in order)" value={profile.how_did_you_hear.preferred} placeholder="LinkedIn, Handshake, …" onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })} />
         <div className="mt-4">
-          <TextField label="Fallback" value={profile.how_did_you_hear.fallback} placeholder="Other" onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })} />
+          <TextField label="Last-resort answer" value={profile.how_did_you_hear.fallback} placeholder="Other" onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })} />
         </div>
       </SectionCard>
 
