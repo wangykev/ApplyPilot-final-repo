@@ -364,3 +364,96 @@ export function CountryField({
     </div>
   );
 }
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+export type DateGranularity = "year" | "month-year" | "month-day-year";
+type DateParts = { year: string; month: string; day: string };
+
+function parseDateValue(value: string, g: DateGranularity): DateParts {
+  if (g === "year") return { year: /^\d{4}$/.test(value) ? value : "", month: "", day: "" };
+  const m = value.match(/^(\d{4})-(\d{2})(?:-(\d{2}))?$/);
+  if (!m) return { year: "", month: "", day: "" };
+  return { year: m[1], month: String(Number(m[2])), day: m[3] ? String(Number(m[3])) : "" };
+}
+
+/** Reassemble the canonical string; empty until the required segments exist so
+ *  we never store a half-formed date the extension's parsers would reject. */
+function assembleDate(p: DateParts, g: DateGranularity): string {
+  const y = p.year.trim();
+  const okY = /^\d{4}$/.test(y);
+  if (g === "year") return okY ? y : "";
+  const mo = p.month.trim();
+  if (g === "month-year") return okY && mo ? `${y}-${mo.padStart(2, "0")}` : "";
+  const d = p.day.trim();
+  return okY && mo && d ? `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}` : "";
+}
+
+/**
+ * Workday-style segmented date input. Granularity picks the segments (year /
+ * month-year / month-day-year, US M/D/Y order) but the STORED value is always
+ * the canonical string prepareProfile expects — "YYYY" / "YYYY-MM" /
+ * "YYYY-MM-DD". Segments live in local state so a partial entry isn't lost.
+ */
+export function DateField({
+  label,
+  value,
+  onChange,
+  granularity,
+  hint,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  granularity: DateGranularity;
+  hint?: string;
+}) {
+  const [parts, setParts] = useState<DateParts>(() => parseDateValue(value, granularity));
+  const set = (patch: Partial<DateParts>) => {
+    const next = { ...parts, ...patch };
+    setParts(next);
+    onChange(assembleDate(next, granularity));
+  };
+  const seg =
+    "rounded-lg border border-hairline bg-cockpit px-2.5 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
+  return (
+    <div>
+      <FieldLabel hint={hint}>{label}</FieldLabel>
+      <div className="mt-1.5 flex gap-2">
+        {granularity !== "year" && (
+          <select
+            aria-label={`${label} month`}
+            value={parts.month}
+            onChange={(e) => set({ month: e.target.value })}
+            className={clsx(seg, "flex-1 appearance-none")}
+          >
+            <option value="">Month</option>
+            {MONTHS.map((m, i) => (
+              <option key={m} value={String(i + 1)} className="bg-panel">
+                {String(i + 1).padStart(2, "0")} — {m}
+              </option>
+            ))}
+          </select>
+        )}
+        {granularity === "month-day-year" && (
+          <input
+            aria-label={`${label} day`}
+            inputMode="numeric"
+            value={parts.day}
+            placeholder="DD"
+            onChange={(e) => set({ day: e.target.value.replace(/\D/g, "").slice(0, 2) })}
+            className={clsx(seg, "w-16 text-center")}
+          />
+        )}
+        <input
+          aria-label={`${label} year`}
+          inputMode="numeric"
+          value={parts.year}
+          placeholder="YYYY"
+          onChange={(e) => set({ year: e.target.value.replace(/\D/g, "").slice(0, 4) })}
+          className={clsx(seg, "w-24 text-center")}
+        />
+      </div>
+    </div>
+  );
+}

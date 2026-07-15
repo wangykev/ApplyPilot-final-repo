@@ -9,6 +9,7 @@ import {
   TagListField,
   TieredField,
   CountryField,
+  DateField,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
@@ -136,8 +137,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                 <TextField label="Company" value={w.company} onChange={(v) => update((p) => { p.work_experience[i].company = v; })} />
                 <TextField label="Location" value={w.location} onChange={(v) => update((p) => { p.work_experience[i].location = v; })} />
                 <TriBoolField label="Currently work here" value={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; })} />
-                <TextField label="From" hint="YYYY-MM" value={w.from} placeholder="2023-01" onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
-                <TextField label="To" hint="YYYY-MM" value={w.to} placeholder="2024-12" onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
+                <DateField label="From" granularity="month-year" value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
+                <DateField label="To" granularity="month-year" value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
               </div>
               <div className="mt-4 space-y-4">
                 <TagListField label="Bullets" value={w.bullets} placeholder="Add an accomplishment, press Enter" onChange={(v) => update((p) => { p.work_experience[i].bullets = v; })} />
@@ -163,8 +164,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
                 <TextField label="Minor" value={e.minor} onChange={(v) => update((p) => { p.education[i].minor = v; })} />
                 <TextField label="GPA" value={e.gpa} onChange={(v) => update((p) => { p.education[i].gpa = v; })} />
                 <TextField label="GPA scale" value={e.gpa_scale} placeholder="4.0" onChange={(v) => update((p) => { p.education[i].gpa_scale = v; })} />
-                <TextField label="From year" hint="YYYY" value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
-                <TextField label="To year" hint="YYYY" value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
+                <DateField label="From year" granularity="year" value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
+                <DateField label="To year" granularity="year" value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <TieredField label="Degree" value={e.degree} onChange={(v) => update((p) => { p.education[i].degree = v; })} />
@@ -213,8 +214,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
               <TieredField label="Certification" value={c.certification} onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <TextField label="Number" value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
-                <TextField label="Issued date" hint="YYYY-MM-DD" value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
-                <TextField label="Expiration date" hint="YYYY-MM-DD" value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
+                <DateField label="Issued date" granularity="month-day-year" value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
+                <DateField label="Expiration date" granularity="month-day-year" value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
               </div>
             </EntryCard>
           ))}
@@ -286,7 +287,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           <TriBoolField label="Valid driver's license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} />
           <TriBoolField label="Willing to relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} />
           <TriBoolField label="Open to remote" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} />
-          <TextField label="Earliest start date" hint="YYYY-MM-DD" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
+          <DateField label="Earliest start date" granularity="month-day-year" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
           <TextField label="Total years of experience" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
           <TextField label="Salary expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
         </div>
