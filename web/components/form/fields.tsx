@@ -217,7 +217,7 @@ export function TieredField({
   label,
   value,
   onChange,
-  placeholder = "Add a candidate, most-specific first",
+  placeholder,
 }: {
   label: string;
   value: string[];
@@ -225,6 +225,15 @@ export function TieredField({
   placeholder?: string;
 }) {
   const [draft, setDraft] = useState("");
+  // Adaptive placeholder: explain the tiered fallback in terms of how many
+  // candidates are already listed ("if the first N aren't on the form").
+  const autoPlaceholder =
+    value.length === 0
+      ? "Add a candidate — most-specific first"
+      : `Add a candidate if the first ${value.length} ${
+          value.length === 1 ? "option isn't" : "options aren't"
+        } on the form`;
+  const ph = placeholder ?? autoPlaceholder;
   const add = () => {
     const t = draft.trim();
     if (!t) return;
@@ -244,7 +253,7 @@ export function TieredField({
       <div className="mt-1.5 flex gap-2">
         <input
           value={draft}
-          placeholder={placeholder}
+          placeholder={ph}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") {

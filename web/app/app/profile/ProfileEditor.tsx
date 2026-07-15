@@ -26,6 +26,33 @@ const opt = (vals: string[], blank = "—") =>
 const PROFICIENCY = opt(["", "None", "Basic", "Intermediate", "Advanced", "Fluent"]);
 const PHONE_TYPE = opt(["", "Mobile", "Home", "Work"]);
 const WEBSITE_TYPE = opt(["linkedin", "github", "portfolio", "other"]);
+// Standard US EEO option sets. Stored values are candidates the extension
+// matches against each tenant's live options — refine per observed wording.
+const GENDER = opt(["", "Male", "Female", "Non-binary", "Decline to self-identify"]);
+const YES_NO_DECLINE = opt(["", "Yes", "No", "Decline to self-identify"]);
+const RACE_ETHNICITY = opt([
+  "",
+  "American Indian or Alaska Native",
+  "Asian",
+  "Black or African American",
+  "Hispanic or Latino",
+  "Native Hawaiian or Other Pacific Islander",
+  "White",
+  "Two or More Races",
+  "Decline to self-identify",
+]);
+const VETERAN_STATUS = opt([
+  "",
+  "I am not a protected veteran",
+  "I identify as one or more of the classifications of a protected veteran",
+  "Decline to self-identify",
+]);
+const DISABILITY_STATUS = opt([
+  "",
+  "No, I do not have a disability",
+  "Yes, I have a disability (or previously had one)",
+  "I do not wish to answer",
+]);
 
 export function ProfileEditor({ initial }: { initial: Profile }) {
   const [profile, setProfile] = useState<Profile>(initial);
@@ -83,9 +110,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
         <div className="space-y-4">
           {profile.websites.map((w, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.websites.splice(i, 1); })}>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <SelectField label="Type" value={w.type} options={WEBSITE_TYPE} onChange={(v) => update((p) => { p.websites[i].type = v; })} />
-                <TextField label="Label" value={w.label} onChange={(v) => update((p) => { p.websites[i].label = v; })} />
                 <TextField label="URL" value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
               </div>
             </EntryCard>
@@ -140,7 +166,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <TieredField label="Degree" value={e.degree} onChange={(v) => update((p) => { p.education[i].degree = v; })} />
-                <TieredField label="Field of study" value={e.field_of_study} onChange={(v) => update((p) => { p.education[i].field_of_study = v; })} />
+                <TieredField label="Major / Field of Study" value={e.field_of_study} onChange={(v) => update((p) => { p.education[i].field_of_study = v; })} />
               </div>
             </EntryCard>
           ))}
@@ -237,15 +263,15 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
 
       {/* Self identification */}
       <SectionCard
-        title="Self-identification (optional)"
+        title="Self-identification"
         subtitle="Used only if you provide it. Left blank, the extension flags these for your review rather than guessing."
       >
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TextField label="Gender" value={profile.self_identification.gender} onChange={(v) => update((p) => { p.self_identification.gender = v; })} />
-          <TextField label="Hispanic or Latino" value={profile.self_identification.hispanic_or_latino} onChange={(v) => update((p) => { p.self_identification.hispanic_or_latino = v; })} />
-          <TextField label="Race / Ethnicity" value={profile.self_identification.race_ethnicity} onChange={(v) => update((p) => { p.self_identification.race_ethnicity = v; })} />
-          <TextField label="Veteran status" value={profile.self_identification.veteran_status} onChange={(v) => update((p) => { p.self_identification.veteran_status = v; })} />
-          <TextField label="Disability status" value={profile.self_identification.disability_status} onChange={(v) => update((p) => { p.self_identification.disability_status = v; })} />
+          <SelectField label="Gender" value={profile.self_identification.gender} options={GENDER} onChange={(v) => update((p) => { p.self_identification.gender = v; })} />
+          <SelectField label="Hispanic or Latino" value={profile.self_identification.hispanic_or_latino} options={YES_NO_DECLINE} onChange={(v) => update((p) => { p.self_identification.hispanic_or_latino = v; })} />
+          <SelectField label="Race / Ethnicity" value={profile.self_identification.race_ethnicity} options={RACE_ETHNICITY} onChange={(v) => update((p) => { p.self_identification.race_ethnicity = v; })} />
+          <SelectField label="Veteran status" value={profile.self_identification.veteran_status} options={VETERAN_STATUS} onChange={(v) => update((p) => { p.self_identification.veteran_status = v; })} />
+          <SelectField label="Disability status" value={profile.self_identification.disability_status} options={DISABILITY_STATUS} onChange={(v) => update((p) => { p.self_identification.disability_status = v; })} />
         </div>
       </SectionCard>
 

@@ -28,7 +28,7 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
       postal_code: "",
       country: [],
     },
-    websites: [{ type: "linkedin|github|portfolio|other", label: "", url: "" }],
+    websites: [{ type: "linkedin|github|portfolio|other", url: "" }],
     work_experience: [
       { job_title: "", company: "", location: "", from: "YYYY-MM", to: "YYYY-MM", bullets: [], tech_stack: [] },
     ],

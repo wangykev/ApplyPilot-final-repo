@@ -19,7 +19,6 @@ const tiered = z.array(z.string()).default([]);
 
 export const websiteSchema = z.object({
   type: str, // linkedin | github | portfolio | other
-  label: str,
   url: str,
 });
 
