@@ -8,8 +8,10 @@ import {
   TriBoolField,
   TagListField,
   TieredField,
+  CountryField,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
+import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
 import { saveProfile } from "./actions";
 import {
   type Profile,
@@ -95,8 +97,8 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           <TextField label="Postal code" value={pi.postal_code} onChange={(v) => update((p) => { p.personal_info.postal_code = v; })} />
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TieredField label="Country" value={pi.country} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
-          <TieredField label="Country phone code" value={pi.country_phone_code} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
+          <CountryField label="Country" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
+          <CountryField label="Country phone code" mode="phone" value={pi.country_phone_code} countries={COUNTRIES} expand={phoneCandidates} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
         </div>
       </SectionCard>
 
@@ -229,7 +231,7 @@ export function ProfileEditor({ initial }: { initial: Profile }) {
           <TextField label="Current visa status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
         <div className="mt-4">
-          <TieredField label="Citizenship country" value={profile.work_authorization.citizenship_country} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
+          <CountryField label="Citizenship country" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
         </div>
       </SectionCard>
 

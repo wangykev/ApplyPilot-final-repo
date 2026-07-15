@@ -309,3 +309,58 @@ export function TieredField({
     </div>
   );
 }
+
+type CountryLike = { name: string; dial: string; candidates?: string[] };
+
+/**
+ * Country / dial-code picker. Pick one country from the dropdown; it EXPANDS
+ * into the tiered candidate list the extension matches against (see
+ * lib/countries.ts). A subtle reveal shows that list so the user can edit it if
+ * a tenant words the option differently. Stored value stays a string[].
+ */
+export function CountryField({
+  label,
+  value,
+  onChange,
+  countries,
+  expand,
+  mode = "country",
+}: {
+  label: string;
+  value: string[];
+  onChange: (v: string[]) => void;
+  countries: CountryLike[];
+  expand: (c: CountryLike) => string[];
+  mode?: "country" | "phone";
+}) {
+  // Reflect the current selection when the stored candidates still match a
+  // known country's expansion; a hand-edited list falls back to "Choose…".
+  const selected = countries.find((c) => expand(c).some((cand) => cand === value[0]))?.name ?? "";
+  return (
+    <div>
+      <FieldLabel hint="pick one; edit the candidates below if a tenant words it differently">
+        {label}
+      </FieldLabel>
+      <select
+        value={selected}
+        onChange={(e) => {
+          const c = countries.find((x) => x.name === e.target.value);
+          if (c) onChange(expand(c));
+        }}
+        className={clsx(inputCls, "mt-1.5 appearance-none")}
+      >
+        <option value="">Choose a country…</option>
+        {countries.map((c) => (
+          <option key={c.name} value={c.name} className="bg-panel">
+            {mode === "phone" ? `${c.name} (${c.dial})` : c.name}
+          </option>
+        ))}
+      </select>
+      {value.length > 0 && (
+        <div className="mt-2 rounded-lg border border-hairline/70 bg-panel-raised/30 p-2.5">
+          <TieredField label="Candidates the extension tries" value={value} onChange={onChange} />
+        </div>
+      )}
+    </div>
+  );
+}
