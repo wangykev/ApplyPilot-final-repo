@@ -56,6 +56,7 @@ export function TextField({
   type = "text",
   hint,
   bucketPath,
+  disabled,
 }: {
   label: string;
   value: string;
@@ -64,6 +65,7 @@ export function TextField({
   type?: string;
   hint?: string;
   bucketPath?: string;
+  disabled?: boolean;
 }) {
   return (
     <label className="group block">
@@ -72,8 +74,9 @@ export function TextField({
         type={type}
         value={value}
         placeholder={placeholder}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
-        className={clsx(inputCls, "mt-1.5")}
+        className={clsx(inputCls, "mt-1.5", disabled && "cursor-not-allowed text-ink-dim opacity-70")}
       />
     </label>
   );

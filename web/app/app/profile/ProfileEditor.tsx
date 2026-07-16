@@ -159,17 +159,12 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               <EntryCard
                 key={i}
                 index={i}
-                title={locked ? w.type : undefined}
                 onRemove={locked ? undefined : () => update((p) => { p.websites.splice(i, 1); })}
               >
-                {locked ? (
-                  <TextField label={`${w.type} URL`} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
-                ) : (
-                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    <TextField label="Type" value={w.type} placeholder="Portfolio, Twitter…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
-                    <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
-                  </div>
-                )}
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <TextField label="Type" value={w.type} disabled={locked} placeholder="Portfolio, Twitter…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
+                  <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
+                </div>
               </EntryCard>
             );
           })}
