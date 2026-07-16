@@ -528,7 +528,7 @@ function BucketFieldPopup({
     const next = buckets.map((b) => ({ ...b }));
     let i = idx;
     if (i < 0) {
-      next.push({ id: "field_" + path.replace(/[^\w]+/g, "_"), profile_path: path, value: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} });
+      next.push({ id: "field_" + path.replace(/[^\w]+/g, "_"), profile_path: path, value: [], category: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} });
       i = next.length - 1;
     }
     next[i] = { ...next[i], ...patch };

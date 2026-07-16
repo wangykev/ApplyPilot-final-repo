@@ -6394,7 +6394,7 @@ test("buildBucketIndex: normalizes wordings, skips blanks/malformed, maps to the
 
 test("bucket Mode B: an unmapped field whose label matches a wording fills from the saved value, flagged 'bucket'", async () => {
   const field = { wrapperSel: "#b1", fieldName: "customColorQ", widgetType: "text", label: "What is your favorite color?", value: "" };
-  const bucket = { id: "color", profile_path: "", value: "Blue", widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
+  const bucket = { id: "color", profile_path: "", value: ["Blue"], widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
   const out = await drivePageFill(makeFakeAct([field]), {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
   const rec = out.results.find((r) => r.fieldName === "customColorQ");
   assert.equal(rec.status, "filled");
@@ -6424,7 +6424,7 @@ test("bucket Mode A: an EMPTY bound profile value produces nothing (falls throug
 
 test("bucket: an unmapped field with NO matching wording is not bucket-filled", async () => {
   const field = { wrapperSel: "#b3", fieldName: "customX", widgetType: "text", label: "Some unmapped question", value: "" };
-  const bucket = { id: "color", profile_path: "", value: "Blue", widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
+  const bucket = { id: "color", profile_path: "", value: ["Blue"], widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
   const out = await drivePageFill(makeFakeAct([field]), {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
   const rec = out.results.find((r) => r.fieldName === "customX");
   assert.notEqual(rec.flag, "bucket");
@@ -6433,11 +6433,31 @@ test("bucket: an unmapped field with NO matching wording is not bucket-filled", 
 
 test("bucket: a match fills BEFORE the AI pass — the LLM is never consulted", async () => {
   const field = { wrapperSel: "#b4", fieldName: "customColorQ", widgetType: "text", label: "What is your favorite color?", isRequired: true, value: "" };
-  const bucket = { id: "color", profile_path: "", value: "Blue", widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
+  const bucket = { id: "color", profile_path: "", value: ["Blue"], widget_hint: "text", questions: ["What is your favorite color?"], selectors: {} };
   const act = makeFakeAct([field], { aiEnabled: true, ai: '{"answer":"Green"}' });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
   const rec = out.results.find((r) => r.fieldName === "customColorQ");
   assert.equal(rec.flag, "bucket");
   assert.equal(field.value, "Blue");
   assert.ok(!act.log.some((e) => e[0] === "llm"), "the bucket won → the AI pass never ran");
+});
+
+test("bucket Mode B: `value` is a CANDIDATE LIST — a choice widget tries each in order until one matches the live options", async () => {
+  const field = { wrapperSel: "#b7", fieldName: "clearanceQ", widgetType: "dropdown", label: "Do you hold an active security clearance?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  // the tenant words the option "No"; the first (more specific) candidate isn't on this form → the ladder falls to "No"
+  const bucket = { id: "clearance", profile_path: "", value: ["No, I do not", "No"], widget_hint: "dropdown", questions: ["Do you hold an active security clearance?"], selectors: {} };
+  const out = await drivePageFill(makeFakeAct([field]), {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "clearanceQ");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(rec.after, "No", "first candidate missed the live options; second matched (tiered fill)");
+});
+
+test("bucket Mode B: a LEGACY single-string `value` is tolerated (upgraded to one candidate at fill time)", async () => {
+  const field = { wrapperSel: "#b8", fieldName: "legacyQ", widgetType: "text", label: "Legacy stored question?", value: "" };
+  const bucket = { id: "legacy", profile_path: "", value: "Blue", widget_hint: "text", questions: ["Legacy stored question?"], selectors: {} };
+  const out = await drivePageFill(makeFakeAct([field]), {}, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "legacyQ");
+  assert.equal(rec.flag, "bucket", "a pre-migration string value still fills");
+  assert.equal(field.value, "Blue");
 });

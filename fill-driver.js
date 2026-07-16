@@ -2220,9 +2220,11 @@ const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
     if (!r || r.skip) return null;
     arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
   } else {
-    const v = bucket.value != null ? String(bucket.value) : "";
-    if (v.trim() === "") return null;
-    arg = (f.widgetType === "text") ? v : [v]; // Mode B: a single standalone value
+    // Mode B: `value` is a CANDIDATE LIST (most-specific first); a legacy single string is tolerated.
+    const cands = (Array.isArray(bucket.value) ? bucket.value : (bucket.value != null ? [bucket.value] : []))
+      .map((c) => String(c)).filter((c) => c.trim() !== "");
+    if (!cands.length) return null;
+    arg = (f.widgetType === "text") ? cands[0] : cands; // text → top candidate; choice → the full ladder
   }
   if (arg == null || (Array.isArray(arg) && arg.length === 0)) return null;
 
