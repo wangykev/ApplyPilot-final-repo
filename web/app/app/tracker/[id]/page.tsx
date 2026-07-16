@@ -3,18 +3,19 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
-import { ReviewSummaryView } from "@/components/app/ReviewSummaryView";
+import { ReviewEditor } from "@/components/app/review/ReviewEditor";
 import type { ReviewBundle } from "@/lib/review-summary";
 import type { Application } from "../shared";
 import { SAMPLE_APPS, SAMPLE_BUNDLE_BY_ID } from "../sample";
 
 export const dynamic = "force-dynamic";
 
-type Loaded = { app: Application; bundle: ReviewBundle | null };
+// persistable = the bundle came from a real DB row we can UPDATE (not a DEV_PREVIEW sample).
+type Loaded = { app: Application; bundle: ReviewBundle | null; persistable: boolean };
 
 function sampleLookup(id: string): Loaded | null {
   const app = SAMPLE_APPS.find((a) => a.id === id);
-  return app ? { app, bundle: SAMPLE_BUNDLE_BY_ID[id] ?? null } : null;
+  return app ? { app, bundle: SAMPLE_BUNDLE_BY_ID[id] ?? null, persistable: false } : null;
 }
 
 async function loadApp(id: string): Promise<Loaded | null> {
@@ -33,7 +34,7 @@ async function loadApp(id: string): Promise<Loaded | null> {
       .maybeSingle();
     if (!data) return DEV_PREVIEW ? sampleLookup(id) : null;
     const { review_bundle_json, ...app } = data as Application & { review_bundle_json: ReviewBundle | null };
-    return { app: app as Application, bundle: review_bundle_json ?? null };
+    return { app: app as Application, bundle: review_bundle_json ?? null, persistable: true };
   } catch {
     return DEV_PREVIEW ? sampleLookup(id) : null;
   }
@@ -43,7 +44,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
   const { id } = await params;
   const loaded = await loadApp(id);
   if (!loaded) notFound();
-  const { app, bundle } = loaded;
+  const { app, bundle, persistable } = loaded;
 
   return (
     <div className="space-y-8">
@@ -70,7 +71,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
       </div>
 
       {bundle ? (
-        <ReviewSummaryView bundle={bundle} />
+        <ReviewEditor appId={id} initialBundle={bundle} canPersist={persistable} />
       ) : (
         <div className="bezel px-6 py-12 text-center">
           <p className="text-sm text-ink-dim">No review summary captured yet.</p>

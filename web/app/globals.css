@@ -57,6 +57,36 @@
   .hairline-rule {
     @apply h-px w-full bg-hairline;
   }
+
+  /* ── review editor (ReviewEditor.tsx) ── */
+  .ap-input {
+    @apply w-full rounded-md border border-hairline bg-panel-raised/60 px-2.5 py-1.5 text-sm text-ink
+      outline-none transition-colors placeholder:text-ink-faint focus:border-amber/60;
+  }
+  select.ap-input {
+    @apply appearance-none pr-7;
+  }
+  .ap-check {
+    @apply h-4 w-4 shrink-0 accent-amber;
+  }
+  .ap-opt {
+    @apply block w-full px-2.5 py-1.5 text-left text-sm text-ink transition-colors hover:bg-panel-raised;
+  }
+  .ap-add {
+    @apply m-3 rounded-md border border-dashed border-hairline px-3 py-1.5 text-xs
+      text-ink-dim transition-colors hover:border-ink-dim hover:text-ink;
+  }
+  .ap-del {
+    @apply inline-flex items-center gap-1 text-[11px] text-ink-faint transition-colors hover:text-signal;
+  }
+  .ap-sec-approve {
+    @apply m-3 rounded-md border border-verified/40 px-3 py-1.5 font-mono text-[11px] uppercase
+      tracking-label text-verified transition-colors hover:bg-verified/10
+      disabled:cursor-default disabled:border-hairline disabled:text-ink-faint;
+  }
+  .ap-sec-approve.is-done {
+    @apply border-verified/30 text-verified/70;
+  }
 }
 
 @layer utilities {
