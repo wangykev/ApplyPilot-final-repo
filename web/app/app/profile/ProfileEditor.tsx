@@ -40,12 +40,22 @@ const allFluent = (l: { reading: string; speaking: string; writing: string }) =>
   isFluentLevel(l.reading) && isFluentLevel(l.speaking) && isFluentLevel(l.writing);
 const PROFICIENCY = opt(["", "None", "Basic", "Intermediate", "Advanced", "Fluent"]);
 const PHONE_TYPE = opt(["", "Mobile", "Home", "Work"]);
-// New profiles start with these three link rows (each gets its own question bucket).
-const DEFAULT_WEBSITES = [
-  { type: "LinkedIn", url: "" },
-  { type: "GitHub", url: "" },
-  { type: "Website", url: "" },
-];
+// The three fixed link rows every profile shows — type is LOCKED, only the URL is
+// editable. Any of the user's existing links of these types are slotted in (matched
+// case-insensitively), and a missing one is created empty.
+const DEFAULT_WEBSITE_TYPES = ["LinkedIn", "GitHub", "Personal Website"];
+function withDefaultWebsites(list: { type: string; url: string }[] | undefined) {
+  const arr = Array.isArray(list) ? [...list] : [];
+  const fixed = DEFAULT_WEBSITE_TYPES.map((t) => {
+    const idx = arr.findIndex((w) => (w.type || "").trim().toLowerCase() === t.toLowerCase());
+    if (idx >= 0) {
+      const [found] = arr.splice(idx, 1);
+      return { ...found, type: t };
+    }
+    return { type: t, url: "" };
+  });
+  return [...fixed, ...arr]; // fixed defaults first, then any custom links
+}
 // Standard US EEO option sets. Stored values are candidates the extension
 // matches against each tenant's live options — refine per observed wording.
 const GENDER = opt(["", "Male", "Female", "Non-binary", "Decline to self-identify"]);
@@ -75,9 +85,10 @@ const DISABILITY_STATUS = opt([
 ]);
 
 export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
-  const [profile, setProfile] = useState<Profile>(() =>
-    initial.websites && initial.websites.length > 0 ? initial : { ...initial, websites: DEFAULT_WEBSITES }
-  );
+  const [profile, setProfile] = useState<Profile>(() => ({
+    ...initial,
+    websites: withDefaultWebsites(initial.websites),
+  }));
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
   const [pending, startTransition] = useTransition();
@@ -138,19 +149,30 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       {/* Websites */}
       <SectionCard
         title="Websites & links"
-        subtitle="Starts with LinkedIn, GitHub, and a personal website — each its own bucket. Add a row with any type and click its label to give it wordings."
+        subtitle="LinkedIn, GitHub, and a personal website are built in (type locked — just add the URL). Add more with your own name; each link has its own bucket."
         actions={<AddButton onClick={() => update((p) => { p.websites.push(websiteSchema.parse({})); })} />}
       >
-        {profile.websites.length === 0 && <Empty>No links yet.</Empty>}
         <div className="space-y-4">
-          {profile.websites.map((w, i) => (
-            <EntryCard key={i} index={i} onRemove={() => update((p) => { p.websites.splice(i, 1); })}>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <TextField label="Type" value={w.type} placeholder="LinkedIn, GitHub, Portfolio…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
-                <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
-              </div>
-            </EntryCard>
-          ))}
+          {profile.websites.map((w, i) => {
+            const locked = i < DEFAULT_WEBSITE_TYPES.length;
+            return (
+              <EntryCard
+                key={i}
+                index={i}
+                title={locked ? w.type : undefined}
+                onRemove={locked ? undefined : () => update((p) => { p.websites.splice(i, 1); })}
+              >
+                {locked ? (
+                  <TextField label={`${w.type} URL`} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
+                ) : (
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <TextField label="Type" value={w.type} placeholder="Portfolio, Twitter…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
+                    <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
+                  </div>
+                )}
+              </EntryCard>
+            );
+          })}
         </div>
       </SectionCard>
 
@@ -444,26 +466,30 @@ function AddButton({ onClick }: { onClick: () => void }) {
 function EntryCard({
   index,
   onRemove,
+  title,
   children,
 }: {
   index: number;
-  onRemove: () => void;
+  onRemove?: () => void;
+  title?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="rounded-lg border border-hairline bg-panel-raised/40 p-4">
       <div className="mb-3 flex items-center justify-between">
         <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">
-          Entry {String(index + 1).padStart(2, "0")}
+          {title || `Entry ${String(index + 1).padStart(2, "0")}`}
         </span>
-        <button
-          type="button"
-          onClick={onRemove}
-          className="inline-flex items-center gap-1 text-xs text-ink-faint transition-colors hover:text-signal"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-          Remove
-        </button>
+        {onRemove && (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="inline-flex items-center gap-1 text-xs text-ink-faint transition-colors hover:text-signal"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Remove
+          </button>
+        )}
       </div>
       {children}
     </div>
