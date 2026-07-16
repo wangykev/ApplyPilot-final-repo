@@ -36,7 +36,7 @@ export function FieldLabel({
             openBucket!(bucketPath!, typeof children === "string" ? children : String(bucketPath), bucketWidget || "text")
           }
           title="Edit the questions that map to this answer"
-          className="font-mono text-[10px] uppercase tracking-label text-ink-dim underline decoration-dotted decoration-ink-faint/40 underline-offset-4 transition-colors hover:text-ink hover:decoration-ink-faint group-hover:text-ink group-hover:decoration-ink-faint"
+          className="cursor-pointer font-mono text-[10px] uppercase tracking-label text-ink-dim transition-colors hover:text-ink group-hover:text-ink"
         >
           {children}
         </button>
