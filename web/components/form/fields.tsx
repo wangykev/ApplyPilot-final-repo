@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, createContext, useContext } from "react";
-import { X, ArrowUp, ArrowDown, Plus, ChevronDown, Paperclip, Upload } from "lucide-react";
+import { X, ArrowUp, ArrowDown, Plus, ChevronRight, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 
 /**
@@ -473,7 +473,7 @@ export function CandidateField({
             extra > 0 ? "text-amber" : "text-ink-faint hover:text-amber"
           )}
         >
-          <ChevronDown className="h-4 w-4" />
+          <ChevronRight className="h-4 w-4" />
         </button>
       </div>
       {open && <AdvancedChoices label={label} value={value} onChange={onChange} onClose={() => setOpen(false)} />}

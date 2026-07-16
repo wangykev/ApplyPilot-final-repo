@@ -10,9 +10,12 @@
 > is a lockstep change — keep `web/lib/profile-schema.ts`, the extension's `prepareProfile`
 > (`background.js`), and the section maps (`fill-driver.js` + `background.js`) in sync.
 >
-> Status: **planned, not yet built.** Sign-off pending. Built incrementally, one milestone per commit,
-> unit + live-verified, per the project's working principles. This plan **supersedes and absorbs** the
-> `answerBank` design in `docs/profile-learning-plan.md` (the "self-completing profile" — see §B.7).
+> Status: **BUILT + merged (PR #10, 2026-07-16), live-verified on the website (localhost:3000).** Both
+> parts shipped: the editor overhaul and the answer-bucket system (per-field popups) + attachments.
+> Extension consume tier (`buildBucketIndex`/`fillFromBucket`) unit-pinned (593/593). Remaining follow-ups:
+> date/textarea bucket FILLING and the extension attaching specialty/additional files per-field on Workday.
+> This plan **supersedes and absorbs** the `answerBank` design in `docs/profile-learning-plan.md`
+> (the "self-completing profile" — see §B.7).
 
 ---
 
