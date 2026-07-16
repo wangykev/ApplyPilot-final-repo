@@ -74,10 +74,19 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
-  // Reporting credential for the extension→backend status path (built out in P2).
+  // Reporting credential for the extension→backend status path (P2) + the review PULL
+  // endpoint (the website is the review surface now; the SW pulls the approved bundle from
+  // reviewUrl before replay — see pullApprovedBundle). reviewUrl is optional for backward
+  // compat (pullApprovedBundle derives it from ingestUrl when absent).
   if (type === "AP_SET_SESSION") {
     chrome.storage.local.set(
-      { apSession: { ingestUrl: message.ingestUrl || "", ingestKey: message.ingestKey || "" } },
+      {
+        apSession: {
+          ingestUrl: message.ingestUrl || "",
+          ingestKey: message.ingestKey || "",
+          reviewUrl: message.reviewUrl || "",
+        },
+      },
       () => {
         const err = chrome.runtime.lastError;
         sendResponse(err ? { ok: false, error: err.message } : { ok: true });
@@ -2240,6 +2249,60 @@ async function reportApplication(bundle, jobContext) {
   }
 }
 
+// The website is now the primary REVIEW surface (edit + approve), replacing the extension's
+// summary.html. Before a replay/submit, PULL the human-approved bundle the operator saved on
+// the site and write it into chrome.storage.local.reviewSummary — so runCdpReplayWalk (which
+// reads that slot directly) replays exactly what was approved. Uses the same per-user ingest
+// credential the website synced via AP_SET_SESSION; the review pull endpoint is apSession.reviewUrl
+// (derived from ingestUrl for older sessions). Matches the application row by the LOCAL bundle's
+// url (the key reportApplication upserts by).
+//
+// CONTRACT: when the website is connected AND returns a bundle, it is the SOURCE OF TRUTH — it
+// overwrites the local bundle (the whole point of hosting review on the site). When NOT connected
+// (no apSession) or the site has no bundle, this is a silent no-op and the local bundle (from the
+// extension's own summary.html fallback) is used unchanged. NEVER throws — a pull failure falls back
+// to local so replay is never blocked by the network.
+async function pullApprovedBundle(LOG) {
+  const log = LOG || ((...a) => console.log("[ApplyPilot][REVIEW-PULL]", ...a));
+  try {
+    const { apSession, reviewSummary: localBundle } = await new Promise((res) =>
+      chrome.storage.local.get(["apSession", "reviewSummary"], res)
+    );
+    if (!apSession || !apSession.ingestKey) return { pulled: false, reason: "not-connected" };
+    const reviewUrl =
+      apSession.reviewUrl ||
+      (apSession.ingestUrl ? apSession.ingestUrl.replace(/\/report(\?.*)?$/, "/review") : "");
+    if (!reviewUrl) return { pulled: false, reason: "no-review-url" };
+    const url = localBundle && localBundle.url ? localBundle.url : "";
+    const endpoint = reviewUrl + (url ? "?url=" + encodeURIComponent(url) : "");
+    const res = await fetch(endpoint, {
+      method: "GET",
+      headers: { authorization: "Bearer " + apSession.ingestKey },
+    });
+    if (!res.ok) {
+      log(`review pull: HTTP ${res.status} — keeping the local bundle.`);
+      return { pulled: false, reason: "http-" + res.status };
+    }
+    const data = await res.json().catch(() => null);
+    const bundle = data && data.ok ? data.bundle : null;
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      log(`review pull: no approved bundle on the website — keeping the local bundle.`);
+      return { pulled: false, reason: "no-remote-bundle" };
+    }
+    await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle }, r));
+    const ap = bundle.approval || {};
+    log(
+      `review pull: loaded the website-approved bundle (${bundle.entries.length} fields` +
+        (ap.to_approve_count != null ? `, ${ap.approved_count || 0}/${ap.to_approve_count} flagged approved` : "") +
+        `) into storage — replay will use these values.`
+    );
+    return { pulled: true, count: bundle.entries.length, submit_ready: !!ap.submit_ready };
+  } catch (e) {
+    log(`review pull skipped: ${String((e && e.message) || e)} — keeping the local bundle.`);
+    return { pulled: false, reason: "exception" };
+  }
+}
+
 async function runCdpFillPage(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
   try {
@@ -2372,6 +2435,9 @@ async function runCdpReplayWalk(tabId, opts) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
+    // PULL the website-approved bundle first (the website is the review surface now). No-op +
+    // fall back to the local bundle when not connected / the site has none — see pullApprovedBundle.
+    await pullApprovedBundle(LOG);
     const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
     if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
       LOG('no reviewSummary bundle in storage — fill + review an application first, then replay it.');
@@ -2891,6 +2957,14 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — never strand the operator behind the lock
     await cdpDetach();
+    // Push the ACCUMULATED review bundle to the website (the review surface) on EVERY exit —
+    // reached-review, a mid-walk halt, or an abort — so the operator reviews what got filled on
+    // the site. Fire-and-forget; a no-op if the website isn't connected (no apSession). The
+    // single-page fill (runCdpFillPage) already reports; the walk did not until now.
+    try {
+      const { reviewSummary } = await new Promise((r) => chrome.storage.local.get("reviewSummary", r));
+      if (reviewSummary) await reportApplication(reviewSummary, jobContext);
+    } catch (e) { /* reporting NEVER affects the walk result */ }
   }
 }
 
