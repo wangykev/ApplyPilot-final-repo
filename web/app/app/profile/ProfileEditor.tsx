@@ -44,7 +44,7 @@ const PHONE_TYPE = opt(["", "Mobile", "Home", "Work"]);
 const DEFAULT_WEBSITES = [
   { type: "LinkedIn", url: "" },
   { type: "GitHub", url: "" },
-  { type: "Personal Website", url: "" },
+  { type: "Website", url: "" },
 ];
 // Standard US EEO option sets. Stored values are candidates the extension
 // matches against each tenant's live options — refine per observed wording.
@@ -173,7 +173,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                 <DateField label="To" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.to" : undefined} value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
               </div>
               <div className="mt-4 space-y-4">
-                <TextAreaField label="Role description" hint="one box — how Workday shows it" bucketPath={i === 0 ? "work_experience.0.role_description" : undefined} value={w.role_description} rows={5} placeholder="What you did in this role…" onChange={(v) => update((p) => { p.work_experience[i].role_description = v; })} />
+                <TextAreaField label="Role description" bulletOnEnter bucketPath={i === 0 ? "work_experience.0.role_description" : undefined} value={w.role_description} rows={5} placeholder={"- Led the redesign of…\n- Shipped…"} onChange={(v) => update((p) => { p.work_experience[i].role_description = v; })} />
                 <TagListField label="Tech stack" value={w.tech_stack} onChange={(v) => update((p) => { p.work_experience[i].tech_stack = v; })} />
               </div>
             </EntryCard>

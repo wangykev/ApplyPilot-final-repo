@@ -87,6 +87,7 @@ export function TextAreaField({
   rows = 3,
   hint,
   bucketPath,
+  bulletOnEnter,
 }: {
   label: string;
   value: string;
@@ -95,6 +96,7 @@ export function TextAreaField({
   rows?: number;
   hint?: string;
   bucketPath?: string;
+  bulletOnEnter?: boolean;
 }) {
   return (
     <label className="group block">
@@ -104,6 +106,29 @@ export function TextAreaField({
         rows={rows}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
+        onFocus={() => {
+          if (bulletOnEnter && value.trim() === "") onChange("- ");
+        }}
+        onBlur={() => {
+          if (bulletOnEnter && value.trim() === "-") onChange(""); // leave an empty field truly empty
+        }}
+        onKeyDown={(e) => {
+          // Bulleted role description: Enter starts a new "- " line (Shift+Enter = plain newline).
+          if (!bulletOnEnter || e.key !== "Enter" || e.shiftKey) return;
+          e.preventDefault();
+          const el = e.currentTarget;
+          const s = el.selectionStart ?? value.length;
+          const en = el.selectionEnd ?? s;
+          onChange(value.slice(0, s) + "\n- " + value.slice(en));
+          const pos = s + 3;
+          requestAnimationFrame(() => {
+            try {
+              el.selectionStart = el.selectionEnd = pos;
+            } catch {
+              /* noop */
+            }
+          });
+        }}
         className={clsx(inputCls, "mt-1.5 resize-y leading-relaxed")}
       />
     </label>
@@ -408,7 +433,7 @@ export function CandidateField({
   const extra = value.length - 1; // fallbacks beyond the primary
   return (
     <div className="group">
-      <FieldLabel hint={mode === "dropdown" ? "pick one" : undefined} bucketPath={bucketPath} bucketWidget={mode === "dropdown" ? "dropdown" : "typeahead"}>{label}</FieldLabel>
+      <FieldLabel bucketPath={bucketPath} bucketWidget={mode === "dropdown" ? "dropdown" : "typeahead"}>{label}</FieldLabel>
       <div className="relative mt-1.5">
         {mode === "dropdown" && countries && expand ? (
           <select
