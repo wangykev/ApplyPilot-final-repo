@@ -447,3 +447,40 @@ the preferred first/last fields; unchecked → the form hides them, so the revie
 — match the field-NAME tail + canonical, NOT the whole `field_id`, whose cdpPageKey prefix lists every flat
 field name and would hide the ENTIRE page). Toggling it in the viewer re-renders (like "I currently work
 here") so the rows hide/show live.
+
+**Profile v2 — web editor overhaul + answer buckets (merged PR #10, 2026-07-16).** Two halves, built +
+live-verified on the website (localhost:3000); every schema shift kept in lockstep with the extension.
+
+*(A) Editor UX (`web/`).* Country / phone-code / citizenship pickers — a dropdown for the canonical choice +
+a subtle in-field ▾ opening an "Advanced choices" popup over the tiered fallback candidates (`lib/countries.ts`
+expands a pick to its known variants, dodging the ambiguous single-"United States" match). Workday-style
+segmented **date pickers** (year / month-year / month-day-year) emitting the SAME canonical strings
+`prepareProfile` parses; the month is a typeable "5"/"05" → "05 — May" input. **Yes/No toggles** — divider bar
++ bold amber selected cell, no blank option (Esc clears). Self-identification → dropdowns. **Preferred name** —
+an "I have a preferred name" checkbox reveals `preferred_first_name`/`preferred_last_name` (the extension's
+`preferredCheck`/`preferredName--first/last` already mapped these — the web schema was the missing half).
+**Websites** — 3 fixed rows (LinkedIn/GitHub/Personal Website, type LOCKED via a disabled box; existing links
+slotted in by `withDefaultWebsites`) + custom rows with free-text type. **Role description** — `bullets[]`
+replaced by ONE dash-bulleted textarea (focus seeds "- ", Enter continues; `coerceProfile` migrates legacy
+bullets → "- " lines); the extension derives `bulletsText` from it (bullets fallback), so `WORK_EXPERIENCE_MAP`
+is unchanged. Languages `fluent` is now a human-set stored box (the extension uses it, else derives
+reading∧speaking∧writing). How-did-you-hear = a fallback source list. Every mapped field label is a clickable
+bucket link (white hover; highlights on field-hover via group-hover). Schema (`lib/profile-schema.ts` v2.0)
+gained `preferred_first_name`/`_last_name`, `role_description`, `languages[].fluent`,
+`certifications[].specialties[]` (each `{specialty, start_date, end_date, attachment}`, matches `CERT_NESTED`),
+`additional_files[]`.
+
+*(B) Answer buckets.* The platform-agnostic answer store (`profiles.buckets_json`, migration `0002`;
+`web/lib/buckets.ts`; `STARTER_BUCKETS` Mode-A seed, provision-if-null). A bucket = one canonical answer + the
+question wordings that map to it — Mode A (profile-backed `profile_path`) or Mode B (standalone `value`). Edited
+via **per-field popups** (click a field label → edit its wordings, created on first use). The extension consumes
+them in `drivePageFill` (`buildBucketIndex` + `fillFromBucket`, exact-normalized wording only — **no fuzzy**,
+match-ladder-gated, BEFORE the AI pass; commit flagged `bucket`); +6 unit tests (fake bucket, Mode A/B, gate,
+runs-before-AI). Supersedes the `answerBank`/`docs/profile-learning-plan.md` sketch. **Attachments** — a private
+`attachments` Storage bucket (migration `0003`) + `POST /api/attachments/upload`; per-specialty files +
+`additional_files[]`. Fix: `AP_SYNC_PROFILE` now MERGES `defaults` (a website sync no longer wipes the
+extension's field_of_study/degree/gpa_range). Web typecheck + full build green; extension suite **593/593**.
+**Follow-ups:** date/textarea bucket FILLING (labels/wordings persist now; the consume tier fills
+text/dropdown/radio/typeahead/checkbox); the extension attaching specialty/additional files per-field on Workday
+(website upload/storage is done). Design + build plan: `docs/profile-v2-plan.md`; website contract: `WEBSITE.md`
+M8.

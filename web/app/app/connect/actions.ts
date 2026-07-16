@@ -3,12 +3,14 @@
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
+import { coerceBuckets, STARTER_BUCKETS } from "@/lib/buckets";
 import { coerceAiConfig } from "@/lib/ai-config";
 import { generateApiKey, hashApiKey } from "@/lib/api-key";
 
 export type SyncBundle = {
   profile: unknown;
   defaults: unknown;
+  buckets: unknown;
   jobContext: { company: string };
   llmConfig: { provider: string; model: string; apiKey: string; enabled: boolean };
   resume: { filename: string; mime: string; size: number; base64: string } | null;
@@ -32,12 +34,15 @@ export async function getSyncBundle(): Promise<BundleResult> {
 
     const { data: prow } = await supabase
       .from("profiles")
-      .select("profile_json, job_context_json, ai_config")
+      .select("profile_json, job_context_json, ai_config, buckets_json")
       .eq("id", user.id)
       .maybeSingle();
 
     const profile = coerceProfile(prow?.profile_json);
     const defaults = { how_did_you_hear: profile.how_did_you_hear };
+    // Buckets: provision the starter set into the payload if never set (so a sync
+    // before the first profile-page visit still ships them). Extension merges/stores.
+    const buckets = prow?.buckets_json != null ? coerceBuckets(prow.buckets_json) : STARTER_BUCKETS;
     const jobContext =
       (prow?.job_context_json as { company?: string } | null)?.company !== undefined
         ? { company: (prow!.job_context_json as { company: string }).company }
@@ -77,7 +82,7 @@ export async function getSyncBundle(): Promise<BundleResult> {
     });
     const session = { ingestUrl: `${SITE_URL}/api/extension/report`, ingestKey: key };
 
-    return { ok: true, bundle: { profile, defaults, jobContext, llmConfig, resume, session } };
+    return { ok: true, bundle: { profile, defaults, buckets, jobContext, llmConfig, resume, session } };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }

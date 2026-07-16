@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile, emptyProfile, type Profile } from "@/lib/profile-schema";
 import { ProfileEditor } from "./ProfileEditor";
+import { loadBuckets } from "./actions";
 
 export const dynamic = "force-dynamic";
 
@@ -26,15 +27,15 @@ async function loadProfile(): Promise<Profile> {
 }
 
 export default async function ProfilePage() {
-  const initial = await loadProfile();
+  const [initial, buckets] = await Promise.all([loadProfile(), loadBuckets()]);
   return (
-    <div className="space-y-8">
+    <div className="space-y-8 pb-28">
       <PageHeader
         eyebrow="Your data"
         title="Profile"
         description="The details ApplyPilot fills applications from. Stored as raw fields — the extension derives dates, joined bullets, and fluency from these."
       />
-      <ProfileEditor initial={initial} />
+      <ProfileEditor initial={initial} initialBuckets={buckets} />
     </div>
   );
 }

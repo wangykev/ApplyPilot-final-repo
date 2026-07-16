@@ -85,11 +85,12 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
 
     log.push(
       rowFor(
-        "Profile, defaults & job context",
+        "Profile, buckets, defaults & job context",
         await sendToExtension(id, {
           type: "AP_SYNC_PROFILE",
           profile: b.profile,
           defaults: b.defaults,
+          buckets: b.buckets,
           jobContext: b.jobContext,
         })
       )
