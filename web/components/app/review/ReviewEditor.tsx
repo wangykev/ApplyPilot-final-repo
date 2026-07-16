@@ -381,17 +381,17 @@ export function ReviewEditor({
     [filter]
   );
 
-  // shared props threaded into the field renderer
-  const ctx: RowCtx = {
-    commit,
-    setApproved,
-    setTiers,
-    registerRow: (id, node) => {
-      if (node) rowRefs.current.set(id, node);
-      else rowRefs.current.delete(id);
-    },
-    jumpTo,
-  };
+  const registerRow = useCallback((id: string, node: HTMLDivElement | null) => {
+    if (node) rowRefs.current.set(id, node);
+    else rowRefs.current.delete(id);
+  }, []);
+
+  // shared props threaded into the field renderer — STABLE (memoized over stable callbacks) so a
+  // field row's ref-registration effect doesn't re-run on every keystroke elsewhere on the page.
+  const ctx = useMemo<RowCtx>(
+    () => ({ commit, setApproved, setTiers, registerRow, jumpTo }),
+    [commit, setApproved, setTiers, registerRow, jumpTo]
+  );
 
   return (
     <div className="space-y-6">
