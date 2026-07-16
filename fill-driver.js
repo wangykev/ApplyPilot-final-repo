@@ -698,9 +698,17 @@ const parseAiReply = (text) => {
   }
   if (obj && typeof obj === "object" && !Array.isArray(obj)) {
     const pick = (a, b) => String(obj[a] != null ? obj[a] : (obj[b] != null ? obj[b] : "")).trim();
-    return { choice: pick("choice", "answer"), justification: pick("justification", "reason"), confidence: _aiConf(obj.confidence) };
+    // Profile-learning piggyback: which profile field this question maps to ("" / "none" = none) + a
+    // suggested category. Computed in the SAME fill call so the later "teach" curation needs no 2nd LLM call.
+    const mapsTo = pick("maps_to", "profile_path");
+    const cat = pick("suggested_category", "category");
+    return {
+      choice: pick("choice", "answer"), justification: pick("justification", "reason"), confidence: _aiConf(obj.confidence),
+      maps_to: (!mapsTo || /^none$/i.test(mapsTo)) ? "" : mapsTo,
+      suggested_category: (!cat || /^none$/i.test(cat)) ? "" : cat,
+    };
   }
-  return { choice: t, justification: "", confidence: "low" }; // unparseable → best-effort: whole reply is the choice
+  return { choice: t, justification: "", confidence: "low", maps_to: "", suggested_category: "" }; // unparseable → best-effort
 };
 
 // AI dropdown fill (AI-1, ALWAYS-GUESS): open + read the LIVE options → the LLM gets the profile +
@@ -722,12 +730,12 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
       detail: "AI fallback: dropdown options did not render (not actuated)" + keptPrefillNote(cz), options: enabledTextsSafe(state), auditLoc: loc.wrapperSel };
   }
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
-  const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low.";
+  const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low. ALSO map this question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\" or \"self_identification.gender\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const user = "Question: " + String(f.label || "")
     + "\nAnswer options (choose exactly one; reply with its EXACT text): " + JSON.stringify(enabledTexts)
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
-    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\"}";
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}";
   const res = await act.llm({ system, user, maxTokens: 512 });
   if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
@@ -736,15 +744,16 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
   }
   const ai = parseAiReply(res.text);
   const conf = ai.confidence; // the AI's self-reported inference confidence (high/medium/low)
+  const hint = { maps_to: ai.maps_to || "", suggested_category: ai.suggested_category || "" }; // piggyback for the teach flow
   // The choice is a CANDIDATE — clear the match ladder vs the LIVE options. A paraphrase / refusal /
   // literal "UNKNOWN" won't match → a RARE needs_review fallback (never blind-commit arbitrary text).
   const m = ai.choice ? apMatch.matchCandidates([ai.choice], enabledTexts) : { targetIndex: -1, matchTier: null };
   if (m.targetIndex === -1) {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
     const base = "AI chose \"" + ai.choice + "\" — not one of the options" + (ai.justification ? " (" + ai.justification + ")" : "");
-    if (cz.blank) return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-nomatch", confidence: conf,
+    if (cz.blank) return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-nomatch", confidence: conf, ...hint,
       detail: base + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
-    return { status: "needs_review", after: cz.after, flag: "ai-nomatch-stray", confidence: conf,
+    return { status: "needs_review", after: cz.after, flag: "ai-nomatch-stray", confidence: conf, ...hint,
       detail: base + "; \"" + cz.after + "\" STRAYED onto this field — review/correct it", options: enabledTexts, auditLoc: loc.wrapperSel };
   }
 
@@ -758,7 +767,7 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
     post = await act.readDropdownState(loc);
     committed = post && norm(post.triggerText) === norm(target);
   }
-  if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-commit-failed", confidence: conf,
+  if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-commit-failed", confidence: conf, ...hint,
     detail: "AI chose \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   // ALWAYS filled_review — an AI guess is never silently trusted. If the dropdown held a REAL
   // prefilled value the AI's pick replaced, say so (provenance for the reviewer — the prior
@@ -766,7 +775,7 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
   const overwroteNote = hasLiveValue(before) && norm(before) !== norm(target)
     ? " (overwrote prefilled \"" + before + "\")" : "";
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier,
-    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf,
+    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf, ...hint,
     detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + target + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : "") + overwroteNote,
     options: enabledTexts, auditLoc: loc.wrapperSel };
 };
@@ -785,7 +794,10 @@ const parseAiText = (text) => {
   }
   if (obj && typeof obj === "object" && !Array.isArray(obj)) {
     if (obj.skip === true || /^skip\b/i.test(String(obj.answer == null ? "" : obj.answer).trim())) return { skip: true, answer: "", reason: String(obj.reason == null ? "declined" : obj.reason).trim() || "declined" };
-    return { skip: false, answer: String(obj.answer == null ? "" : obj.answer).trim(), reason: "" };
+    const mt = String(obj.maps_to != null ? obj.maps_to : (obj.profile_path != null ? obj.profile_path : "")).trim();
+    const cat = String(obj.suggested_category != null ? obj.suggested_category : (obj.category != null ? obj.category : "")).trim();
+    return { skip: false, answer: String(obj.answer == null ? "" : obj.answer).trim(), reason: "",
+      maps_to: (!mt || /^none$/i.test(mt)) ? "" : mt, suggested_category: (!cat || /^none$/i.test(cat)) ? "" : cat }; // piggyback (teach flow)
   }
   if (/^skip\b/i.test(t)) return { skip: true, answer: "", reason: "declined" };
   return { skip: false, answer: t, reason: "" }; // non-JSON → best-effort: the whole reply is the answer
@@ -821,11 +833,12 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
   const style = (profile && profile.application_questions && profile.application_questions.writing_style) || "";
   const system = "You write a brief, human, professional answer to ONE job-application question for the applicant, using ONLY the applicant's profile (experience, projects, skills, essay_drafts, story_bank, open_ended). "
     + (style ? "Writing style: " + style + " " : "")
-    + "If the field asks for specific FACTUAL data not in the profile (a name, ID, code, date, number, URL, address) or you cannot answer from the profile, reply SKIP — NEVER fabricate facts about the applicant.";
+    + "If the field asks for specific FACTUAL data not in the profile (a name, ID, code, date, number, URL, address) or you cannot answer from the profile, reply SKIP — NEVER fabricate facts about the applicant. "
+    + "When you DO answer, also give \"maps_to\" = the dotted path of the matching profile field (from the profile JSON) or \"none\", and \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const user = "Question / field label: " + String(f.label || "")
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
-    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"answer\":\"<your answer>\"}  OR  {\"skip\":true,\"reason\":\"<short reason>\"}";
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"answer\":\"<your answer>\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}  OR  {\"skip\":true,\"reason\":\"<short reason>\"}";
   const res = await act.llm({ system, user, maxTokens: 1024 });
   if (!res || !res.ok) return await declineOrPlaceholder("AI call failed — " + ((res && res.error) || "no reply"));
   const parsed = parseAiText(res.text);
@@ -836,6 +849,7 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     detail: "AI generated an answer but the text fill did not verify: " + ((r && r.detail) || "no read-back"), auditLoc: loc.wrapperSel };
   // ALWAYS filled_review — an AI-generated answer is never silently trusted.
   return { status: "filled_review", after: parsed.answer, verified: true, flag: "ai-text", confidence: "medium",
+    maps_to: parsed.maps_to || "", suggested_category: parsed.suggested_category || "", // piggyback (teach flow)
     detail: "AI-generated answer from the profile", auditLoc: loc.wrapperSel };
 };
 
@@ -4962,6 +4976,8 @@ function buildReviewBundle(results, meta) {
       detail: rec.detail != null ? rec.detail : null,
       match_tier: rec.matchTier != null ? rec.matchTier : null,
       flag: rec.flag != null ? rec.flag : null, // PROVENANCE (was dropped) — the viewer badges "AI-INFERRED" off flag.startsWith("ai-")
+      maps_to: rec.maps_to != null ? rec.maps_to : null,                                 // Profile Learning piggyback: the profile field this Q maps to (the teach flow's Q1 hint; "" = none)
+      suggested_category: rec.suggested_category != null ? rec.suggested_category : null, // Profile Learning piggyback: a category for a new standalone bucket
       cascade_revealed: !!rec.cascadeRevealed, // M6: this field appeared only AFTER an earlier value committed (cascade re-scan) → the viewer badges it + it FORCES a second review before submit
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,

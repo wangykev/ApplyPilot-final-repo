@@ -1014,6 +1014,27 @@ test("AI fallback: a matched JSON answer → filled_review + ai-choice-sensitive
   assert.strictEqual(e.current_value, "No");
 });
 
+test("Buckets M4 piggyback: the fill AI's maps_to + suggested_category ride the record → the bundle entry (one call, no 2nd)", async () => {
+  const act = makeFakeAct([aiDd({ label: "Are you legally authorized to work in the US?*" })], { aiEnabled: true,
+    ai: '{"choice":"Yes","justification":"work_authorization says authorized","confidence":"High","maps_to":"work_authorization.authorized_to_work_in_us","suggested_category":"Work authorization"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.maps_to, "work_authorization.authorized_to_work_in_us", "the profile-field hint is carried on the record");
+  assert.strictEqual(rec.suggested_category, "Work authorization");
+  const e = buildReviewBundle(out.results, {}).entries[0];
+  assert.strictEqual(e.maps_to, "work_authorization.authorized_to_work_in_us", "the hint reaches the review bundle (→ report → teach page)");
+  assert.strictEqual(e.suggested_category, "Work authorization");
+});
+
+test("Buckets M4 piggyback: maps_to 'none' normalizes to \"\" (the teach card starts at 'is this in your profile?')", async () => {
+  const act = makeFakeAct([aiDd({ label: "Do you own a reliable vehicle?" })], { aiEnabled: true,
+    ai: '{"choice":"Yes","confidence":"Medium","maps_to":"none","suggested_category":"Screening"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.maps_to, "", "'none' → empty (no field hint)");
+  assert.strictEqual(rec.suggested_category, "Screening");
+});
+
 test("AI fallback: a literal UNKNOWN reply is just a non-option → needs_review (ai-nomatch), blank, no commit (the gate is dropped — guess, don't refuse)", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
@@ -1103,11 +1124,15 @@ test("AI: sensitive-vs-not prominence DATA — both flags + distinct reasons per
 });
 
 test("parseAiReply: plain JSON, ```-fenced, embedded, bad-confidence, and a non-JSON fallback", () => {
-  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high" });
+  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high", maps_to: "", suggested_category: "" });
   assert.strictEqual(parseAiReply('```json\n{"choice":"No","confidence":"Low"}\n```').choice, "No");
   assert.strictEqual(parseAiReply('Here is my answer: {"choice":"Maybe","confidence":"Medium"}').confidence, "medium");
   assert.strictEqual(parseAiReply('{"choice":"X","confidence":"bogus"}').confidence, "low", "unknown confidence → low");
   const fb = parseAiReply("just No"); assert.strictEqual(fb.choice, "just No"); assert.strictEqual(fb.confidence, "low");
+  // piggyback (teach flow): maps_to + suggested_category parsed; "none" → ""
+  const pg = parseAiReply('{"choice":"Yes","maps_to":"work_authorization.authorized_to_work_in_us","suggested_category":"Work authorization"}');
+  assert.strictEqual(pg.maps_to, "work_authorization.authorized_to_work_in_us"); assert.strictEqual(pg.suggested_category, "Work authorization");
+  assert.strictEqual(parseAiReply('{"choice":"Y","maps_to":"none"}').maps_to, "", "'none' → empty");
 });
 
 // ── AI-2: free-text / essay fill (fake act.llm) ──────────────────────────────
@@ -1117,8 +1142,9 @@ const aiText = (flags) => Object.assign({
 }, flags || {});
 
 test("parseAiText: {answer}, {skip,reason}, bare SKIP, ```-fenced, and non-JSON → whole reply is the answer", () => {
-  assert.deepStrictEqual(parseAiText('{"answer":"I admire the mission."}'), { skip: false, answer: "I admire the mission.", reason: "" });
+  assert.deepStrictEqual(parseAiText('{"answer":"I admire the mission."}'), { skip: false, answer: "I admire the mission.", reason: "", maps_to: "", suggested_category: "" });
   assert.deepStrictEqual(parseAiText('{"skip":true,"reason":"asks for an ID"}'), { skip: true, answer: "", reason: "asks for an ID" });
+  assert.strictEqual(parseAiText('{"answer":"5 years","maps_to":"screening.years_of_experience_total","suggested_category":"Screening"}').maps_to, "screening.years_of_experience_total"); // piggyback
   assert.strictEqual(parseAiText('```json\n{"answer":"Hello"}\n```').answer, "Hello");
   assert.strictEqual(parseAiText("SKIP").skip, true);
   assert.deepStrictEqual(parseAiText("a plain prose answer"), { skip: false, answer: "a plain prose answer", reason: "" });
