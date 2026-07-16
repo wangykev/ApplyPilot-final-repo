@@ -484,3 +484,57 @@ extension's field_of_study/degree/gpa_range). Web typecheck + full build green; 
 text/dropdown/radio/typeahead/checkbox); the extension attaching specialty/additional files per-field on Workday
 (website upload/storage is done). Design + build plan: `docs/profile-v2-plan.md`; website contract: `WEBSITE.md`
 M8.
+
+## 2026-07-16 — Review stage migrated to the website (editing + approval + round-trip)
+
+Moved the review stage OFF the extension's `summary.html` viewer and ONTO the companion
+website — the website is now the PRIMARY review surface. The extension's `summary.html`/
+`summary.js` stays as a fallback until the web path is live-verified. Operator decision:
+full editor parity in one go; write-back = the extension PULLS the approved bundle from the
+backend (DB is the source of truth), not a website→extension push.
+
+**Web (Next.js/TS).**
+- **M1 — pure transforms ported.** `web/lib/review-approval.ts` = faithful TS port of
+  `summary-lib.js` (editKindOf/tokenFor/checkedOf/effectiveValue/approvalEnvelope/
+  requiresApproval/newEntryRecords/visibleEntryItems/isHiddenPreferredName + the AI-2
+  placeholder marker). `web/lib/review-model.ts` = the non-DOM logic from `summary.js`
+  (sectionOf-with-index/nestedInfoOf/flag-prominence predicates/statusOf/sectionShapeFor/
+  nextIndexFor). `ReviewEntry`/`ReviewBundle` (review-summary.ts) extended with the
+  editing+approval fields the replay reads. LOCKSTEP with `summary-lib.js`;
+  `test/summary.test.js` remains the semantic spec.
+- **M2/M3 — the React editor + persistence.** `web/components/app/review/ReviewEditor.tsx`
+  ports the whole `summary.js` editor: needs-review-first with flag-driven prominence
+  (super-hard / legally-loaded / demographic / needs-answer badges), every widget editable
+  (select / combobox / segmented date / checkbox / textarea / tier editor), per-field /
+  per-section / all approval with submit-readiness gating + submit-blocked banner,
+  repeating-entry add + soft-delete (+undo), nested cert-specialty sub-sections, and the
+  currently-work-here / preferred-name visibility mirrors. React holds ONE bundle in state
+  (immutable updates replace the manual DOM-refresher machinery); a value edit resets that
+  field's approval. `saveReviewBundle` server action autosaves (debounced) to
+  `applications.review_bundle_json` (RLS), recomputing the approval envelope +
+  needs_review_count server-side. `/app/tracker/[id]` renders the editor instead of the
+  read-only view; DEV_PREVIEW/sample data shows but doesn't persist.
+- **M4 — the pull endpoint.** `GET /api/extension/review` (ingest-key auth, mirrors the
+  queue-pull) returns the approved bundle by `?url=` (the report upsert key). READ-ONLY.
+
+**Extension (vanilla JS).**
+- **M5 — pull before replay.** `pullApprovedBundle` (background.js) reads `apSession` + the
+  local bundle's url, GETs `reviewUrl`, and writes `chrome.storage.local.reviewSummary` — so
+  `runCdpReplayWalk` (unchanged; it reads that slot directly) replays exactly what was
+  approved on the site. NEVER throws: not-connected / no-remote-bundle / HTTP error all fall
+  back to the local bundle. `AP_SET_SESSION` now stores `reviewUrl` (derived from `ingestUrl`
+  for older sessions); the website's getSyncBundle/getSession + ConnectPanel supply it.
+- **M6 — the walk pushes.** `runCdpWalk` now reports its accumulated bundle to the website on
+  every exit (reached-review / halt / abort) via `reportApplication` in its `finally`
+  (previously only the single-page fill reported).
+
+The submit pipeline is UNCHANGED — `runCdpReplayWalk` / `replayField` / `submitPrecondition`
+still read `current_value`/`edit_kind`/`is_deleted`/`is_approved`/`needs_review`/
+`cascade_revealed` off each entry and re-check the review-page equality gate, so the round-trip
+can only change WHERE the bundle is edited, never HOW it's verified/submitted. Extension suite
+**593/593**; web typecheck + production build green (incl. the new route).
+
+**Live-verify PENDING (operator):** end-to-end on a real tenant — fill → walk reports to the
+site → edit/approve on `/app/tracker/[id]` → Replay pulls the approved bundle → replay/would-submit.
+Needs Supabase wired + the extension connected (`/app/connect`). Prod origin must be added to
+the extension manifest `externally_connectable` + `host_permissions` before a non-localhost site.
