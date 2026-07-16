@@ -24,6 +24,13 @@ export type ReviewEntry = {
   detail?: string | null;
   options?: string[] | null;
   captured_options?: string[] | null;
+  // Present in the persisted bundle (jsonb) but previously not surfaced in this type.
+  is_approved?: boolean;
+  approved_at?: string | null;
+  // Profile Learning piggyback (Buckets M4): the fill AI's routing hints the teach flow reads —
+  // maps_to = the profile field this question maps to ("" = none), suggested_category = a bucket group.
+  maps_to?: string | null;
+  suggested_category?: string | null;
 };
 
 export type ReviewBundle = {
