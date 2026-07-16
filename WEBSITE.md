@@ -76,7 +76,7 @@ handoff contract).
 | Message `type` | Action | Storage |
 |---|---|---|
 | `AP_PING` | detection + status | returns `{ ok, version, hasProfile, hasResume }` |
-| `AP_SYNC_PROFILE` | write the handoff bundle | `chrome.storage.local` ← `profile`, `defaults`, `jobContext` (RAW fields only) |
+| `AP_SYNC_PROFILE` | write the handoff bundle | `chrome.storage.local` ← `profile`, `jobContext`, `buckets` (RAW); `defaults` **MERGED** (not clobbered) |
 | `AP_SYNC_RESUME` | store the resume | IndexedDB via `saveResume({filename,mime,size,base64,savedAt})` |
 | `AP_SET_SESSION` | reporting credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey }` |
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
@@ -102,20 +102,47 @@ The extension's `prepareProfile` (`background.js`) DERIVES `*Parsed` (dates), `b
 `_allFluent`, and the filtered/sorted order at fill time. The website stores **only raw user
 fields** — never the derived ones. Reference: `data/profile.example.json`.
 
-- `personal_info` — names, address, email, phone, `country`*, `country_phone_code`* (*=tiered array).
-- `websites[]` — `{type, label, url}` (url gets `https://` prepended by the extension).
+- `personal_info` — `first_name`, `last_name`, `has_preferred_name` + `preferred_first_name` + `preferred_last_name` (revealed by an "I have a preferred name" checkbox — the extension's `preferredCheck`/`preferredName--first/last` already map these), address, email, phone, `country`*, `country_phone_code`* (*=tiered array).
+- `websites[]` — `{type, url}` (url gets `https://` prepended; `label` was dropped — the extension only fills url). The editor pins **3 fixed rows** (LinkedIn / GitHub / Personal Website, **type locked**); added rows carry a custom type.
 - `education[]` — `{school_or_university, degree*, field_of_study*, minor, gpa, gpa_scale, from_year("YYYY"), to_year("YYYY"), graduation_date("YYYY-MM"), currently_enrolled, …}`.
-- `work_experience[]` — `{job_title, company, location, currently_work_here, from("YYYY-MM"), to("YYYY-MM"), bullets[], tech_stack[]}`.
-- `projects[]`, `languages[]` `{language, reading, speaking, writing}`, `certifications[]` `{certification*, certification_number, issued_date("YYYY-MM-DD"), expiration_date}`.
-- `skills[]`, `work_authorization`, `story_bank[]`, `essay_drafts{}`, `application_questions{}`, `self_identification`, `agreements`.
-- `how_did_you_hear` `{preferred[], fallback}` (profile WINS over `defaults`).
+- `work_experience[]` — `{job_title, company, location, currently_work_here, from("YYYY-MM"), to("YYYY-MM"), role_description, tech_stack[]}`. **`role_description` (one Workday-style textarea, dash-bulleted) REPLACED `bullets[]`** — `coerceProfile` migrates legacy bullets → `- ` lines; the extension's `prepareProfile` derives `bulletsText` from it (bullets fallback), so `WORK_EXPERIENCE_MAP` is unchanged.
+- `languages[]` `{language, reading, speaking, writing, fluent}` — `fluent` (tri-bool) is the human-set "I am fluent" box; `prepareProfile` uses it when set, else derives from reading∧speaking∧writing. `certifications[]` `{certification*, certification_number, issued_date("YYYY-MM-DD"), expiration_date, specialties[]}`; each specialty `{specialty, start_date("YYYY-MM-DD"), end_date, attachment}` — nested repeating, matches the extension's `CERT_NESTED`. `projects[]`.
+- `additional_files[]` — `{label, file}` general documents (transcripts, portfolios) → the private `attachments` bucket (see below).
+- `skills[]`, `work_authorization`, `self_identification`, `screening`, `agreements`.
+- `how_did_you_hear` `{preferred[], fallback}` — a fallback source list (profile WINS over `defaults`); the editor shows `preferred[]` only (the extension fills the real source when the queue knows it, else works down the list).
 - `employment_history_companies[]` — **maintained by hand**, NOT derived from `work_experience`
   (safety-critical for the "previously worked here?" auto-No). `[]`=unfilled (flags review),
   `["none"]`=never employed.
 
-\* **Tiered arrays** (most-specific first) account for tenant-specific dropdown text. The editor
-offers a candidates multi-input for: `personal_info.country`, `personal_info.country_phone_code`,
-`education[].degree`, `education[].field_of_study`, `certifications[].certification`.
+\* **Tiered arrays** (most-specific first) account for tenant-specific dropdown text:
+`personal_info.country`, `personal_info.country_phone_code`, `work_authorization.citizenship_country`,
+`education[].degree`, `education[].field_of_study`, `certifications[].certification`. The editor shows a
+primary control (a country dropdown, or a free-text box) + a subtle in-field ▾ that opens an
+**Advanced-choices popup** holding the ordered fallback list (country picks EXPAND to their known
+candidates via `lib/countries.ts`, avoiding the ambiguous single-"United States" match).
+
+### Answer buckets — `profiles.buckets_json` (Profile v2)
+The platform-agnostic answer store that generalizes `FIELD_MAP` + question-wording matching. A **bucket**
+= one canonical answer + the wordings that map to it. Two modes:
+- **Mode A** (`profile_path` set) — value comes from that profile field; editing the field re-fills every
+  wording, on every ATS.
+- **Mode B** (`value` set, no `profile_path`) — a standalone answer for the long tail; promotable later.
+
+Element shape: `{ id, profile_path, value, widget_hint, sensitive, questions[], selectors{} }`. The editor
+edits buckets via **per-field popups** — click a field label to edit the wordings that map to it (creates
+the bucket on first use). **Seed:** new profiles are provisioned (`loadBuckets`, provision-if-null) with
+`STARTER_BUCKETS` — Mode-A wording→field bindings only, no baked answers.
+
+Matching hierarchy in the extension (`drivePageFill`): platform accelerator (Workday automation-id via
+`FIELD_MAP`) → exact-normalized wording (the bucket, `buildBucketIndex`/`fillFromBucket`) → AI fallback.
+**No fuzzy** in the deterministic tier; a bucket value is only ever a CANDIDATE through the match ladder
+(never blind), consulted BEFORE the AI pass. This SUPERSEDES the earlier `answerBank` sketch.
+
+### Attachments — private `attachments` Storage bucket (Profile v2)
+Per-specialty files + `additional_files[]` upload to a private Supabase bucket, namespaced
+`attachments/<uid>/<uuid>-<name>` (`POST /api/attachments/upload` → a `{path,filename,size,mime}` ref stored
+in `profile_json`). Migration `0003_attachments.sql`. *(The extension attaching these per-field on Workday
+is a follow-up; the website owns upload/storage/management today.)*
 
 ### Defaults — `data/application_defaults.json`
 `{ how_did_you_hear, field_of_study, degree, gpa_range }`, each `{ preferred[], fallback }`.
@@ -142,8 +169,9 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 
 ## Database model (Supabase Postgres, RLS keyed to `auth.uid()`)
 
-- `profiles` — one row/user: `profile_json`, `defaults_json`, `job_context_json`, `ai_config` (provider/model/key/enabled), `updated_at`.
+- `profiles` — one row/user: `profile_json`, `buckets_json` (answer buckets — migration `0002_buckets.sql`), `defaults_json`, `job_context_json`, `ai_config` (provider/model/key/enabled), `updated_at`.
 - `resumes` — `id, user_id, kind('default'|'variant'), job_id?, filename, mime, size, storage_path, created_at`.
+- **Storage buckets:** `resumes` (0001) + `attachments` (0003) — both private, objects path-namespaced under `<uid>/`.
 - `applications` — `id, user_id, company, role, url, status('queued'|'filling'|'needs_review'|'submitted'|'interviewing'|'offer'|'rejected'), needs_review_count, review_bundle_json?, applied_at, …`.
 - `queue_items` — `id, user_id, url, status, position, created_at`.
 - `reminders` — `id, application_id, due_at, note`.
@@ -182,6 +210,8 @@ extension's discipline.
 - **M5 — Resume + AI parse** *(done)*: `lib/llm.ts` (faithful TS port of `llm.js`, never-throws, same `LLM_MODELS`); `lib/ai-config.ts` (`llmConfig`-parity); `lib/resume-prompt.ts` (extraction prompt + tolerant JSON parse); `mergeProfile` (fill-blanks). `POST /api/resume/upload` (PDF → Storage `resumes/<uid>/default-resume.pdf` + `resumes` row) and `POST /api/parse-resume` (`unpdf` text extract → user's LLM → raw profile JSON). Resume UI: drag-drop upload, "Parse with AI", found-summary, "Apply to my profile" (fill-blanks, `applyParsedProfile`), remove. Type-check + render verified. *(Live upload/parse needs the user's Supabase + AI key.)*
 - **M6 — AI config + job context** *(done)*: `/app/ai` — provider/model (from `LLM_MODELS`, default `gemini-3.1-flash-lite`)/key/enable toggle + server-side **Test connection** (`testLlm` round-trips a trivial prompt); saved to `profiles.ai_config`. `/app/job` — target company → `profiles.job_context_json`. Type-check + render verified.
 - **M7 — Extension wiring** *(done)*: `manifest.json` gained `externally_connectable.matches` (`http://localhost/*`, `127.0.0.1`) + `http://localhost/*` host permission; `background.js` gained the `onMessageExternal` handler (`AP_PING`/`AP_SYNC_PROFILE`/`AP_SET_LLM`/`AP_SET_SESSION`/`AP_SYNC_RESUME`) writing the same `chrome.storage.local`/IndexedDB slots the popup seeds. Website: `lib/extension.ts` client bridge (`pingExtension`/`sendToExtension`, graceful when `chrome.runtime` absent), `getSyncBundle` server action (profile+defaults+jobContext+llmConfig+resume base64 + a freshly-minted ingest key), `/app/connect` (paste ID → check → sync, per-step status), and `POST /api/extension/report` (validates the ingest key via `api_keys`, inserts an `applications` row — the P2 tracker path, ready). Extension suite **325/325 green**; web production build green; bridge graceful-path verified. **Live website↔extension round-trip is the user's step** (load unpacked extension → copy ID → Sync) — needs the extension in the same Chrome profile.
+- **M8 — Profile v2: editor overhaul + answer buckets** *(done, merged PR `#10`, live-verified on localhost:3000)*: two halves.
+  **(A) Editor UX** — country / phone-code / citizenship pickers (dropdown + an Advanced-choices ▾ popup over the tiered candidates; `lib/countries.ts`); Workday-style segmented **date pickers** (year / month-year / month-day-year, emitting the same canonical strings; month is a typeable "5"→"05 — May" input); Yes/No toggles with a divider bar + bold amber selected state, no blank option (Esc clears); self-identification → dropdowns; **preferred-name** checkbox revealing first/last; websites = 3 fixed rows (LinkedIn/GitHub/Personal Website, type locked) + custom rows; bullets → one dash-bulleted **Role description** box; how-did-you-hear as a fallback list. Schema (`lib/profile-schema.ts` v2.0) gained `preferred_first_name`/`preferred_last_name`, `role_description` (replacing `bullets`), `languages[].fluent`, `certifications[].specialties[]`, `additional_files[]` — all lockstep with the extension (`prepareProfile`, `WORK_EXPERIENCE_MAP`, `CERT_NESTED`, the `preferredName--*` FIELD_MAP entries). **(B) Answer buckets** — `buckets_json` (migration `0002`) + `lib/buckets.ts` + `STARTER_BUCKETS` seed (provision-if-null) + per-field bucket popups; the extension consumes them (`buildBucketIndex`/`fillFromBucket` in `drivePageFill`, match-ladder-gated, before AI) — supersedes the `answerBank` sketch. Plus **attachments** (`0003` bucket + `POST /api/attachments/upload`; per-specialty + `additional_files`). Also fixed: `AP_SYNC_PROFILE` now MERGES `defaults` (a sync no longer wipes the extension's field_of_study/degree/gpa_range). Web typecheck + build green; extension suite 593/593.
 
 ## Design directions (under review)
 
@@ -217,7 +247,7 @@ copy its ID, paste it on `/app/connect`, then **Sync to extension**.
 
 ### Supabase setup (one-time)
 1. Create a Supabase project. Project Settings → API → copy the URL + anon key + service-role key into `web/.env.local`.
-2. Run `web/supabase/migrations/0001_init.sql` in the SQL editor (creates tables + RLS + the private `resumes` bucket).
+2. Run the migrations in `web/supabase/migrations/` **in order**: `0001_init.sql` (tables + RLS + private `resumes` bucket), `0002_buckets.sql` (`profiles.buckets_json`), `0003_attachments.sql` (private `attachments` bucket + RLS).
 3. Auth → Providers → enable **Email** and **Google** (set the Google OAuth client + the `…/auth/callback` redirect).
 4. Remove `NEXT_PUBLIC_DEV_PREVIEW` from `.env.local` to enforce real auth.
 
