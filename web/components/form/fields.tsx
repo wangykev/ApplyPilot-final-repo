@@ -36,7 +36,7 @@ export function FieldLabel({
             openBucket!(bucketPath!, typeof children === "string" ? children : String(bucketPath), bucketWidget || "text")
           }
           title="Edit the questions that map to this answer"
-          className="font-mono text-[10px] uppercase tracking-label text-ink-dim underline decoration-dotted decoration-ink-faint/50 underline-offset-4 transition-colors hover:text-amber hover:decoration-amber group-hover:text-amber group-hover:decoration-amber"
+          className="font-mono text-[10px] uppercase tracking-label text-ink-dim underline decoration-dotted decoration-ink-faint/40 underline-offset-4 transition-colors hover:text-ink hover:decoration-ink-faint group-hover:text-ink group-hover:decoration-ink-faint"
         >
           {children}
         </button>
@@ -181,13 +181,14 @@ export function TriBoolField({
               type="button"
               onClick={() => onChange(o.v)}
               className={clsx(
-                "flex flex-1 items-center justify-center py-1.5 text-sm transition-colors",
+                "flex-1 py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
-                active ? "text-ink" : "text-ink-dim hover:text-ink"
+                active
+                  ? "bg-amber font-semibold text-cockpit" // bold, unmistakably selected
+                  : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
               )}
             >
-              {/* tight, subtle white box around the selected option */}
-              <span className={clsx("rounded px-2 py-0.5 transition-colors", active && "bg-ink/10")}>{o.t}</span>
+              {o.t}
             </button>
           );
         })}
