@@ -8,6 +8,7 @@ import {
   SelectField,
   TriBoolField,
   TagListField,
+  TieredField,
   CandidateField,
   DateField,
   CheckboxField,
@@ -414,6 +415,11 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         </div>
       </SectionCard>
 
+      {/* Other remembered answers — standalone (Mode-B) buckets for questions the profile doesn't cover */}
+      <SectionCard title="Other remembered answers" subtitle="Custom question→answer pairs with no profile field — taught once, then filled deterministically.">
+        <ModeBBucketsPanel buckets={buckets} onBucketsChange={setBuckets} />
+      </SectionCard>
+
       {/* sticky save bar */}
       <div className="fixed inset-x-0 bottom-0 z-30 border-t border-hairline bg-cockpit/90 backdrop-blur md:left-60">
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-5 py-3 sm:px-8">
@@ -493,6 +499,83 @@ function EntryCard({
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="py-2 text-sm text-ink-faint">{children}</p>;
+}
+
+// Groupings offered for a standalone (Mode-B) bucket. Mode-A buckets derive their category from the
+// profile section, so this list is only for the custom long-tail answers.
+const BUCKET_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal", "Experience", "Education", "Other"];
+const BUCKET_WIDGETS = [
+  { value: "text", label: "Text" },
+  { value: "dropdown", label: "Dropdown" },
+  { value: "radio", label: "Yes/No or single choice" },
+  { value: "typeahead", label: "Search / type-ahead" },
+  { value: "checkbox", label: "Checkbox" },
+];
+
+/**
+ * Manage standalone (Mode-B) answer buckets — a question→answer with no profile field (the long tail
+ * a taught form question lands in). Each bucket: its question wordings, an answer as a CANDIDATE LIST
+ * (TieredField — text uses the first, choice widgets try each against the live options), a field type,
+ * a category, and a sensitive flag. Edits the same `buckets` array the label popups use (filtered to
+ * profile_path === ""); the one Save persists it.
+ */
+function ModeBBucketsPanel({ buckets, onBucketsChange }: { buckets: Bucket[]; onBucketsChange: (b: Bucket[]) => void }) {
+  const modeB = buckets.map((b, i) => ({ b, i })).filter((x) => x.b.profile_path.trim() === "");
+  const patchAt = (i: number, patch: Partial<Bucket>) => {
+    const next = buckets.map((b) => ({ ...b }));
+    next[i] = { ...next[i], ...patch };
+    onBucketsChange(next);
+  };
+  const removeAt = (i: number) => onBucketsChange(buckets.filter((_, j) => j !== i));
+  const add = () =>
+    onBucketsChange([
+      ...buckets,
+      {
+        id: "custom_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        profile_path: "",
+        value: [],
+        category: "Other",
+        widget_hint: "text",
+        sensitive: false,
+        questions: [],
+        selectors: {},
+      },
+    ]);
+  return (
+    <div className="space-y-4">
+      {modeB.length === 0 && <Empty>No custom answers yet. Add one for a question your profile doesn&apos;t cover.</Empty>}
+      {modeB.map(({ b, i }) => (
+        <EntryCard key={b.id} index={i} title={b.questions[0] || "New custom answer"} onRemove={() => removeAt(i)}>
+          <div className="space-y-4">
+            <TagListField
+              label="Question wordings"
+              value={b.questions}
+              onChange={(q) => patchAt(i, { questions: q })}
+              placeholder="Paste the exact question, press Enter"
+              hint="every phrasing that should get this answer"
+            />
+            <TieredField
+              label="Answer"
+              value={b.value}
+              onChange={(v) => patchAt(i, { value: v })}
+              placeholder="the answer — add fallbacks for other tenants' option wordings"
+            />
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <SelectField label="Field type" value={b.widget_hint} options={BUCKET_WIDGETS} onChange={(w) => patchAt(i, { widget_hint: w })} />
+              <SelectField label="Category" value={b.category} options={opt(["", ...BUCKET_CATEGORIES])} onChange={(c) => patchAt(i, { category: c })} />
+            </div>
+            <CheckboxField
+              label="Sensitive (EEO / legal)"
+              checked={b.sensitive}
+              onChange={(s) => patchAt(i, { sensitive: s })}
+              hint="reused verbatim on future applications — verify before relying on it"
+            />
+          </div>
+        </EntryCard>
+      ))}
+      <AddButton onClick={add} />
+    </div>
+  );
 }
 
 /** Popup that opens when a field label is clicked: edit the question wordings that
