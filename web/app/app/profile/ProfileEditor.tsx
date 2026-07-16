@@ -40,7 +40,12 @@ const allFluent = (l: { reading: string; speaking: string; writing: string }) =>
   isFluentLevel(l.reading) && isFluentLevel(l.speaking) && isFluentLevel(l.writing);
 const PROFICIENCY = opt(["", "None", "Basic", "Intermediate", "Advanced", "Fluent"]);
 const PHONE_TYPE = opt(["", "Mobile", "Home", "Work"]);
-const WEBSITE_TYPE = opt(["linkedin", "github", "portfolio", "other"]);
+// New profiles start with these three link rows (each gets its own question bucket).
+const DEFAULT_WEBSITES = [
+  { type: "LinkedIn", url: "" },
+  { type: "GitHub", url: "" },
+  { type: "Personal Website", url: "" },
+];
 // Standard US EEO option sets. Stored values are candidates the extension
 // matches against each tenant's live options — refine per observed wording.
 const GENDER = opt(["", "Male", "Female", "Non-binary", "Decline to self-identify"]);
@@ -70,7 +75,9 @@ const DISABILITY_STATUS = opt([
 ]);
 
 export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
-  const [profile, setProfile] = useState<Profile>(initial);
+  const [profile, setProfile] = useState<Profile>(() =>
+    initial.websites && initial.websites.length > 0 ? initial : { ...initial, websites: DEFAULT_WEBSITES }
+  );
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
   const [pending, startTransition] = useTransition();
@@ -123,15 +130,15 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           )}
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <CandidateField label="Country" mode="dropdown" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
-          <CandidateField label="Country phone code" mode="dropdown" dropdownMode="phone" value={pi.country_phone_code} countries={COUNTRIES} expand={phoneCandidates} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
+          <CandidateField label="Country" mode="dropdown" bucketPath="personal_info.country" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
+          <CandidateField label="Country phone code" mode="dropdown" dropdownMode="phone" bucketPath="personal_info.country_phone_code" value={pi.country_phone_code} countries={COUNTRIES} expand={phoneCandidates} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
         </div>
       </SectionCard>
 
       {/* Websites */}
       <SectionCard
         title="Websites & links"
-        subtitle="LinkedIn, GitHub, portfolio — each filled into its own row."
+        subtitle="Starts with LinkedIn, GitHub, and a personal website — each its own bucket. Add a row with any type and click its label to give it wordings."
         actions={<AddButton onClick={() => update((p) => { p.websites.push(websiteSchema.parse({})); })} />}
       >
         {profile.websites.length === 0 && <Empty>No links yet.</Empty>}
@@ -139,8 +146,8 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           {profile.websites.map((w, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.websites.splice(i, 1); })}>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <SelectField label="Type" value={w.type} options={WEBSITE_TYPE} onChange={(v) => update((p) => { p.websites[i].type = v; })} />
-                <TextField label="URL" value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
+                <TextField label="Type" value={w.type} placeholder="LinkedIn, GitHub, Portfolio…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
+                <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
               </div>
             </EntryCard>
           ))}
@@ -161,12 +168,12 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                 <TextField label="Job title" bucketPath={i === 0 ? "work_experience.0.job_title" : undefined} value={w.job_title} onChange={(v) => update((p) => { p.work_experience[i].job_title = v; })} />
                 <TextField label="Company" bucketPath={i === 0 ? "work_experience.0.company" : undefined} value={w.company} onChange={(v) => update((p) => { p.work_experience[i].company = v; })} />
                 <TextField label="Location" bucketPath={i === 0 ? "work_experience.0.location" : undefined} value={w.location} onChange={(v) => update((p) => { p.work_experience[i].location = v; })} />
-                <TriBoolField label="Currently work here" value={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; })} />
-                <DateField label="From" granularity="month-year" value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
-                <DateField label="To" granularity="month-year" value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
+                <TriBoolField label="Currently work here" bucketPath={i === 0 ? "work_experience.0.currently_work_here" : undefined} value={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; })} />
+                <DateField label="From" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.from" : undefined} value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
+                <DateField label="To" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.to" : undefined} value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
               </div>
               <div className="mt-4 space-y-4">
-                <TextAreaField label="Role description" hint="one box — how Workday shows it" value={w.role_description} rows={5} placeholder="What you did in this role…" onChange={(v) => update((p) => { p.work_experience[i].role_description = v; })} />
+                <TextAreaField label="Role description" hint="one box — how Workday shows it" bucketPath={i === 0 ? "work_experience.0.role_description" : undefined} value={w.role_description} rows={5} placeholder="What you did in this role…" onChange={(v) => update((p) => { p.work_experience[i].role_description = v; })} />
                 <TagListField label="Tech stack" value={w.tech_stack} onChange={(v) => update((p) => { p.work_experience[i].tech_stack = v; })} />
               </div>
             </EntryCard>
@@ -189,12 +196,12 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                 <TextField label="Minor(s)" hint="comma-separate multiple" bucketPath={i === 0 ? "education.0.minor" : undefined} value={e.minor} onChange={(v) => update((p) => { p.education[i].minor = v; })} />
                 <TextField label="GPA" bucketPath={i === 0 ? "education.0.gpa" : undefined} value={e.gpa} onChange={(v) => update((p) => { p.education[i].gpa = v; })} />
                 <TextField label="GPA scale" bucketPath={i === 0 ? "education.0.gpa_scale" : undefined} value={e.gpa_scale} placeholder="4.0" onChange={(v) => update((p) => { p.education[i].gpa_scale = v; })} />
-                <DateField label="From year" granularity="year" value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
-                <DateField label="To year" granularity="year" value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
+                <DateField label="From year" granularity="year" bucketPath={i === 0 ? "education.0.from_year" : undefined} value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
+                <DateField label="To year" granularity="year" bucketPath={i === 0 ? "education.0.to_year" : undefined} value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <CandidateField label="Degree" value={e.degree} placeholder="e.g. Bachelor of Science" onChange={(v) => update((p) => { p.education[i].degree = v; })} />
-                <CandidateField label="Major / Field of Study" value={e.field_of_study} placeholder="e.g. Computer Science" onChange={(v) => update((p) => { p.education[i].field_of_study = v; })} />
+                <CandidateField label="Degree" bucketPath={i === 0 ? "education.0.degree" : undefined} value={e.degree} placeholder="e.g. Bachelor of Science" onChange={(v) => update((p) => { p.education[i].degree = v; })} />
+                <CandidateField label="Major / Field of Study" bucketPath={i === 0 ? "education.0.field_of_study" : undefined} value={e.field_of_study} placeholder="e.g. Computer Science" onChange={(v) => update((p) => { p.education[i].field_of_study = v; })} />
               </div>
             </EntryCard>
           ))}
@@ -243,11 +250,11 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         <div className="space-y-4">
           {profile.certifications.map((c, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.certifications.splice(i, 1); })}>
-              <CandidateField label="Certification" value={c.certification} placeholder="Certification name" onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
+              <CandidateField label="Certification" bucketPath={i === 0 ? "certifications.0.certification" : undefined} value={c.certification} placeholder="Certification name" onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <TextField label="Number" bucketPath={i === 0 ? "certifications.0.certification_number" : undefined} value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
-                <DateField label="Issued date" granularity="month-day-year" value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
-                <DateField label="Expiration date" granularity="month-day-year" value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
+                <DateField label="Issued date" granularity="month-day-year" bucketPath={i === 0 ? "certifications.0.issued_date" : undefined} value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
+                <DateField label="Expiration date" granularity="month-day-year" bucketPath={i === 0 ? "certifications.0.expiration_date" : undefined} value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
               </div>
               {/* Nested specialties (matches the extension's CERT_NESTED sub-section) */}
               <div className="mt-4 border-t border-hairline/60 pt-4">
@@ -325,7 +332,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TextField label="Current visa status" bucketPath="work_authorization.current_visa_status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
         <div className="mt-4">
-          <CandidateField label="Citizenship country" mode="dropdown" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
+          <CandidateField label="Citizenship country" mode="dropdown" bucketPath="work_authorization.citizenship_country" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
         </div>
       </SectionCard>
 
@@ -384,7 +391,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TriBoolField label="Valid driver's license" bucketPath="screening.has_valid_drivers_license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} />
           <TriBoolField label="Willing to relocate" bucketPath="screening.willing_to_relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} />
           <TriBoolField label="Open to remote" bucketPath="screening.remote_ok" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} />
-          <DateField label="Earliest start date" granularity="month-day-year" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
+          <DateField label="Earliest start date" granularity="month-day-year" bucketPath="screening.earliest_start_date" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
           <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
           <TextField label="Salary expectation" bucketPath="screening.salary_expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
         </div>

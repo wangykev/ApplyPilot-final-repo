@@ -86,6 +86,7 @@ export function TextAreaField({
   placeholder,
   rows = 3,
   hint,
+  bucketPath,
 }: {
   label: string;
   value: string;
@@ -93,10 +94,11 @@ export function TextAreaField({
   placeholder?: string;
   rows?: number;
   hint?: string;
+  bucketPath?: string;
 }) {
   return (
-    <label className="block">
-      <FieldLabel hint={hint}>{label}</FieldLabel>
+    <label className="group block">
+      <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="textarea">{label}</FieldLabel>
       <textarea
         value={value}
         rows={rows}
@@ -381,6 +383,7 @@ export function CandidateField({
   expand,
   dropdownMode = "country",
   placeholder,
+  bucketPath,
 }: {
   label: string;
   value: string[];
@@ -390,6 +393,7 @@ export function CandidateField({
   expand?: (c: CountryLike) => string[];
   dropdownMode?: "country" | "phone";
   placeholder?: string;
+  bucketPath?: string;
 }) {
   const [open, setOpen] = useState(false);
   const selected =
@@ -404,7 +408,7 @@ export function CandidateField({
   const extra = value.length - 1; // fallbacks beyond the primary
   return (
     <div>
-      <FieldLabel hint={mode === "dropdown" ? "pick one" : undefined}>{label}</FieldLabel>
+      <FieldLabel hint={mode === "dropdown" ? "pick one" : undefined} bucketPath={bucketPath} bucketWidget={mode === "dropdown" ? "dropdown" : "typeahead"}>{label}</FieldLabel>
       <div className="relative mt-1.5">
         {mode === "dropdown" && countries && expand ? (
           <select
@@ -541,12 +545,14 @@ export function DateField({
   onChange,
   granularity,
   hint,
+  bucketPath,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   granularity: DateGranularity;
   hint?: string;
+  bucketPath?: string;
 }) {
   const [parts, setParts] = useState<DateParts>(() => parseDateValue(value, granularity));
   const [monthFocused, setMonthFocused] = useState(false);
@@ -558,8 +564,8 @@ export function DateField({
   const seg =
     "rounded-lg border border-hairline bg-cockpit px-2.5 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
   return (
-    <div>
-      <FieldLabel hint={hint}>{label}</FieldLabel>
+    <div className="group">
+      <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="date">{label}</FieldLabel>
       <div className="mt-1.5 flex gap-2">
         {granularity !== "year" && (
           <input
