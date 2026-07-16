@@ -3,6 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { profileSchema, type Profile } from "@/lib/profile-schema";
+import { bucketsSchema, coerceBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
 
 export type SaveResult = { ok: true } | { ok: false; error: string };
 
@@ -32,5 +33,61 @@ export async function saveProfile(raw: unknown): Promise<SaveResult> {
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
+/** Validate + upsert the signed-in user's answer buckets (buckets_json). */
+export async function saveBuckets(raw: unknown): Promise<SaveResult> {
+  const parsed = bucketsSchema.safeParse(raw);
+  if (!parsed.success) return { ok: false, error: "Buckets didn't validate." };
+
+  if (!isSupabaseConfigured()) {
+    return { ok: false, error: "Backend not connected — set Supabase env vars to save (see WEBSITE.md)." };
+  }
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "You're not signed in." };
+
+    const { error } = await supabase
+      .from("profiles")
+      .upsert({ id: user.id, buckets_json: parsed.data }, { onConflict: "id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
+/**
+ * Load the user's buckets. Provision-if-null: a brand-new profile row has
+ * buckets_json = NULL → seed STARTER_BUCKETS once and persist. An explicit []
+ * (user emptied them) is respected and never re-seeded.
+ */
+export async function loadBuckets(): Promise<Bucket[]> {
+  if (!isSupabaseConfigured()) return STARTER_BUCKETS;
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return STARTER_BUCKETS;
+
+    const { data } = await supabase
+      .from("profiles")
+      .select("buckets_json")
+      .eq("id", user.id)
+      .maybeSingle();
+    if (data && data.buckets_json != null) return coerceBuckets(data.buckets_json);
+
+    // Never provisioned → seed the approved starter set (Mode-A bindings only).
+    await supabase
+      .from("profiles")
+      .upsert({ id: user.id, buckets_json: STARTER_BUCKETS }, { onConflict: "id" });
+    return STARTER_BUCKETS;
+  } catch {
+    return STARTER_BUCKETS;
   }
 }

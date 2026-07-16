@@ -38,14 +38,26 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
   // The handoff bundle: profile + defaults + jobContext (RAW fields only).
   if (type === "AP_SYNC_PROFILE") {
-    const data = {};
-    if (message.profile !== undefined) data.profile = message.profile;
-    if (message.defaults !== undefined) data.defaults = message.defaults;
-    if (message.jobContext !== undefined) data.jobContext = message.jobContext;
-    if (Object.keys(data).length === 0) { sendResponse({ ok: false, error: "nothing to sync" }); return true; }
-    chrome.storage.local.set(data, () => {
-      const err = chrome.runtime.lastError;
-      sendResponse(err ? { ok: false, error: err.message } : { ok: true, keys: Object.keys(data) });
+    if (message.profile === undefined && message.defaults === undefined && message.jobContext === undefined) {
+      sendResponse({ ok: false, error: "nothing to sync" }); return true;
+    }
+    // MERGE defaults, don't clobber: the website manages only `how_did_you_hear`, but the
+    // extension's `defaults` also holds field_of_study/degree/gpa_range (from
+    // application_defaults.json). A wholesale overwrite would wipe those, degrading the
+    // default-matching ladder — so shallow-merge the incoming keys over the existing object.
+    // `buckets` (answer buckets, Profile v2) are fully website-managed → stored wholesale.
+    chrome.storage.local.get("defaults", ({ defaults: existingDefaults }) => {
+      const data = {};
+      if (message.profile !== undefined) data.profile = message.profile;
+      if (message.jobContext !== undefined) data.jobContext = message.jobContext;
+      if (message.buckets !== undefined) data.buckets = message.buckets;
+      if (message.defaults !== undefined) {
+        data.defaults = { ...(existingDefaults || {}), ...message.defaults };
+      }
+      chrome.storage.local.set(data, () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true, keys: Object.keys(data) });
+      });
     });
     return true;
   }
@@ -392,7 +404,10 @@ function prepareProfile(profile) {
     out.work_experience = sortWorkExperienceByRecency(
       meaningfulEntries(profile.work_experience, ["job_title", "company"])
     ).map((e) => ({
-      ...e, fromParsed: parseYearMonth(e.from), toParsed: parseYearMonth(e.to), bulletsText: joinBullets(e.bullets)
+      // roleDescription is now a single textarea (profile v2); fall back to legacy bullets[] for
+      // older profiles. WORK_EXPERIENCE_MAP still reads `bulletsText` → the Workday role description.
+      ...e, fromParsed: parseYearMonth(e.from), toParsed: parseYearMonth(e.to),
+      bulletsText: (e.role_description != null && String(e.role_description).trim() !== "") ? String(e.role_description) : joinBullets(e.bullets)
     }));
   }
   if (Array.isArray(profile.education)) {
@@ -406,7 +421,11 @@ function prepareProfile(profile) {
   }
   if (Array.isArray(profile.languages)) {
     const langs = meaningfulEntries(profile.languages, ["language"]).map((e) => ({
-      ...e, _allFluent: isFluent(e.reading) && isFluent(e.speaking) && isFluent(e.writing) // → check the "I am fluent" box
+      // Explicit human-set `fluent` (true/false) WINS; a null/unset value falls back to the
+      // reading+speaking+writing all-fluent derivation (back-compat for profiles predating the box).
+      ...e, _allFluent: (e.fluent == null)
+        ? (isFluent(e.reading) && isFluent(e.speaking) && isFluent(e.writing))
+        : !!e.fluent // → check the "I am fluent" box
     }));
     // English LAST (operator, 2026-07-06): filling English as the last language entry reduces Workday's
     // spurious "duplicate languages not allowed" ghost error on Save & Continue. Stable partition — the
@@ -1819,7 +1838,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // (The act.attachStoredResume seam — the TEST-ONLY per-cert résumé attach — was verified live
   // 2026-07-02 and then REMOVED with the profile test data. The résumé attaches ONLY to the
   // top-level Documents field, via the post-fill step below.)
-  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase });
+  // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
+  // SW does I/O) and hands them to the driver, which consults them before the AI pass.
+  const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
+  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report

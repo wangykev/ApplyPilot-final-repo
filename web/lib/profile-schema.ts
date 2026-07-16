@@ -19,7 +19,6 @@ const tiered = z.array(z.string()).default([]);
 
 export const websiteSchema = z.object({
   type: str, // linkedin | github | portfolio | other
-  label: str,
   url: str,
 });
 
@@ -43,7 +42,7 @@ export const workExperienceSchema = z.object({
   currently_work_here: triBool,
   from: str, // "YYYY-MM"
   to: str, // "YYYY-MM"
-  bullets: z.array(z.string()).default([]),
+  role_description: str, // one textarea — how Workday renders the role description
   tech_stack: z.array(z.string()).default([]),
 });
 
@@ -52,6 +51,29 @@ export const languageSchema = z.object({
   reading: str,
   speaking: str,
   writing: str,
+  // Human-controlled "I am fluent" box, decoupled from the three proficiencies.
+  // null = unset → the extension falls back to deriving it (all three Fluent).
+  fluent: triBool,
+});
+
+/** A stored file reference (bytes live in the private `attachments` bucket). */
+export const fileRefSchema = z.object({
+  path: str,
+  filename: str,
+  size: z.number().default(0),
+  mime: str,
+});
+/** An additional document = a human label + a file reference. */
+export const additionalFileSchema = z.object({
+  label: str,
+  file: fileRefSchema.nullable().default(null),
+});
+
+export const specialtySchema = z.object({
+  specialty: str,
+  start_date: str, // "YYYY-MM-DD"
+  end_date: str, // "YYYY-MM-DD"
+  attachment: fileRefSchema.nullable().default(null), // optional per-specialty file
 });
 
 export const certificationSchema = z.object({
@@ -59,6 +81,8 @@ export const certificationSchema = z.object({
   certification_number: str,
   issued_date: str, // "YYYY-MM-DD"
   expiration_date: str, // "YYYY-MM-DD"
+  // Nested repeating sub-section (matches the extension's CERT_NESTED fill).
+  specialties: z.array(specialtySchema).default([]),
 });
 
 export const personalInfoSchema = z
@@ -67,6 +91,8 @@ export const personalInfoSchema = z
     last_name: str,
     preferred_name: str,
     has_preferred_name: triBool,
+    preferred_first_name: str,
+    preferred_last_name: str,
     email: str,
     phone_number: str,
     phone_extension: str,
@@ -137,6 +163,7 @@ export const profileSchema = z.object({
   employment_history_companies: z.array(z.string()).default([]),
   self_identification: selfIdentificationSchema,
   screening: screeningSchema,
+  additional_files: z.array(additionalFileSchema).default([]),
 });
 
 export type Profile = z.infer<typeof profileSchema>;
@@ -145,6 +172,8 @@ export type Education = z.infer<typeof educationSchema>;
 export type WorkExperience = z.infer<typeof workExperienceSchema>;
 export type Language = z.infer<typeof languageSchema>;
 export type Certification = z.infer<typeof certificationSchema>;
+export type FileRef = z.infer<typeof fileRefSchema>;
+export type AdditionalFile = z.infer<typeof additionalFileSchema>;
 
 /** A fully-defaulted empty profile. */
 export function emptyProfile(): Profile {
@@ -180,6 +209,23 @@ export function coerceProfile(raw: unknown): Profile {
   };
   obj.education = fixTieredIn(obj.education, ["degree", "field_of_study"]);
   obj.certifications = fixTieredIn(obj.certifications, ["certification"]);
+
+  // Migrate legacy work-experience bullets[] → role_description (one textarea), joined line
+  // by line, so switching away from bullets never loses text.
+  if (Array.isArray(obj.work_experience)) {
+    obj.work_experience = obj.work_experience.map((e) => {
+      if (!e || typeof e !== "object") return e;
+      const rec = { ...(e as Record<string, unknown>) };
+      const rd = rec.role_description;
+      if ((rd == null || rd === "") && Array.isArray(rec.bullets) && rec.bullets.length) {
+        rec.role_description = (rec.bullets as unknown[])
+          .filter(Boolean)
+          .map((b) => "- " + String(b)) // keep the bullet format, dash-style
+          .join("\n");
+      }
+      return rec;
+    });
+  }
 
   const wa = (obj.work_authorization as Record<string, unknown>) ?? {};
   if (typeof wa.citizenship_country === "string") {

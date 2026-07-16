@@ -28,7 +28,7 @@
 // lib.js globals in the SW scope).
 const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
-  : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio,
+  : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio, normalizeLabel: normalizeLabel,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
       sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders };
 
@@ -2189,11 +2189,68 @@ function makeStartCapture(act, loc) {
 // reach (the live nested-Specialty miss, 2026-07-01). Same targeted-mode skips as onlyFieldNames
 // (no unknown-section stubs / cascade / sweep / inline audit — the Save & Continue retry verifies).
 // Default (no opts) = the full page fill, unchanged.
+//
+// ── Answer buckets (Profile v2) ─────────────────────────────────────────────
+// A bucket = one answer + the question wordings that resolve to it (docs/profile-v2-plan.md).
+// Consulted for an UNMAPPED field the deterministic pass left empty, BEFORE the AI pass — the
+// value is a CANDIDATE through the SAME match ladder vs the LIVE options (never blind).
+
+// Build a normalized-wording → bucket index (pure; last wording wins a collision, blank skipped).
+function buildBucketIndex(buckets) {
+  const idx = new Map();
+  for (const b of (Array.isArray(buckets) ? buckets : [])) {
+    if (!b || typeof b !== "object" || !Array.isArray(b.questions)) continue;
+    for (const q of b.questions) {
+      const k = apMatch.normalizeLabel(q);
+      if (k) idx.set(k, b);
+    }
+  }
+  return idx;
+}
+
+// Fill a field from a matched bucket. Mode A (profile_path) → resolve the profile value; Mode B →
+// the bucket's own value. Runs the widget-appropriate deterministic fill (match-ladder-gated) and
+// returns the result flagged `bucket` (provenance — a "remembered" style badge, NOT an ai-* flag)
+// ONLY on a real commit; a no-match/failure returns null so the caller falls through to the AI pass
+// / blank. textarea (essays) + file_upload + unknown are never bucket-filled.
+const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
+  let arg;
+  if (bucket.profile_path) {
+    const r = resolve(getByPath(profile, bucket.profile_path), f.widgetType);
+    if (!r || r.skip) return null;
+    arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
+  } else {
+    const v = bucket.value != null ? String(bucket.value) : "";
+    if (v.trim() === "") return null;
+    arg = (f.widgetType === "text") ? v : [v]; // Mode B: a single standalone value
+  }
+  if (arg == null || (Array.isArray(arg) && arg.length === 0)) return null;
+
+  let res = null;
+  if (f.widgetType === "text") res = await fillTextCdp(act, loc, arg, budgets);
+  else if (f.widgetType === "dropdown") res = await fillDropdownCdp(act, loc, arg, budgets);
+  else if (f.widgetType === "radio") res = await fillRadioCdp(act, loc, arg, budgets);
+  else if (f.widgetType === "typeahead") {
+    const cap = makeStartCapture(act, loc);
+    res = await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture: cap.onCapture }); // NO opts.ai → deterministic candidate only
+    if (res && (res.status === "filled" || res.status === "filled_review")) { const ro = cap.reviewOptions(); if (ro && ro.length) res.options = ro; }
+  } else if (f.widgetType === "checkbox") {
+    const want = /^(true|yes|checked|1|on)$/i.test(String(Array.isArray(arg) ? arg[0] : arg));
+    res = await fillCheckboxCdp(act, loc, want, budgets);
+  } else return null; // textarea / file_upload / unknown — never bucket-filled
+  if (!res || (res.status !== "filled" && res.status !== "filled_review")) return null;
+  res.flag = "bucket";
+  res.detail = (bucket.profile_path ? "From a profile bucket (" + bucket.profile_path + ")" : "From a saved answer bucket")
+    + (res.detail ? " · " + res.detail : "");
+  return res;
+};
+
 async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts) {
   const budgets = Object.assign({}, DEFAULT_BUDGETS, budgetsIn || {});
   const only = opts && opts.onlyFieldNames ? opts.onlyFieldNames : null; // AI-4 targeted re-fill
   const onlySec = opts && opts.onlySections ? opts.onlySections : null;  // AI-4 Tier-1.5 section re-fill
   const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
+  const bucketIndex = buildBucketIndex(opts && opts.buckets); // Profile v2: wording → answer buckets (consulted before AI)
   const scan = await act.scanPage();
   const results = [];
 
@@ -2315,6 +2372,22 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     } catch (e) {
       record.status = "error";
       record.detail = String(e);
+    }
+
+    // ── ANSWER-BUCKET CONSULT (Profile v2) ── BEFORE any AI: an UNMAPPED field the deterministic
+    // pass left empty whose question matches a bucket wording fills from the bucket (Mode A → the
+    // profile field; Mode B → the saved value) — a CANDIDATE through the SAME match ladder vs the
+    // LIVE options (never blind). A no-match falls through to the AI pass / blank below. `!mappedPath`
+    // so a mapped-but-no-match field goes to CANONICALIZE instead. A human-curated binding beats a
+    // fresh AI guess → this runs first, for REQUIRED and OPTIONAL fields alike.
+    if (producedNothing(record) && !mappedPath && bucketIndex.size) {
+      const bucket = bucketIndex.get(apMatch.normalizeLabel(f.label));
+      if (bucket) {
+        try {
+          const bkRes = await fillFromBucket(act, loc, f, bucket, profile, budgets);
+          if (bkRes) Object.assign(record, bkRes);
+        } catch (e) { /* leave the record as-is → the AI post-pass / blank handles it */ }
+      }
     }
 
     // ── AI FALLBACK ── if AI is ON and the deterministic pass produced NOTHING usable. Additive +
@@ -4942,5 +5015,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

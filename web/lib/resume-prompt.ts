@@ -14,7 +14,8 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
     "NEVER invent facts (emails, phone numbers, dates, employers). If it isn't in the resume, leave it blank.",
     "Dates: work_experience.from/to and certifications dates as \"YYYY-MM\" or \"YYYY-MM-DD\"; education from_year/to_year as \"YYYY\".",
     "Tiered fields (degree, field_of_study, country, country_phone_code, certification) are arrays, most-specific first.",
-    "work_experience[].bullets is an array of short accomplishment strings.",
+    "work_experience[].role_description is ONE paragraph (a few sentences) describing the role — how it would fill a single Workday text box, NOT a bulleted list.",
+    "work_experience[].currently_work_here is a boolean: true when the role has no end date or says Present/Current, else false.",
   ].join(" ");
 
   const template = {
@@ -28,9 +29,9 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
       postal_code: "",
       country: [],
     },
-    websites: [{ type: "linkedin|github|portfolio|other", label: "", url: "" }],
+    websites: [{ type: "linkedin|github|portfolio|other", url: "" }],
     work_experience: [
-      { job_title: "", company: "", location: "", from: "YYYY-MM", to: "YYYY-MM", bullets: [], tech_stack: [] },
+      { job_title: "", company: "", location: "", currently_work_here: false, from: "YYYY-MM", to: "YYYY-MM", role_description: "", tech_stack: [] },
     ],
     education: [
       { school_or_university: "", degree: [], field_of_study: [], gpa: "", from_year: "YYYY", to_year: "YYYY" },
