@@ -407,7 +407,7 @@ export function CandidateField({
   };
   const extra = value.length - 1; // fallbacks beyond the primary
   return (
-    <div>
+    <div className="group">
       <FieldLabel hint={mode === "dropdown" ? "pick one" : undefined} bucketPath={bucketPath} bucketWidget={mode === "dropdown" ? "dropdown" : "typeahead"}>{label}</FieldLabel>
       <div className="relative mt-1.5">
         {mode === "dropdown" && countries && expand ? (
