@@ -218,7 +218,10 @@ export function coerceProfile(raw: unknown): Profile {
       const rec = { ...(e as Record<string, unknown>) };
       const rd = rec.role_description;
       if ((rd == null || rd === "") && Array.isArray(rec.bullets) && rec.bullets.length) {
-        rec.role_description = (rec.bullets as unknown[]).filter(Boolean).map(String).join("\n");
+        rec.role_description = (rec.bullets as unknown[])
+          .filter(Boolean)
+          .map((b) => "- " + String(b)) // keep the bullet format, dash-style
+          .join("\n");
       }
       return rec;
     });
