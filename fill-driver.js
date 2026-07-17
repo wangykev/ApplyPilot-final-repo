@@ -1133,7 +1133,9 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   }
 
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
-  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts);
+  // DROPDOWN = select from a full list → NO containment (a substring match is a guess: "PA" must not
+  // silently become "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate to review. (2026-07-16)
+  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
   if (m.targetIndex === -1) {
     // CLOSE-CONFIRMED before returning: the open list OVERLAPS the next field, so a lingering
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
@@ -1628,7 +1630,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     const texts = s.pageWide.texts;
     lastFiltered = texts;
     step.filteredCount = s.pageWide.count;
-    const m = apMatch.matchCandidates([cand], texts);
+    // DIRECTED pick (Workday showed a LIST and did NOT autocommit) → NO containment: us clicking the one
+    // filtered option that merely CONTAINS what we typed is a self-made GUESS. Exact/typo only; else the
+    // candidate escalates (→ next candidate → the inline AI rescue for a required field, else review). The
+    // AUTOCOMMIT branch above KEEPS containment — there Workday itself resolved the input, which we trust.
+    const m = apMatch.matchCandidates([cand], texts, { containment: false });
     if (m.targetIndex !== -1) step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
     if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set"; continue; }
 

@@ -538,3 +538,32 @@ can only change WHERE the bundle is edited, never HOW it's verified/submitted. E
 site → edit/approve on `/app/tracker/[id]` → Replay pulls the approved bundle → replay/would-submit.
 Needs Supabase wired + the extension connected (`/app/connect`). Prod origin must be added to
 the extension manifest `externally_connectable` + `host_permissions` before a non-localhost site.
+
+## 2026-07-16 — Containment is a guess unless Workday made it (match-ladder safety)
+
+Live bug: profile state `"PA"` filled a dropdown as **"Armed Forces Pacific"** at `filled` with NO review
+flag. `normalize("PA")="pa"` is a mid-string substring of "Armed Forces **Pa**cific" — the ONLY option
+containing it, so the ambiguity-safe guard (which only rejects 2+ hits) couldn't help, and the dropdown
+commit graded a containment match as a confident `filled` (not `filled_review`). A 2-letter abbreviation is
+a substring of countless unrelated options → the whole class is unsafe on a *select-from-a-list* widget.
+
+Operator decision: **ApplyPilot never PICKS a containment match itself.** `matchCandidates` gained an
+`opts.containment` param (default ON, LOCKSTEP lib.js + the `background.js` inline copy) plus a
+short-candidate guard (mid-string `includes` requires ≥ 3 chars):
+- **Dropdowns + radios** (`fillDropdownCdp`, page-engine dropdown; `fillRadioCdp` was already exact-only) →
+  `{containment:false}`: exact → typo (fuzzy ≥ 90) → escalate. A `"PA"` with no exact/typo option now flags
+  for review (→ AI rescue on a required field).
+- **Typeahead / cert / source DIRECTED picks** (Workday showed a list, did NOT autocommit, we would click
+  the one containing option) → `{containment:false}` too — us picking is a guess.
+- **Typeahead AUTOCOMMIT recognition KEPT** (default containment): when *Workday itself* commits a completed
+  chip after you type (`"Training Instructor - AEVO"` → `"…AEVO - Multiple Recognized Providers"`),
+  "chip contains what I typed" is how we RECOGNIZE Workday's own completion (vs a stray `"Canada"` chip for a
+  US query) — trusting Workday, not guessing; still `filled_review` (flagged). AI anti-hallucination belts
+  keep containment (the AI rescue must resolve the AI's choice to a real option for required fields).
+
+Net rule: accept only an **exact** match, a **typo**, or a value **Workday autocommitted**; everything else
+escalates → the website review editor / an answer bucket (→ exact next time) / the AI rescue for required
+fields (**all required fills keep the AI rescue** — operator rule). Tests: `test/matching.test.js` rewritten
+(containment ON default incl. the ≥3 short guard + autocommit case; OFF for dropdown/radio); the CDP
+directed-containment test updated to expect escalation; autocommit-containment tests unchanged. Extension
+suite **597/597**. Docs: CLAUDE.md → Matching strategy.

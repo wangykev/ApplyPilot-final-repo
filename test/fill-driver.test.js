@@ -2470,16 +2470,17 @@ test("typeahead directed containment is AMBIGUITY-SAFE: 2 containing options →
   assert.strictEqual(rec.after, null); // the wrong value was NOT committed
 });
 
-test("typeahead directed containment STILL commits when UNAMBIGUOUS (only one option contains the value)", async () => {
-  // candidate "United States" filters to ONE containing option (+ an unrelated one) → directed commit.
+test("typeahead DIRECTED containment REMOVED (2026-07-16): an unambiguous list-contain no longer self-commits → escalates", async () => {
+  // WAS: "United States" filtered to ONE containing option → we clicked it (directed-containment). NOW a
+  // DIRECTED pick never containment-matches — ApplyPilot only trusts Workday's OWN autocommit, or an exact/
+  // typo match. So this escalates (→ the inline AI rescue for a REQUIRED field; here, no AI → genuine
+  // no-match). The AUTOCOMMIT-containment path is unchanged (see the auto-commit test above).
   const act = makeFakeAct([taField({ filterMap: { "United States": { filtered: ["United States of America (+1)", "Canada (+1)"] } } })]);
   const out = await drivePageFill(act, taProfile(["United States"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
-  assert.strictEqual(rec.flag, "directed-containment");
-  assert.strictEqual(rec.confidence, "low");
-  assert.strictEqual(rec.after, "United States of America (+1)");
-  assert.strictEqual(rec.matchTier, "click-commit"); // commit-path (unified click-by-label), not the match tier
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.genuineNoMatch, true);
+  assert.strictEqual(rec.after, null); // the containing option was NOT self-committed
 });
 
 // ── source picker (backlog C — the Magna SEARCH shape; mirrors the typeahead walk) ──

@@ -3632,27 +3632,34 @@ async function fillEngine(profile, defaults, jobContext) {
   // are tried most-specific first; NO low-threshold fuzzy — a loose bar silently
   // selects a WRONG value. Returns { targetIndex, matchTier, matchedCandidate };
   // targetIndex === -1 means escalate to needs_review rather than guess.
-  const matchCandidates = (candidates, optionTexts) => {
+  // opts.containment (default TRUE) — WIDGET-DEPENDENT (LOCKSTEP with lib.js, 2026-07-16): dropdown/radio
+  // pass {containment:false} (a substring match is a GUESS — "PA"→"Armed Forces Pacific" — so they escalate
+  // to review instead); typeahead/cert/source keep it ON (typed-partial ⊆ completion is the correct,
+  // chip-verified + filled_review-flagged commit signal). Mid-string includes needs a candidate >= 3 chars.
+  const matchCandidates = (candidates, optionTexts, opts) => {
+    const allowContainment = !opts || opts.containment !== false;
     // Tier 1: exact after normalize() (which strips a trailing "(+N)").
     for (const cand of candidates) {
       const nc = normalize(cand);
       const idx = optionTexts.findIndex((t) => normalize(t) === nc);
       if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
     }
-    // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate
-    // contained in 2+ options is NOT a confident match (e.g. "United States" is in both
-    // "...of America" and "...Virgin Islands") → skip it, never silently pick the first.
-    // Commit ONLY when EXACTLY ONE option contains it. startsWith still beats includes.
-    for (const cand of candidates) {
-      const nc = normalize(cand);
-      const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
-      if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
-      if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
-      const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
-      if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
-      // 0 or 2+ includes → not a confident containment match for this candidate
+    // Tier 2: containment — startsWith then includes, AMBIGUITY-SAFE (exactly one), skipped for
+    // dropdown/radio (opts). Mid-string includes requires >= 3 chars (a 2-char abbrev is too promiscuous).
+    if (allowContainment) {
+      for (const cand of candidates) {
+        const nc = normalize(cand);
+        const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
+        if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
+        if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
+        if (nc.length >= 3) {
+          const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
+          if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
+        }
+        // 0 or 2+ includes (or a too-short candidate) → not a confident containment match
+      }
     }
-    // Tier 3: fuzzy >= 90 — typo tolerance only.
+    // Tier 3: fuzzy >= 90 — TYPO TOLERANCE ONLY.
     let best = -1, bestScore = 0, bestCand = null;
     for (const cand of candidates) {
       const nc = normalize(cand);
@@ -3795,7 +3802,9 @@ async function fillEngine(profile, defaults, jobContext) {
     }
     const optionTexts = optionEls.map((el) => el.textContent.trim());
 
-    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts);
+    // DROPDOWN = select from a full list → NO containment (a substring is a guess: "PA" must not become
+    // "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate. (LOCKSTEP with fillDropdownCdp, 2026-07-16.)
+    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts, { containment: false });
     if (targetIndex === -1) {
       return { status: "needs_review", detail: "no candidate matched", after: before, options: optionTexts };
     }
@@ -3889,7 +3898,9 @@ async function fillEngine(profile, defaults, jobContext) {
     if (!optionEls.length) return { status: "needs_review", detail: "no options appeared after typing", after: null };
     const optionTexts = optionEls.map((el) => el.textContent.trim());
 
-    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts);
+    // DIRECTED typeahead pick (we choose from the filtered list) → NO containment (a substring pick is a
+    // guess); exact/typo only, else escalate → AI rescue for required. (LOCKSTEP with fillTypeaheadCdp.)
+    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts, { containment: false });
     if (targetIndex === -1) {
       // captured_options is the LIVE-FILTERED set the search surfaced (what the match
       // was made against) — not the full underlying list. No cap needed; it's small.
@@ -4051,12 +4062,13 @@ async function fillEngine(profile, defaults, jobContext) {
         pressEnter();
         const leaves = await waitForResults(baselineSig);
 
-        // Match via the shared ladder against data-automation-label, then textContent.
+        // Match via the shared ladder against data-automation-label, then textContent. DIRECTED source
+        // pick → NO containment (a substring pick is a guess); exact/typo only, else escalate → AI rescue.
         const labels = leaves.map(leafLabel);
-        let m = matchCandidates([cand], labels);
+        let m = matchCandidates([cand], labels, { containment: false });
         if (m.targetIndex === -1) {
           const texts = leaves.map((el) => (el.textContent || "").trim());
-          m = matchCandidates([cand], texts);
+          m = matchCandidates([cand], texts, { containment: false });
         }
         if (m.targetIndex === -1) continue; // no results / no match → next (fast)
 
@@ -4079,10 +4091,10 @@ async function fillEngine(profile, defaults, jobContext) {
       }
     } else {
       for (const cand of candidates) {
-        // Level-1 leaf?
+        // Level-1 leaf? DIRECTED pick → NO containment (exact/typo only, else escalate → AI rescue).
         const l1leaves = scrapeRows().filter((el) => !isCategory(el));
         const l1texts = l1leaves.map((el) => el.textContent.trim());
-        const m = matchCandidates([cand], l1texts);
+        const m = matchCandidates([cand], l1texts, { containment: false });
         if (m.targetIndex !== -1) {
           await robustClick(l1leaves[m.targetIndex]);
           picked = l1texts[m.targetIndex]; matchTier = m.matchTier; break;
@@ -4095,7 +4107,7 @@ async function fillEngine(profile, defaults, jobContext) {
           await new Promise((r) => setTimeout(r, 150));
           const sub = scrapeRows().filter((el) => !isCategory(el));
           const subTexts = sub.map((el) => el.textContent.trim());
-          const sm = matchCandidates([cand], subTexts);
+          const sm = matchCandidates([cand], subTexts, { containment: false });
           if (sm.targetIndex !== -1) {
             await robustClick(sub[sm.targetIndex]);
             picked = subTexts[sm.targetIndex]; matchTier = sm.matchTier; found = true; break;

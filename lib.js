@@ -187,27 +187,43 @@ function fuzzyRatio(a, b) {
 // are tried most-specific first; NO low-threshold fuzzy — a loose bar silently
 // selects a WRONG value. Returns { targetIndex, matchTier, matchedCandidate };
 // targetIndex === -1 means escalate to needs_review rather than guess.
-function matchCandidates(candidates, optionTexts) {
+//
+// opts.containment (default TRUE) — whether the containment tier runs. WIDGET-DEPENDENT (2026-07-16):
+//   • SELECT-from-a-full-list widgets (dropdown / radio) pass {containment:false}. There a substring
+//     match is a GUESS dressed up as a match — "PA" silently committed "Armed Forces Pacific" — so those
+//     escalate to needs_review instead (exact → typo → review; the operator picks the option / teaches a
+//     bucket → an exact match next time). (fillRadioCdp is already exact-label-only, so this only affects
+//     fillDropdownCdp.)
+//   • TYPE-a-partial-the-widget-completes widgets (typeahead / cert / source) keep containment ON — there
+//     "what I typed ⊆ what the widget offered" IS the correct commit signal (and the commit is separately
+//     chip-verified + always flagged filled_review, so it's never silent). It stays the DEFAULT.
+function matchCandidates(candidates, optionTexts, opts) {
+  const allowContainment = !opts || opts.containment !== false;
   // Tier 1: exact after normalize() (which strips a trailing "(+N)").
   for (const cand of candidates) {
     const nc = normalize(cand);
     const idx = optionTexts.findIndex((t) => normalize(t) === nc);
     if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
   }
-  // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate
-  // contained in 2+ options is NOT a confident match (e.g. "United States" is in both
-  // "...of America" and "...Virgin Islands") → skip it, never silently pick the first.
-  // Commit ONLY when EXACTLY ONE option contains it. startsWith still beats includes.
-  for (const cand of candidates) {
-    const nc = normalize(cand);
-    const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
-    if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
-    if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
-    const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
-    if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
-    // 0 or 2+ includes → not a confident containment match for this candidate
+  // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate contained in 2+ options
+  // is NOT a confident match → skip it, never silently pick the first. Commit ONLY when EXACTLY ONE option
+  // contains it. startsWith still beats includes. MID-STRING `includes` additionally requires the candidate
+  // to be >= 3 chars — a 2-char value ("PA") is a substring of too many unrelated options to trust, and the
+  // ambiguity guard can't catch a SINGLE coincidental hit. Skipped entirely for dropdown/radio (see opts).
+  if (allowContainment) {
+    for (const cand of candidates) {
+      const nc = normalize(cand);
+      const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
+      if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
+      if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
+      if (nc.length >= 3) {
+        const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
+        if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
+      }
+      // 0 or 2+ includes (or a candidate too short to mid-string-match) → not a confident containment match
+    }
   }
-  // Tier 3: fuzzy >= 90 — typo tolerance only.
+  // Tier 3: fuzzy >= 90 — TYPO TOLERANCE ONLY.
   let best = -1, bestScore = 0, bestCand = null;
   for (const cand of candidates) {
     const nc = normalize(cand);
