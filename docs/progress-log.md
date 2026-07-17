@@ -601,3 +601,30 @@ of a `<select>`; larger radio sets still use a select. New `RadioButtons` editor
 Extension suite 597/597; web typecheck + build green. Refill button + edit-preserving refill (so
 approved deterministic fields don't re-review after a refill) proposed next — needs the
 website↔extension refill-trigger decision.
+
+## 2026-07-16 — Refill: replay APPROVED fields (flat + repeating), re-fill the rest
+
+After a halt (e.g. a bad postal code), the operator fixes the profile + approves the correct
+fields on the website, then REFILLS. A refill re-runs the guarded walk but REPLAYS the
+human-approved fields via the SAME primitives the submit replay walk uses — so an approved field
+lands identically to a submit-replay and drops out of the flag list; everything else re-fills
+fresh from the (now-fixed) profile. The new review always contains every field; approval only
+flips a field flagged → not-flagged. NEVER submits.
+
+- **Flat** — `refillReplayApprovedFlat` (fill-driver): matches approved flat entries to live records
+  by field name, `replayField` each (skip-if-correct → per-widget commit); committed → `filled` +
+  `approved-kept` + `is_approved` (buildReviewBundle's deriveReview → needs_review:false); a replay
+  that doesn't commit KEEPS the field flagged (no false "kept").
+- **Repeating** — a section with ANY approved field is replayed whole via the SAME
+  `replayRepeatingSections`; `refillMergeApprovedSections` (pure) replaces the fresh section entries
+  with the reviewed ones, un-flagging approved. `refillApprovedRepeatingSections` picks the sections.
+- `buildReviewBundle` carries `is_approved`/`approved_at` (both lockstep twins) so replayed-approved
+  fields stay approved. `runCdpWalk({refill:true})` pulls the website-approved bundle before the clear
+  + threads the entries per page (`fillAndPersistPage`). `RUN_CDP_REFILL` handler + popup "CDP REFILL".
+- **Website:** when `walk_status.completed === false`, the ApprovalBar button becomes **Refill**
+  (ungated) instead of "Approve & continue to submit", with guidance to re-run in the extension.
+
+Model: FILL/WALK = fresh (a re-run overwrites); **REFILL = preserve-approved** (approvals are the
+mechanism, replayed). +3 unit tests (600 total). Extension suite 600/600; web typecheck + build green.
+Follow-up: skip fresh-filling approved sections (avoid the double-fill) is an optimization, not needed
+for correctness (the replay reconciles over the fresh fill).
