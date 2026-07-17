@@ -1,0 +1,110 @@
+{
+  "node": {
+    "4062d57e2807aee8ea8f0e46e8bb1655f97c3b6ee8": {
+      "workers": {
+        "app/app/tracker/page": {
+          "moduleId": "(action-browser)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%224062d57e2807aee8ea8f0e46e8bb1655f97c3b6ee8%22%2C%22exportedName%22%3A%22deleteApplication%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%22600652932021339ba9aa6a85fbe304dfd461342b4c%22%2C%22exportedName%22%3A%22updateApplicationStatus%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=true!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/tracker/page": "action-browser"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\tracker\\actions.ts",
+      "exportedName": "deleteApplication"
+    },
+    "600652932021339ba9aa6a85fbe304dfd461342b4c": {
+      "workers": {
+        "app/app/tracker/page": {
+          "moduleId": "(action-browser)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%224062d57e2807aee8ea8f0e46e8bb1655f97c3b6ee8%22%2C%22exportedName%22%3A%22deleteApplication%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%22600652932021339ba9aa6a85fbe304dfd461342b4c%22%2C%22exportedName%22%3A%22updateApplicationStatus%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=true!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/tracker/page": "action-browser"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\tracker\\actions.ts",
+      "exportedName": "updateApplicationStatus"
+    },
+    "60efc9dd1a4077a388d0dbf3a71c70ac72e8f9e50d": {
+      "workers": {
+        "app/app/tracker/[id]/page": {
+          "moduleId": "(action-browser)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5C%5Bid%5D%5C%5Creview-actions.ts%22%2C%5B%7B%22id%22%3A%2260efc9dd1a4077a388d0dbf3a71c70ac72e8f9e50d%22%2C%22exportedName%22%3A%22saveReviewBundle%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Ctracker%5C%5C%5Bid%5D%5C%5Creview-actions.ts%22%7D%5D%5D%5D&__client_imported__=true!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/tracker/[id]/page": "action-browser"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\tracker\\[id]\\review-actions.ts",
+      "exportedName": "saveReviewBundle"
+    },
+    "00b36060f956f67c937909a9c3f68f327337907151": {
+      "workers": {
+        "app/app/profile/page": {
+          "moduleId": "(rsc)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%2200b36060f956f67c937909a9c3f68f327337907151%22%2C%22exportedName%22%3A%22loadBuckets%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%224004ae3c3b94d8c0ac4a7fbea3a430c1a69c109f3d%22%2C%22exportedName%22%3A%22saveBuckets%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%2240cbe8da07694c6a9a67d85d0df831016c894d75ae%22%2C%22exportedName%22%3A%22saveProfile%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/profile/page": "rsc"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\profile\\actions.ts",
+      "exportedName": "loadBuckets"
+    },
+    "4004ae3c3b94d8c0ac4a7fbea3a430c1a69c109f3d": {
+      "workers": {
+        "app/app/profile/page": {
+          "moduleId": "(rsc)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%2200b36060f956f67c937909a9c3f68f327337907151%22%2C%22exportedName%22%3A%22loadBuckets%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%224004ae3c3b94d8c0ac4a7fbea3a430c1a69c109f3d%22%2C%22exportedName%22%3A%22saveBuckets%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%2240cbe8da07694c6a9a67d85d0df831016c894d75ae%22%2C%22exportedName%22%3A%22saveProfile%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/profile/page": "rsc"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\profile\\actions.ts",
+      "exportedName": "saveBuckets"
+    },
+    "40cbe8da07694c6a9a67d85d0df831016c894d75ae": {
+      "workers": {
+        "app/app/profile/page": {
+          "moduleId": "(rsc)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%2200b36060f956f67c937909a9c3f68f327337907151%22%2C%22exportedName%22%3A%22loadBuckets%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%224004ae3c3b94d8c0ac4a7fbea3a430c1a69c109f3d%22%2C%22exportedName%22%3A%22saveBuckets%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%2240cbe8da07694c6a9a67d85d0df831016c894d75ae%22%2C%22exportedName%22%3A%22saveProfile%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cprofile%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/profile/page": "rsc"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\profile\\actions.ts",
+      "exportedName": "saveProfile"
+    },
+    "00c42ff106dc73116c6878b6679103a5a472292379": {
+      "workers": {
+        "app/app/connect/page": {
+          "moduleId": "(action-browser)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cconnect%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%2200c42ff106dc73116c6878b6679103a5a472292379%22%2C%22exportedName%22%3A%22getSyncBundle%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cconnect%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%2200d941850943cfd62272693c6534d59db1bbde702a%22%2C%22exportedName%22%3A%22getSession%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cconnect%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=true!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/connect/page": "action-browser"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\connect\\actions.ts",
+      "exportedName": "getSyncBundle"
+    },
+    "00d941850943cfd62272693c6534d59db1bbde702a": {
+      "workers": {
+        "app/app/connect/page": {
+          "moduleId": "(action-browser)/./node_modules/next/dist/build/webpack/loaders/next-flight-action-entry-loader.js?actions=%5B%5B%22C%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cconnect%5C%5Cactions.ts%22%2C%5B%7B%22id%22%3A%2200c42ff106dc73116c6878b6679103a5a472292379%22%2C%22exportedName%22%3A%22getSyncBundle%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cconnect%5C%5Cactions.ts%22%7D%2C%7B%22id%22%3A%2200d941850943cfd62272693c6534d59db1bbde702a%22%2C%22exportedName%22%3A%22getSession%22%2C%22filename%22%3A%22..%2FC%3A%5C%5CKevin%5C%5CApplyPilot%5C%5CApplyPilot-ext%20Debugger%5C%5C.claude%5C%5Cworktrees%5C%5Cweb-review-migration%5C%5Cweb%5C%5Capp%5C%5Capp%5C%5Cconnect%5C%5Cactions.ts%22%7D%5D%5D%5D&__client_imported__=true!",
+          "async": false
+        }
+      },
+      "layer": {
+        "app/app/connect/page": "action-browser"
+      },
+      "filename": "../C:\\Kevin\\ApplyPilot\\ApplyPilot-ext Debugger\\.claude\\worktrees\\web-review-migration\\web\\app\\app\\connect\\actions.ts",
+      "exportedName": "getSession"
+    }
+  },
+  "edge": {},
+  "encryptionKey": "EXxhfx+Kn9gOaSJV9WQ7iqby2DczAlQ/HxeaUFSp4tI="
+}
