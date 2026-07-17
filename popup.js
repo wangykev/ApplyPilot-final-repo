@@ -139,18 +139,20 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
   });
 });
 
-// CDP REFILL: re-run the fill after fixing a halt (e.g. a bad postal code) + approving the good fields on
-// the website. Pulls the website-approved bundle → REPLAYS approved fields (same commit path as submit,
-// so they don't re-flag) + re-fills everything else fresh. Same guarded walk, NEVER submits.
+// CDP REFILL = REPLAY the reviewed bundle. After reviewing/editing/approving on the website, refill
+// pulls that bundle and REPLAYS it onto the form — approved-flagged + unflagged + manually-changed fields
+// alike — SKIP-IF-CORRECT (leaves a field already right, no edit) and NO re-fill / NO re-recon (the first
+// fill already reconned). Same guarded walk to REVIEW; NEVER submits. (Identical to the DRY replay walk.)
 document.getElementById("cdp-refill").addEventListener("click", () => {
-  setStatus("CDP refill: pulling your website approvals → replaying approved fields + re-filling the rest → to REVIEW (never submits). Keep the tab VISIBLE. See [CDP-WALK].");
-  chrome.runtime.sendMessage({ type: "RUN_CDP_REFILL" }, (resp) => {
+  setStatus("CDP refill — pulling your website review, then REPLAYING the reviewed values onto the form (skip-if-correct; no re-fill, no re-recon) → to REVIEW. Keep the tab VISIBLE. NEVER submits. See [CDP-REPLAY-WALK].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REPLAY_WALK" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return;
-    if (resp.ok === false && resp.error === "no-profile") setStatus('No profile in storage — click "Load default profile" first.');
-    else if (resp.ok === false) setStatus("CDP refill failed: " + resp.error + " — see the service worker console.");
-    else if (resp.reached_review) setStatus(`✓ Refill reached REVIEW — ${resp.pages_filled} page(s), NOT submitted. Approved fields were replayed. "View last summary". See [CDP-WALK].`);
-    else if (resp.session_expired) setStatus(`⚠ SESSION EXPIRED during refill after ${resp.pages_filled} page(s). See [CDP-WALK].`);
-    else setStatus(`Refill stopped — ${resp.stopped} (${resp.pages_filled != null ? resp.pages_filled : "?"} page(s)). See [CDP-WALK].`);
+    if (resp.ok === false && resp.error === "no-bundle") setStatus('No saved review to refill — fill + review an application first.');
+    else if (resp.ok === false) setStatus("Refill failed: " + resp.error + " — see the service worker console.");
+    else if (resp.reached_review) setStatus(`✓ Refill reached REVIEW — ${resp.pages_replayed} page(s) replayed, NOT submitted. See [CDP-REPLAY-WALK].`);
+    else if (resp.stopped === "replay-page-not-in-bundle") setStatus(`⚠ Refill HALTED on page ${resp.page} — your review doesn't cover this page (a later page wasn't filled the first time). See [CDP-REPLAY-WALK].`);
+    else if (resp.session_expired) setStatus(`⚠ SESSION EXPIRED during refill after ${resp.pages_replayed} page(s). See [CDP-REPLAY-WALK].`);
+    else setStatus(`Refill stopped — ${resp.stopped} (${resp.pages_replayed != null ? resp.pages_replayed : "?"} page(s)). See [CDP-REPLAY-WALK].`);
   });
 });
 

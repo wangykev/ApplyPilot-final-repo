@@ -4179,85 +4179,6 @@ async function replayFlatFields(act, entries, presentFieldNames, budgets) {
   return results;
 }
 
-// ── REFILL: replay the human-APPROVED fields over a fresh fill ───────────────
-// After drivePageFill freshly fills a page, a REFILL replays the fields the human APPROVED on the review
-// page — via the SAME primitives the submit replay walk uses (replayField for FLAT here;
-// replayRepeatingSections for repeating, called from the SW) — so an approved field lands identically to a
-// submit-replay, and is marked un-flagged (approval = "I've confirmed this; replay it, stop flagging it").
-// Unapproved fields keep the fresh fill. Mutates `results` in place (matched by field name = field_id tail).
-// A replay that DOESN'T commit (the approved value is no longer offered) KEEPS the field flagged — never a
-// false "approved-kept". Returns { replayed, kept } counts.
-async function refillReplayApprovedFlat(act, results, approvedEntries, budgets) {
-  const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
-  const byName = new Map();
-  for (const e of (approvedEntries || [])) {
-    if (!e || !e.is_approved || e.is_deleted || isRepeatingEntry(e)) continue; // flat approved only
-    const tail = String(e.field_id || "").replace(/^.*formField-/, "");
-    if (tail) byName.set(tail, e);
-  }
-  let replayed = 0, kept = 0;
-  if (!byName.size) return { replayed, kept };
-  for (const rec of (results || [])) {
-    const appr = byName.get(rec.fieldName);
-    if (!appr) continue;
-    const rr = await replayField(act, appr, b); // identical to the submit replay walk's per-field commit
-    if (rr.status === "filled" || rr.status === "filled_review") {
-      // committed → un-flag: status "filled" + a non-ai flag makes buildReviewBundle.deriveReview yield
-      // needs_review:false, and is_approved rides onto the entry (buildReviewBundle passthrough).
-      Object.assign(rec, rr, {
-        status: "filled", flag: "approved-kept", is_approved: true, approved_at: appr.approved_at || null,
-        confidence: "high", verified: true,
-        detail: "approved by you — replayed (same commit path as submit); not re-flagged",
-      });
-      replayed++;
-    } else {
-      // approved value no longer applies on the live form → KEEP flagged so the human re-checks (no false "kept").
-      Object.assign(rec, rr, {
-        is_approved: true, approved_at: appr.approved_at || null,
-        detail: (rr.detail || "replay produced no commit") + " — approved value could not be replayed; re-check",
-      });
-      kept++;
-    }
-  }
-  return { replayed, kept };
-}
-
-// REFILL (repeating) — SECTION granularity. A repeating section with ANY approved field is REPLAYED as a
-// whole from the reviewed bundle (via the SAME replayRepeatingSections the submit walk uses) and its
-// approved fields are un-flagged. Returns the set of such section names (canonical prefix, e.g.
-// "workExperience") so the caller actuates + merges them.
-function refillApprovedRepeatingSections(pulledEntries) {
-  const secs = new Set();
-  for (const e of (pulledEntries || [])) {
-    if (!e || !e.is_approved || e.is_deleted || !isRepeatingEntry(e)) continue;
-    const m = /^([A-Za-z_]+)\s*\[/.exec(String(e.canonical_field || ""));
-    if (m) secs.add(m[1]);
-  }
-  return secs;
-}
-
-// PURE bundle merge for the refill's repeating sections: replace the FRESH bundle's entries for each
-// approved section with the REVIEWED (pulled) entries — un-flagging approved fields (needs_review:false),
-// keeping unapproved fields' flags. The reviewed values are what replayRepeatingSections just put on the
-// form, so bundle + form agree. Spliced entries are rewritten to the current bundle's page / field_id
-// prefix so they accumulate under this page. Recomputes needs_review_count. Unit-tested.
-function refillMergeApprovedSections(bundle, pulledEntries, approvedSections) {
-  if (!bundle || !approvedSections || !approvedSections.size) return bundle;
-  const page = bundle.page;
-  const secOf = (e) => { const m = /^([A-Za-z_]+)\s*\[/.exec(String((e && e.canonical_field) || "")); return m ? m[1] : null; };
-  const kept = (bundle.entries || []).filter((e) => !approvedSections.has(secOf(e))); // drop the fresh entries of approved sections
-  const merged = (pulledEntries || [])
-    .filter((e) => e && !e.is_deleted && isRepeatingEntry(e) && approvedSections.has(secOf(e)))
-    .map((e) => {
-      const tail = String(e.field_id || "").replace(/^.*formField-/, "");
-      const out = Object.assign({}, e, { page, field_id: (page ? page + "::" : "") + "formField-" + tail });
-      if (e.is_approved) { out.needs_review = false; out.needs_review_reason = null; out.flag = "approved-kept"; }
-      return out;
-    });
-  const entries = kept.concat(merged);
-  return Object.assign({}, bundle, { entries, needs_review_count: entries.filter((e) => e.needs_review).length });
-}
-
 // ── M3 (strict-replay SUBMIT — repeating sections) ───────────────────────────
 // coerceReplayValue: turn a bundle entry's DISPLAY current_value back into the profile-shaped
 // value fillEntryCdp expects at item[f.key]. Dates are the only real transform — the bundle stores
@@ -5102,5 +5023,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, refillReplayApprovedFlat, refillApprovedRepeatingSections, refillMergeApprovedSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
