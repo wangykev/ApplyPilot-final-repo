@@ -66,12 +66,6 @@
   select.ap-input {
     @apply appearance-none pr-7;
   }
-  /* Flat dropdown: reads as the VALUE (transparent, no filled "input bar") — a picker, not a typeable
-     box. A chevron marks it clickable; the box border shows only on hover/focus (a11y). */
-  .ap-select {
-    @apply w-full appearance-none rounded-md border border-transparent bg-transparent px-2.5 py-1.5 pr-7
-      text-sm text-ink outline-none transition-colors hover:border-hairline focus:border-amber;
-  }
   .ap-check {
     @apply h-4 w-4 shrink-0 accent-amber;
   }

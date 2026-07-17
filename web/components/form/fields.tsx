@@ -42,7 +42,7 @@ export function FieldLabel({
           {children}
         </button>
       ) : (
-        <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{children}</span>
+        <span className="cursor-default font-mono text-[10px] uppercase tracking-label text-ink-dim">{children}</span>
       )}
       {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
     </span>
@@ -68,18 +68,21 @@ export function TextField({
   bucketPath?: string;
   disabled?: boolean;
 }) {
+  // A <div>, NOT a <label>: clicking the QUESTION text must not focus the box (no "white bar" on a
+  // non-editable label). aria-label keeps the input named for screen readers.
   return (
-    <label className="group block">
+    <div className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="text">{label}</FieldLabel>
       <input
         type={type}
+        aria-label={label}
         value={value}
         placeholder={placeholder}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
         className={clsx(inputCls, "mt-1.5", disabled && "cursor-not-allowed text-ink-dim opacity-70")}
       />
-    </label>
+    </div>
   );
 }
 
@@ -103,9 +106,10 @@ export function TextAreaField({
   bulletOnEnter?: boolean;
 }) {
   return (
-    <label className="group block">
+    <div className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="textarea">{label}</FieldLabel>
       <textarea
+        aria-label={label}
         value={value}
         rows={rows}
         placeholder={placeholder}
@@ -135,7 +139,7 @@ export function TextAreaField({
         }}
         className={clsx(inputCls, "mt-1.5 resize-y leading-relaxed")}
       />
-    </label>
+    </div>
   );
 }
 
@@ -155,9 +159,10 @@ export function SelectField({
   bucketPath?: string;
 }) {
   return (
-    <label className="group block">
+    <div className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="dropdown">{label}</FieldLabel>
       <select
+        aria-label={label}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className={clsx(inputCls, "mt-1.5 appearance-none")}
@@ -168,7 +173,7 @@ export function SelectField({
           </option>
         ))}
       </select>
-    </label>
+    </div>
   );
 }
 
