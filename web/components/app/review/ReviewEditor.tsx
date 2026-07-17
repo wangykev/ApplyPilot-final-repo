@@ -890,13 +890,18 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
 
   const kind = editKindOf(e);
   const approvedRow = !!(e.needs_review && e.is_approved);
+  // A field the operator CHANGED that was NOT flagged for review → tint it green (a confirmed edit),
+  // mirroring the extension viewer's f-edit. The "autofilled: <bot value>" ref shows too (below).
+  const editedRow = !e.needs_review && !!kind;
   const rowTint = approvedRow
     ? "bg-verified/[0.05]"
     : e.needs_review && mustReplace(e)
       ? "bg-signal/[0.05]"
       : e.needs_review
         ? "bg-amber/[0.04]"
-        : "";
+        : editedRow
+          ? "border-l-2 border-verified/60 bg-verified/[0.07]"
+          : "";
 
   const editor = <FieldEditor e={e} ctx={ctx} />;
   const showApprove = requiresApproval(e);
