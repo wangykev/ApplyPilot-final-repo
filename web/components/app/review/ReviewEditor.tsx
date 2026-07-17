@@ -17,6 +17,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
+import { ChevronDown } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import type { ReviewBundle, ReviewEntry, FieldShape, WalkStatus } from "@/lib/review-summary";
 import {
@@ -1041,15 +1042,20 @@ function SelectBox({
 }) {
   const list = options.slice();
   if (value != null && value !== "" && !list.includes(value)) list.unshift(value);
+  // A dropdown is a PICKER, not a typeable field → render it FLAT (reads as the value) with a chevron,
+  // not a filled "white bar" input box. The box border only appears on hover/focus.
   return (
-    <select className="ap-input" value={value ?? ""} onChange={(e) => onCommit(e.target.value || null)}>
-      <option value="">— choose —</option>
-      {list.map((o) => (
-        <option key={o} value={o}>
-          {o}
-        </option>
-      ))}
-    </select>
+    <div className="relative">
+      <select className="ap-select" value={value ?? ""} onChange={(e) => onCommit(e.target.value || null)}>
+        <option value="">— choose —</option>
+        {list.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
+      </select>
+      <ChevronDown className="pointer-events-none absolute right-1.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-faint" />
+    </div>
   );
 }
 
