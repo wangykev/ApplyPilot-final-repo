@@ -69,8 +69,24 @@ export function parseProfileFromReply(reply: string): Profile | null {
   }
   try {
     const obj = JSON.parse(text);
-    return coerceProfile(obj);
+    return deriveCurrentlyWorkHere(coerceProfile(obj));
   } catch {
     return null;
   }
+}
+
+/**
+ * Guarantee every work-experience entry carries a concrete currently_work_here
+ * (Yes/No) instead of null — so the profile's toggle is never left blank after a
+ * parse. An explicit model answer is respected; only an UNSET (null) value is
+ * derived, from the end date: no `to` (or a "Present"/"Current" `to`) means the
+ * role is ongoing → true, otherwise → false.
+ */
+export function deriveCurrentlyWorkHere(profile: Profile): Profile {
+  for (const w of profile.work_experience) {
+    if (w.currently_work_here != null) continue;
+    const to = (w.to ?? "").trim().toLowerCase();
+    w.currently_work_here = to === "" || to === "present" || to === "current";
+  }
+  return profile;
 }
