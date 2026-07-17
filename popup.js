@@ -144,13 +144,13 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
 // alike — SKIP-IF-CORRECT (leaves a field already right, no edit) and NO re-fill / NO re-recon (the first
 // fill already reconned). Same guarded walk to REVIEW; NEVER submits. (Identical to the DRY replay walk.)
 document.getElementById("cdp-refill").addEventListener("click", () => {
-  setStatus("CDP refill — pulling your website review, then REPLAYING the reviewed values onto the form (skip-if-correct; no re-fill, no re-recon) → to REVIEW. Keep the tab VISIBLE. NEVER submits. See [CDP-REPLAY-WALK].");
-  chrome.runtime.sendMessage({ type: "RUN_CDP_REPLAY_WALK" }, (resp) => {
+  setStatus("CDP refill — pulling your website review, then REPLAYING the reviewed values (skip-if-correct; no re-fill, no re-recon); any page the first fill NEVER reached gets a FRESH fill → continues to REVIEW. Keep the tab VISIBLE. NEVER submits. See [CDP-REPLAY-WALK].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REPLAY_WALK", refill: true }, (resp) => {
     if (chrome.runtime.lastError || !resp) return;
     if (resp.ok === false && resp.error === "no-bundle") setStatus('No saved review to refill — fill + review an application first.');
     else if (resp.ok === false) setStatus("Refill failed: " + resp.error + " — see the service worker console.");
-    else if (resp.reached_review) setStatus(`✓ Refill reached REVIEW — ${resp.pages_replayed} page(s) replayed, NOT submitted. See [CDP-REPLAY-WALK].`);
-    else if (resp.stopped === "replay-page-not-in-bundle") setStatus(`⚠ Refill HALTED on page ${resp.page} — your review doesn't cover this page (a later page wasn't filled the first time). See [CDP-REPLAY-WALK].`);
+    else if (resp.reached_review) setStatus(`✓ Refill reached REVIEW — ${resp.pages_replayed} page(s), NOT submitted. See [CDP-REPLAY-WALK].`);
+    else if (resp.stopped === "replay-page-not-in-bundle") setStatus(`⚠ Refill HALTED on page ${resp.page} — no profile loaded, so a never-filled page can't be fresh-filled. Click "Load default profile", then refill. See [CDP-REPLAY-WALK].`);
     else if (resp.session_expired) setStatus(`⚠ SESSION EXPIRED during refill after ${resp.pages_replayed} page(s). See [CDP-REPLAY-WALK].`);
     else setStatus(`Refill stopped — ${resp.stopped} (${resp.pages_replayed != null ? resp.pages_replayed : "?"} page(s)). See [CDP-REPLAY-WALK].`);
   });
