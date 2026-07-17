@@ -540,7 +540,7 @@ export function CandidateField({
           aria-label="More choices"
           className={clsx(
             "absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors",
-            extra > 0 ? "text-amber" : "text-ink-faint hover:text-amber"
+            extra > 0 ? "text-amber/70" : "text-ink-faint hover:text-amber/70"
           )}
         >
           <ChevronRight className="h-4 w-4" />
