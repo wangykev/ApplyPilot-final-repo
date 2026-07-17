@@ -93,7 +93,9 @@ export const requiresApproval = (e: ReviewEntry): boolean =>
  *  still holds an unreplaced AI placeholder. */
 export function approvalEnvelope(entries: ReviewEntry[]): ApprovalEnvelope {
   const live = (entries || []).filter((e) => !e.is_deleted);
-  const toApprove = live.filter(requiresApproval);
+  // A preferred-name field HIDDEN by an unchecked "I have a preferred name" is off the form, so it
+  // must NOT demand approval (else a synthesized/empty preferred row blocks submit while invisible).
+  const toApprove = live.filter((e) => requiresApproval(e) && !isHiddenPreferredName(e, live));
   const approved = toApprove.filter((e) => !!e.is_approved);
   const placeholdersLeft = live.filter(
     (e) => e.flag === "ai-text-needs-answer" && hasPlaceholder(e.current_value)
@@ -140,6 +142,66 @@ export function isHiddenPreferredName(e: ReviewEntry, entries: ReviewEntry[]): b
   if (!isPreferredNameField(e)) return false;
   const ctrl = (entries || []).find((x) => isPreferredCheckField(x) && x.page === e.page);
   return !!ctrl && !checkedOf(ctrl.current_value); // controlling checkbox present + UNCHECKED → hide
+}
+
+/** When "I have a preferred name" is CHECKED but the preferred first/last fields are ABSENT from the
+ *  bundle (the first fill had the box unchecked, so the form never revealed them), SYNTHESIZE editable
+ *  text rows so the review page shows them just like the profile page does — inserted right after the
+ *  controlling checkbox. Uses the SAME field name / canonical the fill engine emits
+ *  (preferredName--firstName → personal_info.preferred_first_name) so a later replay recognizes them.
+ *  Returns the list UNCHANGED if both already exist (isHiddenPreferredName already reveals those). PURE. */
+export function ensurePreferredNameEntries(entries: ReviewEntry[], ctrl: ReviewEntry): ReviewEntry[] {
+  const list = entries || [];
+  const page = ctrl.page ?? null;
+  const hasFor = (which: "first" | "last"): boolean =>
+    list.some(
+      (e) =>
+        isPreferredNameField(e) &&
+        e.page === page &&
+        new RegExp("preferred_" + which + "_name").test(sumNorm(e.canonical_field))
+    );
+  const make = (which: "first" | "last"): ReviewEntry => ({
+    field_id: (page != null ? page + "::" : "") + "formField-preferredName--" + (which === "first" ? "firstName" : "lastName"),
+    page,
+    field_index: null,
+    question_label: which === "first" ? "Preferred First Name" : "Preferred Last Name",
+    widget_type: "text",
+    canonical_field: "personal_info.preferred_" + which + "_name",
+    is_required: false, // Workday preferred-name fields are optional → an empty one never blocks approval
+    current_value: null,
+    original_ai_value: null,
+    is_edited: false,
+    edit_kind: null,
+    is_added: true,
+    added_at: null,
+    is_approved: false,
+    approved_at: null,
+    page_number: ctrl.page_number ?? null,
+    page_label: ctrl.page_label ?? null,
+    confidence: "none",
+    confidence_source: "added",
+    needs_review: true,
+    needs_review_reason: "revealed by 'I have a preferred name' — fill it in",
+    fill_status: "not_filled",
+    fill_error: null,
+    detail: "revealed by 'I have a preferred name' — fill it in",
+    match_tier: null,
+    flag: "preferred-name-added",
+    options: null,
+    captured_options: null,
+    tree_structure: null,
+    date_order: null,
+    tiers: null,
+    character_count: null,
+  } as ReviewEntry);
+
+  const additions: ReviewEntry[] = [];
+  if (!hasFor("first")) additions.push(make("first"));
+  if (!hasFor("last")) additions.push(make("last"));
+  if (!additions.length) return list;
+  const idx = list.findIndex((e) => e.field_id === ctrl.field_id);
+  if (idx === -1) return [...list, ...additions];
+  return [...list.slice(0, idx + 1), ...additions, ...list.slice(idx + 1)];
 }
 
 /** Given one repeating-entry's fields, return the ones to SHOW: when "I currently work

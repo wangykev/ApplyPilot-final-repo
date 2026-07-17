@@ -27,6 +27,8 @@ import {
   approvalEnvelope,
   hasPlaceholder,
   isHiddenPreferredName,
+  isPreferredCheckField,
+  ensurePreferredNameEntries,
   isCurrentlyWorkHere,
   visibleEntryItems,
   newEntryRecords,
@@ -134,6 +136,19 @@ export function ReviewEditor({
       if (entry.is_approved) {
         patch.is_approved = false;
         patch.approved_at = null;
+      }
+      // Preferred-name reveal (mirror the profile page + the form cascade): CHECKING "I have a
+      // preferred name" reveals the preferred first/last fields. If the first fill had the box
+      // UNCHECKED, the form never rendered them → they're absent from the bundle, so synthesize
+      // editable rows here (right after the checkbox). Unchecking keeps them but isHiddenPreferredName
+      // hides them from view. Needs setBundle (adds entries) — patchEntry only touches one field.
+      if (isPreferredCheckField(entry) && checkedOf(value)) {
+        setBundle((b) => {
+          const patched = b.entries.map((e) => (e.field_id === entry.field_id ? { ...e, ...patch } : e));
+          const withPref = ensurePreferredNameEntries(patched, { ...entry, ...patch });
+          return { ...b, entries: withPref, approval: approvalEnvelope(withPref) };
+        });
+        return;
       }
       patchEntry(entry.field_id, patch);
     },
