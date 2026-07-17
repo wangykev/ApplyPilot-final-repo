@@ -8,7 +8,10 @@
  * 2-letter abbreviation like "PA" that used to mis-match "Armed Forces Pacific".
  */
 
-export const US_STATES: string[] = [
+// Full set: 50 states + DC + territories + military postings (all real Workday countryRegion options).
+// Exported SORTED so the dropdown reads A→Z like Workday's own review-page list (findability) — the
+// territories / armed-forces entries sort IN (e.g. "American Samoa" near the top), not at the bottom.
+const US_STATES_SET: string[] = [
   "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware",
   "District of Columbia", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa",
   "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
@@ -16,10 +19,11 @@ export const US_STATES: string[] = [
   "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
   "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
   "West Virginia", "Wisconsin", "Wyoming",
-  // Territories + military postings — real Workday countryRegion options for those who need them.
   "American Samoa", "Guam", "Northern Mariana Islands", "Puerto Rico", "United States Virgin Islands",
   "Armed Forces Americas", "Armed Forces Europe", "Armed Forces Pacific",
 ];
+
+export const US_STATES: string[] = [...US_STATES_SET].sort((a, b) => a.localeCompare(b));
 
 // 2-letter USPS abbreviations → the canonical full name (so a legacy "PA" auto-upgrades to "Pennsylvania").
 const US_STATE_BY_ABBR: Record<string, string> = {
