@@ -1231,17 +1231,24 @@ test("AI-3: a REQUIRED consent AUTO-CHECKS silently (filled, NOT flagged) even w
   assert.ok(!a1.log.concat(a2.log).some(([m]) => m === "llm"), "consents never involve the LLM");
 });
 
-test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it (reveals the preferred-name fields); false leaves it unchecked", async () => {
+test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it; false OR null/unanswered UNCHECKS it", async () => {
   const prefField = (flags) => Object.assign({ wrapperSel: "[w-pref]", fieldName: "preferredCheck", widgetType: "checkbox", isRequired: false, label: "I have a preferred name", inputId: "pc-1" }, flags || {});
   // has_preferred_name:true → the optional checkbox reconciles to CHECKED (which reveals the preferred first/last fields on the live page → the cascade re-scan then fills them once mapped).
   const onF = prefField({ checked: false });
   const onRec = (await drivePageFill(makeFakeAct([onF]), { personal_info: { has_preferred_name: true } }, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(onRec.status, "filled");
   assert.strictEqual(onF.checked, true, "mapped + true → box checked");
-  // has_preferred_name:false → reconciles to UNCHECKED (no reveal). Mapped, so not 'skipped: no mapping' anymore.
+  // has_preferred_name:false → reconciles to UNCHECKED (no reveal). Mapped, so not 'skipped: no mapping'.
   const offF = prefField({ checked: true });
   await drivePageFill(makeFakeAct([offF]), { personal_info: { has_preferred_name: false } }, {}, {}, T_BUDGETS);
   assert.strictEqual(offF.checked, false, "mapped + false → box unchecked");
+  // has_preferred_name UNANSWERED (null / never toggled) → STILL unchecks a pre-checked form box. A
+  // checkbox has no "unanswered" state on the form; the profile is authoritative. (2026-07-16 bug: a null
+  // value used to SKIP → a box left checked by the account / a prior run never unchecked.)
+  const nullF = prefField({ checked: true });
+  const nullRec = (await drivePageFill(makeFakeAct([nullF]), { personal_info: {} }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(nullF.checked, false, "mapped + null/unanswered → box unchecked (not skipped)");
+  assert.strictEqual(nullRec.status, "filled");
 });
 
 test("FIELD_MAP: revealed preferred-name fields fill DETERMINISTICALLY from the profile (mapped → no AI even though optional)", async () => {
@@ -2470,16 +2477,17 @@ test("typeahead directed containment is AMBIGUITY-SAFE: 2 containing options →
   assert.strictEqual(rec.after, null); // the wrong value was NOT committed
 });
 
-test("typeahead directed containment STILL commits when UNAMBIGUOUS (only one option contains the value)", async () => {
-  // candidate "United States" filters to ONE containing option (+ an unrelated one) → directed commit.
+test("typeahead DIRECTED containment REMOVED (2026-07-16): an unambiguous list-contain no longer self-commits → escalates", async () => {
+  // WAS: "United States" filtered to ONE containing option → we clicked it (directed-containment). NOW a
+  // DIRECTED pick never containment-matches — ApplyPilot only trusts Workday's OWN autocommit, or an exact/
+  // typo match. So this escalates (→ the inline AI rescue for a REQUIRED field; here, no AI → genuine
+  // no-match). The AUTOCOMMIT-containment path is unchanged (see the auto-commit test above).
   const act = makeFakeAct([taField({ filterMap: { "United States": { filtered: ["United States of America (+1)", "Canada (+1)"] } } })]);
   const out = await drivePageFill(act, taProfile(["United States"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
-  assert.strictEqual(rec.flag, "directed-containment");
-  assert.strictEqual(rec.confidence, "low");
-  assert.strictEqual(rec.after, "United States of America (+1)");
-  assert.strictEqual(rec.matchTier, "click-commit"); // commit-path (unified click-by-label), not the match tier
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.genuineNoMatch, true);
+  assert.strictEqual(rec.after, null); // the containing option was NOT self-committed
 });
 
 // ── source picker (backlog C — the Magna SEARCH shape; mirrors the typeahead walk) ──

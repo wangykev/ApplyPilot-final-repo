@@ -11,6 +11,7 @@ import {
   CandidateField,
   DateField,
   CheckboxField,
+  StateProvinceField,
   FieldLabel,
   FileField,
   BucketLabelContext,
@@ -128,7 +129,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TextField label="Address line 1" bucketPath="personal_info.address_line_1" value={pi.address_line_1} onChange={(v) => update((p) => { p.personal_info.address_line_1 = v; })} />
           <TextField label="Address line 2" bucketPath="personal_info.address_line_2" value={pi.address_line_2} onChange={(v) => update((p) => { p.personal_info.address_line_2 = v; })} />
           <TextField label="City" bucketPath="personal_info.city" value={pi.city} onChange={(v) => update((p) => { p.personal_info.city = v; })} />
-          <TextField label="State / Province" bucketPath="personal_info.state_province" value={pi.state_province} onChange={(v) => update((p) => { p.personal_info.state_province = v; })} />
+          <StateProvinceField country={pi.country} bucketPath="personal_info.state_province" value={pi.state_province} onChange={(v) => update((p) => { p.personal_info.state_province = v; })} />
           <TextField label="Postal code" bucketPath="personal_info.postal_code" value={pi.postal_code} onChange={(v) => update((p) => { p.personal_info.postal_code = v; })} />
         </div>
         <div className="mt-4">
@@ -185,7 +186,10 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                 <TextField label="Job title" bucketPath={i === 0 ? "work_experience.0.job_title" : undefined} value={w.job_title} onChange={(v) => update((p) => { p.work_experience[i].job_title = v; })} />
                 <TextField label="Company" bucketPath={i === 0 ? "work_experience.0.company" : undefined} value={w.company} onChange={(v) => update((p) => { p.work_experience[i].company = v; })} />
                 <TextField label="Location" bucketPath={i === 0 ? "work_experience.0.location" : undefined} value={w.location} onChange={(v) => update((p) => { p.work_experience[i].location = v; })} />
-                <TriBoolField label="Currently work here" bucketPath={i === 0 ? "work_experience.0.currently_work_here" : undefined} value={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; if (v === true) p.work_experience[i].to = ""; })} />
+                {/* Flattened to a plain boolean checkbox (unchecked = false, checked = true) — the
+                    form checkbox has no "unanswered" state. Checking it clears the To date (no end
+                    date), keeping main #14's behavior on the boolean widget. */}
+                <CheckboxField label="Currently work here" bucketPath={i === 0 ? "work_experience.0.currently_work_here" : undefined} checked={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; if (v === true) p.work_experience[i].to = ""; })} />
                 <DateField label="From" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.from" : undefined} value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
                 {/* "Currently work here" means no end date — hide the To field when Yes. */}
                 {w.currently_work_here !== true && (

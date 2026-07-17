@@ -78,7 +78,7 @@ handoff contract).
 | `AP_PING` | detection + status | returns `{ ok, version, hasProfile, hasResume }` |
 | `AP_SYNC_PROFILE` | write the handoff bundle | `chrome.storage.local` ← `profile`, `jobContext`, `buckets` (RAW); `defaults` **MERGED** (not clobbered) |
 | `AP_SYNC_RESUME` | store the resume | IndexedDB via `saveResume({filename,mime,size,base64,savedAt})` |
-| `AP_SET_SESSION` | reporting credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey }` |
+| `AP_SET_SESSION` | reporting + review-pull credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey, reviewUrl }` |
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
 
 - **Extension ID:** v1 = the user pastes their extension ID (from `chrome://extensions`) once on the
@@ -89,9 +89,22 @@ handoff contract).
 ### 2. Extension → Backend (report application status) — P2 (credential plumbed in v1)
 
 After a fill/walk, the SW POSTs to `{ingestUrl}` with `Bearer {ingestKey}`:
-`{ company, role, url, status, needs_review_count, captured_at }`. A Next.js route validates the
-per-user ingest key (an `api_keys` row) and inserts an `applications` row. Per-user API key avoids
-extension-side OAuth token refresh.
+`{ company, role, url, status, needs_review_count, captured_at, review_bundle }`. A Next.js route
+validates the per-user ingest key (an `api_keys` row) and upserts-by-URL an `applications` row.
+Per-user API key avoids extension-side OAuth token refresh. **Both** the single-page CDP fill
+(`runCdpFillPage`) and the multi-page walk (`runCdpWalk`, on every exit) push the accumulated
+review bundle, so the website always has the latest to review.
+
+### 3. Backend → Extension (PULL the approved review bundle) — the review round-trip
+
+The website is the **review surface** (edit + approve — see the review-editor section). Before a
+replay/submit, the SW **pulls** the human-approved bundle from `{reviewUrl}`
+(`GET /api/extension/review?url=…` with `Bearer {ingestKey}`) and writes it into
+`chrome.storage.local.reviewSummary` — the exact slot `runCdpReplayWalk` reads. `pullApprovedBundle`
+NEVER throws: not-connected / no-remote-bundle / HTTP error all fall back to the local bundle, so
+replay is never blocked by the network. **When the site is connected and has a bundle, it is the
+source of truth** (it overwrites the local one — the point of hosting review on the site); the
+extension's own `summary.html` stays as a fallback for when the site isn't connected.
 
 ---
 
@@ -107,6 +120,7 @@ fields** — never the derived ones. Reference: `data/profile.example.json`.
 - `education[]` — `{school_or_university, degree*, field_of_study*, minor, gpa, gpa_scale, from_year("YYYY"), to_year("YYYY"), graduation_date("YYYY-MM"), currently_enrolled, …}`.
 - `work_experience[]` — `{job_title, company, location, currently_work_here, from("YYYY-MM"), to("YYYY-MM"), role_description, tech_stack[]}`. **`role_description` (one Workday-style textarea, dash-bulleted) REPLACED `bullets[]`** — `coerceProfile` migrates legacy bullets → `- ` lines; the extension's `prepareProfile` derives `bulletsText` from it (bullets fallback), so `WORK_EXPERIENCE_MAP` is unchanged.
 - `languages[]` `{language, reading, speaking, writing, fluent}` — `fluent` (tri-bool) is the human-set "I am fluent" box; `prepareProfile` uses it when set, else derives from reading∧speaking∧writing. `certifications[]` `{certification*, certification_number, issued_date("YYYY-MM-DD"), expiration_date, specialties[]}`; each specialty `{specialty, start_date("YYYY-MM-DD"), end_date, attachment}` — nested repeating, matches the extension's `CERT_NESTED`. `projects[]`.
+- **Boolean convention (2026-07-16).** True CHECKBOX widgets are plain **`boolean`** (default `false`) — a checkbox has no "unanswered" state on a form, so `has_preferred_name`, `work_experience[].currently_work_here`, `education[].currently_enrolled` are booleans (`coerceProfile` migrates legacy `null`→`false`; the extension unchecks a false/absent mapped box). **`triBool`** (`true|false|null`) is reserved for genuine yes/no *questions* where "unanswered" is meaningful — `work_authorization.*`, `screening.*` (leave blank / flag rather than guess) — and for `languages[].fluent` (`null` = auto-derive from reading∧speaking∧writing).
 - `additional_files[]` — `{label, file}` general documents (transcripts, portfolios) → the private `attachments` bucket (see below).
 - `skills[]`, `work_authorization`, `self_identification`, `screening`, `agreements`.
 - `how_did_you_hear` `{preferred[], fallback}` — a fallback source list (profile WINS over `defaults`); the editor shows `preferred[]` only (the extension fills the real source when the queue knows it, else works down the list).
@@ -158,12 +172,24 @@ contract) — single source for resume parsing + AI-config parity.
 `{ key, filename, mime, size, base64, savedAt }` (raw base64, not a data: URL). Base64 string crosses
 the messaging boundary; the extension's `saveResume` (`db.js`) writes it.
 
-### reviewSummary — for hosted summaries (P3)
-Envelope `{ schema_version, page, url, tenant, captured_at, total, counts, by_type,
-needs_review_count, entries[] }`; per-entry `{ field_id, question_label, widget_type,
-canonical_field, is_required, current_value, original_ai_value, is_edited, edit_kind, confidence,
-confidence_source, needs_review, needs_review_reason, fill_status, options, captured_options,
-match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this schema.
+### reviewSummary — the hosted review EDITOR (P3 → now the primary review surface)
+Envelope `{ schema_version, page, page_number, page_label, url, tenant, captured_at, total, counts,
+by_type, needs_review_count, section_shapes, approval, entries[] }`; per-entry `{ field_id, page,
+page_number, page_label, question_label, widget_type, canonical_field, is_required, current_value,
+original_ai_value, is_edited, edit_kind, is_approved, approved_at, is_deleted, is_added,
+cascade_revealed, confidence, confidence_source, needs_review, needs_review_reason, fill_status,
+options, captured_options, tree_structure, date_order, tiers, match_tier, flag, … }` (see
+`lib/review-summary.ts`). The extension's `summary.js` viewer/editor is ported to React at
+`components/app/review/ReviewEditor.tsx` over this schema — **the website is now the primary review
+surface**. The PURE edit/approval transforms are `lib/review-approval.ts` (faithful TS port of the
+extension's `summary-lib.js` — keep in LOCKSTEP; `test/summary.test.js` is the semantic spec) +
+`lib/review-model.ts` (the grouping/prominence/shape logic from `summary.js`). Edits autosave to
+`applications.review_bundle_json` via the `saveReviewBundle` server action (recomputes the `approval`
+envelope + `needs_review_count` server-side — never trusts a client `submit_ready`). The extension
+PULLS this bundle before replay (direction 3 above). **`submit_ready` semantics are unchanged:** every
+`needs_review`/`cascade_revealed` field approved AND no unreplaced AI placeholder — but the extension's
+`submitPrecondition` recomputes the equivalent itself, so the website's job is to write correct
+per-entry `is_approved`/`current_value`/`edit_kind`/`is_deleted`.
 
 ---
 
@@ -183,7 +209,7 @@ match_tier, flag, … }`. Port `summary.js` viewer/editor to React over this sch
 
 - **v1 (done)** — auth · resume upload + AI parse · profile editor · job context · AI config · **extension auto-sync**. The core "upload your resume and feed the extension" loop.
 - **P2 (done)** — Tracker + Queue: `/app/queue` (paste Workday URLs → `queue_items`, manage) + `GET /api/extension/queue` (ingest-key pull); `/app/tracker` (applications list, stats strip, status lights, pipeline-stage select, filters) fed by `POST /api/extension/report`. Queue + Tracker promoted to live sidebar nav; dashboard updated; Analytics now the "coming soon" item. A hard-gated `DEV_PREVIEW` sample dataset makes both demoable pre-Supabase.
-- **P3 (done)** — Hosted review summaries: `lib/review-summary.ts` + `ReviewSummaryView` render the `reviewSummary` bundle at `/app/tracker/[id]` (needs-review-first, safety badges, grouped all-fields) — read-only; tracker rows link in. The extension now PUSHES its bundle: `reportApplication(bundle, jobContext)` in `background.js` fires after `runCdpFillPage` (fire-and-forget, no-op if the website isn't connected, status never "submitted"); `POST /api/extension/report` upserts-by-URL so re-runs don't duplicate. *(Edit/write-back-to-extension + the walk-side report are follow-ups; live extension push is the operator's verify step.)*
+- **P3 (done)** — Hosted review summaries: `lib/review-summary.ts` + `ReviewSummaryView` render the `reviewSummary` bundle at `/app/tracker/[id]` (needs-review-first, safety badges, grouped all-fields) — read-only; tracker rows link in. The extension now PUSHES its bundle: `reportApplication(bundle, jobContext)` in `background.js` fires after `runCdpFillPage` (fire-and-forget, no-op if the website isn't connected, status never "submitted"); `POST /api/extension/report` upserts-by-URL so re-runs don't duplicate. **Superseded by M9** (the read-only view → a full editor; the walk now reports too; write-back landed as a PULL).
 - **P4 (analytics done; reminders pending)** — `/app/analytics`: stat tiles (applications, submitted, interview rate, needs-review load), a labeled pipeline-distribution bar, an outcomes panel (offer/interview rates), and applications-over-time columns — server-rendered SVG, no chart lib, following the dataviz method (status colors always label-paired; palette contrast-validated). Pipeline stages ship via the tracker's status select; per-application **reminders** (the `reminders` table) are the remaining P4 piece.
 
 > **Merged `origin/main` (backend features) — `6219cc2`.** Main added Gmail integration
@@ -212,6 +238,8 @@ extension's discipline.
 - **M7 — Extension wiring** *(done)*: `manifest.json` gained `externally_connectable.matches` (`http://localhost/*`, `127.0.0.1`) + `http://localhost/*` host permission; `background.js` gained the `onMessageExternal` handler (`AP_PING`/`AP_SYNC_PROFILE`/`AP_SET_LLM`/`AP_SET_SESSION`/`AP_SYNC_RESUME`) writing the same `chrome.storage.local`/IndexedDB slots the popup seeds. Website: `lib/extension.ts` client bridge (`pingExtension`/`sendToExtension`, graceful when `chrome.runtime` absent), `getSyncBundle` server action (profile+defaults+jobContext+llmConfig+resume base64 + a freshly-minted ingest key), `/app/connect` (paste ID → check → sync, per-step status), and `POST /api/extension/report` (validates the ingest key via `api_keys`, inserts an `applications` row — the P2 tracker path, ready). Extension suite **325/325 green**; web production build green; bridge graceful-path verified. **Live website↔extension round-trip is the user's step** (load unpacked extension → copy ID → Sync) — needs the extension in the same Chrome profile.
 - **M8 — Profile v2: editor overhaul + answer buckets** *(done, merged PR `#10`, live-verified on localhost:3000)*: two halves.
   **(A) Editor UX** — country / phone-code / citizenship pickers (dropdown + an Advanced-choices ▾ popup over the tiered candidates; `lib/countries.ts`); Workday-style segmented **date pickers** (year / month-year / month-day-year, emitting the same canonical strings; month is a typeable "5"→"05 — May" input); Yes/No toggles with a divider bar + bold amber selected state, no blank option (Esc clears); self-identification → dropdowns; **preferred-name** checkbox revealing first/last; websites = 3 fixed rows (LinkedIn/GitHub/Personal Website, type locked) + custom rows; bullets → one dash-bulleted **Role description** box; how-did-you-hear as a fallback list. Schema (`lib/profile-schema.ts` v2.0) gained `preferred_first_name`/`preferred_last_name`, `role_description` (replacing `bullets`), `languages[].fluent`, `certifications[].specialties[]`, `additional_files[]` — all lockstep with the extension (`prepareProfile`, `WORK_EXPERIENCE_MAP`, `CERT_NESTED`, the `preferredName--*` FIELD_MAP entries). **(B) Answer buckets** — `buckets_json` (migration `0002`) + `lib/buckets.ts` + `STARTER_BUCKETS` seed (provision-if-null) + per-field bucket popups; the extension consumes them (`buildBucketIndex`/`fillFromBucket` in `drivePageFill`, match-ladder-gated, before AI) — supersedes the `answerBank` sketch. Plus **attachments** (`0003` bucket + `POST /api/attachments/upload`; per-specialty + `additional_files`). Also fixed: `AP_SYNC_PROFILE` now MERGES `defaults` (a sync no longer wipes the extension's field_of_study/degree/gpa_range). Web typecheck + build green; extension suite 593/593.
+
+- **M9 — Review stage migrated to the website (editor + approval + round-trip)** *(built; live-verify pending)*: the review stage moved OFF the extension's `summary.html` and ONTO the site — the site is now the PRIMARY review surface. `components/app/review/ReviewEditor.tsx` is a faithful React port of `summary.js`'s editor (every widget editable, per-field/section/all approval, submit-ready gating, repeating + nested cert-specialty sections, currently-work-here / preferred-name mirrors) over the extended `reviewSummary` schema; pure transforms in `lib/review-approval.ts` (port of `summary-lib.js`) + `lib/review-model.ts`. `saveReviewBundle` autosaves edits to `applications.review_bundle_json` (RLS; recomputes approval + needs_review_count). Round-trip: the walk PUSHES its accumulated bundle on every exit (`reportApplication` in `runCdpWalk`); the extension PULLS the approved bundle before replay (`GET /api/extension/review` + `pullApprovedBundle`, writing `chrome.storage.local.reviewSummary`), so `runCdpReplayWalk`/`submitPrecondition` are UNCHANGED. `AP_SET_SESSION` carries `reviewUrl`. The extension `summary.html` stays as a fallback until this is live-verified. Extension suite 593/593; web typecheck + build green. **Live-verify:** fill → walk reports → edit/approve on `/app/tracker/[id]` → Replay pulls + would-submit (needs Supabase + `/app/connect`).
 
 ## Design directions (under review)
 

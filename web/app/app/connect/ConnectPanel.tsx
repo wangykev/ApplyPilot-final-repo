@@ -104,6 +104,7 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
           type: "AP_SET_SESSION",
           ingestUrl: b.session.ingestUrl,
           ingestKey: b.session.ingestKey,
+          reviewUrl: b.session.reviewUrl,
         })
       )
     );
@@ -140,6 +141,7 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
       type: "AP_SET_SESSION",
       ingestUrl: res.session.ingestUrl,
       ingestKey: res.session.ingestKey,
+      reviewUrl: res.session.reviewUrl,
     });
     setSteps([rowFor("Reporting link (profile untouched)", r)]);
     setSyncing(false);

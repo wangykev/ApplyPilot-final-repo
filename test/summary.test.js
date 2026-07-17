@@ -4,7 +4,7 @@
 // the logic seams it (and the future SUBMIT) depend on — the first tests for the summary path.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
+const { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, isPreferredNameField, isPreferredCheckField, ensurePreferredNameEntries, visibleEntryItems, newEntryRecords } = require("../summary-lib.js");
 
 // ── 2b: operator-added repeating-section entries ──
 test("editKindOf: an is_added entry is STICKY 'added_entry' (even after a value edit)", () => {
@@ -138,6 +138,53 @@ test("#3 (bug fix): a REALISTIC field_id whose page-key prefix LISTS preferredNa
   assert.strictEqual(isHiddenPreferredName(legal, all), false, "legalName must NOT be hidden (this was the whole-page bug)");
   assert.strictEqual(isHiddenPreferredName(src, all), false, "source must NOT be hidden");
   assert.strictEqual(isHiddenPreferredName(check, all), false, "the checkbox itself is not a preferred-name field");
+});
+
+test("ensurePreferredNameEntries: synthesizes first+last (engine ids/canonicals) right AFTER the checkbox when absent", () => {
+  const check = { field_id: "P1::formField-preferredCheck", canonical_field: "personal_info.has_preferred_name", widget_type: "checkbox", current_value: "true", page: "P1", page_number: 1, page_label: "My Information" };
+  const other = { field_id: "P1::formField-source", canonical_field: "personal_info.how_did_you_hear", widget_type: "hierarchical", current_value: "LinkedIn", page: "P1" };
+  const out = ensurePreferredNameEntries([check, other], check);
+  assert.strictEqual(out.length, 4, "two rows added");
+  // inserted immediately after the checkbox (index 0), before `other`
+  assert.strictEqual(out[1].canonical_field, "personal_info.preferred_first_name");
+  assert.strictEqual(out[2].canonical_field, "personal_info.preferred_last_name");
+  assert.strictEqual(out[3].field_id, other.field_id, "the pre-existing field stays after the synthesized rows");
+  // engine-format field ids so replay recognizes them
+  assert.strictEqual(out[1].field_id, "P1::formField-preferredName--firstName");
+  assert.strictEqual(out[2].field_id, "P1::formField-preferredName--lastName");
+  // they are preferred-name fields, editable text, optional, flagged for the operator to fill
+  assert.strictEqual(isPreferredNameField(out[1]), true);
+  assert.strictEqual(out[1].widget_type, "text");
+  assert.strictEqual(out[1].is_required, false);
+  assert.strictEqual(out[1].needs_review, true);
+  assert.strictEqual(out[1].is_added, true);
+  assert.strictEqual(out[1].page_number, 1);
+});
+
+test("ensurePreferredNameEntries: no-op when both preferred fields already exist (only adds the MISSING one)", () => {
+  const check = { field_id: "P1::formField-preferredCheck", canonical_field: "personal_info.has_preferred_name", widget_type: "checkbox", current_value: "true", page: "P1" };
+  const first = { field_id: "P1::formField-preferredName--firstName", canonical_field: "personal_info.preferred_first_name", widget_type: "text", current_value: "Jo", page: "P1" };
+  // both present → unchanged (same array reference back)
+  const both = [check, first, { field_id: "P1::formField-preferredName--lastName", canonical_field: "personal_info.preferred_last_name", widget_type: "text", current_value: "Lee", page: "P1" }];
+  assert.strictEqual(ensurePreferredNameEntries(both, check), both, "no additions → returns the list unchanged");
+  // only first present → adds only last (no duplicate of first)
+  const out = ensurePreferredNameEntries([check, first], check);
+  assert.strictEqual(out.length, 3);
+  assert.ok(out.some((e) => e.canonical_field === "personal_info.preferred_last_name"), "adds the missing last");
+  assert.strictEqual(out.filter((e) => e.canonical_field === "personal_info.preferred_first_name").length, 1, "does not duplicate the existing first");
+});
+
+test("approvalEnvelope: a HIDDEN preferred field (checkbox unchecked) does NOT block submit; checking it does", () => {
+  const check = (val) => ({ field_id: "P1::formField-preferredCheck", canonical_field: "personal_info.has_preferred_name", widget_type: "checkbox", current_value: val, page: "P1", needs_review: false, is_approved: false, is_deleted: false });
+  const synthFirst = { field_id: "P1::formField-preferredName--firstName", canonical_field: "personal_info.preferred_first_name", widget_type: "text", current_value: null, page: "P1", needs_review: true, is_approved: false, is_deleted: false };
+  // UNCHECKED → the synthesized preferred field is hidden → excluded from the approval count → submit_ready
+  let ap = approvalEnvelope([check("false"), synthFirst]);
+  assert.strictEqual(ap.to_approve_count, 0, "hidden preferred field not counted");
+  assert.strictEqual(ap.submit_ready, true);
+  // CHECKED → it's visible again → it DOES demand approval (blocks submit until approved)
+  ap = approvalEnvelope([check("true"), synthFirst]);
+  assert.strictEqual(ap.to_approve_count, 1, "visible preferred field counted");
+  assert.strictEqual(ap.submit_ready, false);
 });
 
 test("M6: a cascade-REVEALED field FORCES approval even if it filled cleanly (needs_review false)", () => {

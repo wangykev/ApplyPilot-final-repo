@@ -484,3 +484,147 @@ extension's field_of_study/degree/gpa_range). Web typecheck + full build green; 
 text/dropdown/radio/typeahead/checkbox); the extension attaching specialty/additional files per-field on Workday
 (website upload/storage is done). Design + build plan: `docs/profile-v2-plan.md`; website contract: `WEBSITE.md`
 M8.
+
+## 2026-07-16 — Review stage migrated to the website (editing + approval + round-trip)
+
+Moved the review stage OFF the extension's `summary.html` viewer and ONTO the companion
+website — the website is now the PRIMARY review surface. The extension's `summary.html`/
+`summary.js` stays as a fallback until the web path is live-verified. Operator decision:
+full editor parity in one go; write-back = the extension PULLS the approved bundle from the
+backend (DB is the source of truth), not a website→extension push.
+
+**Web (Next.js/TS).**
+- **M1 — pure transforms ported.** `web/lib/review-approval.ts` = faithful TS port of
+  `summary-lib.js` (editKindOf/tokenFor/checkedOf/effectiveValue/approvalEnvelope/
+  requiresApproval/newEntryRecords/visibleEntryItems/isHiddenPreferredName + the AI-2
+  placeholder marker). `web/lib/review-model.ts` = the non-DOM logic from `summary.js`
+  (sectionOf-with-index/nestedInfoOf/flag-prominence predicates/statusOf/sectionShapeFor/
+  nextIndexFor). `ReviewEntry`/`ReviewBundle` (review-summary.ts) extended with the
+  editing+approval fields the replay reads. LOCKSTEP with `summary-lib.js`;
+  `test/summary.test.js` remains the semantic spec.
+- **M2/M3 — the React editor + persistence.** `web/components/app/review/ReviewEditor.tsx`
+  ports the whole `summary.js` editor: needs-review-first with flag-driven prominence
+  (super-hard / legally-loaded / demographic / needs-answer badges), every widget editable
+  (select / combobox / segmented date / checkbox / textarea / tier editor), per-field /
+  per-section / all approval with submit-readiness gating + submit-blocked banner,
+  repeating-entry add + soft-delete (+undo), nested cert-specialty sub-sections, and the
+  currently-work-here / preferred-name visibility mirrors. React holds ONE bundle in state
+  (immutable updates replace the manual DOM-refresher machinery); a value edit resets that
+  field's approval. `saveReviewBundle` server action autosaves (debounced) to
+  `applications.review_bundle_json` (RLS), recomputing the approval envelope +
+  needs_review_count server-side. `/app/tracker/[id]` renders the editor instead of the
+  read-only view; DEV_PREVIEW/sample data shows but doesn't persist.
+- **M4 — the pull endpoint.** `GET /api/extension/review` (ingest-key auth, mirrors the
+  queue-pull) returns the approved bundle by `?url=` (the report upsert key). READ-ONLY.
+
+**Extension (vanilla JS).**
+- **M5 — pull before replay.** `pullApprovedBundle` (background.js) reads `apSession` + the
+  local bundle's url, GETs `reviewUrl`, and writes `chrome.storage.local.reviewSummary` — so
+  `runCdpReplayWalk` (unchanged; it reads that slot directly) replays exactly what was
+  approved on the site. NEVER throws: not-connected / no-remote-bundle / HTTP error all fall
+  back to the local bundle. `AP_SET_SESSION` now stores `reviewUrl` (derived from `ingestUrl`
+  for older sessions); the website's getSyncBundle/getSession + ConnectPanel supply it.
+- **M6 — the walk pushes.** `runCdpWalk` now reports its accumulated bundle to the website on
+  every exit (reached-review / halt / abort) via `reportApplication` in its `finally`
+  (previously only the single-page fill reported).
+
+The submit pipeline is UNCHANGED — `runCdpReplayWalk` / `replayField` / `submitPrecondition`
+still read `current_value`/`edit_kind`/`is_deleted`/`is_approved`/`needs_review`/
+`cascade_revealed` off each entry and re-check the review-page equality gate, so the round-trip
+can only change WHERE the bundle is edited, never HOW it's verified/submitted. Extension suite
+**593/593**; web typecheck + production build green (incl. the new route).
+
+**Live-verify PENDING (operator):** end-to-end on a real tenant — fill → walk reports to the
+site → edit/approve on `/app/tracker/[id]` → Replay pulls the approved bundle → replay/would-submit.
+Needs Supabase wired + the extension connected (`/app/connect`). Prod origin must be added to
+the extension manifest `externally_connectable` + `host_permissions` before a non-localhost site.
+
+## 2026-07-16 — Containment is a guess unless Workday made it (match-ladder safety)
+
+Live bug: profile state `"PA"` filled a dropdown as **"Armed Forces Pacific"** at `filled` with NO review
+flag. `normalize("PA")="pa"` is a mid-string substring of "Armed Forces **Pa**cific" — the ONLY option
+containing it, so the ambiguity-safe guard (which only rejects 2+ hits) couldn't help, and the dropdown
+commit graded a containment match as a confident `filled` (not `filled_review`). A 2-letter abbreviation is
+a substring of countless unrelated options → the whole class is unsafe on a *select-from-a-list* widget.
+
+Operator decision: **ApplyPilot never PICKS a containment match itself.** `matchCandidates` gained an
+`opts.containment` param (default ON, LOCKSTEP lib.js + the `background.js` inline copy) plus a
+short-candidate guard (mid-string `includes` requires ≥ 3 chars):
+- **Dropdowns + radios** (`fillDropdownCdp`, page-engine dropdown; `fillRadioCdp` was already exact-only) →
+  `{containment:false}`: exact → typo (fuzzy ≥ 90) → escalate. A `"PA"` with no exact/typo option now flags
+  for review (→ AI rescue on a required field).
+- **Typeahead / cert / source DIRECTED picks** (Workday showed a list, did NOT autocommit, we would click
+  the one containing option) → `{containment:false}` too — us picking is a guess.
+- **Typeahead AUTOCOMMIT recognition KEPT** (default containment): when *Workday itself* commits a completed
+  chip after you type (`"Training Instructor - AEVO"` → `"…AEVO - Multiple Recognized Providers"`),
+  "chip contains what I typed" is how we RECOGNIZE Workday's own completion (vs a stray `"Canada"` chip for a
+  US query) — trusting Workday, not guessing; still `filled_review` (flagged). AI anti-hallucination belts
+  keep containment (the AI rescue must resolve the AI's choice to a real option for required fields).
+
+Net rule: accept only an **exact** match, a **typo**, or a value **Workday autocommitted**; everything else
+escalates → the website review editor / an answer bucket (→ exact next time) / the AI rescue for required
+fields (**all required fills keep the AI rescue** — operator rule). Tests: `test/matching.test.js` rewritten
+(containment ON default incl. the ≥3 short guard + autocommit case; OFF for dropdown/radio); the CDP
+directed-containment test updated to expect escalation; autocommit-containment tests unchanged. Extension
+suite **597/597**. Docs: CLAUDE.md → Matching strategy.
+
+## 2026-07-16 — Flatten checkbox fields to plain booleans (no "unanswered" state)
+
+Follow-up to the checkbox-fill fix: a checkbox has no "unanswered" state on a form, so the true
+checkbox-widget profile fields are now plain `boolean` (default `false`) instead of `triBool`
+(`true|false|null`) — `personal_info.has_preferred_name`, `work_experience[].currently_work_here`,
+`education[].currently_enrolled` (`web/lib/profile-schema.ts` new `bool` = preprocess→boolean, default
+false; `coerceProfile` migrates legacy `null`→`false`, verified null/absent→false). The editor's
+"Currently work here" switches from a Yes/No `TriBoolField` to a real `CheckboxField` (which gained
+`bucketPath` support). `triBool` stays for genuine yes/no QUESTIONS (`work_authorization.*`,
+`screening.*` — null=unanswered is meaningful) and `languages[].fluent` (null=auto-derive). Web
+typecheck + build green. Docs: WEBSITE.md boolean convention.
+
+## 2026-07-16 — Halt reason + form errors on the review page; yes/no radios as buttons
+
+Two review-page improvements requested after a live fill halted on a bad postal code
+("32312 is not a valid postal code for Pennsylvania"):
+
+**Halt surfacing (why a fill didn't reach the end).** `runCdpWalk` now stamps a `walk_status`
+onto the accumulated bundle in its finally — `{completed, stopped_page, page_errors[], error_text,
+empty_fields[], cancelled}` — captured via closure vars (reachedReview / walkPage / lastDiag from
+reportPageErrors) with no change to the walk's return sites. It's reported to the website with the
+bundle. `ReviewEditor` renders a LOUD red `WalkStatusBanner` at the top when `!completed`: the reason
+(form error / empty required / operator-cancelled / other), the exact Workday error text verbatim, any
+empty required fields, and an **"Edit my profile"** link (→ `/app/profile`). `WalkStatus` added to the
+bundle type; the report/save paths carry it unchanged (stored in `review_bundle_json`).
+
+**Radio yes/no → buttons.** A radio field with ≤4 options now renders as segmented Yes/No-style
+buttons in the review editor (the profile's toggle look, matching how the field is on the form) instead
+of a `<select>`; larger radio sets still use a select. New `RadioButtons` editor.
+
+Extension suite 597/597; web typecheck + build green. Refill button + edit-preserving refill (so
+approved deterministic fields don't re-review after a refill) proposed next — needs the
+website↔extension refill-trigger decision.
+
+## 2026-07-16 — Refill: replay APPROVED fields (flat + repeating), re-fill the rest
+
+After a halt (e.g. a bad postal code), the operator fixes the profile + approves the correct
+fields on the website, then REFILLS. A refill re-runs the guarded walk but REPLAYS the
+human-approved fields via the SAME primitives the submit replay walk uses — so an approved field
+lands identically to a submit-replay and drops out of the flag list; everything else re-fills
+fresh from the (now-fixed) profile. The new review always contains every field; approval only
+flips a field flagged → not-flagged. NEVER submits.
+
+- **Flat** — `refillReplayApprovedFlat` (fill-driver): matches approved flat entries to live records
+  by field name, `replayField` each (skip-if-correct → per-widget commit); committed → `filled` +
+  `approved-kept` + `is_approved` (buildReviewBundle's deriveReview → needs_review:false); a replay
+  that doesn't commit KEEPS the field flagged (no false "kept").
+- **Repeating** — a section with ANY approved field is replayed whole via the SAME
+  `replayRepeatingSections`; `refillMergeApprovedSections` (pure) replaces the fresh section entries
+  with the reviewed ones, un-flagging approved. `refillApprovedRepeatingSections` picks the sections.
+- `buildReviewBundle` carries `is_approved`/`approved_at` (both lockstep twins) so replayed-approved
+  fields stay approved. `runCdpWalk({refill:true})` pulls the website-approved bundle before the clear
+  + threads the entries per page (`fillAndPersistPage`). `RUN_CDP_REFILL` handler + popup "CDP REFILL".
+- **Website:** when `walk_status.completed === false`, the ApprovalBar button becomes **Refill**
+  (ungated) instead of "Approve & continue to submit", with guidance to re-run in the extension.
+
+Model: FILL/WALK = fresh (a re-run overwrites); **REFILL = preserve-approved** (approvals are the
+mechanism, replayed). +3 unit tests (600 total). Extension suite 600/600; web typecheck + build green.
+Follow-up: skip fresh-filling approved sections (avoid the double-fill) is an optimization, not needed
+for correctness (the replay reconciles over the fresh fill).
