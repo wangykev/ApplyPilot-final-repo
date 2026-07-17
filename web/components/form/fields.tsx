@@ -42,7 +42,7 @@ export function FieldLabel({
           {children}
         </button>
       ) : (
-        <span className="cursor-default font-mono text-[10px] uppercase tracking-label text-ink-dim">{children}</span>
+        <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{children}</span>
       )}
       {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
     </span>
@@ -209,23 +209,25 @@ export function StateProvinceField({
 
   if (!us) {
     return (
-      <label className="group block">
+      <div className="group block">
         <FieldLabel bucketPath={bucketPath} bucketWidget="text">State / Province / Region</FieldLabel>
         <input
+          aria-label="State / Province / Region"
           value={value}
           placeholder="Region (optional outside the US)"
           onChange={(e) => onChange(e.target.value)}
           className={clsx(inputCls, "mt-1.5")}
         />
-      </label>
+      </div>
     );
   }
 
   const invalid = !!value && !resolved; // a US value that isn't a real state (typed-first, then picked US)
   return (
-    <label className="group block">
+    <div className="group block">
       <FieldLabel bucketPath={bucketPath} bucketWidget="dropdown">State</FieldLabel>
       <select
+        aria-label="State"
         value={resolved ?? ""}
         onChange={(e) => onChange(e.target.value)}
         className={clsx(inputCls, "mt-1.5 appearance-none", invalid && "border-amber")}
@@ -242,7 +244,7 @@ export function StateProvinceField({
           &ldquo;{value}&rdquo; isn&apos;t a US state — pick your state from the list.
         </p>
       )}
-    </label>
+    </div>
   );
 }
 

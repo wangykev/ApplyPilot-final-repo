@@ -912,7 +912,7 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
         <div className="min-w-0 sm:w-1/2">
           <div className="flex flex-wrap items-center gap-1.5">
             {review && <ReviewBadges e={e} />}
-            <span className="cursor-default text-sm text-ink">{fmt(e.question_label)}</span>
+            <span className="text-sm text-ink">{fmt(e.question_label)}</span>
             {e.is_required && (
               <span className="text-signal" title="required">
                 ✱

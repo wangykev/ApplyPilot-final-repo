@@ -11,31 +11,6 @@
     scroll-behavior: smooth;
   }
 
-  /* The "white bar" is the text I-beam cursor (white on the dark deck). Show it ONLY over things you can
-     actually type into; everywhere else — labels, values, static copy — use the normal arrow, not the
-     I-beam. (Text is still selectable; only the cursor SHAPE changes.) */
-  body {
-    cursor: default;
-  }
-  input,
-  textarea,
-  [contenteditable="true"] {
-    cursor: text;
-  }
-  input[type="checkbox"],
-  input[type="radio"],
-  input[type="file"],
-  input[type="range"],
-  select,
-  button,
-  a[href],
-  summary,
-  label,
-  [role="button"],
-  [role="tab"] {
-    cursor: pointer;
-  }
-
   body {
     @apply bg-cockpit text-ink font-sans antialiased;
     /* Faint instrument grid + a single amber horizon glow, fixed to the deck. */
