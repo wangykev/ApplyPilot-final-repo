@@ -14,7 +14,7 @@ export type SyncBundle = {
   jobContext: { company: string };
   llmConfig: { provider: string; model: string; apiKey: string; enabled: boolean };
   resume: { filename: string; mime: string; size: number; base64: string } | null;
-  session: { ingestUrl: string; ingestKey: string };
+  session: { ingestUrl: string; ingestKey: string; reviewUrl: string };
 };
 
 export type BundleResult = { ok: true; bundle: SyncBundle } | { ok: false; error: string };
@@ -80,7 +80,11 @@ export async function getSyncBundle(): Promise<BundleResult> {
       key_hash: hashApiKey(key),
       label: "extension",
     });
-    const session = { ingestUrl: `${SITE_URL}/api/extension/report`, ingestKey: key };
+    const session = {
+      ingestUrl: `${SITE_URL}/api/extension/report`,
+      ingestKey: key,
+      reviewUrl: `${SITE_URL}/api/extension/review`,
+    };
 
     return { ok: true, bundle: { profile, defaults, buckets, jobContext, llmConfig, resume, session } };
   } catch (err) {
@@ -89,7 +93,7 @@ export async function getSyncBundle(): Promise<BundleResult> {
 }
 
 export type SessionResult =
-  | { ok: true; session: { ingestUrl: string; ingestKey: string } }
+  | { ok: true; session: { ingestUrl: string; ingestKey: string; reviewUrl: string } }
   | { ok: false; error: string };
 
 /** Mint ONLY the reporting credential — for linking the extension's tracker
@@ -108,7 +112,14 @@ export async function getSession(): Promise<SessionResult> {
     const key = generateApiKey();
     await supabase.from("api_keys").delete().eq("user_id", user.id);
     await supabase.from("api_keys").insert({ user_id: user.id, key_hash: hashApiKey(key), label: "extension" });
-    return { ok: true, session: { ingestUrl: `${SITE_URL}/api/extension/report`, ingestKey: key } };
+    return {
+      ok: true,
+      session: {
+        ingestUrl: `${SITE_URL}/api/extension/report`,
+        ingestKey: key,
+        reviewUrl: `${SITE_URL}/api/extension/review`,
+      },
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }

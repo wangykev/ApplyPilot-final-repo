@@ -74,10 +74,19 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
-  // Reporting credential for the extension→backend status path (built out in P2).
+  // Reporting credential for the extension→backend status path (P2) + the review PULL
+  // endpoint (the website is the review surface now; the SW pulls the approved bundle from
+  // reviewUrl before replay — see pullApprovedBundle). reviewUrl is optional for backward
+  // compat (pullApprovedBundle derives it from ingestUrl when absent).
   if (type === "AP_SET_SESSION") {
     chrome.storage.local.set(
-      { apSession: { ingestUrl: message.ingestUrl || "", ingestKey: message.ingestKey || "" } },
+      {
+        apSession: {
+          ingestUrl: message.ingestUrl || "",
+          ingestKey: message.ingestKey || "",
+          reviewUrl: message.reviewUrl || "",
+        },
+      },
       () => {
         const err = chrome.runtime.lastError;
         sendResponse(err ? { ok: false, error: err.message } : { ok: true });
@@ -255,7 +264,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs[0];
       if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
-      const out = await runCdpReplayWalk(tab.id, { authorize: message.authorize === true });
+      const out = await runCdpReplayWalk(tab.id, { authorize: message.authorize === true, refill: message.refill === true });
       sendResponse(out);
     });
     return true; // async sendResponse
@@ -2240,6 +2249,60 @@ async function reportApplication(bundle, jobContext) {
   }
 }
 
+// The website is now the primary REVIEW surface (edit + approve), replacing the extension's
+// summary.html. Before a replay/submit, PULL the human-approved bundle the operator saved on
+// the site and write it into chrome.storage.local.reviewSummary — so runCdpReplayWalk (which
+// reads that slot directly) replays exactly what was approved. Uses the same per-user ingest
+// credential the website synced via AP_SET_SESSION; the review pull endpoint is apSession.reviewUrl
+// (derived from ingestUrl for older sessions). Matches the application row by the LOCAL bundle's
+// url (the key reportApplication upserts by).
+//
+// CONTRACT: when the website is connected AND returns a bundle, it is the SOURCE OF TRUTH — it
+// overwrites the local bundle (the whole point of hosting review on the site). When NOT connected
+// (no apSession) or the site has no bundle, this is a silent no-op and the local bundle (from the
+// extension's own summary.html fallback) is used unchanged. NEVER throws — a pull failure falls back
+// to local so replay is never blocked by the network.
+async function pullApprovedBundle(LOG) {
+  const log = LOG || ((...a) => console.log("[ApplyPilot][REVIEW-PULL]", ...a));
+  try {
+    const { apSession, reviewSummary: localBundle } = await new Promise((res) =>
+      chrome.storage.local.get(["apSession", "reviewSummary"], res)
+    );
+    if (!apSession || !apSession.ingestKey) return { pulled: false, reason: "not-connected" };
+    const reviewUrl =
+      apSession.reviewUrl ||
+      (apSession.ingestUrl ? apSession.ingestUrl.replace(/\/report(\?.*)?$/, "/review") : "");
+    if (!reviewUrl) return { pulled: false, reason: "no-review-url" };
+    const url = localBundle && localBundle.url ? localBundle.url : "";
+    const endpoint = reviewUrl + (url ? "?url=" + encodeURIComponent(url) : "");
+    const res = await fetch(endpoint, {
+      method: "GET",
+      headers: { authorization: "Bearer " + apSession.ingestKey },
+    });
+    if (!res.ok) {
+      log(`review pull: HTTP ${res.status} — keeping the local bundle.`);
+      return { pulled: false, reason: "http-" + res.status };
+    }
+    const data = await res.json().catch(() => null);
+    const bundle = data && data.ok ? data.bundle : null;
+    if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
+      log(`review pull: no approved bundle on the website — keeping the local bundle.`);
+      return { pulled: false, reason: "no-remote-bundle" };
+    }
+    await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle }, r));
+    const ap = bundle.approval || {};
+    log(
+      `review pull: loaded the website-approved bundle (${bundle.entries.length} fields` +
+        (ap.to_approve_count != null ? `, ${ap.approved_count || 0}/${ap.to_approve_count} flagged approved` : "") +
+        `) into storage — replay will use these values.`
+    );
+    return { pulled: true, count: bundle.entries.length, submit_ready: !!ap.submit_ready };
+  } catch (e) {
+    log(`review pull skipped: ${String((e && e.message) || e)} — keeping the local bundle.`);
+    return { pulled: false, reason: "exception" };
+  }
+}
+
 async function runCdpFillPage(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-PAGE]", ...a);
   try {
@@ -2367,15 +2430,32 @@ async function reloadAndSettle(LOG, ceilingMs = 12000) {
 
 async function runCdpReplayWalk(tabId, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
-  const authorize = !!(opts && opts.authorize); // per-run submit token (M4). false ⇒ DRY (reach review + stop).
+  const refill = !!(opts && opts.refill); // REFILL mode: pages IN the approved bundle REPLAY (skip-if-correct, no re-recon); pages the first fill NEVER reached get a FRESH fill; walk continues to review. Always DRY (never submits).
+  const authorize = !!(opts && opts.authorize) && !refill; // per-run submit token (M4). false ⇒ DRY (reach review + stop). REFILL is always DRY (never submits) regardless of the caller.
   const simulateSubmit = !!(opts && opts.simulateSubmit); // M5 SAFETY BRAKE: run the FULL gate + log "WOULD CLICK SUBMIT", but NEVER actually click (operator not ready for a real submit). Flip via the handler's simulateSubmit:false.
+  // Walk-status + reporting locals — meaningful in refill mode (fresh fills change the bundle → push it to the website review page). The plain DRY replay walk touches none of these (freshFilledDidHappen stays false ⇒ no report).
+  let jobContext = null, prepared = null, defaults = {};
+  let freshFilledDidHappen = false, reachedReview = false, walkPage = 0, lastDiag = null;
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
-    const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
+    // PULL the website-approved bundle first (the website is the review surface now). No-op +
+    // fall back to the local bundle when not connected / the site has none — see pullApprovedBundle.
+    await pullApprovedBundle(LOG);
+    let bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)));
     if (!bundle || !Array.isArray(bundle.entries) || !bundle.entries.length) {
       LOG('no reviewSummary bundle in storage — fill + review an application first, then replay it.');
       return { ok: false, error: "no-bundle" };
+    }
+    // REFILL: load the profile so a page the first fill never reached can be FRESH-filled (recon + fill).
+    // Reviewed pages still REPLAY from the bundle — the profile is only for never-filled pages.
+    if (refill) {
+      const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext"], r));
+      defaults = store.defaults || {};
+      jobContext = store.jobContext || {};
+      prepared = store.profile ? prepareProfile(store.profile) : null;
+      if (prepared) LOG("REFILL mode: bundled pages REPLAY (skip-if-correct, no re-recon); pages the first fill never reached get a FRESH fill; continues to the REVIEW page. NEVER submits.");
+      else LOG("⚠ REFILL: no profile in storage — a page not in the bundle can't be fresh-filled and will HALT. Click 'Load default profile' first to enable fresh-fill of never-reached pages.");
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
     LOG(authorize
@@ -2390,6 +2470,7 @@ async function runCdpReplayWalk(tabId, opts) {
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1; a clean finish / halt / review-terminal returns out of the function
     pagesReplayed = []; findings = { mismatches: [], cascadeRevealed: [] }; submitFired = false; // reset per attempt
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
+      walkPage = page;
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
       let nav = null;
       try { nav = await cdpEval(cdpReadSessionState); } catch (e) { /* not-ready → handled below */ }
@@ -2402,6 +2483,7 @@ async function runCdpReplayWalk(tabId, opts) {
         return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
       if (nav && nav.applyFlowReviewPresent) {
+        reachedReview = true;
         LOG(`✓✓ reached the REVIEW page after replaying ${pagesReplayed.length} page(s) — the whole application is replayed + verified.`);
         // ── REVIEW-PAGE EQUALITY (operator requirement) — the review page must DISPLAY exactly the
         //    approved values. Scrape its label→value pairs and diff vs the approved bundle
@@ -2484,46 +2566,76 @@ async function runCdpReplayWalk(tabId, opts) {
       const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
       if (!sel.entries.length || sel.score <= 0) {
         const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
-        LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). The bundle never captured this page — HALT (can't replay what wasn't reviewed).`);
-        return { ok: true, stopped: "replay-page-not-in-bundle", page, live_fields: liveNames, live_sections: liveSecs, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
-      }
-      LOG(`page ${page} → matched approved page "${(sel.pageKey || "").split("|")[0]}" (${sel.score} flat-field overlap; ${sel.entries.length} approved entr${sel.entries.length === 1 ? "y" : "ies"}).`);
-
-      const present = new Set(liveNames);
-      const flat = await replayFlatFields(act, sel.entries, present, DEFAULT_BUDGETS);
-      const rep = await replayRepeatingSections(act, sel.entries, DEFAULT_BUDGETS);
-      const results = flat.concat(rep);
-
-      // Résumé re-attach (replayField defers file_upload). Required upload blocks advance → HALT if it fails.
-      if (fields.some((f) => f.widgetType === "file_upload")) {
-        const ar = await replayAttachResume(LOG);
-        if (!ar.attached) {
-          LOG(`⚠ resume NOT attached on page ${page} (${ar.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
-          return { ok: true, stopped: "resume-not-attached", resume_detail: ar.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        // ── NOT in the approved bundle. In a plain replay/submit walk this is a HARD HALT (can't
+        //    replay what wasn't reviewed). In REFILL mode it means the first fill NEVER REACHED this
+        //    page (a mid-walk halt) — so FRESH-FILL it (recon + fill + accumulate) and keep walking to
+        //    review. Reviewed pages above are untouched; only never-filled pages get a fresh fill. ──
+        if (!refill || !prepared) {
+          LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). ${refill ? "REFILL but no profile in storage — can't fresh-fill." : "The bundle never captured this page"} — HALT.`);
+          return { ok: true, stopped: "replay-page-not-in-bundle", page, live_fields: liveNames, live_sections: liveSecs, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
         }
-      }
-
-      const failed = results.filter((r) => r.status === "needs_review" || r.status === "error");
-      const changed = results.filter((r) => (r.status === "filled" || r.status === "filled_review") && r.flag !== "replay-already-correct").length;
-      const kept = results.filter((r) => r.flag === "replay-already-correct").length;
-      pagesReplayed.push({ page, matched_key: sel.pageKey, total: results.length, changed, kept, failed: failed.length });
-      LOG(`page ${page} replay: ${results.length} field(s) — ${changed} changed, ${kept} already-correct, ${failed.length} FAILED.`);
-
-      // ── STRICT verify: any field that did NOT replay cleanly HALTS before advancing (never a guess) —
-      //    UNLESS every failure is a TRANSIENT render-flake (options-did-not-render). Then RELOAD (which
-      //    returns Workday to page 1) + RESTART the whole walk from page 1, bounded. skip-if-correct makes
-      //    the already-good pages fast on the restart. A TERMINAL failure (genuine no-match) never retries. ──
-      if (failed.length) {
-        if (isTransientRenderFailure(failed) && reloadsUsed < MAX_RELOAD_RETRIES) {
+        LOG(`page ${page}: not in the approved bundle — REFILL: fresh-filling this never-reached page (recon + fill + accumulate) + continuing to review.`);
+        const { out } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
+        // Re-read the ACCUMULATED bundle so later pages' selectPageBundleEntries + the review-page diff include this page.
+        bundle = (await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve(r && r.reviewSummary)))) || bundle;
+        freshFilledDidHappen = true;
+        // Transient-flake reload parity with the fill walk: all-flake failures → reload (→ page 1) + restart.
+        const flakes = (out.results || []).filter((r) => r.status === "needs_review" || r.status === "error");
+        if (flakes.length && isTransientRenderFailure(flakes) && reloadsUsed < MAX_RELOAD_RETRIES) {
           reloadsUsed++;
-          LOG(`⟳ page ${page}: ${failed.length} field(s) failed with a TRANSIENT render-flake — reloading (Workday returns to page 1) + RESTARTING the walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}): ${failed.map((r) => r.field || r.fieldName).join(", ")}`);
+          LOG(`⟳ page ${page}: fresh-fill failure(s) are all TRANSIENT render-flakes — reloading (→ page 1) + RESTARTING the walk (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}): ${flakes.map((r) => r.fieldName).join(", ")}`);
           const ready = await reloadAndSettle(LOG);
-          if (ready) continue restartWalk; // re-run the whole walk from page 1
-          LOG(`⚠ page ${page}: reload did not settle in time — halting.`);
+          if (ready) continue restartWalk;
+          LOG(`⚠ page ${page}: reload did not settle — proceeding with the last fresh fill.`);
         }
-        LOG(`⚠ page ${page}: ${failed.length} field(s) did not replay cleanly${reloadsUsed ? ` (persisted through ${reloadsUsed} reload-restart)` : ""} — HALT before advancing (a value the live form no longer offers is never guessed):`);
-        failed.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`));
-        return { ok: true, stopped: "replay-mismatch", page, failed: failed.map((r) => ({ field: r.field || r.fieldName, widget: r.widgetType, status: r.status, detail: r.detail || null })), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        pagesReplayed.push({ page, matched_key: "(fresh-filled)", fresh: true, total: out.results.length, changed: out.results.filter((r) => r.status === "filled" || r.status === "filled_review").length, kept: 0, failed: out.needsReview.length });
+        LOG(`page ${page} fresh-fill: ${out.results.length} field(s) — ${out.needsReview.length} need review (they go to the review page).`);
+        // Required-upload guard (a missing/failed résumé blocks advancement) — the fresh fill attaches it inline.
+        const upRec = out.results.find((r) => r.widgetType === "file_upload");
+        if (upRec && upRec.status !== "filled") {
+          LOG(`⚠ resume NOT attached on page ${page} (${upRec.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
+          return { ok: true, stopped: "resume-not-attached", resume_detail: upRec.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        // Fall through to the SHARED guarded advance below (skip the replay-specific verify block).
+      } else {
+        LOG(`page ${page} → matched approved page "${(sel.pageKey || "").split("|")[0]}" (${sel.score} flat-field overlap; ${sel.entries.length} approved entr${sel.entries.length === 1 ? "y" : "ies"}).`);
+
+        const present = new Set(liveNames);
+        const flat = await replayFlatFields(act, sel.entries, present, DEFAULT_BUDGETS);
+        const rep = await replayRepeatingSections(act, sel.entries, DEFAULT_BUDGETS);
+        const results = flat.concat(rep);
+
+        // Résumé re-attach (replayField defers file_upload). Required upload blocks advance → HALT if it fails.
+        if (fields.some((f) => f.widgetType === "file_upload")) {
+          const ar = await replayAttachResume(LOG);
+          if (!ar.attached) {
+            LOG(`⚠ resume NOT attached on page ${page} (${ar.detail}) — the required upload blocks advancement. HALT. Upload a resume in the popup, then re-run.`);
+            return { ok: true, stopped: "resume-not-attached", resume_detail: ar.detail, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          }
+        }
+
+        const failed = results.filter((r) => r.status === "needs_review" || r.status === "error");
+        const changed = results.filter((r) => (r.status === "filled" || r.status === "filled_review") && r.flag !== "replay-already-correct").length;
+        const kept = results.filter((r) => r.flag === "replay-already-correct").length;
+        pagesReplayed.push({ page, matched_key: sel.pageKey, total: results.length, changed, kept, failed: failed.length });
+        LOG(`page ${page} replay: ${results.length} field(s) — ${changed} changed, ${kept} already-correct, ${failed.length} FAILED.`);
+
+        // ── STRICT verify: any field that did NOT replay cleanly HALTS before advancing (never a guess) —
+        //    UNLESS every failure is a TRANSIENT render-flake (options-did-not-render). Then RELOAD (which
+        //    returns Workday to page 1) + RESTART the whole walk from page 1, bounded. skip-if-correct makes
+        //    the already-good pages fast on the restart. A TERMINAL failure (genuine no-match) never retries. ──
+        if (failed.length) {
+          if (isTransientRenderFailure(failed) && reloadsUsed < MAX_RELOAD_RETRIES) {
+            reloadsUsed++;
+            LOG(`⟳ page ${page}: ${failed.length} field(s) failed with a TRANSIENT render-flake — reloading (Workday returns to page 1) + RESTARTING the walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}): ${failed.map((r) => r.field || r.fieldName).join(", ")}`);
+            const ready = await reloadAndSettle(LOG);
+            if (ready) continue restartWalk; // re-run the whole walk from page 1
+            LOG(`⚠ page ${page}: reload did not settle in time — halting.`);
+          }
+          LOG(`⚠ page ${page}: ${failed.length} field(s) did not replay cleanly${reloadsUsed ? ` (persisted through ${reloadsUsed} reload-restart)` : ""} — HALT before advancing (a value the live form no longer offers is never guessed):`);
+          failed.forEach((r) => LOG(`    • ${r.field || r.fieldName} [${r.widgetType}] ${r.status} — ${r.detail || ""}`));
+          return { ok: true, stopped: "replay-mismatch", page, failed: failed.map((r) => ({ field: r.field || r.fieldName, widget: r.widgetType, status: r.status, detail: r.detail || null })), pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
       }
 
       // ── Guarded advance (clickPageNext independently refuses on the review marker — 2nd guard). ──
@@ -2559,6 +2671,7 @@ async function runCdpReplayWalk(tabId, opts) {
           const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
           if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG("    • " + s)); }
           diag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null };
+          lastDiag = diag; // refill stamps this onto walk_status → the website review page shows WHY it stopped
         } catch (e) { /* ignore */ }
         LOG(`⚠ page ${page} did NOT advance (nav-timeout${reclick.errorsPresent ? ", real error present" : ", re-click fallback exhausted"}) — a required field is empty (likely a cascade-revealed field not in the approved bundle). HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
         return { ok: true, stopped: "replay-blocked", nav_timeout_page: page, pages_replayed: pagesReplayed.length, pages: pagesReplayed, ...diag };
@@ -2577,6 +2690,28 @@ async function runCdpReplayWalk(tabId, opts) {
   } finally {
     await removeInputLock(); // BEFORE detach — never strand the operator behind the lock
     await cdpDetach();
+    // REFILL only: fresh-filling a never-reached page CHANGED the accumulated bundle, so push it to the
+    // website review page (same as the fill walk's finally) — STAMPED with a walk_status so the site can
+    // say WHY the refill stopped (completed / halted-on-error) + surface the exact page errors. The plain
+    // replay/submit walk never sets freshFilledDidHappen ⇒ no report here (it only replays what was reviewed).
+    if (freshFilledDidHappen) {
+      try {
+        const store = await new Promise((r) => chrome.storage.local.get(["reviewSummary", "lastRunAbort"], r));
+        const reviewSummary = store.reviewSummary;
+        if (reviewSummary) {
+          reviewSummary.walk_status = {
+            completed: reachedReview,
+            stopped_page: walkPage || null,
+            page_errors: (lastDiag && lastDiag.page_errors) || [],
+            error_text: (lastDiag && lastDiag.error_page_text) || null,
+            empty_fields: (lastDiag && lastDiag.empty_fields) || [],
+            cancelled: !!(store.lastRunAbort && store.lastRunAbort.reason === "operator-cancelled"),
+          };
+          await new Promise((r) => chrome.storage.local.set({ reviewSummary }, r));
+          await reportApplication(reviewSummary, jobContext);
+        }
+      } catch (e) { /* reporting NEVER affects the refill result */ }
+    }
   }
 }
 
@@ -2710,6 +2845,11 @@ const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks ar
 async function runCdpWalk(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-WALK]", ...a);
 
+  // Walk-status capture for the website review page (WHY a fill didn't reach the end): the review
+  // terminal sets reachedReview, the loop tracks walkPage, reportPageErrors stashes lastDiag. Stamped
+  // onto the bundle in the finally + reported → the website renders a loud halt banner + edit-profile link.
+  let reachedReview = false, walkPage = 0, lastDiag = null;
+
   // M31.1: surface the EXACT page error text + the fields left EMPTY (no profile value —
   // the likely "required" validation cause) on a stop-with-errors. Takes the CURRENT page's
   // results (per-page in the loop). Reads error state FRESH (errors render post Save & Continue).
@@ -2737,7 +2877,8 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
       empties.forEach((r) => LOG(`    • ${r.fieldName} — ${r.detail}`));
     }
-    return { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+    lastDiag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+    return lastDiag;
   };
 
   try {
@@ -2763,6 +2904,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1 (the bundle clear stays ABOVE, once per run)
     pagesFilled = []; // reset per attempt
     for (let page = 1; page <= WALK_MAX_PAGES; page++) {
+      walkPage = page;
       // ── (a/b) TOP-OF-ITERATION guards: session-death + the REVIEW terminal (SUBMIT-NEVER —
       // checked BEFORE any fill/click, so we never fill or advance the review page). ──
       let nav = null;
@@ -2777,6 +2919,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
       if (nav && nav.applyFlowReviewPresent) {
+        reachedReview = true;
         LOG(`✓✓ reached the REVIEW page after ${pagesFilled.length} page(s) — the whole application is filled. NOT submitting (terminal). "View last summary" for the accumulated bundle.`);
         return { ok: true, stopped: "reached-review", reached_review: true, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
@@ -2891,6 +3034,27 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   } finally {
     await removeInputLock(); // BEFORE detach (needs the attach) — never strand the operator behind the lock
     await cdpDetach();
+    // Push the ACCUMULATED review bundle to the website (the review surface) on EVERY exit —
+    // reached-review, a mid-walk halt, or an abort — STAMPED with a walk_status so the review page can
+    // say WHY the fill didn't reach the end (halted-on-error / session-expired / cancelled / completed),
+    // surface the exact page errors, and offer an edit-profile link. Fire-and-forget; no-op if the
+    // website isn't connected (no apSession).
+    try {
+      const store = await new Promise((r) => chrome.storage.local.get(["reviewSummary", "lastRunAbort"], r));
+      const reviewSummary = store.reviewSummary;
+      if (reviewSummary) {
+        reviewSummary.walk_status = {
+          completed: reachedReview,               // reached the review page = the whole app got filled
+          stopped_page: walkPage || null,         // the page the walk was on when it ended
+          page_errors: (lastDiag && lastDiag.page_errors) || [],       // Workday's top-of-page error text
+          error_text: (lastDiag && lastDiag.error_page_text) || null,
+          empty_fields: (lastDiag && lastDiag.empty_fields) || [],     // required fields with no profile value
+          cancelled: !!(store.lastRunAbort && store.lastRunAbort.reason === "operator-cancelled"),
+        };
+        await new Promise((r) => chrome.storage.local.set({ reviewSummary }, r));
+        await reportApplication(reviewSummary, jobContext);
+      }
+    } catch (e) { /* reporting NEVER affects the walk result */ }
   }
 }
 
@@ -3558,27 +3722,34 @@ async function fillEngine(profile, defaults, jobContext) {
   // are tried most-specific first; NO low-threshold fuzzy — a loose bar silently
   // selects a WRONG value. Returns { targetIndex, matchTier, matchedCandidate };
   // targetIndex === -1 means escalate to needs_review rather than guess.
-  const matchCandidates = (candidates, optionTexts) => {
+  // opts.containment (default TRUE) — WIDGET-DEPENDENT (LOCKSTEP with lib.js, 2026-07-16): dropdown/radio
+  // pass {containment:false} (a substring match is a GUESS — "PA"→"Armed Forces Pacific" — so they escalate
+  // to review instead); typeahead/cert/source keep it ON (typed-partial ⊆ completion is the correct,
+  // chip-verified + filled_review-flagged commit signal). Mid-string includes needs a candidate >= 3 chars.
+  const matchCandidates = (candidates, optionTexts, opts) => {
+    const allowContainment = !opts || opts.containment !== false;
     // Tier 1: exact after normalize() (which strips a trailing "(+N)").
     for (const cand of candidates) {
       const nc = normalize(cand);
       const idx = optionTexts.findIndex((t) => normalize(t) === nc);
       if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
     }
-    // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate
-    // contained in 2+ options is NOT a confident match (e.g. "United States" is in both
-    // "...of America" and "...Virgin Islands") → skip it, never silently pick the first.
-    // Commit ONLY when EXACTLY ONE option contains it. startsWith still beats includes.
-    for (const cand of candidates) {
-      const nc = normalize(cand);
-      const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
-      if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
-      if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
-      const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
-      if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
-      // 0 or 2+ includes → not a confident containment match for this candidate
+    // Tier 2: containment — startsWith then includes, AMBIGUITY-SAFE (exactly one), skipped for
+    // dropdown/radio (opts). Mid-string includes requires >= 3 chars (a 2-char abbrev is too promiscuous).
+    if (allowContainment) {
+      for (const cand of candidates) {
+        const nc = normalize(cand);
+        const sw = []; optionTexts.forEach((t, i) => { if (normalize(t).startsWith(nc)) sw.push(i); });
+        if (sw.length === 1) return { targetIndex: sw[0], matchTier: "containment", matchedCandidate: cand };
+        if (sw.length > 1) continue; // ambiguous prefix → try next (more-specific) candidate, else escalate
+        if (nc.length >= 3) {
+          const inc = []; optionTexts.forEach((t, i) => { if (normalize(t).includes(nc)) inc.push(i); });
+          if (inc.length === 1) return { targetIndex: inc[0], matchTier: "containment", matchedCandidate: cand };
+        }
+        // 0 or 2+ includes (or a too-short candidate) → not a confident containment match
+      }
     }
-    // Tier 3: fuzzy >= 90 — typo tolerance only.
+    // Tier 3: fuzzy >= 90 — TYPO TOLERANCE ONLY.
     let best = -1, bestScore = 0, bestCand = null;
     for (const cand of candidates) {
       const nc = normalize(cand);
@@ -3721,7 +3892,9 @@ async function fillEngine(profile, defaults, jobContext) {
     }
     const optionTexts = optionEls.map((el) => el.textContent.trim());
 
-    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts);
+    // DROPDOWN = select from a full list → NO containment (a substring is a guess: "PA" must not become
+    // "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate. (LOCKSTEP with fillDropdownCdp, 2026-07-16.)
+    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts, { containment: false });
     if (targetIndex === -1) {
       return { status: "needs_review", detail: "no candidate matched", after: before, options: optionTexts };
     }
@@ -3815,7 +3988,9 @@ async function fillEngine(profile, defaults, jobContext) {
     if (!optionEls.length) return { status: "needs_review", detail: "no options appeared after typing", after: null };
     const optionTexts = optionEls.map((el) => el.textContent.trim());
 
-    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts);
+    // DIRECTED typeahead pick (we choose from the filtered list) → NO containment (a substring pick is a
+    // guess); exact/typo only, else escalate → AI rescue for required. (LOCKSTEP with fillTypeaheadCdp.)
+    const { targetIndex, matchTier } = matchCandidates(candidates, optionTexts, { containment: false });
     if (targetIndex === -1) {
       // captured_options is the LIVE-FILTERED set the search surfaced (what the match
       // was made against) — not the full underlying list. No cap needed; it's small.
@@ -3977,12 +4152,13 @@ async function fillEngine(profile, defaults, jobContext) {
         pressEnter();
         const leaves = await waitForResults(baselineSig);
 
-        // Match via the shared ladder against data-automation-label, then textContent.
+        // Match via the shared ladder against data-automation-label, then textContent. DIRECTED source
+        // pick → NO containment (a substring pick is a guess); exact/typo only, else escalate → AI rescue.
         const labels = leaves.map(leafLabel);
-        let m = matchCandidates([cand], labels);
+        let m = matchCandidates([cand], labels, { containment: false });
         if (m.targetIndex === -1) {
           const texts = leaves.map((el) => (el.textContent || "").trim());
-          m = matchCandidates([cand], texts);
+          m = matchCandidates([cand], texts, { containment: false });
         }
         if (m.targetIndex === -1) continue; // no results / no match → next (fast)
 
@@ -4005,10 +4181,10 @@ async function fillEngine(profile, defaults, jobContext) {
       }
     } else {
       for (const cand of candidates) {
-        // Level-1 leaf?
+        // Level-1 leaf? DIRECTED pick → NO containment (exact/typo only, else escalate → AI rescue).
         const l1leaves = scrapeRows().filter((el) => !isCategory(el));
         const l1texts = l1leaves.map((el) => el.textContent.trim());
-        const m = matchCandidates([cand], l1texts);
+        const m = matchCandidates([cand], l1texts, { containment: false });
         if (m.targetIndex !== -1) {
           await robustClick(l1leaves[m.targetIndex]);
           picked = l1texts[m.targetIndex]; matchTier = m.matchTier; break;
@@ -4021,7 +4197,7 @@ async function fillEngine(profile, defaults, jobContext) {
           await new Promise((r) => setTimeout(r, 150));
           const sub = scrapeRows().filter((el) => !isCategory(el));
           const subTexts = sub.map((el) => el.textContent.trim());
-          const sm = matchCandidates([cand], subTexts);
+          const sm = matchCandidates([cand], subTexts, { containment: false });
           if (sm.targetIndex !== -1) {
             await robustClick(sub[sm.targetIndex]);
             picked = subTexts[sm.targetIndex]; matchTier = sm.matchTier; found = true; break;
@@ -4874,8 +5050,8 @@ async function fillEngine(profile, defaults, jobContext) {
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,                 // human changed the effective value (set by the summary editor)
       edit_kind: null,                  // provenance for replay: override | filled_blank | cleared | null
-      is_approved: false,               // Plan 2: explicit human sign-off (flagged fields)
-      approved_at: null,
+      is_approved: !!rec.is_approved,   // Plan 2: explicit human sign-off; carried so a REFILL's replayed-approved fields stay approved (LOCKSTEP with fill-driver twin)
+      approved_at: rec.approved_at != null ? rec.approved_at : null,
       confidence,
       confidence_source,
       needs_review,

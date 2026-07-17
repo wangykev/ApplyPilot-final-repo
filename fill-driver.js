@@ -1147,7 +1147,9 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
   }
 
   const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
-  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts);
+  // DROPDOWN = select from a full list → NO containment (a substring match is a guess: "PA" must not
+  // silently become "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate to review. (2026-07-16)
+  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
   if (m.targetIndex === -1) {
     // CLOSE-CONFIRMED before returning: the open list OVERLAPS the next field, so a lingering
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
@@ -1642,7 +1644,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     const texts = s.pageWide.texts;
     lastFiltered = texts;
     step.filteredCount = s.pageWide.count;
-    const m = apMatch.matchCandidates([cand], texts);
+    // DIRECTED pick (Workday showed a LIST and did NOT autocommit) → NO containment: us clicking the one
+    // filtered option that merely CONTAINS what we typed is a self-made GUESS. Exact/typo only; else the
+    // candidate escalates (→ next candidate → the inline AI rescue for a required field, else review). The
+    // AUTOCOMMIT branch above KEEPS containment — there Workday itself resolved the input, which we trust.
+    const m = apMatch.matchCandidates([cand], texts, { containment: false });
     if (m.targetIndex !== -1) step.match = { targetIndex: m.targetIndex, matchTier: m.matchTier };
     if (m.targetIndex === -1) { step.note = "candidate not in its own filtered set"; continue; }
 
@@ -2352,11 +2358,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         } else if (!mappedPath) {
           record.status = "skipped";
           record.detail = "no mapping";
-        } else if (rawValue === null || rawValue === undefined || (typeof rawValue === "string" && rawValue.trim() === "")) {
-          record.status = "skipped";
-          record.detail = `empty value at ${mappedPath}`;
         } else {
-          const want = rawValue === true || /^(true|yes)$/i.test(String(rawValue));
+          // A MAPPED optional checkbox is reconciled to a DEFINITE boolean: true → check, everything
+          // else (false / null / unanswered / empty) → UNCHECK. A checkbox has no "unanswered" state on
+          // the form — "not affirmatively checked in the profile" means it should be UNCHECKED, so a form
+          // box left checked by the account or a prior run reconciles down. (2026-07-16: a null/empty
+          // value used to SKIP → the "I have a preferred name" box stayed checked and never unchecked.)
+          const want = rawValue === true || /^(true|yes|checked|1|on)$/i.test(String(rawValue == null ? "" : rawValue));
           record.resolved = want;
           Object.assign(record, await fillCheckboxCdp(act, loc, want, budgets));
         }
@@ -4963,8 +4971,8 @@ function buildReviewBundle(results, meta) {
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,
       edit_kind: null,
-      is_approved: false,                // Plan 2: explicit human sign-off (flagged fields); the viewer toggles it
-      approved_at: null,
+      is_approved: !!rec.is_approved,    // Plan 2: explicit human sign-off; carried so a REFILL's replayed-approved fields stay approved (viewer/refill set rec.is_approved)
+      approved_at: rec.approved_at != null ? rec.approved_at : null,
       page_number: m.pageNumber != null ? m.pageNumber : null, // the walk's 1..N ordinal (display order/caption); null = single-page/unknown
       page_label: m.pageLabel != null ? m.pageLabel : null,     // friendly caption ("Page N"); null → viewer derives from page_number/page key
       confidence,

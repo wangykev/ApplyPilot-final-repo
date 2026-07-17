@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, useEffect, createContext, useContext } from "react";
-import { X, ArrowUp, ArrowDown, Plus, ChevronDown, Paperclip, Upload } from "lucide-react";
+import { X, ArrowUp, ArrowDown, Plus, ChevronRight, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
+import { US_STATES, resolveUsState, isUnitedStates } from "@/lib/us-states";
 
 /**
  * Optional hook: when a provider supplies an opener, a FieldLabel given a
@@ -167,6 +168,75 @@ export function SelectField({
           </option>
         ))}
       </select>
+    </label>
+  );
+}
+
+/**
+ * State / region field. When the selected country is the United States it's a DROPDOWN of the fixed
+ * US-states list (`us-states.ts`) — the full names match Workday's `countryRegion` options so the
+ * extension EXACT-matches (containment is off for dropdowns now). Otherwise it's a free-text box
+ * (type your own region, or leave it blank). One stored `state_province` value regardless of country.
+ *
+ * Migration + safety: a legacy abbreviation / mis-cased value on a US profile auto-normalizes to the
+ * canonical full name ("PA" → "Pennsylvania"). If you typed a region first and then pick the US, a value
+ * that isn't a real US state shows a warning to pick again (and the dropdown falls back to "Choose…").
+ */
+export function StateProvinceField({
+  value,
+  country,
+  onChange,
+  bucketPath,
+}: {
+  value: string;
+  country: string[];
+  onChange: (v: string) => void;
+  bucketPath?: string;
+}) {
+  const us = isUnitedStates(country);
+  const resolved = resolveUsState(value);
+
+  // Auto-upgrade a US abbreviation / mis-cased value to the canonical full name so the fill exact-matches.
+  // Fires only when it actually differs (never loops — resolveUsState returns a canonical list member).
+  useEffect(() => {
+    if (us && resolved && resolved !== value) onChange(resolved);
+  }, [us, resolved, value, onChange]);
+
+  if (!us) {
+    return (
+      <label className="group block">
+        <FieldLabel bucketPath={bucketPath} bucketWidget="text">State / Province / Region</FieldLabel>
+        <input
+          value={value}
+          placeholder="Region (optional outside the US)"
+          onChange={(e) => onChange(e.target.value)}
+          className={clsx(inputCls, "mt-1.5")}
+        />
+      </label>
+    );
+  }
+
+  const invalid = !!value && !resolved; // a US value that isn't a real state (typed-first, then picked US)
+  return (
+    <label className="group block">
+      <FieldLabel bucketPath={bucketPath} bucketWidget="dropdown">State</FieldLabel>
+      <select
+        value={resolved ?? ""}
+        onChange={(e) => onChange(e.target.value)}
+        className={clsx(inputCls, "mt-1.5 appearance-none", invalid && "border-amber")}
+      >
+        <option value="">Choose a state…</option>
+        {US_STATES.map((s) => (
+          <option key={s} value={s} className="bg-panel">
+            {s}
+          </option>
+        ))}
+      </select>
+      {invalid && (
+        <p className="mt-1 text-[11px] text-amber">
+          &ldquo;{value}&rdquo; isn&apos;t a US state — pick your state from the list.
+        </p>
+      )}
     </label>
   );
 }
@@ -470,10 +540,14 @@ export function CandidateField({
           aria-label="More choices"
           className={clsx(
             "absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors",
-            extra > 0 ? "text-amber" : "text-ink-faint hover:text-amber"
+            // Amber "you have fallbacks" only for TEXT fields (degree / major / cert), where the extra
+            // candidates are USER-authored. A DROPDOWN pick auto-EXPANDS into a tiered array (US →
+            // 3 candidates), so `extra > 0` is always true there — that's not a signal, it's noise, so
+            // country / phone-code / citizenship stay neutral (grey → hover-amber) like degree.
+            extra > 0 && mode === "text" ? "text-amber/70" : "text-ink-faint hover:text-amber/70"
           )}
         >
-          <ChevronDown className="h-4 w-4" />
+          <ChevronRight className="h-4 w-4" />
         </button>
       </div>
       {open && <AdvancedChoices label={label} value={value} onChange={onChange} onClose={() => setOpen(false)} />}
@@ -640,21 +714,23 @@ export function CheckboxField({
   checked,
   onChange,
   hint,
+  bucketPath,
 }: {
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   hint?: string;
+  bucketPath?: string;
 }) {
   return (
-    <label className="flex cursor-pointer select-none items-center gap-2.5">
+    <label className="group flex cursor-pointer select-none items-center gap-2.5">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
         className="h-4 w-4 shrink-0 accent-amber"
       />
-      <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{label}</span>
+      <FieldLabel bucketPath={bucketPath} bucketWidget="checkbox">{label}</FieldLabel>
       {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
     </label>
   );
