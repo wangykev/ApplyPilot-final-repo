@@ -2342,11 +2342,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         } else if (!mappedPath) {
           record.status = "skipped";
           record.detail = "no mapping";
-        } else if (rawValue === null || rawValue === undefined || (typeof rawValue === "string" && rawValue.trim() === "")) {
-          record.status = "skipped";
-          record.detail = `empty value at ${mappedPath}`;
         } else {
-          const want = rawValue === true || /^(true|yes)$/i.test(String(rawValue));
+          // A MAPPED optional checkbox is reconciled to a DEFINITE boolean: true → check, everything
+          // else (false / null / unanswered / empty) → UNCHECK. A checkbox has no "unanswered" state on
+          // the form — "not affirmatively checked in the profile" means it should be UNCHECKED, so a form
+          // box left checked by the account or a prior run reconciles down. (2026-07-16: a null/empty
+          // value used to SKIP → the "I have a preferred name" box stayed checked and never unchecked.)
+          const want = rawValue === true || /^(true|yes|checked|1|on)$/i.test(String(rawValue == null ? "" : rawValue));
           record.resolved = want;
           Object.assign(record, await fillCheckboxCdp(act, loc, want, budgets));
         }

@@ -1231,17 +1231,24 @@ test("AI-3: a REQUIRED consent AUTO-CHECKS silently (filled, NOT flagged) even w
   assert.ok(!a1.log.concat(a2.log).some(([m]) => m === "llm"), "consents never involve the LLM");
 });
 
-test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it (reveals the preferred-name fields); false leaves it unchecked", async () => {
+test("FIELD_MAP: preferredCheck → has_preferred_name — true CHECKS it; false OR null/unanswered UNCHECKS it", async () => {
   const prefField = (flags) => Object.assign({ wrapperSel: "[w-pref]", fieldName: "preferredCheck", widgetType: "checkbox", isRequired: false, label: "I have a preferred name", inputId: "pc-1" }, flags || {});
   // has_preferred_name:true → the optional checkbox reconciles to CHECKED (which reveals the preferred first/last fields on the live page → the cascade re-scan then fills them once mapped).
   const onF = prefField({ checked: false });
   const onRec = (await drivePageFill(makeFakeAct([onF]), { personal_info: { has_preferred_name: true } }, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(onRec.status, "filled");
   assert.strictEqual(onF.checked, true, "mapped + true → box checked");
-  // has_preferred_name:false → reconciles to UNCHECKED (no reveal). Mapped, so not 'skipped: no mapping' anymore.
+  // has_preferred_name:false → reconciles to UNCHECKED (no reveal). Mapped, so not 'skipped: no mapping'.
   const offF = prefField({ checked: true });
   await drivePageFill(makeFakeAct([offF]), { personal_info: { has_preferred_name: false } }, {}, {}, T_BUDGETS);
   assert.strictEqual(offF.checked, false, "mapped + false → box unchecked");
+  // has_preferred_name UNANSWERED (null / never toggled) → STILL unchecks a pre-checked form box. A
+  // checkbox has no "unanswered" state on the form; the profile is authoritative. (2026-07-16 bug: a null
+  // value used to SKIP → a box left checked by the account / a prior run never unchecked.)
+  const nullF = prefField({ checked: true });
+  const nullRec = (await drivePageFill(makeFakeAct([nullF]), { personal_info: {} }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(nullF.checked, false, "mapped + null/unanswered → box unchecked (not skipped)");
+  assert.strictEqual(nullRec.status, "filled");
 });
 
 test("FIELD_MAP: revealed preferred-name fields fill DETERMINISTICALLY from the profile (mapped → no AI even though optional)", async () => {
