@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, refillReplayApprovedFlat, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, refillReplayApprovedFlat, refillApprovedRepeatingSections, refillMergeApprovedSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5937,6 +5937,34 @@ test("refillReplayApprovedFlat: an approved value the form no longer offers stay
   assert.strictEqual(out.kept, 1);
   assert.notStrictEqual(results[0].flag, "approved-kept", "a replay that didn't commit is never falsely marked kept");
   assert.strictEqual(results[0].status, "needs_review", "stays flagged so the human re-checks");
+});
+
+// ── REFILL (repeating): a section with ANY approval replays whole (same as submit) + un-flags approved ──
+test("refill repeating: only sections with an approved field are selected; the merge replays whole + un-flags approved", () => {
+  const pulled = [
+    { field_id: "P2::formField-workExperience[0].jobTitle", canonical_field: "workExperience[0].job_title", widget_type: "text", current_value: "Engineer", is_approved: true, needs_review: true, needs_review_reason: "x", flag: "audit-mismatch" },
+    { field_id: "P2::formField-workExperience[0].company", canonical_field: "workExperience[0].company", widget_type: "text", current_value: "Acme", is_approved: false, needs_review: true, needs_review_reason: "y", flag: "audit-mismatch" },
+    { field_id: "P2::formField-education[0].school", canonical_field: "education[0].school_or_university", widget_type: "text", current_value: "MIT", is_approved: false, needs_review: false },
+  ];
+  const secs = refillApprovedRepeatingSections(pulled);
+  assert.deepStrictEqual([...secs], ["workExperience"], "only a section with ≥1 approved field is replayed");
+
+  const fresh = { page: "P2", entries: [
+    { field_id: "P2::formField-workExperience[0].jobTitle", canonical_field: "workExperience[0].job_title", widget_type: "text", current_value: "STALE", needs_review: true },
+    { field_id: "P2::formField-workExperience[0].company", canonical_field: "workExperience[0].company", widget_type: "text", current_value: "STALE", needs_review: true },
+    { field_id: "P2::formField-education[0].school", canonical_field: "education[0].school_or_university", widget_type: "text", current_value: "MIT", needs_review: false },
+  ] };
+  const merged = refillMergeApprovedSections(fresh, pulled, secs);
+  const je = merged.entries.find((e) => e.canonical_field === "workExperience[0].job_title");
+  const ce = merged.entries.find((e) => e.canonical_field === "workExperience[0].company");
+  const ee = merged.entries.find((e) => e.canonical_field === "education[0].school_or_university");
+  assert.strictEqual(je.current_value, "Engineer", "approved section entry takes the reviewed value (not the stale fresh fill)");
+  assert.strictEqual(je.needs_review, false, "approved field un-flagged");
+  assert.strictEqual(je.flag, "approved-kept");
+  assert.strictEqual(ce.current_value, "Acme", "unapproved field in the approved section takes the reviewed value");
+  assert.strictEqual(ce.needs_review, true, "unapproved field keeps its flag");
+  assert.strictEqual(ee.current_value, "MIT", "a section with no approvals is left as the fresh fill");
+  assert.strictEqual(merged.needs_review_count, 1, "recomputed: only the unapproved company field remains flagged");
 });
 
 test("replayField: a CLEARED text entry leaves the field blank (verify-blank, no value typed)", async () => {

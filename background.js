@@ -1947,19 +1947,31 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   LOG(`audit: re-read ${(out.audit || []).length} filled field(s) post-settle —`, auditFlags.length ? `${auditFlags.length} FLAGGED (${auditFlags.map((r) => r.fieldName + ":" + r.flag).join(", ")})` : "all matched the report");
   await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
 
-  // REFILL: replay the human-APPROVED fields onto this page via the SAME primitive as the submit replay
-  // walk (refillReplayApprovedFlat → replayField), and un-flag them, so approved deterministic fields
-  // don't re-appear in the review. Unapproved fields keep the fresh fill above. Gated on
-  // opts.refillApproved (the pulled review bundle's approved entries). Flat fields here; repeating is a
-  // follow-on (replayRepeatingSections, same as the submit walk).
-  if (opts && Array.isArray(opts.refillApproved) && opts.refillApproved.length) {
-    const rr = await refillReplayApprovedFlat(act, out.results, opts.refillApproved, {});
+  // REFILL (flat): replay the human-APPROVED flat fields onto this page via the SAME primitive as the
+  // submit replay walk (refillReplayApprovedFlat → replayField) and un-flag them, so approved deterministic
+  // fields don't re-appear in the review. Unapproved fields keep the fresh fill above.
+  if (opts && Array.isArray(opts.refillEntries) && opts.refillEntries.length) {
+    const rr = await refillReplayApprovedFlat(act, out.results, opts.refillEntries, {});
     LOG(`refill: replayed ${rr.replayed} approved flat field(s) (un-flagged); ${rr.kept} approved value(s) no longer offered → kept flagged.`);
   }
 
   // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
-  const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
+  let bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
+
+  // REFILL (repeating): a section with ANY approved field is REPLAYED AS A WHOLE via the SAME
+  // replayRepeatingSections the submit walk uses, then merged into the bundle (approved entries un-flagged;
+  // the section shows its reviewed state). Runs at the entry level after the bundle build.
+  if (opts && Array.isArray(opts.refillEntries) && opts.refillEntries.length) {
+    const approvedSecs = refillApprovedRepeatingSections(opts.refillEntries);
+    if (approvedSecs.size) {
+      const secEntries = opts.refillEntries.filter((e) => { const m = /^([A-Za-z_]+)\s*\[/.exec(String((e && e.canonical_field) || "")); return m && approvedSecs.has(m[1]); });
+      try { await replayRepeatingSections(act, secEntries, {}); } catch (e) { LOG("refill: repeating replay error — " + String((e && e.message) || e)); }
+      bundle = refillMergeApprovedSections(bundle, opts.refillEntries, approvedSecs);
+      LOG(`refill: replayed ${approvedSecs.size} approved repeating section(s) [${[...approvedSecs].join(", ")}] — approved entries un-flagged.`);
+    }
+  }
+
   await persistAccumulated(bundle);
   return { out, bundle, auditFlags, pageKey };
 }
@@ -2860,8 +2872,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext, walkOpts) {
     if (refill) {
       await pullApprovedBundle(LOG);
       const pulled = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
-      refillEntries = (pulled && Array.isArray(pulled.entries)) ? pulled.entries.filter((e) => e && e.is_approved && !e.is_deleted) : [];
-      LOG(`REFILL — ${refillEntries.length} approved field(s) will be REPLAYED (same commit path as submit); everything else re-fills fresh from the profile.`);
+      refillEntries = (pulled && Array.isArray(pulled.entries)) ? pulled.entries.filter((e) => e && !e.is_deleted) : [];
+      const napproved = refillEntries.filter((e) => e.is_approved).length;
+      LOG(`REFILL — ${napproved} approved field(s) will be REPLAYED (same commit path as submit); everything else re-fills fresh from the profile.`);
     }
 
     // CLEAR the accumulated summary ONCE at walk START, OUTSIDE the loop (its own guard):
@@ -2901,7 +2914,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext, walkOpts) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, refillApproved: refillEntries });
+      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, refillEntries });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
       //    field does NOT reload (those go to review as usual). Each page accumulate-replaces, so the
