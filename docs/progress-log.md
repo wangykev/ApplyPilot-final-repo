@@ -567,3 +567,15 @@ fields (**all required fills keep the AI rescue** — operator rule). Tests: `te
 (containment ON default incl. the ≥3 short guard + autocommit case; OFF for dropdown/radio); the CDP
 directed-containment test updated to expect escalation; autocommit-containment tests unchanged. Extension
 suite **597/597**. Docs: CLAUDE.md → Matching strategy.
+
+## 2026-07-16 — Flatten checkbox fields to plain booleans (no "unanswered" state)
+
+Follow-up to the checkbox-fill fix: a checkbox has no "unanswered" state on a form, so the true
+checkbox-widget profile fields are now plain `boolean` (default `false`) instead of `triBool`
+(`true|false|null`) — `personal_info.has_preferred_name`, `work_experience[].currently_work_here`,
+`education[].currently_enrolled` (`web/lib/profile-schema.ts` new `bool` = preprocess→boolean, default
+false; `coerceProfile` migrates legacy `null`→`false`, verified null/absent→false). The editor's
+"Currently work here" switches from a Yes/No `TriBoolField` to a real `CheckboxField` (which gained
+`bucketPath` support). `triBool` stays for genuine yes/no QUESTIONS (`work_authorization.*`,
+`screening.*` — null=unanswered is meaningful) and `languages[].fluent` (null=auto-derive). Web
+typecheck + build green. Docs: WEBSITE.md boolean convention.

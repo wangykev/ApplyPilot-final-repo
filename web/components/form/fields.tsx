@@ -710,21 +710,23 @@ export function CheckboxField({
   checked,
   onChange,
   hint,
+  bucketPath,
 }: {
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   hint?: string;
+  bucketPath?: string;
 }) {
   return (
-    <label className="flex cursor-pointer select-none items-center gap-2.5">
+    <label className="group flex cursor-pointer select-none items-center gap-2.5">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
         className="h-4 w-4 shrink-0 accent-amber"
       />
-      <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">{label}</span>
+      <FieldLabel bucketPath={bucketPath} bucketWidget="checkbox">{label}</FieldLabel>
       {hint && <span className="text-[11px] text-ink-faint">{hint}</span>}
     </label>
   );

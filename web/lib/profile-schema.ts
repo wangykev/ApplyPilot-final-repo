@@ -12,8 +12,15 @@ import { z } from "zod";
  */
 
 const str = z.string().default("");
-/** tri-state boolean: true / false / null (unanswered) */
+/** tri-state boolean: true / false / null (unanswered). For genuine yes/no QUESTIONS (work
+ *  authorization, screening) where "unanswered" is meaningful — the tool leaves it blank rather
+ *  than guess — and for languages[].fluent (null = auto-derive from reading∧speaking∧writing). */
 const triBool = z.boolean().nullable().default(null);
+/** plain CHECKBOX boolean. A checkbox has no "unanswered" state on a form — it's checked or it isn't —
+ *  so absent / null / legacy values coerce to false. Migrates old triBool nulls → false. */
+const bool = z
+  .preprocess((v) => v === true || v === "true" || v === "yes" || v === "on" || v === 1, z.boolean())
+  .default(false);
 /** ordered candidate list, most-specific first */
 const tiered = z.array(z.string()).default([]);
 
@@ -32,14 +39,14 @@ export const educationSchema = z.object({
   from_year: str, // "YYYY"
   to_year: str, // "YYYY"
   graduation_date: str, // "YYYY-MM"
-  currently_enrolled: triBool,
+  currently_enrolled: bool, // checkbox
 });
 
 export const workExperienceSchema = z.object({
   job_title: str,
   company: str,
   location: str,
-  currently_work_here: triBool,
+  currently_work_here: bool, // checkbox
   from: str, // "YYYY-MM"
   to: str, // "YYYY-MM"
   role_description: str, // one textarea — how Workday renders the role description
@@ -90,7 +97,7 @@ export const personalInfoSchema = z
     first_name: str,
     last_name: str,
     preferred_name: str,
-    has_preferred_name: triBool,
+    has_preferred_name: bool, // checkbox — "I have a preferred name"
     preferred_first_name: str,
     preferred_last_name: str,
     email: str,

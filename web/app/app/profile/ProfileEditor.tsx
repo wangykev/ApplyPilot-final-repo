@@ -186,7 +186,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                 <TextField label="Job title" bucketPath={i === 0 ? "work_experience.0.job_title" : undefined} value={w.job_title} onChange={(v) => update((p) => { p.work_experience[i].job_title = v; })} />
                 <TextField label="Company" bucketPath={i === 0 ? "work_experience.0.company" : undefined} value={w.company} onChange={(v) => update((p) => { p.work_experience[i].company = v; })} />
                 <TextField label="Location" bucketPath={i === 0 ? "work_experience.0.location" : undefined} value={w.location} onChange={(v) => update((p) => { p.work_experience[i].location = v; })} />
-                <TriBoolField label="Currently work here" bucketPath={i === 0 ? "work_experience.0.currently_work_here" : undefined} value={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; })} />
+                <CheckboxField label="Currently work here" bucketPath={i === 0 ? "work_experience.0.currently_work_here" : undefined} checked={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; })} />
                 <DateField label="From" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.from" : undefined} value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
                 <DateField label="To" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.to" : undefined} value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
               </div>
