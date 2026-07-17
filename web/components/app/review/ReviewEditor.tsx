@@ -444,7 +444,11 @@ export function ReviewEditor({
       </div>
 
       {/* approval bar */}
-      <ApprovalBar approval={approval} onApproveAll={approveAll} />
+      <ApprovalBar
+        approval={approval}
+        onApproveAll={approveAll}
+        incomplete={!!(bundle.walk_status && !bundle.walk_status.completed)}
+      />
 
       {/* submit-blocked banner */}
       {blocked.length > 0 && (
@@ -1439,18 +1443,28 @@ function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
 function ApprovalBar({
   approval,
   onApproveAll,
+  incomplete,
 }: {
   approval: ReturnType<typeof approvalEnvelope>;
   onApproveAll: () => void;
+  incomplete?: boolean;
 }) {
+  const [refillClicked, setRefillClicked] = useState(false);
   const total = approval.to_approve_count;
   const done = approval.approved_count;
   const pct = total === 0 ? 100 : Math.round((done / total) * 100);
-  const note = approval.submit_ready
-    ? "Ready to submit — run “Replay + SUBMIT” in the extension; it pulls these approved values. (Real submit stays behind the eyes-on, disposable-app gate.)"
-    : approval.unreplaced_placeholders
-      ? `Replace ${approval.unreplaced_placeholders} AI placeholder${approval.unreplaced_placeholders > 1 ? "s" : ""} on the form, then approve the remaining flagged fields.`
-      : `Approve the ${approval.pending_count} remaining flagged field${approval.pending_count === 1 ? "" : "s"} to continue.`;
+  // When the fill DIDN'T reach the review page, the primary action is REFILL (not submit) — and it's
+  // NOT gated on approving everything: approve the fields that are correct, then refill. Otherwise the
+  // usual submit-readiness guidance.
+  const note = incomplete
+    ? refillClicked
+      ? "Approvals saved. On the Workday tab, open the extension and click “CDP REFILL” — your approved fields replay (the same commit as submit, so they won’t re-flag) and everything else re-fills fresh from your profile."
+      : "This fill stopped before the review page. Approve the fields that are already correct (optional), then Refill — approved fields replay and won’t re-flag; the rest re-fill fresh."
+    : approval.submit_ready
+      ? "Ready to submit — run “Replay + SUBMIT” in the extension; it pulls these approved values. (Real submit stays behind the eyes-on, disposable-app gate.)"
+      : approval.unreplaced_placeholders
+        ? `Replace ${approval.unreplaced_placeholders} AI placeholder${approval.unreplaced_placeholders > 1 ? "s" : ""} on the form, then approve the remaining flagged fields.`
+        : `Approve the ${approval.pending_count} remaining flagged field${approval.pending_count === 1 ? "" : "s"} to continue.`;
   return (
     <div className="bezel space-y-3 px-5 py-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1476,23 +1490,36 @@ function ApprovalBar({
           >
             Approve all reviewed
           </button>
-          <button
-            className={clsx(
-              "rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-              approval.submit_ready
-                ? "bg-verified/20 text-verified hover:bg-verified/30"
-                : "cursor-not-allowed bg-panel-raised text-ink-faint"
-            )}
-            disabled={!approval.submit_ready}
-            title={approval.submit_ready ? "Approved — submit from the extension" : note}
-          >
-            Approve &amp; continue to submit
-          </button>
+          {incomplete ? (
+            <button
+              className="rounded-md bg-amber/20 px-3 py-1.5 text-xs font-medium text-amber transition-colors hover:bg-amber/30"
+              onClick={() => setRefillClicked(true)}
+              title="Approvals are saved automatically — re-run the fill from the extension"
+            >
+              Refill
+            </button>
+          ) : (
+            <button
+              className={clsx(
+                "rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+                approval.submit_ready
+                  ? "bg-verified/20 text-verified hover:bg-verified/30"
+                  : "cursor-not-allowed bg-panel-raised text-ink-faint"
+              )}
+              disabled={!approval.submit_ready}
+              title={approval.submit_ready ? "Approved — submit from the extension" : note}
+            >
+              Approve &amp; continue to submit
+            </button>
+          )}
         </div>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-panel-raised">
         <div
-          className={clsx("h-full transition-all", approval.submit_ready ? "bg-verified" : "bg-amber")}
+          className={clsx(
+            "h-full transition-all",
+            incomplete ? "bg-amber" : approval.submit_ready ? "bg-verified" : "bg-amber"
+          )}
           style={{ width: pct + "%" }}
         />
       </div>
