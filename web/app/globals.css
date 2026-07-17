@@ -30,6 +30,29 @@
     outline-offset: 2px;
     border-radius: 2px;
   }
+
+  /* Cursor semantics: the deck is an app, not a document. Non-editable text
+     (questions, labels, headings) shows the default arrow — the text I-beam
+     ("typing caret") appears ONLY in fields you can actually type into.
+     `cursor` inherits, so we set the arrow on the body and restore the I-beam
+     on editable fields and the pointer on clickable controls. In @layer base,
+     so any explicit `cursor-*` utility class still wins. */
+  body {
+    cursor: default;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]):not([type="range"]):not([type="color"]),
+  textarea,
+  [contenteditable="true"],
+  [contenteditable=""] {
+    cursor: text;
+  }
+  a[href],
+  button:not(:disabled),
+  select,
+  summary,
+  [role="button"] {
+    cursor: pointer;
+  }
 }
 
 @layer components {
