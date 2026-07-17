@@ -540,7 +540,11 @@ export function CandidateField({
           aria-label="More choices"
           className={clsx(
             "absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors",
-            extra > 0 ? "text-amber/70" : "text-ink-faint hover:text-amber/70"
+            // Amber "you have fallbacks" only for TEXT fields (degree / major / cert), where the extra
+            // candidates are USER-authored. A DROPDOWN pick auto-EXPANDS into a tiered array (US →
+            // 3 candidates), so `extra > 0` is always true there — that's not a signal, it's noise, so
+            // country / phone-code / citizenship stay neutral (grey → hover-amber) like degree.
+            extra > 0 && mode === "text" ? "text-amber/70" : "text-ink-faint hover:text-amber/70"
           )}
         >
           <ChevronRight className="h-4 w-4" />
