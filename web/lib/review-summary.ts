@@ -86,6 +86,17 @@ export type ApprovalEnvelope = {
   submit_ready: boolean;
 };
 
+/** WHY a fill didn't reach the review page (stamped by the extension's runCdpWalk finally). Drives the
+ *  loud halt banner on the review page. `completed` = reached the review page (whole app filled). */
+export type WalkStatus = {
+  completed: boolean;
+  stopped_page?: number | null;
+  page_errors?: string[]; // Workday's top-of-page error text (e.g. "32312 is not a valid postal code…")
+  error_text?: string | null;
+  empty_fields?: { field: string; reason: string }[]; // required fields with no profile value
+  cancelled?: boolean; // operator cancelled the run mid-fill
+};
+
 export type ReviewBundle = {
   schema_version?: string;
   page?: string | null;
@@ -100,6 +111,7 @@ export type ReviewBundle = {
   by_type?: Record<string, number>;
   section_shapes?: Record<string, FieldShape[]> | null; // DOM-detected field sets, per section key
   approval?: ApprovalEnvelope | null; // viewer roll-up (kept in the bundle, persisted on write)
+  walk_status?: WalkStatus | null; // WHY the fill stopped (halt banner); absent on older bundles
   entries: ReviewEntry[];
 };
 

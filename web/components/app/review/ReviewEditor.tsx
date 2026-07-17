@@ -16,8 +16,9 @@
  * changed value into replay).
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import Link from "next/link";
 import { clsx } from "@/lib/clsx";
-import type { ReviewBundle, ReviewEntry, FieldShape } from "@/lib/review-summary";
+import type { ReviewBundle, ReviewEntry, FieldShape, WalkStatus } from "@/lib/review-summary";
 import {
   editKindOf,
   checkedOf,
@@ -395,6 +396,9 @@ export function ReviewEditor({
 
   return (
     <div className="space-y-6">
+      {/* halt banner — WHY the fill didn't reach the end (loud, top of page) */}
+      {bundle.walk_status && <WalkStatusBanner ws={bundle.walk_status} />}
+
       {/* header */}
       <div className="bezel flex flex-wrap items-center justify-between gap-4 px-5 py-4">
         <div className="min-w-0">
@@ -985,6 +989,10 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   // tree-AI (cert): searchable over the chosen category's leaves (partial)
   if (e.tree_structure && Array.isArray(e.tree_structure.leaves) && e.tree_structure.leaves.length)
     return <Combobox value={cur} options={e.tree_structure.leaves} onCommit={onCommit} />;
+  // RADIO with a small option set → segmented Yes/No-style buttons (the same look as the profile's
+  // toggles), which is how the field actually renders on the form. A large radio set falls back to a select.
+  if (wt === "radio" && e.options && e.options.length && e.options.length <= 4)
+    return <RadioButtons value={cur} options={e.options} onCommit={onCommit} />;
   if ((wt === "dropdown" || wt === "radio") && e.options && e.options.length)
     return <SelectBox value={cur} options={e.options} onCommit={onCommit} />;
   if (wt === "radio") return <TextBox value={cur} onCommit={onCommit} />;
@@ -1033,6 +1041,40 @@ function SelectBox({
         </option>
       ))}
     </select>
+  );
+}
+
+// Radio → segmented buttons (the profile's Yes/No toggle look). Reflects how the field renders on the
+// form; selecting commits that option. Used for small radio sets (yes/no + a few); larger sets → select.
+function RadioButtons({
+  value,
+  options,
+  onCommit,
+}: {
+  value: string | null | undefined;
+  options: string[];
+  onCommit: (v: string | null) => void;
+}) {
+  return (
+    <div className="flex flex-wrap overflow-hidden rounded-md border border-hairline">
+      {options.map((o, idx) => {
+        const active = norm(value) === norm(o);
+        return (
+          <button
+            key={o}
+            type="button"
+            onClick={() => onCommit(o)}
+            className={clsx(
+              "flex-1 whitespace-nowrap px-3 py-1.5 text-sm transition-colors",
+              idx > 0 && "border-l border-hairline",
+              active ? "bg-amber font-semibold text-cockpit" : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
+            )}
+          >
+            {o}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1337,6 +1379,59 @@ function ApproveToggle({ e, onToggle }: { e: ReviewEntry; onToggle: (on: boolean
         {e.is_approved ? "✓ Approved" : "Approve"}
       </button>
       {note && <div className="mt-1 max-w-[10rem] text-[10px] text-signal">{note}</div>}
+    </div>
+  );
+}
+
+// Loud halt banner — WHY a fill didn't reach the review page (error / empty-required / cancelled /
+// other) + the exact form errors + an edit-my-profile link. Only shows when the walk did NOT complete.
+function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
+  if (ws.completed) return null;
+  const errors = (ws.page_errors || []).filter(Boolean);
+  const empties = ws.empty_fields || [];
+  const pg = ws.stopped_page ?? "?";
+  const reason = ws.cancelled
+    ? "This fill was cancelled mid-run before reaching the review page."
+    : errors.length
+      ? `The form rejected a value on page ${pg}, so the fill couldn't continue.`
+      : empties.length
+        ? `Required fields on page ${pg} had no value in your profile, so the fill couldn't continue.`
+        : `The fill stopped on page ${pg} before reaching the review page.`;
+  return (
+    <div className="rounded-lg border border-signal/50 bg-signal/[0.07] px-5 py-4">
+      <div className="flex items-start gap-3">
+        <span aria-hidden className="text-lg leading-none">⛔</span>
+        <div className="min-w-0 flex-1 space-y-2.5">
+          <div className="font-display text-sm font-semibold text-signal">Fill didn&apos;t finish — needs your attention</div>
+          <p className="text-sm text-ink">{reason}</p>
+          {errors.length > 0 && (
+            <div className="space-y-1">
+              <div className="font-mono text-[10px] uppercase tracking-label text-ink-faint">Errors on the form</div>
+              <ul className="space-y-1">
+                {errors.map((er, i) => (
+                  <li
+                    key={i}
+                    className="rounded border border-signal/30 bg-cockpit px-2.5 py-1.5 font-mono text-[12px] leading-relaxed text-signal"
+                  >
+                    {er}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {empties.length > 0 && (
+            <p className="text-xs text-ink-dim">
+              Empty required field{empties.length > 1 ? "s" : ""}: {empties.map((f) => f.field).join(", ")}
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-3 pt-0.5">
+            <Link href="/app/profile" className="btn-ghost text-xs">
+              Edit my profile
+            </Link>
+            <span className="text-xs text-ink-faint">Fix the value on your profile, re-sync, then refill.</span>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

@@ -579,3 +579,25 @@ false; `coerceProfile` migrates legacy `null`→`false`, verified null/absent→
 `bucketPath` support). `triBool` stays for genuine yes/no QUESTIONS (`work_authorization.*`,
 `screening.*` — null=unanswered is meaningful) and `languages[].fluent` (null=auto-derive). Web
 typecheck + build green. Docs: WEBSITE.md boolean convention.
+
+## 2026-07-16 — Halt reason + form errors on the review page; yes/no radios as buttons
+
+Two review-page improvements requested after a live fill halted on a bad postal code
+("32312 is not a valid postal code for Pennsylvania"):
+
+**Halt surfacing (why a fill didn't reach the end).** `runCdpWalk` now stamps a `walk_status`
+onto the accumulated bundle in its finally — `{completed, stopped_page, page_errors[], error_text,
+empty_fields[], cancelled}` — captured via closure vars (reachedReview / walkPage / lastDiag from
+reportPageErrors) with no change to the walk's return sites. It's reported to the website with the
+bundle. `ReviewEditor` renders a LOUD red `WalkStatusBanner` at the top when `!completed`: the reason
+(form error / empty required / operator-cancelled / other), the exact Workday error text verbatim, any
+empty required fields, and an **"Edit my profile"** link (→ `/app/profile`). `WalkStatus` added to the
+bundle type; the report/save paths carry it unchanged (stored in `review_bundle_json`).
+
+**Radio yes/no → buttons.** A radio field with ≤4 options now renders as segmented Yes/No-style
+buttons in the review editor (the profile's toggle look, matching how the field is on the form) instead
+of a `<select>`; larger radio sets still use a select. New `RadioButtons` editor.
+
+Extension suite 597/597; web typecheck + build green. Refill button + edit-preserving refill (so
+approved deterministic fields don't re-review after a refill) proposed next — needs the
+website↔extension refill-trigger decision.

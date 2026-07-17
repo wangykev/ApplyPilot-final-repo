@@ -2776,6 +2776,11 @@ const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks ar
 async function runCdpWalk(tabId, profile, defaults, jobContext) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-WALK]", ...a);
 
+  // Walk-status capture for the website review page (WHY a fill didn't reach the end): the review
+  // terminal sets reachedReview, the loop tracks walkPage, reportPageErrors stashes lastDiag. Stamped
+  // onto the bundle in the finally + reported → the website renders a loud halt banner + edit-profile link.
+  let reachedReview = false, walkPage = 0, lastDiag = null;
+
   // M31.1: surface the EXACT page error text + the fields left EMPTY (no profile value —
   // the likely "required" validation cause) on a stop-with-errors. Takes the CURRENT page's
   // results (per-page in the loop). Reads error state FRESH (errors render post Save & Continue).
@@ -2803,7 +2808,8 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
       empties.forEach((r) => LOG(`    • ${r.fieldName} — ${r.detail}`));
     }
-    return { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+    lastDiag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+    return lastDiag;
   };
 
   try {
@@ -2829,6 +2835,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1 (the bundle clear stays ABOVE, once per run)
     pagesFilled = []; // reset per attempt
     for (let page = 1; page <= WALK_MAX_PAGES; page++) {
+      walkPage = page;
       // ── (a/b) TOP-OF-ITERATION guards: session-death + the REVIEW terminal (SUBMIT-NEVER —
       // checked BEFORE any fill/click, so we never fill or advance the review page). ──
       let nav = null;
@@ -2843,6 +2850,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         return { ok: true, stopped: "session-expired", session_expired: true, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
       if (nav && nav.applyFlowReviewPresent) {
+        reachedReview = true;
         LOG(`✓✓ reached the REVIEW page after ${pagesFilled.length} page(s) — the whole application is filled. NOT submitting (terminal). "View last summary" for the accumulated bundle.`);
         return { ok: true, stopped: "reached-review", reached_review: true, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
@@ -2958,12 +2966,25 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     await removeInputLock(); // BEFORE detach (needs the attach) — never strand the operator behind the lock
     await cdpDetach();
     // Push the ACCUMULATED review bundle to the website (the review surface) on EVERY exit —
-    // reached-review, a mid-walk halt, or an abort — so the operator reviews what got filled on
-    // the site. Fire-and-forget; a no-op if the website isn't connected (no apSession). The
-    // single-page fill (runCdpFillPage) already reports; the walk did not until now.
+    // reached-review, a mid-walk halt, or an abort — STAMPED with a walk_status so the review page can
+    // say WHY the fill didn't reach the end (halted-on-error / session-expired / cancelled / completed),
+    // surface the exact page errors, and offer an edit-profile link. Fire-and-forget; no-op if the
+    // website isn't connected (no apSession).
     try {
-      const { reviewSummary } = await new Promise((r) => chrome.storage.local.get("reviewSummary", r));
-      if (reviewSummary) await reportApplication(reviewSummary, jobContext);
+      const store = await new Promise((r) => chrome.storage.local.get(["reviewSummary", "lastRunAbort"], r));
+      const reviewSummary = store.reviewSummary;
+      if (reviewSummary) {
+        reviewSummary.walk_status = {
+          completed: reachedReview,               // reached the review page = the whole app got filled
+          stopped_page: walkPage || null,         // the page the walk was on when it ended
+          page_errors: (lastDiag && lastDiag.page_errors) || [],       // Workday's top-of-page error text
+          error_text: (lastDiag && lastDiag.error_page_text) || null,
+          empty_fields: (lastDiag && lastDiag.empty_fields) || [],     // required fields with no profile value
+          cancelled: !!(store.lastRunAbort && store.lastRunAbort.reason === "operator-cancelled"),
+        };
+        await new Promise((r) => chrome.storage.local.set({ reviewSummary }, r));
+        await reportApplication(reviewSummary, jobContext);
+      }
     } catch (e) { /* reporting NEVER affects the walk result */ }
   }
 }
