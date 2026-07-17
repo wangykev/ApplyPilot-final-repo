@@ -11,6 +11,7 @@ import {
   CandidateField,
   DateField,
   CheckboxField,
+  StateProvinceField,
   FieldLabel,
   FileField,
   BucketLabelContext,
@@ -128,7 +129,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TextField label="Address line 1" bucketPath="personal_info.address_line_1" value={pi.address_line_1} onChange={(v) => update((p) => { p.personal_info.address_line_1 = v; })} />
           <TextField label="Address line 2" bucketPath="personal_info.address_line_2" value={pi.address_line_2} onChange={(v) => update((p) => { p.personal_info.address_line_2 = v; })} />
           <TextField label="City" bucketPath="personal_info.city" value={pi.city} onChange={(v) => update((p) => { p.personal_info.city = v; })} />
-          <TextField label="State / Province" bucketPath="personal_info.state_province" value={pi.state_province} onChange={(v) => update((p) => { p.personal_info.state_province = v; })} />
+          <StateProvinceField country={pi.country} bucketPath="personal_info.state_province" value={pi.state_province} onChange={(v) => update((p) => { p.personal_info.state_province = v; })} />
           <TextField label="Postal code" bucketPath="personal_info.postal_code" value={pi.postal_code} onChange={(v) => update((p) => { p.personal_info.postal_code = v; })} />
         </div>
         <div className="mt-4">
