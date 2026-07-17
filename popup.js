@@ -139,6 +139,21 @@ document.getElementById("cdp-walk").addEventListener("click", () => {
   });
 });
 
+// CDP REFILL: re-run the fill after fixing a halt (e.g. a bad postal code) + approving the good fields on
+// the website. Pulls the website-approved bundle → REPLAYS approved fields (same commit path as submit,
+// so they don't re-flag) + re-fills everything else fresh. Same guarded walk, NEVER submits.
+document.getElementById("cdp-refill").addEventListener("click", () => {
+  setStatus("CDP refill: pulling your website approvals → replaying approved fields + re-filling the rest → to REVIEW (never submits). Keep the tab VISIBLE. See [CDP-WALK].");
+  chrome.runtime.sendMessage({ type: "RUN_CDP_REFILL" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    if (resp.ok === false && resp.error === "no-profile") setStatus('No profile in storage — click "Load default profile" first.');
+    else if (resp.ok === false) setStatus("CDP refill failed: " + resp.error + " — see the service worker console.");
+    else if (resp.reached_review) setStatus(`✓ Refill reached REVIEW — ${resp.pages_filled} page(s), NOT submitted. Approved fields were replayed. "View last summary". See [CDP-WALK].`);
+    else if (resp.session_expired) setStatus(`⚠ SESSION EXPIRED during refill after ${resp.pages_filled} page(s). See [CDP-WALK].`);
+    else setStatus(`Refill stopped — ${resp.stopped} (${resp.pages_filled != null ? resp.pages_filled : "?"} page(s)). See [CDP-WALK].`);
+  });
+});
+
 // M3 SUBMIT replay (DRY): replay the SAVED approved review-summary bundle onto the current page
 // (flat + repeating), NO Next/Submit. Load the same page you filled (fresh). [CDP-REPLAY].
 document.getElementById("cdp-replay-page").addEventListener("click", () => {

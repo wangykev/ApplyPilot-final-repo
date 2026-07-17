@@ -331,6 +331,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // CDP REFILL: re-run the fill after a halt (e.g. you fixed a bad postal code + approved the good fields
+  // on the website review page). Pulls the website-APPROVED bundle and REPLAYS approved fields (same commit
+  // path as the submit walk) so they don't re-flag; everything else re-fills fresh from the profile. Same
+  // guarded per-page walk, NEVER submits. [CDP-WALK] in the SW console.
+  if (message.type === "RUN_CDP_REFILL") {
+    chrome.storage.local.get(["profile", "defaults", "jobContext"], ({ profile, defaults, jobContext }) => {
+      if (!profile) {
+        console.log('[ApplyPilot][CDP-WALK] No profile in storage — click "Load default profile" first.');
+        sendResponse({ ok: false, error: "no-profile" });
+        return;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs[0];
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const out = await runCdpWalk(tab.id, profile, defaults || {}, jobContext || {}, { refill: true });
+        sendResponse(out);
+      });
+    });
+    return true; // async sendResponse
+  }
+
   // RUN_FILL = single page (the proven path, untouched). RUN_WALK = M15 two-page
   // walk (fill → Next → re-inject → fill, hard cap 2). Both share the same storage
   // read + active-tab lookup; they diverge on what they do with the tab.
@@ -1926,6 +1947,16 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   LOG(`audit: re-read ${(out.audit || []).length} filled field(s) post-settle —`, auditFlags.length ? `${auditFlags.length} FLAGGED (${auditFlags.map((r) => r.fieldName + ":" + r.flag).join(", ")})` : "all matched the report");
   await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
 
+  // REFILL: replay the human-APPROVED fields onto this page via the SAME primitive as the submit replay
+  // walk (refillReplayApprovedFlat → replayField), and un-flag them, so approved deterministic fields
+  // don't re-appear in the review. Unapproved fields keep the fresh fill above. Gated on
+  // opts.refillApproved (the pulled review bundle's approved entries). Flat fields here; repeating is a
+  // follow-on (replayRepeatingSections, same as the submit walk).
+  if (opts && Array.isArray(opts.refillApproved) && opts.refillApproved.length) {
+    const rr = await refillReplayApprovedFlat(act, out.results, opts.refillApproved, {});
+    LOG(`refill: replayed ${rr.replayed} approved flat field(s) (un-flagged); ${rr.kept} approved value(s) no longer offered → kept flagged.`);
+  }
+
   // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
   const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
@@ -2773,8 +2804,10 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
 
 const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks are the REAL stops — this only bounds a detection bug from looping forever.
 
-async function runCdpWalk(tabId, profile, defaults, jobContext) {
+async function runCdpWalk(tabId, profile, defaults, jobContext, walkOpts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-WALK]", ...a);
+  const refill = !!(walkOpts && walkOpts.refill); // REFILL: replay the website-approved fields; the rest re-fill fresh
+  let refillEntries = null;
 
   // Walk-status capture for the website review page (WHY a fill didn't reach the end): the review
   // terminal sets reachedReview, the loop tracks walkPage, reportPageErrors stashes lastDiag. Stamped
@@ -2821,6 +2854,16 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
     LOG("note: orphan EMPTY cert Specialties are auto-reconciled during the cert fill (deleted when the profile has none) — no manual pre-clean needed; a blocked page also gets an AI-4 Tier-1.5 section re-fill.");
 
+    // REFILL: pull the website-APPROVED bundle FIRST (before the clear wipes it) and capture the approved
+    // entries — each page's fill then replays them (same commit path as the submit walk) + un-flags them,
+    // while everything else re-fills fresh from the (now-fixed) profile. No-op if the site isn't connected.
+    if (refill) {
+      await pullApprovedBundle(LOG);
+      const pulled = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
+      refillEntries = (pulled && Array.isArray(pulled.entries)) ? pulled.entries.filter((e) => e && e.is_approved && !e.is_deleted) : [];
+      LOG(`REFILL — ${refillEntries.length} approved field(s) will be REPLAYED (same commit path as submit); everything else re-fills fresh from the profile.`);
+    }
+
     // CLEAR the accumulated summary ONCE at walk START, OUTSIDE the loop (its own guard):
     // a fresh application starts clean. The loop only calls the ACCUMULATING persist — a
     // mid-walk clear (from re-entry) would wipe the pages already filled.
@@ -2858,7 +2901,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
-      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
+      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, refillApproved: refillEntries });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
       //    field does NOT reload (those go to review as usual). Each page accumulate-replaces, so the
@@ -4981,8 +5024,8 @@ async function fillEngine(profile, defaults, jobContext) {
       original_ai_value: current_value, // the bot's pick at write time — never changed by edits
       is_edited: false,                 // human changed the effective value (set by the summary editor)
       edit_kind: null,                  // provenance for replay: override | filled_blank | cleared | null
-      is_approved: false,               // Plan 2: explicit human sign-off (flagged fields)
-      approved_at: null,
+      is_approved: !!rec.is_approved,   // Plan 2: explicit human sign-off; carried so a REFILL's replayed-approved fields stay approved (LOCKSTEP with fill-driver twin)
+      approved_at: rec.approved_at != null ? rec.approved_at : null,
       confidence,
       confidence_source,
       needs_review,

@@ -63,6 +63,8 @@
          page — use a DISPOSABLE application. Keep the tab VISIBLE to watch it reach review
          and stop. [CDP-WALK] in the service-worker console. -->
     <button id="cdp-walk">CDP WALK to review (fills all pages; never submits)</button>
+    <!-- REFILL after a halt: pull website approvals → replay approved fields (same as submit) + re-fill the rest. -->
+    <button id="cdp-refill">CDP REFILL (replay approved + re-fill the rest; never submits)</button>
     <!-- M3 SUBMIT REPLAY (DRY): replays the SAVED approved review-summary bundle onto THIS live
          page — flat fields + repeating sections, NO Next, NO Submit. Load the same page you filled
          (fresh), keep it VISIBLE. Uses the bundle, not the profile. [CDP-REPLAY] in the SW console. -->

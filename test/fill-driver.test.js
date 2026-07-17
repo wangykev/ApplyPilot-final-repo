@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, refillReplayApprovedFlat, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5897,6 +5897,46 @@ test("replayField (STRICT): an approved value with NO live match → needs_revie
   const act = makeFakeAct([f]);
   const r = await replayField(act, { field_id: "P1::formField-country", canonical_field: "personal_info.country", widget_type: "dropdown", current_value: "Atlantis", edit_kind: null }, T_BUDGETS);
   assert.strictEqual(r.status, "needs_review", "a value the live form no longer offers HALTS this field");
+});
+
+// ── REFILL (flat): approved fields replay (SAME as the submit walk) + drop out of the flag list ──
+test("refillReplayApprovedFlat: an approved flat field replays + un-flags; an unapproved field is untouched", async () => {
+  const zip = { wrapperSel: '[data-automation-id="formField-postalCode"]', fieldName: "postalCode", widgetType: "text", value: "" };
+  const first = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Kevin" };
+  const act = makeFakeAct([zip, first]);
+  const results = [
+    { fieldName: "postalCode", widgetType: "text", status: "needs_review", flag: "audit-mismatch", after: null, isRequired: true },
+    { fieldName: "legalName--firstName", widgetType: "text", status: "filled", flag: null, after: "Kevin" },
+  ];
+  const approved = [
+    { field_id: "P1::formField-postalCode", canonical_field: "personal_info.postal_code", widget_type: "text", current_value: "15213", is_approved: true, approved_at: "t" },
+  ];
+  const out = await refillReplayApprovedFlat(act, results, approved, T_BUDGETS);
+  assert.strictEqual(out.replayed, 1);
+  assert.strictEqual(results[0].status, "filled");
+  assert.strictEqual(results[0].flag, "approved-kept");
+  assert.strictEqual(results[0].is_approved, true);
+  assert.strictEqual(results[0].after, "15213");
+  assert.strictEqual(zip.value, "15213", "the approved value was actually replayed onto the form (same path as submit)");
+  assert.strictEqual(results[1].flag, null, "an unapproved field keeps its fresh fill, untouched");
+  assert.strictEqual(results[1].is_approved, undefined);
+  // buildReviewBundle then yields needs_review:false for the approved (filled + non-ai flag) record:
+  const bundle = buildReviewBundle(results, { page: "P1" });
+  const ze = bundle.entries.find((e) => e.field_id.endsWith("formField-postalCode"));
+  assert.strictEqual(ze.needs_review, false, "approved → not flagged in the new review");
+  assert.strictEqual(ze.is_approved, true, "approval carried onto the entry");
+});
+
+test("refillReplayApprovedFlat: an approved value the form no longer offers stays FLAGGED (no false 'kept')", async () => {
+  const country = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }] };
+  const act = makeFakeAct([country]);
+  const results = [{ fieldName: "country", widgetType: "dropdown", status: "needs_review", flag: "audit-mismatch", after: null, isRequired: true }];
+  const approved = [{ field_id: "P1::formField-country", canonical_field: "personal_info.country", widget_type: "dropdown", current_value: "Atlantis", is_approved: true }];
+  const out = await refillReplayApprovedFlat(act, results, approved, T_BUDGETS);
+  assert.strictEqual(out.replayed, 0);
+  assert.strictEqual(out.kept, 1);
+  assert.notStrictEqual(results[0].flag, "approved-kept", "a replay that didn't commit is never falsely marked kept");
+  assert.strictEqual(results[0].status, "needs_review", "stays flagged so the human re-checks");
 });
 
 test("replayField: a CLEARED text entry leaves the field blank (verify-blank, no value typed)", async () => {
