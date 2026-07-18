@@ -1357,34 +1357,35 @@ const aiFillRadio = async (act, loc, f, profile, jobContext, budgets) => {
   if (!opts || opts.length === 0) return { status: "needs_review", after: null, flag: "ai-no-options", detail: "AI radio fallback: no radio inputs found (not actuated)", auditLoc: loc.wrapperSel };
   const optionLabels = opts.map((o) => o.labelText).filter(Boolean);
   const sensitive = legallyLoaded(f.label) || f.fieldName === "candidateIsPreviousWorker";
-  const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, whether they PREVIOUSLY WORKED at a company from their employment history, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"company not in employment history\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low.";
+  const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, whether they PREVIOUSLY WORKED at a company from their employment history, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"company not in employment history\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low. ALSO map this question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const user = "Question: " + String(f.label || "")
     + "\nAnswer options (choose exactly one; reply with its EXACT text): " + JSON.stringify(optionLabels)
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
-    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\"}";
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}";
   const res = await act.llm({ system, user, maxTokens: 512 });
   if (!res || !res.ok) return { status: "needs_review", after: null, flag: "ai-call-failed", detail: "AI call failed — " + ((res && res.error) || "no reply"), options: optionLabels, auditLoc: loc.wrapperSel };
   const ai = parseAiReply(res.text);
   const conf = ai.confidence;
+  const hint = { maps_to: ai.maps_to || "", suggested_category: ai.suggested_category || "" }; // piggyback for the teach flow
   // The AI's choice is a CANDIDATE — clear the match ladder vs the live labels. A paraphrase / refusal
   // won't match → needs_review (never blind-commit arbitrary text onto a truthfulness-adjacent field).
   const m = ai.choice ? apMatch.matchCandidates([ai.choice], optionLabels) : { targetIndex: -1, matchTier: null };
   if (m.targetIndex === -1) {
-    return { status: "needs_review", after: null, flag: "ai-nomatch", confidence: conf,
+    return { status: "needs_review", after: null, flag: "ai-nomatch", confidence: conf, ...hint,
       detail: "AI chose \"" + ai.choice + "\" — not one of the options" + (ai.justification ? " (" + ai.justification + ")" : ""),
       options: optionLabels, auditLoc: loc.wrapperSel };
   }
   const target = optionLabels[m.targetIndex];
   const hr = await fillRadioCdp(act, loc, [target], budgets); // proven commit: label-click → focus+Space → read-back verify
   if (!hr || hr.status !== "filled") {
-    return { status: "needs_review", after: (hr && hr.after != null) ? hr.after : null, flag: "ai-commit-failed", confidence: conf,
+    return { status: "needs_review", after: (hr && hr.after != null) ? hr.after : null, flag: "ai-commit-failed", confidence: conf, ...hint,
       detail: "AI chose \"" + target + "\" but the radio did not commit (" + ((hr && hr.detail) || "no result") + ")",
       options: optionLabels, auditLoc: loc.wrapperSel };
   }
   // ALWAYS filled_review — an AI guess is never silently trusted; the human review gate is the safety.
   return { status: "filled_review", after: hr.after, verified: true, matchTier: m.matchTier,
-    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf,
+    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf, ...hint,
     detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + hr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
     options: optionLabels, auditLoc: loc.wrapperSel };
 };

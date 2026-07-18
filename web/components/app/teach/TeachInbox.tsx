@@ -131,8 +131,8 @@ export function TeachInbox({
           )}
         </div>
 
-        {/* maps_to suggestion */}
-        {card.maps_to && (
+        {/* AI routing hint (the maps_to piggyback) — or, when the AI found no field, a "new answer" nudge */}
+        {card.maps_to ? (
           <div className="mt-4 rounded-lg border border-amber/30 bg-amber/5 px-3 py-2.5">
             <p className="text-xs text-ink-dim">
               AI thinks this is your <span className="font-medium text-ink">{pathLabel(card.maps_to)}</span>
@@ -155,6 +155,13 @@ export function TeachInbox({
                 Your answer differs from that field — save it as a new answer below, or skip if it&apos;s a typo.
               </p>
             )}
+          </div>
+        ) : (
+          <div className="mt-4 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
+            <p className="text-xs text-ink-dim">
+              AI didn&apos;t find a matching field in your profile — this looks like a{" "}
+              <span className="font-medium text-ink">new answer</span>. Save it below, or add it to an existing one.
+            </p>
           </div>
         )}
 

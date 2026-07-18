@@ -4,7 +4,7 @@
   "private": true,
   "description": "ApplyPilot Chrome extension — dev tooling (tests). The extension itself has no build step; this exists only to run unit tests for testable-without-a-page logic (e.g. the IndexedDB storage helpers).",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.0.0"
