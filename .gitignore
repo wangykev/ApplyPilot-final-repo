@@ -19,3 +19,7 @@ secrets/
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# Claude Code worktrees live OUTSIDE this repo (see .claude/settings.local.json
+# WorktreeCreate hook). Never track worktree contents — build output, deps, copies.
+.claude/worktrees/
