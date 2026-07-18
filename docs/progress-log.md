@@ -628,3 +628,37 @@ Model: FILL/WALK = fresh (a re-run overwrites); **REFILL = preserve-approved** (
 mechanism, replayed). +3 unit tests (600 total). Extension suite 600/600; web typecheck + build green.
 Follow-up: skip fresh-filling approved sections (avoid the double-fill) is an optimization, not needed
 for correctness (the replay reconciles over the fresh fill).
+
+## 2026-07-18 — Answer buckets CHANGEABLE + the /app/teach flow (Buckets M1–M9)
+
+Make answer buckets editable and close the learning loop: approved answers that didn't fill
+deterministically become teaching cards that get filed into buckets, so they fill deterministically
+(no review) next time. Built off the web-review migration (the website is the primary review surface).
+
+- **M1 — schema:** bucket `value` → a **candidate list** (`string[]`; text→value[0], choice→match ladder,
+  like a tiered dropdown across tenants) + a `category`; `coerceBuckets` upgrades legacy strings;
+  `fillFromBucket` (extension) consumes the list (legacy string tolerated). LOCKSTEP web ↔ extension.
+- **M2 — Mode-B management:** an "Other remembered answers" section in `ProfileEditor` — create/edit/delete
+  standalone buckets (wordings, candidate-list answer, field type, category, sensitive).
+- **M3 — coverage:** no-op (every flat bucket-eligible field already had a clickable label).
+- **M4 — piggyback:** `aiFillField`/`aiFillText`/`aiFillRadio` return `maps_to`+`suggested_category` in the
+  SAME fill call → ride the review bundle → the teach page needs no 2nd LLM call for AI-filled questions.
+- **M5 — `/app/teach`:** reads APPROVED review data from `applications.review_bundle_json`; a flashcard
+  queue. `web/lib/teach.ts` (pure) + server page + `TeachInbox`.
+- **M6 — persistent skip:** `profiles.teach_dismissed_json` (migration `0004`) — a skipped card never
+  reappears.
+- **M7 — web test harness:** `tsx --test` (resolves `@/` aliases + strips types) + `test/teach.test.ts`
+  (the web had no test runner before).
+- **M8 — split-screen + broaden:** the profile is **physically displayed on the left** (`ProfilePanel`,
+  `flattenProfileFields`), the recommended field highlighted, clicking a field files the wording under it;
+  the queue broadened to EVERY non-deterministic (`needs_review`) approved fill; an **AI recommendation on
+  every card** — a teach-time fallback (`recommendField` → `callLLM` with the user's `ai_config`) for cards
+  with no stamped hint.
+- **M9 — recommendation precedence:** `canonical_field` (the mapped home — free/exact) → fill-time `maps_to`
+  → LLM fallback (fires only when nothing known). A fuzzy/containment match on a known field shows a
+  "possible typo/variant — verify" note instead of an LLM guess.
+
+Verified: extension `npm test` **604**; web `tsx --test` **15**, `tsc --noEmit` + `next build` clean. Merged
+to main. Remaining: end-to-end live-verify on a real Workday page (fill → approve on review → teach → re-fill
+deterministic); apply migration `0004` to Supabase; the fill-time typeahead-AI piggyback (covered by the
+teach-time fallback for now).

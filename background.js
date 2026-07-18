@@ -5060,6 +5060,8 @@ async function fillEngine(profile, defaults, jobContext) {
       fill_error: rec.status === "error" ? (rec.detail || null) : null,
       detail: rec.detail != null ? rec.detail : null,
       match_tier: rec.matchTier != null ? rec.matchTier : null,
+      maps_to: rec.maps_to != null ? rec.maps_to : null,                                 // Profile Learning piggyback (LOCKSTEP ↔ fill-driver buildReviewBundle; page engine has no AI piggyback → usually null)
+      suggested_category: rec.suggested_category != null ? rec.suggested_category : null,
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       character_count: null // reserved for textareas

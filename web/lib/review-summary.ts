@@ -66,6 +66,11 @@ export type ReviewEntry = {
   added_at?: string | null;
   cascade_revealed?: boolean; // appeared only after another value committed → force review
 
+  // Profile Learning piggyback (Buckets M4): the fill AI's routing hints the teach flow reads —
+  // maps_to = the profile field this question maps to ("" = none), suggested_category = a bucket group.
+  maps_to?: string | null;
+  suggested_category?: string | null;
+
   // ── repeating / nested section metadata (grouping + add-entry) ──
   section_heading?: string | null; // real DOM heading for an unknown section
   section_field_shape?: FieldShape[] | null; // shape stub for an empty section / nested sub-section
