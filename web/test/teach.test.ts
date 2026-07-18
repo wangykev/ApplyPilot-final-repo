@@ -10,6 +10,8 @@ import {
   ensureModeABucket,
   createModeBBucket,
   bucketLabel,
+  humanize,
+  flattenProfileFields,
   type TeachSource,
 } from "@/lib/teach";
 import type { Bucket } from "@/lib/buckets";
@@ -19,7 +21,7 @@ const bucket = (over: Partial<Bucket>): Bucket => ({
   id: "b", profile_path: "", value: [], category: "", widget_hint: "text", sensitive: false, questions: [], selectors: {}, ...over,
 });
 const entry = (over: Partial<ReviewEntry>): ReviewEntry => ({
-  field_id: "f", question_label: "Q?", widget_type: "dropdown", flag: "ai-choice", is_approved: true, current_value: "Yes", ...over,
+  field_id: "f", question_label: "Q?", widget_type: "dropdown", flag: "ai-choice", needs_review: true, is_approved: true, current_value: "Yes", ...over,
 });
 const bundle = (entries: ReviewEntry[]): ReviewBundle => ({ entries });
 const src = (id: string, entries: ReviewEntry[], company?: string): TeachSource => ({ id, company: company ?? null, bundle: bundle(entries) });
@@ -63,14 +65,15 @@ test("teachableCards: an approved AI answer becomes a card with the maps_to hint
   assert.equal(cards[0].sensitive, true); // eeo flag → sensitive
 });
 
-test("teachableCards: excludes non-approved / non-AI / essay / empty / already-covered / dismissed; dedups across apps", () => {
-  const mk = (over: Partial<ReviewEntry>) => entry({ question_label: "Reliable transport?", widget_type: "radio", flag: "ai-choice", is_approved: true, current_value: "Yes", ...over });
+test("teachableCards: excludes non-approved / deterministic / essay / empty / already-covered / dismissed; includes any REVIEWED field (not only AI); dedups", () => {
+  const mk = (over: Partial<ReviewEntry>) => entry({ question_label: "Reliable transport?", widget_type: "radio", current_value: "Yes", ...over });
   assert.equal(teachableCards([src("a", [mk({ is_approved: false })])], [], {}).length, 0, "not approved");
-  assert.equal(teachableCards([src("a", [mk({ flag: "bucket" })])], [], {}).length, 0, "deterministic (non-AI)");
+  assert.equal(teachableCards([src("a", [mk({ needs_review: false })])], [], {}).length, 0, "filled deterministically (no review)");
   assert.equal(teachableCards([src("a", [mk({ widget_type: "textarea" })])], [], {}).length, 0, "essay excluded");
   assert.equal(teachableCards([src("a", [mk({ current_value: "" })])], [], {}).length, 0, "empty value");
   assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"] })], {}).length, 0, "already covered");
   assert.equal(teachableCards([src("a", [mk({})])], [], {}, ["reliable transport?"]).length, 0, "dismissed");
+  assert.equal(teachableCards([src("a", [mk({ flag: null })])], [], {}).length, 1, "a REVIEWED non-AI field is teachable too (Req B)");
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");
 });
 
@@ -108,4 +111,46 @@ test("createModeBBucket: unique id, filters empty candidates, defaults category"
 test("bucketLabel: Mode-A shows the path; Mode-B shows the first wording", () => {
   assert.equal(bucketLabel(bucket({ profile_path: "personal_info.city" })), "personal_info.city");
   assert.equal(bucketLabel(bucket({ profile_path: "", questions: ["Do you have a clearance?"] })), "Do you have a clearance?");
+});
+
+test("humanize: last segment, snake → Title Case, strips [i]", () => {
+  assert.equal(humanize("self_identification.gender"), "Gender");
+  assert.equal(humanize("work_authorization.authorized_to_work_in_us"), "Authorized To Work In Us");
+  assert.equal(humanize("work_experience[0].job_title"), "Job Title");
+});
+
+test("flattenProfileFields: object sections → scalar/bool/tiered rows; arrays-of-objects + top-level scalars skipped", () => {
+  const profile = {
+    schema_version: "2.0",
+    personal_info: { first_name: "Ada", has_preferred_name: true, country: ["United States of America", "United States"] },
+    work_experience: [{ job_title: "Engineer" }],
+    skills: ["ts", "react"],
+  };
+  const rows = flattenProfileFields(profile);
+  const byPath = Object.fromEntries(rows.map((r) => [r.path, r]));
+  assert.equal(byPath["personal_info.first_name"].value, "Ada");
+  assert.equal(byPath["personal_info.first_name"].label, "First Name");
+  assert.equal(byPath["personal_info.first_name"].sectionLabel, "Personal Info");
+  assert.equal(byPath["personal_info.has_preferred_name"].value, "Yes"); // boolean → Yes
+  assert.equal(byPath["personal_info.country"].value, "United States of America"); // tiered → first
+  assert.equal(rows.find((r) => r.path.startsWith("work_experience")), undefined, "array-of-objects section skipped");
+  assert.equal(rows.find((r) => r.section === "skills"), undefined, "top-level string array skipped");
+  assert.equal(rows.find((r) => r.section === "schema_version"), undefined, "top-level scalar skipped");
+});
+
+test("loop closes: teach a card (file under the recommended field) → it's covered → no longer in the queue", () => {
+  const profile = { work_authorization: { authorized_to_work_in_us: "Yes" } };
+  const apps = [src("a", [
+    entry({ question_label: "Authorized to work in the US?", widget_type: "radio", flag: "ai-choice-sensitive", current_value: "Yes", maps_to: "work_authorization.authorized_to_work_in_us" }),
+  ])];
+  let buckets: Bucket[] = [];
+  const before = teachableCards(apps, buckets, profile);
+  assert.equal(before.length, 1);
+  const card = before[0];
+  // what fileUnder(card.maps_to) does in the UI:
+  const { buckets: withB, bucketId } = ensureModeABucket(buckets, card.maps_to, card.widget);
+  buckets = addWordingToBucket(withB, bucketId, card.question);
+  assert.equal(teachableCards(apps, buckets, profile).length, 0, "taught → covered → gone from the queue");
+  const b = buckets.find((x) => x.profile_path === "work_authorization.authorized_to_work_in_us")!;
+  assert.ok(b.questions.some((q) => q.toLowerCase() === "authorized to work in the us?"), "the bucket carries the wording");
 });

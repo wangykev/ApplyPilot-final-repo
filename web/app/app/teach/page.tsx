@@ -51,7 +51,7 @@ export default async function TeachPage() {
         title="Teach"
         description="Questions the AI had to guess — that you approved on review. Add each to your saved answers so the next application fills it deterministically, with no review."
       />
-      <TeachInbox initialCards={cards} initialBuckets={buckets} initialDismissed={dismissed} />
+      <TeachInbox initialCards={cards} initialBuckets={buckets} initialDismissed={dismissed} profile={profile} />
     </div>
   );
 }

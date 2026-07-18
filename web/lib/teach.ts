@@ -40,13 +40,15 @@ export type TeachCard = {
 
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
 
-/** An approved, AI-answered, bucket-eligible question with a real label + value. */
+/** A teachable pair: the human APPROVED it, and it DIDN'T fill deterministically (needs_review —
+ *  an AI guess, a no-match the human answered, a fuzzy/containment match…). A clean deterministic
+ *  fill (mapped exact / bucket) has needs_review=false and is skipped — it's already known. Must be
+ *  bucket-eligible with a real question + a non-empty value. */
 function isTeachable(e: ReviewEntry): boolean {
   return (
     !!e.is_approved &&
     !e.is_deleted &&
-    typeof e.flag === "string" &&
-    e.flag.startsWith("ai-") && // an AI guess — deterministic / bucket fills are already known
+    !!e.needs_review && // didn't fill deterministically (any reviewed field, not only AI-flagged ones)
     isBucketEligibleWidget(e.widget_type) &&
     !!e.question_label &&
     normalizeQuestion(e.question_label) !== "" &&
@@ -155,4 +157,48 @@ export function createModeBBucket(
 export function bucketLabel(b: Bucket): string {
   if (b.profile_path) return b.profile_path;
   return b.questions[0] || "(untitled answer)";
+}
+
+/** Title-case a snake_case field/section key ("state_province" → "State Province"). */
+export function humanize(key: string): string {
+  return String(key || "")
+    .split(".")
+    .pop()!
+    .replace(/\[\d+\]/g, "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** One displayable profile field for the teach page's profile panel. */
+export type ProfileFieldRow = { path: string; label: string; value: string; section: string; sectionLabel: string };
+
+/**
+ * Flatten the profile's OBJECT sections (personal_info, work_authorization, self_identification,
+ * screening, …) into scalar/boolean/tiered rows (path = "section.field") — the maps_to targets a
+ * screening question resolves to. Repeating array sections (work_experience, education, skills…) and
+ * nested objects are skipped; a boolean shows Yes/No, a tiered array shows its first candidate.
+ */
+export function flattenProfileFields(profile: unknown): ProfileFieldRow[] {
+  const rows: ProfileFieldRow[] = [];
+  if (!profile || typeof profile !== "object") return rows;
+  const p = profile as Record<string, unknown>;
+  for (const section of Object.keys(p)) {
+    const sv = p[section];
+    if (!sv || typeof sv !== "object" || Array.isArray(sv)) continue; // object sections only
+    const sectionLabel = humanize(section);
+    for (const field of Object.keys(sv as Record<string, unknown>)) {
+      const v = (sv as Record<string, unknown>)[field];
+      let value: string;
+      if (v == null) value = "";
+      else if (typeof v === "string") value = v;
+      else if (typeof v === "boolean") value = v ? "Yes" : "No";
+      else if (Array.isArray(v)) {
+        if (v.length === 0) value = "";
+        else if (v.every((x) => typeof x === "string")) value = (v as string[])[0];
+        else continue; // array of objects → skip
+      } else continue; // nested object → skip
+      rows.push({ path: section + "." + field, label: humanize(field), value, section, sectionLabel });
+    }
+  }
+  return rows;
 }
