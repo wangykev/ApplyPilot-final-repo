@@ -13,6 +13,7 @@ import {
   bucketLabel,
 } from "@/lib/teach";
 import { saveBuckets } from "@/app/app/profile/actions";
+import { saveDismissed } from "@/app/app/teach/actions";
 
 const CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal", "Experience", "Education", "Other"];
 const opt = (vals: string[], blank = "—") => vals.map((v) => ({ value: v, label: v === "" ? blank : v }));
@@ -23,10 +24,19 @@ function pathLabel(path: string): string {
   return seg.replace(/\[\d+\]/g, "").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-export function TeachInbox({ initialCards, initialBuckets }: { initialCards: TeachCard[]; initialBuckets: Bucket[] }) {
+export function TeachInbox({
+  initialCards,
+  initialBuckets,
+  initialDismissed,
+}: {
+  initialCards: TeachCard[];
+  initialBuckets: Bucket[];
+  initialDismissed: string[];
+}) {
   const [cards, setCards] = useState<TeachCard[]>(initialCards);
   const [done, setDone] = useState(0); // how many taught/skipped this session
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
+  const [dismissed, setDismissed] = useState<string[]>(initialDismissed);
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   // per-card sub-form state (reset when the card advances)
@@ -56,6 +66,11 @@ export function TeachInbox({ initialCards, initialBuckets }: { initialCards: Tea
   };
 
   const skip = () => {
+    if (card) {
+      const next = Array.from(new Set([...dismissed, card.key]));
+      setDismissed(next);
+      void saveDismissed(next); // persist so this card doesn't reappear next visit
+    }
     setNote(null);
     advance();
   };

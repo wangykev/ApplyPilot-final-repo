@@ -66,16 +66,23 @@ export function coveredKeys(buckets: Bucket[]): Set<string> {
 }
 
 /** Teachable cards across the user's reviewed applications — deduped by question, excluding
- *  anything already covered by a bucket. Most-recent application wins a duplicate. */
-export function teachableCards(apps: TeachSource[], buckets: Bucket[], profile: unknown): TeachCard[] {
+ *  anything already covered by a bucket OR explicitly dismissed (skipped). Most-recent application
+ *  wins a duplicate. */
+export function teachableCards(
+  apps: TeachSource[],
+  buckets: Bucket[],
+  profile: unknown,
+  dismissed?: Iterable<string>,
+): TeachCard[] {
   const covered = coveredKeys(buckets);
+  const skipped = new Set<string>(dismissed || []);
   const seen = new Set<string>();
   const cards: TeachCard[] = [];
   for (const app of apps) {
     for (const e of app.bundle?.entries || []) {
       if (!isTeachable(e)) continue;
       const key = normalizeQuestion(e.question_label as string);
-      if (covered.has(key) || seen.has(key)) continue;
+      if (covered.has(key) || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
       const maps_to = e.maps_to || "";
       cards.push({

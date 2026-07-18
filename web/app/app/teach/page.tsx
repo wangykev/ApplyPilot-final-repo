@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile, emptyProfile, type Profile } from "@/lib/profile-schema";
 import { loadBuckets } from "../profile/actions";
+import { loadDismissed } from "./actions";
 import type { ReviewBundle } from "@/lib/review-summary";
 import { teachableCards, type TeachSource } from "@/lib/teach";
 import { TeachInbox } from "@/components/app/teach/TeachInbox";
@@ -41,8 +42,8 @@ async function loadSources(): Promise<{ apps: TeachSource[]; profile: Profile }>
 }
 
 export default async function TeachPage() {
-  const [{ apps, profile }, buckets] = await Promise.all([loadSources(), loadBuckets()]);
-  const cards = teachableCards(apps, buckets, profile);
+  const [{ apps, profile }, buckets, dismissed] = await Promise.all([loadSources(), loadBuckets(), loadDismissed()]);
+  const cards = teachableCards(apps, buckets, profile, dismissed);
   return (
     <div className="space-y-8 pb-28">
       <PageHeader
@@ -50,7 +51,7 @@ export default async function TeachPage() {
         title="Teach"
         description="Questions the AI had to guess — that you approved on review. Add each to your saved answers so the next application fills it deterministically, with no review."
       />
-      <TeachInbox initialCards={cards} initialBuckets={buckets} />
+      <TeachInbox initialCards={cards} initialBuckets={buckets} initialDismissed={dismissed} />
     </div>
   );
 }
