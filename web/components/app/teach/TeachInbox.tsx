@@ -13,6 +13,7 @@ import {
   bucketLabel,
   profileValueAt,
   humanize,
+  isFuzzyTier,
 } from "@/lib/teach";
 import { saveBuckets } from "@/app/app/profile/actions";
 import { saveDismissed, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
@@ -50,18 +51,19 @@ export function TeachInbox({
   const card = cards[0] || null;
   const bucketedPaths = new Set(buckets.filter((b) => b.profile_path.trim() !== "").map((b) => b.profile_path.trim()));
 
-  // Effective recommendation for the current card: the fill-time hint, else the teach-time fallback.
-  const rec: FieldRecommendation = card
-    ? card.maps_to
-      ? { maps_to: card.maps_to, suggested_category: card.suggested_category }
-      : recCache[card.key] || { maps_to: "", suggested_category: "" }
-    : { maps_to: "", suggested_category: "" };
-  const recProfileValue = rec.maps_to ? (card && card.maps_to ? card.profile_value : profileValueAt(profile, rec.maps_to)) : "";
-  const matches = !!rec.maps_to && sameAnswer(card?.answer || "", recProfileValue);
+  // The recommendation, in precedence order: the field's KNOWN mapped home (canonical_field) →
+  // the fill-time AI hint (maps_to) → the teach-time LLM fallback (only when nothing is known).
+  const stampedPath = card ? card.canonical_field || card.maps_to : "";
+  const fallback = card && !stampedPath ? recCache[card.key] : undefined;
+  const recPath = stampedPath || (fallback ? fallback.maps_to : "");
+  const recCat = card ? card.suggested_category || (fallback ? fallback.suggested_category : "") : "";
+  const recProfileValue = recPath ? profileValueAt(profile, recPath) : "";
+  const fuzzy = !!stampedPath && isFuzzyTier(card?.match_tier); // matched a known field by near/typo
+  const matches = !!recPath && sameAnswer(card?.answer || "", recProfileValue);
 
-  // Fetch the fallback recommendation for a card that arrived without a stamped hint.
+  // Fetch the fallback recommendation ONLY for a card with no known home (no canonical_field + no hint).
   useEffect(() => {
-    if (!card || card.maps_to || recCache[card.key] !== undefined) {
+    if (!card || card.canonical_field || card.maps_to || recCache[card.key] !== undefined) {
       setRecLoading(false);
       return;
     }
@@ -112,7 +114,7 @@ export function TeachInbox({
   };
 
   const openNew = (c: TeachCard) => {
-    setNewCat(CATEGORIES.includes(rec.suggested_category) ? rec.suggested_category : "Other");
+    setNewCat(CATEGORIES.includes(recCat) ? recCat : "Other");
     setNewValue([c.answer]);
     setNewSensitive(c.sensitive);
     setMode("new");
@@ -123,7 +125,7 @@ export function TeachInbox({
       {/* LEFT — the profile, physically displayed + clickable */}
       <ProfilePanel
         profile={profile}
-        highlightPath={rec.maps_to}
+        highlightPath={recPath}
         bucketedPaths={bucketedPaths}
         onPick={fileUnder}
         disabled={saving || !card}
@@ -173,23 +175,22 @@ export function TeachInbox({
               <div className="mt-4 flex items-center gap-2 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5 text-xs text-ink-dim">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" /> Finding the matching field…
               </div>
-            ) : rec.maps_to ? (
+            ) : recPath ? (
               <div className="mt-4 rounded-lg border border-amber/30 bg-amber/5 px-3 py-2.5">
                 <p className="text-xs text-ink-dim">
-                  AI recommends filing this under <span className="font-medium text-ink">{humanize(rec.maps_to)}</span>
+                  Looks like your <span className="font-medium text-ink">{humanize(recPath)}</span>
                   {" — "}your profile has <span className="font-mono text-ink">{recProfileValue || "—"}</span>{" "}
                   <span className="text-ink-faint">(highlighted on the left).</span>
                 </p>
-                {matches ? (
-                  <button onClick={() => fileUnder(rec.maps_to)} className="btn-primary mt-2.5" disabled={saving}>
-                    <Check className="h-4 w-4" />
-                    File under {humanize(rec.maps_to)}
-                  </button>
-                ) : (
-                  <p className="mt-1.5 text-xs text-ink-faint">
-                    Your answer differs from that field — save it as a new answer below, or click the correct field on the left.
-                  </p>
-                )}
+                {fuzzy ? (
+                  <p className="mt-1.5 text-xs text-signal">⚠ Matched by a near match (possible typo/variant) — verify it&apos;s the same answer.</p>
+                ) : !matches ? (
+                  <p className="mt-1.5 text-xs text-ink-faint">Your answer differs from that field&apos;s value — verify, or save it as a new answer below.</p>
+                ) : null}
+                <button onClick={() => fileUnder(recPath)} className="btn-primary mt-2.5" disabled={saving}>
+                  <Check className="h-4 w-4" />
+                  File under {humanize(recPath)}
+                </button>
               </div>
             ) : (
               <div className="mt-4 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">

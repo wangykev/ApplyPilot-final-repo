@@ -12,6 +12,7 @@ import {
   bucketLabel,
   humanize,
   flattenProfileFields,
+  isFuzzyTier,
   type TeachSource,
 } from "@/lib/teach";
 import type { Bucket } from "@/lib/buckets";
@@ -153,4 +154,24 @@ test("loop closes: teach a card (file under the recommended field) → it's cove
   assert.equal(teachableCards(apps, buckets, profile).length, 0, "taught → covered → gone from the queue");
   const b = buckets.find((x) => x.profile_path === "work_authorization.authorized_to_work_in_us")!;
   assert.ok(b.questions.some((q) => q.toLowerCase() === "authorized to work in the us?"), "the bucket carries the wording");
+});
+
+test("teachableCards: a MAPPED fuzzy-matched field carries canonical_field + match_tier + profile_value from it (no LLM needed)", () => {
+  const profile = { self_identification: { gender: "Male" } };
+  const apps = [src("a", [
+    entry({ question_label: "Sex/Gender", widget_type: "dropdown", flag: null, canonical_field: "self_identification.gender", match_tier: "fuzzy-92", current_value: "Man" }),
+  ])];
+  const c = teachableCards(apps, [], profile)[0];
+  assert.equal(c.canonical_field, "self_identification.gender");
+  assert.equal(c.match_tier, "fuzzy-92");
+  assert.equal(c.profile_value, "Male", "profile_value from the KNOWN canonical_field");
+  assert.equal(c.maps_to, "", "no AI hint on a deterministic fuzzy match");
+});
+
+test("isFuzzyTier: containment / fuzzy-* → true; exact / empty → false", () => {
+  assert.equal(isFuzzyTier("containment"), true);
+  assert.equal(isFuzzyTier("fuzzy-90"), true);
+  assert.equal(isFuzzyTier("exact-normalized"), false);
+  assert.equal(isFuzzyTier(""), false);
+  assert.equal(isFuzzyTier(null), false);
 });

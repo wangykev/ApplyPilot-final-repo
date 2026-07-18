@@ -31,12 +31,20 @@ export type TeachCard = {
   answer: string; // the approved / edited value
   widget: string; // widget_type
   sensitive: boolean; // legally-loaded / EEO (from the flag)
-  maps_to: string; // piggyback hint: the profile field this Q maps to ("" = none)
+  maps_to: string; // fill-time AI piggyback hint: the profile field this Q maps to ("" = none)
+  canonical_field: string; // the field's MAPPED home (FIELD_MAP), if any — a KNOWN target, no LLM needed
+  match_tier: string; // how it filled ("containment"/"fuzzy-NN"/…) — a fuzzy/containment tier ⇒ possible typo/variant
   suggested_category: string; // piggyback hint: a category for a new standalone bucket
-  profile_value: string; // the profile's value at maps_to (for the same-vs-different check)
+  profile_value: string; // the profile's value at the KNOWN path (canonical_field || maps_to) — for the same-vs-different check
   app_id: string; // source application (reference only)
   company: string | null;
 };
+
+/** Whether a match_tier indicates a fuzzy / containment (near) match — a likely typo/variant. */
+export function isFuzzyTier(matchTier?: string | null): boolean {
+  const t = String(matchTier || "");
+  return t === "containment" || /^fuzzy/.test(t);
+}
 
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
 
@@ -87,6 +95,8 @@ export function teachableCards(
       if (covered.has(key) || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
       const maps_to = e.maps_to || "";
+      const canonical_field = e.canonical_field || "";
+      const known = canonical_field || maps_to; // the deterministic mapped home wins over the AI hint
       cards.push({
         key,
         question: e.question_label as string,
@@ -94,8 +104,10 @@ export function teachableCards(
         widget: String(e.widget_type || "text"),
         sensitive: typeof e.flag === "string" && /sensitive|eeo/.test(e.flag),
         maps_to,
+        canonical_field,
+        match_tier: e.match_tier || "",
         suggested_category: e.suggested_category || "",
-        profile_value: maps_to ? profileValueAt(profile, maps_to) : "",
+        profile_value: known ? profileValueAt(profile, known) : "",
         app_id: app.id,
         company: app.company ?? null,
       });
