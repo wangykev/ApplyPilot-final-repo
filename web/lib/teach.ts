@@ -1,0 +1,151 @@
+import { normalizeQuestion, type Bucket } from "@/lib/buckets";
+import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
+
+/**
+ * Pure logic for the "teach the tool" flow (see docs/profile-v2-plan.md → teach).
+ * After a fill is reviewed + APPROVED on the website, its AI-answered questions become
+ * teaching candidates: the user adds each to an answer bucket (a wording on an existing
+ * bucket, or a new standalone Mode-B bucket) so it fills deterministically next time.
+ * No DOM / Supabase / React here — the page does the I/O.
+ */
+
+/** Widget types that can be remembered as a bucket (essays/files are never bucketed). */
+const BUCKET_ELIGIBLE = new Set(["text", "dropdown", "radio", "typeahead", "checkbox"]);
+export function isBucketEligibleWidget(w?: string | null): boolean {
+  return BUCKET_ELIGIBLE.has(String(w || ""));
+}
+
+/** Read a dotted profile path → a display string (a tiered array shows its first candidate). */
+export function profileValueAt(profile: unknown, path: string): string {
+  if (!path) return "";
+  const v = String(path)
+    .split(".")
+    .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
+  if (Array.isArray(v)) return v.length ? String(v[0]) : "";
+  return v == null ? "" : String(v);
+}
+
+export type TeachCard = {
+  key: string; // normalizeQuestion(question) — identity + dedup key
+  question: string; // verbatim label (what gets stored as the bucket wording)
+  answer: string; // the approved / edited value
+  widget: string; // widget_type
+  sensitive: boolean; // legally-loaded / EEO (from the flag)
+  maps_to: string; // piggyback hint: the profile field this Q maps to ("" = none)
+  suggested_category: string; // piggyback hint: a category for a new standalone bucket
+  profile_value: string; // the profile's value at maps_to (for the same-vs-different check)
+  app_id: string; // source application (reference only)
+  company: string | null;
+};
+
+export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
+
+/** An approved, AI-answered, bucket-eligible question with a real label + value. */
+function isTeachable(e: ReviewEntry): boolean {
+  return (
+    !!e.is_approved &&
+    !e.is_deleted &&
+    typeof e.flag === "string" &&
+    e.flag.startsWith("ai-") && // an AI guess — deterministic / bucket fills are already known
+    isBucketEligibleWidget(e.widget_type) &&
+    !!e.question_label &&
+    normalizeQuestion(e.question_label) !== "" &&
+    e.current_value != null &&
+    String(e.current_value).trim() !== ""
+  );
+}
+
+/** Normalized wordings already covered by SOME bucket (so a taught question won't reappear). */
+export function coveredKeys(buckets: Bucket[]): Set<string> {
+  const s = new Set<string>();
+  for (const b of buckets) for (const q of b.questions || []) {
+    const k = normalizeQuestion(q);
+    if (k) s.add(k);
+  }
+  return s;
+}
+
+/** Teachable cards across the user's reviewed applications — deduped by question, excluding
+ *  anything already covered by a bucket. Most-recent application wins a duplicate. */
+export function teachableCards(apps: TeachSource[], buckets: Bucket[], profile: unknown): TeachCard[] {
+  const covered = coveredKeys(buckets);
+  const seen = new Set<string>();
+  const cards: TeachCard[] = [];
+  for (const app of apps) {
+    for (const e of app.bundle?.entries || []) {
+      if (!isTeachable(e)) continue;
+      const key = normalizeQuestion(e.question_label as string);
+      if (covered.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      const maps_to = e.maps_to || "";
+      cards.push({
+        key,
+        question: e.question_label as string,
+        answer: String(e.current_value),
+        widget: String(e.widget_type || "text"),
+        sensitive: typeof e.flag === "string" && /sensitive|eeo/.test(e.flag),
+        maps_to,
+        suggested_category: e.suggested_category || "",
+        profile_value: maps_to ? profileValueAt(profile, maps_to) : "",
+        app_id: app.id,
+        company: app.company ?? null,
+      });
+    }
+  }
+  return cards;
+}
+
+/** Same-vs-different answer for the add-wording-vs-new-bucket decision (normalize per the plan). */
+export function sameAnswer(a: string, b: string): boolean {
+  const n = (s: string) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return !!n(a) && n(a) === n(b);
+}
+
+/** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */
+export function addWordingToBucket(buckets: Bucket[], bucketId: string, wording: string): Bucket[] {
+  const k = normalizeQuestion(wording);
+  return buckets.map((b) => {
+    if (b.id !== bucketId) return b;
+    if ((b.questions || []).some((q) => normalizeQuestion(q) === k)) return b;
+    return { ...b, questions: [...(b.questions || []), wording] };
+  });
+}
+
+/** Ensure a Mode-A bucket bound to `path` exists; returns the (possibly extended) buckets + its id. */
+export function ensureModeABucket(buckets: Bucket[], path: string, widget: string): { buckets: Bucket[]; bucketId: string } {
+  const p = String(path).trim();
+  const existing = buckets.find((b) => b.profile_path.trim() === p);
+  if (existing) return { buckets, bucketId: existing.id };
+  const bucketId = "field_" + p.replace(/[^\w]+/g, "_");
+  const nb: Bucket = { id: bucketId, profile_path: p, value: [], category: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} };
+  return { buckets: [...buckets, nb], bucketId };
+}
+
+/** Create a new standalone (Mode-B) bucket with a unique id. Returns the new buckets + its id. */
+export function createModeBBucket(
+  buckets: Bucket[],
+  spec: { question: string; value: string[]; category: string; widget_hint: string; sensitive: boolean },
+): { buckets: Bucket[]; bucketId: string } {
+  const base = "custom_" + (normalizeQuestion(spec.question).replace(/[^\w]+/g, "_").slice(0, 40) || "answer");
+  const ids = new Set(buckets.map((b) => b.id));
+  let bucketId = base;
+  let n = 1;
+  while (ids.has(bucketId)) bucketId = base + "_" + n++;
+  const nb: Bucket = {
+    id: bucketId,
+    profile_path: "",
+    value: spec.value.filter((v) => v.trim() !== ""),
+    category: spec.category || "Other",
+    widget_hint: spec.widget_hint || "text",
+    sensitive: !!spec.sensitive,
+    questions: [spec.question],
+    selectors: {},
+  };
+  return { buckets: [...buckets, nb], bucketId };
+}
+
+/** A short human label for a bucket in the "add to existing" picker. */
+export function bucketLabel(b: Bucket): string {
+  if (b.profile_path) return b.profile_path;
+  return b.questions[0] || "(untitled answer)";
+}

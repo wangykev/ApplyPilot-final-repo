@@ -12,6 +12,7 @@ import {
   Cable,
   ListChecks,
   Activity,
+  GraduationCap,
   BarChart3,
   LogOut,
 } from "lucide-react";
@@ -28,6 +29,7 @@ const PRIMARY = [
   { href: "/app/connect", label: "Connect", icon: Cable },
   { href: "/app/queue", label: "Queue", icon: ListChecks },
   { href: "/app/tracker", label: "Tracker", icon: Activity },
+  { href: "/app/teach", label: "Teach", icon: GraduationCap },
   { href: "/app/analytics", label: "Analytics", icon: BarChart3 },
 ];
 
