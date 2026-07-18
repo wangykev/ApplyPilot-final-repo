@@ -567,3 +567,17 @@ port it onto the bucket lookup. Merge concepts before merging code.
 - **EEO staleness** — an optional periodic "re-confirm remembered demographics" prompt.
 - **Self-id + country option lists** — confirm the canonical option sets (standard US EEO; ISO country
   list + dial codes).
+
+---
+
+## Update (2026-07-18) — buckets are now CHANGEABLE + the teach loop shipped
+
+B-series is built and merged. Beyond the original plan, buckets became fully editable and the learning
+loop closed:
+- **Mode-B standalone buckets** are creatable/editable in `ProfileEditor` ("Other remembered answers");
+  `bucket.value` is a candidate list; `bucket.category` added.
+- **`/app/teach`** — the flashcard curation page: split-screen with the profile physically displayed,
+  teachable = every approved non-deterministic fill, an AI recommendation on every card
+  (`canonical_field` → fill-time `maps_to` piggyback → a teach-time `recommendField` LLM fallback), and
+  persistent skip (`teach_dismissed_json`, migration `0004`).
+See `docs/progress-log.md` (2026-07-18, Buckets M1–M9) for the full milestone breakdown.

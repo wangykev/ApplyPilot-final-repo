@@ -142,15 +142,39 @@ The platform-agnostic answer store that generalizes `FIELD_MAP` + question-wordi
   wording, on every ATS.
 - **Mode B** (`value` set, no `profile_path`) — a standalone answer for the long tail; promotable later.
 
-Element shape: `{ id, profile_path, value, widget_hint, sensitive, questions[], selectors{} }`. The editor
-edits buckets via **per-field popups** — click a field label to edit the wordings that map to it (creates
-the bucket on first use). **Seed:** new profiles are provisioned (`loadBuckets`, provision-if-null) with
-`STARTER_BUCKETS` — Mode-A wording→field bindings only, no baked answers.
+Element shape: `{ id, profile_path, value (string[] — a candidate list), category, widget_hint, sensitive,
+questions[], selectors{} }` (`coerceBuckets` upgrades a legacy string `value`). Edited two ways in
+`ProfileEditor`: **per-field popups** (click a field label → edit the wordings that map to it, creates the
+Mode-A bucket on first use) and an **"Other remembered answers"** section — create/edit/delete **Mode-B**
+standalone buckets (wordings, a candidate-list answer via `TieredField`, a category, sensitive). **Seed:**
+new profiles are provisioned (`loadBuckets`, provision-if-null) with `STARTER_BUCKETS` — Mode-A
+wording→field bindings only, no baked answers.
 
 Matching hierarchy in the extension (`drivePageFill`): platform accelerator (Workday automation-id via
-`FIELD_MAP`) → exact-normalized wording (the bucket, `buildBucketIndex`/`fillFromBucket`) → AI fallback.
-**No fuzzy** in the deterministic tier; a bucket value is only ever a CANDIDATE through the match ladder
-(never blind), consulted BEFORE the AI pass. This SUPERSEDES the earlier `answerBank` sketch.
+`FIELD_MAP`) → exact-normalized **label** wording (the bucket, `buildBucketIndex`/`fillFromBucket`) → AI
+fallback. **No fuzzy** in the deterministic tier; a bucket value is only ever a CANDIDATE through the match
+ladder (never blind), consulted BEFORE the AI pass. Matching is LABEL-only — `bucket.selectors` (per-platform
+ids) is unused scaffolding. This SUPERSEDES the earlier `answerBank` sketch.
+
+### Teach the tool — `/app/teach` (approved AI answers → buckets)
+The learning loop's curation surface. After a fill is reviewed + **approved** (the review editor persists the
+approved bundle to `applications.review_bundle_json`), its answers that DIDN'T fill deterministically become
+teaching cards, so they fill deterministically (no review) next time.
+- **Data (`lib/teach.ts`, pure + unit-tested in `test/teach.test.ts` via the `tsx` runner):**
+  `teachableCards(apps, buckets, profile, dismissed)` = every **approved + `needs_review` + bucket-eligible**
+  entry with a value, deduped by normalized question, minus anything already bucketed or dismissed — read
+  across the user's reviewed applications.
+- **Split-screen (`components/app/teach/`):** the **profile is physically displayed on the left**
+  (`ProfilePanel`, from `flattenProfileFields`); the current card is on the right. The recommended field is
+  **highlighted**, and **clicking any profile field files this question's wording under it** (Mode-A).
+- **Recommendation precedence: `canonical_field` (the mapped home — free/exact) → the fill-time `maps_to`
+  piggyback → a teach-time LLM fallback** (`recommendField` server action → `callLLM` with the user's
+  `ai_config`), which fires ONLY when nothing is known (e.g. an unmapped pre-populated field). A
+  fuzzy/containment match (`isFuzzyTier`) on a known field shows a "possible typo/variant — verify" note
+  instead of an LLM guess.
+- **Actions:** file-under-recommended, **save as a new Mode-B bucket** (candidate-list value + category +
+  sensitive), add-to-an-existing-bucket, or **skip** (persisted in `profiles.teach_dismissed_json`, migration
+  `0004`, so a skipped card doesn't reappear). Writes via `saveBuckets` → synced to the extension.
 
 ### Attachments — private `attachments` Storage bucket (Profile v2)
 Per-specialty files + `additional_files[]` upload to a private Supabase bucket, namespaced

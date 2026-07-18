@@ -88,16 +88,22 @@ for any UNMAPPED field the deterministic pass left empty, **before** the AI post
   the website's `normalizeQuestion`). **Exact-normalized match only — no fuzzy** (the AI fallback covers
   misses; a fuzzy tier would only add silent-wrong-match risk).
 - `fillFromBucket`: **Mode A** (`profile_path`) resolves the bound profile value; **Mode B** uses the
-  bucket's own `value`. Either way it's a CANDIDATE through the SAME match ladder vs the LIVE options —
-  never a blind commit; a no-match falls through to AI/blank. A real commit is flagged `bucket`
-  (a "remembered"-style provenance, NOT an `ai-*` flag). Gated `producedNothing(record) && !mappedPath`
-  (a mapped-but-no-match field goes to CANONICALIZE instead). Runs for REQUIRED **and** OPTIONAL fields.
+  bucket's own `value` — a **CANDIDATE LIST** (`string[]`, a legacy string tolerated): text → `value[0]`,
+  choice widgets pass the whole list through the match ladder (fills like a tiered dropdown/typeahead
+  across tenants). Either way it's a CANDIDATE through the SAME match ladder vs the LIVE options — never a
+  blind commit; a no-match falls through to AI/blank. A real commit is flagged `bucket` (a "remembered"-
+  style provenance, NOT an `ai-*` flag). Gated `producedNothing(record) && !mappedPath` (a mapped-but-no-
+  match field goes to CANONICALIZE instead). Runs for REQUIRED **and** OPTIONAL fields.
 - The SW loads `buckets` from `chrome.storage.local` and hands them into `drivePageFill` (engine computes /
-  SW does I/O). Unit-pinned in `test/fill-driver.test.js` (fake bucket: Mode A/B, match-ladder gate,
-  runs-before-AI, `buildBucketIndex` normalization). **Supersedes** the earlier `answerBank` sketch.
-- Not-yet-wired: date/textarea bucket **filling** (labels/wordings persist; the tier fills
-  text/dropdown/radio/typeahead/checkbox). `normalize`-style lockstep dup: `normalizeLabel` (lib.js) ↔
-  `normalizeQuestion` (web `lib/buckets.ts`).
+  SW does I/O). Unit-pinned in `test/fill-driver.test.js` (fake bucket: Mode A/B, candidate-list + legacy
+  string, match-ladder gate, runs-before-AI, `buildBucketIndex` normalization). **Supersedes** `answerBank`.
+- **Teach-flow piggyback (for the website `/app/teach` page).** The AI fill functions
+  (`aiFillField`/`aiFillText`/`aiFillRadio`) return, in the SAME fill call, `maps_to` (the profile field
+  this question maps to; `""`=none) + `suggested_category`; these ride each review-bundle entry (`buildReviewBundle`
+  + `background.js buildEntry`, lockstep). The website teach page consumes them so curation needs **no extra
+  LLM call** for AI-filled questions. Buckets match LABEL-only (`normalizeLabel`); `bucket.selectors`
+  (per-platform ids) stays UNUSED scaffolding. `normalize`-style lockstep dup: `normalizeLabel` (lib.js) ↔
+  `normalizeQuestion` (web `lib/buckets.ts`). Not-yet-wired: date/textarea bucket **filling**.
 
 ## Employer match — "previously employed here?" (safety-critical)
 
