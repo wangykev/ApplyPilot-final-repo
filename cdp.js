@@ -1372,6 +1372,18 @@ function cdpReadSessionState() {
   // is the PRECISE footer-button read (vs the saveContinuePresent text heuristic).
   const errorEls = qa('[data-automation-id="errorMessage"], [role="alert"], [data-automation-id*="rror"]')
     .filter((el) => { const r = el.getBoundingClientRect && el.getBoundingClientRect(); return r && r.width > 0 && r.height > 0; });
+  // Workday's TRANSIENT soft-error page ("Something went wrong / Please refresh the page and then try
+  // again.") — a reload-fixable render failure that can pop up right after login or after Save & Continue
+  // (live-reconned on Magna wd3, 2026-07-17: an <h1>Something went wrong</h1>, formFieldCount 0, but the
+  // applyFlowPage shell still present). Computed off the FULL bodyText — the 500-char bodyTextSample can
+  // truncate right BEFORE the "Something went wrong" line (it sits after the cookie banner + step nav).
+  // Requires BOTH an apology AND a refresh/try-again cue (mirrors lib.js isWorkdaySoftError) so an
+  // ordinary field-validation "something's wrong" banner can't trigger a needless reload; the <h1> is a
+  // corroborating belt. The walks reload (Workday returns to page 1) → restart. looksLikeWorkdaySoftError.
+  const softApologyRx = /something went wrong|an? (unexpected )?error (has )?occurred|we('| ?a)?re sorry/i;
+  const softRefreshRx = /refresh (the|this) page|please refresh|try again/i;
+  const softHeading = qa("h1, h2").some((h) => /something went wrong/i.test((h.textContent || "")));
+  const softErrorPresent = softRefreshRx.test(bodyText) && (softApologyRx.test(bodyText) || softHeading);
   return {
     url: location.href,
     title: document.title,
@@ -1393,6 +1405,7 @@ function cdpReadSessionState() {
     // Workday PLANNED-MAINTENANCE page ("Workday is currently unavailable") — a transient retry-later
     // state, NOT a dead session (recon 2026-06-27). isWorkdayMaintenance keys off this (+ title/bodyText).
     maintenancePresent: /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(bodyText),
+    softErrorPresent, // Workday's transient "Something went wrong / please refresh" page — the walks reload + restart (see above)
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
     // M31: error-element detail for the validation-vs-VPS recon diff. Samples are now DECISION
     // INPUTS (the AI-4 tiers key off them via lib.js expandErrorSamples), not just diagnostics —

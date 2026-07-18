@@ -748,6 +748,19 @@ function isWorkdaySoftError(bodyText) {
     && /refresh (the|this) page|please refresh|try again/i.test(t);
 }
 
+// Does a cdpReadSessionState snapshot look like Workday's TRANSIENT soft-error page ("Something went
+// wrong / please refresh")? Prefers the `softErrorPresent` marker (computed off the FULL 20k-char bodyText
+// inside cdpReadSessionState — robust vs the truncated 500-char bodyTextSample), with a text fallback for
+// callers that only carry text. The walks reload → Workday returns to page 1 → RESTART the walk (the
+// maintenance-page precedent, but soft-error is reload-FIXABLE, so we retry rather than halt-for-later).
+// MUST be checked BEFORE sessionLooksDead: a soft-error page that lacks the applyFlowPage shell would
+// otherwise read as a dead session (its "no form" branch) → wrong "refresh + re-login" guidance.
+function looksLikeWorkdaySoftError(state) {
+  if (!state) return false;
+  if (state.softErrorPresent === true) return true;
+  return isWorkdaySoftError(state.bodyText || state.bodyTextSample || "");
+}
+
 // SSO / federated-login detection. The reference REFUSES SSO (a Workday tenant that
 // bounces to Okta/Ping/Azure/etc can't be driven with an email+password) — so we halt
 // for operator takeover rather than fumble. Two signals: an SSO-looking URL, or an
@@ -770,5 +783,5 @@ function looksLikeSso(state) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeWorkdaySoftError, looksLikeSso };
 }

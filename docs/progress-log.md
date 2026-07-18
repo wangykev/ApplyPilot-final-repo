@@ -628,3 +628,39 @@ Model: FILL/WALK = fresh (a re-run overwrites); **REFILL = preserve-approved** (
 mechanism, replayed). +3 unit tests (600 total). Extension suite 600/600; web typecheck + build green.
 Follow-up: skip fresh-filling approved sections (avoid the double-fill) is an optimization, not needed
 for correctness (the replay reconciles over the fresh fill).
+
+## 2026-07-17 — Transient soft-error ("Something went wrong / please refresh") reload+restart in the WALKS
+
+**Operator ask:** the "Something went wrong / Please refresh the page and then try again." page (usually
+pops up right after login, but also after Save & Continue or randomly mid-fill) should be (a) detected +
+reloaded in the start-application/onboarding flow, and (b) mid-walk: detect → refresh → get back to page 1
+→ redo the current process (fill / replay). Live recon captured on Magna wd3 (see dom-patterns 2026-07-17).
+
+**Onboarding (a): already covered — verified, no change.** `runCdpOnboard`'s `maybeRefresh` (caps at 2
+reloads/run) runs `isWorkdaySoftError(st.bodyText)` over the FULL-bodyText `cdpOnboardScan` at every scan
+point — the start scan, every `waitFor` poll (apply → apply-manually → auth-or-form transitions), each
+`doAuth` attempt top, `submitAndWait`, and the post-activation sign-in wait. So a soft-error anywhere in
+apply → login → verify → form already reloads-once-and-retries.
+
+**Walks (b): NEW.** The walks read `cdpReadSessionState`, which did NOT detect the soft-error page.
+- **`cdp.js` `cdpReadSessionState`** now emits **`softErrorPresent`** — computed off the FULL 20k-char
+  `bodyText` (the 500-char `bodyTextSample` truncates before the phrase) as `refreshCue && (apologyCue ||
+  <h1>Something went wrong</h1>)`. NOT the recon's `apology` marker (maintenance-only; read `false` live).
+- **`lib.js`** — pure **`looksLikeWorkdaySoftError(state)`** (prefers the marker; text fallback for
+  text-only callers). Exported + unit-pinned.
+- **`background.js`** — reload+restart wired at 5 points, bounded by the existing `MAX_RELOAD_RETRIES=2`
+  (`reloadsUsed`) + honest `stopped:"workday-soft-error"` halt past the cap:
+  - `cdpWaitNextPage` → `{advanced:false, softError:true}` (checked after maintenance, BEFORE sessionDead).
+  - `runCdpWalk` (fill): top-of-iteration, mid-fill (`navAfter` — else it MIShalts at `no-next-button`),
+    and the post-Save&Continue `res.softError` branch → `continue restartWalk` (→ page 1).
+  - `runCdpReplayWalk` (replay/submit): top-of-iteration → `continue restartWalk`. The strict per-field
+    verify + review-page equality + `submitPrecondition` gate are UNTOUCHED, so a restart can never
+    advance/submit a bad state.
+- Checked BEFORE `sessionLooksDead` everywhere (a shell-less soft-error page would trip its no-form branch
+  → a bogus "session expired / re-login"). Same ordering discipline as `isWorkdayMaintenance`.
+
+**Tests:** +6 in `test/session.test.js` (marker detection, the truncated-sample case proving the marker —
+not the sample — is load-bearing, the text fallback, valid-form/maintenance/null negatives, and the
+before-`sessionLooksDead` ordering invariant). Full suite **605/605** green; `node --check` clean on
+lib.js / cdp.js / background.js. Live-verify pending: trip a real soft-error mid-walk and confirm the
+reload lands on page 1 and the walk completes.

@@ -2478,6 +2478,19 @@ async function runCdpReplayWalk(tabId, opts) {
         LOG(`⛔ WORKDAY MAINTENANCE at page ${page} — retry after the window.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
+      // Workday's TRANSIENT soft-error ("Something went wrong / please refresh") — reload (→ page 1) +
+      // RESTART the replay walk from page 1, bounded. The strict per-field verify + review-page equality +
+      // submitPrecondition gate are UNCHANGED, so a reload-restart can never advance/submit a bad state.
+      if (nav && looksLikeWorkdaySoftError(nav)) {
+        if (reloadsUsed >= MAX_RELOAD_RETRIES) {
+          LOG(`⛔ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") at page ${page} PERSISTS after ${reloadsUsed} reload(s) — halting. Refresh the page manually and re-run.`);
+          return { ok: true, stopped: "workday-soft-error", workday_soft_error: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        }
+        reloadsUsed++;
+        LOG(`⟳ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") at page ${page} — reloading (Workday returns to page 1) + RESTARTING the replay walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}).`);
+        await reloadAndSettle(LOG);
+        continue restartWalk;
+      }
       if (nav && sessionLooksDead(nav)) {
         LOG(`⚠⚠ SESSION EXPIRED at page ${page} — refresh, log in, reopen the form, retry.`);
         return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
@@ -2813,6 +2826,7 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
     let state = null;
     try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
     if (state && isWorkdayMaintenance(state)) return { advanced: false, maintenance: true, state }; // transient, retry-later — NOT dead (checked first)
+    if (state && looksLikeWorkdaySoftError(state)) return { advanced: false, softError: true, state }; // transient "Something went wrong / please refresh" — reload + restart. BEFORE sessionLooksDead (its no-form branch would MISread it as dead).
     if (state && sessionLooksDead(state)) return { advanced: false, sessionDead: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
@@ -2913,6 +2927,20 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         LOG(`⛔ WORKDAY PLANNED MAINTENANCE at page ${page} ("Workday is currently unavailable") — NOT a dead session, no re-login needed. Retry after the maintenance window, then re-run.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
+      // Workday's TRANSIENT soft-error ("Something went wrong / please refresh") — a reload-fixable render
+      // failure (live-seen right after login + mid-walk on Magna wd3, 2026-07-17). RELOAD (Workday returns
+      // to page 1) + RESTART the walk from page 1, bounded by the same MAX_RELOAD_RETRIES budget as a
+      // transient render-flake. Checked BEFORE sessionLooksDead (its no-form branch would MISread it dead).
+      if (nav && looksLikeWorkdaySoftError(nav)) {
+        if (reloadsUsed >= MAX_RELOAD_RETRIES) {
+          LOG(`⛔ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") at page ${page} PERSISTS after ${reloadsUsed} reload(s) — halting. Refresh the page manually and re-run.`);
+          return { ok: true, stopped: "workday-soft-error", workday_soft_error: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+        }
+        reloadsUsed++;
+        LOG(`⟳ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") at page ${page} — reloading (Workday returns to page 1) + RESTARTING the fill walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}).`);
+        await reloadAndSettle(LOG);
+        continue restartWalk;
+      }
       if (nav && sessionLooksDead(nav)) {
         LOG(`⚠⚠ SESSION EXPIRED at page ${page} (login/VPS/no-form) — refresh, log in, reopen the form, retry.`);
         const diag = await reportPageErrors(null);
@@ -2958,6 +2986,18 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (d) Terminal page with no Save & Continue (not the review marker — unusual). ──
       const navAfter = await cdpEval(cdpReadSessionState);
+      // A soft-error that surfaced DURING the fill ("randomly when filling the page") leaves no footer
+      // Next button → without this it would MIShalt at "no-next-button". Reload (→ page 1) + restart.
+      if (navAfter && looksLikeWorkdaySoftError(navAfter)) {
+        if (reloadsUsed >= MAX_RELOAD_RETRIES) {
+          LOG(`⛔ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") mid-fill on page ${page} PERSISTS after ${reloadsUsed} reload(s) — halting. Refresh the page manually and re-run.`);
+          return { ok: true, stopped: "workday-soft-error", workday_soft_error: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+        }
+        reloadsUsed++;
+        LOG(`⟳ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") mid-fill on page ${page} — reloading (Workday returns to page 1) + RESTARTING the fill walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}).`);
+        await reloadAndSettle(LOG);
+        continue restartWalk;
+      }
       if (!navAfter || !navAfter.nextButtonPresent) {
         LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
         return { ok: true, stopped: "no-next-button", pages_filled: pagesFilled.length, pages: pagesFilled };
@@ -2978,6 +3018,18 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       if (res.maintenance) {
         LOG(`⛔ WORKDAY PLANNED MAINTENANCE after Save & Continue on page ${page} ("Workday is currently unavailable") — NOT a dead session. Retry after the maintenance window.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
+      if (res.softError) {
+        // Transient "Something went wrong / please refresh" surfaced during the Save & Continue transition
+        // → reload (→ page 1) + RESTART the walk from page 1, bounded. (Same budget as a render-flake.)
+        if (reloadsUsed >= MAX_RELOAD_RETRIES) {
+          LOG(`⛔ WORKDAY SOFT-ERROR after Save & Continue on page ${page} PERSISTS after ${reloadsUsed} reload(s) — halting. Refresh the page manually and re-run.`);
+          return { ok: true, stopped: "workday-soft-error", workday_soft_error: true, pages_filled: pagesFilled.length, pages: pagesFilled };
+        }
+        reloadsUsed++;
+        LOG(`⟳ WORKDAY SOFT-ERROR ("Something went wrong / please refresh") after Save & Continue on page ${page} — reloading (Workday returns to page 1) + RESTARTING the fill walk from page 1 (reload ${reloadsUsed}/${MAX_RELOAD_RETRIES}).`);
+        await reloadAndSettle(LOG);
+        continue restartWalk;
       }
       if (res.sessionDead) {
         LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`);

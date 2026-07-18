@@ -2269,3 +2269,39 @@ scraper had to learn from tracing it:
 Approach that fell out: pass the bundle's claimed values as HINTS, value-anchor each onto the page, and
 reconcile by presence (distinctive values) + label-anchoring (short values / checkboxes). See
 `cdpReadReviewPage` / `reconcileReviewPage` and progress-log 2026-07-07.
+
+## 2026-07-17 — Magna wd3: the TRANSIENT soft-error page ("Something went wrong / Please refresh") — fingerprint + the apology-marker gotcha
+
+**Why:** Workday intermittently serves a transient "Something went wrong / Please refresh the page and
+then try again." page — live-seen **right after login** (title "Create Account") and observed to also pop
+up **after Save & Continue / randomly while filling**. Onboarding already reloaded on it
+(`maybeRefresh`/`isWorkdaySoftError` over the full-bodyText `cdpOnboardScan`); the WALKS did not. Captured
+LIVE with `RUN_CDP_PAGE_RECON` (`cdp-page-recon` → `cdpPageIdentityDump`).
+
+**Live dump (verbatim, trimmed):**
+- url: `…/apply/applyManually?utm_source=Simplify&ref=Simplify` · host `wd3.myworkdaysite.com`
+- **title: `"Create Account"`** · readyState complete · httpStatus(nav) 200
+- **formFields: 0** · passwordField: false · distinct automation-ids: 30
+- MARKERS: `{"apology":false,"login":false,"maintenance":false,"noForm":true,"sessionExpired":false,"vpsError":false,"workdayAdmin":false}`
+- **headings: `[{"tag":"H1","text":""},{"tag":"H2","text":"Junior Full Stack Developer Coop"},{"tag":"H1","text":"Something went wrong"}]`** ← the load-bearing structural marker
+- automation-ids INCLUDE **`applyFlowPage`** (the shell is still mounted), `progressBar`/`progressBarActiveStep` (step 1 of 5), header/footer chrome — but NO `pageFooterNextButton`, NO `formField-*`.
+- body text (whitespace-collapsed): `…step 5 of 5 Review Something went wrong Please refresh the page and then try again. Follow Us…` — the "Something went wrong" line sits **after** the cookie banner + 5-step nav, roughly char ~500.
+
+**Two gotchas that shaped the detector:**
+1. **`apology` reads `false`.** The recon's `apology` marker is `/we apologize for the inconvenience/` —
+   MAINTENANCE-specific. This page's apology is literally "Something went wrong", so any detection keyed
+   off `apology`/`maintenance` MISSES it. The reliable signals are the **`<h1>Something went wrong</h1>`**
+   heading + the body-text pair (apology cue AND refresh cue).
+2. **The 500-char `bodyTextSample` can truncate BEFORE the phrase.** Because the cookie banner + step nav
+   eat the first ~500 chars, `cdpReadSessionState`'s `bodyTextSample` may not contain "Something went
+   wrong". So the new **`softErrorPresent`** marker is computed off the FULL 20k-char `bodyText` (plus the
+   `<h1>` belt), NOT the sample.
+
+**`sessionLooksDead` does NOT misfire here** — `applyFlowPagePresent:true` keeps it out of the no-form
+branch. BUT a soft-error page that lacks the shell WOULD read as dead, so `looksLikeWorkdaySoftError` is
+checked BEFORE `sessionLooksDead` everywhere (the same ordering discipline as `isWorkdayMaintenance`).
+
+**Fix:** `cdpReadSessionState` now emits `softErrorPresent`; pure `looksLikeWorkdaySoftError(state)`
+(lib.js) → RELOAD (→ page 1) + RESTART the walk, bounded by `MAX_RELOAD_RETRIES`, in both walks
+(top-of-iteration + mid-fill + post-Save&Continue). Unit-pinned in `test/session.test.js` (incl. the
+truncated-sample case + the before-sessionLooksDead ordering invariant).
