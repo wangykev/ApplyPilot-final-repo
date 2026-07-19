@@ -359,6 +359,8 @@ how-verified), one commit each so the project stays bisectable.
 
 This file keeps the standing design + contracts; `docs/status.md` keeps the open work.
 
+- **M10 — Match score page (`/app/match`)** *(built; live-verify pending)*: the "should I even apply?" signal, on the site (moved off the extension side). `lib/score.ts` (pure — `buildScorePrompt` rubric adapted from `ApplyPilot-oss-reference/src/applypilot/scoring/scorer.py`; `buildCandidateSummary` EXCLUDES PII / demographics / work-auth so none enters the prompt; tolerant `parseScoreReply`; code-side `verdictForScore` bucket). `scoreMatch` server action (profile + pasted JD → the user's LLM via `callLLM`, mirrors `generateCoverLetter`); `MatchPanel` + `page.tsx` render a 1–10 score + strong/moderate/weak verdict light + matched / gaps / ATS-keyword lists; sidebar entry. `test/score.test.ts` (11 tests, `tsx --test`); web typecheck + production build green. Reuses the P5 cover-letter pattern; distinct from the pending resume *variants* piece. **Live-verify:** `/app/match` with an AI key set → paste a posting → plausible score + gaps (needs Supabase + AI key).
+
 ## Design directions (under review)
 
 Operator chose the **flight-deck** direction (dark + amber instrument panel). The set is now four
