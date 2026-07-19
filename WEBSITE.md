@@ -142,12 +142,26 @@ The platform-agnostic answer store that generalizes `FIELD_MAP` + question-wordi
   wording, on every ATS.
 - **Mode B** (`value` set, no `profile_path`) — a standalone answer for the long tail; promotable later.
 
-Element shape: `{ id, profile_path, value (string[] — a candidate list), category, widget_hint, sensitive,
-questions[], selectors{} }` (`coerceBuckets` upgrades a legacy string `value`). Edited two ways in
-`ProfileEditor`: **per-field popups** (click a field label → edit the wordings that map to it, creates the
-Mode-A bucket on first use) and an **"Other remembered answers"** section — create/edit/delete **Mode-B**
-standalone buckets (wordings, a candidate-list answer via `TieredField`, a category, sensitive). **Seed:**
-new profiles are provisioned (`loadBuckets`, provision-if-null) with `STARTER_BUCKETS` — Mode-A
+Element shape: `{ id, profile_path, value (string[] — a candidate list), category, widget_hint,
+questions[], selectors{} }` (`coerceBuckets` upgrades a legacy string `value`; a legacy `sensitive` key is
+dropped on parse — deterministic bucket fills are never flagged, so buckets carry no sensitivity, and there's
+no field-type gate: the extension adapts to the LIVE form widget). `widget_hint` is now only a DISPLAY hint
+for the editor — the **"Answer type"**: **Text / Yes-No / Checkbox** (Text also covers dropdown/type-ahead via
+its candidate ladder). Edited two ways in `ProfileEditor`:
+- **per-field label popups** (`BucketFieldPopup`, shared with the teach page) — click a field label → edit the
+  wordings that map to it, creating the Mode-A bucket on first use;
+- **the remembered-answers UI** for **Mode-B** answers: a categorized answer **merges into its matching
+  profile section** (Screening / Work authorization / Self-identification / Personal information — shown as a
+  plain field below that section's inputs); a custom / Experience / Education category gets its **own card**;
+  everything else lands in **"Other remembered answers"**, the single **Add** entry point. Each answer displays
+  like a normal profile field (the question as the label + its value control — text ladder, Yes/No toggle, or a
+  checkbox — with **Advanced + delete on that same line**). An **Advanced/Add popup** works on a **draft** and
+  commits ONLY on **Done** (outside-click / Esc / X cancels; a brand-new answer is never created): it edits the
+  wordings, answer type, the answer, and the category (pick **"Other"** → type a new category **live**, no
+  separate Add — a custom category persists in the dropdown while an answer uses it). Delete is a two-step
+  inline confirm.
+
+**Seed:** new profiles are provisioned (`loadBuckets`, provision-if-null) with `STARTER_BUCKETS` — Mode-A
 wording→field bindings only, no baked answers.
 
 Matching hierarchy in the extension (`drivePageFill`): platform accelerator (Workday automation-id via
@@ -164,17 +178,25 @@ teaching cards, so they fill deterministically (no review) next time.
   `teachableCards(apps, buckets, profile, dismissed)` = every **approved + `needs_review` + bucket-eligible**
   entry with a value, deduped by normalized question, minus anything already bucketed or dismissed — read
   across the user's reviewed applications.
-- **Split-screen (`components/app/teach/`):** the **profile is physically displayed on the left**
-  (`ProfilePanel`, from `flattenProfileFields`); the current card is on the right. The recommended field is
-  **highlighted**, and **clicking any profile field files this question's wording under it** (Mode-A).
+- **Split-screen (`components/app/teach/`):** the current teach card is on the **left**; the **profile is
+  physically displayed AND editable on the right** (`ProfilePanel`, from `flattenProfileFields` + the simple
+  list sections **Skills / Employer history / Websites**). It's a **sticky, self-scrolling** column that
+  **auto-scrolls to + highlights the recommended field** when a card appears, so the card and its target field
+  stay on one screen. Clicking a field's **name** opens its wordings bucket (`BucketFieldPopup`); clicking its
+  **answer** opens an editor (`AnswerEditPopup`) that modifies the profile value and shows the **ladder** for
+  candidate/tiered fields (country / phone-code / citizenship / sources). Both persist via `saveProfile` /
+  `saveBuckets`.
 - **Recommendation precedence: `canonical_field` (the mapped home — free/exact) → the fill-time `maps_to`
   piggyback → a teach-time LLM fallback** (`recommendField` server action → `callLLM` with the user's
   `ai_config`), which fires ONLY when nothing is known (e.g. an unmapped pre-populated field). A
-  fuzzy/containment match (`isFuzzyTier`) on a known field shows a "possible typo/variant — verify" note
-  instead of an LLM guess.
-- **Actions:** file-under-recommended, **save as a new Mode-B bucket** (candidate-list value + category +
-  sensitive), add-to-an-existing-bucket, or **skip** (persisted in `profiles.teach_dismissed_json`, migration
-  `0004`, so a skipped card doesn't reappear). Writes via `saveBuckets` → synced to the extension.
+  fuzzy/containment match (`isFuzzyTier`) on a known field shows a "possible typo/variant — verify" note; a
+  recommended field that's **blank in the profile** shows a warning to add the answer.
+- **Add-to-profile actions each go through a confirm popup (`TeachAddPopup`) that previews the change:** file
+  the QUESTION wording under the recommended field (question bucket), add the ANSWER into that field's
+  value/ladder (also files the wording so it's fully taught), **save a new Mode-B answer** (candidate-list
+  value + category), or add to an existing bucket. **Skip** persists in `profiles.teach_dismissed_json`
+  (migration `0004`) so a skipped card doesn't reappear. Writes via `saveBuckets` / `saveProfile` → synced to
+  the extension.
 
 ### Attachments — private `attachments` Storage bucket (Profile v2)
 Per-specialty files + `additional_files[]` upload to a private Supabase bucket, namespaced
@@ -186,6 +208,9 @@ is a follow-up; the website owns upload/storage/management today.)*
 `{ how_did_you_hear, field_of_study, degree, gpa_range }`, each `{ preferred[], fallback }`.
 
 ### jobContext — `{ company }` (per-application).
+The standalone `/app/job` editor page + its sidebar entry were removed; the value still lives in
+`profiles.job_context_json` and is fed to the extension via **Connect** and used as a default in the **Cover
+letter** page (no dedicated editor UI for now).
 
 ### AI config — `llmConfig` shape (extension `chrome.storage.local.llmConfig`)
 `{ provider: "anthropic"|"gemini"|"openai", model, apiKey, enabled }`. Model lists from `LLM_MODELS`
@@ -264,6 +289,11 @@ extension's discipline.
   **(A) Editor UX** — country / phone-code / citizenship pickers (dropdown + an Advanced-choices ▾ popup over the tiered candidates; `lib/countries.ts`); Workday-style segmented **date pickers** (year / month-year / month-day-year, emitting the same canonical strings; month is a typeable "5"→"05 — May" input); Yes/No toggles with a divider bar + bold amber selected state, no blank option (Esc clears); self-identification → dropdowns; **preferred-name** checkbox revealing first/last; websites = 3 fixed rows (LinkedIn/GitHub/Personal Website, type locked) + custom rows; bullets → one dash-bulleted **Role description** box; how-did-you-hear as a fallback list. Schema (`lib/profile-schema.ts` v2.0) gained `preferred_first_name`/`preferred_last_name`, `role_description` (replacing `bullets`), `languages[].fluent`, `certifications[].specialties[]`, `additional_files[]` — all lockstep with the extension (`prepareProfile`, `WORK_EXPERIENCE_MAP`, `CERT_NESTED`, the `preferredName--*` FIELD_MAP entries). **(B) Answer buckets** — `buckets_json` (migration `0002`) + `lib/buckets.ts` + `STARTER_BUCKETS` seed (provision-if-null) + per-field bucket popups; the extension consumes them (`buildBucketIndex`/`fillFromBucket` in `drivePageFill`, match-ladder-gated, before AI) — supersedes the `answerBank` sketch. Plus **attachments** (`0003` bucket + `POST /api/attachments/upload`; per-specialty + `additional_files`). Also fixed: `AP_SYNC_PROFILE` now MERGES `defaults` (a sync no longer wipes the extension's field_of_study/degree/gpa_range). Web typecheck + build green; extension suite 593/593.
 
 - **M9 — Review stage migrated to the website (editor + approval + round-trip)** *(built; live-verify pending)*: the review stage moved OFF the extension's `summary.html` and ONTO the site — the site is now the PRIMARY review surface. `components/app/review/ReviewEditor.tsx` is a faithful React port of `summary.js`'s editor (every widget editable, per-field/section/all approval, submit-ready gating, repeating + nested cert-specialty sections, currently-work-here / preferred-name mirrors) over the extended `reviewSummary` schema; pure transforms in `lib/review-approval.ts` (port of `summary-lib.js`) + `lib/review-model.ts`. `saveReviewBundle` autosaves edits to `applications.review_bundle_json` (RLS; recomputes approval + needs_review_count). Round-trip: the walk PUSHES its accumulated bundle on every exit (`reportApplication` in `runCdpWalk`); the extension PULLS the approved bundle before replay (`GET /api/extension/review` + `pullApprovedBundle`, writing `chrome.storage.local.reviewSummary`), so `runCdpReplayWalk`/`submitPrecondition` are UNCHANGED. `AP_SET_SESSION` carries `reviewUrl`. The extension `summary.html` stays as a fallback until this is live-verified. Extension suite 593/593; web typecheck + build green. **Live-verify:** fill → walk reports → edit/approve on `/app/tracker/[id]` → Replay pulls + would-submit (needs Supabase + `/app/connect`).
+
+- **M10 — Teach + Remembered-answers UX overhaul** *(done; web typecheck + build green, `test/teach.test.ts` 15/15)*: reworked how custom answers are authored and taught.
+  **Teach page (`/app/teach`)** — swapped the layout (card LEFT, profile RIGHT); the profile panel is now **editable in place** (click a field's name → `BucketFieldPopup` wordings; click its answer → `AnswerEditPopup` value editor with the tiered **ladder** for candidate fields), extended with the simple list sections **Skills / Employer history / Websites** (website URLs are bucketable), made a **sticky self-scrolling** column that **auto-scrolls + highlights** the recommended field, added a **blank-profile warning**, and routed every add-to-profile action through a **confirm popup** (`TeachAddPopup`: question-bucket / answer-into-field / new / existing). Extracted the shared `ProfileFieldEditor` + `BucketFieldPopup`; per-path field metadata in `lib/profile-fields.ts`.
+  **Profile page remembered answers** — a categorized Mode-B answer now **merges into its matching section** (or an own card / the "Other" card, the single **Add** entry point); each answer displays as a plain profile field with **Advanced + delete on the same line**; the **Advanced/Add popup is a draft that commits only on Done** (outside-click / Esc / X cancels); **Answer type** trimmed to **Text / Yes-No / Checkbox** (checkbox renders a real checkbox; Text covers dropdown/type-ahead via its ladder — no field-type gate, the extension adapts at fill time); custom category typed **live** (no separate Add); delete is a two-step inline confirm.
+  **Removed:** the bucket-level `sensitive` flag + checkbox (deterministic fills are never flagged — the AI-guess legally-loaded flag is separate and untouched); the standalone `/app/job` "Job context" page + its sidebar entry (value still lives in `job_context_json`, fed via Connect + Cover letter). "Screening defaults" → **"Screening"**.
 
 ## Design directions (under review)
 

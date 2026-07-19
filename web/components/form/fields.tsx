@@ -482,6 +482,7 @@ export function CandidateField({
   dropdownMode = "country",
   placeholder,
   bucketPath,
+  hideLabel,
 }: {
   label: string;
   value: string[];
@@ -492,6 +493,7 @@ export function CandidateField({
   dropdownMode?: "country" | "phone";
   placeholder?: string;
   bucketPath?: string;
+  hideLabel?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const selected =
@@ -506,8 +508,8 @@ export function CandidateField({
   const extra = value.length - 1; // fallbacks beyond the primary
   return (
     <div className="group">
-      <FieldLabel bucketPath={bucketPath} bucketWidget={mode === "dropdown" ? "dropdown" : "typeahead"}>{label}</FieldLabel>
-      <div className="relative mt-1.5">
+      {!hideLabel && <FieldLabel bucketPath={bucketPath} bucketWidget={mode === "dropdown" ? "dropdown" : "typeahead"}>{label}</FieldLabel>}
+      <div className={clsx("relative", !hideLabel && "mt-1.5")}>
         {mode === "dropdown" && countries && expand ? (
           <select
             value={selected}

@@ -27,8 +27,6 @@ export const bucketSchema = z.object({
   category: z.string().default(""),
   /** text | dropdown | radio | typeahead | checkbox (essays/files are never bucketed). */
   widget_hint: z.string().default(""),
-  /** EEO/legal — drives the review provenance badge + a save-time warning. */
-  sensitive: z.boolean().default(false),
   /** The question wordings (raw, human-readable) that resolve to this answer. */
   questions: z.array(z.string()).default([]),
   /** Optional per-platform stable-selector accelerators (workday automation-ids, etc.). */
@@ -91,7 +89,6 @@ export const STARTER_BUCKETS: Bucket[] = [
     value: [],
     category: "",
     widget_hint: "radio",
-    sensitive: false,
     questions: [
       "Are you legally authorized to work in the United States?",
       "Are you authorized to work in the US?",
@@ -105,7 +102,6 @@ export const STARTER_BUCKETS: Bucket[] = [
     value: [],
     category: "",
     widget_hint: "radio",
-    sensitive: false,
     questions: ["Are you at least 18 years of age?", "Are you over the age of 18?"],
     selectors: {},
   },
@@ -115,7 +111,6 @@ export const STARTER_BUCKETS: Bucket[] = [
     value: [],
     category: "",
     widget_hint: "dropdown",
-    sensitive: true,
     questions: ["Gender", "What is your gender?"],
     selectors: {},
   },

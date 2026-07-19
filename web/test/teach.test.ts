@@ -19,7 +19,7 @@ import type { Bucket } from "@/lib/buckets";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 const bucket = (over: Partial<Bucket>): Bucket => ({
-  id: "b", profile_path: "", value: [], category: "", widget_hint: "text", sensitive: false, questions: [], selectors: {}, ...over,
+  id: "b", profile_path: "", value: [], category: "", widget_hint: "text", questions: [], selectors: {}, ...over,
 });
 const entry = (over: Partial<ReviewEntry>): ReviewEntry => ({
   field_id: "f", question_label: "Q?", widget_type: "dropdown", flag: "ai-choice", needs_review: true, is_approved: true, current_value: "Yes", ...over,
@@ -99,13 +99,13 @@ test("ensureModeABucket: an existing path returns it; a new path creates a Mode-
 });
 
 test("createModeBBucket: unique id, filters empty candidates, defaults category", () => {
-  const r1 = createModeBBucket([], { question: "Clearance?", value: ["No", ""], category: "", widget_hint: "radio", sensitive: false });
+  const r1 = createModeBBucket([], { question: "Clearance?", value: ["No", ""], category: "", widget_hint: "radio" });
   const b1 = r1.buckets.find((b) => b.id === r1.bucketId)!;
   assert.deepEqual(b1.value, ["No"]);
   assert.equal(b1.category, "Other");
   assert.deepEqual(b1.questions, ["Clearance?"]);
   assert.equal(b1.profile_path, "");
-  const r2 = createModeBBucket(r1.buckets, { question: "Clearance?", value: ["Yes"], category: "Screening", widget_hint: "radio", sensitive: true });
+  const r2 = createModeBBucket(r1.buckets, { question: "Clearance?", value: ["Yes"], category: "Screening", widget_hint: "radio" });
   assert.notEqual(r2.bucketId, r1.bucketId, "second create of the same question gets a distinct id");
 });
 

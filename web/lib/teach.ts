@@ -138,14 +138,14 @@ export function ensureModeABucket(buckets: Bucket[], path: string, widget: strin
   const existing = buckets.find((b) => b.profile_path.trim() === p);
   if (existing) return { buckets, bucketId: existing.id };
   const bucketId = "field_" + p.replace(/[^\w]+/g, "_");
-  const nb: Bucket = { id: bucketId, profile_path: p, value: [], category: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} };
+  const nb: Bucket = { id: bucketId, profile_path: p, value: [], category: "", widget_hint: widget, questions: [], selectors: {} };
   return { buckets: [...buckets, nb], bucketId };
 }
 
 /** Create a new standalone (Mode-B) bucket with a unique id. Returns the new buckets + its id. */
 export function createModeBBucket(
   buckets: Bucket[],
-  spec: { question: string; value: string[]; category: string; widget_hint: string; sensitive: boolean },
+  spec: { question: string; value: string[]; category: string; widget_hint: string },
 ): { buckets: Bucket[]; bucketId: string } {
   const base = "custom_" + (normalizeQuestion(spec.question).replace(/[^\w]+/g, "_").slice(0, 40) || "answer");
   const ids = new Set(buckets.map((b) => b.id));
@@ -158,7 +158,6 @@ export function createModeBBucket(
     value: spec.value.filter((v) => v.trim() !== ""),
     category: spec.category || "Other",
     widget_hint: spec.widget_hint || "text",
-    sensitive: !!spec.sensitive,
     questions: [spec.question],
     selectors: {},
   };

@@ -1,37 +1,33 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2 } from "lucide-react";
-import { SelectField, TieredField, CheckboxField } from "@/components/form/fields";
+import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
 import { type Bucket } from "@/lib/buckets";
+import type { Profile } from "@/lib/profile-schema";
 import {
   type TeachCard,
   sameAnswer,
-  addWordingToBucket,
-  ensureModeABucket,
-  createModeBBucket,
-  bucketLabel,
   profileValueAt,
   humanize,
   isFuzzyTier,
 } from "@/lib/teach";
-import { saveBuckets } from "@/app/app/profile/actions";
+import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
 import { saveDismissed, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
-
-const CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal", "Experience", "Education", "Other"];
-const opt = (vals: string[]) => vals.map((v) => ({ value: v, label: v }));
+import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
+import { TeachAddPopup, type AddKind, type AddResult } from "@/components/app/teach/TeachAddPopup";
 
 export function TeachInbox({
   initialCards,
   initialBuckets,
   initialDismissed,
-  profile,
+  profile: initialProfile,
 }: {
   initialCards: TeachCard[];
   initialBuckets: Bucket[];
   initialDismissed: string[];
-  profile: unknown;
+  profile: Profile;
 }) {
   const [cards, setCards] = useState<TeachCard[]>(initialCards);
   const [done, setDone] = useState(0);
@@ -39,17 +35,38 @@ export function TeachInbox({
   const [dismissed, setDismissed] = useState<string[]>(initialDismissed);
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  const [mode, setMode] = useState<"root" | "new" | "existing">("root");
-  const [newCat, setNewCat] = useState("Other");
-  const [newValue, setNewValue] = useState<string[]>([]);
-  const [newSensitive, setNewSensitive] = useState(false);
-  const [pickId, setPickId] = useState("");
+  const [addPopup, setAddPopup] = useState<{ kind: AddKind } | null>(null);
   // teach-time AI fallback: recommendation per card.key for cards with no stamped maps_to hint
   const [recCache, setRecCache] = useState<Record<string, FieldRecommendation>>({});
   const [recLoading, setRecLoading] = useState(false);
 
+  // ── editable profile (the panel on the right) — edited in place, like the real profile page ──
+  const [profile, setProfile] = useState<Profile>(initialProfile);
+  const profileRef = useRef(profile); // latest value for the save-on-close of the answer popup
+  const [bucketPopup, setBucketPopup] = useState<{ path: string; label: string; widget: string } | null>(null);
+  const [answerPopup, setAnswerPopup] = useState<{ path: string; label?: string } | null>(null);
+  const [panelNote, setPanelNote] = useState<string | null>(null);
+
+  // persist a profile-panel edit (answer value or a field's question bucket). Shows a small note; does
+  // NOT touch the teach-card `saving`/advance flow.
+  const persistProfile = async (p: Profile) => {
+    const r = await saveProfile(p);
+    setPanelNote(r.ok ? "Saved ✓" : `Couldn't save: ${r.error}`);
+  };
+  const persistBuckets = async (b: Bucket[]) => {
+    const r = await saveBuckets(b);
+    setPanelNote(r.ok ? "Saved ✓" : `Couldn't save: ${r.error}`);
+  };
+  const onAnswerChange = (next: Profile) => {
+    profileRef.current = next;
+    setProfile(next);
+  };
+  const closeAnswer = () => {
+    setAnswerPopup(null);
+    void persistProfile(profileRef.current);
+  };
+
   const card = cards[0] || null;
-  const bucketedPaths = new Set(buckets.filter((b) => b.profile_path.trim() !== "").map((b) => b.profile_path.trim()));
 
   // The recommendation, in precedence order: the field's KNOWN mapped home (canonical_field) →
   // the fill-time AI hint (maps_to) → the teach-time LLM fallback (only when nothing is known).
@@ -82,17 +99,39 @@ export function TeachInbox({
   const advance = () => {
     setCards((c) => c.slice(1));
     setDone((d) => d + 1);
-    setMode("root");
-    setPickId("");
   };
 
-  const commit = async (next: Bucket[], toast: string) => {
-    setBuckets(next);
+  // Commit a confirmed "add to profile" from the teach popup: persist the changed store(s), then
+  // advance to the next card. Saves buckets first, then the profile.
+  const commitAdd = async (r: AddResult) => {
     setSaving(true);
-    const res = await saveBuckets(next);
+    let ok = true;
+    let err = "";
+    if (r.buckets) {
+      setBuckets(r.buckets);
+      const res = await saveBuckets(r.buckets);
+      if (!res.ok) {
+        ok = false;
+        err = res.error;
+      }
+    }
+    if (ok && r.profile) {
+      setProfile(r.profile);
+      profileRef.current = r.profile;
+      const res = await saveProfile(r.profile);
+      if (!res.ok) {
+        ok = false;
+        err = res.error;
+      }
+    }
     setSaving(false);
-    setNote(res.ok ? toast : `Couldn't save: ${res.ok ? "" : res.error}`);
-    if (res.ok) advance();
+    if (ok) {
+      setNote(r.toast);
+      setAddPopup(null);
+      advance();
+    } else {
+      setNote(`Couldn't save: ${err}`);
+    }
   };
 
   const skip = () => {
@@ -105,33 +144,9 @@ export function TeachInbox({
     advance();
   };
 
-  // File the current question's wording under a profile field (Mode-A) — from the panel click or the
-  // "file under" shortcut. Creates the Mode-A bucket if needed.
-  const fileUnder = (path: string) => {
-    if (!card || saving) return;
-    const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
-    void commit(addWordingToBucket(withB, bucketId, card.question), `Filed under ${humanize(path)} ✓`);
-  };
-
-  const openNew = (c: TeachCard) => {
-    setNewCat(CATEGORIES.includes(recCat) ? recCat : "Other");
-    setNewValue([c.answer]);
-    setNewSensitive(c.sensitive);
-    setMode("new");
-  };
-
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-      {/* LEFT — the profile, physically displayed + clickable */}
-      <ProfilePanel
-        profile={profile}
-        highlightPath={recPath}
-        bucketedPaths={bucketedPaths}
-        onPick={fileUnder}
-        disabled={saving || !card}
-      />
-
-      {/* RIGHT — the current teach card */}
+      {/* LEFT — the current teach card */}
       {!card ? (
         <div className="bezel flex flex-col items-center justify-center px-6 py-14 text-center">
           <Sparkles className="h-6 w-6 text-amber" />
@@ -170,7 +185,7 @@ export function TeachInbox({
               )}
             </div>
 
-            {/* AI recommendation — the fill-time hint or the teach-time fallback */}
+            {/* AI recommendation — where this answer maps + the add-to-profile actions (each confirmed in a popup) */}
             {recLoading ? (
               <div className="mt-4 flex items-center gap-2 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5 text-xs text-ink-dim">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" /> Finding the matching field…
@@ -179,104 +194,117 @@ export function TeachInbox({
               <div className="mt-4 rounded-lg border border-amber/30 bg-amber/5 px-3 py-2.5">
                 <p className="text-xs text-ink-dim">
                   Looks like your <span className="font-medium text-ink">{humanize(recPath)}</span>
-                  {" — "}your profile has <span className="font-mono text-ink">{recProfileValue || "—"}</span>{" "}
-                  <span className="text-ink-faint">(highlighted on the left).</span>
+                  {recProfileValue ? (
+                    <>
+                      {" — "}your profile has <span className="font-mono text-ink">{recProfileValue}</span>{" "}
+                      <span className="text-ink-faint">(highlighted on the right).</span>
+                    </>
+                  ) : (
+                    <span className="text-ink-faint"> (highlighted on the right).</span>
+                  )}
                 </p>
+                {/* blank-profile warning: the AI mapped this answer to a field that's empty in the profile */}
+                {!recProfileValue && (
+                  <p className="mt-1.5 text-xs text-signal">
+                    ⚠ Your profile has no value for {humanize(recPath)} yet — add your answer so it fills next time.
+                  </p>
+                )}
                 {fuzzy ? (
                   <p className="mt-1.5 text-xs text-signal">⚠ Matched by a near match (possible typo/variant) — verify it&apos;s the same answer.</p>
-                ) : !matches ? (
-                  <p className="mt-1.5 text-xs text-ink-faint">Your answer differs from that field&apos;s value — verify, or save it as a new answer below.</p>
+                ) : recProfileValue && !matches ? (
+                  <p className="mt-1.5 text-xs text-ink-faint">Your answer differs from that field&apos;s value — add it, or save it as a new answer.</p>
                 ) : null}
-                <button onClick={() => fileUnder(recPath)} className="btn-primary mt-2.5" disabled={saving}>
-                  <Check className="h-4 w-4" />
-                  File under {humanize(recPath)}
-                </button>
+                <div className="mt-2.5 flex flex-wrap gap-2">
+                  {(!recProfileValue || !matches) && (
+                    <button onClick={() => setAddPopup({ kind: "field" })} className="btn-primary" disabled={saving}>
+                      <Check className="h-4 w-4" />
+                      Add to your {humanize(recPath)}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setAddPopup({ kind: "wording" })}
+                    className={!recProfileValue || !matches ? "btn-ghost px-3 py-1.5 text-sm" : "btn-primary"}
+                    disabled={saving}
+                  >
+                    <Check className="h-4 w-4" />
+                    File wording under {humanize(recPath)}
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="mt-4 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
                 <p className="text-xs text-ink-dim">
                   AI didn&apos;t find a matching field — this looks like a <span className="font-medium text-ink">new answer</span>. Save it
-                  below, or click a field on the left to file it there.
+                  below, or click a field on the right to edit your profile.
                 </p>
               </div>
             )}
 
-            {mode === "root" && (
-              <div className="mt-4 flex flex-wrap gap-2">
-                <button onClick={() => openNew(card)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                  <Plus className="h-3.5 w-3.5" />
-                  Save as a new answer
+            {/* always-available add routes — each opens a confirm popup */}
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button onClick={() => setAddPopup({ kind: "new" })} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+                <Plus className="h-3.5 w-3.5" />
+                Save as a new answer
+              </button>
+              {buckets.length > 0 && (
+                <button onClick={() => setAddPopup({ kind: "existing" })} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+                  Add to an existing answer…
                 </button>
-                {buckets.length > 0 && (
-                  <button onClick={() => setMode("existing")} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                    Add to an existing answer…
-                  </button>
-                )}
-              </div>
-            )}
-
-            {mode === "new" && (
-              <div className="mt-4 space-y-4 rounded-lg border border-hairline bg-panel-raised/30 p-4">
-                <p className="eyebrow">New saved answer</p>
-                <TieredField label="Answer" value={newValue} onChange={setNewValue} placeholder="the answer — add fallbacks for other tenants' wordings" />
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                  <SelectField label="Category" value={newCat} options={opt(CATEGORIES)} onChange={setNewCat} />
-                  <div className="flex items-end pb-1">
-                    <CheckboxField label="Sensitive (EEO / legal)" checked={newSensitive} onChange={setNewSensitive} />
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() =>
-                      commit(
-                        createModeBBucket(buckets, {
-                          question: card.question,
-                          value: newValue,
-                          category: newCat,
-                          widget_hint: card.widget,
-                          sensitive: newSensitive,
-                        }).buckets,
-                        "Saved as a new answer ✓",
-                      )
-                    }
-                    className="btn-primary"
-                    disabled={saving || newValue.length === 0}
-                  >
-                    <Check className="h-4 w-4" />
-                    Save new answer
-                  </button>
-                  <button onClick={() => setMode("root")} className="btn-ghost px-3 py-1.5 text-sm">
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {mode === "existing" && (
-              <div className="mt-4 space-y-3 rounded-lg border border-hairline bg-panel-raised/30 p-4">
-                <SelectField
-                  label="Add this question's wording to"
-                  value={pickId}
-                  options={[{ value: "", label: "Choose an answer…" }, ...buckets.map((b) => ({ value: b.id, label: bucketLabel(b) }))]}
-                  onChange={setPickId}
-                />
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => commit(addWordingToBucket(buckets, pickId, card.question), "Added the wording ✓")}
-                    className="btn-primary"
-                    disabled={saving || !pickId}
-                  >
-                    <Check className="h-4 w-4" />
-                    Add wording
-                  </button>
-                  <button onClick={() => setMode("root")} className="btn-ghost px-3 py-1.5 text-sm">
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
+      )}
+
+      {/* RIGHT — the profile, physically displayed + editable in place */}
+      <ProfilePanel
+        profile={profile}
+        highlightPath={recPath}
+        note={panelNote}
+        onOpenBucket={(path, label, widget) => setBucketPopup({ path, label, widget })}
+        onOpenAnswer={(path, label) => setAnswerPopup({ path, label })}
+      />
+
+      {/* advanced options — the question wordings that map to a field's answer */}
+      {bucketPopup && (
+        <BucketFieldPopup
+          path={bucketPopup.path}
+          label={bucketPopup.label}
+          widget={bucketPopup.widget}
+          buckets={buckets}
+          onBucketsChange={(next) => {
+            setBuckets(next);
+            void persistBuckets(next);
+          }}
+          onClose={() => setBucketPopup(null)}
+        />
+      )}
+
+      {/* modify an answer (with the ladder, where one exists) */}
+      {answerPopup && (
+        <AnswerEditPopup
+          profile={profile}
+          path={answerPopup.path}
+          label={answerPopup.label}
+          onChange={onAnswerChange}
+          onClose={closeAnswer}
+        />
+      )}
+
+      {/* add the current teach card to the profile — preview + confirm */}
+      {addPopup && card && (
+        <TeachAddPopup
+          kind={addPopup.kind}
+          card={card}
+          buckets={buckets}
+          profile={profile}
+          recPath={recPath}
+          recLabel={recPath ? humanize(recPath) : ""}
+          recCat={recCat}
+          saving={saving}
+          onConfirm={commitAdd}
+          onClose={() => setAddPopup(null)}
+        />
       )}
     </div>
   );
