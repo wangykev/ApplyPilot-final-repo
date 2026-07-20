@@ -5711,9 +5711,12 @@ function makeFakeTreeAct(tree, opts) {
     // (banner = the category name, the drill-confirmation).
     scrapeSourceRows: async (loc) => {
       log.push(["scrapeSourceRows", loc && loc.wrapperSel]);
+      // o.scrapeCatsEmpty models a tenant (Magna wd3) whose CATEGORY rows are role=option/treeitem, NOT
+      // promptOptions — so the promptOption-only scrape returns 0 categories on-open (readTreeCategories
+      // still sees them). Leaves after a drill are promptOptions → scraped normally.
       return expanded
         ? { ok: true, options: leavesOf(), banner: expanded, atBottom: true }
-        : { ok: true, options: tree.categories.slice(), banner: "No matches found", atBottom: true };
+        : { ok: true, options: o.scrapeCatsEmpty ? [] : tree.categories.slice(), banner: o.scrapeCatsEmpty ? "" : "No matches found", atBottom: true };
     },
     expandCategory: async (loc, label) => {
       if (!tree.categories.includes(label)) return false;
@@ -5766,6 +5769,17 @@ test("aiTreeDrillFallback: category + leaf → CLICK-drills + TYPE-commits the m
   assert.strictEqual(out.tree_structure.chosen, "Multiple Recognized Providers");
   assert.ok(act.log.some(([m]) => m === "expand"), "CLICK-drilled the category (not typed)");
   assert.ok(act.log.some(([m]) => m === "typeInSourceSearch"), "committed the leaf by TYPING (the unified type-commit, not clickTreeLeaf)");
+});
+
+test("aiTreeDrillFallback: promptOption scrape finds 0 categories (role=option tenant) → falls back to readTreeCategories, STILL drills + commits (never returns null)", async () => {
+  const act = makeFakeTreeAct(CERT_TREE, { scrapeCatsEmpty: true, ai: [
+    '{"choice":"Multiple Recognized Providers","confidence":"High"}',
+    '{"choice":"Certified Payroll Professional (CPP)","confidence":"High"}',
+  ] });
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {}, isRequired: true, label: "How Did You Hear About Us?", sourceTree: true }, T_BUDGETS);
+  assert.ok(out && out.status === "filled_review", "drilled via the readTreeCategories fallback instead of returning null (the Magna source bug)");
+  assert.strictEqual(out.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers");
+  assert.ok(act.log.some(([m]) => m === "expand"), "the category→leaf drill actually ran");
 });
 
 test("aiTreeDrillFallback: AI picks 'Other' → commits the suffixed Other leaf (ai-choice)", async () => {

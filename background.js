@@ -2130,12 +2130,29 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       if (decision.action === "refill") {
         const f = scan.fields.find((x) => x.fieldName === decision.field);
         if (f) {
-          const r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+          let r, refillNote;
+          if (f.widgetType === "hierarchical") {
+            // Source is a click-TREE — NEVER flat-type the AI's guess ("job boards" is what that produced).
+            // Re-run the ordered drill from the profile's how_did_you_hear fallback (LinkedIn first) WITH
+            // the tree-drill AI context, so it drills category → recon leaves → pick leaf → commit. Required.
+            const hdyh = (prepared && prepared.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
+            const cands = hdyh && Array.isArray(hdyh.preferred)
+              ? [...hdyh.preferred, ...(hdyh.fallback ? [hdyh.fallback] : [])]
+              : [decision.value];
+            const aiForSource = act.aiEnabled
+              ? { profile: prepared, jobContext, isRequired: true, label: f.label, fieldName: f.fieldName, sourceTree: true }
+              : undefined;
+            r = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, cands, DEFAULT_BUDGETS, { ai: aiForSource });
+            refillNote = `AI-4 Tier-2 re-drill source from how_did_you_hear [${cands.slice(0, 3).join(", ")}…] — `;
+          } else {
+            r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+            refillNote = `AI-4 Tier-2 refill "${decision.value}" — `;
+          }
           mergeRemediationRecord(out, Object.assign({ fieldName: f.fieldName, label: f.label, widgetType: f.widgetType }, r, {
             flag: "ai-remediation", status: r.status === "filled" ? "filled_review" : r.status,
-            detail: `AI-4 Tier-2 refill "${decision.value}" — ` + (r.detail || decision.reason || "")
+            detail: refillNote + (r.detail || decision.reason || "")
           }));
-          actions.push({ tier: 2, action: "refill", field: decision.field, value: decision.value });
+          actions.push({ tier: 2, action: "refill", field: decision.field, value: f.widgetType === "hierarchical" ? "(source drill)" : decision.value });
           didSomething = true;
         } else { LOG(`    AI named field "${decision.field}" not on the page — skipping.`); }
       } else if (decision.action === "delete_entry") {

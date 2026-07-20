@@ -2036,6 +2036,14 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
     let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
     categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
   }
+  // Some tenants (Magna wd3) render the category rows as role="option"/treeitem nodes, NOT promptOptions,
+  // so scrapeSourceRows (promptOption-only) returns 0 and the drill would ABORT here — leaving a required
+  // source blank / flat-guessed (the "none of the drill happened" bug). readTreeCategories reads those
+  // role=option/treeitem rows too (chevron/aria heuristic), so fall back to it before giving up. This is
+  // what lets the category→click→recon-leaves→pick-leaf→commit drill actually run on a click-tree tenant.
+  if (!categories.length && act.readTreeCategories) {
+    try { const tc = await act.readTreeCategories(loc); if (Array.isArray(tc) && tc.length) categories = tc.slice(); } catch (e) { /* keep empty */ }
+  }
   if (!categories.length) return null; // no options visible → caller's needs_review (never guess blind)
 
   // PROMPT 1 — pick the CATEGORY (the one most likely to CONTAIN the applicant's stated answer, or — with no

@@ -712,10 +712,23 @@ CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
   diffed); `selectPageBundleEntries` was NOT at fault — it matched the (wrong, still-page-1) fields it
   was handed.
 
+- **Source ("How did you hear about us?") tree never drilled on Magna → left blank / flat-guessed.** The
+  category→click→recon-leaves→pick-leaf→commit drill lives only in `aiTreeDrillFallback`, and it enumerated
+  categories via `scrapeSourceRows` (reads `promptOption` nodes ONLY). Magna renders its category rows as
+  `role=option`/`treeitem` nodes → the scrape returned 0 → the drill ABORTED to `null` before clicking →
+  the flat "no candidate produced a verified chip" exit → required-source error → the AI-4 remediation
+  then FLAT-TYPED a guess ("job boards") because `refillFieldWithValue`'s hierarchical branch passed no
+  tree context. Two fixes: (1) `aiTreeDrillFallback` falls back to `readTreeCategories` (which reads the
+  `role=option`/`treeitem` rows) when the promptOption scrape finds 0 categories, so the drill actually
+  runs (category → `expandCategory` → recon leaves → pick → commit); (2) the AI-4 remediation of a
+  hierarchical `source` re-runs the drill from the profile's `how_did_you_hear` fallback (LinkedIn first)
+  with the tree-drill AI context, instead of flat-typing the LLM's guess. New test: a 0-category
+  promptOption scrape falls back to `readTreeCategories` and still drills+commits.
+
 (The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
 toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
 
-Verified: extension suite (minus `db`, uninstalled dep) **603/603** incl. new `samePhysicalPage`,
+Verified: extension suite (minus `db`, uninstalled dep) **604/604** incl. new `samePhysicalPage`,
 `accumulateBundle`-overwrite, and broadened `isTransientRenderFailure` tests. **Live-verify PENDING**
 (eyes-on, disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a
 real Workday page.
