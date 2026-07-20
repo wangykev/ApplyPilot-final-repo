@@ -11,22 +11,41 @@ import { clsx } from "@/lib/clsx";
 
 export function AiConfigForm({ initial }: { initial: AiConfig }) {
   const [cfg, setCfg] = useState<AiConfig>(initial);
+  const [savedCfg, setSavedCfg] = useState<AiConfig>(initial); // last persisted value — the dirty baseline
   const [showKey, setShowKey] = useState(false);
   const [saving, startSave] = useTransition();
   const [testing, setTesting] = useState(false);
   const [saveMsg, setSaveMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [testMsg, setTestMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
+  // Only allow Save when the config actually DIFFERS from what's stored (no redundant write + sync).
+  const dirty =
+    cfg.provider !== savedCfg.provider ||
+    cfg.model !== savedCfg.model ||
+    cfg.apiKey !== savedCfg.apiKey ||
+    cfg.enabled !== savedCfg.enabled;
+
+  // Any edit invalidates the stale "Saved ✓" note.
+  const edit = (updater: (c: AiConfig) => AiConfig) => {
+    setCfg(updater);
+    setSaveMsg(null);
+  };
+
   const setProvider = (p: string) => {
     const provider = p as LlmProvider;
-    setCfg((c) => ({ ...c, provider, model: LLM_DEFAULT_MODELS[provider] }));
+    edit((c) => ({ ...c, provider, model: LLM_DEFAULT_MODELS[provider] }));
   };
 
   const save = () =>
     startSave(async () => {
       setSaveMsg(null);
       const res = await saveAiConfig(cfg);
-      setSaveMsg(res.ok ? { kind: "ok", text: "Saved" } : { kind: "err", text: res.error });
+      if (res.ok) {
+        setSavedCfg(cfg); // now clean — Save disables until the next change
+        setSaveMsg({ kind: "ok", text: "Saved" });
+      } else {
+        setSaveMsg({ kind: "err", text: res.error });
+      }
     });
 
   const test = async () => {
@@ -63,7 +82,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
             role="switch"
             aria-checked={cfg.enabled}
             aria-label="AI fill"
-            onClick={() => setCfg((c) => ({ ...c, enabled: !c.enabled }))}
+            onClick={() => edit((c) => ({ ...c, enabled: !c.enabled }))}
             className={clsx(
               "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full outline-none transition-colors",
               "focus-visible:ring-2 focus-visible:ring-amber/60 focus-visible:ring-offset-2 focus-visible:ring-offset-panel",
@@ -85,7 +104,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
             label="Model"
             value={cfg.model}
             options={modelOptions}
-            onChange={(v) => setCfg((c) => ({ ...c, model: v }))}
+            onChange={(v) => edit((c) => ({ ...c, model: v }))}
           />
         </div>
 
@@ -95,7 +114,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
             <input
               type={showKey ? "text" : "password"}
               value={cfg.apiKey}
-              onChange={(e) => setCfg((c) => ({ ...c, apiKey: e.target.value }))}
+              onChange={(e) => edit((c) => ({ ...c, apiKey: e.target.value }))}
               placeholder="Paste your provider API key"
               autoComplete="off"
               className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
@@ -112,7 +131,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-3 pt-1">
-          <button onClick={save} disabled={saving} className="btn-primary">
+          <button onClick={save} disabled={saving || !dirty} className="btn-primary" title={!dirty ? "No changes to save" : undefined}>
             <Save className="h-4 w-4" />
             {saving ? "Saving…" : "Save AI config"}
           </button>
