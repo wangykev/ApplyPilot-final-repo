@@ -1,7 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useEffect, useTransition } from "react";
 import Link from "next/link";
 import { Trash2, ExternalLink } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
@@ -46,22 +45,56 @@ function fmtDate(iso: string | null): string {
 }
 
 export function TrackerPanel({ applications }: { applications: Application[] }) {
-  const router = useRouter();
+  // The list lives in client state so a background poll can PATCH it in place — a fill the extension
+  // reports appears without an F5 (no page reload, no server re-render). Seeded from the server prop.
+  const [apps, setApps] = useState<Application[]>(applications);
   const [filter, setFilter] = useState<AppStatus | "all">("all");
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<string | null>(null);
 
+  // Poll the lightweight applications endpoint (every 12s while the tab is visible + on focus) and patch
+  // the list in place. NOT a refresh: a JSON fetch → setState, only when the visible fields changed.
+  useEffect(() => {
+    const sig = (list: Application[]) =>
+      list.map((a) => `${a.id}:${a.status}:${a.needs_review_count ?? ""}:${a.company ?? ""}:${a.role ?? ""}:${a.applied_at ?? ""}`).join("|");
+    let stopped = false;
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const res = await fetch("/api/applications", { cache: "no-store" });
+        if (stopped || !res.ok) return;
+        const j = await res.json();
+        if (stopped || !j?.ok || !Array.isArray(j.applications)) return; // non-ok → leave the list untouched
+        const next = j.applications as Application[];
+        setApps((prev) => (sig(prev) === sig(next) ? prev : next));
+      } catch {
+        /* transient network — the next tick retries */
+      }
+    };
+    const id = setInterval(poll, 12000);
+    const onFocus = () => poll();
+    document.addEventListener("visibilitychange", onFocus);
+    window.addEventListener("focus", onFocus);
+    poll(); // catch up immediately on mount (e.g. arriving right after a fill)
+    return () => {
+      stopped = true;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onFocus);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+
   const counts = APP_STATUSES.reduce<Record<string, number>>((acc, s) => {
-    acc[s] = applications.filter((a) => a.status === s).length;
+    acc[s] = apps.filter((a) => a.status === s).length;
     return acc;
   }, {});
-  const shown = filter === "all" ? applications : applications.filter((a) => a.status === filter);
+  const shown = filter === "all" ? apps : apps.filter((a) => a.status === filter);
 
   const setStatus = (id: string, status: AppStatus) =>
     startTransition(async () => {
       setErr(null);
       const r = await updateApplicationStatus(id, status);
-      if (r.ok) router.refresh();
+      if (r.ok) setApps((prev) => prev.map((a) => (a.id === id ? { ...a, status } : a)));
       else setErr(r.error);
     });
 
@@ -69,12 +102,12 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
     startTransition(async () => {
       setErr(null);
       const r = await deleteApplication(id);
-      if (r.ok) router.refresh();
+      if (r.ok) setApps((prev) => prev.filter((a) => a.id !== id));
       else setErr(r.error);
     });
 
   const stats = [
-    { label: "Total", value: applications.length, color: "#E6EDF5" },
+    { label: "Total", value: apps.length, color: "#E6EDF5" },
     { label: "Needs review", value: counts.needs_review, color: "#FFB627" },
     { label: "Submitted", value: counts.submitted, color: "#36D6A0" },
     { label: "Interviewing", value: counts.interviewing, color: "#5BD2FF" },
@@ -107,7 +140,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
         subtitle="Fills in automatically as the extension reports each run. Move a card through your pipeline as things progress."
       >
         {/* filters */}
-        {applications.length > 0 && (
+        {apps.length > 0 && (
           <div className="mb-4 flex flex-wrap gap-2">
             {chips.map((c) => (
               <button
@@ -120,7 +153,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                     : "border-hairline text-ink-dim hover:text-ink"
                 )}
               >
-                {c === "all" ? `All ${applications.length}` : `${LABEL[c]} ${counts[c]}`}
+                {c === "all" ? `All ${apps.length}` : `${LABEL[c]} ${counts[c]}`}
               </button>
             ))}
           </div>
@@ -128,7 +161,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
 
         {err && <p className="mb-3 text-sm text-signal">{err}</p>}
 
-        {applications.length === 0 ? (
+        {apps.length === 0 ? (
           <div className="py-10 text-center">
             <p className="text-sm text-ink-dim">No applications yet.</p>
             <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-ink-faint">

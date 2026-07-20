@@ -2,7 +2,6 @@ import { redirect } from "next/navigation";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
 import { Sidebar } from "@/components/app/Sidebar";
-import { RefreshOnFocus } from "./RefreshOnFocus";
 
 export const dynamic = "force-dynamic";
 
@@ -34,7 +33,6 @@ export default async function AppLayout({
 
   return (
     <div className="flex min-h-screen">
-      <RefreshOnFocus />
       <Sidebar email={email} />
       <div className="min-w-0 flex-1">
         <div className="mx-auto max-w-5xl px-5 py-8 sm:px-8 sm:py-10">{children}</div>
