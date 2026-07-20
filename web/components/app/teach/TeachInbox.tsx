@@ -105,10 +105,51 @@ export function TeachInbox({
     };
   }, [card, recCache]);
 
+  // Keys the operator has already TAUGHT or SKIPPED this session — so the background poll never
+  // re-appends a card on its way out before the server persist (bucket / dismissed) catches up.
+  const handledRef = useRef<Set<string>>(new Set());
+
   const advance = () => {
+    const cur = cards[0];
+    if (cur) handledRef.current.add(cur.key);
     setCards((c) => c.slice(1));
     setDone((d) => d + 1);
   };
+
+  // Background poll: APPEND newly-teachable cards to the END of the queue (never replace/reorder) so a
+  // just-reviewed fill shows up without a refresh, WITHOUT disrupting the current card / open popups /
+  // in-progress edits. Skips anything already queued or handled this session. Every 15s while visible.
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const res = await fetch("/api/teach", { cache: "no-store" });
+        if (stopped || !res.ok) return;
+        const j = await res.json();
+        if (stopped || !j?.ok || !Array.isArray(j.cards)) return;
+        const fetched = j.cards as TeachCard[];
+        setCards((prev) => {
+          const have = new Set(prev.map((c) => c.key));
+          const add = fetched.filter((c) => c && c.key && !have.has(c.key) && !handledRef.current.has(c.key));
+          return add.length ? [...prev, ...add] : prev;
+        });
+      } catch {
+        /* transient — the next tick retries */
+      }
+    };
+    const id = setInterval(poll, 15000);
+    const onFocus = () => poll();
+    document.addEventListener("visibilitychange", onFocus);
+    window.addEventListener("focus", onFocus);
+    poll();
+    return () => {
+      stopped = true;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onFocus);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
 
   // Commit a confirmed change (from the confirm popup or the new-answer popup): persist the changed
   // store(s), then advance to the next card. Saves buckets first, then the profile.
