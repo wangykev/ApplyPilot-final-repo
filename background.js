@@ -67,7 +67,13 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     if (!message.llmConfig || typeof message.llmConfig !== "object") {
       sendResponse({ ok: false, error: "no llmConfig" }); return true;
     }
-    chrome.storage.local.set({ llmConfig: message.llmConfig }, () => {
+    // Auto-opt-in (operator ask): syncing a USABLE AI config from the website turns the extension's
+    // AI fill ON automatically — an apiKey present ⇒ enabled, so the operator doesn't have to ALSO
+    // flip the popup toggle. An explicit `enabled:false` from the website is still honored; the popup
+    // toggle can turn it off afterward (until the next sync).
+    const cfg = { ...message.llmConfig };
+    if (cfg.apiKey && cfg.enabled !== false) cfg.enabled = true;
+    chrome.storage.local.set({ llmConfig: cfg }, () => {
       const err = chrome.runtime.lastError;
       sendResponse(err ? { ok: false, error: err.message } : { ok: true });
     });
@@ -2989,7 +2995,17 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // error (sessionLooksDead already excluded above). Attempt BOUNDED remediation before the
         // dirty halt: Tier-0 dup-language / Tier-1 deterministic re-fill → Tier-2 AI, capped + halt-on-no-progress.
         if (res.errorDetected) LOG(`page ${page} Save & Continue blocked — error markers detected fast (~1s).`);
-        const rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        // OPERATOR RULE: with AI fill OFF, do NOT auto-remediate — the deterministic Tier-1/1.6 re-fill
+        // is the unwanted "refill on error" (and, pre-M-overwrite, a duplicate-page vector). Skip
+        // remediation entirely and HALT on any error the deterministic pass couldn't clear; only a
+        // harmless re-click (a SWALLOWED Save & Continue, never a re-fill) is still attempted below. AI
+        // ON keeps the full AI-4 remediation ladder.
+        let rem = { attempts: 0, advanced: false, reason: "ai-off (no remediation — halt on error)", actions: [] };
+        if (act.aiEnabled) {
+          rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        } else {
+          LOG(`page ${page} nav-timeout with AI fill OFF — NOT re-filling the page (halt-on-error, operator rule). Only a re-click for a swallowed Save & Continue will be tried.`);
+        }
         // refresh the page-summary entry with the remediation outcome
         pagesFilled[pagesFilled.length - 1].remediation = { attempts: rem.attempts, advanced: !!rem.advanced, reason: rem.reason || null, actions: rem.actions };
         if (rem.sessionDead) {
@@ -3015,7 +3031,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
           continue;
         }
-        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        LOG(`⚠ nav-timeout on page ${page} — ${act.aiEnabled ? `AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason})` : "AI fill OFF (no re-fill — operator halt-on-error rule)"} ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }

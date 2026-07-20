@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6161,15 +6161,49 @@ test("NAMED INVARIANT — submitPrecondition NEVER passes with an unresolved fla
 test("isTransientRenderFailure: all render-flakes → true; any terminal → false; no failures → false", () => {
   const flake = { status: "needs_review", detail: "options did not render (skipped_no_option_match)" };
   const flakeByFlag = { status: "needs_review", flag: "skipped_no_option_match", detail: "" };
+  // control-not-laid-out family (the replay page-2 Country-cascade race — same underlying render race)
+  const noInput = { status: "error", detail: "no input in wrapper" };
+  const noTextarea = { status: "error", detail: "no textarea in wrapper" };
+  const noTypeahead = { status: "error", detail: "typeahead wrapper not found" };
   const terminal = { status: "needs_review", detail: "no candidate matched — value not offered" };
   const ok = { status: "filled", detail: "overwrote x" };
   assert.strictEqual(isTransientRenderFailure([flake]), true);
   assert.strictEqual(isTransientRenderFailure([flake, flakeByFlag]), true);
+  assert.strictEqual(isTransientRenderFailure([noInput, noTextarea, noTypeahead]), true, "control-not-laid-out is a render race");
+  assert.strictEqual(isTransientRenderFailure([flake, noTypeahead]), true, "mixed render-races → retryable");
   assert.strictEqual(isTransientRenderFailure([flake, terminal]), false, "a mix with a genuine no-match is NOT retryable");
+  assert.strictEqual(isTransientRenderFailure([noInput, terminal]), false, "a mix with a genuine no-match is NOT retryable");
   assert.strictEqual(isTransientRenderFailure([terminal]), false);
   assert.strictEqual(isTransientRenderFailure([ok]), false, "no failures → nothing to retry");
   assert.strictEqual(isTransientRenderFailure([]), false);
   assert.strictEqual(isTransientRenderFailure(null), false);
+});
+
+test("samePhysicalPage: same pathname + overlapping field-set → same page (overwrite); disjoint → separate", () => {
+  const k = (path, fields) => path + "|" + fields.slice().sort().join(",");
+  // a cascade-revealed field persisted between fills → keys differ but it's the SAME page
+  assert.strictEqual(samePhysicalPage(k("/apply", ["country", "name", "email"]), k("/apply", ["country", "name", "email", "state"])), true);
+  // genuinely different SPA pages sharing the pathname have DISJOINT field-sets → separate
+  assert.strictEqual(samePhysicalPage(k("/apply", ["country", "name"]), k("/apply", ["workExp", "school"])), false);
+  // different pathname → never the same
+  assert.strictEqual(samePhysicalPage(k("/apply", ["a", "b"]), k("/review", ["a", "b"])), false);
+  // plain (field-less) keys only match themselves
+  assert.strictEqual(samePhysicalPage("P1", "P1"), true);
+  assert.strictEqual(samePhysicalPage("P1", "P2"), false);
+  assert.strictEqual(samePhysicalPage(null, "P1"), false);
+});
+
+test("accumulateBundle OVERWRITES a re-fill of the same page whose field-set SHIFTED (no duplicate page)", () => {
+  const k = (fields) => "/apply|" + fields.slice().sort().join(",");
+  const mk = (pageKey, fields) =>
+    buildReviewBundle(fields.map((f) => ({ fieldName: f, widgetType: "text", status: "filled", after: f.toUpperCase(), label: f })), { page: pageKey });
+  // first fill of page 1 (country blank → no cascade fields)
+  let acc = accumulateBundle([], mk(k(["country", "name"]), ["country", "name"]));
+  assert.strictEqual(acc.entries.length, 2);
+  // re-fill of the SAME page — now country is set, so `state` cascade-revealed → a DIFFERENT key
+  acc = accumulateBundle(acc.entries, mk(k(["country", "name", "state"]), ["country", "name", "state"]));
+  assert.strictEqual(acc.entries.length, 3, "the prior page-1 entries were overwritten, not duplicated");
+  assert.deepStrictEqual(acc.entries.map((e) => e.field_id.split("::").pop()).sort(), ["formField-country", "formField-name", "formField-state"]);
 });
 
 test("submitPrecondition (M6): an unapproved CASCADE-REVEALED field blocks even if it filled cleanly (needs_review false)", () => {

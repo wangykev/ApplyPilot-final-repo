@@ -4593,11 +4593,15 @@ const ACCEPTED_SCHEMA_VERSIONS = ["1.0", "1.1"]; // M4 submit gate accepts these
 
 // isTransientRenderFailure — are ALL these failing records TRANSIENT render-flakes (retryable via a page
 // RELOAD) rather than terminal (a genuine no-match / real error / session death, which must halt)? The
-// flake: a choice widget whose option list never rendered ("options did not render" /
-// "skipped_no_option_match" — a Workday render race a reload clears; live-seen on Magna page-2 language
-// proficiencies). Returns false when there are NO failures, or when ANY failure is terminal — so a reload
-// can NEVER mask a real problem. Used by both walks' bounded reload-retry (operator ask 2026-07-11). PURE.
-const RENDER_FLAKE_RX = /options did not render|skipped_no_option_match/i;
+// flake: a control that never LAID OUT before it was actuated — a choice widget whose option list never
+// rendered ("options did not render" / "skipped_no_option_match"), OR a text/typeahead whose wrapper's
+// input never mounted ("no input/textarea in wrapper" / "typeahead wrapper not found"). All are the SAME
+// Workday render/hydration race (live-seen on Magna page-2 language proficiencies AND the replay page-2
+// Country-cascade block: region/phone/postal appear ~5.6s after Country commits, past the per-field poll)
+// — a reload returns to a FRESH page where the server re-renders cleanly. Returns false when there are NO
+// failures, or when ANY failure is terminal (a genuine no-match / "value not offered") — so a reload can
+// NEVER mask a real problem. Used by both walks' bounded reload-retry (operator ask 2026-07-11). PURE.
+const RENDER_FLAKE_RX = /options did not render|skipped_no_option_match|no (input|textarea) in wrapper|typeahead wrapper not found/i;
 function isTransientRenderFailure(records) {
   const fails = (records || []).filter((r) => r && (r.status === "needs_review" || r.status === "error"));
   if (!fails.length) return false;
@@ -5017,17 +5021,44 @@ function buildReviewBundle(results, meta) {
   }, summarizeEntries(entries), { entries });
 }
 
+// Two `cdpPageKey`s (pathname + "|" + sorted field-name set) refer to the SAME physical page when
+// they share the pathname AND their field-name sets OVERLAP. This is what makes a re-fill OVERWRITE
+// instead of stacking a duplicate: filling one page twice can yield DIFFERENT keys when the field-set
+// shifted between fills (e.g. a cascade-revealed field — country→state/phone — persisted, so the 2nd
+// pre-fill scan sees it and the 1st didn't). Same-pathname SPA pages that are genuinely DIFFERENT have
+// DISJOINT field-sets (the M31 discriminator), so they never overlap → they stay separate. A plain
+// (field-less) key like a page-engine "P1" only matches itself (the `a === b` fast path). PURE.
+function samePhysicalPage(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  const split = (k) => {
+    const s = String(k);
+    const i = s.indexOf("|");
+    return i < 0 ? { path: s, fields: [] } : { path: s.slice(0, i), fields: s.slice(i + 1).split(",").filter(Boolean) };
+  };
+  const A = split(a), B = split(b);
+  if (A.path !== B.path) return false;
+  if (!A.fields.length || !B.fields.length) return false; // field-less key ⇒ only its exact self (a===b above)
+  const setB = new Set(B.fields);
+  let overlap = 0;
+  for (const f of A.fields) if (setB.has(f)) overlap++;
+  // same page if a meaningful fraction of the SMALLER field-set overlaps (a cascade adds/removes a few
+  // fields but keeps most; two different pages share ~none).
+  return overlap > 0 && overlap >= Math.min(A.fields.length, B.fields.length) * 0.5;
+}
+
 // Accumulate a page bundle into the prior entries — WRITE-PER-PAGE (the M15 decision).
-// Drop the prior entries for THIS page (by `entry.page`), KEEP all OTHER pages' entries
-// VERBATIM (a viewer EDIT on a prior page survives the next page's persist — NOT a
-// rebuild), append this page's, recompute the envelope. PURE — the SW does the I/O.
+// Drop the prior entries for THIS physical page (by `samePhysicalPage`, NOT exact key — so a re-fill
+// whose field-set shifted still OVERWRITES rather than duplicating), KEEP all OTHER pages' entries
+// VERBATIM (a viewer EDIT on a prior page survives the next page's persist — NOT a rebuild), append
+// this page's, recompute the envelope. PURE — the SW does the I/O.
 function accumulateBundle(priorEntries, pageBundle) {
   const pageKey = pageBundle.page;
   // Keep OTHER pages verbatim (edits intact) AND this page's OPERATOR-ADDED entries (2b — they
   // aren't in the engine's freshly-built page bundle, so a re-fill would otherwise drop them; the
   // future section-reconcile CREATEs them on the form). Their index sits beyond the fresh fill's
   // (nextIndexFor = max+1 at add time), so no collision with the rebuilt entries.
-  const kept = (priorEntries || []).filter((e) => e.page !== pageKey || e.is_added);
+  const kept = (priorEntries || []).filter((e) => !samePhysicalPage(e.page, pageKey) || e.is_added);
   const entries = kept.concat(pageBundle.entries || []);
   const pages = Array.from(new Set(entries.map((e) => e.page).filter((p) => p != null))).sort();
   return Object.assign({
@@ -5042,5 +5073,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
