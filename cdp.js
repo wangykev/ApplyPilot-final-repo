@@ -1949,7 +1949,14 @@ async function cdpScrapeTaOptions(wrapperSel) {
   const acEl = acId ? document.getElementById(acId) : null;
   // rAF races a setTimeout fallback so a loop never HANGS on a hidden tab (frozen rAF). Used both to WAIT
   // for the list to render (below) and to pace the virtualizer between scroll steps (see doScroll).
-  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(() => requestAnimationFrame(fin)); setTimeout(fin, 250); });
+  // SINGLE rAF (2026-07-20): was double-rAF (~32ms floor). Every caller re-checks its own gate after each
+  // frame — pickSel re-reads the option count, awaitRender re-reads the mounted-set signature — so a
+  // too-early ~16ms read just re-polls; halving the settle floor cuts the per-hop wall-clock (biggest win
+  // VISIBLE, where real scroll-paint contends with the timer callback). The setTimeout(fin, 250) fallback is
+  // UNCHANGED, so frame() still always resolves (never hangs on a frozen-rAF hidden tab). Both poll loops
+  // below give up on a WALL-CLOCK deadline (regime-independent), so this is provably no-slower than the old
+  // double-rAF path even in the hidden+CSP-blocked slow regime where frame() is fallback-bound (~1s), not rAF.
+  const frame = () => new Promise((r) => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(fin); setTimeout(fin, 250); });
   const labelOf = (el) => (el.getAttribute && el.getAttribute("data-automation-label")) || (el.textContent || "").trim();
   // A REAL option leaf: visible, not the disabled placeholder, and NOT a selectedItem CHIP. Chips carry
   // role="option" markup too (the documented chip-contamination), so they must NEVER count as options — else
@@ -1964,10 +1971,15 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // WAIT for the list to render, then pick the selector that finds REAL (non-chip) leaves. The searchBox
   // becomes visible a beat BEFORE the virtualized rows mount, so an immediate read finds only chips (0 real)
   // — that was the countryPhoneCode 0-options bug. Frame-poll until non-chip leaves appear (or a no-match
-  // banner, or a ~24-frame ceiling). FoS is already rendered when scraped mid-fill → resolves at frame 0.
+  // banner, or a ceiling). FoS is already rendered when scraped mid-fill → resolves at frame 0. The ceiling
+  // is a WALL-CLOCK ~768ms (2026-07-20: matches the old 24×double-rAF ~768ms first-render budget). Wall-clock
+  // (not an iteration count) so the ceiling is REGIME-INDEPENDENT: in the fast regime (visible / hidden+
+  // worker-timers) frame() ~16ms fits ~48 polls; in the rare hidden+CSP-blocked slow regime frame() is bound
+  // by the throttled ~1s setTimeout fallback (NOT rAF), so an iteration count would double the tail — here it
+  // does 1 frame then the deadline, provably no-slower than the old code. i<200 is a spin-guard only.
   const pickSel = () => OPT_SELECTORS.find((sel) => optsFor(sel).length) || null;
   let optSel = pickSel();
-  for (let i = 0; i < 24 && !optSel && !bannerUp(); i++) { await frame(); optSel = pickSel(); }
+  for (let t0 = Date.now(), i = 0; Date.now() - t0 < 768 && i < 200 && !optSel && !bannerUp(); i++) { await frame(); optSel = pickSel(); }
   optSel = optSel || '[role="option"]';
   const roleCount = optsFor('[role="option"]').length;                       // non-chip counts (diagnostic)
   const promptCount = optsFor('[data-automation-id="promptOption"]').length;
@@ -1993,11 +2005,14 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // (live-verified: 65/65 options, seen-count climbs with scrollTop).
   const doScroll = (top) => { if (!sc) return; sc.scrollTop = top; try { sc.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (e) {} };
   // FASTER per-step wait (2026-07-06): poll single frames until the mounted set actually CHANGES (React
-  // committed the just-scrolled window) — breaks at ~1 frame on the common steps (≈2× the old fixed
-  // double-rAF), capped at 3 (≈ the old worst case, so NEVER slower and safe for a slow commit). The
-  // sig-change IS the mount signal, so this reads a COMMITTED window — it can't advance before the mount, so
-  // it can't re-truncate; overlap + de-dup + stable-2-at-bottom still backstop completeness.
-  const awaitRender = async (beforeSig) => { for (let i = 0; i < 3; i++) { await frame(); if (curSig() !== beforeSig) return; } };
+  // committed the just-scrolled window) — breaks at ~1 frame on the common steps. The sig-change IS the mount
+  // signal, so this reads a COMMITTED window — it can't advance before the mount, so it can't re-truncate;
+  // overlap + de-dup + stable-2-at-bottom still backstop completeness. The give-up is a WALL-CLOCK ~96ms
+  // (2026-07-20: matches the old 3×double-rAF ~96ms per-hop budget). Wall-clock (not an iteration count) makes
+  // the mount-wait REGIME-INDEPENDENT: fast regime (visible / hidden+worker) frame() ~16ms → up to ~6 polls;
+  // rare hidden+CSP-blocked slow regime frame() ~1s (throttled fallback) → 1 poll then the deadline, provably
+  // no-slower than the old code (an iteration count would have doubled the stable-2 tail there). i<60 spin-guard.
+  const awaitRender = async (beforeSig) => { for (let t0 = Date.now(), i = 0; Date.now() - t0 < 96 && i < 60; i++) { await frame(); if (curSig() !== beforeSig) return; } };
   // Measure the CURRENTLY-mounted window's pixel span (viewport + the virtualizer's overscan, typically
   // 2–3× clientHeight). Stepping by a fraction of THIS (not the viewport) means far fewer hops to the bottom
   // — the big visible-scroll speedup — while self-adapting to the tenant's overscan. Falls back to clientHeight.
@@ -2017,9 +2032,13 @@ async function cdpScrapeTaOptions(wrapperSel) {
     while (steps < MAX_STEPS) {
       const before = seen.size;
       const prevTop = sc.scrollTop;
-      // Hop by 0.6× the mounted-window span → ~40% overlap between consecutive windows, so no row is skipped
-      // even if the span is mis-measured by up to 40% (a big safety margin; de-dup + stable-2 still backstop).
-      const inc = Math.max(60, Math.floor(mountedSpan() * 0.6));
+      // Hop by 0.7× the mounted-window span → ~30% overlap between consecutive windows (2026-07-20: was 0.6×
+      // / 40% overlap; 0.7× drops ~1 hop in 8 while KEEPING the original's completeness robustness. A DOM/rAF
+      // sim of a slow-mounting virtualizer (tmp harness) showed 0.6–0.75 all stay complete up to a ~200ms
+      // per-scroll mount latency, but 0.8 REGRESSES to ~100ms: under a slow mount awaitRender times out and
+      // scrollTop runs ~2 hops ahead before a window is collected, and only a factor ≤0.75 keeps enough
+      // overlap to reach back to the last-collected row. de-dup + stable-2-at-bottom still backstop the rest.)
+      const inc = Math.max(60, Math.floor(mountedSpan() * 0.7));
       doScroll(Math.min(sc.scrollTop + inc, sc.scrollHeight));
       await awaitRender(priorSig);
       priorSig = curSig();
