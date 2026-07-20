@@ -2058,13 +2058,21 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
   if (!categories.length && (act.readTreeCategories || act.scrapeSourceRows)) {
     const waitFull = act.delayFull || delayRender;
     const ceil = budgets.sourceCatLoadCeilingMs || 6000;
+    const pollMs = budgets.sourceCatPollMs || 150;
     const t0 = Date.now();
-    let reopened = false;
+    // ADAPTIVE: poll ONLY the cheap read (readTreeCategories = a single DOM read of promptOption +
+    // role=option rows) on a TIGHT interval and PROCEED THE INSTANT the list appears — no fixed wait
+    // (`ceil` is only a give-up bound). Do NOT scroll-scrape (scrapeSourceRows) per tick; that scrolls
+    // the virtualized list every iteration and was the "way too slow." Re-open ONLY if the popup actually
+    // closed (searchBox gone) — never re-click an already-open one (toggle-shut). One scroll-scrape
+    // backstop AFTER the loop for a tenant readTreeCategories can't read.
     while (!categories.length && (Date.now() - t0) < ceil) {
-      await waitFull(budgets.reopenSettleMs || 400);
+      await waitFull(pollMs);
       try { const tc = act.readTreeCategories ? await act.readTreeCategories(loc) : null; if (Array.isArray(tc) && tc.length) { categories = tc.slice(); catSrc = "readTreeCategories(poll)"; break; } } catch (e) {}
-      try { const scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; if (scan && scan.ok && scan.options.length) { categories = scan.options.slice(); catSrc = "scrapeSourceRows(poll)"; break; } } catch (e) {}
-      if (!reopened && (Date.now() - t0) > ceil / 2 && act.openHier) { reopened = true; try { await act.openHier(loc); } catch (e) {} }
+      try { const st = act.readHier ? await act.readHier(loc) : null; if (st && st.searchBox && !st.searchBox.visible && act.openHier) await act.openHier(loc); } catch (e) {}
+    }
+    if (!categories.length && act.scrapeSourceRows) {
+      try { const scan = await act.scrapeSourceRows(loc); if (scan && scan.ok && scan.options.length) { categories = scan.options.slice(); catSrc = "scrapeSourceRows(poll-final)"; } } catch (e) {}
     }
   }
   // DIAGNOSTIC (source-tree drill on a new/unverified tenant — trace the real DOM before assuming): show
