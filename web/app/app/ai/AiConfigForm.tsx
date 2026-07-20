@@ -62,16 +62,18 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
             type="button"
             role="switch"
             aria-checked={cfg.enabled}
+            aria-label="AI fill"
             onClick={() => setCfg((c) => ({ ...c, enabled: !c.enabled }))}
             className={clsx(
-              "relative h-6 w-11 shrink-0 rounded-full transition-colors",
-              cfg.enabled ? "bg-amber" : "bg-hairline"
+              "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full outline-none transition-colors",
+              "focus-visible:ring-2 focus-visible:ring-amber/60 focus-visible:ring-offset-2 focus-visible:ring-offset-panel",
+              cfg.enabled ? "bg-amber" : "bg-panel-raised ring-1 ring-inset ring-hairline"
             )}
           >
             <span
               className={clsx(
-                "absolute top-0.5 h-5 w-5 rounded-full bg-cockpit transition-transform",
-                cfg.enabled ? "translate-x-[22px]" : "translate-x-0.5"
+                "inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform",
+                cfg.enabled ? "translate-x-[1.375rem]" : "translate-x-0.5"
               )}
             />
           </button>
