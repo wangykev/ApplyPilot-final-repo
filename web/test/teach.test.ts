@@ -97,6 +97,8 @@ test("teachableCards: a MANUALLY-EDITED clean fill (needs_review=false) is teach
   assert.equal(teachableCards([src("a", [mk({})])], [], {}).length, 0, "untouched clean fill skipped");
   // the human OVERRODE the clean fill on review → now teachable
   assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "override" })])], [], {}).length, 1, "override teaches");
+  // the edit RESET approval (is_approved=false) — it STILL teaches (the user's own typed answer; #4)
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "override", is_approved: false })])], [], {}).length, 1, "an edit that reset approval still teaches");
   // a filled-in blank → teachable
   assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "filled_blank" })])], [], {}).length, 1, "filled_blank teaches");
   // a cleared field (now empty) → excluded (no value to remember)

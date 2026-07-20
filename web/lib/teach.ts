@@ -55,17 +55,20 @@ export function wasManuallyEdited(e: ReviewEntry): boolean {
   return !!e.is_edited && e.edit_kind !== "cleared" && e.edit_kind !== "added_entry";
 }
 
-/** A teachable pair: the human APPROVED it, and EITHER it didn't fill deterministically (needs_review —
- *  an AI guess, a no-match the human answered, a fuzzy/containment match…) OR the human MANUALLY CHANGED
- *  it on review (an override / filled-in blank — a signal the deterministic fill was wrong, worth
- *  remembering so it's right next time). A clean, untouched deterministic fill (mapped exact / bucket,
- *  needs_review=false, not edited) is skipped — it's already known. Must be bucket-eligible with a real
- *  question + a non-empty value. */
+/** A teachable pair, either:
+ *   • an APPROVED fill that DIDN'T fill deterministically (needs_review — an AI guess, a no-match the
+ *     human answered, a fuzzy/containment match…); OR
+ *   • a MANUAL EDIT on review (`wasManuallyEdited` — an override / filled-in blank). The user typed this
+ *     value themselves, so it's their own answer and teaches EVEN THOUGH the edit reset its approval
+ *     (the review editor clears `is_approved` on any value edit, to force a submit re-review — a
+ *     submit concern, not a teach one). The teach popup is its own confirm gate.
+ *  A clean, untouched deterministic fill (needs_review=false, not edited) is skipped — already known.
+ *  Must be bucket-eligible with a real question + a non-empty value. */
 function isTeachable(e: ReviewEntry): boolean {
+  const edited = wasManuallyEdited(e);
   return (
-    !!e.is_approved &&
     !e.is_deleted &&
-    (!!e.needs_review || wasManuallyEdited(e)) && // flagged for review OR a human override of a clean fill
+    (edited || (!!e.is_approved && !!e.needs_review)) &&
     isBucketEligibleWidget(e.widget_type) &&
     !!e.question_label &&
     normalizeQuestion(e.question_label) !== "" &&
