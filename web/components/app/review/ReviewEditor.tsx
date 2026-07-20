@@ -1421,6 +1421,10 @@ function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
       : empties.length
         ? `Required fields on page ${pg} had no value in your profile, so the fill couldn't continue.`
         : `The fill stopped on page ${pg} before reaching the review page.`;
+  // "Edit my profile" only makes sense when a PROFILE VALUE is the problem (the form rejected a value,
+  // or a required field was empty). A cancellation — or any stop with no data problem detected — isn't a
+  // profile issue, so it gets a re-run message instead of pointing the operator at their profile.
+  const isDataProblem = errors.length > 0 || empties.length > 0;
   return (
     <div className="rounded-lg border border-signal/50 bg-signal/[0.07] px-5 py-4">
       <div className="flex items-start gap-3">
@@ -1449,10 +1453,22 @@ function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
             </p>
           )}
           <div className="flex flex-wrap items-center gap-3 pt-0.5">
-            <Link href="/app/profile" className="btn-ghost text-xs">
-              Edit my profile
-            </Link>
-            <span className="text-xs text-ink-faint">Fix the value on your profile, re-sync, then refill.</span>
+            {isDataProblem ? (
+              <>
+                <Link href="/app/profile" className="btn-ghost text-xs">
+                  Edit my profile
+                </Link>
+                <span className="text-xs text-ink-faint">
+                  {errors.length
+                    ? "Fix the value on your profile, re-sync, then refill."
+                    : "Add the missing value to your profile, re-sync, then refill."}
+                </span>
+              </>
+            ) : ws.cancelled ? (
+              <span className="text-xs text-ink-faint">Nothing&apos;s wrong with your data — just start the fill again from the extension.</span>
+            ) : (
+              <span className="text-xs text-ink-faint">Check that page on the form, then run the fill again — this is often a transient.</span>
+            )}
           </div>
         </div>
       </div>
