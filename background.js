@@ -2469,6 +2469,7 @@ async function runCdpReplayWalk(tabId, opts) {
 
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1; a clean finish / halt / review-terminal returns out of the function
     pagesReplayed = []; findings = { mismatches: [], cascadeRevealed: [] }; submitFired = false; // reset per attempt
+    let prevPageIdentity = null; // flat-fields+sections identity of the page just replayed — to catch a false "advanced" (see the same-page guard)
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
       walkPage = page;
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
@@ -2562,6 +2563,17 @@ async function runCdpReplayWalk(tabId, opts) {
       // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
       let rscanLive = null;
       try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
+      // ── SAME-PAGE GUARD (backstop for a premature "advanced"): if the live page is IDENTICAL to the
+      //    one just replayed — same flat field-set AND same repeating sections — then the prior Save &
+      //    Continue did NOT actually move the form (a slow/blocked transition read as advanced). NEVER
+      //    re-replay the same page; HALT honestly. Skips a wholly-empty (loading) scan. ──
+      const liveSecKey = rscanLive && rscanLive.sections ? Object.keys(rscanLive.sections).sort().join(",") : "";
+      const pageIdentity = liveNames.slice().sort().join(",") + "||" + liveSecKey;
+      if (prevPageIdentity !== null && (liveNames.length || liveSecKey) && pageIdentity === prevPageIdentity) {
+        LOG(`⚠ page ${page}: the form did NOT advance — the live page is IDENTICAL to the step just replayed (Save & Continue was blocked, or the transition didn't settle). HALT — never re-replaying the same page. Eyeball the form; a re-run usually clears a transient race.`);
+        return { ok: true, stopped: "did-not-advance", page, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      prevPageIdentity = pageIdentity;
       const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
       if (!sel.entries.length || sel.score <= 0) {
         const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
@@ -2767,11 +2779,17 @@ async function runCdpPageRecon(tabId) {
 // refuses on the review marker. Review-page reached = SUCCESS (walked the whole app).
 // ============================================================================
 
-// Page signature for transition detection: url + the sorted formField name set
-// (the field-set delta is the load-bearing signal — pageId alone is shared across
-// pages on some tenants; dom-patterns).
+// Page signature for transition detection: URL PATHNAME (query stripped) + the sorted formField name
+// set. The field-set delta is the load-bearing signal (pageId alone is shared across pages on some
+// tenants; dom-patterns). The query is dropped for the SAME reason cdpPageKey drops it — a session /
+// tracking token in the query (Magna carries ?utm_source=…&ref=…) mutating mid-transition would flip
+// the sig and be read as a FALSE advance while the same page is still mounted. Pathname + field-set
+// means only a REAL page change (different questions) registers as an advance.
 function cdpPageSig(scan) {
-  return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
+  if (!scan || !scan.fields) return null;
+  let path = scan.url || "";
+  try { path = new URL(scan.url).pathname; } catch (e) { /* non-URL → keep raw (still stable) */ }
+  return path + "|" + scan.fields.map((f) => f.fieldName).sort().join(",");
 }
 
 // A CLEAN no-advance fallback (operator ask, 2026-07-10, Magna page 1): Save & Continue registered

@@ -699,10 +699,23 @@ CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
   recovers on a fresh load (which also clears the stale-session aggravation a cancelled-then-rerun adds). A
   genuine no-match ("value not offered") stays terminal — a reload can never mask a real problem.
 
+- **Replay walk: premature "advanced" → re-processing the SAME page (`runCdpReplayWalk`).** On a 2nd
+  refill of an already-completed Magna form (bundle now holds all pages), page 1's Save & Continue read
+  as "advanced" while My-Information was still mounted, so "page 2" re-scanned My-Info, `selectPageBundleEntries`
+  re-matched the 14 My-Info entries, and it died focusing the empty `extension` field. Three fixes:
+  (1) `cdpPageSig` now strips the URL query (pathname + field-set, matching `cdpPageKey`) so a session/
+  tracking token (Magna's `?utm_source=…&ref=…`) mutating mid-transition can't register as an advance;
+  (2) a SAME-PAGE guard in the replay loop — if the live page's flat-fields+sections identity equals the
+  step just replayed, HALT `did-not-advance` instead of re-replaying; (3) `replayField`'s cleared-text
+  path SKIPS an already-blank / not-yet-laid-out optional field (read-first) instead of focus-and-clear,
+  so an empty `extension` can never halt the walk. Root-caused by a read-only trace (both refill runs
+  diffed); `selectPageBundleEntries` was NOT at fault — it matched the (wrong, still-page-1) fields it
+  was handed.
+
 (The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
 toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
 
-Verified: extension suite (minus `db`, uninstalled dep) **602/602** incl. new `samePhysicalPage`,
+Verified: extension suite (minus `db`, uninstalled dep) **603/603** incl. new `samePhysicalPage`,
 `accumulateBundle`-overwrite, and broadened `isTransientRenderFailure` tests. **Live-verify PENDING**
 (eyes-on, disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a
 real Workday page.

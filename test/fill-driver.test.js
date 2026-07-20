@@ -5933,6 +5933,15 @@ test("replayField: a CLEARED text entry leaves the field blank (verify-blank, no
   assert.strictEqual(f.value, "", "the box is emptied, not refilled");
 });
 
+test("replayField: a CLEARED text entry on an ALREADY-BLANK field is SKIPPED (no focus — an empty optional field like phone extension can't halt the walk)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-extension"]', fieldName: "extension", widgetType: "text", value: "" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-extension", canonical_field: "personal_info.phone_extension", widget_type: "text", current_value: "", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "skipped");
+  assert.strictEqual(r.replay, "cleared");
+  assert.strictEqual(f.value, "", "left blank, never actuated (no focus attempt)");
+});
+
 test("replayField: a REPEATING-section field is DEFERRED (skipped, zero actuation — M3 replays it positionally)", async () => {
   const act = makeFakeAct([]);
   const r = await replayField(act, { field_id: "P2::formField-jobTitle", canonical_field: "workExperience[0].job_title", widget_type: "text", current_value: "Engineer" }, T_BUDGETS);

@@ -4138,11 +4138,22 @@ async function replayField(act, entry, budgets) {
   const value = entry.current_value;
   const cleared = entry.edit_kind === "cleared" || value == null || value === "";
 
-  // CLEARED (human emptied it): leave blank. A fresh submit form starts blank, so this is a
-  // verify-blank, not a destructive clear (choice widgets default to their placeholder).
+  // CLEARED (human emptied it, or the approved value is empty): leave blank. A fresh submit form starts
+  // blank, so this is a verify-blank, not a destructive clear (choice widgets default to their placeholder).
   if (cleared) {
     if (widget === "text" || widget === "textarea") {
-      return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, widget === "textarea" ? "textarea" : "input"));
+      // Only ACTUATE if the field actually HAS content to clear. An empty approved value on an
+      // already-blank field is nothing to do — and focusing a not-yet-laid-out OPTIONAL input (e.g. a
+      // phone "extension" during a slow page transition) would fail and HALT the whole walk for no
+      // reason. An unreadable field (no rect yet) is treated as blank → skip, never a fatal focus error.
+      const tag = widget === "textarea" ? "textarea" : "input";
+      let live = null;
+      try { live = await act.readTextValue(loc, tag); } catch (e) { /* unreadable → treat as blank */ }
+      const liveVal = live && live.value != null ? String(live.value) : ""; // readTextValue → {value,…} | null
+      if (liveVal.trim() === "") {
+        return { status: "skipped", replay: "cleared", detail: "already blank — nothing to clear" };
+      }
+      return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, tag));
     }
     return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
   }
