@@ -663,9 +663,21 @@ to main. Remaining: end-to-end live-verify on a real Workday page (fill → appr
 deterministic); apply migration `0004` to Supabase; the fill-time typeahead-AI piggyback (covered by the
 teach-time fallback for now).
 
-## 2026-07-20 — Fill idempotency + AI-off halt + replay cascade race (branch `fill-overwrite-and-halt-fixes`)
+## 2026-07-20 — Fill idempotency + AI-off halt + replay cascade race + false-advance (branch `fill-overwrite-and-halt-fixes`)
 
-Three CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
+CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
+
+- **False "advanced" → phantom page re-fill (`runCdpWalk` + `runCdpReplayWalk`).** `prevSig` (the
+  transition signature `cdpWaitNextPage` diffs against) was captured BEFORE the page fill. But the fill
+  itself mutates the field set — leaving "preferred name" unchecked removes its two fields, a Country
+  cascade adds/removes others — so the post-fill signature already differed from the stale pre-fill one.
+  On a FRESH form with an invalid value (operator repro: a ZIP that doesn't match the state), Save &
+  Continue was BLOCKED, but the changed signature made `cdpWaitNextPage` read "advanced" → the walk
+  re-scanned the SAME page as "page 2" and RE-FILLED it (regardless of AI on/off). Now `prevSig` is
+  snapshotted AFTER the fill/replay, immediately before the click, so only a REAL transition changes it —
+  a blocked page correctly stays put (nav-timeout → remediation-if-AI / halt-if-not). Only bit the FIRST
+  fill because a re-run starts with those fields already removed (no signature delta). The
+  `remediatePageErrors` re-click already captured its sig post-refill — unchanged.
 
 - **Duplicate review page → OVERWRITE (`accumulateBundle`).** Dedup was by EXACT `cdpPageKey` (pathname +
   sorted field-set). Filling ONE page twice can yield DIFFERENT keys when the field-set shifts between

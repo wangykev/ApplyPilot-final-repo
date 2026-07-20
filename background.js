@@ -2556,7 +2556,6 @@ async function runCdpReplayWalk(tabId, opts) {
 
       LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
       await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const scan = await cdpEval(cdpPageScan);
       const fields = (scan && scan.fields) || [];
       const liveNames = fields.map((f) => f.fieldName);
@@ -2644,6 +2643,10 @@ async function runCdpReplayWalk(tabId, opts) {
         LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
         return { ok: true, stopped: "no-next-button", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
+      // Snapshot the transition signature AFTER the replay/refill (they mutate this page's field set —
+      // preferred name, Country cascade), so cdpWaitNextPage detects only a REAL Save & Continue and not
+      // the fill's own DOM changes (a pre-replay sig would FALSELY read "advanced" on a blocked page).
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       await cdpWakePage(); // wake a frozen hidden tab so the transition can run
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
@@ -2926,7 +2929,6 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
@@ -2964,6 +2966,13 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──
+      // Capture the transition signature AFTER the fill (not before it): the fill itself mutates this
+      // page's field set — leaving "preferred name" unchecked removes its two fields, a Country cascade
+      // adds/removes others — so a PRE-fill signature already differs from the settled post-fill DOM.
+      // With a stale pre-fill sig, cdpWaitNextPage FALSELY reads "advanced" when Save & Continue was
+      // actually BLOCKED (e.g. an invalid ZIP), and the walk re-fills the SAME page as a phantom next
+      // page. Snapshotting here means ONLY a real Save & Continue transition changes the signature.
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       await cdpWakePage(); // wake a frozen hidden tab so the Save & Continue transition can run (hidden page-N→N+1 stall)
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
