@@ -8,6 +8,7 @@ import {
   SelectField,
   TriBoolField,
   TagListField,
+  TieredField,
   CandidateField,
   DateField,
   CheckboxField,
@@ -423,7 +424,14 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
             form offers wins. The last resort below is tried only if none of these match.
           </p>
         </div>
-        <TagListField label="Fallback sources (in order)" value={profile.how_did_you_hear.preferred} placeholder="LinkedIn, Handshake, …" onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })} />
+        <TieredField
+          label="Fallback sources (in order)"
+          horizontal
+          hint="reorder with the ◄ ► arrows; the first one the form offers wins"
+          value={profile.how_did_you_hear.preferred}
+          placeholder="Add a source — e.g. LinkedIn"
+          onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })}
+        />
         <div className="mt-4 sm:max-w-xs">
           <TextField
             label="Last resort"
