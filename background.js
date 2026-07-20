@@ -2135,12 +2135,12 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
             // Source is a click-TREE — NEVER flat-type the AI's guess ("job boards" is what that produced).
             // Re-run the ordered drill from the profile's how_did_you_hear fallback (LinkedIn first) WITH
             // the tree-drill AI context, so it drills category → recon leaves → pick leaf → commit. Required.
-            const hdyh = (prepared && prepared.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
-            const cands = hdyh && Array.isArray(hdyh.preferred)
+            const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
+            const cands = hdyh && Array.isArray(hdyh.preferred) && (hdyh.preferred.length || hdyh.fallback)
               ? [...hdyh.preferred, ...(hdyh.fallback ? [hdyh.fallback] : [])]
               : [decision.value];
             const aiForSource = act.aiEnabled
-              ? { profile: prepared, jobContext, isRequired: true, label: f.label, fieldName: f.fieldName, sourceTree: true }
+              ? { profile, jobContext, isRequired: true, label: f.label, fieldName: f.fieldName, sourceTree: true }
               : undefined;
             r = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, cands, DEFAULT_BUDGETS, { ai: aiForSource });
             refillNote = `AI-4 Tier-2 re-drill source from how_did_you_hear [${cands.slice(0, 3).join(", ")}…] — `;

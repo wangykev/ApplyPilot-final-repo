@@ -2031,19 +2031,32 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
   // (1) Categories: the Fix 2 START-scrape (`preCats`) if available, else scroll-enumerate the on-no-match
   //     fallback now (its category LABELS render as promptOptions → scrapeSourceRows returns them in `options`).
   let categories = (Array.isArray(preCats) && preCats.length) ? preCats.slice() : [];
+  let catSrc = categories.length ? "preCats" : "";
+  let scrapeDump = null;
   if (!categories.length) {
     await delayRender(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner) — adaptive under the measured-fast gate (STAGE 3); the category scrape/drill/commit downstream is chip-gated
     let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
+    scrapeDump = scan;
     categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
+    if (categories.length) catSrc = "scrapeSourceRows";
   }
   // Some tenants (Magna wd3) render the category rows as role="option"/treeitem nodes, NOT promptOptions,
   // so scrapeSourceRows (promptOption-only) returns 0 and the drill would ABORT here — leaving a required
   // source blank / flat-guessed (the "none of the drill happened" bug). readTreeCategories reads those
   // role=option/treeitem rows too (chevron/aria heuristic), so fall back to it before giving up. This is
   // what lets the category→click→recon-leaves→pick-leaf→commit drill actually run on a click-tree tenant.
+  let rtcDump = null;
   if (!categories.length && act.readTreeCategories) {
-    try { const tc = await act.readTreeCategories(loc); if (Array.isArray(tc) && tc.length) categories = tc.slice(); } catch (e) { /* keep empty */ }
+    try { const tc = await act.readTreeCategories(loc); rtcDump = tc; if (Array.isArray(tc) && tc.length) { categories = tc.slice(); catSrc = "readTreeCategories"; } } catch (e) { /* keep empty */ }
   }
+  // DIAGNOSTIC (source-tree drill on a new/unverified tenant — trace the real DOM before assuming): show
+  // what each enumeration source returned, so a 0-category abort is debuggable from the SW console.
+  try {
+    console.log("[ApplyPilot][CDP-SRC-DRILL] categories=" + categories.length + " via " + (catSrc || "(none — cannot drill)") +
+      " | scrapeSourceRows=" + (scrapeDump ? (scrapeDump.ok ? scrapeDump.options.length + " opt, banner=" + JSON.stringify(scrapeDump.banner) : "FAILED") : "n/a") +
+      " | readTreeCategories=" + (rtcDump == null ? "n/a" : rtcDump.length) +
+      " | first: " + JSON.stringify(categories.slice(0, 8)));
+  } catch (e) {}
   if (!categories.length) return null; // no options visible → caller's needs_review (never guess blind)
 
   // PROMPT 1 — pick the CATEGORY (the one most likely to CONTAIN the applicant's stated answer, or — with no
