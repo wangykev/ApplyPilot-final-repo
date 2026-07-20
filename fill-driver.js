@@ -2049,6 +2049,18 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
   if (!categories.length && act.readTreeCategories) {
     try { const tc = await act.readTreeCategories(loc); rtcDump = tc; if (Array.isArray(tc) && tc.length) { categories = tc.slice(); catSrc = "readTreeCategories"; } } catch (e) { /* keep empty */ }
   }
+  // RE-OPEN retry (operator-observed 2026-07-20): on Magna the source popup often opens EMPTY — a
+  // focus/tab lands the cursor but the tree options never render; RE-clicking the opener renders them.
+  // ensureSearchFocused only verified the searchbox was focused, not that options rendered. So if nothing
+  // enumerated, re-open (openHier re-clicks the opener) + re-scan, bounded — "if it doesn't render, open
+  // it again." Each attempt is chip/enumeration-gated downstream, so an extra open only costs a re-scan.
+  const reopenTries = budgets.taOpenRetries || 3;
+  for (let reopen = 1; !categories.length && reopen <= reopenTries && act.openHier; reopen++) {
+    try { await act.openHier(loc); } catch (e) {}
+    await delayRender(budgets.reopenSettleMs);
+    try { const tc = act.readTreeCategories ? await act.readTreeCategories(loc) : null; if (Array.isArray(tc) && tc.length) { categories = tc.slice(); catSrc = "readTreeCategories(reopen" + reopen + ")"; break; } } catch (e) {}
+    try { const scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; if (scan && scan.ok && scan.options.length) { categories = scan.options.slice(); catSrc = "scrapeSourceRows(reopen" + reopen + ")"; break; } } catch (e) {}
+  }
   // DIAGNOSTIC (source-tree drill on a new/unverified tenant — trace the real DOM before assuming): show
   // what each enumeration source returned, so a 0-category abort is debuggable from the SW console.
   try {
