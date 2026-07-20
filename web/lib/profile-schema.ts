@@ -127,8 +127,13 @@ export const workAuthSchema = z
 
 export const howDidYouHearSchema = z
   .object({
-    preferred: z.array(z.string()).default([]),
-    fallback: str,
+    // Deterministic fallback ladder for the "How did you hear about us?" source
+    // picker — tried in order, most-preferred first, BEFORE the AI drill. The
+    // primary/per-application answer is deferred, so this ladder is what fills.
+    // "Other" is the always-matching last resort → it lives in `fallback` (appended
+    // LAST), never in `preferred`, so it can't short-circuit LinkedIn/Handshake/GitHub.
+    preferred: z.array(z.string()).default(["LinkedIn", "Handshake", "GitHub"]),
+    fallback: z.string().default("Other"),
   })
   .default({});
 

@@ -2,7 +2,7 @@
   "schema_version": "2.0",
 
   "how_did_you_hear": {
-    "preferred": ["LinkedIn", "Handshake", "Campus Recruiting Event", "College / University Recruiting"],
+    "preferred": ["LinkedIn", "Handshake", "GitHub"],
     "fallback": "Other"
   },
   "_how_did_you_hear_note": "Source picker ('How did you hear about us?') candidates, most-preferred first. Profile value WINS over application_defaults.how_did_you_hear (which remains as a shared fallback). On a genuine no-match the AI drills the source tree (category -> leaf) when the AI toggle is on.",
