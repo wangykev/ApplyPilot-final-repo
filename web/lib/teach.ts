@@ -122,6 +122,34 @@ export function sameAnswer(a: string, b: string): boolean {
   return !!n(a) && n(a) === n(b);
 }
 
+/** Raw value at a dotted path (arrays PRESERVED, unlike profileValueAt which collapses to the first). */
+function rawAt(profile: unknown, path: string): unknown {
+  if (!path) return undefined;
+  return String(path)
+    .split(".")
+    .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
+}
+
+/** Whether the profile field at `path` ALREADY holds `answer` — for a tiered array, ANY candidate
+ *  counts; a boolean is compared as Yes/No; a scalar is compared normalized. */
+export function fieldHoldsAnswer(profile: unknown, path: string, answer: string): boolean {
+  const raw = rawAt(profile, path);
+  if (Array.isArray(raw)) return raw.some((v) => typeof v === "string" && sameAnswer(v, answer));
+  if (typeof raw === "boolean") return sameAnswer(raw ? "Yes" : "No", answer);
+  return raw != null && sameAnswer(String(raw), answer);
+}
+
+/** Which route the teach confirm popup takes when a card is added to a chosen profile field:
+ *  - "wording": the field already holds the card's answer → only the phrasing is missing, so add the
+ *    wording (the value stays untouched);
+ *  - "answer":  the field is empty OR holds a different value → set / append the answer (and file the
+ *    wording too, so the card is fully taught).
+ *  Splitting these is what makes the popup show exactly "the question OR the answer" that's missing. */
+export type TeachRoute = "answer" | "wording";
+export function decideTeachRoute(profile: unknown, path: string, answer: string): TeachRoute {
+  return fieldHoldsAnswer(profile, path, answer) ? "wording" : "answer";
+}
+
 /** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */
 export function addWordingToBucket(buckets: Bucket[], bucketId: string, wording: string): Bucket[] {
   const k = normalizeQuestion(wording);

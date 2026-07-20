@@ -13,6 +13,8 @@ import {
   humanize,
   flattenProfileFields,
   isFuzzyTier,
+  fieldHoldsAnswer,
+  decideTeachRoute,
   type TeachSource,
 } from "@/lib/teach";
 import type { Bucket } from "@/lib/buckets";
@@ -174,4 +176,27 @@ test("isFuzzyTier: containment / fuzzy-* → true; exact / empty → false", () 
   assert.equal(isFuzzyTier("exact-normalized"), false);
   assert.equal(isFuzzyTier(""), false);
   assert.equal(isFuzzyTier(null), false);
+});
+
+test("fieldHoldsAnswer: scalar / boolean(Yes-No) / tiered-array-any-candidate; empty → false", () => {
+  const p = {
+    self_identification: { gender: "Male" },
+    work_authorization: { authorized_to_work_in_us: true, citizenship_country: ["United States of America", "United States"] },
+    personal_info: { city: "" },
+  };
+  assert.equal(fieldHoldsAnswer(p, "self_identification.gender", "male"), true); // scalar, case-insensitive
+  assert.equal(fieldHoldsAnswer(p, "self_identification.gender", "Female"), false);
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.authorized_to_work_in_us", "Yes"), true); // boolean → Yes
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.authorized_to_work_in_us", "No"), false);
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.citizenship_country", "United States"), true); // ANY candidate
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.citizenship_country", "Canada"), false);
+  assert.equal(fieldHoldsAnswer(p, "personal_info.city", "Chicago"), false); // empty holds nothing
+  assert.equal(fieldHoldsAnswer(p, "personal_info.missing", "x"), false); // absent path
+});
+
+test("decideTeachRoute: value already present → 'wording'; missing/different → 'answer'", () => {
+  const p = { self_identification: { gender: "Male" }, personal_info: { city: "" } };
+  assert.equal(decideTeachRoute(p, "self_identification.gender", "Male"), "wording"); // already holds it
+  assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
+  assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
 });

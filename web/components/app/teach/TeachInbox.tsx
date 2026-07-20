@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2 } from "lucide-react";
+import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
-import { type Bucket } from "@/lib/buckets";
+import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
 import {
   type TeachCard,
@@ -16,7 +16,12 @@ import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
 import { saveDismissed, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
 import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
-import { TeachAddPopup, type AddKind, type AddResult } from "@/components/app/teach/TeachAddPopup";
+import { TeachAddPopup, type ConfirmTarget, type AddResult } from "@/components/app/teach/TeachAddPopup";
+import { TargetPicker, type PickedTarget } from "@/components/app/teach/TargetPicker";
+import { RememberedAnswerPopup } from "@/components/app/RememberedAnswerPopup";
+
+// Categories a new remembered answer can carry (fixed set + any custom already in use + "Other").
+const BASE_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal", "Experience", "Education"];
 
 export function TeachInbox({
   initialCards,
@@ -35,7 +40,11 @@ export function TeachInbox({
   const [dismissed, setDismissed] = useState<string[]>(initialDismissed);
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  const [addPopup, setAddPopup] = useState<{ kind: AddKind } | null>(null);
+  // the three add surfaces: the end-step confirm popup (a chosen target), the "wrong field" picker, and
+  // the shared new-answer popup (identical to the profile page's "Add remembered answer").
+  const [confirm, setConfirm] = useState<{ target: ConfirmTarget } | null>(null);
+  const [picker, setPicker] = useState(false);
+  const [newOpen, setNewOpen] = useState(false);
   // teach-time AI fallback: recommendation per card.key for cards with no stamped maps_to hint
   const [recCache, setRecCache] = useState<Record<string, FieldRecommendation>>({});
   const [recLoading, setRecLoading] = useState(false);
@@ -101,9 +110,9 @@ export function TeachInbox({
     setDone((d) => d + 1);
   };
 
-  // Commit a confirmed "add to profile" from the teach popup: persist the changed store(s), then
-  // advance to the next card. Saves buckets first, then the profile.
-  const commitAdd = async (r: AddResult) => {
+  // Commit a confirmed change (from the confirm popup or the new-answer popup): persist the changed
+  // store(s), then advance to the next card. Saves buckets first, then the profile.
+  const commit = async (r: AddResult) => {
     setSaving(true);
     let ok = true;
     let err = "";
@@ -127,7 +136,9 @@ export function TeachInbox({
     setSaving(false);
     if (ok) {
       setNote(r.toast);
-      setAddPopup(null);
+      setConfirm(null);
+      setNewOpen(false);
+      setPicker(false);
       advance();
     } else {
       setNote(`Couldn't save: ${err}`);
@@ -142,6 +153,34 @@ export function TeachInbox({
     }
     setNote(null);
     advance();
+  };
+
+  // ── new-answer popup (shared with the profile page) ──
+  const usedCustomCats = Array.from(
+    new Set(buckets.filter((b) => !isModeA(b)).map((b) => (b.category || "").trim()).filter((c) => c && !BASE_CATEGORIES.includes(c) && c !== "Other")),
+  );
+  const categoryOptions = [...BASE_CATEGORIES, ...usedCustomCats, "Other"];
+  const seedNewBucket = (): Bucket => ({
+    id: "custom_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    profile_path: "",
+    value: card && card.answer.trim() !== "" ? [card.answer] : [],
+    category: recCat || "Other",
+    widget_hint: card && (card.widget === "radio" || card.widget === "checkbox") ? card.widget : "text",
+    questions: card ? [card.question] : [],
+    selectors: {},
+  });
+  const commitNew = (draft: Bucket) => {
+    const ids = new Set(buckets.map((b) => b.id));
+    let d = draft;
+    if (ids.has(d.id)) d = { ...d, id: d.id + "_" + Math.random().toString(36).slice(2, 6) };
+    void commit({ buckets: [...buckets, d], toast: "Saved as a new answer ✓" });
+  };
+
+  const pickTarget = (t: PickedTarget) => {
+    setPicker(false);
+    if (t.kind === "new") setNewOpen(true);
+    else if (t.kind === "field") setConfirm({ target: { kind: "field", path: t.path, label: humanize(t.path) } });
+    else setConfirm({ target: { kind: "existing", id: t.id } });
   };
 
   return (
@@ -185,7 +224,7 @@ export function TeachInbox({
               )}
             </div>
 
-            {/* AI recommendation — where this answer maps + the add-to-profile actions (each confirmed in a popup) */}
+            {/* AI recommendation — where this answer maps. One primary "add to profile"; the popup confirms. */}
             {recLoading ? (
               <div className="mt-4 flex items-center gap-2 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5 text-xs text-ink-dim">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" /> Finding the matching field…
@@ -206,52 +245,41 @@ export function TeachInbox({
                 {/* blank-profile warning: the AI mapped this answer to a field that's empty in the profile */}
                 {!recProfileValue && (
                   <p className="mt-1.5 text-xs text-signal">
-                    ⚠ Your profile has no value for {humanize(recPath)} yet — add your answer so it fills next time.
+                    ⚠ Your profile has no value for {humanize(recPath)} yet — adding your answer fills it next time.
                   </p>
                 )}
                 {fuzzy ? (
                   <p className="mt-1.5 text-xs text-signal">⚠ Matched by a near match (possible typo/variant) — verify it&apos;s the same answer.</p>
                 ) : recProfileValue && !matches ? (
-                  <p className="mt-1.5 text-xs text-ink-faint">Your answer differs from that field&apos;s value — add it, or save it as a new answer.</p>
+                  <p className="mt-1.5 text-xs text-ink-faint">Your answer differs from that field&apos;s value — confirm the change in the next step.</p>
                 ) : null}
                 <div className="mt-2.5 flex flex-wrap gap-2">
-                  {(!recProfileValue || !matches) && (
-                    <button onClick={() => setAddPopup({ kind: "field" })} className="btn-primary" disabled={saving}>
-                      <Check className="h-4 w-4" />
-                      Add to your {humanize(recPath)}
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setAddPopup({ kind: "wording" })}
-                    className={!recProfileValue || !matches ? "btn-ghost px-3 py-1.5 text-sm" : "btn-primary"}
-                    disabled={saving}
-                  >
+                  <button onClick={() => setConfirm({ target: { kind: "field", path: recPath, label: humanize(recPath) } })} className="btn-primary" disabled={saving}>
                     <Check className="h-4 w-4" />
-                    File wording under {humanize(recPath)}
+                    Add to your {humanize(recPath)}
+                  </button>
+                  <button onClick={() => setPicker(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+                    Wrong field?
                   </button>
                 </div>
               </div>
             ) : (
               <div className="mt-4 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
                 <p className="text-xs text-ink-dim">
-                  AI didn&apos;t find a matching field — this looks like a <span className="font-medium text-ink">new answer</span>. Save it
-                  below, or click a field on the right to edit your profile.
+                  This looks like a <span className="font-medium text-ink">new answer</span> — no existing field matched.
                 </p>
+                <div className="mt-2.5 flex flex-wrap gap-2">
+                  <button onClick={() => setNewOpen(true)} className="btn-primary" disabled={saving}>
+                    <Plus className="h-4 w-4" />
+                    Save as a new answer
+                  </button>
+                  <button onClick={() => setPicker(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+                    <PenLine className="h-3.5 w-3.5" />
+                    Choose a field…
+                  </button>
+                </div>
               </div>
             )}
-
-            {/* always-available add routes — each opens a confirm popup */}
-            <div className="mt-4 flex flex-wrap gap-2">
-              <button onClick={() => setAddPopup({ kind: "new" })} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                <Plus className="h-3.5 w-3.5" />
-                Save as a new answer
-              </button>
-              {buckets.length > 0 && (
-                <button onClick={() => setAddPopup({ kind: "existing" })} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                  Add to an existing answer…
-                </button>
-              )}
-            </div>
           </div>
         </div>
       )}
@@ -291,19 +319,34 @@ export function TeachInbox({
         />
       )}
 
-      {/* add the current teach card to the profile — preview + confirm */}
-      {addPopup && card && (
+      {/* the "wrong field" chooser — pick a different field / saved answer / make new */}
+      {picker && card && (
+        <TargetPicker profile={profile} buckets={buckets} onPick={pickTarget} onClose={() => setPicker(false)} />
+      )}
+
+      {/* the END-STEP confirm — shows exactly what's added, highlighted, before it commits */}
+      {confirm && card && (
         <TeachAddPopup
-          kind={addPopup.kind}
+          target={confirm.target}
           card={card}
           buckets={buckets}
           profile={profile}
-          recPath={recPath}
-          recLabel={recPath ? humanize(recPath) : ""}
-          recCat={recCat}
           saving={saving}
-          onConfirm={commitAdd}
-          onClose={() => setAddPopup(null)}
+          onConfirm={commit}
+          onClose={() => setConfirm(null)}
+        />
+      )}
+
+      {/* a brand-new answer — the SAME popup the profile page uses, prefilled from the card */}
+      {newOpen && card && (
+        <RememberedAnswerPopup
+          initial={seedNewBucket()}
+          mode="add"
+          title="Save as a new answer"
+          categoryOptions={categoryOptions}
+          onDone={commitNew}
+          onCancel={() => setNewOpen(false)}
+          onDelete={() => setNewOpen(false)}
         />
       )}
     </div>

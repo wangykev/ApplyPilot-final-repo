@@ -191,12 +191,19 @@ teaching cards, so they fill deterministically (no review) next time.
   `ai_config`), which fires ONLY when nothing is known (e.g. an unmapped pre-populated field). A
   fuzzy/containment match (`isFuzzyTier`) on a known field shows a "possible typo/variant — verify" note; a
   recommended field that's **blank in the profile** shows a warning to add the answer.
-- **Add-to-profile actions each go through a confirm popup (`TeachAddPopup`) that previews the change:** file
-  the QUESTION wording under the recommended field (question bucket), add the ANSWER into that field's
-  value/ladder (also files the wording so it's fully taught), **save a new Mode-B answer** (candidate-list
-  value + category), or add to an existing bucket. **Skip** persists in `profiles.teach_dismissed_json`
-  (migration `0004`) so a skipped card doesn't reappear. Writes via `saveBuckets` / `saveProfile` → synced to
-  the extension.
+- **Two-step add flow (reuses the profile page's add-a-remembered-answer flow).** The card leads with ONE
+  smart primary — **"Add to your &lt;field&gt;"** (the recommended field) — that opens the **end-step confirm
+  popup** (`TeachAddPopup`, keyed on a `ConfirmTarget = field | existing`). The popup opens straight into the
+  MISSING half (`decideTeachRoute`, pure + tested): the field already holds this answer → **wording** (just
+  remember the phrasing); empty/different → **answer** (set the value, or append to the ladder — reorderable
+  — AND file the wording). The element being added is **highlighted in amber** (`highlight` prop on
+  `TieredField` / `TagListField` / `ProfileFieldEditor`) so the user confirms exactly what changes. If the AI
+  picked the wrong field, **"Wrong field?"** opens the **`TargetPicker`** — a filterable list of every profile
+  field + standalone saved answer, plus **"Make a completely new answer"**. A brand-new answer opens the SAME
+  **`RememberedAnswerPopup`** the profile page uses (extracted to `components/app/RememberedAnswerPopup.tsx`,
+  shared LOCKSTEP), prefilled from the card. A card with no recommended field leads with **"Save as a new
+  answer"** instead. **Skip** persists in `profiles.teach_dismissed_json` (migration `0004`) so a skipped card
+  doesn't reappear. Writes via `saveBuckets` / `saveProfile` → synced to the extension.
 
 ### Attachments — private `attachments` Storage bucket (Profile v2)
 Per-specialty files + `additional_files[]` upload to a private Supabase bucket, namespaced
@@ -294,6 +301,10 @@ extension's discipline.
   **Teach page (`/app/teach`)** — swapped the layout (card LEFT, profile RIGHT); the profile panel is now **editable in place** (click a field's name → `BucketFieldPopup` wordings; click its answer → `AnswerEditPopup` value editor with the tiered **ladder** for candidate fields), extended with the simple list sections **Skills / Employer history / Websites** (website URLs are bucketable), made a **sticky self-scrolling** column that **auto-scrolls + highlights** the recommended field, added a **blank-profile warning**, and routed every add-to-profile action through a **confirm popup** (`TeachAddPopup`: question-bucket / answer-into-field / new / existing). Extracted the shared `ProfileFieldEditor` + `BucketFieldPopup`; per-path field metadata in `lib/profile-fields.ts`.
   **Profile page remembered answers** — a categorized Mode-B answer now **merges into its matching section** (or an own card / the "Other" card, the single **Add** entry point); each answer displays as a plain profile field with **Advanced + delete on the same line**; the **Advanced/Add popup is a draft that commits only on Done** (outside-click / Esc / X cancels); **Answer type** trimmed to **Text / Yes-No / Checkbox** (checkbox renders a real checkbox; Text covers dropdown/type-ahead via its ladder — no field-type gate, the extension adapts at fill time); custom category typed **live** (no separate Add); delete is a two-step inline confirm.
   **Removed:** the bucket-level `sensitive` flag + checkbox (deterministic fills are never flagged — the AI-guess legally-loaded flag is separate and untouched); the standalone `/app/job` "Job context" page + its sidebar entry (value still lives in `job_context_json`, fed via Connect + Cover letter). "Screening defaults" → **"Screening"**.
+- **M11 — Teach reuses the profile page's add flow** *(done; web typecheck + build green, `test/teach.test.ts` 17/17)*: the teach page no longer maintains a parallel "add to profile" UX — it **reuses the profile page's** exact add-a-remembered-answer popup.
+  **Shared popup** — extracted `RememberedAdvancedPopup` (+ `ConfirmDeleteButton` / `RememberedToggle` / `RememberedCheckbox`) out of `ProfileEditor.tsx` into `components/app/RememberedAnswerPopup.tsx`; the profile page imports it (behavior unchanged) and the teach page's "new answer" route opens the SAME popup, prefilled from the card.
+  **Two-step add** — collapsed the old four add-buttons into ONE smart primary **"Add to your &lt;field&gt;"** → the **end-step confirm popup** (`TeachAddPopup`, now keyed on a `ConfirmTarget = field | existing`). Pure `decideTeachRoute` / `fieldHoldsAnswer` (`lib/teach.ts`) pick the missing half — **wording** (value already there) vs **answer** (set / append the ladder + file the wording). The added element is **highlighted in amber** (new `highlight` prop on `TieredField` / `TagListField` / `ProfileFieldEditor`), and a candidate ladder stays **reorderable** before Confirm.
+  **Wrong-field escape hatch** — a new **`TargetPicker`** (filterable list of every profile field + standalone saved answer + "Make a completely new answer") replaces the scattered "add to existing / save new" buttons; a no-recommendation card leads with "Save as a new answer". The right `ProfilePanel` (in-place profile editing) is unchanged.
 
 ## Design directions (under review)
 

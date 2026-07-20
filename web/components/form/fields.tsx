@@ -15,6 +15,15 @@ export const BucketLabelContext = createContext<((path: string, label: string, w
 const inputCls =
   "w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
 
+// Amber ring/tint applied to a list entry that equals the optional `highlight` value — used by the
+// teach confirm popup to show WHICH candidate/wording it's about to add (case/whitespace-insensitive).
+const HIGHLIGHT_CLS = "border-amber bg-amber/10 ring-1 ring-amber/40";
+function isHighlighted(entry: string, highlight?: string): boolean {
+  if (!highlight) return false;
+  const n = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  return n(entry) === n(highlight);
+}
+
 export function FieldLabel({
   children,
   hint,
@@ -304,12 +313,15 @@ export function TagListField({
   onChange,
   placeholder = "Type and press Enter",
   hint,
+  highlight,
 }: {
   label: string;
   value: string[];
   onChange: (v: string[]) => void;
   placeholder?: string;
   hint?: string;
+  /** An entry equal to this value gets an amber ring (the teach popup's "adding this one"). */
+  highlight?: string;
 }) {
   const [draft, setDraft] = useState("");
   const add = () => {
@@ -343,7 +355,10 @@ export function TagListField({
           {value.map((tag, i) => (
             <li
               key={`${tag}-${i}`}
-              className="inline-flex items-center gap-1.5 rounded-md border border-hairline bg-panel-raised px-2 py-1 text-xs text-ink"
+              className={clsx(
+                "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs text-ink",
+                isHighlighted(tag, highlight) ? HIGHLIGHT_CLS : "border-hairline bg-panel-raised",
+              )}
             >
               {tag}
               <button
@@ -368,11 +383,14 @@ export function TieredField({
   value,
   onChange,
   placeholder,
+  highlight,
 }: {
   label: string;
   value: string[];
   onChange: (v: string[]) => void;
   placeholder?: string;
+  /** A candidate equal to this value gets an amber ring (the teach popup's "adding this one"). */
+  highlight?: string;
 }) {
   const [draft, setDraft] = useState("");
   // Adaptive placeholder: explain the tiered fallback in terms of how many
@@ -422,7 +440,10 @@ export function TieredField({
           {value.map((cand, i) => (
             <li
               key={`${cand}-${i}`}
-              className="flex items-center gap-2 rounded-md border border-hairline bg-panel-raised px-2.5 py-1.5 text-sm"
+              className={clsx(
+                "flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm",
+                isHighlighted(cand, highlight) ? HIGHLIGHT_CLS : "border-hairline bg-panel-raised",
+              )}
             >
               <span className="font-mono text-[10px] text-ink-faint">{i + 1}</span>
               <span className="flex-1 truncate text-ink">{cand}</span>
