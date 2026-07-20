@@ -15,6 +15,7 @@ import {
   isFuzzyTier,
   fieldHoldsAnswer,
   decideTeachRoute,
+  wasManuallyEdited,
   type TeachSource,
 } from "@/lib/teach";
 import type { Bucket } from "@/lib/buckets";
@@ -78,6 +79,28 @@ test("teachableCards: excludes non-approved / deterministic / essay / empty / al
   assert.equal(teachableCards([src("a", [mk({})])], [], {}, ["reliable transport?"]).length, 0, "dismissed");
   assert.equal(teachableCards([src("a", [mk({ flag: null })])], [], {}).length, 1, "a REVIEWED non-AI field is teachable too (Req B)");
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");
+});
+
+test("wasManuallyEdited: override / filled_blank → true; cleared / added_entry / not-edited → false", () => {
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "override" })), true);
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "filled_blank" })), true);
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: null })), true); // edited, kind unset
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "cleared" })), false); // now empty
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "added_entry" })), false); // a new row, not a Q→A
+  assert.equal(wasManuallyEdited(entry({ is_edited: false })), false);
+});
+
+test("teachableCards: a MANUALLY-EDITED clean fill (needs_review=false) is teachable too", () => {
+  const mk = (over: Partial<ReviewEntry>) =>
+    entry({ question_label: "Preferred name?", widget_type: "text", needs_review: false, flag: null, current_value: "Sam", ...over });
+  // a clean deterministic fill the human DIDN'T touch → not teachable (already known)
+  assert.equal(teachableCards([src("a", [mk({})])], [], {}).length, 0, "untouched clean fill skipped");
+  // the human OVERRODE the clean fill on review → now teachable
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "override" })])], [], {}).length, 1, "override teaches");
+  // a filled-in blank → teachable
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "filled_blank" })])], [], {}).length, 1, "filled_blank teaches");
+  // a cleared field (now empty) → excluded (no value to remember)
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "cleared", current_value: "" })])], [], {}).length, 0, "cleared skipped");
 });
 
 test("addWordingToBucket: adds to the right bucket, dedups by normalize, leaves others", () => {

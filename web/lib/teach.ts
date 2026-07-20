@@ -48,15 +48,24 @@ export function isFuzzyTier(matchTier?: string | null): boolean {
 
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
 
-/** A teachable pair: the human APPROVED it, and it DIDN'T fill deterministically (needs_review —
- *  an AI guess, a no-match the human answered, a fuzzy/containment match…). A clean deterministic
- *  fill (mapped exact / bucket) has needs_review=false and is skipped — it's already known. Must be
- *  bucket-eligible with a real question + a non-empty value. */
+/** A human value edit on review that represents a corrected answer worth remembering — an override, or
+ *  a filled-in blank. A `cleared` edit (the field is now empty) or an `added_entry` (a new repeating row,
+ *  not a question→answer) is NOT a teachable answer. */
+export function wasManuallyEdited(e: ReviewEntry): boolean {
+  return !!e.is_edited && e.edit_kind !== "cleared" && e.edit_kind !== "added_entry";
+}
+
+/** A teachable pair: the human APPROVED it, and EITHER it didn't fill deterministically (needs_review —
+ *  an AI guess, a no-match the human answered, a fuzzy/containment match…) OR the human MANUALLY CHANGED
+ *  it on review (an override / filled-in blank — a signal the deterministic fill was wrong, worth
+ *  remembering so it's right next time). A clean, untouched deterministic fill (mapped exact / bucket,
+ *  needs_review=false, not edited) is skipped — it's already known. Must be bucket-eligible with a real
+ *  question + a non-empty value. */
 function isTeachable(e: ReviewEntry): boolean {
   return (
     !!e.is_approved &&
     !e.is_deleted &&
-    !!e.needs_review && // didn't fill deterministically (any reviewed field, not only AI-flagged ones)
+    (!!e.needs_review || wasManuallyEdited(e)) && // flagged for review OR a human override of a clean fill
     isBucketEligibleWidget(e.widget_type) &&
     !!e.question_label &&
     normalizeQuestion(e.question_label) !== "" &&

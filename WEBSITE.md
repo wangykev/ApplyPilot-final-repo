@@ -175,9 +175,11 @@ The learning loop's curation surface. After a fill is reviewed + **approved** (t
 approved bundle to `applications.review_bundle_json`), its answers that DIDN'T fill deterministically become
 teaching cards, so they fill deterministically (no review) next time.
 - **Data (`lib/teach.ts`, pure + unit-tested in `test/teach.test.ts` via the `tsx` runner):**
-  `teachableCards(apps, buckets, profile, dismissed)` = every **approved + `needs_review` + bucket-eligible**
-  entry with a value, deduped by normalized question, minus anything already bucketed or dismissed — read
-  across the user's reviewed applications.
+  `teachableCards(apps, buckets, profile, dismissed)` = every **approved + bucket-eligible** entry with a
+  value that either was flagged **`needs_review`** OR was **manually edited on review** (`wasManuallyEdited`
+  — an `override` / `filled_blank`; a human override of a *clean* deterministic fill is a signal the fill
+  was wrong, so it teaches too). Deduped by normalized question, minus anything already bucketed or
+  dismissed — read across the user's reviewed applications.
 - **Split-screen (`components/app/teach/`):** the current teach card is on the **left**; the **profile is
   physically displayed AND editable on the right** (`ProfilePanel`, from `flattenProfileFields` + the simple
   list sections **Skills / Employer history / Websites**). It's a **sticky, self-scrolling** column that
