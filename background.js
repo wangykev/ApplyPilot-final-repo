@@ -2142,7 +2142,7 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
             const aiForSource = act.aiEnabled
               ? { profile, jobContext, isRequired: true, label: f.label, fieldName: f.fieldName, sourceTree: true }
               : undefined;
-            r = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, cands, DEFAULT_BUDGETS, { ai: aiForSource });
+            r = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, cands, DEFAULT_BUDGETS, { ai: aiForSource, sourceTree: true });
             refillNote = `AI-4 Tier-2 re-drill source from how_did_you_hear [${cands.slice(0, 3).join(", ")}…] — `;
           } else {
             r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);

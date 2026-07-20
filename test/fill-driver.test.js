@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5780,6 +5780,30 @@ test("aiTreeDrillFallback: promptOption scrape finds 0 categories (role=option t
   assert.ok(out && out.status === "filled_review", "drilled via the readTreeCategories fallback instead of returning null (the Magna source bug)");
   assert.strictEqual(out.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers");
   assert.ok(act.log.some(([m]) => m === "expand"), "the category→leaf drill actually ran");
+});
+
+test("awaitSourceListLoaded: waits out a LATE server-fetched tree, returns the instant categories appear", async () => {
+  let calls = 0;
+  const act = {
+    delayFull: async () => {},
+    readTreeCategories: async () => { calls++; return calls >= 3 ? ["Job Board", "College/University"] : []; },
+    readHier: async () => ({ searchBox: { visible: true } }),
+    scrapeSourceRows: async () => ({ ok: true, options: [] }),
+  };
+  const loaded = await awaitSourceListLoaded(act, { wrapperSel: "[w]" }, { sourceCatLoadCeilingMs: 2000, sourceCatPollMs: 1 });
+  assert.strictEqual(loaded, true, "returns true once readTreeCategories populates (the fallback can then type into a loaded tree)");
+  assert.ok(calls >= 3, "polled until the tree loaded (adaptive, not a fixed wait)");
+});
+
+test("awaitSourceListLoaded: a tree that never loads returns false (bounded — never blocks forever)", async () => {
+  const act = {
+    delayFull: async () => {},
+    readTreeCategories: async () => [],
+    readHier: async () => ({ searchBox: { visible: true } }),
+    scrapeSourceRows: async () => ({ ok: true, options: [] }),
+  };
+  const loaded = await awaitSourceListLoaded(act, { wrapperSel: "[w]" }, { sourceCatLoadCeilingMs: 30, sourceCatPollMs: 1 });
+  assert.strictEqual(loaded, false, "gives up at the ceiling → the caller falls through (needs_review / AI), never hangs");
 });
 
 test("aiTreeDrillFallback: AI picks 'Other' → commits the suffixed Other leaf (ai-choice)", async () => {

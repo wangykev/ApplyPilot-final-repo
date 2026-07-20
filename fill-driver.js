@@ -1434,6 +1434,34 @@ const fillCheckboxCdp = async (act, loc, want, budgets) => {
 //     settle trace, never a silent or false fill.
 // The listbox + searchBox self-unmount after a trusted commit (recon (f)) —
 // no close workaround needed.
+
+// Wait for a SERVER-FETCHED source tree's option list to actually LOAD before we type into it. A tree
+// tenant (Magna wd3) opens with an EMPTY, stable list (the categories/leaves are fetched async), so
+// awaitListStable is satisfied by the stable-EMPTY state and the candidate typing below would hit a false
+// "No matches found." ADAPTIVE: poll the CHEAP read (readTreeCategories) and return the INSTANT the tree
+// has content (categories or options) — no fixed wait (the ceiling is only a give-up bound). Re-open only
+// if the popup actually closed. One scroll-scrape backstop. Returns true if loaded. Only invoked for a
+// source tree (opts.sourceTree); flat/fast typeaheads never call it. LOCKSTEP with the aiTreeDrillFallback
+// enumeration poll.
+async function awaitSourceListLoaded(act, loc, budgets) {
+  const has = async () => {
+    try { if (act.readTreeCategories) { const c = await act.readTreeCategories(loc); if (Array.isArray(c) && c.length) return true; } } catch (e) {}
+    try { if (act.scrapeSourceRows) { const s = await act.scrapeSourceRows(loc); if (s && s.ok && s.options && s.options.length) return true; } } catch (e) {}
+    return false;
+  };
+  if (await has()) return true;
+  const waitFull = act.delayFull || act.delay || (async () => {});
+  const ceil = budgets.sourceCatLoadCeilingMs || 6000;
+  const pollMs = budgets.sourceCatPollMs || 150;
+  const t0 = Date.now();
+  while ((Date.now() - t0) < ceil) {
+    await waitFull(pollMs);
+    try { if (act.readTreeCategories) { const c = await act.readTreeCategories(loc); if (Array.isArray(c) && c.length) return true; } } catch (e) {} // CHEAP per-tick (no scroll-scrape)
+    try { const st = act.readHier ? await act.readHier(loc) : null; if (st && st.searchBox && !st.searchBox.visible && act.openHier) await act.openHier(loc); } catch (e) {} // re-open only if it closed
+  }
+  return await has(); // final check (incl. the scroll-scrape backstop)
+}
+
 const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const norm = apMatch.normalize;
   const pre = await act.readHier(loc);
@@ -1554,6 +1582,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     //   • opts.onCapture — the pre-loop open+awaitListStable+scrape already rendered the list and left it open.
     if (ci === 0 && !opts.onCapture) {
       await awaitListStable(act, (l) => act.readHier(l), loc, budgets);
+      // Source TREE load gate: awaitListStable is satisfied by a stable-EMPTY list (Magna's categories are
+      // server-fetched LATE), so the candidate typing below would hit a false "No matches found" and the
+      // deterministic fallback would lose to the AI. Wait (adaptive) for the tree to actually LOAD first, so
+      // `type candidate → Enter` searches a populated tree (autocommit / pick the match). sourceTree only.
+      if (opts.sourceTree) await awaitSourceListLoaded(act, loc, budgets);
       if (!(await ensureSearchFocused())) {
         step.note = "could not re-focus after the open list rendered — not actuating blind";
         await act.pressTab(); // BLUR before leaving (lockstep with the focus-fail bail above)
@@ -2368,7 +2401,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           const aiForSource = act.aiEnabled
             ? { profile, jobContext, isRequired: f.isRequired, label: f.label, fieldName: f.fieldName, sourceTree: true }
             : undefined;
-          Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource }));
+          // sourceTree:true (independent of the AI toggle) → the deterministic candidate loop waits for the
+          // server-fetched tree to LOAD before typing, so the fallback (LinkedIn…) is tried by type→Enter
+          // FIRST; the AI drill only runs if no fallback candidate matches.
+          Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource, sourceTree: true }));
         }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
@@ -5131,5 +5167,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
