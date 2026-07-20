@@ -665,7 +665,7 @@ teach-time fallback for now).
 
 ## 2026-07-20 — Fill idempotency + AI-off halt + replay cascade race (branch `fill-overwrite-and-halt-fixes`)
 
-Three CDP fill/replay fixes + one sync tweak, each root-caused by a read-only trace (never guessed):
+Three CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
 
 - **Duplicate review page → OVERWRITE (`accumulateBundle`).** Dedup was by EXACT `cdpPageKey` (pathname +
   sorted field-set). Filling ONE page twice can yield DIFFERENT keys when the field-set shifts between
@@ -686,9 +686,9 @@ Three CDP fill/replay fixes + one sync tweak, each root-caused by a read-only tr
   Broadened `RENDER_FLAKE_RX` to the control-not-laid-out family so the bounded reload-retry (BOTH walks)
   recovers on a fresh load (which also clears the stale-session aggravation a cancelled-then-rerun adds). A
   genuine no-match ("value not offered") stays terminal — a reload can never mask a real problem.
-- **AI sync auto-opts-in AI fill (`AP_SET_LLM`).** Sets `llmConfig.enabled = true` when a usable config
-  (apiKey) syncs from the website (unless it sends `enabled:false`), so the operator needn't also flip the
-  popup toggle.
+
+(The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
+toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
 
 Verified: extension suite (minus `db`, uninstalled dep) **602/602** incl. new `samePhysicalPage`,
 `accumulateBundle`-overwrite, and broadened `isTransientRenderFailure` tests. **Live-verify PENDING**

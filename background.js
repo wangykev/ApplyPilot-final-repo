@@ -67,13 +67,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     if (!message.llmConfig || typeof message.llmConfig !== "object") {
       sendResponse({ ok: false, error: "no llmConfig" }); return true;
     }
-    // Auto-opt-in (operator ask): syncing a USABLE AI config from the website turns the extension's
-    // AI fill ON automatically — an apiKey present ⇒ enabled, so the operator doesn't have to ALSO
-    // flip the popup toggle. An explicit `enabled:false` from the website is still honored; the popup
-    // toggle can turn it off afterward (until the next sync).
-    const cfg = { ...message.llmConfig };
-    if (cfg.apiKey && cfg.enabled !== false) cfg.enabled = true;
-    chrome.storage.local.set({ llmConfig: cfg }, () => {
+    chrome.storage.local.set({ llmConfig: message.llmConfig }, () => {
       const err = chrome.runtime.lastError;
       sendResponse(err ? { ok: false, error: err.message } : { ok: true });
     });
