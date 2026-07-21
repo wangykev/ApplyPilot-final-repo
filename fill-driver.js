@@ -3653,7 +3653,7 @@ async function reconPageTruth(act, results) {
   const markRemoved = (r, why) => { r.status = "removed"; r.flag = "recon-removed"; r.detail = (r.detail ? r.detail + " | " : "") + why; };
   for (const r of results) {
     if (r.status === "removed" || r.widgetType === "section" || r.widgetType === "remediation" || r.widgetType === "file_upload") continue;
-    if (r.widgetType === "section_stub" || r.widgetType === "nested_section_stub") continue;
+    if (r.widgetType === "section_stub" || r.widgetType === "nested_section_stub" || r.widgetType === "removed_entry") continue;
     // nested (cert ▸ specialties): the probed auditLoc is the existence key (Tier-1.5 deletes rows)
     if (r.nested_child_base) {
       if (r.auditLoc && act.selExists) {
@@ -3799,6 +3799,40 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null, // hardcoded sub-section shapes → viewer shows them on an added-back parent
     nested_attachments: nestedHasAttachments || null                       // the section has a per-entry attach field → the viewer offers a file picker
   });
+  // Phase 2 (delete-with-memory): an entry we DELETED on the form (a required field couldn't be filled)
+  // but whose values + recon we REMEMBER so the review can offer add-back-with-prefill. Unlike the old
+  // bare "removed" sectionRec (widgetType "section" → dropped from the bundle), this SURVIVES into the
+  // bundle (widgetType "removed_entry" passes buildReviewBundle's filter) and carries `remembered_fields`
+  // (what filled, per field, + how) and `unfilled_fields` (why it was removed).
+  const shortName = (fn) => String(fn == null ? "" : fn).split(".").pop();
+  const makeRemovedEntry = (i, entryRecs, problemFields) => {
+    const remembered = (entryRecs || [])
+      .filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub" && r.widgetType !== "removed_entry")
+      .map((r) => ({
+        recName: shortName(r.fieldName), path: r.mappedPath ? shortName(r.mappedPath) : shortName(r.fieldName),
+        widget_type: r.widgetType, label: r.label, is_required: !!r.isRequired,
+        value: hasLiveValue(r.after) ? r.after : null,
+        filled_by: (r.flag && String(r.flag).indexOf("ai-") === 0) ? r.flag : (hasLiveValue(r.after) ? "deterministic" : "unfilled"),
+        match_tier: r.matchTier || null, options: r.options || null, date_order: r.date_order || null,
+      }));
+    // The fields the operator must SUPPLY or VERIFY on add-back: unfilled OR unconfidently-AI-filled.
+    const unfilled = (problemFields || []).map((r) => ({ recName: shortName(r.fieldName), label: r.label }));
+    const names = unfilled.map((u) => u.label || u.recName).filter(Boolean);
+    return {
+      fieldName: name + "[" + i + "].__removed", label: humanName + " entry " + (i + 1) + " — removed",
+      widgetType: "removed_entry", isRequired: false, mappedPath: name + "[" + i + "].__removed",
+      rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+      flag: "entry-removed-remembered", verified: null, after: null, section_known: true,
+      container_prefix: containerPrefix, section_field_shape: stubShape(),
+      nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null,
+      nested_attachments: nestedHasAttachments || null,
+      remembered_fields: remembered, unfilled_fields: unfilled,
+      detail: humanName + " entry removed — " + (names.length
+        ? "couldn't fill " + names.join(", ") + " (not in your profile / no option matched)"
+        : "a required field couldn't be filled")
+        + ". Add it back (the fields that filled are prefilled) and supply the missing one.",
+    };
+  };
   const humanChild = (s) => String(s).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
 
   // Poll the entry count off-loop until it moves in the wanted direction or a
@@ -3816,7 +3850,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const finalize = (url) => {
     const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
     const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
-    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub").length;
+    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub" && r.widgetType !== "removed_entry").length;
     return { url, repeatingFieldCount, results, counts, needsReview };
   };
 
@@ -3883,57 +3917,55 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.
-    const failedRequired = entryRecs.filter((r) => r.isRequired && r.status !== "filled" && r.status !== "filled_review");
-    const ok = failedRequired.length === 0;
-    // M38 Bug B1 — an entry is DELETABLE (deleteOnNoMatch) ONLY if EVERY failed required pick
-    // is a GENUINE no-match (options/leaves RENDERED, candidate genuinely absent → this value
-    // isn't offered). A transient/infra failure (dropdown didn't render / couldn't open / commit
-    // didn't take / typeahead focus-unconfirmable) is NOT invalid data → KEEP + surface
-    // (needs_review), NEVER silently destroy valid data (the live English/Chinese loss when the
-    // language dropdown failed to render deep in a long fold).
-    // Step 2.5 — an AI-rescued REQUIRED pick is KEPT only if it's CONFIDENT + genuinely represented
-    // (ai-choice, high/medium). Anything shakier — low-confidence, ai-closest-forced (forced a value the
-    // applicant didn't claim), ai-choice-other ("Other" fallback), ai-typeahead-decline, ai-commit-failed
-    // — is UNCONFIDENT: in a deleteOnNoMatch (optional) section a shaky entry is worse than none → DELETE
-    // it (operator rule). The AI is INLINE now (it already ran in fillEntryCdp), so there is no end-of-page
-    // defer (the old aiWillRescue). `deletable` is acted on ONLY by the deleteOnNoMatch sweep below, so a
-    // non-deletable section (education/FoS) keeps + flags regardless.
+    // Phase 2 (delete-with-memory) — per-entry disposition, per the LOCKED decision tree
+    // (docs/plan-repeating-ai-and-delete-remember.md). A required field is RESOLVED iff it committed a
+    // value (filled / filled_review) AND — if that value came from the AI — the AI was CONFIDENT
+    // (ai-choice, high/medium). A PROBLEM field is a required field that is NOT resolved: unfilled, OR
+    // filled only by an UNCONFIDENT AI pick (low-confidence / ai-closest-forced / "Other" fallback /
+    // commit-failed). These problem fields are exactly what the operator must supply/verify on add-back.
+    //   • no problem fields → KEEP (normal; a confident AI-filled field already flags itself).
+    //   • problem fields present:
+    //       - AI ON  → DELETE-WITH-MEMORY: delete the entry so the walk ADVANCES to review, but remember
+    //                  its values + recon and surface an add-back card (supersedes keep-and-halt, D4).
+    //       - AI OFF + deleteOnNoMatch (optional cert/language) + a GENUINE no-match → DELETE-WITH-MEMORY
+    //         (an optional entry the tenant doesn't offer is deterministically removable — never halt on it).
+    //       - otherwise (expected-data education/WE/websites, OR a transient/infra failure) → KEEP → the
+    //         unfilled required field makes Save & Continue fail → the walk HALTS (D1; Bug B1 = never
+    //         destroy valid data blind, so a transient failure is KEPT even in a deleteOnNoMatch section).
     const isAiRec = (r) => r.flag && String(r.flag).indexOf("ai-") === 0;
     const aiConfidentKeep = (r) => r.flag === "ai-choice" && (r.confidence === "high" || r.confidence === "medium");
-    const aiUnconfident = entryRecs.some((r) => r.isRequired && isAiRec(r) && !aiConfidentKeep(r));
-    const deletable =
-      (failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true)) // deterministic genuine no-match (AI off / not eligible)
-      || aiUnconfident;                                                                       // an unconfident AI pick (optional section only — sweep-gated)
-    perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
+    const isResolved = (r) => (r.status === "filled" || r.status === "filled_review") && !(isAiRec(r) && !aiConfidentKeep(r));
+    const problemFields = entryRecs.filter((r) => r.isRequired && !isResolved(r));
+    const genuineOptionalMiss = deleteOnNoMatch && problemFields.length > 0 && problemFields.every((r) => r.genuineNoMatch === true);
+    let disposition = "keep";
+    if (problemFields.length > 0) {
+      if (act.aiEnabled) disposition = "delete_memory";            // AI couldn't confidently resolve → delete + remember
+      else if (genuineOptionalMiss) disposition = "delete_memory"; // AI off, optional genuine no-match → deterministic removal
+      else disposition = "keep";                                   // AI off, expected-data / transient → keep → walk halts
+    }
+    perEntry.push({ idx: i, recs: entryRecs, problemFields, disposition });
   }
 
-  // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose REQUIRED
-  // pick GENUINELY didn't match (the value isn't offered) would block Next, so delete it.
-  // Sweep high→low so lower indices stay valid. OFF for Websites (text always fills if present).
-  // A transient/infra pick failure is NOT deletable (kept + surfaced — Bug B1).
-  if (deleteOnNoMatch) {
-    await captureDetectedShape(); // BEFORE deleting — so an emptied section's stub keeps the recon'd date_order (segmented date editor, not a text box)
-    let removed = 0;
+  // Phase 2 DELETE-WITH-MEMORY sweep — delete each entry whose disposition is `delete_memory`, but keep
+  // its data alive: replace its recs with a `removed_entry` record carrying `remembered_fields` (what
+  // filled, per field, + how) and `unfilled_fields` (why it was removed), so the review shows an
+  // add-back-with-prefill card instead of the value silently vanishing. Runs for ALL sections now (the
+  // per-entry disposition already encodes the AI-on/off + optional/expected split — was deleteOnNoMatch-
+  // only). Sweep high→low so lower indices stay valid. A delete that doesn't take (can't click) leaves
+  // the entry's field recs as-is (still surfaces).
+  if (perEntry.some((e) => e.disposition === "delete_memory")) {
+    await captureDetectedShape(); // BEFORE deleting — the removed_entry's shape keeps the recon'd date_order
     for (let k = perEntry.length - 1; k >= 0; k--) {
-      if (!perEntry[k].deletable) continue; // ok entries AND transient-fail entries are KEPT
+      if (perEntry[k].disposition !== "delete_memory") continue;
       const before = await act.entryCount(containerPrefix);
       const clicked = await act.clickDeleteEntry(containerPrefix, perEntry[k].idx);
-      if (!clicked || !clicked.ok) continue; // can't delete — leave it (surfaces in review)
+      if (!clicked || !clicked.ok) continue;
       const after = await pollCount(before, false);
       if (after < before) {
-        removed++;
         perEntry[k].wasDeleted = true; // so the nested emit below skips this entry's sub-sections
-        perEntry[k].recs = [sectionRec("[" + perEntry[k].idx + "].removed", name + " entry removed",
-          "skipped", "a required pick didn't match an option → entry deleted (optional section)")];
+        perEntry[k].recs = [makeRemovedEntry(perEntry[k].idx, perEntry[k].recs, perEntry[k].problemFields)];
       }
       await act.delay(budgets.interFieldMs);
-    }
-    // If deletion EMPTIED the section, it would VANISH from review (the removed recs are widgetType
-    // "section" → filtered out of the bundle). Keep the CATEGORY visible + addable, with a "removed —
-    // no match" note, so the operator can still add/verify (the recon's field shape rides the stub).
-    if (removed > 0 && (await act.entryCount(containerPrefix)) === 0) {
-      results.push(makeSectionStub(humanName + " — no entries (removed)",
-        removed + " entr" + (removed === 1 ? "y was" : "ies were") + " removed — no option matched what you entered. Add or verify here."));
     }
   }
 
@@ -4232,7 +4264,7 @@ async function replayField(act, entry, budgets) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const widget = entry && entry.widget_type;
   if (!entry || !widget || widget === "section") return { status: "skipped", detail: "no widget / section op (not replayable)" };
-  if (widget === "section_stub" || widget === "nested_section_stub") return { status: "skipped", flag: "replay-stub-skip", detail: "section stub — a display-only add-entry card, not a fillable field" };
+  if (widget === "section_stub" || widget === "nested_section_stub" || widget === "removed_entry") return { status: "skipped", flag: "replay-stub-skip", detail: "section stub / removed-entry card — display-only, not a fillable field (an added-back entry replays as real fields, not via this record)" };
   if (entry.is_deleted) return { status: "skipped", flag: "replay-deleted", detail: "deleted entry — dropped by the section reconcile, not replayed" };
   if (isRepeatingEntry(entry)) return { status: "skipped", flag: "replay-repeating-deferred", detail: "repeating-section field — replayed positionally by the section reconcile (M3), not by a recorded selector" };
   if (widget === "file_upload") return { status: "skipped", flag: "replay-file-deferred", detail: "résumé re-attach handled by the SW attachResumeForPage step, not replayField" };
@@ -5031,6 +5063,10 @@ function buildReviewBundle(results, meta) {
     // the profile is on the page it should be review". A required-but-empty KNOWN section still blocks
     // Save & Continue → the walk halts at nav-timeout, so skipping the review flag never hides a blocker.)
     // Handled BEFORE the flagged-base guard (its status is "skipped", which would early-return false).
+    // Phase 2 delete-with-memory: an entry DELETED on the form (a required field couldn't be filled) but
+    // whose values + recon we REMEMBERED → ALWAYS a review item (the operator adds it back + supplies the
+    // missing field). Its status is "skipped", so it must be caught before the flagged-base guard too.
+    if (rec.flag === "entry-removed-remembered") return { needs_review: true, needs_review_reason: "entry_removed" };
     if (rec.flag === "section-stub") {
       if (rec.section_known === true) return { needs_review: false, needs_review_reason: null };
       return { needs_review: true, needs_review_reason: "section_unfilled" };
@@ -5122,6 +5158,8 @@ function buildReviewBundle(results, meta) {
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
+      remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them
+      unfilled_fields: Array.isArray(rec.unfilled_fields) ? rec.unfilled_fields : null,       // Phase 2: removed_entry → the required field(s) that couldn't fill (why it was removed)
       container_prefix: rec.container_prefix != null ? rec.container_prefix : null, // m3a: backend identifier (fkit prefix) for a future fill-back session
       section_heading: rec.section_heading != null ? rec.section_heading : null,    // m3a: section heading / Add anchor
       section_known: rec.section_known != null ? !!rec.section_known : null,        // m3a: false = unmapped/unknown section

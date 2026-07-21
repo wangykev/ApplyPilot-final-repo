@@ -2120,12 +2120,15 @@ test("required-empty typeahead (section / FoS): AI ON → infers + forces a pick
   const eduEntry = (fkit) => ({ fkit, fields: [{ fieldName: "fieldOfStudy", widgetType: "typeahead", isRequired: true, chips: [], scrapeOptions: ["Accounting", "Biology", "Other"], filterMap: { "Biology": { autoCommit: "Biology" } } }] });
   const fieldMap = [{ field: "fieldOfStudy", widget: "typeahead", key: "fos", path: "field_of_study" }];
   const items = [{}]; // no fos value → resolve skips → required-empty AI fill
-  const state = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Biology","represented":true}', newEntry: (i) => eduEntry("education-new" + i), entries: [eduEntry("education-0--null")] };
+  // Phase 2: the AI must be CONFIDENT (High/Med) for the entry to be KEPT — a low-confidence pick now
+  // feeds the delete-with-memory decision (D2). "Biology" is represented AND High confidence → kept.
+  const state = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Biology","represented":true,"confidence":"High"}', newEntry: (i) => eduEntry("education-new" + i), entries: [eduEntry("education-0--null")] };
   const act = makeFakeRepeatAct(state);
   const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-", items, fieldMap, deleteOnNoMatch: false, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
   const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
-  assert.strictEqual(fos.status, "filled_review", "a required empty section typeahead is AI-filled, not skipped");
+  assert.strictEqual(fos.status, "filled_review", "a required empty section typeahead is CONFIDENTLY AI-filled, not skipped");
   assert.strictEqual(fos.after, "Biology");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "a confident AI fill KEEPS the entry (not delete-with-memory)");
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
@@ -4221,6 +4224,62 @@ test("repeating dropdown AI canonicalize (Phase 1): a STATED degree that isn't i
   assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to canonicalize");
 });
 
+test("Phase 2 delete-with-memory: education (expected-data) + AI ON + an unfillable required field → entry DELETED but REMEMBERED (add-back prefills school+degree)", async () => {
+  // school + degree fill deterministically; fieldOfStudy is required but has no profile value and no AI
+  // resolution (2a: dropdowns have no infer) → the whole entry is delete-with-memory'd (advance the walk,
+  // supersedes keep-and-halt, D4), remembering school+degree for prefill + recording fieldOfStudy as missing.
+  const eduEntry = (fkit) => ({ fkit, fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Bachelors" }] },
+    { fieldName: "fieldOfStudy", label: "Field of Study*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Accounting" }, { text: "Biology" }] },
+  ] });
+  const state = { prefix: "education-", addable: false, deletable: true, aiEnabled: true, ai: null, entries: [eduEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school_or_university" },
+    { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
+    { field: "fieldOfStudy", widget: "dropdown", key: "fos", path: "field_of_study" },
+  ];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU", degree: ["Bachelors"] }], fieldMap, deleteOnNoMatch: false, // no fos value
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  assert.ok(act.log.some(([m]) => m === "clickDeleteEntry"), "AI on → delete-with-memory (advance the walk, not halt)");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem, "delete-with-memory → a removed_entry card");
+  assert.strictEqual(rem.flag, "entry-removed-remembered");
+  const school = rem.remembered_fields.find((f) => f.recName === "schoolName");
+  assert.ok(school && school.value === "CMU" && school.filled_by === "deterministic", "school remembered for prefill");
+  const deg = rem.remembered_fields.find((f) => f.recName === "degree");
+  assert.ok(deg && deg.value === "Bachelors" && deg.filled_by === "deterministic", "degree remembered for prefill");
+  assert.ok(rem.unfilled_fields.some((u) => u.recName === "fieldOfStudy"), "the missing required field is recorded");
+});
+
+test("Phase 2: education (expected-data) + AI OFF + an unfillable required field → entry KEPT (walk halts), NOT delete-with-memory", async () => {
+  // AI off + expected-data section → NEVER delete/advance: keep the entry with the unfilled required field
+  // → Save & Continue fails → the walk HALTS for the operator (D1). Never destroy data blind.
+  const eduEntry = (fkit) => ({ fkit, fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "fieldOfStudy", label: "Field of Study*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Accounting" }] },
+  ] });
+  const state = { prefix: "education-", addable: false, aiEnabled: false, entries: [eduEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school_or_university" },
+    { field: "fieldOfStudy", widget: "dropdown", key: "fos", path: "field_of_study" },
+  ];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU" }], fieldMap, deleteOnNoMatch: false, aiContext: null,
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "expected-data + AI off → NEVER delete (keep → halt)");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "no delete-with-memory when AI is off");
+  const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
+  assert.strictEqual(fos.status, "skipped", "the unfilled required field is kept (skipped) → deriveReview flags it → blocks Save → walk halts");
+  assert.strictEqual(fos.isRequired, true);
+});
+
 test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candidate absent) deletes high→low", async () => {
   // M38 Bug B1: deleteOnNoMatch fires on a GENUINE no-match — the required dropdown's
   // options RENDERED but the candidate isn't among them (this value isn't offered).
@@ -4234,16 +4293,17 @@ test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candid
   }, T_BUDGETS);
   const delIdx = act.log.filter(([m]) => m === "clickDeleteEntry").map(([, i]) => i);
   assert.deepStrictEqual(delIdx, [1, 0]); // high→low so lower indices stay valid
-  const removed = out.results.filter((r) => /removed$/.test(r.fieldName));
+  // Phase 2 delete-with-memory: each deleted entry → a removed_entry card (not a dropped "removed" op).
+  const removed = out.results.filter((r) => r.widgetType === "removed_entry");
   assert.strictEqual(removed.length, 2);
-  assert.ok(removed.every((r) => r.status === "skipped" && /entry deleted/.test(r.detail)));
+  assert.ok(removed.every((r) => r.status === "skipped" && r.flag === "entry-removed-remembered" && /removed/i.test(r.detail)));
+  assert.ok(removed.every((r) => Array.isArray(r.unfilled_fields) && r.unfilled_fields.length), "carries the unfilled field (why it was removed)");
 });
 
-test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a stub (recon + note), not vanished", async () => {
-  // Operator bug: when deleteOnNoMatch deletes the LAST entry the whole section disappeared from
-  // review (the "removed" recs are widgetType "section" → filtered from the bundle). Now the
-  // section stays VISIBLE as a section_stub with a "removed — no match" note, so the operator can
-  // still ADD an entry (the field-shape rides the stub) or verify.
+test("repeating delete-on-no-match: EMPTYING the section surfaces a removed_entry card (delete-with-memory), not vanished", async () => {
+  // Phase 2 (delete-with-memory): when a genuine no-match deletes an entry, it's not dropped — a
+  // removed_entry record carries its recon + remembered values so the review shows an add-back card.
+  // (Supersedes the old "emptied → section_stub" behavior.)
   const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Alpha" }, { text: "Beta" }] }] });
   const state = webState({ prefix: "certification-", entries: [mk("certification-1--null")] });
   const fieldMap = [{ field: "x", widget: "dropdown", key: "x", path: "x" }];
@@ -4253,22 +4313,21 @@ test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a
     items: [{ x: "Zzz-nomatch" }], fieldMap, deleteOnNoMatch: true
   }, T_BUDGETS);
   assert.strictEqual(await act.entryCount("certification-"), 0, "the only entry was deleted");
-  const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub, "the emptied deleteOnNoMatch section still surfaces as a section_stub");
-  assert.strictEqual(stub.fieldName, "certification");
-  assert.strictEqual(stub.flag, "section-stub");
-  assert.strictEqual(stub.container_prefix, "certification-"); // backend identifier for the future add-fill
-  assert.ok(Array.isArray(stub.section_field_shape) && stub.section_field_shape.length, "carries the field shape so add-entry works");
-  assert.match(stub.detail, /removed/i);
-  assert.match(stub.detail, /no option matched/i);
-  // ...and it must SURVIVE into the bundle (the "appear in review" requirement): the section_stub
-  // passes buildReviewBundle's filter while the "removed" recs (widgetType "section") are dropped.
-  assert.strictEqual(stub.section_known, true, "cert is a KNOWN, profile-defined section");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem, "the deleted entry surfaces as a removed_entry card (not vanished)");
+  assert.strictEqual(rem.flag, "entry-removed-remembered");
+  assert.strictEqual(rem.container_prefix, "certification-"); // backend identifier for the future add-back
+  assert.ok(Array.isArray(rem.section_field_shape) && rem.section_field_shape.length, "carries the field shape so add-back works");
+  assert.ok(Array.isArray(rem.remembered_fields), "carries remembered_fields to prefill on add-back");
+  assert.ok(Array.isArray(rem.unfilled_fields) && rem.unfilled_fields.length, "records the field that couldn't fill");
+  assert.match(rem.detail, /removed/i);
+  // ...and it SURVIVES into the bundle as a needs_review add-back item.
   const entries = buildReviewBundle(out.results, {}).entries;
-  const stubEntry = entries.find((e) => e.widget_type === "section_stub" && /certification/.test(e.field_id || ""));
-  assert.ok(stubEntry, "the section_stub reaches the bundle → shows on the review page");
-  assert.strictEqual(stubEntry.needs_review, false, "a KNOWN empty section shows in ALL FIELDS but does NOT nag for review (operator 2026-07-20)");
-  assert.ok(!entries.some((e) => /\.removed$/.test(e.field_id || "")), "the raw 'removed' ops do NOT show");
+  const remEntry = entries.find((e) => e.widget_type === "removed_entry" && /certification/.test(e.field_id || ""));
+  assert.ok(remEntry, "the removed_entry reaches the bundle → shows on the review page");
+  assert.strictEqual(remEntry.needs_review, true, "a removed entry is a review item (add it back + supply the missing field)");
+  assert.strictEqual(remEntry.needs_review_reason, "entry_removed");
+  assert.ok(Array.isArray(remEntry.remembered_fields), "remembered_fields ride into the bundle");
 });
 
 test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletion) → segmented date editor, not a text box", async () => {
@@ -4289,11 +4348,11 @@ test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletio
     name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
     items: [{ x: "Zzz-nomatch", dParsed: "2024" }], fieldMap, deleteOnNoMatch: true
   }, T_BUDGETS);
-  const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub, "emptied section still stubbed");
-  const dShape = stub.section_field_shape.find((s) => s.recName === "d");
-  assert.ok(dShape, "the date field is in the stub shape");
-  assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented editor");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem, "emptied section → a removed_entry card");
+  const dShape = rem.section_field_shape.find((s) => s.recName === "d");
+  assert.ok(dShape, "the date field is in the removed_entry's recon shape");
+  assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented add-back editor");
 });
 
 test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_shapes (add-back shows Specialties)", async () => {
@@ -4319,17 +4378,17 @@ test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_sha
     items: [{ cert: "Zzz-bogus" }], fieldMap, deleteOnNoMatch: true, nested: CERT_NESTED
   }, T_BUDGETS);
   assert.strictEqual(await act.entryCount("certification-"), 0, "bogus cert deleted → section empty");
-  const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub && stub.nested_shapes && Array.isArray(stub.nested_shapes.specialties), "the emptied cert's stub carries the hardcoded Specialties shape");
-  assert.strictEqual(stub.nested_shapes.specialties[0].recName, "specialtyParent");
-  assert.deepStrictEqual(stub.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
-  assert.strictEqual(stub.nested_attachments, true, "the stub knows the section has attachments (add-back offers a picker)");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem && rem.nested_shapes && Array.isArray(rem.nested_shapes.specialties), "the removed cert's card carries the hardcoded Specialties shape");
+  assert.strictEqual(rem.nested_shapes.specialties[0].recName, "specialtyParent");
+  assert.deepStrictEqual(rem.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
+  assert.strictEqual(rem.nested_attachments, true, "the card knows the section has attachments (add-back offers a picker)");
   assert.ok(!out.results.some((r) => r.widgetType === "nested_section_stub"), "a deleted cert → NO per-entry nested stub");
-  const flatNames = stub.section_field_shape.map((s) => s.recName);
+  const flatNames = rem.section_field_shape.map((s) => s.recName);
   assert.ok(flatNames.includes("certification") && flatNames.includes("certificationNumber"), "the cert's OWN fields stay in the flat shape");
   assert.ok(!flatNames.includes("specialtyParent") && !flatNames.includes("startDate") && !flatNames.includes("endDate"),
     "nested child fields EXCLUDED from the flat shape — Specialty renders ONLY as the sub-section");
-  assert.ok(!stub.section_field_shape.some((s) => s.widget_type === "file_upload"),
+  assert.ok(!rem.section_field_shape.some((s) => s.widget_type === "file_upload"),
     "the per-entry Attachments input EXCLUDED — nested_attachments renders the single picker (no double box)");
 });
 

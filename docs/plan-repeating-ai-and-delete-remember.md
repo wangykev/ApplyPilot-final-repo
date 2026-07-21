@@ -180,6 +180,15 @@ sections (education / work-experience / websites).
 2. **Extension delete-with-memory** (PR #19) — the unified entry-level decision in
    `driveRepeatingSectionCdp`: keep (flag AI) / delete-with-memory / halt, per the tree. Emit the
    `removed_entry` record with `remembered_fields` + recon. `buildReviewBundle`/`deriveReview` handle it.
+   - [x] **2a — mechanism** DONE (2026-07-21): per-entry disposition keyed on `problemFields` (required
+     fields not confidently resolved — unfilled OR unconfident-AI); AI-on → delete-with-memory, AI-off →
+     optional-genuine-miss deletes / expected-data keeps→halts. New `makeRemovedEntry` → `removed_entry`
+     record (`entry-removed-remembered`, `remembered_fields` {value, filled_by, recon}, `unfilled_fields`,
+     `section_field_shape`/`nested_shapes`); `deriveReview` → needs_review `entry_removed`; bundle carries
+     it; replay/reconPageTruth/finalize skip it. Old deleteOnNoMatch "removed"/emptied-stub tests migrated
+     to `removed_entry`. Suite 612/612.
+   - [ ] **2b — confident required-empty INFER** for repeating dropdowns/typeaheads (High/Med commits;
+     Low → stays a problem field → delete-with-memory), reducing how often 2a deletes.
 3. **Website add-back-with-prefill** (PR #18) — the `removed_entry` card + reconstruct-on-add.
 4. **Teach per-field scoping** (PR #18).
 5. **Replay** (PR #19) — `bundleToSectionItems` reconstructs an added-back entry.
