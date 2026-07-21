@@ -13,6 +13,7 @@ import {
   humanize,
   flattenProfileFields,
   isFuzzyTier,
+  dottedPath,
   fieldHoldsAnswer,
   decideTeachRoute,
   wasManuallyEdited,
@@ -88,6 +89,28 @@ test("teachableCards: a repeating entry's AI-filled field TEACHES; a determinist
   assert.equal(teachableCards([src("a", [aiRep])], [], {}).length, 1, "an AI-filled repeating field teaches");
   const detRep = entry({ question_label: "School", flag: null, needs_review: false, is_edited: false, current_value: "CMU", canonical_field: "education[0].school_or_university" });
   assert.equal(teachableCards([src("b", [detRep])], [], {}).length, 0, "a clean deterministic repeating field does NOT teach (already known)");
+});
+
+test("dottedPath: bracketed indexes → dots; flat paths unchanged", () => {
+  assert.equal(dottedPath("education[0].degree"), "education.0.degree");
+  assert.equal(dottedPath("certifications[1].specialties[0].specialty"), "certifications.1.specialties.0.specialty");
+  assert.equal(dottedPath("self_identification.gender"), "self_identification.gender");
+  assert.equal(dottedPath(""), "");
+  assert.equal(dottedPath(null), "");
+});
+
+test("teachableCards: a repeating field's BRACKETED path is dotted-normalized → resolves the profile value (not 'no value')", () => {
+  // The degree bug: canonical_field "education[0].degree" didn't resolve (split-on-'.') so the card read
+  // "no value" + never highlighted. Dotted-normalized, it resolves the real profile value.
+  const profile = { education: [{ degree: ["Bachelor of Science"] }] };
+  const cards = teachableCards(
+    [src("a", [entry({ question_label: "Degree", widget_type: "dropdown", flag: "ai-canonicalized", current_value: "Bachelors", canonical_field: "education[0].degree" })])],
+    [],
+    profile,
+  );
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].canonical_field, "education.0.degree", "bracketed → dotted");
+  assert.equal(cards[0].profile_value, "Bachelor of Science", "resolves the profile value → NOT 'no value'");
 });
 
 test("wasManuallyEdited: override / filled_blank → true; cleared / added_entry / not-edited → false", () => {

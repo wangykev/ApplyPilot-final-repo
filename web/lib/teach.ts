@@ -46,6 +46,15 @@ export function isFuzzyTier(matchTier?: string | null): boolean {
   return t === "containment" || /^fuzzy/.test(t);
 }
 
+/** Normalize a repeating-section path to the DOTTED form the profile resolvers + the teach panel rows use:
+ *  "education[0].degree" → "education.0.degree". The extension emits BRACKETED indexes in a bundle entry's
+ *  canonical_field, but profileValueAt / getAtPath / setAtPath split on "." (and arrays index by "0"), and
+ *  ProfilePanel rows are dotted — so without this a repeating field reads as "no value", never highlights,
+ *  and can't be edited. A flat path (no brackets) passes through unchanged. */
+export function dottedPath(path?: string | null): string {
+  return String(path == null ? "" : path).replace(/\[(\d+)\]/g, ".$1");
+}
+
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
 
 /** A human value edit on review that represents a corrected answer worth remembering — an override, or
@@ -112,8 +121,10 @@ export function teachableCards(
       const key = normalizeQuestion(e.question_label as string);
       if (covered.has(key) || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
-      const maps_to = e.maps_to || "";
-      const canonical_field = e.canonical_field || "";
+      // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
+      // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).
+      const maps_to = dottedPath(e.maps_to || "");
+      const canonical_field = dottedPath(e.canonical_field || "");
       const known = canonical_field || maps_to; // the deterministic mapped home wins over the AI hint
       cards.push({
         key,
