@@ -87,7 +87,13 @@
       outline-none transition-colors placeholder:text-ink-faint focus:border-amber/60;
   }
   select.ap-input {
-    @apply appearance-none pr-7;
+    @apply appearance-none bg-cockpit pr-8;
+    /* a themed down-caret (appearance-none removes the native one) so it reads as a dropdown + matches
+       the site's dark selects; the native option LIST is themed via the bg-panel on each <option>. */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.55rem center;
+    background-size: 1rem;
   }
   .ap-check {
     @apply h-4 w-4 shrink-0 accent-amber;

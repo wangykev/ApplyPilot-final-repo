@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, useTransition, useEffect } from "react";
-import { Plus, Trash2, Save, ShieldAlert, Settings2, X } from "lucide-react";
+import { useState, useTransition } from "react";
+import { Plus, Trash2, Save, ShieldAlert, Settings2 } from "lucide-react";
 import {
   TextField,
   TextAreaField,
   SelectField,
   TriBoolField,
   TagListField,
+  TieredField,
   CandidateField,
   DateField,
   CheckboxField,
@@ -18,6 +19,12 @@ import {
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
+import {
+  RememberedAnswerPopup,
+  ConfirmDeleteButton,
+  RememberedToggle,
+  RememberedCheckbox,
+} from "@/components/app/RememberedAnswerPopup";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
 import {
   PHONE_TYPE_OPTIONS,
@@ -66,6 +73,16 @@ function withDefaultWebsites(list: { type: string; url: string }[] | undefined) 
   });
   return [...fixed, ...arr]; // fixed defaults first, then any custom links
 }
+// The "How did you hear about us?" fallback ladder, shown pre-filled so the user
+// can see and edit it. Seeded ONLY when the stored list is empty (mirrors
+// withDefaultWebsites): a user who trimmed it to a non-empty list keeps theirs.
+const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub"];
+function withDefaultSources(h: Profile["how_did_you_hear"] | undefined) {
+  const preferred =
+    Array.isArray(h?.preferred) && h!.preferred.length > 0 ? h!.preferred : [...DEFAULT_SOURCE_LADDER];
+  const fallback = (h?.fallback ?? "").trim() ? h!.fallback : "Other";
+  return { preferred, fallback };
+}
 // Standard US EEO option sets (canonical lists live in lib/profile-fields.ts, shared with the teach
 // panel). Stored values are candidates the extension matches against each tenant's live options.
 const GENDER = opt(GENDER_OPTIONS);
@@ -78,6 +95,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
   const [profile, setProfile] = useState<Profile>(() => ({
     ...initial,
     websites: withDefaultWebsites(initial.websites),
+    how_did_you_hear: withDefaultSources(initial.how_did_you_hear),
   }));
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
@@ -402,10 +420,27 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <p className="text-xs leading-relaxed text-ink-dim">
             The extension fills the <span className="text-ink">real source</span> when it&apos;s known
             (from how the job was queued). For a manually pasted link, or when no source is available, it
-            works down this fallback list in order.
+            works down this fallback list <span className="text-ink">in order</span> — the first one the
+            form offers wins. The last resort below is tried only if none of these match.
           </p>
         </div>
-        <TagListField label="Fallback sources (in order)" value={profile.how_did_you_hear.preferred} placeholder="LinkedIn, Handshake, …" onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })} />
+        <TieredField
+          label="Fallback sources (in order)"
+          horizontal
+          hint="reorder with the ◄ ► arrows; the first one the form offers wins"
+          value={profile.how_did_you_hear.preferred}
+          placeholder="Add a source — e.g. LinkedIn"
+          onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })}
+        />
+        <div className="mt-4 sm:max-w-xs">
+          <TextField
+            label="Last resort"
+            hint="tried last, after the list above — a catch-all most forms offer"
+            value={profile.how_did_you_hear.fallback}
+            placeholder="Other"
+            onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })}
+          />
+        </div>
       </SectionCard>
 
       {/* Employment history companies — safety-critical */}
@@ -511,7 +546,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       )}
 
       {adv && (
-        <RememberedAdvancedPopup
+        <RememberedAnswerPopup
           initial={adv.draft}
           mode={adv.mode}
           categoryOptions={categoryOptions}
@@ -576,93 +611,10 @@ function Empty({ children }: { children: React.ReactNode }) {
 // renders as its own card.
 const BUCKET_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal", "Experience", "Education", "Other"];
 const MERGED_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal"];
-// How to ENTER a remembered answer here. This only drives the editor shown below; the extension still
-// adapts to whatever widget the LIVE form field is at fill time (the value is a candidate list). Text
-// covers dropdown / type-ahead too — its top-choice-plus-ladder layout IS the "try these options in
-// order" a dropdown needs — so those aren't separate options.
-const ANSWER_WIDGETS = [
-  { value: "text", label: "Text" },
-  { value: "radio", label: "Yes / No" },
-  { value: "checkbox", label: "Checkbox" },
-];
 
 /** A bucket's grouping category (blank → "Other"). */
 function bucketCategory(b: Bucket): string {
   return (b.category || "").trim() || "Other";
-}
-
-/** A trash control that requires a second click to confirm (no browser confirm dialog). */
-function ConfirmDeleteButton({ onDelete, withLabel }: { onDelete: () => void; withLabel?: boolean }) {
-  const [confirming, setConfirming] = useState(false);
-  if (confirming) {
-    return (
-      <span className="inline-flex items-center gap-2 text-[11px]">
-        <span className="text-ink-dim">Delete?</span>
-        <button type="button" onClick={onDelete} className="font-medium text-signal hover:underline">
-          Yes
-        </button>
-        <button type="button" onClick={() => setConfirming(false)} className="text-ink-faint hover:text-ink">
-          Cancel
-        </button>
-      </span>
-    );
-  }
-  return (
-    <button
-      type="button"
-      onClick={() => setConfirming(true)}
-      className="inline-flex items-center gap-1 text-[11px] text-ink-faint transition-colors hover:text-signal"
-      title="Delete this answer"
-    >
-      <Trash2 className="h-3.5 w-3.5" />
-      {withLabel && "Remove"}
-    </button>
-  );
-}
-
-/** A Yes/No toggle for a remembered answer (stores ["Yes"] / ["No"] / []). Label is optional — omit it
- *  when the question is already shown elsewhere (e.g. on the row header). */
-function RememberedToggle({ label, value, onChange }: { label?: string; value: string[]; onChange: (v: string[]) => void }) {
-  const cur = value[0] || "";
-  return (
-    <div>
-      {label && <FieldLabel>{label}</FieldLabel>}
-      <div className={clsx("flex max-w-[14rem] overflow-hidden rounded-lg border border-hairline", label && "mt-1.5")}>
-        {["Yes", "No"].map((o, idx) => {
-          const active = cur.toLowerCase() === o.toLowerCase();
-          return (
-            <button
-              key={o}
-              type="button"
-              onClick={() => onChange(active ? [] : [o])}
-              className={clsx(
-                "flex-1 py-1.5 text-sm transition-colors",
-                idx === 0 && "border-r border-hairline",
-                active ? "bg-amber font-semibold text-cockpit" : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink",
-              )}
-            >
-              {o}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/** A single checkbox for a remembered answer (stores ["Yes"] checked / ["No"] unchecked). */
-function RememberedCheckbox({ label, value, onChange }: { label: string; value: string[]; onChange: (v: string[]) => void }) {
-  const checked = (value[0] || "").toLowerCase() === "yes";
-  return <CheckboxField label={label} checked={checked} onChange={(c) => onChange([c ? "Yes" : "No"])} />;
-}
-
-/** The value editor for a remembered answer, labeled by the QUESTION so it reads like any profile field:
- *  Yes/No → a toggle; checkbox → a checkbox; text (also dropdown / type-ahead) → the candidate field
- *  (top choice + arrow → advanced ladder). */
-function RememberedValueField({ widget, label, value, onChange }: { widget: string; label: string; value: string[]; onChange: (v: string[]) => void }) {
-  if (widget === "radio") return <RememberedToggle label={label} value={value} onChange={onChange} />;
-  if (widget === "checkbox") return <RememberedCheckbox label={label} value={value} onChange={onChange} />;
-  return <CandidateField label={label} value={value} onChange={onChange} placeholder="the answer" />;
 }
 
 /** One remembered answer displayed like a normal profile field: the question as the label, with Advanced
@@ -720,73 +672,6 @@ function RememberedFieldRow({
   );
 }
 
-/** The Add / Advanced popup for a remembered answer. Works on a local DRAFT — edits commit ONLY when
- *  "Done" is clicked; clicking outside, Escape, or the X cancels (the draft is discarded; a brand-new
- *  answer is simply never created). */
-function RememberedAdvancedPopup({
-  initial,
-  mode,
-  categoryOptions,
-  onDone,
-  onCancel,
-  onDelete,
-}: {
-  initial: Bucket;
-  mode: "add" | "edit";
-  categoryOptions: string[];
-  onDone: (draft: Bucket) => void;
-  onCancel: () => void;
-  onDelete: () => void;
-}) {
-  const [draft, setDraft] = useState<Bucket>(initial);
-  const patch = (p: Partial<Bucket>) => setDraft((d) => ({ ...d, ...p }));
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", h);
-    return () => document.removeEventListener("keydown", h);
-  }, [onCancel]);
-  const answerType = draft.widget_hint === "radio" || draft.widget_hint === "checkbox" ? draft.widget_hint : "text";
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onCancel} role="presentation">
-      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-3 flex items-center justify-between">
-          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
-            {mode === "add" ? "Add remembered answer" : "Remembered answer — advanced"}
-          </h3>
-          <button type="button" onClick={onCancel} className="text-ink-faint hover:text-ink" aria-label="Cancel">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        <div className="space-y-4">
-          <TagListField
-            label="Question wordings"
-            value={draft.questions}
-            onChange={(q) => patch({ questions: q })}
-            placeholder="Paste the exact question, press Enter"
-            hint="every phrasing that should get this answer"
-          />
-          <SelectField label="Answer type" value={answerType} options={ANSWER_WIDGETS} onChange={(w) => patch({ widget_hint: w })} />
-          <RememberedValueField widget={answerType} label="Answer" value={draft.value} onChange={(v) => patch({ value: v })} />
-          <CategoryField value={draft.category} options={categoryOptions} onChange={(c) => patch({ category: c })} />
-        </div>
-        <div className="mt-5 flex items-center justify-between">
-          <div>{mode === "edit" && <ConfirmDeleteButton onDelete={onDelete} withLabel />}</div>
-          <div className="flex gap-2">
-            <button type="button" onClick={onCancel} className="btn-ghost px-3 py-1.5 text-sm">
-              Cancel
-            </button>
-            <button type="button" onClick={() => onDone(draft)} className="btn-primary">
-              Done
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 /** Remembered answers shown inside a matching profile section (below its fields), as simple profile-style
  *  fields. Renders NOTHING when the section has none — adding happens only in the "Other remembered
  *  answers" area at the end. */
@@ -808,45 +693,6 @@ function SectionRemembered({
       {items.map(({ b, i }) => (
         <RememberedFieldRow key={b.id} b={b} i={i} onPatch={onPatch} onOpenAdvanced={onOpenAdvanced} onRemove={onRemove} />
       ))}
-    </div>
-  );
-}
-
-/** Category picker for a saved answer: a dropdown of the known + in-use categories. Pick "Other" to type
- *  a new category — the typed name becomes the category live (no separate Add; the popup's Done commits).
- *  A custom category persists in this dropdown for as long as an answer carries it. */
-function CategoryField({ value, options, onChange }: { value: string; options: string[]; onChange: (c: string) => void }) {
-  // "typing" = entering a new custom category. Enter it by picking "Other", or when the current value is
-  // a custom that isn't offered in the dropdown.
-  const [typing, setTyping] = useState(() => value !== "" && !options.includes(value));
-  const inCustom = typing || value === "Other";
-  const selectValue = inCustom ? "Other" : value;
-  return (
-    <div>
-      <SelectField
-        label="Category"
-        value={selectValue}
-        options={opt(["", ...options])}
-        onChange={(c) => {
-          setTyping(c === "Other");
-          onChange(c);
-        }}
-      />
-      {inCustom && (
-        <div className="mt-2">
-          <input
-            value={value === "Other" ? "" : value}
-            placeholder="Type a category name (optional)"
-            onChange={(e) => {
-              setTyping(true);
-              const t = e.target.value;
-              onChange(t.trim() === "" ? "Other" : t);
-            }}
-            className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
-          />
-          <p className="mt-1 text-[11px] text-ink-faint">Leave blank to keep it under &ldquo;Other&rdquo;. New categories appear in this list once an answer uses them.</p>
-        </div>
-      )}
     </div>
   );
 }

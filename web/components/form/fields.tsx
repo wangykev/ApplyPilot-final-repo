@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, createContext, useContext } from "react";
-import { X, ArrowUp, ArrowDown, Plus, ChevronRight, Paperclip, Upload } from "lucide-react";
+import { X, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Plus, ChevronRight, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import { US_STATES, resolveUsState, isUnitedStates } from "@/lib/us-states";
 
@@ -14,6 +14,15 @@ export const BucketLabelContext = createContext<((path: string, label: string, w
 
 const inputCls =
   "w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
+
+// Amber ring/tint applied to a list entry that equals the optional `highlight` value — used by the
+// teach confirm popup to show WHICH candidate/wording it's about to add (case/whitespace-insensitive).
+const HIGHLIGHT_CLS = "border-amber bg-amber/10 ring-1 ring-amber/40";
+function isHighlighted(entry: string, highlight?: string): boolean {
+  if (!highlight) return false;
+  const n = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  return n(entry) === n(highlight);
+}
 
 export function FieldLabel({
   children,
@@ -304,12 +313,15 @@ export function TagListField({
   onChange,
   placeholder = "Type and press Enter",
   hint,
+  highlight,
 }: {
   label: string;
   value: string[];
   onChange: (v: string[]) => void;
   placeholder?: string;
   hint?: string;
+  /** An entry equal to this value gets an amber ring (the teach popup's "adding this one"). */
+  highlight?: string;
 }) {
   const [draft, setDraft] = useState("");
   const add = () => {
@@ -343,7 +355,10 @@ export function TagListField({
           {value.map((tag, i) => (
             <li
               key={`${tag}-${i}`}
-              className="inline-flex items-center gap-1.5 rounded-md border border-hairline bg-panel-raised px-2 py-1 text-xs text-ink"
+              className={clsx(
+                "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs text-ink",
+                isHighlighted(tag, highlight) ? HIGHLIGHT_CLS : "border-hairline bg-panel-raised",
+              )}
             >
               {tag}
               <button
@@ -362,17 +377,27 @@ export function TagListField({
   );
 }
 
-/** Ordered candidate list, most-specific first. Add / remove / reorder. */
+/** Ordered candidate list, most-specific first. Add / remove / reorder.
+ *  `horizontal` lays the entries out side-by-side (chips) with left/right reorder
+ *  arrows instead of the default stacked list with up/down arrows. */
 export function TieredField({
   label,
   value,
   onChange,
   placeholder,
+  highlight,
+  horizontal,
+  hint = "most-specific first; the extension tries each in order",
 }: {
   label: string;
   value: string[];
   onChange: (v: string[]) => void;
   placeholder?: string;
+  /** A candidate equal to this value gets an amber ring (the teach popup's "adding this one"). */
+  highlight?: string;
+  /** Side-by-side chip layout with left/right reorder arrows. */
+  horizontal?: boolean;
+  hint?: string;
 }) {
   const [draft, setDraft] = useState("");
   // Adaptive placeholder: explain the tiered fallback in terms of how many
@@ -397,9 +422,12 @@ export function TieredField({
     [next[i], next[j]] = [next[j], next[i]];
     onChange(next);
   };
+  const PrevIcon = horizontal ? ArrowLeft : ArrowUp;
+  const NextIcon = horizontal ? ArrowRight : ArrowDown;
+  const ListTag: "ul" | "ol" = horizontal ? "ul" : "ol";
   return (
     <div>
-      <FieldLabel hint="most-specific first; the extension tries each in order">{label}</FieldLabel>
+      <FieldLabel hint={hint}>{label}</FieldLabel>
       <div className="mt-1.5 flex gap-2">
         <input
           value={draft}
@@ -418,31 +446,35 @@ export function TieredField({
         </button>
       </div>
       {value.length > 0 && (
-        <ol className="mt-2 space-y-1">
+        <ListTag className={clsx("mt-2", horizontal ? "flex flex-wrap items-center gap-2" : "space-y-1")}>
           {value.map((cand, i) => (
             <li
               key={`${cand}-${i}`}
-              className="flex items-center gap-2 rounded-md border border-hairline bg-panel-raised px-2.5 py-1.5 text-sm"
+              className={clsx(
+                "items-center rounded-md border text-sm",
+                horizontal ? "inline-flex gap-1.5 px-2 py-1" : "flex gap-2 px-2.5 py-1.5",
+                isHighlighted(cand, highlight) ? HIGHLIGHT_CLS : "border-hairline bg-panel-raised",
+              )}
             >
               <span className="font-mono text-[10px] text-ink-faint">{i + 1}</span>
-              <span className="flex-1 truncate text-ink">{cand}</span>
+              <span className={clsx("text-ink", horizontal ? "whitespace-nowrap" : "flex-1 truncate")}>{cand}</span>
               <button
                 type="button"
                 onClick={() => move(i, -1)}
                 disabled={i === 0}
                 className="text-ink-faint hover:text-ink disabled:opacity-30"
-                aria-label="Move up"
+                aria-label={horizontal ? "Move left" : "Move up"}
               >
-                <ArrowUp className="h-3.5 w-3.5" />
+                <PrevIcon className="h-3.5 w-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => move(i, 1)}
                 disabled={i === value.length - 1}
                 className="text-ink-faint hover:text-ink disabled:opacity-30"
-                aria-label="Move down"
+                aria-label={horizontal ? "Move right" : "Move down"}
               >
-                <ArrowDown className="h-3.5 w-3.5" />
+                <NextIcon className="h-3.5 w-3.5" />
               </button>
               <button
                 type="button"
@@ -454,7 +486,7 @@ export function TieredField({
               </button>
             </li>
           ))}
-        </ol>
+        </ListTag>
       )}
     </div>
   );

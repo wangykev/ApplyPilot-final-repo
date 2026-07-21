@@ -62,7 +62,9 @@ export function ProfilePanel({
   useEffect(() => {
     if (!highlightPath) return;
     const el = scrollRef.current?.querySelector<HTMLElement>('[data-hot="1"]');
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    // block:"start" (+ the hot row's scroll-mt) lands the field near the TOP of the panel with a little
+    // breathing room, rather than dead-center — easier to see the field and the rows below it.
+    el?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [highlightPath]);
 
   return (
@@ -122,7 +124,7 @@ function FieldBox({
             <div
               key={r.path}
               data-hot={hot ? "1" : undefined}
-              className={clsx("flex items-baseline justify-between gap-3 px-3 py-1.5", hot && "bg-amber/10")}
+              className={clsx("flex items-baseline justify-between gap-3 px-3 py-1.5", hot && "scroll-mt-20 bg-amber/10")}
             >
               {/* NAME — plain text, highlights on hover → advanced options (the question wordings) */}
               <button

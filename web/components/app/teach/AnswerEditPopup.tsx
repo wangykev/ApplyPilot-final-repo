@@ -37,12 +37,16 @@ export function ProfileFieldEditor({
   value,
   countryForState,
   onChange,
+  highlight,
 }: {
   path: string;
   label: string;
   value: unknown;
   countryForState?: string[];
   onChange: (value: unknown) => void;
+  /** For list widgets (candidate / tiered / taglist): the entry to ring in amber (the teach popup's
+   *  "adding this one"). Ignored by scalar widgets. */
+  highlight?: string;
 }) {
   const meta = profileFieldMeta(path, value);
   if (meta.widget === "dropdown")
@@ -54,9 +58,9 @@ export function ProfileFieldEditor({
   if (meta.widget === "state")
     return <StateProvinceField value={strv(value)} country={countryForState || []} onChange={(v) => onChange(v)} />;
   if (meta.widget === "candidate")
-    return <CandidateLadder value={arrv(value)} mode={meta.dropdownMode || "country"} onChange={(v) => onChange(v)} />;
-  if (meta.widget === "tiered") return <TieredField label={label} value={arrv(value)} onChange={(v) => onChange(v)} />;
-  if (meta.widget === "taglist") return <TagListField label={label} value={arrv(value)} onChange={(v) => onChange(v)} />;
+    return <CandidateLadder value={arrv(value)} mode={meta.dropdownMode || "country"} onChange={(v) => onChange(v)} highlight={highlight} />;
+  if (meta.widget === "tiered") return <TieredField label={label} value={arrv(value)} onChange={(v) => onChange(v)} highlight={highlight} />;
+  if (meta.widget === "taglist") return <TagListField label={label} value={arrv(value)} onChange={(v) => onChange(v)} highlight={highlight} />;
   return <TextField label={label} value={strv(value)} onChange={(v) => onChange(v)} />;
 }
 
@@ -123,10 +127,12 @@ function CandidateLadder({
   value,
   mode,
   onChange,
+  highlight,
 }: {
   value: string[];
   mode: "country" | "phone";
   onChange: (v: string[]) => void;
+  highlight?: string;
 }) {
   const expand = mode === "phone" ? phoneCandidates : countryCandidates;
   const selected = COUNTRIES.find((c) => expand(c).some((cand) => cand === value[0]))?.name ?? "";
@@ -145,7 +151,7 @@ function CandidateLadder({
           onChange(c ? expand(c) : []);
         }}
       />
-      <TieredField label="Candidates it tries (most-specific first)" value={value} onChange={onChange} />
+      <TieredField label="Candidates it tries (most-specific first)" value={value} onChange={onChange} highlight={highlight} />
     </div>
   );
 }
