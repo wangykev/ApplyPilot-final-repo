@@ -2405,6 +2405,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // server-fetched tree to LOAD before typing, so the fallback (LinkedIn…) is tried by type→Enter
           // FIRST; the AI drill only runs if no fallback candidate matches.
           Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource, sourceTree: true }));
+          // "How did you hear about us?" is LOW-STAKES and its candidates come from the user's OWN curated
+          // fallback ladder, so a DETERMINISTIC match (exact / containment / fuzzy — Workday-autocommitted or
+          // directed) is a CONFIDENT fill, not a guess to nag about. Elsewhere containment/fuzzy → filled_review
+          // (the "containment is a guess" safety rule), but for SOURCE that surfaces a confident fill for review
+          // needlessly (operator: "filled deterministically … shouldn't surface for review"). Downgrade a
+          // deterministic `filled_review` (the benign commit flags only) to `filled`. AI rescues (ai-*),
+          // pre-existing values (already-filled), and genuine strays/no-match (status needs_review) are
+          // UNCHANGED — those still get a human glance. (operator rule 2026-07-20)
+          if (record.status === "filled_review" && record.verified === true &&
+              typeof record.flag === "string" &&
+              /^(autocommit-(containment|fuzzy)|directed-(containment|fuzzy)|overwrite-success)$/.test(record.flag)) {
+            record.status = "filled";
+            record.detail = (record.detail || "") + " — source is low-stakes + from your curated ladder → confident, not flagged";
+          }
         }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
@@ -4999,10 +5013,20 @@ function buildReviewBundle(results, meta) {
     return { confidence: band, confidence_source: source };
   };
   const deriveReview = (rec) => {
-    // SECTION STUB (Feature A): a present-but-empty repeating section → a gentle review item so the
-    // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
-    // "skipped", which would otherwise early-return needs_review:false).
-    if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
+    // SECTION STUB (Feature A): a present-but-empty repeating section still APPEARS in review (ALL
+    // FIELDS) so the operator can add an entry — but whether it NAGS (needs_review) depends on whether
+    // the profile models it. A KNOWN, profile-defined section (cert / languages / work-experience /
+    // education / websites — `section_known:true`) left empty is the USER'S OWN CHOICE, not a gap → no
+    // review. Only an UNKNOWN section (a tenant repeating section the profile doesn't model,
+    // `section_known:false`) is a genuine gap the operator must decide on → review. (operator rule
+    // 2026-07-20: "having no values is fine since they're in the profile; if a repeating section NOT in
+    // the profile is on the page it should be review". A required-but-empty KNOWN section still blocks
+    // Save & Continue → the walk halts at nav-timeout, so skipping the review flag never hides a blocker.)
+    // Handled BEFORE the flagged-base guard (its status is "skipped", which would early-return false).
+    if (rec.flag === "section-stub") {
+      if (rec.section_known === true) return { needs_review: false, needs_review_reason: null };
+      return { needs_review: true, needs_review_reason: "section_unfilled" };
+    }
     if (rec.flag === "already-filled") { // a field already on the form — bot didn't fill it (unknown section OR the page-wide sweep)
       if (rec.status === "skipped") return { needs_review: false, needs_review_reason: null }; // OPTIONAL + empty → fine to leave, no approval needed
       return { needs_review: true, needs_review_reason: "already_on_form" }; // has a value (verify) OR required + empty (needs a value)

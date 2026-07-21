@@ -1544,6 +1544,24 @@ test("source WITH how_did_you_hear defaults → routes through fillSourceCdp and
   assert.deepStrictEqual(rec.resolved, ["LinkedIn", "Other"]); // candidates from defaults
 });
 
+test("source: a DETERMINISTIC containment autocommit is downgraded filled_review→filled (low-stakes + curated ladder → no needless review)", async () => {
+  // Type "LinkedIn"; Workday autocommits a COMPOUND option that CONTAINS it → containment tier →
+  // normally filled_review (the "containment is a guess" rule). For the low-stakes SOURCE field, whose
+  // candidates come from the user's OWN curated ladder, that's a confident fill → downgraded to `filled`
+  // and NOT surfaced for review. (operator rule 2026-07-20)
+  const act = makeFakeAct([
+    srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { autoCommit: "Social Networking Site (LinkedIn)" } } })
+  ]);
+  const defaults = { how_did_you_hear: { preferred: ["LinkedIn"], fallback: "Other" } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "Social Networking Site (LinkedIn)", "Workday resolved the typed candidate to its compound option (containment)");
+  assert.strictEqual(rec.status, "filled", "containment autocommit downgraded to filled for the source field");
+  assert.strictEqual(rec.verified, true);
+  const e = buildReviewBundle(out.results, { page: "p1" }).entries[0];
+  assert.strictEqual(e.needs_review, false, "a deterministic source fill is NOT surfaced for review");
+});
+
 // ── M30 session-expiry early-warning (heuristic, SOURCE-only) ────────────────
 // A NOTE never a halt; fires only when the source options NEVER load (dead-session
 // tell), NOT on a matching miss (the false-positive guard).
@@ -3018,20 +3036,28 @@ test("repeating N===0: deletes phantom entries, records a section STUB (Feature 
   assert.ok(!out.results.some((r) => /\.url$/.test(r.fieldName)));
 });
 
-test("section_stub flows through buildReviewBundle as a needs_review category (Feature A)", () => {
-  const recs = [{ fieldName: "certification", label: "Certification — section present, no entries",
+test("section_stub review flag keys off section_known: a KNOWN (profile-defined) empty section does NOT nag; an UNKNOWN one does", () => {
+  // operator rule 2026-07-20: an empty cert/language/WE/education/websites section is the user's own
+  // choice (the profile models it) → still shows in ALL FIELDS (addable) but is NOT a needs_review item.
+  const known = [{ fieldName: "certification", label: "Certification — section present, no entries",
     widgetType: "section_stub", isRequired: false, mappedPath: "certification._stub",
-    status: "skipped", flag: "section-stub", after: null,
+    status: "skipped", flag: "section-stub", after: null, section_known: true,
     detail: "no meaningful certification entries to fill — the section is on the form but empty" }];
-  const bundle = buildReviewBundle(recs, { page: "p1" });
-  assert.strictEqual(bundle.entries.length, 1); // KEPT (unlike the .add/.delete "section" ops, which are filtered)
-  const e = bundle.entries[0];
-  assert.strictEqual(e.widget_type, "section_stub");
-  assert.strictEqual(e.canonical_field, "certification._stub");
-  assert.strictEqual(e.needs_review, true);
-  assert.strictEqual(e.needs_review_reason, "section_unfilled");
-  assert.strictEqual(e.fill_status, "skipped");
-  assert.strictEqual(e.current_value, null);
+  const kb = buildReviewBundle(known, { page: "p1" });
+  assert.strictEqual(kb.entries.length, 1); // KEPT (unlike the .add/.delete "section" ops, which are filtered)
+  assert.strictEqual(kb.entries[0].widget_type, "section_stub");
+  assert.strictEqual(kb.entries[0].canonical_field, "certification._stub");
+  assert.strictEqual(kb.entries[0].needs_review, false, "known/profile-defined empty section does NOT nag for review");
+  assert.strictEqual(kb.entries[0].fill_status, "skipped");
+  assert.strictEqual(kb.entries[0].current_value, null);
+
+  // An UNKNOWN section (a tenant repeating section the profile doesn't model) IS a genuine gap → review.
+  const unknown = [{ fieldName: "publication", label: "Publications — section present (unmapped)",
+    widgetType: "section_stub", isRequired: false, mappedPath: "publication._stub",
+    status: "skipped", flag: "section-stub", after: null, section_known: false, detail: "unmapped section" }];
+  const ub = buildReviewBundle(unknown, { page: "p1" });
+  assert.strictEqual(ub.entries[0].needs_review, true, "unknown/unmodeled section IS a review item");
+  assert.strictEqual(ub.entries[0].needs_review_reason, "section_unfilled");
 });
 
 test("section_stub carries section_field_shape into the bundle (2b: viewer builds a new entry)", () => {

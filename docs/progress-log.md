@@ -725,10 +725,44 @@ CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
   with the tree-drill AI context, instead of flat-typing the LLM's guess. New test: a 0-category
   promptOption scrape falls back to `readTreeCategories` and still drills+commits.
 
+- **Source tree is SERVER-FETCHED → the DETERMINISTIC fallback ladder ran too early and lost to the AI
+  (`awaitSourceListLoaded`, LIVE-VERIFIED on Magna).** With no primary/per-application source value (that
+  answer is deferred), the deterministic candidate loop (LinkedIn → Handshake → GitHub → Other) IS what
+  fills — and typing a candidate + Enter DOES autocommit / pick the filtered match. But the loop typed
+  the instant the picker opened, BEFORE Magna's category tree finished loading, so `awaitListStable`
+  accepted the stable-EMPTY list, every candidate hit a false "No matches found", and the field fell
+  straight to the `aiTreeDrillFallback` AI drill (which then guessed a category). Fix: for a `sourceTree`
+  field the first-open now waits on new `awaitSourceListLoaded` — a cheap `readTreeCategories` poll
+  (150ms, real wall-clock, bounded by `sourceCatLoadCeilingMs`, re-opens only if the popup closed) that
+  proceeds the INSTANT the tree has content (adaptive, not a fixed sleep — an earlier fixed wait was
+  "way too slow"). So the deterministic ladder is tried FIRST (type→Enter→autocommit, `sourceTree:true`
+  passed by both `drivePageFill` and the AI-4 re-drill, independent of the AI toggle); the AI drill runs
+  ONLY on a genuine no-match. New tests: `awaitSourceListLoaded` returns true the moment a late tree
+  loads, and false (bounded) when it never loads.
+
+- **Review-flag over-surfacing on profile-covered fields (operator rule: "having no values is fine since
+  they're in the profile; a repeating section NOT in the profile on the page should be review").** Two
+  fixes: (1) **Known empty repeating sections no longer nag.** `buildReviewBundle` flagged EVERY
+  `section-stub` as `needs_review: section_unfilled`. Now it keys off `section_known` — a KNOWN,
+  profile-DEFINED section (cert / languages / work-experience / education / websites, `section_known:true`)
+  left empty is the user's own choice → still shows in ALL FIELDS (addable) but is NOT a review item; only
+  an UNKNOWN section (`section_known:false`, a tenant repeating section the profile doesn't model) is a
+  genuine gap → review. A required-but-empty KNOWN section still blocks Save & Continue → nav-timeout halt,
+  so skipping the review flag never hides a blocker. (2) **A deterministic SOURCE fill isn't flagged.**
+  "How did you hear about us?" filled deterministically (a containment/fuzzy match — e.g. typing "LinkedIn"
+  and Workday autocommitting a compound "…(LinkedIn)" option) still surfaced for review under the global
+  "containment is a guess → filled_review" rule. But SOURCE is low-stakes and its candidates come from the
+  user's OWN curated fallback ladder, so a deterministic match is confident: the source call site now
+  downgrades a deterministic `filled_review` (benign commit flags only) to `filled`. AI rescues (`ai-*`),
+  pre-existing values (`already-filled`), and genuine strays/no-match (`needs_review`) are UNCHANGED, and
+  the downgrade is SOURCE-only (cert lives in the repeating section — its containment matches stay flagged).
+
 (The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
 toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
 
-Verified: extension suite (minus `db`, uninstalled dep) **604/604** incl. new `samePhysicalPage`,
-`accumulateBundle`-overwrite, and broadened `isTransientRenderFailure` tests. **Live-verify PENDING**
-(eyes-on, disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a
-real Workday page.
+Verified: extension suite (minus `db`, uninstalled dep) **607/607** incl. new `samePhysicalPage`,
+`accumulateBundle`-overwrite, broadened `isTransientRenderFailure`, `awaitSourceListLoaded`
+load/give-up, section-stub known-vs-unknown, and source-containment-downgrade tests. The source category-load timing + deterministic-before-AI ladder is **LIVE-VERIFIED
+on Magna** (fills LinkedIn deterministically once the tree loads). **Live-verify PENDING** (eyes-on,
+disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a real
+Workday page.
