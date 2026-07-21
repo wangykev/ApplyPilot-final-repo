@@ -4309,6 +4309,35 @@ test("Phase 2b: required-empty repeating DROPDOWN + AI ON infers CONFIDENTLY →
   assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to infer the required-empty dropdown");
 });
 
+test("Phase 2 fix: a PROVIDED value the AI maps to the form vocab (canonicalize) is KEPT + high-confidence, even at LOW AI confidence", async () => {
+  // Operator bug: degree profile "Bachelor of Science" vs a form offering only "Bachelors" → genuine
+  // no-match → aiCanonicalizeField maps it (ai-canonicalized) but the AI self-reported LOW confidence, so
+  // it was wrongly treated as an unconfident guess and delete-with-memory'd. A value that's IN the profile
+  // (just reworded) is a canonicalization, not a guess → KEEP + treat as high confidence. deletable:true so
+  // the OLD behavior WOULD have deleted it.
+  const state = {
+    prefix: "education-",
+    entries: [{ fkit: "education-1--null", fields: [
+      { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Bachelors" }, { text: "Masters" }] },
+    ] }],
+    addable: false, deletable: true, aiEnabled: true, ai: '{"choice":"Bachelors","confidence":"Low"}',
+  };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [{ field: "degree", widget: "dropdown", key: "degree", path: "degree" }];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ degree: ["Bachelor of Science"] }], fieldMap, deleteOnNoMatch: false,
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "a canonicalized PROVIDED value is KEPT, not delete-with-memory'd");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "no delete-with-memory");
+  const deg = out.results.find((r) => r.fieldName === "education[0].degree");
+  assert.strictEqual(deg.status, "filled_review", "kept + flagged for a glance");
+  assert.strictEqual(deg.flag, "ai-canonicalized");
+  assert.strictEqual(deg.after, "Bachelors");
+  assert.strictEqual(deg.confidence, "high", "a provided-value map is treated as HIGH confidence (was low → deleted)");
+});
+
 test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candidate absent) deletes high→low", async () => {
   // M38 Bug B1: deleteOnNoMatch fires on a GENUINE no-match — the required dropdown's
   // options RENDERED but the candidate isn't among them (this value isn't offered).

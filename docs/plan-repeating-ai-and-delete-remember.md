@@ -189,6 +189,13 @@ sections (education / work-experience / websites).
 2. **Extension delete-with-memory** (PR #19) — the unified entry-level decision in
    `driveRepeatingSectionCdp`: keep (flag AI) / delete-with-memory / halt, per the tree. Emit the
    `removed_entry` record with `remembered_fields` + recon. `buildReviewBundle`/`deriveReview` handle it.
+   - [x] **2a.1 — provided-value maps are confident** (2026-07-21): a value the user PROVIDED that the AI
+     maps to the form's vocab is a CANONICALIZATION, not a guess → KEPT + treated HIGH confidence regardless
+     of the AI's self-reported confidence (operator: degree "Bachelor of Science"→"Bachelors",
+     FoS "Electrical and Computer Engineering"→"Electrical Engineering" were low-confidence + deleted). A
+     provided-value map = `ai-canonicalized` OR a FLAT `ai-choice` (genuinely represented; matchTier ≠
+     "ai-source-tree") on a field with a stated value. A TREE `ai-choice` stays confidence-gated (a forced
+     cert/source leaf still delete-with-memory's). Test: `Phase 2 fix: a PROVIDED value … KEPT + high-confidence`.
    - [x] **2a — mechanism** DONE (2026-07-21): per-entry disposition keyed on `problemFields` (required
      fields not confidently resolved — unfilled OR unconfident-AI); AI-on → delete-with-memory, AI-off →
      optional-genuine-miss deletes / expected-data keeps→halts. New `makeRemovedEntry` → `removed_entry`

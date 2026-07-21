@@ -3947,7 +3947,31 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     //         unfilled required field makes Save & Continue fail → the walk HALTS (D1; Bug B1 = never
     //         destroy valid data blind, so a transient failure is KEPT even in a deleteOnNoMatch section).
     const isAiRec = (r) => r.flag && String(r.flag).indexOf("ai-") === 0;
-    const aiConfidentKeep = (r) => r.flag === "ai-choice" && (r.confidence === "high" || r.confidence === "medium");
+    // A field the user PROVIDED a value for (rawValue) that the AI mapped to the form's vocab is a
+    // CANONICALIZATION, not a guess — the value is theirs, only the wording changed (e.g. profile "Bachelor
+    // of Science" → form "Bachelors"; "Electrical and Computer Engineering" → "Electrical Engineering").
+    // Treat it as HIGH confidence: this both fixes the review badge AND the keep decision — a provided-value
+    // map must NEVER be delete-with-memory'd over the AI's uncertain self-report about the WORDING. A
+    // `ai-canonicalized` (dropdown canonicalize) ALWAYS qualifies (it only runs on a stated value); an
+    // `ai-choice` qualifies only when the field HAD a stated value (else it's a pure inference). Still
+    // filled_review — flagged for a glance. (operator 2026-07-21)
+    const hadStatedValue = (r) => {
+      const v = r.rawValue;
+      if (v == null) return false;
+      return Array.isArray(v) ? v.some((x) => x != null && String(x).trim() !== "") : String(v).trim() !== "";
+    };
+    // `ai-choice` means GENUINELY REPRESENTED for a FLAT dropdown/typeahead (aiTypeaheadFallback commits
+    // ai-choice only when the AI's pick is a real option corresponding to the value — a FORCED nearest is
+    // `ai-closest-forced`). But the TREE drill (cert/source) flags BOTH represented and FORCED leaves
+    // `ai-choice` (matchTier "ai-source-tree"), leaning on confidence to tell them apart. So a provided-value
+    // MAP is: `ai-canonicalized` (dropdown canonicalize), OR a FLAT `ai-choice` on a field the user gave a
+    // value for (matchTier ≠ "ai-source-tree"). A TREE `ai-choice` stays confidence-gated so a low-confidence
+    // FORCED cert/source leaf still delete-with-memory's.
+    const isProvidedValueMap = (r) =>
+      r.flag === "ai-canonicalized" ||
+      (r.flag === "ai-choice" && r.matchTier !== "ai-source-tree" && hadStatedValue(r));
+    for (const r of entryRecs) if (isProvidedValueMap(r) && r.confidence !== "high") r.confidence = "high";
+    const aiConfidentKeep = (r) => isProvidedValueMap(r) || (r.flag === "ai-choice" && (r.confidence === "high" || r.confidence === "medium"));
     const isResolved = (r) => (r.status === "filled" || r.status === "filled_review") && !(isAiRec(r) && !aiConfidentKeep(r));
     const problemFields = entryRecs.filter((r) => r.isRequired && !isResolved(r));
     const genuineOptionalMiss = deleteOnNoMatch && problemFields.length > 0 && problemFields.every((r) => r.genuineNoMatch === true);
