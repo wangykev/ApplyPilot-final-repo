@@ -187,8 +187,13 @@ sections (education / work-experience / websites).
      `section_field_shape`/`nested_shapes`); `deriveReview` → needs_review `entry_removed`; bundle carries
      it; replay/reconPageTruth/finalize skip it. Old deleteOnNoMatch "removed"/emptied-stub tests migrated
      to `removed_entry`. Suite 612/612.
-   - [ ] **2b — confident required-empty INFER** for repeating dropdowns/typeaheads (High/Med commits;
-     Low → stays a problem field → delete-with-memory), reducing how often 2a deletes.
+   - [x] **2b — required-empty DROPDOWN infer** DONE (2026-07-21): `fillEntryCdp` now runs `aiFillField`
+     on a required-empty repeating dropdown (was typeahead-only). No special "confident-only commit" was
+     needed — aiFillField commits its pick + confidence, and 2a's `isResolved`/`problemFields` already
+     keeps a confident `ai-choice` (High/Med) but delete-with-memory's a low-confidence/forced one (D2).
+     Test: `Phase 2b: required-empty repeating DROPDOWN + AI ON infers CONFIDENTLY → KEPT`. Suite 613/613.
+
+**Extension (Phases 1–2) COMPLETE.** Remaining: 3 (website add-back-with-prefill), 4 (teach per-field), 5 (replay).
 3. **Website add-back-with-prefill** (PR #18) — the `removed_entry` card + reconstruct-on-add.
 4. **Teach per-field scoping** (PR #18).
 5. **Replay** (PR #19) — `bundleToSectionItems` reconstructs an added-back entry.

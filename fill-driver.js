@@ -3336,6 +3336,20 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
         if (aiRes) { Object.assign(rec, aiRes); if (aiRes.status === "filled_review" && isEeoField(f2)) rec.flag = "ai-eeo-guess"; }
       } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI dropdown canonicalize error: " + String((e && e.message) || e); }
     }
+    // ── Phase 2b: required-empty repeating DROPDOWN INFER ── a REQUIRED dropdown with no profile value is
+    // SKIPPED above; when AI is on, infer a pick from the profile (mirrors the flat loop's aiFillField +
+    // the required-empty typeahead block below). aiFillField commits its pick + a self-reported confidence;
+    // the entry-level disposition (driveRepeatingSectionCdp) then decides: a CONFIDENT ai-choice (High/Med)
+    // is RESOLVED → the entry is KEPT (only this field flags); a low-confidence / forced pick is UNCONFIDENT
+    // → a problem field → delete-with-memory (D2 — no low-confidence guess sticks on the form). AI OFF →
+    // stays skipped → problem field (→ halt for expected-data, or optional delete).
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && f.widget === "dropdown") {
+      const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: true, widgetType: "dropdown", wrapperSel: fd.wrapperSel };
+      try {
+        const aiRes = await aiFillField(act, loc, f2, aiCtx.profile, aiCtx.jobContext, budgets);
+        if (aiRes) { Object.assign(rec, aiRes); if (aiRes.status === "filled_review" && isEeoField(f2)) rec.flag = "ai-eeo-guess"; }
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI dropdown infer error: " + String((e && e.message) || e); }
+    }
     // Required-EMPTY TYPEAHEAD AI fill (section analog of the flat-loop block): a REQUIRED section typeahead with
     // no profile value (e.g. an Education entry's fieldOfStudy) is SKIPPED above, but a blank required field BLOCKS
     // Save & Continue. When AI is on, run the unified filler with NO candidates → the inline AI infers from the

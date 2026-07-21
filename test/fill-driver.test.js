@@ -4280,6 +4280,35 @@ test("Phase 2: education (expected-data) + AI OFF + an unfillable required field
   assert.strictEqual(fos.isRequired, true);
 });
 
+test("Phase 2b: required-empty repeating DROPDOWN + AI ON infers CONFIDENTLY → the field fills (ai-choice), the entry is KEPT", async () => {
+  // fieldOfStudy is a required DROPDOWN with no profile value. Repeating dropdowns now infer (2b): the AI
+  // returns a High-confidence represented pick → the field fills (ai-choice) and the entry is KEPT (a
+  // confident fill resolves the field; only IT flags). A low-confidence / forced pick would instead feed
+  // delete-with-memory (2a). Repeating dropdowns had NO infer before.
+  const eduEntry = (fkit) => ({ fkit, fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "fieldOfStudy", label: "Field of Study*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Computer Science" }, { text: "Biology" }] },
+  ] });
+  const state = { prefix: "education-", addable: false, deletable: true, aiEnabled: true, ai: '{"choice":"Computer Science","justification":"prior CS coursework","confidence":"High"}', entries: [eduEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school_or_university" },
+    { field: "fieldOfStudy", widget: "dropdown", key: "fos", path: "field_of_study" },
+  ];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU" }], fieldMap, deleteOnNoMatch: false, // no fos value → AI infers
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "a CONFIDENT infer KEEPS the entry (no delete-with-memory)");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "not delete-with-memory");
+  const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
+  assert.strictEqual(fos.status, "filled_review", "the inferred dropdown fills (flagged for review)");
+  assert.strictEqual(fos.flag, "ai-choice");
+  assert.strictEqual(fos.after, "Computer Science");
+  assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to infer the required-empty dropdown");
+});
+
 test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candidate absent) deletes high→low", async () => {
   // M38 Bug B1: deleteOnNoMatch fires on a GENUINE no-match — the required dropdown's
   // options RENDERED but the candidate isn't among them (this value isn't offered).
