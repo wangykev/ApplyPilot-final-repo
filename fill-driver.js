@@ -564,6 +564,10 @@ const openAndReadDropdown = async (act, loc, budgets) => {
   const pre = await act.readDropdownState(loc);
   const before = pre ? pre.triggerText : null;
   let state = null, expanded = false;
+  // REUSE an already-open list (e.g. fillDropdownCdp left it open via keepOpenForCanonicalize so this
+  // canonicalize could pick up the same list) — clicking openDropdown again would TOGGLE it shut. If the
+  // pre-read shows it expanded with options, adopt it and skip the open ladder.
+  if (pre && pre.ariaExpanded === "true" && pre.optionCount > 0) { state = pre; expanded = true; }
   for (let attempt = 1; attempt <= budgets.openRetries && !expanded; attempt++) {
     if (attempt > 1) { await act.pressEscape(); await act.delay(budgets.reopenSettleMs); }
     if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
@@ -1058,7 +1062,7 @@ function overwriteBeatLadder(b, visible) {
 // The highlighted text MUST equal the matched target before Enter — never an
 // unverified commit. Coordinate option-click survives only as a last resort,
 // behind the same trigger-text verify gate.
-const fillDropdownCdp = async (act, loc, candidates, budgets) => {
+const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const norm = apMatch.normalize;
   const delayRender = act.delayRender || act.delayFull; // STAGE 2: option-settle + commit-persistence intervals, adaptive under the measured-fast gate (fallback for older fakes)
   const pre = await act.readDropdownState(loc);
@@ -1155,7 +1159,13 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
     // box sits over the degree list's "Associates"). Both the tier-keep and the genuine no-match
     // opened the list, so both must confirm it's gone (not a fire-and-return Escape).
-    await closeDropdownConfirmed(act, loc, budgets);
+    // EXCEPTION (opt-in, 2026-07-21): on the GENUINE no-match path (preTierIndex === -1), when the caller
+    // says an AI canonicalize will run IMMEDIATELY next (keepOpenForCanonicalize), LEAVE the list open so
+    // aiCanonicalizeField REUSES it instead of a redundant close→reopen (a canonicalized dropdown was
+    // being opened twice). Safe: the canonicalize runs right away and closes the list itself, so the next
+    // field still opens on a closed list. Every other return still close-confirms.
+    const leftOpen = !!opts.keepOpenForCanonicalize && preTierIndex === -1;
+    if (!leftOpen) await closeDropdownConfirmed(act, loc, budgets);
     // Overwrite-upgrade miss (preTierIndex>0): the dropdown offers NONE of the higher-priority
     // tiers → the pre-fill IS the best the form has → KEEP it (filled, not needs_review — it's a
     // valid lower-tier candidate). (Typeahead parity: prefilled-better-tier-unavailable.)
@@ -1174,7 +1184,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     // The other needs_review/error returns (options-didn't-render / couldn't-open /
     // target-vanished / commit-didn't-take) are transient/infra failures, NOT invalid
     // data — they are NOT tagged, so deleteOnNoMatch keeps + surfaces them.
-    return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts, genuineNoMatch: true };
+    return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts, genuineNoMatch: true, leftOpen };
   }
   const target = enabledTexts[m.targetIndex];
   // Verify gate TIGHTENED (M28): exact-normalize ONLY — a substring trigger can't false-pass.
@@ -3297,7 +3307,10 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           rec.resolved = arg;
           if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
-          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
+          // keepOpenForCanonicalize: when AI is on, a genuine no-match here is IMMEDIATELY followed by the
+          // canonicalize block below — so fillDropdownCdp leaves the list OPEN and aiCanonicalizeField reuses
+          // it (no redundant close→reopen; the canonicalize closes it). Off when AI can't canonicalize.
+          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets, { keepOpenForCanonicalize: !!(aiCtx && act.aiEnabled) }));
           else if (f.widget === "typeahead") {
             // Fix 2: start-of-fill option capture for EVERY section typeahead (was FoS-only). makeStartCapture
             // scrapes the full leaf list at the START for a FLAT field (FoS → rec.options for the summary
@@ -3336,6 +3349,11 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
         if (aiRes) { Object.assign(rec, aiRes); if (aiRes.status === "filled_review" && isEeoField(f2)) rec.flag = "ai-eeo-guess"; }
       } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI dropdown canonicalize error: " + String((e && e.message) || e); }
     }
+    // Defensive: if fillDropdownCdp left the list OPEN for a canonicalize that then did NOT run (no stated
+    // value / not eligible), close it here so a lingering open list can't stray the next field. The
+    // canonicalize path closes the list itself (commit / verified-blank), so `rec.flag` is set whenever it
+    // ran — this only fires on the unexpected no-canonicalize case.
+    if (rec.leftOpen === true && !rec.flag) { try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort */ } }
     // ── Phase 2b: required-empty repeating DROPDOWN INFER ── a REQUIRED dropdown with no profile value is
     // SKIPPED above; when AI is on, infer a pick from the profile (mirrors the flat loop's aiFillField +
     // the required-empty typeahead block below). aiFillField commits its pick + a self-reported confidence;

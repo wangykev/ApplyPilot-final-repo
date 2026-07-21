@@ -4222,6 +4222,9 @@ test("repeating dropdown AI canonicalize (Phase 1): a STATED degree that isn't i
   assert.strictEqual(rec.flag, "ai-canonicalized", "provenance: mapped a STATED value, not a guess");
   assert.strictEqual(rec.after, "Bachelors", "reworded to the form's vocab");
   assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to canonicalize");
+  // keepOpenForCanonicalize: the dropdown is opened ONCE — fillDropdownCdp leaves the no-match list OPEN
+  // and aiCanonicalizeField REUSES it (no redundant close→reopen: the "open it once" operator ask).
+  assert.strictEqual(act.log.filter(([m]) => m === "openDropdown").length, 1, "opened once — no close→reopen for the canonicalize");
 });
 
 test("Phase 2 delete-with-memory: education (expected-data) + AI ON + an unfillable required field → entry DELETED but REMEMBERED (add-back prefills school+degree)", async () => {
