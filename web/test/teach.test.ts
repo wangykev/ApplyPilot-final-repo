@@ -81,16 +81,13 @@ test("teachableCards: excludes non-approved / deterministic / essay / empty / al
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");
 });
 
-test("teachableCards: a REPEATING-section field is NOT teachable (per-entry data → profile list, not a bucket)", () => {
-  // education[0].degree filled by AI + approved would otherwise be teachable, but a repeating field's
-  // answer varies per entry and the section machinery never consults buckets → excluded (Phase 4).
-  const rep = entry({ question_label: "Degree", flag: "ai-canonicalized", current_value: "Bachelors", canonical_field: "education[0].degree" });
-  assert.equal(teachableCards([src("a", [rep])], [], {}).length, 0, "repeating field excluded from teach");
-  const repNested = entry({ question_label: "Specialty", flag: "ai-choice", current_value: "Safety", canonical_field: "certification[1].specialties[0].specialty" });
-  assert.equal(teachableCards([src("a", [repNested])], [], {}).length, 0, "nested repeating field excluded too");
-  // a FLAT AI field with the same everything-else IS still teachable (sanity — the guard is repeating-only)
-  const flat = entry({ question_label: "Highest degree level?", flag: "ai-choice", current_value: "Bachelors", canonical_field: "screening.degree_level" });
-  assert.equal(teachableCards([src("b", [flat])], [], {}).length, 1, "a flat AI field still teaches");
+test("teachableCards: a repeating entry's AI-filled field TEACHES; a deterministically-filled one does NOT", () => {
+  // Operator rule (2026-07-21): the AI/manually-supplied field of a repeating entry is worth learning
+  // (an AI-canonicalized education[0].degree teaches), but a clean deterministic fill isn't (already known).
+  const aiRep = entry({ question_label: "Degree", flag: "ai-canonicalized", needs_review: true, is_approved: true, current_value: "Bachelors", canonical_field: "education[0].degree" });
+  assert.equal(teachableCards([src("a", [aiRep])], [], {}).length, 1, "an AI-filled repeating field teaches");
+  const detRep = entry({ question_label: "School", flag: null, needs_review: false, is_edited: false, current_value: "CMU", canonical_field: "education[0].school_or_university" });
+  assert.equal(teachableCards([src("b", [detRep])], [], {}).length, 0, "a clean deterministic repeating field does NOT teach (already known)");
 });
 
 test("wasManuallyEdited: override / filled_blank → true; cleared / added_entry / not-edited → false", () => {

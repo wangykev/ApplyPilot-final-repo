@@ -64,22 +64,16 @@ export function wasManuallyEdited(e: ReviewEntry): boolean {
  *     submit concern, not a teach one). The teach popup is its own confirm gate.
  *  A clean, untouched deterministic fill (needs_review=false, not edited) is skipped — already known.
  *  Must be bucket-eligible with a real question + a non-empty value. */
-/** A repeating / nested SECTION field (education[0].degree, certification[1].specialties[0].x). Its answer
- *  is PER-ENTRY structured profile data filled by the section machinery, which does NOT consult buckets — so
- *  it is NOT a label→answer teach candidate (a "Degree" bucket would never fire on a repeating fill and would
- *  wrongly apply ONE value to EVERY entry). This also implements the operator's Phase-4 rule: for a
- *  delete-with-memory add-back, the deterministically-filled fields (school/degree) don't teach; and the
- *  AI/manually-supplied field isn't bucket-taught either — a repeating answer is learned by editing the
- *  profile's LIST (the profile page), not by a bucket. */
-function isRepeatingSectionField(e: ReviewEntry): boolean {
-  return /\[\d+\]\./.test(String(e.canonical_field || "")) || /\[\d+\]\./.test(String(e.field_id || ""));
-}
-
 function isTeachable(e: ReviewEntry): boolean {
+  // Operator rule (per-field, incl. repeating entries): the AI-filled / manually-supplied field of an
+  // entry teaches (needs_review + approved, or a manual edit); a DETERMINISTICALLY-filled field does NOT
+  // (needs_review=false, untouched → already known). The base condition below is exactly that split — it
+  // applies to repeating-section fields too (an AI-canonicalized education[0].degree teaches; a clean
+  // deterministic one doesn't). (No repeating-field exclusion — that was over-broad and dropped the very
+  // AI-filled answers worth learning; reverted 2026-07-21.)
   const edited = wasManuallyEdited(e);
   return (
     !e.is_deleted &&
-    !isRepeatingSectionField(e) && // per-entry structured data → learned by editing the profile list, not a bucket
     (edited || (!!e.is_approved && !!e.needs_review)) &&
     isBucketEligibleWidget(e.widget_type) &&
     !!e.question_label &&

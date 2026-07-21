@@ -1105,9 +1105,9 @@ function SelectBox({
   if (value != null && value !== "" && !list.includes(value)) list.unshift(value);
   return (
     <select className="ap-input" value={value ?? ""} onChange={(e) => onCommit(e.target.value || null)}>
-      <option value="">— choose —</option>
+      <option value="" className="bg-panel text-ink-faint">— choose —</option>
       {list.map((o) => (
-        <option key={o} value={o}>
+        <option key={o} value={o} className="bg-panel text-ink">
           {o}
         </option>
       ))}
@@ -1180,6 +1180,10 @@ function TextBox({
   );
 }
 
+// A single-layer typeahead editor: click in → a LARGE dropdown of ALL the options (not pre-filtered by
+// the current value), type to filter. The input shows the current value when unfocused; on focus the
+// filter starts EMPTY so the full list is visible. The current value is highlighted; "clear" is demoted
+// to a small footer, not the first item. (operator 2026-07-21)
 function Combobox({
   value,
   options,
@@ -1189,26 +1193,31 @@ function Combobox({
   options: string[];
   onCommit: (v: string | null) => void;
 }) {
-  const [q, setQ] = useState(value ?? "");
+  const [q, setQ] = useState(""); // the FILTER query (starts empty → show ALL options)
   const [open, setOpen] = useState(false);
-  useEffect(() => setQ(value ?? ""), [value]);
   const matches = q.trim() === "" ? options : options.filter((o) => o.toLowerCase().includes(q.trim().toLowerCase()));
   const pick = (v: string | null) => {
     onCommit(v);
+    setQ("");
     setOpen(false);
   };
+  const hasValue = value != null && String(value).trim() !== "";
   return (
     <div className="relative">
       <input
         className="ap-input"
         type="text"
-        value={q}
-        placeholder="type to filter…"
+        // unfocused → show the current value; focused → the filter query (empty until they type → all options)
+        value={open ? q : hasValue ? String(value) : ""}
+        placeholder={hasValue ? String(value) : "click to choose · type to filter…"}
         onChange={(e) => {
           setQ(e.target.value);
           setOpen(true);
         }}
-        onFocus={() => setOpen(true)}
+        onFocus={() => {
+          setQ(""); // reset the filter so the FULL option list shows on click
+          setOpen(true);
+        }}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
         onKeyDown={(e) => {
           if (e.key === "Enter" && matches.length) {
@@ -1218,19 +1227,25 @@ function Combobox({
         }}
       />
       {open && (
-        <div className="absolute z-20 mt-1 max-h-52 w-full overflow-auto rounded-md border border-hairline bg-panel-raised shadow-lg">
-          <button className="ap-opt text-ink-faint" onMouseDown={(ev) => (ev.preventDefault(), pick(null))}>
-            — clear —
-          </button>
+        <div className="absolute z-20 mt-1 max-h-60 w-full overflow-auto rounded-md border border-hairline bg-panel-raised shadow-lg">
+          {matches.length === 0 && <div className="px-3 py-2 text-xs text-ink-faint">no matches</div>}
           {matches.map((o) => (
             <button
               key={o}
-              className={clsx("ap-opt", o === norm(value) && "bg-amber/10 text-amber")}
+              className={clsx("ap-opt", norm(o) === norm(value) && "bg-amber/10 font-medium text-amber")}
               onMouseDown={(ev) => (ev.preventDefault(), pick(o))}
             >
               {o}
             </button>
           ))}
+          {hasValue && (
+            <button
+              className="ap-opt border-t border-hairline/60 text-xs text-ink-faint"
+              onMouseDown={(ev) => (ev.preventDefault(), pick(null))}
+            >
+              — clear —
+            </button>
+          )}
         </div>
       )}
     </div>
