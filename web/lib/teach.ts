@@ -235,25 +235,54 @@ export type ProfileFieldRow = { path: string; label: string; value: string; sect
  * screening question resolves to. Repeating array sections (work_experience, education, skills…) and
  * nested objects are skipped; a boolean shows Yes/No, a tiered array shows its first candidate.
  */
+// Arrays shown by ProfilePanel's OWN boxes (websites) or as single editable string-lists (skills /
+// employer history) — not expanded into per-entry rows here (avoids duplication / a wall of tokens).
+const TEACH_SKIP_ARRAYS = new Set(["websites", "skills", "employment_history_companies"]);
+
+/** A field's display string, or null to SKIP (a nested object / an array-of-objects — handled per-entry).
+ *  A tiered/string array shows its FIRST value (its primary), matching the object-section behavior. */
+function _teachDisplayVal(v: unknown): string | null {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "boolean") return v ? "Yes" : "No";
+  if (Array.isArray(v)) {
+    if (v.length === 0) return "";
+    if (v.every((x) => typeof x === "string")) return (v as string[])[0];
+    return null; // array of objects → skip (a repeating sub-section)
+  }
+  return null; // nested object → skip
+}
+
 export function flattenProfileFields(profile: unknown): ProfileFieldRow[] {
   const rows: ProfileFieldRow[] = [];
   if (!profile || typeof profile !== "object") return rows;
   const p = profile as Record<string, unknown>;
   for (const section of Object.keys(p)) {
     const sv = p[section];
-    if (!sv || typeof sv !== "object" || Array.isArray(sv)) continue; // object sections only
+    if (!sv || typeof sv !== "object") continue;
+    if (Array.isArray(sv)) {
+      // REPEATING section (arrays of OBJECTS: work_experience / education / languages / certifications /
+      // additional_files) → one grouped box PER ENTRY, so the teach page shows EVERYTHING the profile
+      // page does. DOTTED index paths ("education.0.degree") so getAtPath/setAtPath resolve them (arrays
+      // index by "0") → the answer editor edits them in place.
+      if (TEACH_SKIP_ARRAYS.has(section)) continue;
+      (sv as unknown[]).forEach((entry, i) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return; // objects only (skip a string-list)
+        const sectionKey = section + "." + i;
+        const sectionLabel = humanize(section) + " · " + (i + 1);
+        for (const field of Object.keys(entry as Record<string, unknown>)) {
+          const value = _teachDisplayVal((entry as Record<string, unknown>)[field]);
+          if (value == null) continue; // nested object/array (specialties, file) → skip
+          rows.push({ path: sectionKey + "." + field, label: humanize(field), value, section: sectionKey, sectionLabel });
+        }
+      });
+      continue;
+    }
+    // OBJECT section (personal_info / work_authorization / how_did_you_hear / self_identification / screening).
     const sectionLabel = humanize(section);
     for (const field of Object.keys(sv as Record<string, unknown>)) {
-      const v = (sv as Record<string, unknown>)[field];
-      let value: string;
-      if (v == null) value = "";
-      else if (typeof v === "string") value = v;
-      else if (typeof v === "boolean") value = v ? "Yes" : "No";
-      else if (Array.isArray(v)) {
-        if (v.length === 0) value = "";
-        else if (v.every((x) => typeof x === "string")) value = (v as string[])[0];
-        else continue; // array of objects → skip
-      } else continue; // nested object → skip
+      const value = _teachDisplayVal((sv as Record<string, unknown>)[field]);
+      if (value == null) continue;
       rows.push({ path: section + "." + field, label: humanize(field), value, section, sectionLabel });
     }
   }

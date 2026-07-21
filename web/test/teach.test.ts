@@ -156,21 +156,35 @@ test("humanize: last segment, snake → Title Case, strips [i]", () => {
   assert.equal(humanize("work_experience[0].job_title"), "Job Title");
 });
 
-test("flattenProfileFields: object sections → scalar/bool/tiered rows; arrays-of-objects + top-level scalars skipped", () => {
+test("flattenProfileFields: object sections + repeating entries (per-entry, dotted paths); string-arrays/websites skipped", () => {
   const profile = {
     schema_version: "2.0",
     personal_info: { first_name: "Ada", has_preferred_name: true, country: ["United States of America", "United States"] },
-    work_experience: [{ job_title: "Engineer" }],
+    education: [
+      { school_or_university: "CMU", degree: ["Bachelor of Science", "Bachelors"] },
+      { school_or_university: "MIT" },
+    ],
+    certifications: [{ certification: "CPP", specialties: [{ specialty: "x" }] }],
+    websites: [{ type: "LinkedIn", url: "https://x" }],
     skills: ["ts", "react"],
   };
   const rows = flattenProfileFields(profile);
   const byPath = Object.fromEntries(rows.map((r) => [r.path, r]));
+  // object sections (unchanged)
   assert.equal(byPath["personal_info.first_name"].value, "Ada");
-  assert.equal(byPath["personal_info.first_name"].label, "First Name");
   assert.equal(byPath["personal_info.first_name"].sectionLabel, "Personal Info");
   assert.equal(byPath["personal_info.has_preferred_name"].value, "Yes"); // boolean → Yes
   assert.equal(byPath["personal_info.country"].value, "United States of America"); // tiered → first
-  assert.equal(rows.find((r) => r.path.startsWith("work_experience")), undefined, "array-of-objects section skipped");
+  // repeating sections → per-entry rows, DOTTED index paths, one section group per entry
+  assert.equal(byPath["education.0.school_or_university"].value, "CMU");
+  assert.equal(byPath["education.0.school_or_university"].sectionLabel, "Education · 1");
+  assert.equal(byPath["education.0.degree"].value, "Bachelor of Science", "tiered → first");
+  assert.equal(byPath["education.1.school_or_university"].value, "MIT");
+  assert.equal(byPath["education.1.school_or_university"].sectionLabel, "Education · 2");
+  assert.equal(byPath["certifications.0.certification"].value, "CPP");
+  assert.equal(byPath["certifications.0.specialties"], undefined, "a nested array-of-objects (specialties) is skipped");
+  // still handled by ProfilePanel's own boxes → NOT auto-flattened here
+  assert.equal(rows.find((r) => r.section.startsWith("websites")), undefined, "websites shown by its own box, not per-entry rows");
   assert.equal(rows.find((r) => r.section === "skills"), undefined, "top-level string array skipped");
   assert.equal(rows.find((r) => r.section === "schema_version"), undefined, "top-level scalar skipped");
 });
