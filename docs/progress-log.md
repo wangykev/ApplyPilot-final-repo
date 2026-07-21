@@ -740,29 +740,24 @@ CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
   ONLY on a genuine no-match. New tests: `awaitSourceListLoaded` returns true the moment a late tree
   loads, and false (bounded) when it never loads.
 
-- **Review-flag over-surfacing on profile-covered fields (operator rule: "having no values is fine since
-  they're in the profile; a repeating section NOT in the profile on the page should be review").** Two
-  fixes: (1) **Known empty repeating sections no longer nag.** `buildReviewBundle` flagged EVERY
-  `section-stub` as `needs_review: section_unfilled`. Now it keys off `section_known` — a KNOWN,
-  profile-DEFINED section (cert / languages / work-experience / education / websites, `section_known:true`)
-  left empty is the user's own choice → still shows in ALL FIELDS (addable) but is NOT a review item; only
-  an UNKNOWN section (`section_known:false`, a tenant repeating section the profile doesn't model) is a
-  genuine gap → review. A required-but-empty KNOWN section still blocks Save & Continue → nav-timeout halt,
-  so skipping the review flag never hides a blocker. (2) **A deterministic SOURCE fill isn't flagged.**
-  "How did you hear about us?" filled deterministically (a containment/fuzzy match — e.g. typing "LinkedIn"
-  and Workday autocommitting a compound "…(LinkedIn)" option) still surfaced for review under the global
-  "containment is a guess → filled_review" rule. But SOURCE is low-stakes and its candidates come from the
-  user's OWN curated fallback ladder, so a deterministic match is confident: the source call site now
-  downgrades a deterministic `filled_review` (benign commit flags only) to `filled`. AI rescues (`ai-*`),
-  pre-existing values (`already-filled`), and genuine strays/no-match (`needs_review`) are UNCHANGED, and
-  the downgrade is SOURCE-only (cert lives in the repeating section — its containment matches stay flagged).
+- **Known empty repeating sections no longer nag for review (operator rule: "having no values is fine since
+  they're in the profile; a repeating section NOT in the profile on the page should be review").**
+  `buildReviewBundle` flagged EVERY `section-stub` as `needs_review: section_unfilled`. Now it keys off
+  `section_known` — a KNOWN, profile-DEFINED section (cert / languages / work-experience / education /
+  websites, `section_known:true`) left empty is the user's own choice → still shows in ALL FIELDS (addable)
+  but is NOT a review item; only an UNKNOWN section (`section_known:false`, a tenant repeating section the
+  profile doesn't model) is a genuine gap → review. A required-but-empty KNOWN section still blocks Save &
+  Continue → nav-timeout halt, so skipping the review flag never hides a blocker. (A source-specific
+  relaxation was tried + REVERTED: a deterministic NON-EXACT source match stays `filled_review`/flagged like
+  any choice widget; an EXACT match — at any ladder position — is already `filled`, no special-casing.)
 
 (The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
 toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
 
-Verified: extension suite (minus `db`, uninstalled dep) **607/607** incl. new `samePhysicalPage`,
+Verified: extension suite (minus `db`, uninstalled dep) **608/608** incl. new `samePhysicalPage`,
 `accumulateBundle`-overwrite, broadened `isTransientRenderFailure`, `awaitSourceListLoaded`
-load/give-up, section-stub known-vs-unknown, and source-containment-downgrade tests. The source category-load timing + deterministic-before-AI ladder is **LIVE-VERIFIED
+load/give-up, section-stub known-vs-unknown, and source non-exact-stays-flagged / later-ladder-exact-
+not-flagged tests. The source category-load timing + deterministic-before-AI ladder is **LIVE-VERIFIED
 on Magna** (fills LinkedIn deterministically once the tree loads). **Live-verify PENDING** (eyes-on,
 disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a real
 Workday page.

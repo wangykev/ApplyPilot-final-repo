@@ -2404,21 +2404,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // sourceTree:true (independent of the AI toggle) → the deterministic candidate loop waits for the
           // server-fetched tree to LOAD before typing, so the fallback (LinkedIn…) is tried by type→Enter
           // FIRST; the AI drill only runs if no fallback candidate matches.
+          // NOTE: source is graded like any choice widget — an EXACT match (at ANY ladder position, so a
+          // later candidate winning because earlier ones aren't offered is fine) → `filled`, no review; a
+          // NON-EXACT deterministic match (containment/fuzzy) → `filled_review`, flagged (the "containment
+          // is a guess" rule holds for source too — operator 2026-07-20). No source-specific relaxation.
           Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource, sourceTree: true }));
-          // "How did you hear about us?" is LOW-STAKES and its candidates come from the user's OWN curated
-          // fallback ladder, so a DETERMINISTIC match (exact / containment / fuzzy — Workday-autocommitted or
-          // directed) is a CONFIDENT fill, not a guess to nag about. Elsewhere containment/fuzzy → filled_review
-          // (the "containment is a guess" safety rule), but for SOURCE that surfaces a confident fill for review
-          // needlessly (operator: "filled deterministically … shouldn't surface for review"). Downgrade a
-          // deterministic `filled_review` (the benign commit flags only) to `filled`. AI rescues (ai-*),
-          // pre-existing values (already-filled), and genuine strays/no-match (status needs_review) are
-          // UNCHANGED — those still get a human glance. (operator rule 2026-07-20)
-          if (record.status === "filled_review" && record.verified === true &&
-              typeof record.flag === "string" &&
-              /^(autocommit-(containment|fuzzy)|directed-(containment|fuzzy)|overwrite-success)$/.test(record.flag)) {
-            record.status = "filled";
-            record.detail = (record.detail || "") + " — source is low-stakes + from your curated ladder → confident, not flagged";
-          }
         }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
