@@ -124,9 +124,18 @@ A KEPT entry with AI-filled fields uses the normal per-field records; only the A
    entry + emit the `removed_entry` record with `remembered_fields` + recon. Unify the fill-time
    delete (replaces the deleteOnNoMatch-at-fill + the keep-and-halt behavior) so it's ONE decision.
    `buildReviewBundle` + `deriveReview` handle the new record.
-3. **Website — add-back-with-prefill** (PR #18): the `removed_entry` card + reconstruct-on-add.
-4. **Teach — per-field scoping** (PR #18).
-5. **Replay** (PR #19): `bundleToSectionItems` handles the added-back entry.
+3. **Website — add-back-with-prefill** (PR #18) — [x] DONE (2026-07-21): `RememberedField` type +
+   `remembered_fields`/`unfilled_fields` on `ReviewEntry`; pure `addBackEntryRecords` (prefill reconstruct —
+   deterministic clean, AI/unfilled flagged); `statusOf` → removed_entry is "crit"; `RemovedEntryCard`
+   (Add-it-back / Leave-removed) via `RowCtx.addBack`/`leaveRemoved`; `test/review-approval.test.ts`.
+4. **Teach — per-field scoping** (PR #18) — [x] DONE (2026-07-21): `isTeachable` excludes repeating/nested
+   section fields (`<section>[i].<f>`) — per-entry data is learned by editing the profile LIST, not a
+   label-keyed bucket the section machinery never consults. Flat AI/manual fields still teach.
+5. **Replay** (PR #19) — [x] DONE (2026-07-21): `bundleToSectionItems` already reconstructs an added-back
+   entry (same canonical shape as a Feature-B added entry); added a skip so a LEFT-removed `removed_entry`
+   ("<name>[i].__removed") doesn't create a phantom blank item. Test pins both.
+
+**FEATURE COMPLETE (Phases 1–5).** Extension suite 614/614; web typecheck + 22/22. Live-verify pending.
 
 ## Resolved decisions (operator, 2026-07-20)
 

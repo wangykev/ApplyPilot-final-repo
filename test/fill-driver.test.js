@@ -6616,6 +6616,27 @@ test("bundleToSectionItems: Feature-B added entry (higher index) is INCLUDED", (
   assert.deepStrictEqual(items.map((i) => i.job_title), ["First", "Added"]);
 });
 
+test("bundleToSectionItems (Phase 5): a LEFT-removed removed_entry is SKIPPED (no phantom blank); an ADDED-BACK entry reconstructs", () => {
+  // A delete-with-memory `removed_entry` the user LEFT removed has canonical "<name>[i].__removed" — it
+  // matches the index regex but must NOT create an empty item (else the replay would re-create a blank
+  // entry). An ADDED-BACK entry is real field records at a fresh index → reconstructs like any entry.
+  const left = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Kept"),
+    bent("workExperience[1].__removed", null, { widget_type: "removed_entry", flag: "entry-removed-remembered" }),
+  ], weSection());
+  assert.strictEqual(left.length, 1, "the left-removed entry does NOT reconstruct (no phantom blank item)");
+  assert.deepStrictEqual(left[0], { job_title: "Kept" });
+
+  const addedBack = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Kept"),
+    bent("workExperience[3].job_title", "AddedBack", { is_added: true, flag: "added-entry" }),
+    bent("workExperience[3].company", "Acme", { is_added: true }),
+  ], weSection());
+  assert.strictEqual(addedBack.length, 2, "the added-back entry reconstructs → replay re-creates it");
+  assert.deepStrictEqual(addedBack.map((i) => i.job_title), ["Kept", "AddedBack"]);
+  assert.deepStrictEqual(addedBack[1], { job_title: "AddedBack", company: "Acme" }, "its remembered + supplied values ride through");
+});
+
 test("bundleToSectionItems (cert nested): reconstructs item.specialties[j] with key mapping + date reparse", () => {
   const items = bundleToSectionItems([
     bent("certification[0].certification", "CPP", { widget_type: "typeahead" }),

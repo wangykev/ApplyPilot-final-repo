@@ -4395,7 +4395,11 @@ function bundleToSectionItems(entries, section) {
   const pathToFm = {}; for (const m of (section.fieldMap || [])) pathToFm[m.path] = m;
   const byIdx = new Map(); const order = [];
   for (const e of (entries || [])) {
-    if (!e || e.is_deleted) continue;
+    // Skip soft-deleted entries AND Phase-2 `removed_entry` cards left un-added-back — the latter's
+    // canonical is "<name>[i].__removed", which matches the index regex and would otherwise create an
+    // EMPTY item → the replay would re-create a blank entry. A LEFT-removed entry must stay deleted; an
+    // ADDED-BACK entry is real field records (degree/school/…), which reconstruct normally below.
+    if (!e || e.is_deleted || e.widget_type === "removed_entry") continue;
     const m = String(e.canonical_field || "").match(re);
     if (!m) continue;
     const i = +m[1], rest = m[2];
