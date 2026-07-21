@@ -49,6 +49,7 @@ import {
   mustReplace,
   isPrePopulated,
   isCascadeRevealed,
+  explainFill,
   statusOf,
   cleanPageName,
   pageNumOf,
@@ -982,7 +983,9 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
             )}
             <StatusDot e={e} />
           </div>
-          {review && e.detail && <p className="mt-1 text-xs leading-relaxed text-ink-dim">{e.detail}</p>}
+          {review && explainFill(e) && (
+            <p className="mt-1 text-xs leading-relaxed text-ink-dim">{explainFill(e)}</p>
+          )}
           {review && e.tree_structure?.chosen && (
             <p className="mt-1 text-xs text-ink-faint">
               tree: «{fmt(e.tree_structure.chosen)}» →{" "}
@@ -1029,8 +1032,8 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
           : "Pre-populated — not filled by ApplyPilot; verify it's what you want."}
       </p>
     );
-  if (!review && e.needs_review && e.detail && !isPrePopulated(e))
-    notes.push(<p key="d" className="mt-1 text-xs text-ink-dim">{e.detail}</p>);
+  if (!review && e.needs_review && !isPrePopulated(e) && explainFill(e))
+    notes.push(<p key="d" className="mt-1 text-xs text-ink-dim">{explainFill(e)}</p>);
   // autofilled ref (only when the BOT actually had a value)
   if (kind && norm(e.original_ai_value) !== "")
     notes.push(
@@ -1395,8 +1398,8 @@ function ReviewBadges({ e }: { e: ReviewEntry }) {
     );
   else if (isAiFlag(e) && !isSuperHard(e))
     badges.push(
-      <Badge key="ai" tone="info">
-        AI-INFERRED
+      <Badge key="ai" tone="info" title="AI helped fill this — matched your profile to the form, or inferred it. See the note below.">
+        AI-FILLED
       </Badge>
     );
   else if (isPrePopulated(e))
@@ -1434,7 +1437,9 @@ const DOT: Record<ReturnType<typeof statusOf>, string> = {
   skip: "bg-ink-faint",
 };
 function StatusDot({ e }: { e: ReviewEntry }) {
-  const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence]
+  // Debug tooltip — the precise engine detail lives here (and in the bundle + SW logs); the visible
+  // card copy is the intuitive explainFill() line.
+  const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence, e.detail]
     .filter(Boolean)
     .join("  ·  ");
   return <span className={clsx("ml-1 h-2 w-2 shrink-0 rounded-full", DOT[statusOf(e)])} title={tip} />;

@@ -81,6 +81,73 @@ export const isPrePopulated = (e: ReviewEntry): boolean =>
   e.flag === "already-filled" || e.flag === "already-filled-match";
 export const isCascadeRevealed = (e: ReviewEntry): boolean => !!e.cascade_revealed;
 
+// ── Plain-English "what happened" line for a review card ──
+// The engine records a terse log-style `detail` (e.g. `AI canonicalized stated "Bachelor of Science"
+// → "Bachelors" (vocab map, not inferred)`). That's accurate but reads like a debug string. explainFill
+// turns the STABLE flag (+ the specific values the engine kept) into a sentence the applicant can act on:
+// what their profile had, what got filled, and that they should check it. Falls back to the raw detail
+// for shapes we don't specially phrase, so nothing is ever hidden.
+
+/** Pull the applicant's ORIGINAL value out of the engine's detail string (the value it mapped FROM),
+ *  so the explanation can name it. Matches the engine's fixed phrasings; null if none present. */
+function statedFromDetail(detail?: string | null): string | null {
+  if (!detail) return null;
+  const m =
+    detail.match(/stated\s+"([^"]+)"/i) ||
+    detail.match(/mapped\s+"([^"]+)"/i) ||
+    detail.match(/snapped from\s+"([^"]+)"/i);
+  return m ? m[1] : null;
+}
+
+/** A human, one-line explanation of how a flagged field was filled. Prefer this over the raw `detail`
+ *  on the review card. Returns null only when there is nothing to say. */
+export function explainFill(e: ReviewEntry): string | null {
+  const flag = e.flag || "";
+  const chose = fmt(e.current_value);
+  const stated = statedFromDetail(e.detail);
+  const from = stated ? `Your profile value “${stated}”` : "Your profile value";
+
+  // Vocab-match of a value you DID provide (dropdown canonicalize, or a typeahead pick the AI judged
+  // genuinely present in the list) — NOT an inference.
+  if (flag === "ai-canonicalized" || (flag === "ai-choice" && e.match_tier !== "ai-source-tree"))
+    return `${from} wasn’t an exact option on this form, so AI matched it to the closest one — “${chose}”. Check it’s right.`;
+  if (flag === "ai-choice" && e.match_tier === "ai-source-tree")
+    return `AI matched your profile to “${chose}” in this form’s list. Check it’s right.`;
+  // Forced: required field, nothing matched — the riskiest AI answer.
+  if (flag === "ai-closest-forced")
+    return `This field is required, but none of the options matched your profile. AI picked the nearest one — “${chose}”${stated ? ` (closest to “${stated}”)` : ""}. Double-check this one.`;
+  if (flag === "ai-choice-sensitive")
+    return `A legally-loaded question your profile doesn’t answer directly — AI reasoned from your profile and answered “${chose}”. Verify carefully.`;
+  if (flag === "ai-eeo-guess")
+    return `You didn’t state this in your profile — AI guessed “${chose}” from what it knows about you. Verify or clear it.`;
+  if (flag === "ai-text-needs-answer" || needsAnswer(e))
+    return `AI couldn’t answer this from your profile — please fill it in.`;
+  if (flag === "ai-choice-other")
+    return `AI couldn’t find your answer among the options, so it chose “Other”. Verify that’s okay.`;
+  if (flag === "ai-commit-failed")
+    return `AI’s answer didn’t take on the form — please fill this in yourself.`;
+  if (isAiFlag(e)) return `AI filled this as “${chose}”. Verify it’s right.`;
+
+  // Non-AI: a taught/remembered answer, or a deterministic close (containment/fuzzy) match.
+  if (flag === "bucket")
+    return `Filled from an answer you taught ApplyPilot. Check it fits this form.`;
+  if (e.needs_review && e.match_tier && /contain|fuzz/i.test(e.match_tier))
+    return `${from} wasn’t an exact option on this form, so ApplyPilot chose the closest match — “${chose}”. Check it’s right.`;
+  if (flag === "we-currentwork-today")
+    return `Filled with today’s date because you marked “I currently work here” and this end date is required. Verify.`;
+  if (flag === "audit-mismatch" || flag === "overwrite-stray")
+    return `The form ended up showing a different value than expected — please double-check this field.`;
+  if (flag === "audit-unverifiable")
+    return `ApplyPilot couldn’t confirm this value stuck on the form — please verify it.`;
+
+  // Anything else that still needs a look: an intuitive nudge, never the raw engine string (the precise
+  // `detail` stays in the bundle + service-worker logs for debugging).
+  if (e.fill_status === "error" || e.fill_status === "not_filled")
+    return `ApplyPilot couldn’t fill this — please fill it in yourself.`;
+  if (e.needs_review) return `Please double-check this field.`;
+  return null;
+}
+
 export type StatusKind = "ok" | "warn" | "crit" | "skip";
 export function statusOf(e: ReviewEntry): StatusKind {
   if (e.widget_type === "removed_entry") return "crit"; // Phase 2: delete-with-memory card — add it back or dismiss (blocks submit)
