@@ -2897,6 +2897,7 @@ function makeFakeRepeatAct(state) {
       const f = byLoc(loc); const open = !!(f && f._open);
       const options = open ? (f.options || []) : [];
       return { triggerText: f ? (f.triggerText || null) : null, listboxPresent: open,
+        ariaExpanded: open ? "true" : "false", // model the real DOM signal openAndReadDropdown gates on (AI readers)
         optionCount: options.filter((o) => !o.disabled).length,
         options: options.map((o) => ({ text: o.text, disabled: !!o.disabled, selected: false })), activeText: null };
     },
@@ -4192,6 +4193,32 @@ test("repeating Education-shape entry: text + dropdown + YEAR date all fill (dat
   assert.strictEqual(rec("education[0].degree").after, "Bachelors"); // tiered array → matched
   assert.strictEqual(rec("education[0].firstYearAttended").status, "filled");
   assert.strictEqual(entry.fields[2].segments.Year.value, "2024"); // year date WRITTEN
+});
+
+test("repeating dropdown AI canonicalize (Phase 1): a STATED degree that isn't in the option vocab is reworded (ai-canonicalized), not left unfilled", async () => {
+  // Education degree DROPDOWN; the profile's stated "Bachelor of Science" isn't among the form's options
+  // (only Bachelors/Masters) → genuine no-match. Repeating dropdowns had ZERO AI before; now aiCanonicalize
+  // rewords the STATED value (never a guess) → filled_review / ai-canonicalized, so ONLY this field flags.
+  const state = {
+    prefix: "education-",
+    entries: [{ fkit: "education-1--null", fields: [
+      { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: null,
+        options: [{ text: "Bachelors" }, { text: "Masters" }] },
+    ] }],
+    addable: false, aiEnabled: true, ai: '{"choice":"Bachelors","confidence":"High"}',
+  };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [{ field: "degree", widget: "dropdown", key: "degree", path: "degree" }];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ degree: ["Bachelor of Science"] }], fieldMap, deleteOnNoMatch: false,
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].degree");
+  assert.strictEqual(rec.status, "filled_review", "canonicalized → filled_review (flagged for a glance)");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "provenance: mapped a STATED value, not a guess");
+  assert.strictEqual(rec.after, "Bachelors", "reworded to the form's vocab");
+  assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to canonicalize");
 });
 
 test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candidate absent) deletes high→low", async () => {

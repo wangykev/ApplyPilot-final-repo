@@ -172,6 +172,11 @@ sections (education / work-experience / websites).
 
 1. **Extension AI for repeating fields** (PR #19) — `fillEntryCdp`: canonicalize a stated-no-match
    DROPDOWN value; infer a required-empty DROPDOWN (mirroring the typeahead paths). Flag AI fields.
+   - [x] **1a — canonicalize** DONE (2026-07-20): a repeating dropdown genuine-no-match with a stated
+     value → `aiCanonicalizeField` → `ai-canonicalized` (the degree "Bachelor of Science"→"Bachelors"
+     case). Test: `repeating dropdown AI canonicalize (Phase 1)`. Suite 610/610.
+   - [ ] **1b — required-empty INFER** (folded into Phase 2, since a low-confidence infer must NOT
+     force a value — it feeds the delete-with-memory decision, so it can't be a standalone commit).
 2. **Extension delete-with-memory** (PR #19) — the unified entry-level decision in
    `driveRepeatingSectionCdp`: keep (flag AI) / delete-with-memory / halt, per the tree. Emit the
    `removed_entry` record with `remembered_fields` + recon. `buildReviewBundle`/`deriveReview` handle it.

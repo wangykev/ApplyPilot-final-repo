@@ -3322,6 +3322,20 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     } catch (e) {
       rec.status = "error"; rec.detail = String(e);
     }
+    // ── AI CANONICALIZE for a repeating-section DROPDOWN (Phase 1, plan-repeating-ai-and-delete-memory) ──
+    // A STATED profile value that didn't match the option vocab (e.g. degree "Bachelor of Science" vs a
+    // form that offers only "Bachelors") → reword it to the form's options. This maps a value the user
+    // PROVIDED (never a guess), gated on clearing the match ladder → filled_review, flag ai-canonicalized,
+    // so ONLY this field surfaces for review while the row's deterministic fields stay clean. Mirrors the
+    // flat loop's canonicalize + the repeating typeahead's inline AI (dropdowns had NONE before). AI OFF →
+    // untouched. (Required-empty INFER + the keep/delete-with-memory decision are Phase 2.)
+    if (aiCtx && act.aiEnabled && f.widget === "dropdown" && rec.resolved != null && rec.genuineNoMatch === true) {
+      const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired, widgetType: "dropdown", wrapperSel: fd.wrapperSel };
+      try {
+        const aiRes = await aiCanonicalizeField(act, loc, f2, rec.resolved, budgets);
+        if (aiRes) { Object.assign(rec, aiRes); if (aiRes.status === "filled_review" && isEeoField(f2)) rec.flag = "ai-eeo-guess"; }
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI dropdown canonicalize error: " + String((e && e.message) || e); }
+    }
     // Required-EMPTY TYPEAHEAD AI fill (section analog of the flat-loop block): a REQUIRED section typeahead with
     // no profile value (e.g. an Education entry's fieldOfStudy) is SKIPPED above, but a blank required field BLOCKS
     // Save & Continue. When AI is on, run the unified filler with NO candidates → the inline AI infers from the
