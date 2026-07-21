@@ -28,6 +28,22 @@ export type FieldShape = {
 
 export type TreeStructure = { chosen?: string | null; leaves?: string[] | null } | null;
 
+/** Phase 2 (delete-with-memory): one field of a `removed_entry` — the value that filled (if any) and
+ *  HOW, so an add-back reconstructs the entry PREFILLED. `filled_by`: "deterministic" | an `ai-*` flag |
+ *  "unfilled". Mirrors the engine's makeRemovedEntry.remembered_fields. */
+export type RememberedField = {
+  recName: string;
+  path?: string | null;
+  widget_type?: string | null;
+  label?: string | null;
+  is_required?: boolean;
+  value?: string | null;
+  filled_by?: string | null;
+  match_tier?: string | null;
+  options?: string[] | null;
+  date_order?: string[] | null;
+};
+
 export type ReviewEntry = {
   field_id: string;
   page?: string | null; // the STABLE merge key (cdpPageKey / field-set key), NOT the human label
@@ -75,6 +91,10 @@ export type ReviewEntry = {
   section_heading?: string | null; // real DOM heading for an unknown section
   section_field_shape?: FieldShape[] | null; // shape stub for an empty section / nested sub-section
   section_known?: boolean;
+  // Phase 2 (delete-with-memory): a `removed_entry` card — the entry the fill DELETED (a required field
+  // couldn't be filled) but REMEMBERED, so the review offers add-back-with-prefill.
+  remembered_fields?: RememberedField[] | null; // per-field: what filled + how (prefill on add-back)
+  unfilled_fields?: { recName: string; label?: string | null }[] | null; // the field(s) to supply/verify
   nested_shapes?: Record<string, FieldShape[]> | null; // nested sub-section shapes (cert ▸ specialties)
   nested_attachments?: boolean | null;
   container_prefix?: string | null;

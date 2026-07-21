@@ -83,6 +83,7 @@ export const isCascadeRevealed = (e: ReviewEntry): boolean => !!e.cascade_reveal
 
 export type StatusKind = "ok" | "warn" | "crit" | "skip";
 export function statusOf(e: ReviewEntry): StatusKind {
+  if (e.widget_type === "removed_entry") return "crit"; // Phase 2: delete-with-memory card — add it back or dismiss (blocks submit)
   if (e.fill_status === "skipped") return "skip";
   if (e.fill_status === "error" || e.fill_status === "not_filled") return "crit";
   if (e.needs_review) return mustReplace(e) ? "crit" : "warn";

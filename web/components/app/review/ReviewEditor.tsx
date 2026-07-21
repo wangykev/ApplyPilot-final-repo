@@ -32,6 +32,7 @@ import {
   isCurrentlyWorkHere,
   visibleEntryItems,
   newEntryRecords,
+  addBackEntryRecords,
 } from "@/lib/review-approval";
 import {
   fmt,
@@ -321,6 +322,46 @@ export function ReviewEditor({
     []
   );
 
+  // ── Phase 2 (delete-with-memory): ADD BACK a removed_entry — reconstruct the entry PREFILLED from its
+  // remembered_fields (deterministic values clean; AI/unfilled ones flagged), then drop the removed_entry
+  // card. Mirrors addEntry but seeds values instead of a blank shape. ──
+  const addBackEntry = useCallback(
+    (removed: ReviewEntry) => {
+      const remembered = removed.remembered_fields || [];
+      if (!remembered.length) return;
+      const page = removed.page != null ? removed.page : null;
+      const key = sectionOf(removed).key;
+      const unfilled = (removed.unfilled_fields || []).map((u) => u.recName);
+      const sample = bundle.entries.find((e) => e.page === page);
+      const newIx = nextIndexFor(bundle, page, key);
+      const recs = addBackEntryRecords(remembered, unfilled, {
+        page,
+        pageNumber: sample ? sample.page_number : null,
+        pageLabel: sample ? sample.page_label : null,
+        sectionKey: key,
+        index: newIx,
+        at: nowIso(),
+      });
+      // carry the recon'd nested sub-sections (cert ▸ specialties) onto the reconstructed parent
+      if (removed.nested_shapes) {
+        for (const childBase of Object.keys(removed.nested_shapes)) {
+          const shp = removed.nested_shapes[childBase];
+          if (Array.isArray(shp) && shp.length) recs.push(nestedStubRecord(page, key, newIx, childBase, shp, sample));
+        }
+      }
+      replaceEntries([...bundle.entries.filter((e) => e.field_id !== removed.field_id), ...recs]);
+      requestAnimationFrame(() => recs[0] && jumpTo(recs[0]));
+    },
+    [bundle, replaceEntries]
+  );
+
+  // "Leave removed" — accept the deletion (an optional entry the tenant doesn't offer). Approve the card so
+  // it stops blocking submit; it stays visible as resolved and is NOT replayed (removed_entry is skipped).
+  const leaveRemoved = useCallback(
+    (removed: ReviewEntry) => patchEntry(removed.field_id, { is_approved: true, approved_at: nowIso() }),
+    [patchEntry]
+  );
+
   // ── jump-to-field (expand section + switch to All + scroll/flash) ──
   const jumpTo = useCallback((e: ReviewEntry) => {
     const key = e.page + "||" + sectionOf(e).key;
@@ -405,8 +446,8 @@ export function ReviewEditor({
   // shared props threaded into the field renderer — STABLE (memoized over stable callbacks) so a
   // field row's ref-registration effect doesn't re-run on every keystroke elsewhere on the page.
   const ctx = useMemo<RowCtx>(
-    () => ({ commit, setApproved, setTiers, registerRow, jumpTo }),
-    [commit, setApproved, setTiers, registerRow, jumpTo]
+    () => ({ commit, setApproved, setTiers, registerRow, jumpTo, addBack: addBackEntry, leaveRemoved }),
+    [commit, setApproved, setTiers, registerRow, jumpTo, addBackEntry, leaveRemoved]
   );
 
   return (
@@ -525,6 +566,8 @@ type RowCtx = {
   setTiers: (e: ReviewEntry, tiers: string[]) => void;
   registerRow: (id: string, node: HTMLDivElement | null) => void;
   jumpTo: (e: ReviewEntry) => void;
+  addBack: (removed: ReviewEntry) => void; // Phase 2: reconstruct a removed_entry PREFILLED
+  leaveRemoved: (removed: ReviewEntry) => void; // Phase 2: accept the removal (approve the card)
 };
 
 // ── the FIELD LIST (grouped by page → section, collapsible, repeating entries + nested) ──
@@ -685,7 +728,8 @@ function SectionGroup({
   onAddNested: (pg: string | null, pk: string, pi: number, cb: string, stub: ReviewEntry) => void;
   onRemoveNested: (pg: string | null, pk: string, pi: number, cb: string, ci: number) => void;
 }) {
-  const realItems = items.filter((e) => e.widget_type !== "section_stub");
+  const realItems = items.filter((e) => e.widget_type !== "section_stub" && e.widget_type !== "removed_entry");
+  const removedCards = items.filter((e) => e.widget_type === "removed_entry" && filterPass(e)); // Phase 2 delete-with-memory add-back cards
   const repeating = realItems.some((e) => sectionOf(e).index != null);
   const liveItems = (repeating ? realItems : items).filter((e) => !e.is_deleted);
 
@@ -754,9 +798,12 @@ function SectionGroup({
         );
     }
   } else {
-    for (const e of items.filter((e) => !e.is_deleted && filterPass(e)))
+    for (const e of items.filter((e) => !e.is_deleted && filterPass(e) && e.widget_type !== "removed_entry"))
       body.push(<FieldRow key={e.field_id} e={e} ctx={ctx} />);
   }
+
+  // Phase 2 delete-with-memory: an add-back card per removed_entry (prefilled reconstruct, or leave removed).
+  for (const rc of removedCards) body.push(<RemovedEntryCard key={rc.field_id} e={rc} ctx={ctx} />);
 
   // + Add entry (addable repeating section, "all" view only)
   const addable = filter === "all" && sectionShapeFor(bundle, page, sec.key).length > 0;
@@ -1650,6 +1697,65 @@ function DeletedRow({ ix, onUndo }: { ix: number; onUndo: () => void }) {
       <button className="text-amber hover:underline" onClick={onUndo}>
         Undo
       </button>
+    </div>
+  );
+}
+
+// Phase 2 (delete-with-memory): an entry the fill DELETED because a required field couldn't be filled,
+// but whose values it REMEMBERED. The card shows the remembered fields (missing ones highlighted) + two
+// actions: "Add it back" reconstructs the entry PREFILLED (ctx.addBack); "Leave removed" accepts the
+// deletion (ctx.leaveRemoved). One or the other must happen before the app is submit-ready.
+function RemovedEntryCard({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
+  const remembered = e.remembered_fields || [];
+  const unfilled = new Set((e.unfilled_fields || []).map((u) => u.recName));
+  const accepted = !!e.is_approved;
+  return (
+    <div
+      ref={(n) => ctx.registerRow(e.field_id, n)}
+      className={clsx(
+        "mx-4 mb-3 rounded-lg border p-3",
+        accepted ? "border-hairline bg-panel-raised/40" : "border-amber/40 bg-amber/[0.06]"
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-[11px] uppercase tracking-label text-ink">
+          {accepted ? "✓ " : "⚠ "}
+          {e.question_label || "Entry removed"}
+        </span>
+        {accepted && (
+          <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">removed — accepted</span>
+        )}
+      </div>
+      {e.detail && <p className="mt-1 text-xs leading-relaxed text-ink-dim">{e.detail}</p>}
+      {remembered.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {remembered.map((f) => {
+            const missing = unfilled.has(f.recName) || f.value == null || String(f.value).trim() === "";
+            const isAi = typeof f.filled_by === "string" && f.filled_by.indexOf("ai-") === 0;
+            return (
+              <li key={f.recName} className="flex items-center gap-2 text-xs">
+                <span className="min-w-0 flex-1 truncate text-ink-faint">{f.label || f.recName}</span>
+                <span className={clsx("truncate text-right", missing ? "text-amber" : "text-ink")}>
+                  {missing ? "— you'll supply this —" : f.value}
+                </span>
+                {isAi && !missing && (
+                  <span className="shrink-0 rounded bg-amber/20 px-1 text-[10px] uppercase tracking-label text-amber">AI</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {!accepted && (
+        <div className="mt-3 flex items-center gap-2">
+          <button className="ap-add" onClick={() => ctx.addBack(e)}>
+            ↩ Add it back (prefilled)
+          </button>
+          <button className="btn-ghost text-xs" onClick={() => ctx.leaveRemoved(e)}>
+            Leave removed
+          </button>
+        </div>
+      )}
     </div>
   );
 }
