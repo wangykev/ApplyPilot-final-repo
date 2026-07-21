@@ -25,6 +25,7 @@ export async function GET() {
       .from("applications")
       .select("id, company, role, url, status, needs_review_count, applied_at, created_at")
       .eq("user_id", user.id)
+      .is("deleted_at", null) // hide soft-deleted apps from the tracker (bundles still feed teach)
       .order("created_at", { ascending: false });
     if (error) return NextResponse.json({ ok: false, reason: error.message }, { status: 500 });
     return NextResponse.json({ ok: true, applications: data ?? [] });

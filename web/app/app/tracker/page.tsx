@@ -19,6 +19,7 @@ async function loadApplications(): Promise<Application[]> {
       .from("applications")
       .select("id, company, role, url, status, needs_review_count, applied_at, created_at")
       .eq("user_id", user.id)
+      .is("deleted_at", null) // soft-deleted apps are hidden from the tracker (their bundles live on for teach)
       .order("created_at", { ascending: false });
     if ((!data || data.length === 0) && DEV_PREVIEW) return SAMPLE_APPS;
     return (data as Application[]) ?? [];
