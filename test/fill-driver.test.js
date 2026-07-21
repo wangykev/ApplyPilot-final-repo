@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1544,6 +1544,38 @@ test("source WITH how_did_you_hear defaults → routes through fillSourceCdp and
   assert.deepStrictEqual(rec.resolved, ["LinkedIn", "Other"]); // candidates from defaults
 });
 
+test("source: a DETERMINISTIC NON-EXACT match (containment) STAYS filled_review (flagged) — only an EXACT resolution is confident", async () => {
+  // Type "LinkedIn"; Workday autocommits a COMPOUND option that only CONTAINS it → containment tier.
+  // Source is graded like any choice widget: a non-exact match is a guess → filled_review, surfaced for
+  // review. (operator rule 2026-07-20: "deterministic non-exact matches should still be review".)
+  const act = makeFakeAct([
+    srcField({ wrapperSel: "[w-src]", filterMap: { LinkedIn: { autoCommit: "Social Networking Site (LinkedIn)" } } })
+  ]);
+  const defaults = { how_did_you_hear: { preferred: ["LinkedIn"], fallback: "Other" } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "Social Networking Site (LinkedIn)", "Workday resolved the typed candidate to a compound option (containment)");
+  assert.strictEqual(rec.status, "filled_review", "a non-exact (containment) source match is a guess → flagged");
+  const e = buildReviewBundle(out.results, { page: "p1" }).entries[0];
+  assert.strictEqual(e.needs_review, true, "surfaced for review");
+});
+
+test("source: an EXACT match on a LATER ladder candidate → filled, NOT flagged (earlier options absent)", async () => {
+  // Ladder [Handshake, GitHub]: Handshake isn't offered (no-match banner) → fall through to GitHub, which
+  // EXACT-matches. An exact match commits `filled` regardless of ladder POSITION (commitOutcome grades by
+  // tier, not order) → not surfaced for review. (operator rule 2026-07-20)
+  const act = makeFakeAct([
+    srcField({ wrapperSel: "[w-src]", filterMap: { Handshake: { banner: true }, GitHub: { autoCommit: "GitHub" } } })
+  ]);
+  const defaults = { how_did_you_hear: { preferred: ["Handshake", "GitHub"], fallback: "Other" } };
+  const out = await drivePageFill(act, nameProfile, defaults, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "GitHub", "fell through the absent earlier candidate to the one that exists");
+  assert.strictEqual(rec.status, "filled", "an EXACT match commits filled at ANY ladder position");
+  const e = buildReviewBundle(out.results, { page: "p1" }).entries[0];
+  assert.strictEqual(e.needs_review, false, "a deterministic EXACT source fill is not flagged");
+});
+
 // ── M30 session-expiry early-warning (heuristic, SOURCE-only) ────────────────
 // A NOTE never a halt; fires only when the source options NEVER load (dead-session
 // tell), NOT on a matching miss (the false-positive guard).
@@ -2088,12 +2120,15 @@ test("required-empty typeahead (section / FoS): AI ON → infers + forces a pick
   const eduEntry = (fkit) => ({ fkit, fields: [{ fieldName: "fieldOfStudy", widgetType: "typeahead", isRequired: true, chips: [], scrapeOptions: ["Accounting", "Biology", "Other"], filterMap: { "Biology": { autoCommit: "Biology" } } }] });
   const fieldMap = [{ field: "fieldOfStudy", widget: "typeahead", key: "fos", path: "field_of_study" }];
   const items = [{}]; // no fos value → resolve skips → required-empty AI fill
-  const state = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Biology","represented":true}', newEntry: (i) => eduEntry("education-new" + i), entries: [eduEntry("education-0--null")] };
+  // Phase 2: the AI must be CONFIDENT (High/Med) for the entry to be KEPT — a low-confidence pick now
+  // feeds the delete-with-memory decision (D2). "Biology" is represented AND High confidence → kept.
+  const state = { prefix: "education-", addable: true, deletable: true, aiEnabled: true, ai: '{"choice":"Biology","represented":true,"confidence":"High"}', newEntry: (i) => eduEntry("education-new" + i), entries: [eduEntry("education-0--null")] };
   const act = makeFakeRepeatAct(state);
   const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-", items, fieldMap, deleteOnNoMatch: false, aiContext: { profile: {}, jobContext: {} } }, T_BUDGETS);
   const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
-  assert.strictEqual(fos.status, "filled_review", "a required empty section typeahead is AI-filled, not skipped");
+  assert.strictEqual(fos.status, "filled_review", "a required empty section typeahead is CONFIDENTLY AI-filled, not skipped");
   assert.strictEqual(fos.after, "Biology");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "a confident AI fill KEEPS the entry (not delete-with-memory)");
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
@@ -2865,6 +2900,7 @@ function makeFakeRepeatAct(state) {
       const f = byLoc(loc); const open = !!(f && f._open);
       const options = open ? (f.options || []) : [];
       return { triggerText: f ? (f.triggerText || null) : null, listboxPresent: open,
+        ariaExpanded: open ? "true" : "false", // model the real DOM signal openAndReadDropdown gates on (AI readers)
         optionCount: options.filter((o) => !o.disabled).length,
         options: options.map((o) => ({ text: o.text, disabled: !!o.disabled, selected: false })), activeText: null };
     },
@@ -3018,20 +3054,28 @@ test("repeating N===0: deletes phantom entries, records a section STUB (Feature 
   assert.ok(!out.results.some((r) => /\.url$/.test(r.fieldName)));
 });
 
-test("section_stub flows through buildReviewBundle as a needs_review category (Feature A)", () => {
-  const recs = [{ fieldName: "certification", label: "Certification — section present, no entries",
+test("section_stub review flag keys off section_known: a KNOWN (profile-defined) empty section does NOT nag; an UNKNOWN one does", () => {
+  // operator rule 2026-07-20: an empty cert/language/WE/education/websites section is the user's own
+  // choice (the profile models it) → still shows in ALL FIELDS (addable) but is NOT a needs_review item.
+  const known = [{ fieldName: "certification", label: "Certification — section present, no entries",
     widgetType: "section_stub", isRequired: false, mappedPath: "certification._stub",
-    status: "skipped", flag: "section-stub", after: null,
+    status: "skipped", flag: "section-stub", after: null, section_known: true,
     detail: "no meaningful certification entries to fill — the section is on the form but empty" }];
-  const bundle = buildReviewBundle(recs, { page: "p1" });
-  assert.strictEqual(bundle.entries.length, 1); // KEPT (unlike the .add/.delete "section" ops, which are filtered)
-  const e = bundle.entries[0];
-  assert.strictEqual(e.widget_type, "section_stub");
-  assert.strictEqual(e.canonical_field, "certification._stub");
-  assert.strictEqual(e.needs_review, true);
-  assert.strictEqual(e.needs_review_reason, "section_unfilled");
-  assert.strictEqual(e.fill_status, "skipped");
-  assert.strictEqual(e.current_value, null);
+  const kb = buildReviewBundle(known, { page: "p1" });
+  assert.strictEqual(kb.entries.length, 1); // KEPT (unlike the .add/.delete "section" ops, which are filtered)
+  assert.strictEqual(kb.entries[0].widget_type, "section_stub");
+  assert.strictEqual(kb.entries[0].canonical_field, "certification._stub");
+  assert.strictEqual(kb.entries[0].needs_review, false, "known/profile-defined empty section does NOT nag for review");
+  assert.strictEqual(kb.entries[0].fill_status, "skipped");
+  assert.strictEqual(kb.entries[0].current_value, null);
+
+  // An UNKNOWN section (a tenant repeating section the profile doesn't model) IS a genuine gap → review.
+  const unknown = [{ fieldName: "publication", label: "Publications — section present (unmapped)",
+    widgetType: "section_stub", isRequired: false, mappedPath: "publication._stub",
+    status: "skipped", flag: "section-stub", after: null, section_known: false, detail: "unmapped section" }];
+  const ub = buildReviewBundle(unknown, { page: "p1" });
+  assert.strictEqual(ub.entries[0].needs_review, true, "unknown/unmodeled section IS a review item");
+  assert.strictEqual(ub.entries[0].needs_review_reason, "section_unfilled");
 });
 
 test("section_stub carries section_field_shape into the bundle (2b: viewer builds a new entry)", () => {
@@ -3436,6 +3480,38 @@ test("AI-4 deleteEmptyErrorRows: top-level — deletes ONLY entries whose named 
   assert.deepStrictEqual(deleteLog, [1], "only the EMPTY entry deleted; filled rows (incl. manual) untouched");
   assert.strictEqual(entries.length, 2);
   assert.deepStrictEqual(del.deleted, [{ section: "language", kind: "entry", index: 1 }]);
+});
+
+test("AI-4 deleteEmptyErrorRows: a VALUE-HOLDING row with ONE empty required field is KEPT — never nuke partial data (the education bug)", async () => {
+  // Education entry: school + degree FILLED, Field of Study EMPTY (not in the profile), and the Save &
+  // Continue error names "Field of Study". The OLD `anyEmpty` check deleted the WHOLE entry (losing
+  // school + degree, and it vanished from review). Now a row that holds ANY value is KEPT — only a truly
+  // ENTIRELY-empty orphan row is deleted. The missing required field surfaces for review / halts instead.
+  let entries = [
+    { fields: [
+      { fieldName: "schoolName", label: "School*", value: "Carnegie Mellon University" },
+      { fieldName: "degree", label: "Degree*", value: "Bachelor of Science" },
+      { fieldName: "fieldOfStudy", label: "Field of Study*", value: null }, // not in profile → empty
+    ] },
+    { fields: [ // a genuinely-empty orphan row → still deleted (it blocks Save and holds nothing)
+      { fieldName: "schoolName", label: "School*", value: null },
+      { fieldName: "degree", label: "Degree*", value: null },
+      { fieldName: "fieldOfStudy", label: "Field of Study*", value: null },
+    ] },
+  ];
+  const deleteLog = [];
+  const act = {
+    delay: async () => {},
+    repeatingScan: async () => ({ sections: { "education-": { entries } } }),
+    entryCount: async () => entries.length,
+    clickDeleteEntry: async (prefix, idx) => { deleteLog.push(idx); entries = entries.filter((_, i) => i !== idx); return { ok: true }; },
+  };
+  const targets = [{ kind: "entry", section: "education", containerPrefix: "education-", fields: [{ field: "fieldOfStudy" }] }];
+  const del = await deleteEmptyErrorRows(act, targets, T_BUDGETS);
+  assert.deepStrictEqual(deleteLog, [1], "ONLY the entirely-empty orphan row deleted; the partial (value-holding) education entry KEPT");
+  assert.strictEqual(entries.length, 1);
+  assert.strictEqual(entries[0].fields[0].value, "Carnegie Mellon University", "the partial education entry (school + degree) survives");
+  assert.deepStrictEqual(del.deleted, [{ section: "education", kind: "entry", index: 1 }]);
 });
 
 test("AI-4 deleteEmptyErrorRows: nested — deletes ONLY the EMPTY layer-2 row; the parent cert entry is NEVER deleted", async () => {
@@ -4122,6 +4198,149 @@ test("repeating Education-shape entry: text + dropdown + YEAR date all fill (dat
   assert.strictEqual(entry.fields[2].segments.Year.value, "2024"); // year date WRITTEN
 });
 
+test("repeating dropdown AI canonicalize (Phase 1): a STATED degree that isn't in the option vocab is reworded (ai-canonicalized), not left unfilled", async () => {
+  // Education degree DROPDOWN; the profile's stated "Bachelor of Science" isn't among the form's options
+  // (only Bachelors/Masters) → genuine no-match. Repeating dropdowns had ZERO AI before; now aiCanonicalize
+  // rewords the STATED value (never a guess) → filled_review / ai-canonicalized, so ONLY this field flags.
+  const state = {
+    prefix: "education-",
+    entries: [{ fkit: "education-1--null", fields: [
+      { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: null,
+        options: [{ text: "Bachelors" }, { text: "Masters" }] },
+    ] }],
+    addable: false, aiEnabled: true, ai: '{"choice":"Bachelors","confidence":"High"}',
+  };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [{ field: "degree", widget: "dropdown", key: "degree", path: "degree" }];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ degree: ["Bachelor of Science"] }], fieldMap, deleteOnNoMatch: false,
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].degree");
+  assert.strictEqual(rec.status, "filled_review", "canonicalized → filled_review (flagged for a glance)");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "provenance: mapped a STATED value, not a guess");
+  assert.strictEqual(rec.after, "Bachelors", "reworded to the form's vocab");
+  assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to canonicalize");
+  // keepOpenForCanonicalize: the dropdown is opened ONCE — fillDropdownCdp leaves the no-match list OPEN
+  // and aiCanonicalizeField REUSES it (no redundant close→reopen: the "open it once" operator ask).
+  assert.strictEqual(act.log.filter(([m]) => m === "openDropdown").length, 1, "opened once — no close→reopen for the canonicalize");
+});
+
+test("Phase 2 delete-with-memory: education (expected-data) + AI ON + an unfillable required field → entry DELETED but REMEMBERED (add-back prefills school+degree)", async () => {
+  // school + degree fill deterministically; fieldOfStudy is required but has no profile value and no AI
+  // resolution (2a: dropdowns have no infer) → the whole entry is delete-with-memory'd (advance the walk,
+  // supersedes keep-and-halt, D4), remembering school+degree for prefill + recording fieldOfStudy as missing.
+  const eduEntry = (fkit) => ({ fkit, fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Bachelors" }] },
+    { fieldName: "fieldOfStudy", label: "Field of Study*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Accounting" }, { text: "Biology" }] },
+  ] });
+  const state = { prefix: "education-", addable: false, deletable: true, aiEnabled: true, ai: null, entries: [eduEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school_or_university" },
+    { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
+    { field: "fieldOfStudy", widget: "dropdown", key: "fos", path: "field_of_study" },
+  ];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU", degree: ["Bachelors"] }], fieldMap, deleteOnNoMatch: false, // no fos value
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  assert.ok(act.log.some(([m]) => m === "clickDeleteEntry"), "AI on → delete-with-memory (advance the walk, not halt)");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem, "delete-with-memory → a removed_entry card");
+  assert.strictEqual(rem.flag, "entry-removed-remembered");
+  const school = rem.remembered_fields.find((f) => f.recName === "schoolName");
+  assert.ok(school && school.value === "CMU" && school.filled_by === "deterministic", "school remembered for prefill");
+  const deg = rem.remembered_fields.find((f) => f.recName === "degree");
+  assert.ok(deg && deg.value === "Bachelors" && deg.filled_by === "deterministic", "degree remembered for prefill");
+  assert.ok(rem.unfilled_fields.some((u) => u.recName === "fieldOfStudy"), "the missing required field is recorded");
+});
+
+test("Phase 2: education (expected-data) + AI OFF + an unfillable required field → entry KEPT (walk halts), NOT delete-with-memory", async () => {
+  // AI off + expected-data section → NEVER delete/advance: keep the entry with the unfilled required field
+  // → Save & Continue fails → the walk HALTS for the operator (D1). Never destroy data blind.
+  const eduEntry = (fkit) => ({ fkit, fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "fieldOfStudy", label: "Field of Study*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Accounting" }] },
+  ] });
+  const state = { prefix: "education-", addable: false, aiEnabled: false, entries: [eduEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school_or_university" },
+    { field: "fieldOfStudy", widget: "dropdown", key: "fos", path: "field_of_study" },
+  ];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU" }], fieldMap, deleteOnNoMatch: false, aiContext: null,
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "expected-data + AI off → NEVER delete (keep → halt)");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "no delete-with-memory when AI is off");
+  const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
+  assert.strictEqual(fos.status, "skipped", "the unfilled required field is kept (skipped) → deriveReview flags it → blocks Save → walk halts");
+  assert.strictEqual(fos.isRequired, true);
+});
+
+test("Phase 2b: required-empty repeating DROPDOWN + AI ON infers CONFIDENTLY → the field fills (ai-choice), the entry is KEPT", async () => {
+  // fieldOfStudy is a required DROPDOWN with no profile value. Repeating dropdowns now infer (2b): the AI
+  // returns a High-confidence represented pick → the field fills (ai-choice) and the entry is KEPT (a
+  // confident fill resolves the field; only IT flags). A low-confidence / forced pick would instead feed
+  // delete-with-memory (2a). Repeating dropdowns had NO infer before.
+  const eduEntry = (fkit) => ({ fkit, fields: [
+    { fieldName: "schoolName", label: "School*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "fieldOfStudy", label: "Field of Study*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Computer Science" }, { text: "Biology" }] },
+  ] });
+  const state = { prefix: "education-", addable: false, deletable: true, aiEnabled: true, ai: '{"choice":"Computer Science","justification":"prior CS coursework","confidence":"High"}', entries: [eduEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [
+    { field: "schoolName", widget: "text", key: "school", path: "school_or_university" },
+    { field: "fieldOfStudy", widget: "dropdown", key: "fos", path: "field_of_study" },
+  ];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school: "CMU" }], fieldMap, deleteOnNoMatch: false, // no fos value → AI infers
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "a CONFIDENT infer KEEPS the entry (no delete-with-memory)");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "not delete-with-memory");
+  const fos = out.results.find((r) => r.fieldName === "education[0].fieldOfStudy");
+  assert.strictEqual(fos.status, "filled_review", "the inferred dropdown fills (flagged for review)");
+  assert.strictEqual(fos.flag, "ai-choice");
+  assert.strictEqual(fos.after, "Computer Science");
+  assert.ok(act.log.some(([m]) => m === "llm"), "consulted the LLM to infer the required-empty dropdown");
+});
+
+test("Phase 2 fix: a PROVIDED value the AI maps to the form vocab (canonicalize) is KEPT + high-confidence, even at LOW AI confidence", async () => {
+  // Operator bug: degree profile "Bachelor of Science" vs a form offering only "Bachelors" → genuine
+  // no-match → aiCanonicalizeField maps it (ai-canonicalized) but the AI self-reported LOW confidence, so
+  // it was wrongly treated as an unconfident guess and delete-with-memory'd. A value that's IN the profile
+  // (just reworded) is a canonicalization, not a guess → KEEP + treat as high confidence. deletable:true so
+  // the OLD behavior WOULD have deleted it.
+  const state = {
+    prefix: "education-",
+    entries: [{ fkit: "education-1--null", fields: [
+      { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Bachelors" }, { text: "Masters" }] },
+    ] }],
+    addable: false, deletable: true, aiEnabled: true, ai: '{"choice":"Bachelors","confidence":"Low"}',
+  };
+  const act = makeFakeRepeatAct(state);
+  const fieldMap = [{ field: "degree", widget: "dropdown", key: "degree", path: "degree" }];
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ degree: ["Bachelor of Science"] }], fieldMap, deleteOnNoMatch: false,
+    aiContext: { profile: {}, jobContext: {} },
+  }, T_BUDGETS);
+  assert.ok(!act.log.some(([m]) => m === "clickDeleteEntry"), "a canonicalized PROVIDED value is KEPT, not delete-with-memory'd");
+  assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "no delete-with-memory");
+  const deg = out.results.find((r) => r.fieldName === "education[0].degree");
+  assert.strictEqual(deg.status, "filled_review", "kept + flagged for a glance");
+  assert.strictEqual(deg.flag, "ai-canonicalized");
+  assert.strictEqual(deg.after, "Bachelors");
+  assert.strictEqual(deg.confidence, "high", "a provided-value map is treated as HIGH confidence (was low → deleted)");
+});
+
 test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candidate absent) deletes high→low", async () => {
   // M38 Bug B1: deleteOnNoMatch fires on a GENUINE no-match — the required dropdown's
   // options RENDERED but the candidate isn't among them (this value isn't offered).
@@ -4135,16 +4354,17 @@ test("repeating delete-on-no-match: a GENUINE no-match (options rendered, candid
   }, T_BUDGETS);
   const delIdx = act.log.filter(([m]) => m === "clickDeleteEntry").map(([, i]) => i);
   assert.deepStrictEqual(delIdx, [1, 0]); // high→low so lower indices stay valid
-  const removed = out.results.filter((r) => /removed$/.test(r.fieldName));
+  // Phase 2 delete-with-memory: each deleted entry → a removed_entry card (not a dropped "removed" op).
+  const removed = out.results.filter((r) => r.widgetType === "removed_entry");
   assert.strictEqual(removed.length, 2);
-  assert.ok(removed.every((r) => r.status === "skipped" && /entry deleted/.test(r.detail)));
+  assert.ok(removed.every((r) => r.status === "skipped" && r.flag === "entry-removed-remembered" && /removed/i.test(r.detail)));
+  assert.ok(removed.every((r) => Array.isArray(r.unfilled_fields) && r.unfilled_fields.length), "carries the unfilled field (why it was removed)");
 });
 
-test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a stub (recon + note), not vanished", async () => {
-  // Operator bug: when deleteOnNoMatch deletes the LAST entry the whole section disappeared from
-  // review (the "removed" recs are widgetType "section" → filtered from the bundle). Now the
-  // section stays VISIBLE as a section_stub with a "removed — no match" note, so the operator can
-  // still ADD an entry (the field-shape rides the stub) or verify.
+test("repeating delete-on-no-match: EMPTYING the section surfaces a removed_entry card (delete-with-memory), not vanished", async () => {
+  // Phase 2 (delete-with-memory): when a genuine no-match deletes an entry, it's not dropped — a
+  // removed_entry record carries its recon + remembered values so the review shows an add-back card.
+  // (Supersedes the old "emptied → section_stub" behavior.)
   const mk = (fkit) => ({ fkit, fields: [{ fieldName: "x", label: "X*", widgetType: "dropdown", isRequired: true, triggerText: null, options: [{ text: "Alpha" }, { text: "Beta" }] }] });
   const state = webState({ prefix: "certification-", entries: [mk("certification-1--null")] });
   const fieldMap = [{ field: "x", widget: "dropdown", key: "x", path: "x" }];
@@ -4154,20 +4374,21 @@ test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a
     items: [{ x: "Zzz-nomatch" }], fieldMap, deleteOnNoMatch: true
   }, T_BUDGETS);
   assert.strictEqual(await act.entryCount("certification-"), 0, "the only entry was deleted");
-  const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub, "the emptied deleteOnNoMatch section still surfaces as a section_stub");
-  assert.strictEqual(stub.fieldName, "certification");
-  assert.strictEqual(stub.flag, "section-stub");
-  assert.strictEqual(stub.container_prefix, "certification-"); // backend identifier for the future add-fill
-  assert.ok(Array.isArray(stub.section_field_shape) && stub.section_field_shape.length, "carries the field shape so add-entry works");
-  assert.match(stub.detail, /removed/i);
-  assert.match(stub.detail, /no option matched/i);
-  // ...and it must SURVIVE into the bundle (the "appear in review" requirement): the section_stub
-  // passes buildReviewBundle's filter while the "removed" recs (widgetType "section") are dropped.
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem, "the deleted entry surfaces as a removed_entry card (not vanished)");
+  assert.strictEqual(rem.flag, "entry-removed-remembered");
+  assert.strictEqual(rem.container_prefix, "certification-"); // backend identifier for the future add-back
+  assert.ok(Array.isArray(rem.section_field_shape) && rem.section_field_shape.length, "carries the field shape so add-back works");
+  assert.ok(Array.isArray(rem.remembered_fields), "carries remembered_fields to prefill on add-back");
+  assert.ok(Array.isArray(rem.unfilled_fields) && rem.unfilled_fields.length, "records the field that couldn't fill");
+  assert.match(rem.detail, /removed/i);
+  // ...and it SURVIVES into the bundle as a needs_review add-back item.
   const entries = buildReviewBundle(out.results, {}).entries;
-  assert.ok(entries.some((e) => e.widget_type === "section_stub" && /certification/.test(e.field_id || "")),
-    "the section_stub reaches the bundle → shows on the review page");
-  assert.ok(!entries.some((e) => /\.removed$/.test(e.field_id || "")), "the raw 'removed' ops do NOT show");
+  const remEntry = entries.find((e) => e.widget_type === "removed_entry" && /certification/.test(e.field_id || ""));
+  assert.ok(remEntry, "the removed_entry reaches the bundle → shows on the review page");
+  assert.strictEqual(remEntry.needs_review, true, "a removed entry is a review item (add it back + supply the missing field)");
+  assert.strictEqual(remEntry.needs_review_reason, "entry_removed");
+  assert.ok(Array.isArray(remEntry.remembered_fields), "remembered_fields ride into the bundle");
 });
 
 test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletion) → segmented date editor, not a text box", async () => {
@@ -4188,11 +4409,11 @@ test("deleteOnNoMatch stub keeps the recon'd date_order (captured before deletio
     name: "certification", headingRegex: "certifications?", containerPrefix: "certification-",
     items: [{ x: "Zzz-nomatch", dParsed: "2024" }], fieldMap, deleteOnNoMatch: true
   }, T_BUDGETS);
-  const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub, "emptied section still stubbed");
-  const dShape = stub.section_field_shape.find((s) => s.recName === "d");
-  assert.ok(dShape, "the date field is in the stub shape");
-  assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented editor");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem, "emptied section → a removed_entry card");
+  const dShape = rem.section_field_shape.find((s) => s.recName === "d");
+  assert.ok(dShape, "the date field is in the removed_entry's recon shape");
+  assert.deepStrictEqual(dShape.date_order, ["year"], "date_order captured from the live entry (fake date field = year-only) → segmented add-back editor");
 });
 
 test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_shapes (add-back shows Specialties)", async () => {
@@ -4218,17 +4439,17 @@ test("deleteOnNoMatch cert emptied → the stub carries the HARDCODED nested_sha
     items: [{ cert: "Zzz-bogus" }], fieldMap, deleteOnNoMatch: true, nested: CERT_NESTED
   }, T_BUDGETS);
   assert.strictEqual(await act.entryCount("certification-"), 0, "bogus cert deleted → section empty");
-  const stub = out.results.find((r) => r.widgetType === "section_stub");
-  assert.ok(stub && stub.nested_shapes && Array.isArray(stub.nested_shapes.specialties), "the emptied cert's stub carries the hardcoded Specialties shape");
-  assert.strictEqual(stub.nested_shapes.specialties[0].recName, "specialtyParent");
-  assert.deepStrictEqual(stub.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
-  assert.strictEqual(stub.nested_attachments, true, "the stub knows the section has attachments (add-back offers a picker)");
+  const rem = out.results.find((r) => r.widgetType === "removed_entry");
+  assert.ok(rem && rem.nested_shapes && Array.isArray(rem.nested_shapes.specialties), "the removed cert's card carries the hardcoded Specialties shape");
+  assert.strictEqual(rem.nested_shapes.specialties[0].recName, "specialtyParent");
+  assert.deepStrictEqual(rem.nested_shapes.specialties[1].date_order, ["month", "day", "year"], "nested date field kept its segment order");
+  assert.strictEqual(rem.nested_attachments, true, "the card knows the section has attachments (add-back offers a picker)");
   assert.ok(!out.results.some((r) => r.widgetType === "nested_section_stub"), "a deleted cert → NO per-entry nested stub");
-  const flatNames = stub.section_field_shape.map((s) => s.recName);
+  const flatNames = rem.section_field_shape.map((s) => s.recName);
   assert.ok(flatNames.includes("certification") && flatNames.includes("certificationNumber"), "the cert's OWN fields stay in the flat shape");
   assert.ok(!flatNames.includes("specialtyParent") && !flatNames.includes("startDate") && !flatNames.includes("endDate"),
     "nested child fields EXCLUDED from the flat shape — Specialty renders ONLY as the sub-section");
-  assert.ok(!stub.section_field_shape.some((s) => s.widget_type === "file_upload"),
+  assert.ok(!rem.section_field_shape.some((s) => s.widget_type === "file_upload"),
     "the per-entry Attachments input EXCLUDED — nested_attachments renders the single picker (no double box)");
 });
 
@@ -5711,9 +5932,12 @@ function makeFakeTreeAct(tree, opts) {
     // (banner = the category name, the drill-confirmation).
     scrapeSourceRows: async (loc) => {
       log.push(["scrapeSourceRows", loc && loc.wrapperSel]);
+      // o.scrapeCatsEmpty models a tenant (Magna wd3) whose CATEGORY rows are role=option/treeitem, NOT
+      // promptOptions — so the promptOption-only scrape returns 0 categories on-open (readTreeCategories
+      // still sees them). Leaves after a drill are promptOptions → scraped normally.
       return expanded
         ? { ok: true, options: leavesOf(), banner: expanded, atBottom: true }
-        : { ok: true, options: tree.categories.slice(), banner: "No matches found", atBottom: true };
+        : { ok: true, options: o.scrapeCatsEmpty ? [] : tree.categories.slice(), banner: o.scrapeCatsEmpty ? "" : "No matches found", atBottom: true };
     },
     expandCategory: async (loc, label) => {
       if (!tree.categories.includes(label)) return false;
@@ -5766,6 +5990,41 @@ test("aiTreeDrillFallback: category + leaf → CLICK-drills + TYPE-commits the m
   assert.strictEqual(out.tree_structure.chosen, "Multiple Recognized Providers");
   assert.ok(act.log.some(([m]) => m === "expand"), "CLICK-drilled the category (not typed)");
   assert.ok(act.log.some(([m]) => m === "typeInSourceSearch"), "committed the leaf by TYPING (the unified type-commit, not clickTreeLeaf)");
+});
+
+test("aiTreeDrillFallback: promptOption scrape finds 0 categories (role=option tenant) → falls back to readTreeCategories, STILL drills + commits (never returns null)", async () => {
+  const act = makeFakeTreeAct(CERT_TREE, { scrapeCatsEmpty: true, ai: [
+    '{"choice":"Multiple Recognized Providers","confidence":"High"}',
+    '{"choice":"Certified Payroll Professional (CPP)","confidence":"High"}',
+  ] });
+  const out = await aiTreeDrillFallback(act, { wrapperSel: "[w]" }, { profile: {}, jobContext: {}, isRequired: true, label: "How Did You Hear About Us?", sourceTree: true }, T_BUDGETS);
+  assert.ok(out && out.status === "filled_review", "drilled via the readTreeCategories fallback instead of returning null (the Magna source bug)");
+  assert.strictEqual(out.after, "Certified Payroll Professional (CPP) - Multiple Recognized Providers");
+  assert.ok(act.log.some(([m]) => m === "expand"), "the category→leaf drill actually ran");
+});
+
+test("awaitSourceListLoaded: waits out a LATE server-fetched tree, returns the instant categories appear", async () => {
+  let calls = 0;
+  const act = {
+    delayFull: async () => {},
+    readTreeCategories: async () => { calls++; return calls >= 3 ? ["Job Board", "College/University"] : []; },
+    readHier: async () => ({ searchBox: { visible: true } }),
+    scrapeSourceRows: async () => ({ ok: true, options: [] }),
+  };
+  const loaded = await awaitSourceListLoaded(act, { wrapperSel: "[w]" }, { sourceCatLoadCeilingMs: 2000, sourceCatPollMs: 1 });
+  assert.strictEqual(loaded, true, "returns true once readTreeCategories populates (the fallback can then type into a loaded tree)");
+  assert.ok(calls >= 3, "polled until the tree loaded (adaptive, not a fixed wait)");
+});
+
+test("awaitSourceListLoaded: a tree that never loads returns false (bounded — never blocks forever)", async () => {
+  const act = {
+    delayFull: async () => {},
+    readTreeCategories: async () => [],
+    readHier: async () => ({ searchBox: { visible: true } }),
+    scrapeSourceRows: async () => ({ ok: true, options: [] }),
+  };
+  const loaded = await awaitSourceListLoaded(act, { wrapperSel: "[w]" }, { sourceCatLoadCeilingMs: 30, sourceCatPollMs: 1 });
+  assert.strictEqual(loaded, false, "gives up at the ceiling → the caller falls through (needs_review / AI), never hangs");
 });
 
 test("aiTreeDrillFallback: AI picks 'Other' → commits the suffixed Other leaf (ai-choice)", async () => {
@@ -5931,6 +6190,15 @@ test("replayField: a CLEARED text entry leaves the field blank (verify-blank, no
   const r = await replayField(act, { field_id: "P1::formField-legalName--firstName", canonical_field: "personal_info.first_name", widget_type: "text", current_value: null, edit_kind: "cleared" }, T_BUDGETS);
   assert.strictEqual(r.replay, "cleared");
   assert.strictEqual(f.value, "", "the box is emptied, not refilled");
+});
+
+test("replayField: a CLEARED text entry on an ALREADY-BLANK field is SKIPPED (no focus — an empty optional field like phone extension can't halt the walk)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-extension"]', fieldName: "extension", widgetType: "text", value: "" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P1::formField-extension", canonical_field: "personal_info.phone_extension", widget_type: "text", current_value: "", edit_kind: null }, T_BUDGETS);
+  assert.strictEqual(r.status, "skipped");
+  assert.strictEqual(r.replay, "cleared");
+  assert.strictEqual(f.value, "", "left blank, never actuated (no focus attempt)");
 });
 
 test("replayField: a REPEATING-section field is DEFERRED (skipped, zero actuation — M3 replays it positionally)", async () => {
@@ -6161,15 +6429,49 @@ test("NAMED INVARIANT — submitPrecondition NEVER passes with an unresolved fla
 test("isTransientRenderFailure: all render-flakes → true; any terminal → false; no failures → false", () => {
   const flake = { status: "needs_review", detail: "options did not render (skipped_no_option_match)" };
   const flakeByFlag = { status: "needs_review", flag: "skipped_no_option_match", detail: "" };
+  // control-not-laid-out family (the replay page-2 Country-cascade race — same underlying render race)
+  const noInput = { status: "error", detail: "no input in wrapper" };
+  const noTextarea = { status: "error", detail: "no textarea in wrapper" };
+  const noTypeahead = { status: "error", detail: "typeahead wrapper not found" };
   const terminal = { status: "needs_review", detail: "no candidate matched — value not offered" };
   const ok = { status: "filled", detail: "overwrote x" };
   assert.strictEqual(isTransientRenderFailure([flake]), true);
   assert.strictEqual(isTransientRenderFailure([flake, flakeByFlag]), true);
+  assert.strictEqual(isTransientRenderFailure([noInput, noTextarea, noTypeahead]), true, "control-not-laid-out is a render race");
+  assert.strictEqual(isTransientRenderFailure([flake, noTypeahead]), true, "mixed render-races → retryable");
   assert.strictEqual(isTransientRenderFailure([flake, terminal]), false, "a mix with a genuine no-match is NOT retryable");
+  assert.strictEqual(isTransientRenderFailure([noInput, terminal]), false, "a mix with a genuine no-match is NOT retryable");
   assert.strictEqual(isTransientRenderFailure([terminal]), false);
   assert.strictEqual(isTransientRenderFailure([ok]), false, "no failures → nothing to retry");
   assert.strictEqual(isTransientRenderFailure([]), false);
   assert.strictEqual(isTransientRenderFailure(null), false);
+});
+
+test("samePhysicalPage: same pathname + overlapping field-set → same page (overwrite); disjoint → separate", () => {
+  const k = (path, fields) => path + "|" + fields.slice().sort().join(",");
+  // a cascade-revealed field persisted between fills → keys differ but it's the SAME page
+  assert.strictEqual(samePhysicalPage(k("/apply", ["country", "name", "email"]), k("/apply", ["country", "name", "email", "state"])), true);
+  // genuinely different SPA pages sharing the pathname have DISJOINT field-sets → separate
+  assert.strictEqual(samePhysicalPage(k("/apply", ["country", "name"]), k("/apply", ["workExp", "school"])), false);
+  // different pathname → never the same
+  assert.strictEqual(samePhysicalPage(k("/apply", ["a", "b"]), k("/review", ["a", "b"])), false);
+  // plain (field-less) keys only match themselves
+  assert.strictEqual(samePhysicalPage("P1", "P1"), true);
+  assert.strictEqual(samePhysicalPage("P1", "P2"), false);
+  assert.strictEqual(samePhysicalPage(null, "P1"), false);
+});
+
+test("accumulateBundle OVERWRITES a re-fill of the same page whose field-set SHIFTED (no duplicate page)", () => {
+  const k = (fields) => "/apply|" + fields.slice().sort().join(",");
+  const mk = (pageKey, fields) =>
+    buildReviewBundle(fields.map((f) => ({ fieldName: f, widgetType: "text", status: "filled", after: f.toUpperCase(), label: f })), { page: pageKey });
+  // first fill of page 1 (country blank → no cascade fields)
+  let acc = accumulateBundle([], mk(k(["country", "name"]), ["country", "name"]));
+  assert.strictEqual(acc.entries.length, 2);
+  // re-fill of the SAME page — now country is set, so `state` cascade-revealed → a DIFFERENT key
+  acc = accumulateBundle(acc.entries, mk(k(["country", "name", "state"]), ["country", "name", "state"]));
+  assert.strictEqual(acc.entries.length, 3, "the prior page-1 entries were overwritten, not duplicated");
+  assert.deepStrictEqual(acc.entries.map((e) => e.field_id.split("::").pop()).sort(), ["formField-country", "formField-name", "formField-state"]);
 });
 
 test("submitPrecondition (M6): an unapproved CASCADE-REVEALED field blocks even if it filled cleanly (needs_review false)", () => {
@@ -6344,6 +6646,27 @@ test("bundleToSectionItems: Feature-B added entry (higher index) is INCLUDED", (
   ], weSection());
   assert.strictEqual(items.length, 2, "added entry included → replay must CREATE it");
   assert.deepStrictEqual(items.map((i) => i.job_title), ["First", "Added"]);
+});
+
+test("bundleToSectionItems (Phase 5): a LEFT-removed removed_entry is SKIPPED (no phantom blank); an ADDED-BACK entry reconstructs", () => {
+  // A delete-with-memory `removed_entry` the user LEFT removed has canonical "<name>[i].__removed" — it
+  // matches the index regex but must NOT create an empty item (else the replay would re-create a blank
+  // entry). An ADDED-BACK entry is real field records at a fresh index → reconstructs like any entry.
+  const left = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Kept"),
+    bent("workExperience[1].__removed", null, { widget_type: "removed_entry", flag: "entry-removed-remembered" }),
+  ], weSection());
+  assert.strictEqual(left.length, 1, "the left-removed entry does NOT reconstruct (no phantom blank item)");
+  assert.deepStrictEqual(left[0], { job_title: "Kept" });
+
+  const addedBack = bundleToSectionItems([
+    bent("workExperience[0].job_title", "Kept"),
+    bent("workExperience[3].job_title", "AddedBack", { is_added: true, flag: "added-entry" }),
+    bent("workExperience[3].company", "Acme", { is_added: true }),
+  ], weSection());
+  assert.strictEqual(addedBack.length, 2, "the added-back entry reconstructs → replay re-creates it");
+  assert.deepStrictEqual(addedBack.map((i) => i.job_title), ["Kept", "AddedBack"]);
+  assert.deepStrictEqual(addedBack[1], { job_title: "AddedBack", company: "Acme" }, "its remembered + supplied values ride through");
 });
 
 test("bundleToSectionItems (cert nested): reconstructs item.specialties[j] with key mapping + date reparse", () => {

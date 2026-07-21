@@ -662,3 +662,113 @@ Verified: extension `npm test` **604**; web `tsx --test` **15**, `tsc --noEmit` 
 to main. Remaining: end-to-end live-verify on a real Workday page (fill → approve on review → teach → re-fill
 deterministic); apply migration `0004` to Supabase; the fill-time typeahead-AI piggyback (covered by the
 teach-time fallback for now).
+
+## 2026-07-20 — Fill idempotency + AI-off halt + replay cascade race + false-advance (branch `fill-overwrite-and-halt-fixes`)
+
+CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
+
+- **False "advanced" → phantom page re-fill (`runCdpWalk` + `runCdpReplayWalk`).** `prevSig` (the
+  transition signature `cdpWaitNextPage` diffs against) was captured BEFORE the page fill. But the fill
+  itself mutates the field set — leaving "preferred name" unchecked removes its two fields, a Country
+  cascade adds/removes others — so the post-fill signature already differed from the stale pre-fill one.
+  On a FRESH form with an invalid value (operator repro: a ZIP that doesn't match the state), Save &
+  Continue was BLOCKED, but the changed signature made `cdpWaitNextPage` read "advanced" → the walk
+  re-scanned the SAME page as "page 2" and RE-FILLED it (regardless of AI on/off). Now `prevSig` is
+  snapshotted AFTER the fill/replay, immediately before the click, so only a REAL transition changes it —
+  a blocked page correctly stays put (nav-timeout → remediation-if-AI / halt-if-not). Only bit the FIRST
+  fill because a re-run starts with those fields already removed (no signature delta). The
+  `remediatePageErrors` re-click already captured its sig post-refill — unchanged.
+
+- **Duplicate review page → OVERWRITE (`accumulateBundle`).** Dedup was by EXACT `cdpPageKey` (pathname +
+  sorted field-set). Filling ONE page twice can yield DIFFERENT keys when the field-set shifts between
+  fills — a cascade-revealed field (country→state/phone) persisted, so the 2nd pre-fill scan sees it and
+  the 1st didn't — so the prior entries weren't dropped → **two page-1 groups**. New pure
+  `samePhysicalPage(a,b)`: same page ⇔ same pathname AND field-sets OVERLAP (≥50% of the smaller set);
+  genuinely different same-pathname SPA pages have DISJOINT field-sets (the M31 discriminator) → stay
+  separate. Any re-fill (single-page `runCdpFillPage`, remediation, or the reload-restart) now OVERWRITES.
+  Recon never writes `reviewSummary`, so the perceived "recon copy" was always a fill duplicate — same fix.
+- **AI OFF → halt on error, NO refill (`runCdpWalk` nav-timeout branch).** `remediatePageErrors` ran
+  unconditionally; its deterministic Tier-1/1.6 re-fill fired even with AI off (the unwanted "refill on
+  error"). Now gated on `act.aiEnabled`: AI off ⇒ skip remediation, try only a harmless re-click (a
+  swallowed Save & Continue, never a re-fill), else HALT `nav-timeout-dirty`. AI on keeps the full AI-4 ladder.
+- **Replay page-2 cascade race → bounded reload-retry (`RENDER_FLAKE_RX`).** On Magna the Country cascade
+  reveals region/phone/postal ~5.6s after Country commits — past the dropdown 2.5s rect poll and the
+  one-shot text/typeahead reads (0s) — so replay hit "no input in wrapper" / "typeahead wrapper not found" /
+  "options did not render" and HALTED (the reload-retry didn't fire: those errors weren't flakes).
+  Broadened `RENDER_FLAKE_RX` to the control-not-laid-out family so the bounded reload-retry (BOTH walks)
+  recovers on a fresh load (which also clears the stale-session aggravation a cancelled-then-rerun adds). A
+  genuine no-match ("value not offered") stays terminal — a reload can never mask a real problem.
+
+- **Replay walk: premature "advanced" → re-processing the SAME page (`runCdpReplayWalk`).** On a 2nd
+  refill of an already-completed Magna form (bundle now holds all pages), page 1's Save & Continue read
+  as "advanced" while My-Information was still mounted, so "page 2" re-scanned My-Info, `selectPageBundleEntries`
+  re-matched the 14 My-Info entries, and it died focusing the empty `extension` field. Three fixes:
+  (1) `cdpPageSig` now strips the URL query (pathname + field-set, matching `cdpPageKey`) so a session/
+  tracking token (Magna's `?utm_source=…&ref=…`) mutating mid-transition can't register as an advance;
+  (2) a SAME-PAGE guard in the replay loop — if the live page's flat-fields+sections identity equals the
+  step just replayed, HALT `did-not-advance` instead of re-replaying; (3) `replayField`'s cleared-text
+  path SKIPS an already-blank / not-yet-laid-out optional field (read-first) instead of focus-and-clear,
+  so an empty `extension` can never halt the walk. Root-caused by a read-only trace (both refill runs
+  diffed); `selectPageBundleEntries` was NOT at fault — it matched the (wrong, still-page-1) fields it
+  was handed.
+
+- **Source ("How did you hear about us?") tree never drilled on Magna → left blank / flat-guessed.** The
+  category→click→recon-leaves→pick-leaf→commit drill lives only in `aiTreeDrillFallback`, and it enumerated
+  categories via `scrapeSourceRows` (reads `promptOption` nodes ONLY). Magna renders its category rows as
+  `role=option`/`treeitem` nodes → the scrape returned 0 → the drill ABORTED to `null` before clicking →
+  the flat "no candidate produced a verified chip" exit → required-source error → the AI-4 remediation
+  then FLAT-TYPED a guess ("job boards") because `refillFieldWithValue`'s hierarchical branch passed no
+  tree context. Two fixes: (1) `aiTreeDrillFallback` falls back to `readTreeCategories` (which reads the
+  `role=option`/`treeitem` rows) when the promptOption scrape finds 0 categories, so the drill actually
+  runs (category → `expandCategory` → recon leaves → pick → commit); (2) the AI-4 remediation of a
+  hierarchical `source` re-runs the drill from the profile's `how_did_you_hear` fallback (LinkedIn first)
+  with the tree-drill AI context, instead of flat-typing the LLM's guess. New test: a 0-category
+  promptOption scrape falls back to `readTreeCategories` and still drills+commits.
+
+- **Source tree is SERVER-FETCHED → the DETERMINISTIC fallback ladder ran too early and lost to the AI
+  (`awaitSourceListLoaded`, LIVE-VERIFIED on Magna).** With no primary/per-application source value (that
+  answer is deferred), the deterministic candidate loop (LinkedIn → Handshake → GitHub → Other) IS what
+  fills — and typing a candidate + Enter DOES autocommit / pick the filtered match. But the loop typed
+  the instant the picker opened, BEFORE Magna's category tree finished loading, so `awaitListStable`
+  accepted the stable-EMPTY list, every candidate hit a false "No matches found", and the field fell
+  straight to the `aiTreeDrillFallback` AI drill (which then guessed a category). Fix: for a `sourceTree`
+  field the first-open now waits on new `awaitSourceListLoaded` — a cheap `readTreeCategories` poll
+  (150ms, real wall-clock, bounded by `sourceCatLoadCeilingMs`, re-opens only if the popup closed) that
+  proceeds the INSTANT the tree has content (adaptive, not a fixed sleep — an earlier fixed wait was
+  "way too slow"). So the deterministic ladder is tried FIRST (type→Enter→autocommit, `sourceTree:true`
+  passed by both `drivePageFill` and the AI-4 re-drill, independent of the AI toggle); the AI drill runs
+  ONLY on a genuine no-match. New tests: `awaitSourceListLoaded` returns true the moment a late tree
+  loads, and false (bounded) when it never loads.
+
+- **Known empty repeating sections no longer nag for review (operator rule: "having no values is fine since
+  they're in the profile; a repeating section NOT in the profile on the page should be review").**
+  `buildReviewBundle` flagged EVERY `section-stub` as `needs_review: section_unfilled`. Now it keys off
+  `section_known` — a KNOWN, profile-DEFINED section (cert / languages / work-experience / education /
+  websites, `section_known:true`) left empty is the user's own choice → still shows in ALL FIELDS (addable)
+  but is NOT a review item; only an UNKNOWN section (`section_known:false`, a tenant repeating section the
+  profile doesn't model) is a genuine gap → review. A required-but-empty KNOWN section still blocks Save &
+  Continue → nav-timeout halt, so skipping the review flag never hides a blocker. (A source-specific
+  relaxation was tried + REVERTED: a deterministic NON-EXACT source match stays `filled_review`/flagged like
+  any choice widget; an EXACT match — at any ladder position — is already `filled`, no special-casing.)
+
+- **AI-4 remediation deleted PARTIAL repeating entries (the education data-loss bug).** `deleteEmptyErrorRows`
+  (Tier 1.5 — deletes error-named repeating rows to clear a Save & Continue error) gated deletion on
+  `anyEmpty`: if ANY error-named field in a row was empty, it deleted the WHOLE row. So an education entry
+  with school + degree FILLED but one field EMPTY (not in the profile) got NUKED — and the removed row is
+  filtered from the bundle, so it VANISHED from review. This contradicted the documented intent ("a
+  value-holding row is never deleted"). Fixed: delete ONLY a row that is ENTIRELY empty (`holdsValue` false —
+  a true orphan the tenant left that blocks Save); a row holding ANY value is KEPT even with an empty
+  required field — that field surfaces for review / the walk halts, never a silent data loss. Single-field
+  rows behave identically (unit-pinned); a new test pins that a multi-field partial row survives while an
+  entirely-empty orphan is still deleted. (operator 2026-07-20)
+
+(The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
+toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
+
+Verified: extension suite (minus `db`, uninstalled dep) **609/609** incl. new `samePhysicalPage`,
+`accumulateBundle`-overwrite, broadened `isTransientRenderFailure`, `awaitSourceListLoaded`
+load/give-up, section-stub known-vs-unknown, source non-exact-stays-flagged / later-ladder-exact-
+not-flagged, and `deleteEmptyErrorRows` keep-value-holding-partial-row tests. The source category-load timing + deterministic-before-AI ladder is **LIVE-VERIFIED
+on Magna** (fills LinkedIn deterministically once the tree loads). **Live-verify PENDING** (eyes-on,
+disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a real
+Workday page.

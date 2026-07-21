@@ -2130,12 +2130,29 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       if (decision.action === "refill") {
         const f = scan.fields.find((x) => x.fieldName === decision.field);
         if (f) {
-          const r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+          let r, refillNote;
+          if (f.widgetType === "hierarchical") {
+            // Source is a click-TREE — NEVER flat-type the AI's guess ("job boards" is what that produced).
+            // Re-run the ordered drill from the profile's how_did_you_hear fallback (LinkedIn first) WITH
+            // the tree-drill AI context, so it drills category → recon leaves → pick leaf → commit. Required.
+            const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
+            const cands = hdyh && Array.isArray(hdyh.preferred) && (hdyh.preferred.length || hdyh.fallback)
+              ? [...hdyh.preferred, ...(hdyh.fallback ? [hdyh.fallback] : [])]
+              : [decision.value];
+            const aiForSource = act.aiEnabled
+              ? { profile, jobContext, isRequired: true, label: f.label, fieldName: f.fieldName, sourceTree: true }
+              : undefined;
+            r = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, cands, DEFAULT_BUDGETS, { ai: aiForSource, sourceTree: true });
+            refillNote = `AI-4 Tier-2 re-drill source from how_did_you_hear [${cands.slice(0, 3).join(", ")}…] — `;
+          } else {
+            r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+            refillNote = `AI-4 Tier-2 refill "${decision.value}" — `;
+          }
           mergeRemediationRecord(out, Object.assign({ fieldName: f.fieldName, label: f.label, widgetType: f.widgetType }, r, {
             flag: "ai-remediation", status: r.status === "filled" ? "filled_review" : r.status,
-            detail: `AI-4 Tier-2 refill "${decision.value}" — ` + (r.detail || decision.reason || "")
+            detail: refillNote + (r.detail || decision.reason || "")
           }));
-          actions.push({ tier: 2, action: "refill", field: decision.field, value: decision.value });
+          actions.push({ tier: 2, action: "refill", field: decision.field, value: f.widgetType === "hierarchical" ? "(source drill)" : decision.value });
           didSomething = true;
         } else { LOG(`    AI named field "${decision.field}" not on the page — skipping.`); }
       } else if (decision.action === "delete_entry") {
@@ -2469,6 +2486,7 @@ async function runCdpReplayWalk(tabId, opts) {
 
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1; a clean finish / halt / review-terminal returns out of the function
     pagesReplayed = []; findings = { mismatches: [], cascadeRevealed: [] }; submitFired = false; // reset per attempt
+    let prevPageIdentity = null; // flat-fields+sections identity of the page just replayed — to catch a false "advanced" (see the same-page guard)
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
       walkPage = page;
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
@@ -2556,13 +2574,23 @@ async function runCdpReplayWalk(tabId, opts) {
 
       LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
       await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const scan = await cdpEval(cdpPageScan);
       const fields = (scan && scan.fields) || [];
       const liveNames = fields.map((f) => f.fieldName);
       // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
       let rscanLive = null;
       try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
+      // ── SAME-PAGE GUARD (backstop for a premature "advanced"): if the live page is IDENTICAL to the
+      //    one just replayed — same flat field-set AND same repeating sections — then the prior Save &
+      //    Continue did NOT actually move the form (a slow/blocked transition read as advanced). NEVER
+      //    re-replay the same page; HALT honestly. Skips a wholly-empty (loading) scan. ──
+      const liveSecKey = rscanLive && rscanLive.sections ? Object.keys(rscanLive.sections).sort().join(",") : "";
+      const pageIdentity = liveNames.slice().sort().join(",") + "||" + liveSecKey;
+      if (prevPageIdentity !== null && (liveNames.length || liveSecKey) && pageIdentity === prevPageIdentity) {
+        LOG(`⚠ page ${page}: the form did NOT advance — the live page is IDENTICAL to the step just replayed (Save & Continue was blocked, or the transition didn't settle). HALT — never re-replaying the same page. Eyeball the form; a re-run usually clears a transient race.`);
+        return { ok: true, stopped: "did-not-advance", page, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      prevPageIdentity = pageIdentity;
       const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
       if (!sel.entries.length || sel.score <= 0) {
         const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
@@ -2644,6 +2672,10 @@ async function runCdpReplayWalk(tabId, opts) {
         LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
         return { ok: true, stopped: "no-next-button", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
+      // Snapshot the transition signature AFTER the replay/refill (they mutate this page's field set —
+      // preferred name, Country cascade), so cdpWaitNextPage detects only a REAL Save & Continue and not
+      // the fill's own DOM changes (a pre-replay sig would FALSELY read "advanced" on a blocked page).
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       await cdpWakePage(); // wake a frozen hidden tab so the transition can run
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
@@ -2764,11 +2796,17 @@ async function runCdpPageRecon(tabId) {
 // refuses on the review marker. Review-page reached = SUCCESS (walked the whole app).
 // ============================================================================
 
-// Page signature for transition detection: url + the sorted formField name set
-// (the field-set delta is the load-bearing signal — pageId alone is shared across
-// pages on some tenants; dom-patterns).
+// Page signature for transition detection: URL PATHNAME (query stripped) + the sorted formField name
+// set. The field-set delta is the load-bearing signal (pageId alone is shared across pages on some
+// tenants; dom-patterns). The query is dropped for the SAME reason cdpPageKey drops it — a session /
+// tracking token in the query (Magna carries ?utm_source=…&ref=…) mutating mid-transition would flip
+// the sig and be read as a FALSE advance while the same page is still mounted. Pathname + field-set
+// means only a REAL page change (different questions) registers as an advance.
 function cdpPageSig(scan) {
-  return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
+  if (!scan || !scan.fields) return null;
+  let path = scan.url || "";
+  try { path = new URL(scan.url).pathname; } catch (e) { /* non-URL → keep raw (still stable) */ }
+  return path + "|" + scan.fields.map((f) => f.fieldName).sort().join(",");
 }
 
 // A CLEAN no-advance fallback (operator ask, 2026-07-10, Magna page 1): Save & Continue registered
@@ -2926,7 +2964,6 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
@@ -2964,6 +3001,13 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──
+      // Capture the transition signature AFTER the fill (not before it): the fill itself mutates this
+      // page's field set — leaving "preferred name" unchecked removes its two fields, a Country cascade
+      // adds/removes others — so a PRE-fill signature already differs from the settled post-fill DOM.
+      // With a stale pre-fill sig, cdpWaitNextPage FALSELY reads "advanced" when Save & Continue was
+      // actually BLOCKED (e.g. an invalid ZIP), and the walk re-fills the SAME page as a phantom next
+      // page. Snapshotting here means ONLY a real Save & Continue transition changes the signature.
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       await cdpWakePage(); // wake a frozen hidden tab so the Save & Continue transition can run (hidden page-N→N+1 stall)
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
@@ -2989,7 +3033,17 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // error (sessionLooksDead already excluded above). Attempt BOUNDED remediation before the
         // dirty halt: Tier-0 dup-language / Tier-1 deterministic re-fill → Tier-2 AI, capped + halt-on-no-progress.
         if (res.errorDetected) LOG(`page ${page} Save & Continue blocked — error markers detected fast (~1s).`);
-        const rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        // OPERATOR RULE: with AI fill OFF, do NOT auto-remediate — the deterministic Tier-1/1.6 re-fill
+        // is the unwanted "refill on error" (and, pre-M-overwrite, a duplicate-page vector). Skip
+        // remediation entirely and HALT on any error the deterministic pass couldn't clear; only a
+        // harmless re-click (a SWALLOWED Save & Continue, never a re-fill) is still attempted below. AI
+        // ON keeps the full AI-4 remediation ladder.
+        let rem = { attempts: 0, advanced: false, reason: "ai-off (no remediation — halt on error)", actions: [] };
+        if (act.aiEnabled) {
+          rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        } else {
+          LOG(`page ${page} nav-timeout with AI fill OFF — NOT re-filling the page (halt-on-error, operator rule). Only a re-click for a swallowed Save & Continue will be tried.`);
+        }
         // refresh the page-summary entry with the remediation outcome
         pagesFilled[pagesFilled.length - 1].remediation = { attempts: rem.attempts, advanced: !!rem.advanced, reason: rem.reason || null, actions: rem.actions };
         if (rem.sessionDead) {
@@ -3015,7 +3069,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
           continue;
         }
-        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        LOG(`⚠ nav-timeout on page ${page} — ${act.aiEnabled ? `AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason})` : "AI fill OFF (no re-fill — operator halt-on-error rule)"} ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }

@@ -564,6 +564,10 @@ const openAndReadDropdown = async (act, loc, budgets) => {
   const pre = await act.readDropdownState(loc);
   const before = pre ? pre.triggerText : null;
   let state = null, expanded = false;
+  // REUSE an already-open list (e.g. fillDropdownCdp left it open via keepOpenForCanonicalize so this
+  // canonicalize could pick up the same list) — clicking openDropdown again would TOGGLE it shut. If the
+  // pre-read shows it expanded with options, adopt it and skip the open ladder.
+  if (pre && pre.ariaExpanded === "true" && pre.optionCount > 0) { state = pre; expanded = true; }
   for (let attempt = 1; attempt <= budgets.openRetries && !expanded; attempt++) {
     if (attempt > 1) { await act.pressEscape(); await act.delay(budgets.reopenSettleMs); }
     if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
@@ -1058,7 +1062,7 @@ function overwriteBeatLadder(b, visible) {
 // The highlighted text MUST equal the matched target before Enter — never an
 // unverified commit. Coordinate option-click survives only as a last resort,
 // behind the same trigger-text verify gate.
-const fillDropdownCdp = async (act, loc, candidates, budgets) => {
+const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const norm = apMatch.normalize;
   const delayRender = act.delayRender || act.delayFull; // STAGE 2: option-settle + commit-persistence intervals, adaptive under the measured-fast gate (fallback for older fakes)
   const pre = await act.readDropdownState(loc);
@@ -1155,7 +1159,13 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
     // box sits over the degree list's "Associates"). Both the tier-keep and the genuine no-match
     // opened the list, so both must confirm it's gone (not a fire-and-return Escape).
-    await closeDropdownConfirmed(act, loc, budgets);
+    // EXCEPTION (opt-in, 2026-07-21): on the GENUINE no-match path (preTierIndex === -1), when the caller
+    // says an AI canonicalize will run IMMEDIATELY next (keepOpenForCanonicalize), LEAVE the list open so
+    // aiCanonicalizeField REUSES it instead of a redundant close→reopen (a canonicalized dropdown was
+    // being opened twice). Safe: the canonicalize runs right away and closes the list itself, so the next
+    // field still opens on a closed list. Every other return still close-confirms.
+    const leftOpen = !!opts.keepOpenForCanonicalize && preTierIndex === -1;
+    if (!leftOpen) await closeDropdownConfirmed(act, loc, budgets);
     // Overwrite-upgrade miss (preTierIndex>0): the dropdown offers NONE of the higher-priority
     // tiers → the pre-fill IS the best the form has → KEEP it (filled, not needs_review — it's a
     // valid lower-tier candidate). (Typeahead parity: prefilled-better-tier-unavailable.)
@@ -1174,7 +1184,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets) => {
     // The other needs_review/error returns (options-didn't-render / couldn't-open /
     // target-vanished / commit-didn't-take) are transient/infra failures, NOT invalid
     // data — they are NOT tagged, so deleteOnNoMatch keeps + surfaces them.
-    return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts, genuineNoMatch: true };
+    return { status: "needs_review", detail: "no candidate matched", after: before, options: enabledTexts, genuineNoMatch: true, leftOpen };
   }
   const target = enabledTexts[m.targetIndex];
   // Verify gate TIGHTENED (M28): exact-normalize ONLY — a substring trigger can't false-pass.
@@ -1434,6 +1444,34 @@ const fillCheckboxCdp = async (act, loc, want, budgets) => {
 //     settle trace, never a silent or false fill.
 // The listbox + searchBox self-unmount after a trusted commit (recon (f)) —
 // no close workaround needed.
+
+// Wait for a SERVER-FETCHED source tree's option list to actually LOAD before we type into it. A tree
+// tenant (Magna wd3) opens with an EMPTY, stable list (the categories/leaves are fetched async), so
+// awaitListStable is satisfied by the stable-EMPTY state and the candidate typing below would hit a false
+// "No matches found." ADAPTIVE: poll the CHEAP read (readTreeCategories) and return the INSTANT the tree
+// has content (categories or options) — no fixed wait (the ceiling is only a give-up bound). Re-open only
+// if the popup actually closed. One scroll-scrape backstop. Returns true if loaded. Only invoked for a
+// source tree (opts.sourceTree); flat/fast typeaheads never call it. LOCKSTEP with the aiTreeDrillFallback
+// enumeration poll.
+async function awaitSourceListLoaded(act, loc, budgets) {
+  const has = async () => {
+    try { if (act.readTreeCategories) { const c = await act.readTreeCategories(loc); if (Array.isArray(c) && c.length) return true; } } catch (e) {}
+    try { if (act.scrapeSourceRows) { const s = await act.scrapeSourceRows(loc); if (s && s.ok && s.options && s.options.length) return true; } } catch (e) {}
+    return false;
+  };
+  if (await has()) return true;
+  const waitFull = act.delayFull || act.delay || (async () => {});
+  const ceil = budgets.sourceCatLoadCeilingMs || 6000;
+  const pollMs = budgets.sourceCatPollMs || 150;
+  const t0 = Date.now();
+  while ((Date.now() - t0) < ceil) {
+    await waitFull(pollMs);
+    try { if (act.readTreeCategories) { const c = await act.readTreeCategories(loc); if (Array.isArray(c) && c.length) return true; } } catch (e) {} // CHEAP per-tick (no scroll-scrape)
+    try { const st = act.readHier ? await act.readHier(loc) : null; if (st && st.searchBox && !st.searchBox.visible && act.openHier) await act.openHier(loc); } catch (e) {} // re-open only if it closed
+  }
+  return await has(); // final check (incl. the scroll-scrape backstop)
+}
+
 const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   const norm = apMatch.normalize;
   const pre = await act.readHier(loc);
@@ -1554,6 +1592,11 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     //   • opts.onCapture — the pre-loop open+awaitListStable+scrape already rendered the list and left it open.
     if (ci === 0 && !opts.onCapture) {
       await awaitListStable(act, (l) => act.readHier(l), loc, budgets);
+      // Source TREE load gate: awaitListStable is satisfied by a stable-EMPTY list (Magna's categories are
+      // server-fetched LATE), so the candidate typing below would hit a false "No matches found" and the
+      // deterministic fallback would lose to the AI. Wait (adaptive) for the tree to actually LOAD first, so
+      // `type candidate → Enter` searches a populated tree (autocommit / pick the match). sourceTree only.
+      if (opts.sourceTree) await awaitSourceListLoaded(act, loc, budgets);
       if (!(await ensureSearchFocused())) {
         step.note = "could not re-focus after the open list rendered — not actuating blind";
         await act.pressTab(); // BLUR before leaving (lockstep with the focus-fail bail above)
@@ -2031,11 +2074,58 @@ const aiTreeDrillFallback = async (act, loc, aiCtx, budgets, preCats, candidates
   // (1) Categories: the Fix 2 START-scrape (`preCats`) if available, else scroll-enumerate the on-no-match
   //     fallback now (its category LABELS render as promptOptions → scrapeSourceRows returns them in `options`).
   let categories = (Array.isArray(preCats) && preCats.length) ? preCats.slice() : [];
+  let catSrc = categories.length ? "preCats" : "";
+  let scrapeDump = null;
   if (!categories.length) {
     await delayRender(budgets.commitIntervalMs); // let the no-match fallback list render (walk settled on the banner) — adaptive under the measured-fast gate (STAGE 3); the category scrape/drill/commit downstream is chip-gated
     let scan = null; try { scan = act.scrapeSourceRows ? await act.scrapeSourceRows(loc) : null; } catch (e) {}
+    scrapeDump = scan;
     categories = (scan && scan.ok && scan.options.length) ? scan.options : [];
+    if (categories.length) catSrc = "scrapeSourceRows";
   }
+  // Some tenants (Magna wd3) render the category rows as role="option"/treeitem nodes, NOT promptOptions,
+  // so scrapeSourceRows (promptOption-only) returns 0 and the drill would ABORT here — leaving a required
+  // source blank / flat-guessed (the "none of the drill happened" bug). readTreeCategories reads those
+  // role=option/treeitem rows too (chevron/aria heuristic), so fall back to it before giving up. This is
+  // what lets the category→click→recon-leaves→pick-leaf→commit drill actually run on a click-tree tenant.
+  let rtcDump = null;
+  if (!categories.length && act.readTreeCategories) {
+    try { const tc = await act.readTreeCategories(loc); rtcDump = tc; if (Array.isArray(tc) && tc.length) { categories = tc.slice(); catSrc = "readTreeCategories"; } } catch (e) { /* keep empty */ }
+  }
+  // GENEROUS LOAD POLL (operator-observed on Magna 2026-07-20): the popup opens but the category list is
+  // SERVER-FETCHED and arrives LATE — a quick re-open + 400ms scan races the fetch, so the drill saw 0.
+  // Poll on REAL wall-clock (delayFull — a server fetch is NOT affected by the tab-timer scaling, so the
+  // adaptive fast delay would under-wait) for the categories to appear, re-opening ONCE midway in case the
+  // first open didn't trigger the fetch. Bounded; if they never load the drill falls through to needs_review
+  // (an honest "options never loaded" — never a blind guess).
+  if (!categories.length && (act.readTreeCategories || act.scrapeSourceRows)) {
+    const waitFull = act.delayFull || delayRender;
+    const ceil = budgets.sourceCatLoadCeilingMs || 6000;
+    const pollMs = budgets.sourceCatPollMs || 150;
+    const t0 = Date.now();
+    // ADAPTIVE: poll ONLY the cheap read (readTreeCategories = a single DOM read of promptOption +
+    // role=option rows) on a TIGHT interval and PROCEED THE INSTANT the list appears — no fixed wait
+    // (`ceil` is only a give-up bound). Do NOT scroll-scrape (scrapeSourceRows) per tick; that scrolls
+    // the virtualized list every iteration and was the "way too slow." Re-open ONLY if the popup actually
+    // closed (searchBox gone) — never re-click an already-open one (toggle-shut). One scroll-scrape
+    // backstop AFTER the loop for a tenant readTreeCategories can't read.
+    while (!categories.length && (Date.now() - t0) < ceil) {
+      await waitFull(pollMs);
+      try { const tc = act.readTreeCategories ? await act.readTreeCategories(loc) : null; if (Array.isArray(tc) && tc.length) { categories = tc.slice(); catSrc = "readTreeCategories(poll)"; break; } } catch (e) {}
+      try { const st = act.readHier ? await act.readHier(loc) : null; if (st && st.searchBox && !st.searchBox.visible && act.openHier) await act.openHier(loc); } catch (e) {}
+    }
+    if (!categories.length && act.scrapeSourceRows) {
+      try { const scan = await act.scrapeSourceRows(loc); if (scan && scan.ok && scan.options.length) { categories = scan.options.slice(); catSrc = "scrapeSourceRows(poll-final)"; } } catch (e) {}
+    }
+  }
+  // DIAGNOSTIC (source-tree drill on a new/unverified tenant — trace the real DOM before assuming): show
+  // what each enumeration source returned, so a 0-category abort is debuggable from the SW console.
+  try {
+    console.log("[ApplyPilot][CDP-SRC-DRILL] categories=" + categories.length + " via " + (catSrc || "(none — cannot drill)") +
+      " | scrapeSourceRows=" + (scrapeDump ? (scrapeDump.ok ? scrapeDump.options.length + " opt, banner=" + JSON.stringify(scrapeDump.banner) : "FAILED") : "n/a") +
+      " | readTreeCategories=" + (rtcDump == null ? "n/a" : rtcDump.length) +
+      " | first: " + JSON.stringify(categories.slice(0, 8)));
+  } catch (e) {}
   if (!categories.length) return null; // no options visible → caller's needs_review (never guess blind)
 
   // PROMPT 1 — pick the CATEGORY (the one most likely to CONTAIN the applicant's stated answer, or — with no
@@ -2321,7 +2411,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           const aiForSource = act.aiEnabled
             ? { profile, jobContext, isRequired: f.isRequired, label: f.label, fieldName: f.fieldName, sourceTree: true }
             : undefined;
-          Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource }));
+          // sourceTree:true (independent of the AI toggle) → the deterministic candidate loop waits for the
+          // server-fetched tree to LOAD before typing, so the fallback (LinkedIn…) is tried by type→Enter
+          // FIRST; the AI drill only runs if no fallback candidate matches.
+          // NOTE: source is graded like any choice widget — an EXACT match (at ANY ladder position, so a
+          // later candidate winning because earlier ones aren't offered is fine) → `filled`, no review; a
+          // NON-EXACT deterministic match (containment/fuzzy) → `filled_review`, flagged (the "containment
+          // is a guess" rule holds for source too — operator 2026-07-20). No source-specific relaxation.
+          Object.assign(record, await fillTypeaheadCdp(act, loc, candidates, budgets, { ai: aiForSource, sourceTree: true }));
         }
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
@@ -3015,11 +3112,15 @@ async function deleteEmptyErrorRows(act, targets, budgets) {
       const emptyIdxs = [];
       for (let i = 0; i < s.entries.length; i++) {
         const fields = (s.entries[i] && s.entries[i].fields) || [];
-        const anyEmpty = t.fields.some((fm) => {
-          const fd = fm.labelRegex ? fields.find((x) => fm.labelRegex.test(x.label || "")) : fields.find((x) => x.fieldName === fm.field);
-          return fd && !hasLiveValue(fd.value);
-        });
-        if (anyEmpty) emptyIdxs.push(i);
+        // "A value-holding row is NEVER deleted" (the documented intent). Delete ONLY a row that is
+        // ENTIRELY empty — a true orphan the tenant left that blocks Save & Continue. A row that holds
+        // ANY value is KEPT even when an error-named required field is still empty (a field the profile
+        // lacked): the old `anyEmpty` check nuked the WHOLE entry on a single empty field, silently
+        // destroying the row's other data (the education bug — school + degree filled, one field missing
+        // → entry deleted + vanished from review). The empty required field instead stays flagged for
+        // review / the walk halts for the operator, never a silent data loss. (operator 2026-07-20)
+        const holdsValue = fields.some((fd) => hasLiveValue(fd.value));
+        if (!holdsValue) emptyIdxs.push(i);
       }
       for (const idx of emptyIdxs.slice().sort((a, b) => b - a)) {
         const before = await act.entryCount(t.containerPrefix);
@@ -3206,7 +3307,10 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           rec.resolved = arg;
           if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
-          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets));
+          // keepOpenForCanonicalize: when AI is on, a genuine no-match here is IMMEDIATELY followed by the
+          // canonicalize block below — so fillDropdownCdp leaves the list OPEN and aiCanonicalizeField reuses
+          // it (no redundant close→reopen; the canonicalize closes it). Off when AI can't canonicalize.
+          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets, { keepOpenForCanonicalize: !!(aiCtx && act.aiEnabled) }));
           else if (f.widget === "typeahead") {
             // Fix 2: start-of-fill option capture for EVERY section typeahead (was FoS-only). makeStartCapture
             // scrapes the full leaf list at the START for a FLAT field (FoS → rec.options for the summary
@@ -3230,6 +3334,39 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       }
     } catch (e) {
       rec.status = "error"; rec.detail = String(e);
+    }
+    // ── AI CANONICALIZE for a repeating-section DROPDOWN (Phase 1, plan-repeating-ai-and-delete-memory) ──
+    // A STATED profile value that didn't match the option vocab (e.g. degree "Bachelor of Science" vs a
+    // form that offers only "Bachelors") → reword it to the form's options. This maps a value the user
+    // PROVIDED (never a guess), gated on clearing the match ladder → filled_review, flag ai-canonicalized,
+    // so ONLY this field surfaces for review while the row's deterministic fields stay clean. Mirrors the
+    // flat loop's canonicalize + the repeating typeahead's inline AI (dropdowns had NONE before). AI OFF →
+    // untouched. (Required-empty INFER + the keep/delete-with-memory decision are Phase 2.)
+    if (aiCtx && act.aiEnabled && f.widget === "dropdown" && rec.resolved != null && rec.genuineNoMatch === true) {
+      const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired, widgetType: "dropdown", wrapperSel: fd.wrapperSel };
+      try {
+        const aiRes = await aiCanonicalizeField(act, loc, f2, rec.resolved, budgets);
+        if (aiRes) { Object.assign(rec, aiRes); if (aiRes.status === "filled_review" && isEeoField(f2)) rec.flag = "ai-eeo-guess"; }
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI dropdown canonicalize error: " + String((e && e.message) || e); }
+    }
+    // Defensive: if fillDropdownCdp left the list OPEN for a canonicalize that then did NOT run (no stated
+    // value / not eligible), close it here so a lingering open list can't stray the next field. The
+    // canonicalize path closes the list itself (commit / verified-blank), so `rec.flag` is set whenever it
+    // ran — this only fires on the unexpected no-canonicalize case.
+    if (rec.leftOpen === true && !rec.flag) { try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort */ } }
+    // ── Phase 2b: required-empty repeating DROPDOWN INFER ── a REQUIRED dropdown with no profile value is
+    // SKIPPED above; when AI is on, infer a pick from the profile (mirrors the flat loop's aiFillField +
+    // the required-empty typeahead block below). aiFillField commits its pick + a self-reported confidence;
+    // the entry-level disposition (driveRepeatingSectionCdp) then decides: a CONFIDENT ai-choice (High/Med)
+    // is RESOLVED → the entry is KEPT (only this field flags); a low-confidence / forced pick is UNCONFIDENT
+    // → a problem field → delete-with-memory (D2 — no low-confidence guess sticks on the form). AI OFF →
+    // stays skipped → problem field (→ halt for expected-data, or optional delete).
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && f.widget === "dropdown") {
+      const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: true, widgetType: "dropdown", wrapperSel: fd.wrapperSel };
+      try {
+        const aiRes = await aiFillField(act, loc, f2, aiCtx.profile, aiCtx.jobContext, budgets);
+        if (aiRes) { Object.assign(rec, aiRes); if (aiRes.status === "filled_review" && isEeoField(f2)) rec.flag = "ai-eeo-guess"; }
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI dropdown infer error: " + String((e && e.message) || e); }
     }
     // Required-EMPTY TYPEAHEAD AI fill (section analog of the flat-loop block): a REQUIRED section typeahead with
     // no profile value (e.g. an Education entry's fieldOfStudy) is SKIPPED above, but a blank required field BLOCKS
@@ -3548,7 +3685,7 @@ async function reconPageTruth(act, results) {
   const markRemoved = (r, why) => { r.status = "removed"; r.flag = "recon-removed"; r.detail = (r.detail ? r.detail + " | " : "") + why; };
   for (const r of results) {
     if (r.status === "removed" || r.widgetType === "section" || r.widgetType === "remediation" || r.widgetType === "file_upload") continue;
-    if (r.widgetType === "section_stub" || r.widgetType === "nested_section_stub") continue;
+    if (r.widgetType === "section_stub" || r.widgetType === "nested_section_stub" || r.widgetType === "removed_entry") continue;
     // nested (cert ▸ specialties): the probed auditLoc is the existence key (Tier-1.5 deletes rows)
     if (r.nested_child_base) {
       if (r.auditLoc && act.selExists) {
@@ -3694,6 +3831,40 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null, // hardcoded sub-section shapes → viewer shows them on an added-back parent
     nested_attachments: nestedHasAttachments || null                       // the section has a per-entry attach field → the viewer offers a file picker
   });
+  // Phase 2 (delete-with-memory): an entry we DELETED on the form (a required field couldn't be filled)
+  // but whose values + recon we REMEMBER so the review can offer add-back-with-prefill. Unlike the old
+  // bare "removed" sectionRec (widgetType "section" → dropped from the bundle), this SURVIVES into the
+  // bundle (widgetType "removed_entry" passes buildReviewBundle's filter) and carries `remembered_fields`
+  // (what filled, per field, + how) and `unfilled_fields` (why it was removed).
+  const shortName = (fn) => String(fn == null ? "" : fn).split(".").pop();
+  const makeRemovedEntry = (i, entryRecs, problemFields) => {
+    const remembered = (entryRecs || [])
+      .filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub" && r.widgetType !== "removed_entry")
+      .map((r) => ({
+        recName: shortName(r.fieldName), path: r.mappedPath ? shortName(r.mappedPath) : shortName(r.fieldName),
+        widget_type: r.widgetType, label: r.label, is_required: !!r.isRequired,
+        value: hasLiveValue(r.after) ? r.after : null,
+        filled_by: (r.flag && String(r.flag).indexOf("ai-") === 0) ? r.flag : (hasLiveValue(r.after) ? "deterministic" : "unfilled"),
+        match_tier: r.matchTier || null, options: r.options || null, date_order: r.date_order || null,
+      }));
+    // The fields the operator must SUPPLY or VERIFY on add-back: unfilled OR unconfidently-AI-filled.
+    const unfilled = (problemFields || []).map((r) => ({ recName: shortName(r.fieldName), label: r.label }));
+    const names = unfilled.map((u) => u.label || u.recName).filter(Boolean);
+    return {
+      fieldName: name + "[" + i + "].__removed", label: humanName + " entry " + (i + 1) + " — removed",
+      widgetType: "removed_entry", isRequired: false, mappedPath: name + "[" + i + "].__removed",
+      rawValue: null, resolved: null, status: "skipped", matchTier: null, confidence: null,
+      flag: "entry-removed-remembered", verified: null, after: null, section_known: true,
+      container_prefix: containerPrefix, section_field_shape: stubShape(),
+      nested_shapes: Object.keys(nestedShapes).length ? nestedShapes : null,
+      nested_attachments: nestedHasAttachments || null,
+      remembered_fields: remembered, unfilled_fields: unfilled,
+      detail: humanName + " entry removed — " + (names.length
+        ? "couldn't fill " + names.join(", ") + " (not in your profile / no option matched)"
+        : "a required field couldn't be filled")
+        + ". Add it back (the fields that filled are prefilled) and supply the missing one.",
+    };
+  };
   const humanChild = (s) => String(s).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
 
   // Poll the entry count off-loop until it moves in the wanted direction or a
@@ -3711,7 +3882,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const finalize = (url) => {
     const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
     const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
-    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub").length;
+    const repeatingFieldCount = results.filter((r) => r.widgetType !== "section" && r.widgetType !== "section_stub" && r.widgetType !== "removed_entry").length;
     return { url, repeatingFieldCount, results, counts, needsReview };
   };
 
@@ -3778,57 +3949,79 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.
-    const failedRequired = entryRecs.filter((r) => r.isRequired && r.status !== "filled" && r.status !== "filled_review");
-    const ok = failedRequired.length === 0;
-    // M38 Bug B1 — an entry is DELETABLE (deleteOnNoMatch) ONLY if EVERY failed required pick
-    // is a GENUINE no-match (options/leaves RENDERED, candidate genuinely absent → this value
-    // isn't offered). A transient/infra failure (dropdown didn't render / couldn't open / commit
-    // didn't take / typeahead focus-unconfirmable) is NOT invalid data → KEEP + surface
-    // (needs_review), NEVER silently destroy valid data (the live English/Chinese loss when the
-    // language dropdown failed to render deep in a long fold).
-    // Step 2.5 — an AI-rescued REQUIRED pick is KEPT only if it's CONFIDENT + genuinely represented
-    // (ai-choice, high/medium). Anything shakier — low-confidence, ai-closest-forced (forced a value the
-    // applicant didn't claim), ai-choice-other ("Other" fallback), ai-typeahead-decline, ai-commit-failed
-    // — is UNCONFIDENT: in a deleteOnNoMatch (optional) section a shaky entry is worse than none → DELETE
-    // it (operator rule). The AI is INLINE now (it already ran in fillEntryCdp), so there is no end-of-page
-    // defer (the old aiWillRescue). `deletable` is acted on ONLY by the deleteOnNoMatch sweep below, so a
-    // non-deletable section (education/FoS) keeps + flags regardless.
+    // Phase 2 (delete-with-memory) — per-entry disposition, per the LOCKED decision tree
+    // (docs/plan-repeating-ai-and-delete-remember.md). A required field is RESOLVED iff it committed a
+    // value (filled / filled_review) AND — if that value came from the AI — the AI was CONFIDENT
+    // (ai-choice, high/medium). A PROBLEM field is a required field that is NOT resolved: unfilled, OR
+    // filled only by an UNCONFIDENT AI pick (low-confidence / ai-closest-forced / "Other" fallback /
+    // commit-failed). These problem fields are exactly what the operator must supply/verify on add-back.
+    //   • no problem fields → KEEP (normal; a confident AI-filled field already flags itself).
+    //   • problem fields present:
+    //       - AI ON  → DELETE-WITH-MEMORY: delete the entry so the walk ADVANCES to review, but remember
+    //                  its values + recon and surface an add-back card (supersedes keep-and-halt, D4).
+    //       - AI OFF + deleteOnNoMatch (optional cert/language) + a GENUINE no-match → DELETE-WITH-MEMORY
+    //         (an optional entry the tenant doesn't offer is deterministically removable — never halt on it).
+    //       - otherwise (expected-data education/WE/websites, OR a transient/infra failure) → KEEP → the
+    //         unfilled required field makes Save & Continue fail → the walk HALTS (D1; Bug B1 = never
+    //         destroy valid data blind, so a transient failure is KEPT even in a deleteOnNoMatch section).
     const isAiRec = (r) => r.flag && String(r.flag).indexOf("ai-") === 0;
-    const aiConfidentKeep = (r) => r.flag === "ai-choice" && (r.confidence === "high" || r.confidence === "medium");
-    const aiUnconfident = entryRecs.some((r) => r.isRequired && isAiRec(r) && !aiConfidentKeep(r));
-    const deletable =
-      (failedRequired.length > 0 && failedRequired.every((r) => r.genuineNoMatch === true)) // deterministic genuine no-match (AI off / not eligible)
-      || aiUnconfident;                                                                       // an unconfident AI pick (optional section only — sweep-gated)
-    perEntry.push({ idx: i, recs: entryRecs, ok, deletable });
+    // A field the user PROVIDED a value for (rawValue) that the AI mapped to the form's vocab is a
+    // CANONICALIZATION, not a guess — the value is theirs, only the wording changed (e.g. profile "Bachelor
+    // of Science" → form "Bachelors"; "Electrical and Computer Engineering" → "Electrical Engineering").
+    // Treat it as HIGH confidence: this both fixes the review badge AND the keep decision — a provided-value
+    // map must NEVER be delete-with-memory'd over the AI's uncertain self-report about the WORDING. A
+    // `ai-canonicalized` (dropdown canonicalize) ALWAYS qualifies (it only runs on a stated value); an
+    // `ai-choice` qualifies only when the field HAD a stated value (else it's a pure inference). Still
+    // filled_review — flagged for a glance. (operator 2026-07-21)
+    const hadStatedValue = (r) => {
+      const v = r.rawValue;
+      if (v == null) return false;
+      return Array.isArray(v) ? v.some((x) => x != null && String(x).trim() !== "") : String(v).trim() !== "";
+    };
+    // `ai-choice` means GENUINELY REPRESENTED for a FLAT dropdown/typeahead (aiTypeaheadFallback commits
+    // ai-choice only when the AI's pick is a real option corresponding to the value — a FORCED nearest is
+    // `ai-closest-forced`). But the TREE drill (cert/source) flags BOTH represented and FORCED leaves
+    // `ai-choice` (matchTier "ai-source-tree"), leaning on confidence to tell them apart. So a provided-value
+    // MAP is: `ai-canonicalized` (dropdown canonicalize), OR a FLAT `ai-choice` on a field the user gave a
+    // value for (matchTier ≠ "ai-source-tree"). A TREE `ai-choice` stays confidence-gated so a low-confidence
+    // FORCED cert/source leaf still delete-with-memory's.
+    const isProvidedValueMap = (r) =>
+      r.flag === "ai-canonicalized" ||
+      (r.flag === "ai-choice" && r.matchTier !== "ai-source-tree" && hadStatedValue(r));
+    for (const r of entryRecs) if (isProvidedValueMap(r) && r.confidence !== "high") r.confidence = "high";
+    const aiConfidentKeep = (r) => isProvidedValueMap(r) || (r.flag === "ai-choice" && (r.confidence === "high" || r.confidence === "medium"));
+    const isResolved = (r) => (r.status === "filled" || r.status === "filled_review") && !(isAiRec(r) && !aiConfidentKeep(r));
+    const problemFields = entryRecs.filter((r) => r.isRequired && !isResolved(r));
+    const genuineOptionalMiss = deleteOnNoMatch && problemFields.length > 0 && problemFields.every((r) => r.genuineNoMatch === true);
+    let disposition = "keep";
+    if (problemFields.length > 0) {
+      if (act.aiEnabled) disposition = "delete_memory";            // AI couldn't confidently resolve → delete + remember
+      else if (genuineOptionalMiss) disposition = "delete_memory"; // AI off, optional genuine no-match → deterministic removal
+      else disposition = "keep";                                   // AI off, expected-data / transient → keep → walk halts
+    }
+    perEntry.push({ idx: i, recs: entryRecs, problemFields, disposition });
   }
 
-  // delete-on-no-match (optional pick-sections: Languages/Certs) — an entry whose REQUIRED
-  // pick GENUINELY didn't match (the value isn't offered) would block Next, so delete it.
-  // Sweep high→low so lower indices stay valid. OFF for Websites (text always fills if present).
-  // A transient/infra pick failure is NOT deletable (kept + surfaced — Bug B1).
-  if (deleteOnNoMatch) {
-    await captureDetectedShape(); // BEFORE deleting — so an emptied section's stub keeps the recon'd date_order (segmented date editor, not a text box)
-    let removed = 0;
+  // Phase 2 DELETE-WITH-MEMORY sweep — delete each entry whose disposition is `delete_memory`, but keep
+  // its data alive: replace its recs with a `removed_entry` record carrying `remembered_fields` (what
+  // filled, per field, + how) and `unfilled_fields` (why it was removed), so the review shows an
+  // add-back-with-prefill card instead of the value silently vanishing. Runs for ALL sections now (the
+  // per-entry disposition already encodes the AI-on/off + optional/expected split — was deleteOnNoMatch-
+  // only). Sweep high→low so lower indices stay valid. A delete that doesn't take (can't click) leaves
+  // the entry's field recs as-is (still surfaces).
+  if (perEntry.some((e) => e.disposition === "delete_memory")) {
+    await captureDetectedShape(); // BEFORE deleting — the removed_entry's shape keeps the recon'd date_order
     for (let k = perEntry.length - 1; k >= 0; k--) {
-      if (!perEntry[k].deletable) continue; // ok entries AND transient-fail entries are KEPT
+      if (perEntry[k].disposition !== "delete_memory") continue;
       const before = await act.entryCount(containerPrefix);
       const clicked = await act.clickDeleteEntry(containerPrefix, perEntry[k].idx);
-      if (!clicked || !clicked.ok) continue; // can't delete — leave it (surfaces in review)
+      if (!clicked || !clicked.ok) continue;
       const after = await pollCount(before, false);
       if (after < before) {
-        removed++;
         perEntry[k].wasDeleted = true; // so the nested emit below skips this entry's sub-sections
-        perEntry[k].recs = [sectionRec("[" + perEntry[k].idx + "].removed", name + " entry removed",
-          "skipped", "a required pick didn't match an option → entry deleted (optional section)")];
+        perEntry[k].recs = [makeRemovedEntry(perEntry[k].idx, perEntry[k].recs, perEntry[k].problemFields)];
       }
       await act.delay(budgets.interFieldMs);
-    }
-    // If deletion EMPTIED the section, it would VANISH from review (the removed recs are widgetType
-    // "section" → filtered out of the bundle). Keep the CATEGORY visible + addable, with a "removed —
-    // no match" note, so the operator can still add/verify (the recon's field shape rides the stub).
-    if (removed > 0 && (await act.entryCount(containerPrefix)) === 0) {
-      results.push(makeSectionStub(humanName + " — no entries (removed)",
-        removed + " entr" + (removed === 1 ? "y was" : "ies were") + " removed — no option matched what you entered. Add or verify here."));
     }
   }
 
@@ -4127,7 +4320,7 @@ async function replayField(act, entry, budgets) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const widget = entry && entry.widget_type;
   if (!entry || !widget || widget === "section") return { status: "skipped", detail: "no widget / section op (not replayable)" };
-  if (widget === "section_stub" || widget === "nested_section_stub") return { status: "skipped", flag: "replay-stub-skip", detail: "section stub — a display-only add-entry card, not a fillable field" };
+  if (widget === "section_stub" || widget === "nested_section_stub" || widget === "removed_entry") return { status: "skipped", flag: "replay-stub-skip", detail: "section stub / removed-entry card — display-only, not a fillable field (an added-back entry replays as real fields, not via this record)" };
   if (entry.is_deleted) return { status: "skipped", flag: "replay-deleted", detail: "deleted entry — dropped by the section reconcile, not replayed" };
   if (isRepeatingEntry(entry)) return { status: "skipped", flag: "replay-repeating-deferred", detail: "repeating-section field — replayed positionally by the section reconcile (M3), not by a recorded selector" };
   if (widget === "file_upload") return { status: "skipped", flag: "replay-file-deferred", detail: "résumé re-attach handled by the SW attachResumeForPage step, not replayField" };
@@ -4138,11 +4331,22 @@ async function replayField(act, entry, budgets) {
   const value = entry.current_value;
   const cleared = entry.edit_kind === "cleared" || value == null || value === "";
 
-  // CLEARED (human emptied it): leave blank. A fresh submit form starts blank, so this is a
-  // verify-blank, not a destructive clear (choice widgets default to their placeholder).
+  // CLEARED (human emptied it, or the approved value is empty): leave blank. A fresh submit form starts
+  // blank, so this is a verify-blank, not a destructive clear (choice widgets default to their placeholder).
   if (cleared) {
     if (widget === "text" || widget === "textarea") {
-      return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, widget === "textarea" ? "textarea" : "input"));
+      // Only ACTUATE if the field actually HAS content to clear. An empty approved value on an
+      // already-blank field is nothing to do — and focusing a not-yet-laid-out OPTIONAL input (e.g. a
+      // phone "extension" during a slow page transition) would fail and HALT the whole walk for no
+      // reason. An unreadable field (no rect yet) is treated as blank → skip, never a fatal focus error.
+      const tag = widget === "textarea" ? "textarea" : "input";
+      let live = null;
+      try { live = await act.readTextValue(loc, tag); } catch (e) { /* unreadable → treat as blank */ }
+      const liveVal = live && live.value != null ? String(live.value) : ""; // readTextValue → {value,…} | null
+      if (liveVal.trim() === "") {
+        return { status: "skipped", replay: "cleared", detail: "already blank — nothing to clear" };
+      }
+      return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, tag));
     }
     return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
   }
@@ -4233,7 +4437,11 @@ function bundleToSectionItems(entries, section) {
   const pathToFm = {}; for (const m of (section.fieldMap || [])) pathToFm[m.path] = m;
   const byIdx = new Map(); const order = [];
   for (const e of (entries || [])) {
-    if (!e || e.is_deleted) continue;
+    // Skip soft-deleted entries AND Phase-2 `removed_entry` cards left un-added-back — the latter's
+    // canonical is "<name>[i].__removed", which matches the index regex and would otherwise create an
+    // EMPTY item → the replay would re-create a blank entry. A LEFT-removed entry must stay deleted; an
+    // ADDED-BACK entry is real field records (degree/school/…), which reconstruct normally below.
+    if (!e || e.is_deleted || e.widget_type === "removed_entry") continue;
     const m = String(e.canonical_field || "").match(re);
     if (!m) continue;
     const i = +m[1], rest = m[2];
@@ -4593,11 +4801,15 @@ const ACCEPTED_SCHEMA_VERSIONS = ["1.0", "1.1"]; // M4 submit gate accepts these
 
 // isTransientRenderFailure — are ALL these failing records TRANSIENT render-flakes (retryable via a page
 // RELOAD) rather than terminal (a genuine no-match / real error / session death, which must halt)? The
-// flake: a choice widget whose option list never rendered ("options did not render" /
-// "skipped_no_option_match" — a Workday render race a reload clears; live-seen on Magna page-2 language
-// proficiencies). Returns false when there are NO failures, or when ANY failure is terminal — so a reload
-// can NEVER mask a real problem. Used by both walks' bounded reload-retry (operator ask 2026-07-11). PURE.
-const RENDER_FLAKE_RX = /options did not render|skipped_no_option_match/i;
+// flake: a control that never LAID OUT before it was actuated — a choice widget whose option list never
+// rendered ("options did not render" / "skipped_no_option_match"), OR a text/typeahead whose wrapper's
+// input never mounted ("no input/textarea in wrapper" / "typeahead wrapper not found"). All are the SAME
+// Workday render/hydration race (live-seen on Magna page-2 language proficiencies AND the replay page-2
+// Country-cascade block: region/phone/postal appear ~5.6s after Country commits, past the per-field poll)
+// — a reload returns to a FRESH page where the server re-renders cleanly. Returns false when there are NO
+// failures, or when ANY failure is terminal (a genuine no-match / "value not offered") — so a reload can
+// NEVER mask a real problem. Used by both walks' bounded reload-retry (operator ask 2026-07-11). PURE.
+const RENDER_FLAKE_RX = /options did not render|skipped_no_option_match|no (input|textarea) in wrapper|typeahead wrapper not found/i;
 function isTransientRenderFailure(records) {
   const fails = (records || []).filter((r) => r && (r.status === "needs_review" || r.status === "error"));
   if (!fails.length) return false;
@@ -4901,10 +5113,24 @@ function buildReviewBundle(results, meta) {
     return { confidence: band, confidence_source: source };
   };
   const deriveReview = (rec) => {
-    // SECTION STUB (Feature A): a present-but-empty repeating section → a gentle review item so the
-    // operator can see it / add an entry. Handled BEFORE the flagged-base guard (its status is
-    // "skipped", which would otherwise early-return needs_review:false).
-    if (rec.flag === "section-stub") return { needs_review: true, needs_review_reason: "section_unfilled" };
+    // SECTION STUB (Feature A): a present-but-empty repeating section still APPEARS in review (ALL
+    // FIELDS) so the operator can add an entry — but whether it NAGS (needs_review) depends on whether
+    // the profile models it. A KNOWN, profile-defined section (cert / languages / work-experience /
+    // education / websites — `section_known:true`) left empty is the USER'S OWN CHOICE, not a gap → no
+    // review. Only an UNKNOWN section (a tenant repeating section the profile doesn't model,
+    // `section_known:false`) is a genuine gap the operator must decide on → review. (operator rule
+    // 2026-07-20: "having no values is fine since they're in the profile; if a repeating section NOT in
+    // the profile is on the page it should be review". A required-but-empty KNOWN section still blocks
+    // Save & Continue → the walk halts at nav-timeout, so skipping the review flag never hides a blocker.)
+    // Handled BEFORE the flagged-base guard (its status is "skipped", which would early-return false).
+    // Phase 2 delete-with-memory: an entry DELETED on the form (a required field couldn't be filled) but
+    // whose values + recon we REMEMBERED → ALWAYS a review item (the operator adds it back + supplies the
+    // missing field). Its status is "skipped", so it must be caught before the flagged-base guard too.
+    if (rec.flag === "entry-removed-remembered") return { needs_review: true, needs_review_reason: "entry_removed" };
+    if (rec.flag === "section-stub") {
+      if (rec.section_known === true) return { needs_review: false, needs_review_reason: null };
+      return { needs_review: true, needs_review_reason: "section_unfilled" };
+    }
     if (rec.flag === "already-filled") { // a field already on the form — bot didn't fill it (unknown section OR the page-wide sweep)
       if (rec.status === "skipped") return { needs_review: false, needs_review_reason: null }; // OPTIONAL + empty → fine to leave, no approval needed
       return { needs_review: true, needs_review_reason: "already_on_form" }; // has a value (verify) OR required + empty (needs a value)
@@ -4992,6 +5218,8 @@ function buildReviewBundle(results, meta) {
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
+      remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them
+      unfilled_fields: Array.isArray(rec.unfilled_fields) ? rec.unfilled_fields : null,       // Phase 2: removed_entry → the required field(s) that couldn't fill (why it was removed)
       container_prefix: rec.container_prefix != null ? rec.container_prefix : null, // m3a: backend identifier (fkit prefix) for a future fill-back session
       section_heading: rec.section_heading != null ? rec.section_heading : null,    // m3a: section heading / Add anchor
       section_known: rec.section_known != null ? !!rec.section_known : null,        // m3a: false = unmapped/unknown section
@@ -5017,17 +5245,44 @@ function buildReviewBundle(results, meta) {
   }, summarizeEntries(entries), { entries });
 }
 
+// Two `cdpPageKey`s (pathname + "|" + sorted field-name set) refer to the SAME physical page when
+// they share the pathname AND their field-name sets OVERLAP. This is what makes a re-fill OVERWRITE
+// instead of stacking a duplicate: filling one page twice can yield DIFFERENT keys when the field-set
+// shifted between fills (e.g. a cascade-revealed field — country→state/phone — persisted, so the 2nd
+// pre-fill scan sees it and the 1st didn't). Same-pathname SPA pages that are genuinely DIFFERENT have
+// DISJOINT field-sets (the M31 discriminator), so they never overlap → they stay separate. A plain
+// (field-less) key like a page-engine "P1" only matches itself (the `a === b` fast path). PURE.
+function samePhysicalPage(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  const split = (k) => {
+    const s = String(k);
+    const i = s.indexOf("|");
+    return i < 0 ? { path: s, fields: [] } : { path: s.slice(0, i), fields: s.slice(i + 1).split(",").filter(Boolean) };
+  };
+  const A = split(a), B = split(b);
+  if (A.path !== B.path) return false;
+  if (!A.fields.length || !B.fields.length) return false; // field-less key ⇒ only its exact self (a===b above)
+  const setB = new Set(B.fields);
+  let overlap = 0;
+  for (const f of A.fields) if (setB.has(f)) overlap++;
+  // same page if a meaningful fraction of the SMALLER field-set overlaps (a cascade adds/removes a few
+  // fields but keeps most; two different pages share ~none).
+  return overlap > 0 && overlap >= Math.min(A.fields.length, B.fields.length) * 0.5;
+}
+
 // Accumulate a page bundle into the prior entries — WRITE-PER-PAGE (the M15 decision).
-// Drop the prior entries for THIS page (by `entry.page`), KEEP all OTHER pages' entries
-// VERBATIM (a viewer EDIT on a prior page survives the next page's persist — NOT a
-// rebuild), append this page's, recompute the envelope. PURE — the SW does the I/O.
+// Drop the prior entries for THIS physical page (by `samePhysicalPage`, NOT exact key — so a re-fill
+// whose field-set shifted still OVERWRITES rather than duplicating), KEEP all OTHER pages' entries
+// VERBATIM (a viewer EDIT on a prior page survives the next page's persist — NOT a rebuild), append
+// this page's, recompute the envelope. PURE — the SW does the I/O.
 function accumulateBundle(priorEntries, pageBundle) {
   const pageKey = pageBundle.page;
   // Keep OTHER pages verbatim (edits intact) AND this page's OPERATOR-ADDED entries (2b — they
   // aren't in the engine's freshly-built page bundle, so a re-fill would otherwise drop them; the
   // future section-reconcile CREATEs them on the form). Their index sits beyond the fresh fill's
   // (nextIndexFor = max+1 at add time), so no collision with the rebuilt entries.
-  const kept = (priorEntries || []).filter((e) => e.page !== pageKey || e.is_added);
+  const kept = (priorEntries || []).filter((e) => !samePhysicalPage(e.page, pageKey) || e.is_added);
   const entries = kept.concat(pageBundle.entries || []);
   const pages = Array.from(new Set(entries.map((e) => e.page).filter((p) => p != null))).sort();
   return Object.assign({
@@ -5042,5 +5297,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
