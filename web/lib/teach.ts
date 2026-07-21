@@ -64,10 +64,22 @@ export function wasManuallyEdited(e: ReviewEntry): boolean {
  *     submit concern, not a teach one). The teach popup is its own confirm gate.
  *  A clean, untouched deterministic fill (needs_review=false, not edited) is skipped — already known.
  *  Must be bucket-eligible with a real question + a non-empty value. */
+/** A repeating / nested SECTION field (education[0].degree, certification[1].specialties[0].x). Its answer
+ *  is PER-ENTRY structured profile data filled by the section machinery, which does NOT consult buckets — so
+ *  it is NOT a label→answer teach candidate (a "Degree" bucket would never fire on a repeating fill and would
+ *  wrongly apply ONE value to EVERY entry). This also implements the operator's Phase-4 rule: for a
+ *  delete-with-memory add-back, the deterministically-filled fields (school/degree) don't teach; and the
+ *  AI/manually-supplied field isn't bucket-taught either — a repeating answer is learned by editing the
+ *  profile's LIST (the profile page), not by a bucket. */
+function isRepeatingSectionField(e: ReviewEntry): boolean {
+  return /\[\d+\]\./.test(String(e.canonical_field || "")) || /\[\d+\]\./.test(String(e.field_id || ""));
+}
+
 function isTeachable(e: ReviewEntry): boolean {
   const edited = wasManuallyEdited(e);
   return (
     !e.is_deleted &&
+    !isRepeatingSectionField(e) && // per-entry structured data → learned by editing the profile list, not a bucket
     (edited || (!!e.is_approved && !!e.needs_review)) &&
     isBucketEligibleWidget(e.widget_type) &&
     !!e.question_label &&
