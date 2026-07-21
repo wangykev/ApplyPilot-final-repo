@@ -751,13 +751,24 @@ CDP fill/replay fixes, each root-caused by a read-only trace (never guessed):
   relaxation was tried + REVERTED: a deterministic NON-EXACT source match stays `filled_review`/flagged like
   any choice widget; an EXACT match — at any ladder position — is already `filled`, no special-casing.)
 
+- **AI-4 remediation deleted PARTIAL repeating entries (the education data-loss bug).** `deleteEmptyErrorRows`
+  (Tier 1.5 — deletes error-named repeating rows to clear a Save & Continue error) gated deletion on
+  `anyEmpty`: if ANY error-named field in a row was empty, it deleted the WHOLE row. So an education entry
+  with school + degree FILLED but one field EMPTY (not in the profile) got NUKED — and the removed row is
+  filtered from the bundle, so it VANISHED from review. This contradicted the documented intent ("a
+  value-holding row is never deleted"). Fixed: delete ONLY a row that is ENTIRELY empty (`holdsValue` false —
+  a true orphan the tenant left that blocks Save); a row holding ANY value is KEPT even with an empty
+  required field — that field surfaces for review / the walk halts, never a silent data loss. Single-field
+  rows behave identically (unit-pinned); a new test pins that a multi-field partial row survives while an
+  entirely-empty orphan is still deleted. (operator 2026-07-20)
+
 (The extension keeps MIRRORING the website's AI toggle via `AP_SET_LLM` — the website's own enable
 toggle is the single opt-in; an earlier extension-side auto-opt-in was reverted as redundant.)
 
-Verified: extension suite (minus `db`, uninstalled dep) **608/608** incl. new `samePhysicalPage`,
+Verified: extension suite (minus `db`, uninstalled dep) **609/609** incl. new `samePhysicalPage`,
 `accumulateBundle`-overwrite, broadened `isTransientRenderFailure`, `awaitSourceListLoaded`
-load/give-up, section-stub known-vs-unknown, and source non-exact-stays-flagged / later-ladder-exact-
-not-flagged tests. The source category-load timing + deterministic-before-AI ladder is **LIVE-VERIFIED
+load/give-up, section-stub known-vs-unknown, source non-exact-stays-flagged / later-ladder-exact-
+not-flagged, and `deleteEmptyErrorRows` keep-value-holding-partial-row tests. The source category-load timing + deterministic-before-AI ladder is **LIVE-VERIFIED
 on Magna** (fills LinkedIn deterministically once the tree loads). **Live-verify PENDING** (eyes-on,
 disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a real
 Workday page.

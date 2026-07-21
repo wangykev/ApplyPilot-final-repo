@@ -3102,11 +3102,15 @@ async function deleteEmptyErrorRows(act, targets, budgets) {
       const emptyIdxs = [];
       for (let i = 0; i < s.entries.length; i++) {
         const fields = (s.entries[i] && s.entries[i].fields) || [];
-        const anyEmpty = t.fields.some((fm) => {
-          const fd = fm.labelRegex ? fields.find((x) => fm.labelRegex.test(x.label || "")) : fields.find((x) => x.fieldName === fm.field);
-          return fd && !hasLiveValue(fd.value);
-        });
-        if (anyEmpty) emptyIdxs.push(i);
+        // "A value-holding row is NEVER deleted" (the documented intent). Delete ONLY a row that is
+        // ENTIRELY empty — a true orphan the tenant left that blocks Save & Continue. A row that holds
+        // ANY value is KEPT even when an error-named required field is still empty (a field the profile
+        // lacked): the old `anyEmpty` check nuked the WHOLE entry on a single empty field, silently
+        // destroying the row's other data (the education bug — school + degree filled, one field missing
+        // → entry deleted + vanished from review). The empty required field instead stays flagged for
+        // review / the walk halts for the operator, never a silent data loss. (operator 2026-07-20)
+        const holdsValue = fields.some((fd) => hasLiveValue(fd.value));
+        if (!holdsValue) emptyIdxs.push(i);
       }
       for (const idx of emptyIdxs.slice().sort((a, b) => b - a)) {
         const before = await act.entryCount(t.containerPrefix);

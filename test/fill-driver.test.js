@@ -3478,6 +3478,38 @@ test("AI-4 deleteEmptyErrorRows: top-level — deletes ONLY entries whose named 
   assert.deepStrictEqual(del.deleted, [{ section: "language", kind: "entry", index: 1 }]);
 });
 
+test("AI-4 deleteEmptyErrorRows: a VALUE-HOLDING row with ONE empty required field is KEPT — never nuke partial data (the education bug)", async () => {
+  // Education entry: school + degree FILLED, Field of Study EMPTY (not in the profile), and the Save &
+  // Continue error names "Field of Study". The OLD `anyEmpty` check deleted the WHOLE entry (losing
+  // school + degree, and it vanished from review). Now a row that holds ANY value is KEPT — only a truly
+  // ENTIRELY-empty orphan row is deleted. The missing required field surfaces for review / halts instead.
+  let entries = [
+    { fields: [
+      { fieldName: "schoolName", label: "School*", value: "Carnegie Mellon University" },
+      { fieldName: "degree", label: "Degree*", value: "Bachelor of Science" },
+      { fieldName: "fieldOfStudy", label: "Field of Study*", value: null }, // not in profile → empty
+    ] },
+    { fields: [ // a genuinely-empty orphan row → still deleted (it blocks Save and holds nothing)
+      { fieldName: "schoolName", label: "School*", value: null },
+      { fieldName: "degree", label: "Degree*", value: null },
+      { fieldName: "fieldOfStudy", label: "Field of Study*", value: null },
+    ] },
+  ];
+  const deleteLog = [];
+  const act = {
+    delay: async () => {},
+    repeatingScan: async () => ({ sections: { "education-": { entries } } }),
+    entryCount: async () => entries.length,
+    clickDeleteEntry: async (prefix, idx) => { deleteLog.push(idx); entries = entries.filter((_, i) => i !== idx); return { ok: true }; },
+  };
+  const targets = [{ kind: "entry", section: "education", containerPrefix: "education-", fields: [{ field: "fieldOfStudy" }] }];
+  const del = await deleteEmptyErrorRows(act, targets, T_BUDGETS);
+  assert.deepStrictEqual(deleteLog, [1], "ONLY the entirely-empty orphan row deleted; the partial (value-holding) education entry KEPT");
+  assert.strictEqual(entries.length, 1);
+  assert.strictEqual(entries[0].fields[0].value, "Carnegie Mellon University", "the partial education entry (school + degree) survives");
+  assert.deepStrictEqual(del.deleted, [{ section: "education", kind: "entry", index: 1 }]);
+});
+
 test("AI-4 deleteEmptyErrorRows: nested — deletes ONLY the EMPTY layer-2 row; the parent cert entry is NEVER deleted", async () => {
   let kids = [5, 9]; // child 5 filled ("Other"), child 9 empty — the manually-added blocking row
   const chipBySel = { "SEL-5": ["Other"], "SEL-9": [] };
