@@ -128,13 +128,53 @@ A KEPT entry with AI-filled fields uses the normal per-field records; only the A
 4. **Teach — per-field scoping** (PR #18).
 5. **Replay** (PR #19): `bundleToSectionItems` handles the added-back entry.
 
-## Open decisions (need operator confirmation)
+## Resolved decisions (operator, 2026-07-20)
 
-- **D1 — AI-off + required repeating field unfillable:** delete-with-memory (advance + surface) vs
-  halt. Proposal: **delete-with-memory** (repeating rows are re-addable; halting is worse UX).
-- **D2 — Low-confidence inference on a required repeating field:** force a guess (flat-field style)
-  vs delete-with-memory. Proposal: **delete-with-memory** (no junk value on the form).
-- **D3 — deleteOnNoMatch sections (cert/language):** route through the SAME AI-first-then-delete-
-  remember logic (unify) vs keep their current fill-time delete. Proposal: **unify.**
-- **D4 — Does the recent "keep value-holding row + halt" Tier-1.5 fix get superseded?** Proposal:
-  **yes** — the fill-time delete-with-memory replaces it; Tier-1.5's role shrinks to true orphans.
+- **D1 = HALT.** AI OFF + a required repeating field can't be filled deterministically → **halt the
+  walk** (don't auto-delete to advance). Conservative-when-AI-off, matching the standing rule.
+- **D2 = DELETE-WITH-MEMORY.** AI ON + a required field only inferable at LOW confidence → do NOT
+  force a junk guess; delete the entry + remember + surface for add-back.
+- **D3 = UNIFY.** Cert/Language route through the same AI-first-then-delete-remember flow.
+- **D4 = SUPERSEDE.** Fill-time delete-with-memory replaces the "keep value-holding row + halt"
+  Tier-1.5 fix; Tier-1.5 remediation shrinks to deleting only true empty orphans.
+
+## Resolved decision tree (per repeating entry, at fill time)
+
+```
+Fill all fields deterministically.
+
+IF AI is ON:
+    for each still-missing field:
+        stated value that didn't match  → AI CANONICALIZE (reword; clears the ladder → fill, flag ai-canonicalized)
+        required + no profile value      → AI INFER (High/Med conf + clears the ladder → fill, flag ai-choice)
+    → every REQUIRED field now filled     → KEEP the entry; flag ONLY the AI-filled fields.
+    → a REQUIRED field still unfillable    → DELETE-WITH-MEMORY (delete entry, remember values + recon,
+       (AI declined / LOW conf [D2] / no basis)   surface "removed — add back (prefilled)" in review).
+
+IF AI is OFF:
+    → every REQUIRED field filled deterministically → KEEP (normal).
+    → a REQUIRED field unfilled:
+         • OPTIONAL pick-section (cert / language, deleteOnNoMatch) AND a GENUINE no-match
+           (the value the profile HAS simply isn't offered by this tenant) → this is a DETERMINISTIC
+           resolution ("the optional entry can't exist here"), so DELETE-WITH-MEMORY + surface — do
+           NOT halt on an optional entry. [operator-confirmed 2026-07-20]
+         • otherwise (education / work-experience / websites — data you HAVE that must be filled, or
+           an optional entry that merely wasn't ATTEMPTED) → HALT the walk. [D1]
+
+Whole row empty (no field filled, no profile data) → delete, do NOT surface (true orphan).
+```
+
+DESIGN LOCKED (2026-07-20): every branch above is operator-confirmed. AI-OFF × cert/language resolved
+to **delete-with-memory** — never halt on an optional entry; HALT is reserved for expected-data
+sections (education / work-experience / websites).
+
+## Build order (implementation, all under the locked design)
+
+1. **Extension AI for repeating fields** (PR #19) — `fillEntryCdp`: canonicalize a stated-no-match
+   DROPDOWN value; infer a required-empty DROPDOWN (mirroring the typeahead paths). Flag AI fields.
+2. **Extension delete-with-memory** (PR #19) — the unified entry-level decision in
+   `driveRepeatingSectionCdp`: keep (flag AI) / delete-with-memory / halt, per the tree. Emit the
+   `removed_entry` record with `remembered_fields` + recon. `buildReviewBundle`/`deriveReview` handle it.
+3. **Website add-back-with-prefill** (PR #18) — the `removed_entry` card + reconstruct-on-add.
+4. **Teach per-field scoping** (PR #18).
+5. **Replay** (PR #19) — `bundleToSectionItems` reconstructs an added-back entry.
