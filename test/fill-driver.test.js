@@ -4204,9 +4204,11 @@ test("repeating delete-on-no-match: EMPTYING the section keeps the CATEGORY as a
   assert.match(stub.detail, /no option matched/i);
   // ...and it must SURVIVE into the bundle (the "appear in review" requirement): the section_stub
   // passes buildReviewBundle's filter while the "removed" recs (widgetType "section") are dropped.
+  assert.strictEqual(stub.section_known, true, "cert is a KNOWN, profile-defined section");
   const entries = buildReviewBundle(out.results, {}).entries;
-  assert.ok(entries.some((e) => e.widget_type === "section_stub" && /certification/.test(e.field_id || "")),
-    "the section_stub reaches the bundle → shows on the review page");
+  const stubEntry = entries.find((e) => e.widget_type === "section_stub" && /certification/.test(e.field_id || ""));
+  assert.ok(stubEntry, "the section_stub reaches the bundle → shows on the review page");
+  assert.strictEqual(stubEntry.needs_review, false, "a KNOWN empty section shows in ALL FIELDS but does NOT nag for review (operator 2026-07-20)");
   assert.ok(!entries.some((e) => /\.removed$/.test(e.field_id || "")), "the raw 'removed' ops do NOT show");
 });
 
