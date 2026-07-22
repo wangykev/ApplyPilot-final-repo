@@ -8,7 +8,7 @@ A Manifest V3 Chrome extension that automates Workday job applications from a st
 
 ## Architecture & invariants
 
-- Manifest V3; host permissions `*://*.myworkdayjobs.com/*`.
+- Manifest V3; host permissions `*://*.myworkdayjobs.com/*` **and `*://*.myworkdaysite.com/*`** (the logged-in Workday host — needed so the website-Run JD scrape's `chrome.scripting.executeScript` can read the page; the CDP walk works there regardless since `chrome.debugger` isn't host-gated).
 - **Active-tab injection — NOT a content script, NOT a background tab.** `background.js` (service worker) receives a `RUN_FILL` message from the popup and uses `chrome.scripting.executeScript` to inject `fillEngine` into the active tab (frame 0). *Why:* the operator is logged in and on the form themselves, so injecting into the active tab fills the page they're looking at. Content-script files and background-tab/multi-page automation were deliberately deferred — not needed for active-tab fill.
 - **Profile + defaults + jobContext live in `chrome.storage.local`** — the permanent website→extension handoff contract. The engine ALWAYS reads them from storage (today the popup's "Load default profile" seeds `profile` from `data/profile.json` and `defaults` from `data/application_defaults.json`; `jobContext.company` is set via a popup field; later a website will write them). The engine is agnostic to how they got there.
 - **"Engine computes / service worker does I/O."** The injected `fillEngine` is self-contained (closes over nothing from the SW), reads/writes the page DOM, and RETURNS results — it never touches `chrome.storage`. `background.js` does all storage I/O (e.g. persisting the review summary). Keep this boundary.
