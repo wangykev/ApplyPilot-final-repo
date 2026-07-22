@@ -80,6 +80,15 @@ handoff contract).
 | `AP_SYNC_RESUME` | store the resume | IndexedDB via `saveResume({filename,mime,size,base64,savedAt})` |
 | `AP_SET_SESSION` | reporting + review-pull credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey, reviewUrl }` |
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
+| `AP_CLEAR_RESUME` | remove the stored resume (inverse of `AP_SYNC_RESUME`) | IndexedDB `deleteResume()` — idempotent |
+
+- **Live sync (M13).** Connecting once is enough: after the extension id is saved on the device
+  (`localStorage["applypilot.extensionId"]`, the Connect page), every profile / bucket / AI-config /
+  resume edit is pushed to the extension automatically from the browser via `lib/extension-sync.ts`
+  (`liveSync(kind)` — fetches the current slice server-side, then sends the matching `AP_*` message; a
+  debounced, fire-and-forget no-op when not connected here). The `session`/reporting key is **never**
+  re-minted by a routine edit — that stays a Connect-page action. Feedback surfaces via a single
+  `<LiveSyncToast/>` in the app shell.
 
 - **Extension ID:** v1 = the user pastes their extension ID (from `chrome://extensions`) once on the
   Connect page; the website stores it and targets `chrome.runtime.sendMessage(id, …)`. The page must
@@ -312,6 +321,11 @@ extension's discipline.
   **AI config.** The AI-fill toggle switch was redrawn (visible white knob); **Save is disabled until the config actually differs** from what's stored (`savedCfg` / `dirty`). The website's AI toggle stays the SINGLE opt-in — the extension MIRRORS it (an extension-side auto-opt-in was reverted).
   **Review CTA.** `ReviewEditor`'s "Edit my profile" prompt shows ONLY on a genuine data problem (`errors.length || empties.length`), not on a **cancelled** fill (a cancel isn't a profile error).
   **Source fallback ladder (profile).** Default `how_did_you_hear.preferred` = **LinkedIn → Handshake → GitHub** with **"Other"** as the always-matching `fallback` (last resort, kept OUT of `preferred` so it can't short-circuit). Changed in lockstep: `emptyProfile()` zod default, `data/profile.example.json`, `data/application_defaults.json`. The profile page now **shows the ladder pre-filled** (seeded when the stored list is empty — mirrors `withDefaultWebsites`) as a **reorderable, side-by-side** chip list (new `horizontal` mode on `TieredField`, ◄ ► arrows) + a surfaced editable **"Last resort"** field.
+- **M13 — Live sync (connect once, edits push automatically)** *(done; web typecheck + build green, extension suite 621/621)*: after the extension is connected on a device, editing your data on the website pushes it to the extension with no further "Sync everything" click.
+  **Client helper (`web/lib/extension-sync.ts`).** `liveSync(kind)` (`"profile" | "ai" | "resume" | "resume-clear"`) is a **debounced, fire-and-forget no-op unless connected here** (an extension id in `localStorage["applypilot.extensionId"]` AND Chrome extension messaging present). It fetches the current slice from the backend (single source of truth → reflects zod coercion + server-side merges like resume-parse), then sends the matching `AP_*` message via the existing `lib/extension.ts` bridge. Profile pushes **always** carry `profile + defaults + buckets` together (the extension's `AP_SYNC_PROFILE` guard rejects a buckets-only push).
+  **Server slices (no key mint, `connect/actions.ts`).** New `getProfileSyncSlice` / `getAiSyncSlice` / `getResumeSyncSlice`; `getSyncBundle` refactored to compose the shared shapers (`shapeProfileSlice`/`shapeAiSlice`) so the per-slice and whole-bundle payloads never drift. The reporting/`session` key is **never** re-minted by a routine edit.
+  **Wired save sites** — `ProfileEditor.save` (profile + buckets), `AiConfigForm.save` (AI), `ResumePanel` (upload → resume, apply-parsed → profile, remove → resume-clear), `TeachInbox` (`persistProfile`/`persistBuckets`/`commit`). Feedback via a single `<LiveSyncToast/>` mounted in `app/app/layout.tsx`.
+  **Extension side** — new `AP_CLEAR_RESUME` handler (`background.js`) + `deleteResume` (`db.js`, unit-pinned in `test/db.test.js`) so a website resume-removal propagates. All other syncs use the handlers that already shipped in M7 — **only resume-removal requires an extension reload.** Connect page copy updated ("edits sync automatically"). **Live-verify pending:** the browser round-trip on a real Chrome install with the extension.
 
 ## Design directions (under review)
 

@@ -116,6 +116,21 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // Resume removal: the website deleted the stored resume, so clear it here too
+  // (keeps the extension's IndexedDB in step with the website — the inverse of
+  // AP_SYNC_RESUME). Idempotent: no stored resume still resolves ok.
+  if (type === "AP_CLEAR_RESUME") {
+    (async () => {
+      try {
+        await deleteResume();
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      }
+    })();
+    return true;
+  }
+
   sendResponse({ ok: false, error: "unknown message type: " + type });
   return true;
 });
