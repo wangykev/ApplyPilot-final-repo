@@ -116,7 +116,9 @@ export function RunPanel() {
     let appId: string | null = null;
     try {
       const saved = await saveRunJob({
-        url: startUrl,
+        // Prefer the URL the extension actually reported the tracker row under (the form page after
+        // Apply/login navigation) so the JD lands on that SAME row instead of a second empty one.
+        url: (resp.reportedUrl as string) || startUrl,
         company: jd?.company,
         role: jd?.title,
         jobDescription: jd?.text,

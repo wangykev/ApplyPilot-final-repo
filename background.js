@@ -188,7 +188,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
         console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
         const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, store.jobContext || {});
-        sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl });
+        // reportApplication (in the walk's finally) upserts the tracker row keyed by the BUNDLE url —
+        // the form page, which differs from the pasted startUrl once Apply/login navigates. Return that
+        // url so the web side saves the JD onto the SAME row instead of creating a second, empty one.
+        const { reviewSummary } = await new Promise((r) => chrome.storage.local.get("reviewSummary", r));
+        const reportedUrl = (reviewSummary && reviewSummary.url) || null;
+        sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl, reportedUrl });
       } catch (e) {
         sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
       }
@@ -287,7 +292,7 @@ function scrapeJobDescription() {
   const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || (document.title || "").trim();
   let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
   if (!company) {
-    const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$/i);
+    const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
     if (m) company = m[1].replace(/[-_]+/g, " ");
   }
   const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
@@ -2030,6 +2035,28 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
   // SW does I/O) and hands them to the driver, which consults them before the AI pass.
   const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
+  // Let the flat field set finish rendering BEFORE the first fill pass. Workday form pages mount
+  // their fields progressively; on page 1 the walk enters straight from onboarding (no
+  // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
+  // slow-to-mount fields — they then get caught by the cascade re-scan and mis-tagged "REVEALED by
+  // an earlier field's value", which is misleading in review AND makes the submit gate force a second
+  // review of each. Poll cdpPageScan until the flat count holds steady across two consecutive
+  // non-zero reads (adaptive render-pacing, 12s ceiling); a page with no flat fields (repeating-only,
+  // e.g. My Experience) bails after a short all-zero grace so it never burns the ceiling. Genuine
+  // value-triggered cascades still appear only AFTER a commit → they stay the cascade re-scan's job.
+  {
+    let last = -1, stable = 0, zeroReads = 0;
+    const settleDeadline = Date.now() + 12000;
+    while (Date.now() < settleDeadline) {
+      let n = 0;
+      try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → keep polling */ }
+      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayRender(400); continue; }
+      zeroReads = 0;
+      if (n === last) { if (++stable >= 2) break; } else stable = 0;
+      last = n;
+      await act.delayRender(400);
+    }
+  }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
   LOG("page:", out.url);
@@ -2220,6 +2247,37 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
         detail: `AI-4 hardcoded Workday duplicate-language fix (${plan.mode}): deleted ${deleted}/${entries.length} entry(ies) — re-add manually if needed: ${plan.summary}`
       });
       actions.push({ tier: 0, action: "delete-language-" + plan.mode, deleted, languages: plan.summary });
+      didSomething = true;
+    }
+
+    // ── Tier 0 (websites, HARDCODED, DETERMINISTIC, no AI): the Workday phantom "You can't add
+    //    duplicate website URLs" bug — on repeat fills with the same account the backend keeps the
+    //    prior run's links, so a freshly-added URL is rejected as a duplicate of a link the FORM no
+    //    longer shows. Mirror of the dup-language tier: delete the website rows so Save & Continue
+    //    proceeds; the stale links may still surface on the review page, which is expected. NOTE the
+    //    prefix split — results are keyed `website[i].url`, but the DOM entry containers use the
+    //    `webAddress-` fkit prefix, so entryCount/clickDeleteEntry MUST use `webAddress-`. ──
+    if (!didSomething && isDuplicateWebsiteError(prevErrors)) {
+      const entries = websiteEntriesFromResults(out.results);
+      const plan = websiteDeletionPlan(entries);
+      LOG(`  attempt ${attempt} (Tier 0, dup-website ${plan.mode}): deleting ${plan.deleteIndices.length}/${entries.length} entry(ies) [${plan.summary}]`);
+      let deleted = 0;
+      for (const idx of plan.deleteIndices.slice().sort((a, b) => b - a)) { // highest-first → lower indices stay valid
+        const before = await act.entryCount("webAddress-");
+        if (before <= 0) break;
+        const clicked = await act.clickDeleteEntry("webAddress-", idx);
+        if (!clicked || !clicked.ok) break;
+        let now = before, polls = 0;
+        while (polls++ < 20) { now = await act.entryCount("webAddress-"); if (now < before) break; await act.delay(DEFAULT_BUDGETS.interFieldMs); }
+        if (now >= before) break; // NO PROGRESS (count didn't drop) → stop, don't spin the bound
+        deleted++;
+      }
+      mergeRemediationRecord(out, {
+        fieldName: "website.duplicate-fix", label: "Duplicate-website-URL workaround", widgetType: "remediation",
+        status: "needs_review", flag: "ai-remediation", after: null,
+        detail: `AI-4 hardcoded Workday duplicate-website-URL fix (${plan.mode}): deleted ${deleted}/${entries.length} entry(ies). Workday's stale links may still show on the review page — that's expected/acceptable. Removed: ${plan.summary}`
+      });
+      actions.push({ tier: 0, action: "delete-website-" + plan.mode, deleted, websites: plan.summary });
       didSomething = true;
     }
 
