@@ -298,11 +298,18 @@ function scrapeJobDescription() {
   const urlTitle = slugM ? clean(decodeURIComponent(slugM[1])) : "";
   const docTitle = (document.title || "").split(/\s[|–—-]\s/)[0].trim();
   const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || urlTitle || docTitle;
-  // COMPANY: a company element if present; else the tenant subdomain, title-cased (magna → Magna).
+  // COMPANY: a company element if present; else the tenant subdomain (posting host), title-cased
+  // (magna → Magna); else the career-site/tenant display segment right before "/job/" in the path —
+  // needed on the myworkdaysite host, where the tenant is in the PATH, not the subdomain
+  // (…/recruiting/magna/Magna/job/… → "Magna").
   let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
   if (!company) {
     const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
     if (m) company = titleCase(m[1]);
+  }
+  if (!company) {
+    const pm = (location.pathname || "").match(/\/([^/]+)\/job\//i);
+    if (pm) company = titleCase(decodeURIComponent(pm[1]));
   }
   const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
   return {

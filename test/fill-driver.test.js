@@ -5383,12 +5383,15 @@ test("AI-4 websiteDeletionPlan: a REAL duplicate URL (trailing-slash-insensitive
   assert.deepStrictEqual(plan.deleteIndices, [2]);
 });
 
-test("canonicalJobUrl: jobs + site + instance/query variants of the same job collapse to ONE key", () => {
-  const posting = "https://magna.wd3.myworkdayjobs.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply";
-  const form = "https://magna.wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply/applyManually?locale=en_US";
-  const key = "magna.wd3:r00244793";
-  assert.strictEqual(canonicalJobUrl(posting), key, "posting (myworkdayjobs)");
-  assert.strictEqual(canonicalJobUrl(form), key, "form (myworkdaysite + instance tail + query)");
+test("canonicalJobUrl: posting (tenant-subdomain) + logged-in form (tenant-in-path, myworkdaysite) collapse to ONE key", () => {
+  // posting: tenant in the SUBDOMAIN (magna.wd3.myworkdayjobs.com); form after login: tenant only in
+  // the PATH (host is bare wd3.myworkdaysite.com) + a per-application-instance tail + query. The
+  // data-center token "wd3" is the only common host part → both must key to "wd3:r00244793".
+  const posting = "https://magna.wd3.myworkdayjobs.com/en-US/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply";
+  const form = "https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply/applyManually?locale=en_US";
+  const key = "wd3:r00244793";
+  assert.strictEqual(canonicalJobUrl(posting), key, "posting (myworkdayjobs, tenant in subdomain)");
+  assert.strictEqual(canonicalJobUrl(form), key, "form (myworkdaysite, tenant in path, instance tail + query)");
 });
 test("canonicalJobUrl: different reqs differ; non-Workday falls back to origin+path (no query/apply)", () => {
   const base = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Foo_R111/apply";

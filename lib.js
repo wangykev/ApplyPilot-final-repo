@@ -464,19 +464,21 @@ function websiteDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
-// Stable per-JOB identity for tracker dedup. A Workday application URL VARIES across runs: after
-// login the form lives on <tenant>.wdN.myworkdaysite.com with a per-application-instance path, while
-// the job POSTING the user pasted is on myworkdayjobs.com — but BOTH carry the same tenant subdomain
-// + requisition id (…_R00244793). Reduce any of them to "<tenant.wdN>:r<reqid>" so every run of the
-// same job maps to ONE tracker row (and the jobs↔site host difference collapses). No _R match
-// (non-Workday / odd URL) → origin+pathname minus the query and the trailing /apply… tail. LOCKSTEP
+// Stable per-JOB identity for tracker dedup. A Workday application URL VARIES across runs AND hosts:
+// the POSTING the user pastes is <tenant>.wdN.myworkdayjobs.com (tenant in the SUBDOMAIN), but after
+// login the form is on wdN.myworkdaysite.com (tenant in the PATH, /recruiting/<tenant>/ — NOT the
+// subdomain), with a per-application-instance tail. The one token common to BOTH hosts is the
+// data-center (wd3, wd5, …); combined with the requisition id (…_R00244793, present in both paths) it
+// gives a key — "<dc>:r<reqid>" — that collapses the posting + every form/instance/query variant to
+// ONE row. (Keying on the subdomain split myworkdayjobs from myworkdaysite — the 2026-07-22 bug.)
+// No _R match (non-Workday / odd URL) → origin+pathname minus query and the /apply… tail. LOCKSTEP
 // with the web copy in web/lib/job-key.ts (reportApplication + saveRunJob must produce identical keys).
 function canonicalJobUrl(u) {
   try {
     const p = new URL(String(u));
-    const host = p.hostname.toLowerCase().replace(/\.myworkday(?:jobs|site)\.com$/i, ""); // "magna.wd3"
     const req = (p.pathname.match(/_R(\d+)\b/i) || [])[1];
-    if (req && host) return host + ":r" + req;
+    const dc = (p.hostname.match(/\bwd\d+\b/i) || [""])[0].toLowerCase(); // "wd3" — on both hosts
+    if (req) return (dc || "wd") + ":r" + req;
     return (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/+$/, "");
   } catch (e) {
     return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();
