@@ -5,6 +5,7 @@ import Link from "next/link";
 import { UploadCloud, FileText, Sparkles, Check, Trash2, ArrowRight } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { applyParsedProfile, removeResume } from "./actions";
+import { liveSync } from "@/lib/extension-sync";
 import type { Profile } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
 
@@ -57,6 +58,7 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
       if (j.ok) {
         setStored({ filename: f.name, size: f.size });
         setMsg({ kind: "ok", text: "Stored — ready to attach during applications." });
+        liveSync("resume"); // push the new resume bytes to a connected extension
       } else {
         setMsg({ kind: "err", text: j.error ?? "Upload failed." });
       }
@@ -98,6 +100,7 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
     if (!parsed) return;
     startApply(async () => {
       const res = await applyParsedProfile(parsed);
+      if (res.ok) liveSync("profile"); // the merged profile changed — push it to a connected extension
       setMsg(
         res.ok
           ? { kind: "ok", text: "Applied to your profile (filled blanks). Review it on the Profile page." }
@@ -114,6 +117,7 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
         setFile(null);
         setParsed(null);
         setMsg({ kind: "info", text: "Removed." });
+        liveSync("resume-clear"); // clear the resume in a connected extension too
       } else {
         setMsg({ kind: "err", text: res.error });
       }

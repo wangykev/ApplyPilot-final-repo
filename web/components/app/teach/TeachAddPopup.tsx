@@ -1,0 +1,228 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { X, Check } from "lucide-react";
+import { CheckboxField, TagListField } from "@/components/form/fields";
+import { ProfileFieldEditor, arrv } from "@/components/app/teach/AnswerEditPopup";
+import {
+  type TeachCard,
+  addWordingToBucket,
+  ensureModeABucket,
+  bucketLabel,
+  decideTeachRoute,
+} from "@/lib/teach";
+import { profileFieldMeta, getAtPath, setAtPath, type ProfileWidget } from "@/lib/profile-fields";
+import type { Bucket } from "@/lib/buckets";
+import type { Profile } from "@/lib/profile-schema";
+
+const isListWidget = (w: ProfileWidget) => w === "candidate" || w === "tiered" || w === "taglist";
+
+/** Where the current teach card is being filed — a profile FIELD (Mode-A) or an existing standalone
+ *  (Mode-B) saved ANSWER. A brand-new answer is handled by the shared RememberedAnswerPopup, not here. */
+export type ConfirmTarget = { kind: "field"; path: string; label: string } | { kind: "existing"; id: string };
+
+export type AddResult = { buckets?: Bucket[]; profile?: Profile; toast: string };
+
+/** Seed the field editor from the card's answer: append to a list ladder, coerce a yes/no, else set it. */
+function seedFieldValue(widget: ProfileWidget, current: unknown, answer: string): unknown {
+  if (isListWidget(widget)) {
+    const cur = arrv(current);
+    return cur.includes(answer) ? cur : [...cur, answer].filter(Boolean);
+  }
+  if (widget === "tribool")
+    return /^(yes|true)$/i.test(answer) ? true : /^(no|false)$/i.test(answer) ? false : current === true ? true : current === false ? false : null;
+  if (widget === "checkbox") return /^(yes|true|checked|on)$/i.test(answer);
+  return answer;
+}
+
+/**
+ * The END-STEP confirm popup for adding the current teach card to a CHOSEN target. It previews exactly
+ * what will change — with the added element highlighted in amber — before it commits:
+ *   • field + "answer" route  → the field is empty / holds a different value → set (or append, for a
+ *     ladder) the ANSWER, and file the wording too (so the card is fully taught);
+ *   • field + "wording" route → the field ALREADY holds this answer → just remember the QUESTION wording;
+ *   • existing (Mode-B) answer → add the wording to that saved answer (optionally its answer to the ladder).
+ * The answer-vs-wording split for a field is decided by decideTeachRoute — the popup opens straight into
+ * the missing half. On confirm it hands the computed change up to the parent (persist + advance).
+ */
+export function TeachAddPopup({
+  target,
+  card,
+  buckets,
+  profile,
+  saving,
+  onConfirm,
+  onClose,
+}: {
+  target: ConfirmTarget;
+  card: TeachCard;
+  buckets: Bucket[];
+  profile: Profile;
+  saving?: boolean;
+  onConfirm: (r: AddResult) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  const isField = target.kind === "field";
+  const path = isField ? target.path : "";
+  const fieldLabel = isField ? target.label : "";
+  // For a field: does it already hold this answer (→ wording) or not (→ answer)?
+  const route = isField ? decideTeachRoute(profile, path, card.answer) : "answer";
+  const meta = isField ? profileFieldMeta(path, getAtPath(profile, path)) : null;
+
+  // ── field · answer route: the field value seeded with the card's answer ──
+  const [fieldValue, setFieldValue] = useState<unknown>(() =>
+    isField && meta ? seedFieldValue(meta.widget, getAtPath(profile, path), card.answer) : card.answer,
+  );
+
+  // ── the remembered wordings (with this question added + highlighted) ──
+  const existing = !isField ? buckets.find((b) => b.id === target.id) ?? null : null;
+  const seedWordings = isField
+    ? buckets.find((x) => x.profile_path === path)?.questions ?? []
+    : existing?.questions ?? [];
+  const [wordings, setWordings] = useState<string[]>(() => dedupWordings([...seedWordings, card.question]));
+
+  // ── existing (Mode-B) answer: optionally add the card's answer to its candidate ladder ──
+  const [alsoLadder, setAlsoLadder] = useState(false);
+
+  const confirm = () => {
+    if (isField && route === "answer" && meta) {
+      // set the profile value AND remember the wording, so the card is fully taught (covered next time)
+      const withValue = setAtPath(profile, path, fieldValue);
+      const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
+      onConfirm({
+        profile: withValue,
+        buckets: addWordingToBucket(withB, bucketId, card.question),
+        toast: `Added to your ${fieldLabel} ✓`,
+      });
+    } else if (isField) {
+      // wording route — the value's already there, only the phrasing is new
+      const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
+      const next = withB.map((b) => (b.id === bucketId ? { ...b, questions: dedupWordings(wordings) } : b));
+      onConfirm({ buckets: next, toast: `Filed under ${fieldLabel} ✓` });
+    } else if (existing) {
+      let next = buckets.map((b) => (b.id === existing.id ? { ...b, questions: dedupWordings(wordings) } : b));
+      if (alsoLadder) {
+        next = next.map((b) =>
+          b.id === existing.id ? { ...b, value: b.value.includes(card.answer) ? b.value : [...b.value, card.answer] } : b,
+        );
+      }
+      onConfirm({ buckets: next, toast: `Added to ${bucketLabel(existing)} ✓` });
+    }
+  };
+
+  const canConfirm = isField && route === "answer" ? true : wordings.length > 0;
+
+  const title =
+    isField && route === "answer"
+      ? `Add to your ${fieldLabel}`
+      : isField
+        ? `Remember wording — ${fieldLabel}`
+        : `Add to ${existing ? bucketLabel(existing) : "answer"}`;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
+      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{title}</h3>
+          <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* the card being taught — always shown so the confirm has context */}
+        <div className="mb-4 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2 text-xs">
+          <p className="text-ink-dim">{card.question}</p>
+          <p className="mt-1">
+            <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">answer </span>
+            <span className="font-medium text-ink">{card.answer}</span>
+          </p>
+        </div>
+
+        {isField && route === "answer" && meta && (
+          <div className="space-y-2">
+            <p className="text-xs text-ink-dim">
+              {isListWidget(meta.widget)
+                ? "Added to your field's answer options (the ladder the extension tries — reorder if needed)."
+                : "Sets your profile field — the extension fills it from here."}{" "}
+              <span className="text-ink-faint">The question wording is saved too.</span>
+            </p>
+            <ProfileFieldEditor
+              path={path}
+              label={fieldLabel}
+              value={fieldValue}
+              highlight={card.answer}
+              countryForState={arrv(getAtPath(profile, "personal_info.country"))}
+              onChange={setFieldValue}
+            />
+          </div>
+        )}
+
+        {isField && route === "wording" && (
+          <div className="space-y-2">
+            <p className="text-xs text-ink-dim">
+              Your <span className="text-ink">{fieldLabel}</span> already answers this. Remember this phrasing so it
+              fills with no review next time.
+            </p>
+            <TagListField
+              label="Question wordings"
+              value={wordings}
+              onChange={setWordings}
+              highlight={card.question}
+              placeholder="Add another wording, press Enter"
+            />
+          </div>
+        )}
+
+        {!isField && (
+          <div className="space-y-3">
+            <p className="text-xs text-ink-dim">This question maps to that saved answer. Confirm to remember the phrasing.</p>
+            <TagListField
+              label="Question wordings"
+              value={wordings}
+              onChange={setWordings}
+              highlight={card.question}
+              placeholder="Add another wording, press Enter"
+            />
+            <CheckboxField
+              label="Also add this answer to its options"
+              checked={alsoLadder}
+              onChange={setAlsoLadder}
+              hint="adds the card's answer to that saved answer's ladder"
+            />
+          </div>
+        )}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+            Cancel
+          </button>
+          <button type="button" onClick={confirm} className="btn-primary" disabled={saving || !canConfirm}>
+            <Check className="h-4 w-4" />
+            {saving ? "Saving…" : "Confirm"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Case/whitespace-insensitive dedup that preserves the first spelling. */
+function dedupWordings(list: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const q of list) {
+    const k = q.trim().toLowerCase().replace(/\s+/g, " ");
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(q.trim());
+  }
+  return out;
+}

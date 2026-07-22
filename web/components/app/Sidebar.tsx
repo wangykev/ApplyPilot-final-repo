@@ -4,12 +4,13 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
+  Rocket,
   FileText,
   FileSignature,
   IdCard,
-  Briefcase,
   Gauge,
   Sparkles,
+  KeyRound,
   Cable,
   ListChecks,
   Activity,
@@ -22,12 +23,13 @@ import { clsx } from "@/lib/clsx";
 
 const PRIMARY = [
   { href: "/app", label: "Overview", icon: LayoutDashboard, exact: true },
+  { href: "/app/run", label: "Run", icon: Rocket },
   { href: "/app/resume", label: "Resume", icon: FileText },
   { href: "/app/cover-letter", label: "Cover letter", icon: FileSignature },
   { href: "/app/match", label: "Match score", icon: Gauge },
   { href: "/app/profile", label: "Profile", icon: IdCard },
-  { href: "/app/job", label: "Job context", icon: Briefcase },
   { href: "/app/ai", label: "AI", icon: Sparkles },
+  { href: "/app/credentials", label: "Sign-in", icon: KeyRound },
   { href: "/app/connect", label: "Connect", icon: Cable },
   { href: "/app/queue", label: "Queue", icon: ListChecks },
   { href: "/app/tracker", label: "Tracker", icon: Activity },

@@ -7,7 +7,7 @@ require("fake-indexeddb/auto");
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { saveResume, getResume, RESUME_KEY } = require("../db.js");
+const { saveResume, getResume, deleteResume, RESUME_KEY } = require("../db.js");
 
 test("getResume returns undefined when nothing is stored", async () => {
   const rec = await getResume();
@@ -45,4 +45,16 @@ test("saveResume defaults the key to RESUME_KEY when omitted", async () => {
   await saveResume({ filename: "nokey.pdf", base64: "CCCC" });
   const got = await getResume(RESUME_KEY);
   assert.strictEqual(got.filename, "nokey.pdf");
+});
+
+test("deleteResume removes the stored record (AP_CLEAR_RESUME handoff)", async () => {
+  await saveResume({ key: RESUME_KEY, filename: "to-delete.pdf", base64: "DDDD" });
+  assert.ok(await getResume(), "precondition: a resume is stored");
+  await deleteResume();
+  assert.strictEqual(await getResume(), undefined, "resume should be gone after delete");
+});
+
+test("deleteResume is a no-op when nothing is stored (idempotent)", async () => {
+  await deleteResume(); // already empty from the prior test — must still resolve
+  assert.strictEqual(await getResume(), undefined);
 });

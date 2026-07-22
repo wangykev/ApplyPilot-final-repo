@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useTransition, useEffect } from "react";
-import { Plus, Trash2, Save, ShieldAlert, X } from "lucide-react";
+import { useState, useMemo, useTransition } from "react";
+import { Plus, Trash2, Save, ShieldAlert, Settings2 } from "lucide-react";
 import {
   TextField,
   TextAreaField,
@@ -18,8 +18,24 @@ import {
   BucketLabelContext,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
+import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
+import {
+  RememberedAnswerPopup,
+  ConfirmDeleteButton,
+  RememberedToggle,
+  RememberedCheckbox,
+} from "@/components/app/RememberedAnswerPopup";
 import { COUNTRIES, countryCandidates, phoneCandidates } from "@/lib/countries";
+import {
+  PHONE_TYPE_OPTIONS,
+  GENDER_OPTIONS,
+  YES_NO_DECLINE_OPTIONS,
+  RACE_ETHNICITY_OPTIONS,
+  VETERAN_STATUS_OPTIONS,
+  DISABILITY_STATUS_OPTIONS,
+} from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
+import { liveSync } from "@/lib/extension-sync";
 import { type Bucket } from "@/lib/buckets";
 import {
   type Profile,
@@ -41,7 +57,7 @@ const isFluentLevel = (p: string) => p.trim().toLowerCase() === "fluent";
 const allFluent = (l: { reading: string; speaking: string; writing: string }) =>
   isFluentLevel(l.reading) && isFluentLevel(l.speaking) && isFluentLevel(l.writing);
 const PROFICIENCY = opt(["", "None", "Basic", "Intermediate", "Advanced", "Fluent"]);
-const PHONE_TYPE = opt(["", "Mobile", "Home", "Work"]);
+const PHONE_TYPE = opt(PHONE_TYPE_OPTIONS);
 // The three fixed link rows every profile shows — type is LOCKED, only the URL is
 // editable. Any of the user's existing links of these types are slotted in (matched
 // case-insensitively), and a missing one is created empty.
@@ -58,41 +74,43 @@ function withDefaultWebsites(list: { type: string; url: string }[] | undefined) 
   });
   return [...fixed, ...arr]; // fixed defaults first, then any custom links
 }
-// Standard US EEO option sets. Stored values are candidates the extension
-// matches against each tenant's live options — refine per observed wording.
-const GENDER = opt(["", "Male", "Female", "Non-binary", "Decline to self-identify"]);
-const YES_NO_DECLINE = opt(["", "Yes", "No", "Decline to self-identify"]);
-const RACE_ETHNICITY = opt([
-  "",
-  "American Indian or Alaska Native",
-  "Asian",
-  "Black or African American",
-  "Hispanic or Latino",
-  "Native Hawaiian or Other Pacific Islander",
-  "White",
-  "Two or More Races",
-  "Decline to self-identify",
-]);
-const VETERAN_STATUS = opt([
-  "",
-  "I am not a protected veteran",
-  "I identify as one or more of the classifications of a protected veteran",
-  "Decline to self-identify",
-]);
-const DISABILITY_STATUS = opt([
-  "",
-  "No, I do not have a disability",
-  "Yes, I have a disability (or previously had one)",
-  "I do not wish to answer",
-]);
+// The "How did you hear about us?" fallback ladder, shown pre-filled so the user
+// can see and edit it. Seeded ONLY when the stored list is empty (mirrors
+// withDefaultWebsites): a user who trimmed it to a non-empty list keeps theirs.
+const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub"];
+function withDefaultSources(h: Profile["how_did_you_hear"] | undefined) {
+  const preferred =
+    Array.isArray(h?.preferred) && h!.preferred.length > 0 ? h!.preferred : [...DEFAULT_SOURCE_LADDER];
+  const fallback = (h?.fallback ?? "").trim() ? h!.fallback : "Other";
+  return { preferred, fallback };
+}
+// Standard US EEO option sets (canonical lists live in lib/profile-fields.ts, shared with the teach
+// panel). Stored values are candidates the extension matches against each tenant's live options.
+const GENDER = opt(GENDER_OPTIONS);
+const YES_NO_DECLINE = opt(YES_NO_DECLINE_OPTIONS);
+const RACE_ETHNICITY = opt(RACE_ETHNICITY_OPTIONS);
+const VETERAN_STATUS = opt(VETERAN_STATUS_OPTIONS);
+const DISABILITY_STATUS = opt(DISABILITY_STATUS_OPTIONS);
 
 export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
-  const [profile, setProfile] = useState<Profile>(() => ({
-    ...initial,
-    websites: withDefaultWebsites(initial.websites),
-  }));
+  // The seeded baseline (initial + default website/source rows). Used for BOTH the live
+  // profile state and the "last saved" snapshot the dirty check compares against, so applying
+  // those defaults on load never counts as an unsaved change.
+  const seededInitial = useMemo<Profile>(
+    () => ({
+      ...initial,
+      websites: withDefaultWebsites(initial.websites),
+      how_did_you_hear: withDefaultSources(initial.how_did_you_hear),
+    }),
+    [initial]
+  );
+  const [profile, setProfile] = useState<Profile>(seededInitial);
+  const [savedProfile, setSavedProfile] = useState<Profile>(seededInitial);
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
+  const [savedBuckets, setSavedBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
+  // the Add / Advanced popup works on a DRAFT — nothing is written to `buckets` until Done.
+  const [adv, setAdv] = useState<{ mode: "add" | "edit"; index: number; draft: Bucket } | null>(null);
   const [pending, startTransition] = useTransition();
   const [status, setStatus] = useState<{ kind: "idle" | "ok" | "err"; msg?: string }>({
     kind: "idle",
@@ -105,16 +123,67 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       return next;
     });
 
+  // Save is enabled only when the profile or buckets differ from the last-saved snapshot
+  // (deep value compare — every edit goes through structuredClone / object spreads, so key
+  // order stays stable and JSON.stringify is a reliable equality test here).
+  const dirty =
+    JSON.stringify(profile) !== JSON.stringify(savedProfile) ||
+    JSON.stringify(buckets) !== JSON.stringify(savedBuckets);
+
   // One Save persists both the profile and the answer buckets edited via the labels.
   const save = () =>
     startTransition(async () => {
       setStatus({ kind: "idle" });
       const [pr, br] = await Promise.all([saveProfile(profile), saveBuckets(buckets)]);
-      if (pr.ok && br.ok) setStatus({ kind: "ok", msg: "Saved" });
-      else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
+      if (pr.ok && br.ok) {
+        setSavedProfile(profile); // new clean baseline → Save disables until the next edit
+        setSavedBuckets(buckets);
+        setStatus({ kind: "ok", msg: "Saved" });
+        liveSync("profile"); // push profile + buckets to a connected extension (no-op if not connected)
+      } else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
     });
 
   const pi = profile.personal_info;
+
+  // ── remembered (Mode-B) answer helpers, lifted here so the answer cards can render both merged into a
+  // matching profile section (SectionRemembered) and as their own cards (custom categories). ──
+  const modeBBuckets = buckets.map((b, i) => ({ b, i })).filter((x) => x.b.profile_path.trim() === "");
+  const patchBucket = (i: number, patch: Partial<Bucket>) =>
+    setBuckets((prev) => {
+      const next = prev.map((x) => ({ ...x }));
+      next[i] = { ...next[i], ...patch };
+      return next;
+    });
+  const removeBucket = (i: number) => setBuckets((prev) => prev.filter((_, j) => j !== i));
+  const blankBucket = (category: string): Bucket => ({
+    id: "custom_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    profile_path: "",
+    value: [],
+    category,
+    widget_hint: "text",
+    questions: [],
+    selectors: {},
+  });
+  // Add / Advanced open the popup with a DRAFT; nothing is written to `buckets` until Done (commitAdv).
+  const openAdd = () => setAdv({ mode: "add", index: -1, draft: blankBucket("Other") });
+  const openAdvanced = (i: number) => setAdv({ mode: "edit", index: i, draft: { ...buckets[i] } });
+  const closeAdv = () => setAdv(null); // cancel — discards the draft (a brand-new answer is never created)
+  const commitAdv = (draft: Bucket) => {
+    setBuckets((prev) => (adv?.mode === "edit" ? prev.map((b, j) => (j === adv.index ? draft : b)) : [...prev, draft]));
+    setAdv(null);
+  };
+  const deleteAdv = () => {
+    if (adv?.mode === "edit") removeBucket(adv.index);
+    setAdv(null);
+  };
+  const rememberedFor = (cat: string) => modeBBuckets.filter((x) => bucketCategory(x.b) === cat);
+  // dropdown options: fixed set + any custom category already in use (persists while an answer carries it)
+  const usedCustomCats = Array.from(new Set(modeBBuckets.map((x) => (x.b.category || "").trim()).filter((c) => c && !BUCKET_CATEGORIES.includes(c))));
+  const categoryOptions = [...BUCKET_CATEGORIES.filter((c) => c !== "Other"), ...usedCustomCats, "Other"];
+  // categories that get their OWN card (not merged into a section, not "Other"): Experience/Education + customs
+  const ownCardCats = Array.from(new Set(modeBBuckets.map((x) => bucketCategory(x.b)).filter((c) => c !== "Other" && !MERGED_CATEGORIES.includes(c))));
+  // props shared by every simple remembered-answer field row
+  const fieldRowProps = { onPatch: patchBucket, onOpenAdvanced: openAdvanced, onRemove: removeBucket };
 
   return (
     <BucketLabelContext.Provider value={(path, label, widget) => setBucketOpen({ path, label, widget })}>
@@ -146,6 +215,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <CandidateField label="Country" mode="dropdown" bucketPath="personal_info.country" value={pi.country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.personal_info.country = v; })} />
           <CandidateField label="Country phone code" mode="dropdown" dropdownMode="phone" bucketPath="personal_info.country_phone_code" value={pi.country_phone_code} countries={COUNTRIES} expand={phoneCandidates} onChange={(v) => update((p) => { p.personal_info.country_phone_code = v; })} />
         </div>
+        <SectionRemembered items={rememberedFor("Personal")} {...fieldRowProps} />
       </SectionCard>
 
       {/* Websites */}
@@ -359,6 +429,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         <div className="mt-4">
           <CandidateField label="Citizenship country" mode="dropdown" bucketPath="work_authorization.citizenship_country" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
         </div>
+        <SectionRemembered items={rememberedFor("Work authorization")} {...fieldRowProps} />
       </SectionCard>
 
       {/* How did you hear */}
@@ -370,10 +441,27 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <p className="text-xs leading-relaxed text-ink-dim">
             The extension fills the <span className="text-ink">real source</span> when it&apos;s known
             (from how the job was queued). For a manually pasted link, or when no source is available, it
-            works down this fallback list in order.
+            works down this fallback list <span className="text-ink">in order</span> — the first one the
+            form offers wins. The last resort below is tried only if none of these match.
           </p>
         </div>
-        <TagListField label="Fallback sources (in order)" value={profile.how_did_you_hear.preferred} placeholder="LinkedIn, Handshake, …" onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })} />
+        <TieredField
+          label="Fallback sources (in order)"
+          horizontal
+          hint="reorder with the ◄ ► arrows; the first one the form offers wins"
+          value={profile.how_did_you_hear.preferred}
+          placeholder="Add a source — e.g. LinkedIn"
+          onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })}
+        />
+        <div className="mt-4 sm:max-w-xs">
+          <TextField
+            label="Last resort"
+            hint="tried last, after the list above — a catch-all most forms offer"
+            value={profile.how_did_you_hear.fallback}
+            placeholder="Other"
+            onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })}
+          />
+        </div>
       </SectionCard>
 
       {/* Employment history companies — safety-critical */}
@@ -405,10 +493,11 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <SelectField label="Veteran status" bucketPath="self_identification.veteran_status" value={profile.self_identification.veteran_status} options={VETERAN_STATUS} onChange={(v) => update((p) => { p.self_identification.veteran_status = v; })} />
           <SelectField label="Disability status" bucketPath="self_identification.disability_status" value={profile.self_identification.disability_status} options={DISABILITY_STATUS} onChange={(v) => update((p) => { p.self_identification.disability_status = v; })} />
         </div>
+        <SectionRemembered items={rememberedFor("Demographics")} {...fieldRowProps} />
       </SectionCard>
 
-      {/* Screening defaults */}
-      <SectionCard title="Screening defaults" subtitle="Common yes/no questions and preferences the extension fills when asked.">
+      {/* Screening */}
+      <SectionCard title="Screening" subtitle="Common yes/no questions and preferences the extension fills when asked.">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <TriBoolField label="At least 18 years old" bucketPath="screening.at_least_18_years_old" value={profile.screening.at_least_18_years_old} onChange={(v) => update((p) => { p.screening.at_least_18_years_old = v; })} />
           <TriBoolField label="Willing to do a background check" bucketPath="screening.willing_background_check" value={profile.screening.willing_background_check} onChange={(v) => update((p) => { p.screening.willing_background_check = v; })} />
@@ -420,11 +509,30 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
           <TextField label="Salary expectation" bucketPath="screening.salary_expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
         </div>
+        <SectionRemembered items={rememberedFor("Screening")} {...fieldRowProps} />
       </SectionCard>
 
-      {/* Other remembered answers — standalone (Mode-B) buckets for questions the profile doesn't cover */}
-      <SectionCard title="Other remembered answers" subtitle="Custom question→answer pairs with no profile field — taught once, then filled deterministically.">
-        <ModeBBucketsPanel buckets={buckets} onBucketsChange={setBuckets} />
+      {/* Remembered answers with a CUSTOM category (or Experience/Education) → their own cards (display
+          only). Answers whose category matches a section above are merged into that section instead. */}
+      {ownCardCats.map((cat) => (
+        <SectionCard key={cat} title={cat} subtitle="Remembered answers in this category.">
+          <div className="space-y-4">
+            {rememberedFor(cat).map(({ b, i }) => (
+              <RememberedFieldRow key={b.id} b={b} i={i} {...fieldRowProps} />
+            ))}
+          </div>
+        </SectionCard>
+      ))}
+
+      {/* Other / uncategorized — the single entry point for a brand-new remembered answer. Adding opens the
+          Advanced popup; set a category there to file it under its section (or type a new category). */}
+      <SectionCard title="Other remembered answers" subtitle="Custom question→answer pairs the profile doesn't cover. Add one here, then set its category to file it under the matching section.">
+        <div className="space-y-4">
+          {rememberedFor("Other").map(({ b, i }) => (
+            <RememberedFieldRow key={b.id} b={b} i={i} {...fieldRowProps} />
+          ))}
+          <AddButton onClick={openAdd} />
+        </div>
       </SectionCard>
 
       {/* sticky save bar */}
@@ -433,14 +541,25 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <span
             className={clsx(
               "font-mono text-[11px] tracking-label",
-              status.kind === "ok" && "text-verified",
               status.kind === "err" && "text-signal",
-              status.kind === "idle" && "text-ink-faint"
+              !dirty && status.kind === "ok" && "text-verified",
+              (dirty || status.kind === "idle") && "text-ink-faint"
             )}
           >
-            {status.kind === "ok" ? "✓ SAVED" : status.kind === "err" ? status.msg : "EDITS ARE LOCAL UNTIL SAVED"}
+            {status.kind === "err"
+              ? status.msg
+              : dirty
+                ? "EDITS ARE LOCAL UNTIL SAVED"
+                : status.kind === "ok"
+                  ? "✓ SAVED"
+                  : "NO CHANGES TO SAVE"}
           </span>
-          <button onClick={save} disabled={pending} className="btn-primary">
+          <button
+            onClick={save}
+            disabled={pending || !dirty}
+            className="btn-primary"
+            title={!dirty ? "No changes to save" : undefined}
+          >
             <Save className="h-4 w-4" />
             {pending ? "Saving…" : "Save profile"}
           </button>
@@ -455,6 +574,17 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           buckets={buckets}
           onBucketsChange={setBuckets}
           onClose={() => setBucketOpen(null)}
+        />
+      )}
+
+      {adv && (
+        <RememberedAnswerPopup
+          initial={adv.draft}
+          mode={adv.mode}
+          categoryOptions={categoryOptions}
+          onDone={commitAdv}
+          onCancel={closeAdv}
+          onDelete={deleteAdv}
         />
       )}
     </div>
@@ -508,151 +638,94 @@ function Empty({ children }: { children: React.ReactNode }) {
   return <p className="py-2 text-sm text-ink-faint">{children}</p>;
 }
 
-// Groupings offered for a standalone (Mode-B) bucket. Mode-A buckets derive their category from the
-// profile section, so this list is only for the custom long-tail answers.
+// Categories a remembered (Mode-B) answer can carry. The MERGED_CATEGORIES ones render inline in the
+// matching profile section (below its fields); anything else (Experience/Education/custom + Other)
+// renders as its own card.
 const BUCKET_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal", "Experience", "Education", "Other"];
-const BUCKET_WIDGETS = [
-  { value: "text", label: "Text" },
-  { value: "dropdown", label: "Dropdown" },
-  { value: "radio", label: "Yes/No or single choice" },
-  { value: "typeahead", label: "Search / type-ahead" },
-  { value: "checkbox", label: "Checkbox" },
-];
+const MERGED_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Personal"];
 
-/**
- * Manage standalone (Mode-B) answer buckets — a question→answer with no profile field (the long tail
- * a taught form question lands in). Each bucket: its question wordings, an answer as a CANDIDATE LIST
- * (TieredField — text uses the first, choice widgets try each against the live options), a field type,
- * a category, and a sensitive flag. Edits the same `buckets` array the label popups use (filtered to
- * profile_path === ""); the one Save persists it.
- */
-function ModeBBucketsPanel({ buckets, onBucketsChange }: { buckets: Bucket[]; onBucketsChange: (b: Bucket[]) => void }) {
-  const modeB = buckets.map((b, i) => ({ b, i })).filter((x) => x.b.profile_path.trim() === "");
-  const patchAt = (i: number, patch: Partial<Bucket>) => {
-    const next = buckets.map((b) => ({ ...b }));
-    next[i] = { ...next[i], ...patch };
-    onBucketsChange(next);
-  };
-  const removeAt = (i: number) => onBucketsChange(buckets.filter((_, j) => j !== i));
-  const add = () =>
-    onBucketsChange([
-      ...buckets,
-      {
-        id: "custom_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        profile_path: "",
-        value: [],
-        category: "Other",
-        widget_hint: "text",
-        sensitive: false,
-        questions: [],
-        selectors: {},
-      },
-    ]);
-  return (
-    <div className="space-y-4">
-      {modeB.length === 0 && <Empty>No custom answers yet. Add one for a question your profile doesn&apos;t cover.</Empty>}
-      {modeB.map(({ b, i }) => (
-        <EntryCard key={b.id} index={i} title={b.questions[0] || "New custom answer"} onRemove={() => removeAt(i)}>
-          <div className="space-y-4">
-            <TagListField
-              label="Question wordings"
-              value={b.questions}
-              onChange={(q) => patchAt(i, { questions: q })}
-              placeholder="Paste the exact question, press Enter"
-              hint="every phrasing that should get this answer"
-            />
-            <TieredField
-              label="Answer"
-              value={b.value}
-              onChange={(v) => patchAt(i, { value: v })}
-              placeholder="the answer — add fallbacks for other tenants' option wordings"
-            />
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <SelectField label="Field type" value={b.widget_hint} options={BUCKET_WIDGETS} onChange={(w) => patchAt(i, { widget_hint: w })} />
-              <SelectField label="Category" value={b.category} options={opt(["", ...BUCKET_CATEGORIES])} onChange={(c) => patchAt(i, { category: c })} />
-            </div>
-            <CheckboxField
-              label="Sensitive (EEO / legal)"
-              checked={b.sensitive}
-              onChange={(s) => patchAt(i, { sensitive: s })}
-              hint="reused verbatim on future applications — verify before relying on it"
-            />
-          </div>
-        </EntryCard>
-      ))}
-      <AddButton onClick={add} />
-    </div>
-  );
+/** A bucket's grouping category (blank → "Other"). */
+function bucketCategory(b: Bucket): string {
+  return (b.category || "").trim() || "Other";
 }
 
-/** Popup that opens when a field label is clicked: edit the question wordings that
- *  map to that field's answer (creating the bucket on first use). Backdrop / Esc / Done close. */
-function BucketFieldPopup({
-  path,
-  label,
-  widget,
-  buckets,
-  onBucketsChange,
-  onClose,
+/** One remembered answer displayed like a normal profile field: the question as the label, with Advanced
+ *  + delete on the SAME line to save space, and the value control below (checkbox sits inline on the line). */
+function RememberedFieldRow({
+  b,
+  i,
+  onPatch,
+  onOpenAdvanced,
+  onRemove,
 }: {
-  path: string;
-  label: string;
-  widget: string;
-  buckets: Bucket[];
-  onBucketsChange: (b: Bucket[]) => void;
-  onClose: () => void;
+  b: Bucket;
+  i: number;
+  onPatch: (i: number, patch: Partial<Bucket>) => void;
+  onOpenAdvanced: (i: number) => void;
+  onRemove: (i: number) => void;
 }) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", h);
-    return () => document.removeEventListener("keydown", h);
-  }, [onClose]);
-
-  const idx = buckets.findIndex((b) => b.profile_path === path);
-  const bucket = idx >= 0 ? buckets[idx] : null;
-  const questions = bucket ? bucket.questions : [];
-  const sensitive = bucket ? bucket.sensitive : false;
-  const upsert = (patch: Partial<Bucket>) => {
-    const next = buckets.map((b) => ({ ...b }));
-    let i = idx;
-    if (i < 0) {
-      next.push({ id: "field_" + path.replace(/[^\w]+/g, "_"), profile_path: path, value: [], category: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} });
-      i = next.length - 1;
-    }
-    next[i] = { ...next[i], ...patch };
-    onBucketsChange(next);
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
-      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-2 flex items-center justify-between">
-          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{label} — question bucket</h3>
-          <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        <p className="mb-3 text-xs leading-relaxed text-ink-dim">
-          Every wording here fills from this one field — add the phrasings a form might use, and editing the field updates them all.
-          <span className="mt-1 block font-mono text-[10px] text-ink-faint">{path}</span>
-        </p>
-        <TagListField
-          label="Question wordings"
-          value={questions}
-          placeholder="Add a wording a form might use, press Enter"
-          onChange={(v) => upsert({ questions: v })}
-        />
-        <div className="mt-3">
-          <CheckboxField label="Sensitive (EEO / legal)" checked={sensitive} onChange={(v) => upsert({ sensitive: v })} />
-        </div>
-        <div className="mt-4 flex justify-end">
-          <button type="button" onClick={onClose} className="btn-primary">
-            Done
-          </button>
-        </div>
+  const widget = b.widget_hint === "radio" || b.widget_hint === "checkbox" ? b.widget_hint : "text";
+  const label = b.questions[0] || "Untitled answer";
+  const controls = (
+    <div className="flex shrink-0 items-center gap-3">
+      <button
+        type="button"
+        onClick={() => onOpenAdvanced(i)}
+        className="inline-flex items-center gap-1 text-[11px] text-ink-faint transition-colors hover:text-ink"
+        title="Question wordings, answer type, category"
+      >
+        <Settings2 className="h-3 w-3" />
+        Advanced
+      </button>
+      <ConfirmDeleteButton onDelete={() => onRemove(i)} />
+    </div>
+  );
+  // Checkbox reads naturally inline (☑ question), so the whole answer is one line with the controls.
+  if (widget === "checkbox") {
+    return (
+      <div className="group flex items-center justify-between gap-3">
+        <RememberedCheckbox label={label} value={b.value} onChange={(v) => onPatch(i, { value: v })} />
+        {controls}
       </div>
+    );
+  }
+  return (
+    <div className="group">
+      <div className="mb-1.5 flex items-center justify-between gap-3">
+        <span className="min-w-0 truncate font-mono text-[10px] uppercase tracking-label text-ink-dim">{label}</span>
+        {controls}
+      </div>
+      {widget === "radio" ? (
+        <RememberedToggle value={b.value} onChange={(v) => onPatch(i, { value: v })} />
+      ) : (
+        <CandidateField label="" hideLabel value={b.value} onChange={(v) => onPatch(i, { value: v })} placeholder="the answer" />
+      )}
     </div>
   );
 }
+
+/** Remembered answers shown inside a matching profile section (below its fields), as simple profile-style
+ *  fields. Renders NOTHING when the section has none — adding happens only in the "Other remembered
+ *  answers" area at the end. */
+function SectionRemembered({
+  items,
+  onPatch,
+  onOpenAdvanced,
+  onRemove,
+}: {
+  items: { b: Bucket; i: number }[];
+  onPatch: (i: number, patch: Partial<Bucket>) => void;
+  onOpenAdvanced: (i: number) => void;
+  onRemove: (i: number) => void;
+}) {
+  if (items.length === 0) return null;
+  return (
+    <div className="mt-5 space-y-4 border-t border-hairline/60 pt-4">
+      <p className="font-mono text-[10px] uppercase tracking-label text-ink-faint">Remembered answers</p>
+      {items.map(({ b, i }) => (
+        <RememberedFieldRow key={b.id} b={b} i={i} onPatch={onPatch} onOpenAdvanced={onOpenAdvanced} onRemove={onRemove} />
+      ))}
+    </div>
+  );
+}
+

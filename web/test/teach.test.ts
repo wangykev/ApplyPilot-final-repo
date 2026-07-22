@@ -13,13 +13,17 @@ import {
   humanize,
   flattenProfileFields,
   isFuzzyTier,
+  dottedPath,
+  fieldHoldsAnswer,
+  decideTeachRoute,
+  wasManuallyEdited,
   type TeachSource,
 } from "@/lib/teach";
 import type { Bucket } from "@/lib/buckets";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 const bucket = (over: Partial<Bucket>): Bucket => ({
-  id: "b", profile_path: "", value: [], category: "", widget_hint: "text", sensitive: false, questions: [], selectors: {}, ...over,
+  id: "b", profile_path: "", value: [], category: "", widget_hint: "text", questions: [], selectors: {}, ...over,
 });
 const entry = (over: Partial<ReviewEntry>): ReviewEntry => ({
   field_id: "f", question_label: "Q?", widget_type: "dropdown", flag: "ai-choice", needs_review: true, is_approved: true, current_value: "Yes", ...over,
@@ -78,6 +82,61 @@ test("teachableCards: excludes non-approved / deterministic / essay / empty / al
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");
 });
 
+test("teachableCards: a repeating entry's AI-filled field TEACHES; a deterministically-filled one does NOT", () => {
+  // Operator rule (2026-07-21): the AI/manually-supplied field of a repeating entry is worth learning
+  // (an AI-canonicalized education[0].degree teaches), but a clean deterministic fill isn't (already known).
+  const aiRep = entry({ question_label: "Degree", flag: "ai-canonicalized", needs_review: true, is_approved: true, current_value: "Bachelors", canonical_field: "education[0].degree" });
+  assert.equal(teachableCards([src("a", [aiRep])], [], {}).length, 1, "an AI-filled repeating field teaches");
+  const detRep = entry({ question_label: "School", flag: null, needs_review: false, is_edited: false, current_value: "CMU", canonical_field: "education[0].school_or_university" });
+  assert.equal(teachableCards([src("b", [detRep])], [], {}).length, 0, "a clean deterministic repeating field does NOT teach (already known)");
+});
+
+test("dottedPath: bracketed indexes → dots; flat paths unchanged", () => {
+  assert.equal(dottedPath("education[0].degree"), "education.0.degree");
+  assert.equal(dottedPath("certifications[1].specialties[0].specialty"), "certifications.1.specialties.0.specialty");
+  assert.equal(dottedPath("self_identification.gender"), "self_identification.gender");
+  assert.equal(dottedPath(""), "");
+  assert.equal(dottedPath(null), "");
+});
+
+test("teachableCards: a repeating field's BRACKETED path is dotted-normalized → resolves the profile value (not 'no value')", () => {
+  // The degree bug: canonical_field "education[0].degree" didn't resolve (split-on-'.') so the card read
+  // "no value" + never highlighted. Dotted-normalized, it resolves the real profile value.
+  const profile = { education: [{ degree: ["Bachelor of Science"] }] };
+  const cards = teachableCards(
+    [src("a", [entry({ question_label: "Degree", widget_type: "dropdown", flag: "ai-canonicalized", current_value: "Bachelors", canonical_field: "education[0].degree" })])],
+    [],
+    profile,
+  );
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].canonical_field, "education.0.degree", "bracketed → dotted");
+  assert.equal(cards[0].profile_value, "Bachelor of Science", "resolves the profile value → NOT 'no value'");
+});
+
+test("wasManuallyEdited: override / filled_blank → true; cleared / added_entry / not-edited → false", () => {
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "override" })), true);
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "filled_blank" })), true);
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: null })), true); // edited, kind unset
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "cleared" })), false); // now empty
+  assert.equal(wasManuallyEdited(entry({ is_edited: true, edit_kind: "added_entry" })), false); // a new row, not a Q→A
+  assert.equal(wasManuallyEdited(entry({ is_edited: false })), false);
+});
+
+test("teachableCards: a MANUALLY-EDITED clean fill (needs_review=false) is teachable too", () => {
+  const mk = (over: Partial<ReviewEntry>) =>
+    entry({ question_label: "Preferred name?", widget_type: "text", needs_review: false, flag: null, current_value: "Sam", ...over });
+  // a clean deterministic fill the human DIDN'T touch → not teachable (already known)
+  assert.equal(teachableCards([src("a", [mk({})])], [], {}).length, 0, "untouched clean fill skipped");
+  // the human OVERRODE the clean fill on review → now teachable
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "override" })])], [], {}).length, 1, "override teaches");
+  // the edit RESET approval (is_approved=false) — it STILL teaches (the user's own typed answer; #4)
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "override", is_approved: false })])], [], {}).length, 1, "an edit that reset approval still teaches");
+  // a filled-in blank → teachable
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "filled_blank" })])], [], {}).length, 1, "filled_blank teaches");
+  // a cleared field (now empty) → excluded (no value to remember)
+  assert.equal(teachableCards([src("a", [mk({ is_edited: true, edit_kind: "cleared", current_value: "" })])], [], {}).length, 0, "cleared skipped");
+});
+
 test("addWordingToBucket: adds to the right bucket, dedups by normalize, leaves others", () => {
   const bs = [bucket({ id: "x", questions: ["Q one"] }), bucket({ id: "y", questions: [] })];
   const out = addWordingToBucket(bs, "x", "Q TWO");
@@ -99,13 +158,13 @@ test("ensureModeABucket: an existing path returns it; a new path creates a Mode-
 });
 
 test("createModeBBucket: unique id, filters empty candidates, defaults category", () => {
-  const r1 = createModeBBucket([], { question: "Clearance?", value: ["No", ""], category: "", widget_hint: "radio", sensitive: false });
+  const r1 = createModeBBucket([], { question: "Clearance?", value: ["No", ""], category: "", widget_hint: "radio" });
   const b1 = r1.buckets.find((b) => b.id === r1.bucketId)!;
   assert.deepEqual(b1.value, ["No"]);
   assert.equal(b1.category, "Other");
   assert.deepEqual(b1.questions, ["Clearance?"]);
   assert.equal(b1.profile_path, "");
-  const r2 = createModeBBucket(r1.buckets, { question: "Clearance?", value: ["Yes"], category: "Screening", widget_hint: "radio", sensitive: true });
+  const r2 = createModeBBucket(r1.buckets, { question: "Clearance?", value: ["Yes"], category: "Screening", widget_hint: "radio" });
   assert.notEqual(r2.bucketId, r1.bucketId, "second create of the same question gets a distinct id");
 });
 
@@ -120,21 +179,35 @@ test("humanize: last segment, snake → Title Case, strips [i]", () => {
   assert.equal(humanize("work_experience[0].job_title"), "Job Title");
 });
 
-test("flattenProfileFields: object sections → scalar/bool/tiered rows; arrays-of-objects + top-level scalars skipped", () => {
+test("flattenProfileFields: object sections + repeating entries (per-entry, dotted paths); string-arrays/websites skipped", () => {
   const profile = {
     schema_version: "2.0",
     personal_info: { first_name: "Ada", has_preferred_name: true, country: ["United States of America", "United States"] },
-    work_experience: [{ job_title: "Engineer" }],
+    education: [
+      { school_or_university: "CMU", degree: ["Bachelor of Science", "Bachelors"] },
+      { school_or_university: "MIT" },
+    ],
+    certifications: [{ certification: "CPP", specialties: [{ specialty: "x" }] }],
+    websites: [{ type: "LinkedIn", url: "https://x" }],
     skills: ["ts", "react"],
   };
   const rows = flattenProfileFields(profile);
   const byPath = Object.fromEntries(rows.map((r) => [r.path, r]));
+  // object sections (unchanged)
   assert.equal(byPath["personal_info.first_name"].value, "Ada");
-  assert.equal(byPath["personal_info.first_name"].label, "First Name");
   assert.equal(byPath["personal_info.first_name"].sectionLabel, "Personal Info");
   assert.equal(byPath["personal_info.has_preferred_name"].value, "Yes"); // boolean → Yes
   assert.equal(byPath["personal_info.country"].value, "United States of America"); // tiered → first
-  assert.equal(rows.find((r) => r.path.startsWith("work_experience")), undefined, "array-of-objects section skipped");
+  // repeating sections → per-entry rows, DOTTED index paths, one section group per entry
+  assert.equal(byPath["education.0.school_or_university"].value, "CMU");
+  assert.equal(byPath["education.0.school_or_university"].sectionLabel, "Education · 1");
+  assert.equal(byPath["education.0.degree"].value, "Bachelor of Science", "tiered → first");
+  assert.equal(byPath["education.1.school_or_university"].value, "MIT");
+  assert.equal(byPath["education.1.school_or_university"].sectionLabel, "Education · 2");
+  assert.equal(byPath["certifications.0.certification"].value, "CPP");
+  assert.equal(byPath["certifications.0.specialties"], undefined, "a nested array-of-objects (specialties) is skipped");
+  // still handled by ProfilePanel's own boxes → NOT auto-flattened here
+  assert.equal(rows.find((r) => r.section.startsWith("websites")), undefined, "websites shown by its own box, not per-entry rows");
   assert.equal(rows.find((r) => r.section === "skills"), undefined, "top-level string array skipped");
   assert.equal(rows.find((r) => r.section === "schema_version"), undefined, "top-level scalar skipped");
 });
@@ -174,4 +247,27 @@ test("isFuzzyTier: containment / fuzzy-* → true; exact / empty → false", () 
   assert.equal(isFuzzyTier("exact-normalized"), false);
   assert.equal(isFuzzyTier(""), false);
   assert.equal(isFuzzyTier(null), false);
+});
+
+test("fieldHoldsAnswer: scalar / boolean(Yes-No) / tiered-array-any-candidate; empty → false", () => {
+  const p = {
+    self_identification: { gender: "Male" },
+    work_authorization: { authorized_to_work_in_us: true, citizenship_country: ["United States of America", "United States"] },
+    personal_info: { city: "" },
+  };
+  assert.equal(fieldHoldsAnswer(p, "self_identification.gender", "male"), true); // scalar, case-insensitive
+  assert.equal(fieldHoldsAnswer(p, "self_identification.gender", "Female"), false);
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.authorized_to_work_in_us", "Yes"), true); // boolean → Yes
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.authorized_to_work_in_us", "No"), false);
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.citizenship_country", "United States"), true); // ANY candidate
+  assert.equal(fieldHoldsAnswer(p, "work_authorization.citizenship_country", "Canada"), false);
+  assert.equal(fieldHoldsAnswer(p, "personal_info.city", "Chicago"), false); // empty holds nothing
+  assert.equal(fieldHoldsAnswer(p, "personal_info.missing", "x"), false); // absent path
+});
+
+test("decideTeachRoute: value already present → 'wording'; missing/different → 'answer'", () => {
+  const p = { self_identification: { gender: "Male" }, personal_info: { city: "" } };
+  assert.equal(decideTeachRoute(p, "self_identification.gender", "Male"), "wording"); // already holds it
+  assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
+  assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
 });

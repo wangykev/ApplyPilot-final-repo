@@ -1,6 +1,6 @@
 {
   "how_did_you_hear": {
-    "preferred": ["LinkedIn", "Handshake", "Campus Recruiting Event", "College / University Recruiting"],
+    "preferred": ["LinkedIn", "Handshake", "GitHub"],
     "fallback": "Other"
   },
   "field_of_study": {

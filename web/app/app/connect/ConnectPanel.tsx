@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Cable, RefreshCw, ArrowUpFromLine, Link2, Check, X, Minus, ChevronDown } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { pingExtension, sendToExtension, type ExtResponse } from "@/lib/extension";
+import { EXT_ID_KEY } from "@/lib/extension-sync";
 import { getSyncBundle, getSession } from "./actions";
 import { clsx } from "@/lib/clsx";
 
@@ -15,7 +16,7 @@ type Conn =
 
 type Step = { label: string; ok: boolean | null; msg: string };
 
-const LS_KEY = "applypilot.extensionId";
+const LS_KEY = EXT_ID_KEY;
 
 export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
   const [extId, setExtId] = useState(initialExtId);
@@ -117,6 +118,33 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
     }
     setSteps([...log]);
 
+    if (b.credentials.email || b.credentials.password) {
+      log.push(
+        rowFor(
+          "Sign-in credentials",
+          await sendToExtension(id, {
+            type: "AP_SET_CREDENTIALS",
+            email: b.credentials.email,
+            password: b.credentials.password,
+          })
+        )
+      );
+    } else {
+      log.push({ label: "Sign-in credentials", ok: null, msg: "none set — skipped" });
+    }
+    setSteps([...log]);
+
+    log.push(
+      rowFor(
+        "Gmail setting",
+        await sendToExtension(id, {
+          type: "AP_SET_ONBOARD_CONFIG",
+          onboardConfig: { gmailEnabled: b.onboardConfig.gmailEnabled },
+        })
+      )
+    );
+    setSteps([...log]);
+
     setSyncing(false);
     check();
   }
@@ -169,14 +197,19 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
         </div>
 
         {conn.state === "connected" && (
-          <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-verified/30 bg-verified/[0.05] px-4 py-3 text-sm">
-            <span className="flex items-center gap-2 text-verified">
-              <Check className="h-4 w-4" /> Connected
-            </span>
-            <span className="font-mono text-[11px] text-ink-dim">v{conn.version}</span>
-            <span className="font-mono text-[11px] text-ink-dim">
-              profile {conn.hasProfile ? "✓" : "—"} · resume {conn.hasResume ? "✓" : "—"}
-            </span>
+          <div className="mt-4 rounded-lg border border-verified/30 bg-verified/[0.05] px-4 py-3 text-sm">
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+              <span className="flex items-center gap-2 text-verified">
+                <Check className="h-4 w-4" /> Connected
+              </span>
+              <span className="font-mono text-[11px] text-ink-dim">v{conn.version}</span>
+              <span className="font-mono text-[11px] text-ink-dim">
+                profile {conn.hasProfile ? "✓" : "—"} · resume {conn.hasResume ? "✓" : "—"}
+              </span>
+            </div>
+            <p className="mt-2 text-xs text-ink-dim">
+              Live sync is on — edits to your profile, resume, and AI config now push here automatically.
+            </p>
           </div>
         )}
         {conn.state === "error" && <p className="mt-4 text-sm text-signal">{conn.error}</p>}
@@ -203,7 +236,7 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
 
       <SectionCard
         title="Sync to extension"
-        subtitle="Push your website data into the extension, or just link reporting so your fills show up in the Tracker."
+        subtitle="Once connected, edits sync automatically. Use this for the first push, to re-link, or to link reporting only."
       >
         <div className="flex flex-wrap items-center gap-3">
           <button onClick={sync} disabled={syncing} className="btn-primary">
@@ -217,8 +250,9 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
         </div>
         <p className="mt-3 text-xs leading-relaxed text-ink-dim">
           <span className="text-ink">Sync everything</span> overwrites the extension&apos;s profile, resume, and AI config
-          with the website&apos;s. <span className="text-ink">Link for tracking only</span> sends just the reporting
-          credential — use this to keep the profile you loaded in the extension and still have fills land in the Tracker.
+          with the website&apos;s. After that, every edit you make here syncs on its own — no need to press this again.{" "}
+          <span className="text-ink">Link for tracking only</span> sends just the reporting credential — use this to keep
+          the profile you loaded in the extension and still have fills land in the Tracker.
         </p>
 
         {steps.length > 0 && (

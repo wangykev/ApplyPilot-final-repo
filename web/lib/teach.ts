@@ -46,17 +46,44 @@ export function isFuzzyTier(matchTier?: string | null): boolean {
   return t === "containment" || /^fuzzy/.test(t);
 }
 
+/** Normalize a repeating-section path to the DOTTED form the profile resolvers + the teach panel rows use:
+ *  "education[0].degree" → "education.0.degree". The extension emits BRACKETED indexes in a bundle entry's
+ *  canonical_field, but profileValueAt / getAtPath / setAtPath split on "." (and arrays index by "0"), and
+ *  ProfilePanel rows are dotted — so without this a repeating field reads as "no value", never highlights,
+ *  and can't be edited. A flat path (no brackets) passes through unchanged. */
+export function dottedPath(path?: string | null): string {
+  return String(path == null ? "" : path).replace(/\[(\d+)\]/g, ".$1");
+}
+
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
 
-/** A teachable pair: the human APPROVED it, and it DIDN'T fill deterministically (needs_review —
- *  an AI guess, a no-match the human answered, a fuzzy/containment match…). A clean deterministic
- *  fill (mapped exact / bucket) has needs_review=false and is skipped — it's already known. Must be
- *  bucket-eligible with a real question + a non-empty value. */
+/** A human value edit on review that represents a corrected answer worth remembering — an override, or
+ *  a filled-in blank. A `cleared` edit (the field is now empty) or an `added_entry` (a new repeating row,
+ *  not a question→answer) is NOT a teachable answer. */
+export function wasManuallyEdited(e: ReviewEntry): boolean {
+  return !!e.is_edited && e.edit_kind !== "cleared" && e.edit_kind !== "added_entry";
+}
+
+/** A teachable pair, either:
+ *   • an APPROVED fill that DIDN'T fill deterministically (needs_review — an AI guess, a no-match the
+ *     human answered, a fuzzy/containment match…); OR
+ *   • a MANUAL EDIT on review (`wasManuallyEdited` — an override / filled-in blank). The user typed this
+ *     value themselves, so it's their own answer and teaches EVEN THOUGH the edit reset its approval
+ *     (the review editor clears `is_approved` on any value edit, to force a submit re-review — a
+ *     submit concern, not a teach one). The teach popup is its own confirm gate.
+ *  A clean, untouched deterministic fill (needs_review=false, not edited) is skipped — already known.
+ *  Must be bucket-eligible with a real question + a non-empty value. */
 function isTeachable(e: ReviewEntry): boolean {
+  // Operator rule (per-field, incl. repeating entries): the AI-filled / manually-supplied field of an
+  // entry teaches (needs_review + approved, or a manual edit); a DETERMINISTICALLY-filled field does NOT
+  // (needs_review=false, untouched → already known). The base condition below is exactly that split — it
+  // applies to repeating-section fields too (an AI-canonicalized education[0].degree teaches; a clean
+  // deterministic one doesn't). (No repeating-field exclusion — that was over-broad and dropped the very
+  // AI-filled answers worth learning; reverted 2026-07-21.)
+  const edited = wasManuallyEdited(e);
   return (
-    !!e.is_approved &&
     !e.is_deleted &&
-    !!e.needs_review && // didn't fill deterministically (any reviewed field, not only AI-flagged ones)
+    (edited || (!!e.is_approved && !!e.needs_review)) &&
     isBucketEligibleWidget(e.widget_type) &&
     !!e.question_label &&
     normalizeQuestion(e.question_label) !== "" &&
@@ -94,8 +121,10 @@ export function teachableCards(
       const key = normalizeQuestion(e.question_label as string);
       if (covered.has(key) || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
-      const maps_to = e.maps_to || "";
-      const canonical_field = e.canonical_field || "";
+      // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
+      // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).
+      const maps_to = dottedPath(e.maps_to || "");
+      const canonical_field = dottedPath(e.canonical_field || "");
       const known = canonical_field || maps_to; // the deterministic mapped home wins over the AI hint
       cards.push({
         key,
@@ -122,6 +151,34 @@ export function sameAnswer(a: string, b: string): boolean {
   return !!n(a) && n(a) === n(b);
 }
 
+/** Raw value at a dotted path (arrays PRESERVED, unlike profileValueAt which collapses to the first). */
+function rawAt(profile: unknown, path: string): unknown {
+  if (!path) return undefined;
+  return String(path)
+    .split(".")
+    .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
+}
+
+/** Whether the profile field at `path` ALREADY holds `answer` — for a tiered array, ANY candidate
+ *  counts; a boolean is compared as Yes/No; a scalar is compared normalized. */
+export function fieldHoldsAnswer(profile: unknown, path: string, answer: string): boolean {
+  const raw = rawAt(profile, path);
+  if (Array.isArray(raw)) return raw.some((v) => typeof v === "string" && sameAnswer(v, answer));
+  if (typeof raw === "boolean") return sameAnswer(raw ? "Yes" : "No", answer);
+  return raw != null && sameAnswer(String(raw), answer);
+}
+
+/** Which route the teach confirm popup takes when a card is added to a chosen profile field:
+ *  - "wording": the field already holds the card's answer → only the phrasing is missing, so add the
+ *    wording (the value stays untouched);
+ *  - "answer":  the field is empty OR holds a different value → set / append the answer (and file the
+ *    wording too, so the card is fully taught).
+ *  Splitting these is what makes the popup show exactly "the question OR the answer" that's missing. */
+export type TeachRoute = "answer" | "wording";
+export function decideTeachRoute(profile: unknown, path: string, answer: string): TeachRoute {
+  return fieldHoldsAnswer(profile, path, answer) ? "wording" : "answer";
+}
+
 /** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */
 export function addWordingToBucket(buckets: Bucket[], bucketId: string, wording: string): Bucket[] {
   const k = normalizeQuestion(wording);
@@ -138,14 +195,14 @@ export function ensureModeABucket(buckets: Bucket[], path: string, widget: strin
   const existing = buckets.find((b) => b.profile_path.trim() === p);
   if (existing) return { buckets, bucketId: existing.id };
   const bucketId = "field_" + p.replace(/[^\w]+/g, "_");
-  const nb: Bucket = { id: bucketId, profile_path: p, value: [], category: "", widget_hint: widget, sensitive: false, questions: [], selectors: {} };
+  const nb: Bucket = { id: bucketId, profile_path: p, value: [], category: "", widget_hint: widget, questions: [], selectors: {} };
   return { buckets: [...buckets, nb], bucketId };
 }
 
 /** Create a new standalone (Mode-B) bucket with a unique id. Returns the new buckets + its id. */
 export function createModeBBucket(
   buckets: Bucket[],
-  spec: { question: string; value: string[]; category: string; widget_hint: string; sensitive: boolean },
+  spec: { question: string; value: string[]; category: string; widget_hint: string },
 ): { buckets: Bucket[]; bucketId: string } {
   const base = "custom_" + (normalizeQuestion(spec.question).replace(/[^\w]+/g, "_").slice(0, 40) || "answer");
   const ids = new Set(buckets.map((b) => b.id));
@@ -158,7 +215,6 @@ export function createModeBBucket(
     value: spec.value.filter((v) => v.trim() !== ""),
     category: spec.category || "Other",
     widget_hint: spec.widget_hint || "text",
-    sensitive: !!spec.sensitive,
     questions: [spec.question],
     selectors: {},
   };
@@ -190,25 +246,54 @@ export type ProfileFieldRow = { path: string; label: string; value: string; sect
  * screening question resolves to. Repeating array sections (work_experience, education, skills…) and
  * nested objects are skipped; a boolean shows Yes/No, a tiered array shows its first candidate.
  */
+// Arrays shown by ProfilePanel's OWN boxes (websites) or as single editable string-lists (skills /
+// employer history) — not expanded into per-entry rows here (avoids duplication / a wall of tokens).
+const TEACH_SKIP_ARRAYS = new Set(["websites", "skills", "employment_history_companies"]);
+
+/** A field's display string, or null to SKIP (a nested object / an array-of-objects — handled per-entry).
+ *  A tiered/string array shows its FIRST value (its primary), matching the object-section behavior. */
+function _teachDisplayVal(v: unknown): string | null {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "boolean") return v ? "Yes" : "No";
+  if (Array.isArray(v)) {
+    if (v.length === 0) return "";
+    if (v.every((x) => typeof x === "string")) return (v as string[])[0];
+    return null; // array of objects → skip (a repeating sub-section)
+  }
+  return null; // nested object → skip
+}
+
 export function flattenProfileFields(profile: unknown): ProfileFieldRow[] {
   const rows: ProfileFieldRow[] = [];
   if (!profile || typeof profile !== "object") return rows;
   const p = profile as Record<string, unknown>;
   for (const section of Object.keys(p)) {
     const sv = p[section];
-    if (!sv || typeof sv !== "object" || Array.isArray(sv)) continue; // object sections only
+    if (!sv || typeof sv !== "object") continue;
+    if (Array.isArray(sv)) {
+      // REPEATING section (arrays of OBJECTS: work_experience / education / languages / certifications /
+      // additional_files) → one grouped box PER ENTRY, so the teach page shows EVERYTHING the profile
+      // page does. DOTTED index paths ("education.0.degree") so getAtPath/setAtPath resolve them (arrays
+      // index by "0") → the answer editor edits them in place.
+      if (TEACH_SKIP_ARRAYS.has(section)) continue;
+      (sv as unknown[]).forEach((entry, i) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return; // objects only (skip a string-list)
+        const sectionKey = section + "." + i;
+        const sectionLabel = humanize(section) + " · " + (i + 1);
+        for (const field of Object.keys(entry as Record<string, unknown>)) {
+          const value = _teachDisplayVal((entry as Record<string, unknown>)[field]);
+          if (value == null) continue; // nested object/array (specialties, file) → skip
+          rows.push({ path: sectionKey + "." + field, label: humanize(field), value, section: sectionKey, sectionLabel });
+        }
+      });
+      continue;
+    }
+    // OBJECT section (personal_info / work_authorization / how_did_you_hear / self_identification / screening).
     const sectionLabel = humanize(section);
     for (const field of Object.keys(sv as Record<string, unknown>)) {
-      const v = (sv as Record<string, unknown>)[field];
-      let value: string;
-      if (v == null) value = "";
-      else if (typeof v === "string") value = v;
-      else if (typeof v === "boolean") value = v ? "Yes" : "No";
-      else if (Array.isArray(v)) {
-        if (v.length === 0) value = "";
-        else if (v.every((x) => typeof x === "string")) value = (v as string[])[0];
-        else continue; // array of objects → skip
-      } else continue; // nested object → skip
+      const value = _teachDisplayVal((sv as Record<string, unknown>)[field]);
+      if (value == null) continue;
       rows.push({ path: section + "." + field, label: humanize(field), value, section, sectionLabel });
     }
   }

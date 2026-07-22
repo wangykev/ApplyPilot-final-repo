@@ -80,6 +80,15 @@ handoff contract).
 | `AP_SYNC_RESUME` | store the resume | IndexedDB via `saveResume({filename,mime,size,base64,savedAt})` |
 | `AP_SET_SESSION` | reporting + review-pull credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey, reviewUrl }` |
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
+| `AP_CLEAR_RESUME` | remove the stored resume (inverse of `AP_SYNC_RESUME`) | IndexedDB `deleteResume()` — idempotent |
+
+- **Live sync (M13).** Connecting once is enough: after the extension id is saved on the device
+  (`localStorage["applypilot.extensionId"]`, the Connect page), every profile / bucket / AI-config /
+  resume edit is pushed to the extension automatically from the browser via `lib/extension-sync.ts`
+  (`liveSync(kind)` — fetches the current slice server-side, then sends the matching `AP_*` message; a
+  debounced, fire-and-forget no-op when not connected here). The `session`/reporting key is **never**
+  re-minted by a routine edit — that stays a Connect-page action. Feedback surfaces via a single
+  `<LiveSyncToast/>` in the app shell.
 
 - **Extension ID:** v1 = the user pastes their extension ID (from `chrome://extensions`) once on the
   Connect page; the website stores it and targets `chrome.runtime.sendMessage(id, …)`. The page must
@@ -142,12 +151,26 @@ The platform-agnostic answer store that generalizes `FIELD_MAP` + question-wordi
   wording, on every ATS.
 - **Mode B** (`value` set, no `profile_path`) — a standalone answer for the long tail; promotable later.
 
-Element shape: `{ id, profile_path, value (string[] — a candidate list), category, widget_hint, sensitive,
-questions[], selectors{} }` (`coerceBuckets` upgrades a legacy string `value`). Edited two ways in
-`ProfileEditor`: **per-field popups** (click a field label → edit the wordings that map to it, creates the
-Mode-A bucket on first use) and an **"Other remembered answers"** section — create/edit/delete **Mode-B**
-standalone buckets (wordings, a candidate-list answer via `TieredField`, a category, sensitive). **Seed:**
-new profiles are provisioned (`loadBuckets`, provision-if-null) with `STARTER_BUCKETS` — Mode-A
+Element shape: `{ id, profile_path, value (string[] — a candidate list), category, widget_hint,
+questions[], selectors{} }` (`coerceBuckets` upgrades a legacy string `value`; a legacy `sensitive` key is
+dropped on parse — deterministic bucket fills are never flagged, so buckets carry no sensitivity, and there's
+no field-type gate: the extension adapts to the LIVE form widget). `widget_hint` is now only a DISPLAY hint
+for the editor — the **"Answer type"**: **Text / Yes-No / Checkbox** (Text also covers dropdown/type-ahead via
+its candidate ladder). Edited two ways in `ProfileEditor`:
+- **per-field label popups** (`BucketFieldPopup`, shared with the teach page) — click a field label → edit the
+  wordings that map to it, creating the Mode-A bucket on first use;
+- **the remembered-answers UI** for **Mode-B** answers: a categorized answer **merges into its matching
+  profile section** (Screening / Work authorization / Self-identification / Personal information — shown as a
+  plain field below that section's inputs); a custom / Experience / Education category gets its **own card**;
+  everything else lands in **"Other remembered answers"**, the single **Add** entry point. Each answer displays
+  like a normal profile field (the question as the label + its value control — text ladder, Yes/No toggle, or a
+  checkbox — with **Advanced + delete on that same line**). An **Advanced/Add popup** works on a **draft** and
+  commits ONLY on **Done** (outside-click / Esc / X cancels; a brand-new answer is never created): it edits the
+  wordings, answer type, the answer, and the category (pick **"Other"** → type a new category **live**, no
+  separate Add — a custom category persists in the dropdown while an answer uses it). Delete is a two-step
+  inline confirm.
+
+**Seed:** new profiles are provisioned (`loadBuckets`, provision-if-null) with `STARTER_BUCKETS` — Mode-A
 wording→field bindings only, no baked answers.
 
 Matching hierarchy in the extension (`drivePageFill`): platform accelerator (Workday automation-id via
@@ -161,20 +184,37 @@ The learning loop's curation surface. After a fill is reviewed + **approved** (t
 approved bundle to `applications.review_bundle_json`), its answers that DIDN'T fill deterministically become
 teaching cards, so they fill deterministically (no review) next time.
 - **Data (`lib/teach.ts`, pure + unit-tested in `test/teach.test.ts` via the `tsx` runner):**
-  `teachableCards(apps, buckets, profile, dismissed)` = every **approved + `needs_review` + bucket-eligible**
-  entry with a value, deduped by normalized question, minus anything already bucketed or dismissed — read
-  across the user's reviewed applications.
-- **Split-screen (`components/app/teach/`):** the **profile is physically displayed on the left**
-  (`ProfilePanel`, from `flattenProfileFields`); the current card is on the right. The recommended field is
-  **highlighted**, and **clicking any profile field files this question's wording under it** (Mode-A).
+  `teachableCards(apps, buckets, profile, dismissed)` = every **approved + bucket-eligible** entry with a
+  value that either was flagged **`needs_review`** OR was **manually edited on review** (`wasManuallyEdited`
+  — an `override` / `filled_blank`; a human override of a *clean* deterministic fill is a signal the fill
+  was wrong, so it teaches too). Deduped by normalized question, minus anything already bucketed or
+  dismissed — read across the user's reviewed applications.
+- **Split-screen (`components/app/teach/`):** the current teach card is on the **left**; the **profile is
+  physically displayed AND editable on the right** (`ProfilePanel`, from `flattenProfileFields` + the simple
+  list sections **Skills / Employer history / Websites**). It's a **sticky, self-scrolling** column that
+  **auto-scrolls to + highlights the recommended field** when a card appears, so the card and its target field
+  stay on one screen. Clicking a field's **name** opens its wordings bucket (`BucketFieldPopup`); clicking its
+  **answer** opens an editor (`AnswerEditPopup`) that modifies the profile value and shows the **ladder** for
+  candidate/tiered fields (country / phone-code / citizenship / sources). Both persist via `saveProfile` /
+  `saveBuckets`.
 - **Recommendation precedence: `canonical_field` (the mapped home — free/exact) → the fill-time `maps_to`
   piggyback → a teach-time LLM fallback** (`recommendField` server action → `callLLM` with the user's
   `ai_config`), which fires ONLY when nothing is known (e.g. an unmapped pre-populated field). A
-  fuzzy/containment match (`isFuzzyTier`) on a known field shows a "possible typo/variant — verify" note
-  instead of an LLM guess.
-- **Actions:** file-under-recommended, **save as a new Mode-B bucket** (candidate-list value + category +
-  sensitive), add-to-an-existing-bucket, or **skip** (persisted in `profiles.teach_dismissed_json`, migration
-  `0004`, so a skipped card doesn't reappear). Writes via `saveBuckets` → synced to the extension.
+  fuzzy/containment match (`isFuzzyTier`) on a known field shows a "possible typo/variant — verify" note; a
+  recommended field that's **blank in the profile** shows a warning to add the answer.
+- **Two-step add flow (reuses the profile page's add-a-remembered-answer flow).** The card leads with ONE
+  smart primary — **"Add to your &lt;field&gt;"** (the recommended field) — that opens the **end-step confirm
+  popup** (`TeachAddPopup`, keyed on a `ConfirmTarget = field | existing`). The popup opens straight into the
+  MISSING half (`decideTeachRoute`, pure + tested): the field already holds this answer → **wording** (just
+  remember the phrasing); empty/different → **answer** (set the value, or append to the ladder — reorderable
+  — AND file the wording). The element being added is **highlighted in amber** (`highlight` prop on
+  `TieredField` / `TagListField` / `ProfileFieldEditor`) so the user confirms exactly what changes. If the AI
+  picked the wrong field, **"Wrong field?"** opens the **`TargetPicker`** — a filterable list of every profile
+  field + standalone saved answer, plus **"Make a completely new answer"**. A brand-new answer opens the SAME
+  **`RememberedAnswerPopup`** the profile page uses (extracted to `components/app/RememberedAnswerPopup.tsx`,
+  shared LOCKSTEP), prefilled from the card. A card with no recommended field leads with **"Save as a new
+  answer"** instead. **Skip** persists in `profiles.teach_dismissed_json` (migration `0004`) so a skipped card
+  doesn't reappear. Writes via `saveBuckets` / `saveProfile` → synced to the extension.
 
 ### Attachments — private `attachments` Storage bucket (Profile v2)
 Per-specialty files + `additional_files[]` upload to a private Supabase bucket, namespaced
@@ -186,6 +226,9 @@ is a follow-up; the website owns upload/storage/management today.)*
 `{ how_did_you_hear, field_of_study, degree, gpa_range }`, each `{ preferred[], fallback }`.
 
 ### jobContext — `{ company }` (per-application).
+The standalone `/app/job` editor page + its sidebar entry were removed; the value still lives in
+`profiles.job_context_json` and is fed to the extension via **Connect** and used as a default in the **Cover
+letter** page (no dedicated editor UI for now).
 
 ### AI config — `llmConfig` shape (extension `chrome.storage.local.llmConfig`)
 `{ provider: "anthropic"|"gemini"|"openai", model, apiKey, enabled }`. Model lists from `LLM_MODELS`
@@ -265,7 +308,25 @@ extension's discipline.
 
 - **M9 — Review stage migrated to the website (editor + approval + round-trip)** *(built; live-verify pending)*: the review stage moved OFF the extension's `summary.html` and ONTO the site — the site is now the PRIMARY review surface. `components/app/review/ReviewEditor.tsx` is a faithful React port of `summary.js`'s editor (every widget editable, per-field/section/all approval, submit-ready gating, repeating + nested cert-specialty sections, currently-work-here / preferred-name mirrors) over the extended `reviewSummary` schema; pure transforms in `lib/review-approval.ts` (port of `summary-lib.js`) + `lib/review-model.ts`. `saveReviewBundle` autosaves edits to `applications.review_bundle_json` (RLS; recomputes approval + needs_review_count). Round-trip: the walk PUSHES its accumulated bundle on every exit (`reportApplication` in `runCdpWalk`); the extension PULLS the approved bundle before replay (`GET /api/extension/review` + `pullApprovedBundle`, writing `chrome.storage.local.reviewSummary`), so `runCdpReplayWalk`/`submitPrecondition` are UNCHANGED. `AP_SET_SESSION` carries `reviewUrl`. The extension `summary.html` stays as a fallback until this is live-verified. Extension suite 593/593; web typecheck + build green. **Live-verify:** fill → walk reports → edit/approve on `/app/tracker/[id]` → Replay pulls + would-submit (needs Supabase + `/app/connect`).
 
-- **M10 — Match score page (`/app/match`)** *(built; live-verify pending)*: the "should I even apply?" signal, on the site (moved off the extension side). `lib/score.ts` (pure — `buildScorePrompt` rubric adapted from `ApplyPilot-oss-reference/src/applypilot/scoring/scorer.py`; `buildCandidateSummary` EXCLUDES PII / demographics / work-auth so none enters the prompt; tolerant `parseScoreReply`; code-side `verdictForScore` bucket). `scoreMatch` server action (profile + pasted JD → the user's LLM via `callLLM`, mirrors `generateCoverLetter`); `MatchPanel` + `page.tsx` render a 1–10 score + strong/moderate/weak verdict light + matched / gaps / ATS-keyword lists; sidebar entry. `test/score.test.ts` (11 tests, `tsx --test`); web typecheck + production build green. Reuses the P5 cover-letter pattern; distinct from the pending resume *variants* piece. **Live-verify:** `/app/match` with an AI key set → paste a posting → plausible score + gaps (needs Supabase + AI key).
+- **M10 — Teach + Remembered-answers UX overhaul** *(done; web typecheck + build green, `test/teach.test.ts` 15/15)*: reworked how custom answers are authored and taught.
+  **Teach page (`/app/teach`)** — swapped the layout (card LEFT, profile RIGHT); the profile panel is now **editable in place** (click a field's name → `BucketFieldPopup` wordings; click its answer → `AnswerEditPopup` value editor with the tiered **ladder** for candidate fields), extended with the simple list sections **Skills / Employer history / Websites** (website URLs are bucketable), made a **sticky self-scrolling** column that **auto-scrolls + highlights** the recommended field, added a **blank-profile warning**, and routed every add-to-profile action through a **confirm popup** (`TeachAddPopup`: question-bucket / answer-into-field / new / existing). Extracted the shared `ProfileFieldEditor` + `BucketFieldPopup`; per-path field metadata in `lib/profile-fields.ts`.
+  **Profile page remembered answers** — a categorized Mode-B answer now **merges into its matching section** (or an own card / the "Other" card, the single **Add** entry point); each answer displays as a plain profile field with **Advanced + delete on the same line**; the **Advanced/Add popup is a draft that commits only on Done** (outside-click / Esc / X cancels); **Answer type** trimmed to **Text / Yes-No / Checkbox** (checkbox renders a real checkbox; Text covers dropdown/type-ahead via its ladder — no field-type gate, the extension adapts at fill time); custom category typed **live** (no separate Add); delete is a two-step inline confirm.
+  **Removed:** the bucket-level `sensitive` flag + checkbox (deterministic fills are never flagged — the AI-guess legally-loaded flag is separate and untouched); the standalone `/app/job` "Job context" page + its sidebar entry (value still lives in `job_context_json`, fed via Connect + Cover letter). "Screening defaults" → **"Screening"**.
+- **M11 — Teach reuses the profile page's add flow** *(done; web typecheck + build green, `test/teach.test.ts` 17/17)*: the teach page no longer maintains a parallel "add to profile" UX — it **reuses the profile page's** exact add-a-remembered-answer popup.
+  **Shared popup** — extracted `RememberedAdvancedPopup` (+ `ConfirmDeleteButton` / `RememberedToggle` / `RememberedCheckbox`) out of `ProfileEditor.tsx` into `components/app/RememberedAnswerPopup.tsx`; the profile page imports it (behavior unchanged) and the teach page's "new answer" route opens the SAME popup, prefilled from the card.
+  **Two-step add** — collapsed the old four add-buttons into ONE smart primary **"Add to your &lt;field&gt;"** → the **end-step confirm popup** (`TeachAddPopup`, now keyed on a `ConfirmTarget = field | existing`). Pure `decideTeachRoute` / `fieldHoldsAnswer` (`lib/teach.ts`) pick the missing half — **wording** (value already there) vs **answer** (set / append the ladder + file the wording). The added element is **highlighted in amber** (new `highlight` prop on `TieredField` / `TagListField` / `ProfileFieldEditor`), and a candidate ladder stays **reorderable** before Confirm.
+  **Wrong-field escape hatch** — a new **`TargetPicker`** (filterable list of every profile field + standalone saved answer + "Make a completely new answer") replaces the scattered "add to existing / save new" buttons; a no-recommendation card leads with "Save as a new answer". The right `ProfilePanel` (in-place profile editing) is unchanged.
+- **M12 — Live app updates, AI-config polish, review-CTA + source-ladder UX** *(done; web typecheck + build green, `test/teach.test.ts` 19/19)*: a batch of operator-requested UX fixes.
+  **Live fetch (no F5).** Tracker + teach now poll their data in place and patch React state — NOT `router.refresh()` / a hard reload — so a walk's pushed bundle appears without a manual refresh. New cookie-authed JSON endpoints `GET /api/applications` + `GET /api/teach` (return `ok:false` when unconfigured / signed-out so the poller never clobbers the list); `TrackerPanel` holds `apps` in state + a 12s poll; `TeachInbox` background-polls newly-teachable cards into the queue (append-only, `handledRef`-guarded); app pages also refresh on tab focus. A **manually-edited** field is now teachable even when the edit reset its approval (`wasManuallyEdited` / relaxed `isTeachable` in `lib/teach.ts`).
+  **AI config.** The AI-fill toggle switch was redrawn (visible white knob); **Save is disabled until the config actually differs** from what's stored (`savedCfg` / `dirty`). The website's AI toggle stays the SINGLE opt-in — the extension MIRRORS it (an extension-side auto-opt-in was reverted).
+  **Review CTA.** `ReviewEditor`'s "Edit my profile" prompt shows ONLY on a genuine data problem (`errors.length || empties.length`), not on a **cancelled** fill (a cancel isn't a profile error).
+  **Source fallback ladder (profile).** Default `how_did_you_hear.preferred` = **LinkedIn → Handshake → GitHub** with **"Other"** as the always-matching `fallback` (last resort, kept OUT of `preferred` so it can't short-circuit). Changed in lockstep: `emptyProfile()` zod default, `data/profile.example.json`, `data/application_defaults.json`. The profile page now **shows the ladder pre-filled** (seeded when the stored list is empty — mirrors `withDefaultWebsites`) as a **reorderable, side-by-side** chip list (new `horizontal` mode on `TieredField`, ◄ ► arrows) + a surfaced editable **"Last resort"** field.
+- **M13 — Live sync (connect once, edits push automatically)** *(done; web typecheck + build green, extension suite 621/621)*: after the extension is connected on a device, editing your data on the website pushes it to the extension with no further "Sync everything" click.
+  **Client helper (`web/lib/extension-sync.ts`).** `liveSync(kind)` (`"profile" | "ai" | "resume" | "resume-clear"`) is a **debounced, fire-and-forget no-op unless connected here** (an extension id in `localStorage["applypilot.extensionId"]` AND Chrome extension messaging present). It fetches the current slice from the backend (single source of truth → reflects zod coercion + server-side merges like resume-parse), then sends the matching `AP_*` message via the existing `lib/extension.ts` bridge. Profile pushes **always** carry `profile + defaults + buckets` together (the extension's `AP_SYNC_PROFILE` guard rejects a buckets-only push).
+  **Server slices (no key mint, `connect/actions.ts`).** New `getProfileSyncSlice` / `getAiSyncSlice` / `getResumeSyncSlice`; `getSyncBundle` refactored to compose the shared shapers (`shapeProfileSlice`/`shapeAiSlice`) so the per-slice and whole-bundle payloads never drift. The reporting/`session` key is **never** re-minted by a routine edit.
+  **Wired save sites** — `ProfileEditor.save` (profile + buckets), `AiConfigForm.save` (AI), `ResumePanel` (upload → resume, apply-parsed → profile, remove → resume-clear), `TeachInbox` (`persistProfile`/`persistBuckets`/`commit`). Feedback via a single `<LiveSyncToast/>` mounted in `app/app/layout.tsx`.
+  **Extension side** — new `AP_CLEAR_RESUME` handler (`background.js`) + `deleteResume` (`db.js`, unit-pinned in `test/db.test.js`) so a website resume-removal propagates. All other syncs use the handlers that already shipped in M7 — **only resume-removal requires an extension reload.** Connect page copy updated ("edits sync automatically"). **Live-verify pending:** the browser round-trip on a real Chrome install with the extension.
+- **M14 — Match score page (`/app/match`)** *(built; live-verify pending)*: the "should I even apply?" signal, on the site (moved off the extension side). `lib/score.ts` (pure — `buildScorePrompt` rubric adapted from `ApplyPilot-oss-reference/src/applypilot/scoring/scorer.py`; `buildCandidateSummary` EXCLUDES PII / demographics / work-auth so none enters the prompt; tolerant `parseScoreReply`; code-side `verdictForScore` bucket). `scoreMatch` server action (profile + pasted JD → the user's LLM via `callLLM`, mirrors `generateCoverLetter`); `MatchPanel` + `page.tsx` render a 1–10 score + strong/moderate/weak verdict light + matched / gaps / ATS-keyword lists; sidebar entry. `test/score.test.ts` (11 tests, `tsx --test`); web typecheck + production build green. Reuses the P5 cover-letter pattern; distinct from the pending resume *variants* piece. **Live-verify:** `/app/match` with an AI key set → paste a posting → plausible score + gaps (needs Supabase + AI key).
 
 ## Design directions (under review)
 

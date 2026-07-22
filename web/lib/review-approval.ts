@@ -10,7 +10,7 @@
  *
  * NO React, NO DOM, NO Supabase — pure data transforms only.
  */
-import type { ReviewEntry, ApprovalEnvelope, FieldShape } from "./review-summary";
+import type { ReviewEntry, ApprovalEnvelope, FieldShape, RememberedField } from "./review-summary";
 
 const sumNorm = (v: unknown): string => (v == null ? "" : String(v));
 
@@ -223,6 +223,65 @@ export type NewEntryMeta = {
   index: number;
   at?: string | null;
 };
+
+/** Build the field records for an operator ADD-BACK of a delete-with-memory `removed_entry` (Phase 2):
+ *  each remembered field is PREFILLED with the value that filled during the walk. A field that filled
+ *  DETERMINISTICALLY is clean (approved-by-default, needs_review false); an AI-filled field or a field in
+ *  `unfilled` (the ones that couldn't fill) needs review (verify / supply). Same "<sectionKey>[<index>].
+ *  <rec>" id format as newEntryRecords, so replay's isRepeatingEntry re-creates the entry positionally. PURE. */
+export function addBackEntryRecords(
+  remembered: RememberedField[],
+  unfilled: string[],
+  meta: NewEntryMeta
+): ReviewEntry[] {
+  const m = meta || ({} as NewEntryMeta);
+  const fpfx = (m.page != null ? m.page + "::" : "") + "formField-" + m.sectionKey + "[" + m.index + "].";
+  const cpfx = m.sectionKey + "[" + m.index + "].";
+  const unfilledSet = new Set(unfilled || []);
+  return (remembered || []).map((s) => {
+    const isAi = typeof s.filled_by === "string" && s.filled_by.indexOf("ai-") === 0;
+    const hasValue = s.value != null && String(s.value).trim() !== "";
+    const mustAttend = unfilledSet.has(s.recName) || !hasValue || isAi; // supply (unfilled) or verify (AI)
+    return {
+      field_id: fpfx + s.recName,
+      page: m.page != null ? m.page : null,
+      field_index: null,
+      question_label: s.label != null ? s.label : s.recName,
+      widget_type: s.widget_type,
+      canonical_field: cpfx + (s.path != null ? s.path : s.recName),
+      is_required: !!s.is_required,
+      current_value: hasValue ? s.value : null,
+      original_ai_value: isAi && hasValue ? s.value : null,
+      is_edited: true,
+      edit_kind: "added_entry" as const,
+      is_added: true,
+      added_at: m.at != null ? m.at : null,
+      is_approved: false,
+      approved_at: null,
+      page_number: m.pageNumber != null ? m.pageNumber : null,
+      page_label: m.pageLabel != null ? m.pageLabel : null,
+      confidence: isAi ? ("low" as const) : hasValue ? ("high" as const) : ("none" as const),
+      confidence_source: isAi ? "ai_inference" : hasValue ? "profile_direct" : "added",
+      needs_review: mustAttend,
+      needs_review_reason: mustAttend ? (isAi && hasValue ? "ai_inferred" : "added_entry") : null,
+      fill_status: hasValue ? "filled" : "not_filled",
+      fill_error: null,
+      detail: hasValue
+        ? isAi
+          ? "AI-filled during the walk — verify"
+          : "prefilled from your profile (filled cleanly during the walk)"
+        : "add-back: supply this field, then approve",
+      match_tier: s.match_tier || null,
+      flag: isAi ? s.filled_by : hasValue ? null : "added-entry",
+      options: Array.isArray(s.options) ? s.options : null,
+      captured_options: null,
+      tree_structure: null,
+      date_order: Array.isArray(s.date_order) ? s.date_order : null,
+      tiers: null,
+      character_count: null,
+    };
+  });
+}
 
 /** Build the field records for an OPERATOR-ADDED repeating-section entry (the inverse of the
  *  soft-delete). field_id / canonical_field use the SAME "<sectionKey>[<index>].<rec>" format

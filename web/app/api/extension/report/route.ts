@@ -80,7 +80,9 @@ export async function POST(req: Request) {
   const { error } = existing
     ? await admin
         .from("applications")
-        .update({ ...fields, updated_at: new Date().toISOString() })
+        // deleted_at: null — a re-fill of the same URL UN-deletes a previously soft-deleted app (it's
+        // active again, so it returns to the tracker).
+        .update({ ...fields, deleted_at: null, updated_at: new Date().toISOString() })
         .eq("id", existing.id)
     : await admin.from("applications").insert(fields);
   if (error) return j({ ok: false, error: error.message }, 500);

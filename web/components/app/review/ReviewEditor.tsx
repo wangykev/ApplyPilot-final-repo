@@ -32,6 +32,7 @@ import {
   isCurrentlyWorkHere,
   visibleEntryItems,
   newEntryRecords,
+  addBackEntryRecords,
 } from "@/lib/review-approval";
 import {
   fmt,
@@ -48,6 +49,7 @@ import {
   mustReplace,
   isPrePopulated,
   isCascadeRevealed,
+  explainFill,
   statusOf,
   cleanPageName,
   pageNumOf,
@@ -321,6 +323,46 @@ export function ReviewEditor({
     []
   );
 
+  // ── Phase 2 (delete-with-memory): ADD BACK a removed_entry — reconstruct the entry PREFILLED from its
+  // remembered_fields (deterministic values clean; AI/unfilled ones flagged), then drop the removed_entry
+  // card. Mirrors addEntry but seeds values instead of a blank shape. ──
+  const addBackEntry = useCallback(
+    (removed: ReviewEntry) => {
+      const remembered = removed.remembered_fields || [];
+      if (!remembered.length) return;
+      const page = removed.page != null ? removed.page : null;
+      const key = sectionOf(removed).key;
+      const unfilled = (removed.unfilled_fields || []).map((u) => u.recName);
+      const sample = bundle.entries.find((e) => e.page === page);
+      const newIx = nextIndexFor(bundle, page, key);
+      const recs = addBackEntryRecords(remembered, unfilled, {
+        page,
+        pageNumber: sample ? sample.page_number : null,
+        pageLabel: sample ? sample.page_label : null,
+        sectionKey: key,
+        index: newIx,
+        at: nowIso(),
+      });
+      // carry the recon'd nested sub-sections (cert ▸ specialties) onto the reconstructed parent
+      if (removed.nested_shapes) {
+        for (const childBase of Object.keys(removed.nested_shapes)) {
+          const shp = removed.nested_shapes[childBase];
+          if (Array.isArray(shp) && shp.length) recs.push(nestedStubRecord(page, key, newIx, childBase, shp, sample));
+        }
+      }
+      replaceEntries([...bundle.entries.filter((e) => e.field_id !== removed.field_id), ...recs]);
+      requestAnimationFrame(() => recs[0] && jumpTo(recs[0]));
+    },
+    [bundle, replaceEntries]
+  );
+
+  // "Leave removed" — accept the deletion (an optional entry the tenant doesn't offer). Approve the card so
+  // it stops blocking submit; it stays visible as resolved and is NOT replayed (removed_entry is skipped).
+  const leaveRemoved = useCallback(
+    (removed: ReviewEntry) => patchEntry(removed.field_id, { is_approved: true, approved_at: nowIso() }),
+    [patchEntry]
+  );
+
   // ── jump-to-field (expand section + switch to All + scroll/flash) ──
   const jumpTo = useCallback((e: ReviewEntry) => {
     const key = e.page + "||" + sectionOf(e).key;
@@ -405,8 +447,8 @@ export function ReviewEditor({
   // shared props threaded into the field renderer — STABLE (memoized over stable callbacks) so a
   // field row's ref-registration effect doesn't re-run on every keystroke elsewhere on the page.
   const ctx = useMemo<RowCtx>(
-    () => ({ commit, setApproved, setTiers, registerRow, jumpTo }),
-    [commit, setApproved, setTiers, registerRow, jumpTo]
+    () => ({ commit, setApproved, setTiers, registerRow, jumpTo, addBack: addBackEntry, leaveRemoved }),
+    [commit, setApproved, setTiers, registerRow, jumpTo, addBackEntry, leaveRemoved]
   );
 
   return (
@@ -525,6 +567,8 @@ type RowCtx = {
   setTiers: (e: ReviewEntry, tiers: string[]) => void;
   registerRow: (id: string, node: HTMLDivElement | null) => void;
   jumpTo: (e: ReviewEntry) => void;
+  addBack: (removed: ReviewEntry) => void; // Phase 2: reconstruct a removed_entry PREFILLED
+  leaveRemoved: (removed: ReviewEntry) => void; // Phase 2: accept the removal (approve the card)
 };
 
 // ── the FIELD LIST (grouped by page → section, collapsible, repeating entries + nested) ──
@@ -685,7 +729,8 @@ function SectionGroup({
   onAddNested: (pg: string | null, pk: string, pi: number, cb: string, stub: ReviewEntry) => void;
   onRemoveNested: (pg: string | null, pk: string, pi: number, cb: string, ci: number) => void;
 }) {
-  const realItems = items.filter((e) => e.widget_type !== "section_stub");
+  const realItems = items.filter((e) => e.widget_type !== "section_stub" && e.widget_type !== "removed_entry");
+  const removedCards = items.filter((e) => e.widget_type === "removed_entry" && filterPass(e)); // Phase 2 delete-with-memory add-back cards
   const repeating = realItems.some((e) => sectionOf(e).index != null);
   const liveItems = (repeating ? realItems : items).filter((e) => !e.is_deleted);
 
@@ -754,9 +799,12 @@ function SectionGroup({
         );
     }
   } else {
-    for (const e of items.filter((e) => !e.is_deleted && filterPass(e)))
+    for (const e of items.filter((e) => !e.is_deleted && filterPass(e) && e.widget_type !== "removed_entry"))
       body.push(<FieldRow key={e.field_id} e={e} ctx={ctx} />);
   }
+
+  // Phase 2 delete-with-memory: an add-back card per removed_entry (prefilled reconstruct, or leave removed).
+  for (const rc of removedCards) body.push(<RemovedEntryCard key={rc.field_id} e={rc} ctx={ctx} />);
 
   // + Add entry (addable repeating section, "all" view only)
   const addable = filter === "all" && sectionShapeFor(bundle, page, sec.key).length > 0;
@@ -935,7 +983,9 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
             )}
             <StatusDot e={e} />
           </div>
-          {review && e.detail && <p className="mt-1 text-xs leading-relaxed text-ink-dim">{e.detail}</p>}
+          {review && explainFill(e) && (
+            <p className="mt-1 text-xs leading-relaxed text-ink-dim">{explainFill(e)}</p>
+          )}
           {review && e.tree_structure?.chosen && (
             <p className="mt-1 text-xs text-ink-faint">
               tree: «{fmt(e.tree_structure.chosen)}» →{" "}
@@ -982,8 +1032,8 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
           : "Pre-populated — not filled by ApplyPilot; verify it's what you want."}
       </p>
     );
-  if (!review && e.needs_review && e.detail && !isPrePopulated(e))
-    notes.push(<p key="d" className="mt-1 text-xs text-ink-dim">{e.detail}</p>);
+  if (!review && e.needs_review && !isPrePopulated(e) && explainFill(e))
+    notes.push(<p key="d" className="mt-1 text-xs text-ink-dim">{explainFill(e)}</p>);
   // autofilled ref (only when the BOT actually had a value)
   if (kind && norm(e.original_ai_value) !== "")
     notes.push(
@@ -1058,9 +1108,9 @@ function SelectBox({
   if (value != null && value !== "" && !list.includes(value)) list.unshift(value);
   return (
     <select className="ap-input" value={value ?? ""} onChange={(e) => onCommit(e.target.value || null)}>
-      <option value="">— choose —</option>
+      <option value="" className="bg-panel text-ink-faint">— choose —</option>
       {list.map((o) => (
-        <option key={o} value={o}>
+        <option key={o} value={o} className="bg-panel text-ink">
           {o}
         </option>
       ))}
@@ -1133,6 +1183,10 @@ function TextBox({
   );
 }
 
+// A single-layer typeahead editor: click in → a LARGE dropdown of ALL the options (not pre-filtered by
+// the current value), type to filter. The input shows the current value when unfocused; on focus the
+// filter starts EMPTY so the full list is visible. The current value is highlighted; "clear" is demoted
+// to a small footer, not the first item. (operator 2026-07-21)
 function Combobox({
   value,
   options,
@@ -1142,26 +1196,31 @@ function Combobox({
   options: string[];
   onCommit: (v: string | null) => void;
 }) {
-  const [q, setQ] = useState(value ?? "");
+  const [q, setQ] = useState(""); // the FILTER query (starts empty → show ALL options)
   const [open, setOpen] = useState(false);
-  useEffect(() => setQ(value ?? ""), [value]);
   const matches = q.trim() === "" ? options : options.filter((o) => o.toLowerCase().includes(q.trim().toLowerCase()));
   const pick = (v: string | null) => {
     onCommit(v);
+    setQ("");
     setOpen(false);
   };
+  const hasValue = value != null && String(value).trim() !== "";
   return (
     <div className="relative">
       <input
         className="ap-input"
         type="text"
-        value={q}
-        placeholder="type to filter…"
+        // unfocused → show the current value; focused → the filter query (empty until they type → all options)
+        value={open ? q : hasValue ? String(value) : ""}
+        placeholder={hasValue ? String(value) : "click to choose · type to filter…"}
         onChange={(e) => {
           setQ(e.target.value);
           setOpen(true);
         }}
-        onFocus={() => setOpen(true)}
+        onFocus={() => {
+          setQ(""); // reset the filter so the FULL option list shows on click
+          setOpen(true);
+        }}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
         onKeyDown={(e) => {
           if (e.key === "Enter" && matches.length) {
@@ -1171,19 +1230,25 @@ function Combobox({
         }}
       />
       {open && (
-        <div className="absolute z-20 mt-1 max-h-52 w-full overflow-auto rounded-md border border-hairline bg-panel-raised shadow-lg">
-          <button className="ap-opt text-ink-faint" onMouseDown={(ev) => (ev.preventDefault(), pick(null))}>
-            — clear —
-          </button>
+        <div className="absolute z-20 mt-1 max-h-60 w-full overflow-auto rounded-md border border-hairline bg-panel-raised shadow-lg">
+          {matches.length === 0 && <div className="px-3 py-2 text-xs text-ink-faint">no matches</div>}
           {matches.map((o) => (
             <button
               key={o}
-              className={clsx("ap-opt", o === norm(value) && "bg-amber/10 text-amber")}
+              className={clsx("ap-opt", norm(o) === norm(value) && "bg-amber/10 font-medium text-amber")}
               onMouseDown={(ev) => (ev.preventDefault(), pick(o))}
             >
               {o}
             </button>
           ))}
+          {hasValue && (
+            <button
+              className="ap-opt border-t border-hairline/60 text-xs text-ink-faint"
+              onMouseDown={(ev) => (ev.preventDefault(), pick(null))}
+            >
+              — clear —
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1333,8 +1398,8 @@ function ReviewBadges({ e }: { e: ReviewEntry }) {
     );
   else if (isAiFlag(e) && !isSuperHard(e))
     badges.push(
-      <Badge key="ai" tone="info">
-        AI-INFERRED
+      <Badge key="ai" tone="info" title="AI helped fill this — matched your profile to the form, or inferred it. See the note below.">
+        AI-FILLED
       </Badge>
     );
   else if (isPrePopulated(e))
@@ -1372,7 +1437,9 @@ const DOT: Record<ReturnType<typeof statusOf>, string> = {
   skip: "bg-ink-faint",
 };
 function StatusDot({ e }: { e: ReviewEntry }) {
-  const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence]
+  // Debug tooltip — the precise engine detail lives here (and in the bundle + SW logs); the visible
+  // card copy is the intuitive explainFill() line.
+  const tip = [e.widget_type, e.canonical_field, e.match_tier, e.flag, "confidence: " + e.confidence, e.detail]
     .filter(Boolean)
     .join("  ·  ");
   return <span className={clsx("ml-1 h-2 w-2 shrink-0 rounded-full", DOT[statusOf(e)])} title={tip} />;
@@ -1421,6 +1488,10 @@ function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
       : empties.length
         ? `Required fields on page ${pg} had no value in your profile, so the fill couldn't continue.`
         : `The fill stopped on page ${pg} before reaching the review page.`;
+  // "Edit my profile" only makes sense when a PROFILE VALUE is the problem (the form rejected a value,
+  // or a required field was empty). A cancellation — or any stop with no data problem detected — isn't a
+  // profile issue, so it gets a re-run message instead of pointing the operator at their profile.
+  const isDataProblem = errors.length > 0 || empties.length > 0;
   return (
     <div className="rounded-lg border border-signal/50 bg-signal/[0.07] px-5 py-4">
       <div className="flex items-start gap-3">
@@ -1449,10 +1520,22 @@ function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
             </p>
           )}
           <div className="flex flex-wrap items-center gap-3 pt-0.5">
-            <Link href="/app/profile" className="btn-ghost text-xs">
-              Edit my profile
-            </Link>
-            <span className="text-xs text-ink-faint">Fix the value on your profile, re-sync, then refill.</span>
+            {isDataProblem ? (
+              <>
+                <Link href="/app/profile" className="btn-ghost text-xs">
+                  Edit my profile
+                </Link>
+                <span className="text-xs text-ink-faint">
+                  {errors.length
+                    ? "Fix the value on your profile, re-sync, then refill."
+                    : "Add the missing value to your profile, re-sync, then refill."}
+                </span>
+              </>
+            ) : ws.cancelled ? (
+              <span className="text-xs text-ink-faint">Nothing&apos;s wrong with your data — just start the fill again from the extension.</span>
+            ) : (
+              <span className="text-xs text-ink-faint">Check that page on the form, then run the fill again — this is often a transient.</span>
+            )}
           </div>
         </div>
       </div>
@@ -1634,6 +1717,65 @@ function DeletedRow({ ix, onUndo }: { ix: number; onUndo: () => void }) {
       <button className="text-amber hover:underline" onClick={onUndo}>
         Undo
       </button>
+    </div>
+  );
+}
+
+// Phase 2 (delete-with-memory): an entry the fill DELETED because a required field couldn't be filled,
+// but whose values it REMEMBERED. The card shows the remembered fields (missing ones highlighted) + two
+// actions: "Add it back" reconstructs the entry PREFILLED (ctx.addBack); "Leave removed" accepts the
+// deletion (ctx.leaveRemoved). One or the other must happen before the app is submit-ready.
+function RemovedEntryCard({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
+  const remembered = e.remembered_fields || [];
+  const unfilled = new Set((e.unfilled_fields || []).map((u) => u.recName));
+  const accepted = !!e.is_approved;
+  return (
+    <div
+      ref={(n) => ctx.registerRow(e.field_id, n)}
+      className={clsx(
+        "mx-4 mb-3 rounded-lg border p-3",
+        accepted ? "border-hairline bg-panel-raised/40" : "border-amber/40 bg-amber/[0.06]"
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-[11px] uppercase tracking-label text-ink">
+          {accepted ? "✓ " : "⚠ "}
+          {e.question_label || "Entry removed"}
+        </span>
+        {accepted && (
+          <span className="font-mono text-[10px] uppercase tracking-label text-ink-faint">removed — accepted</span>
+        )}
+      </div>
+      {e.detail && <p className="mt-1 text-xs leading-relaxed text-ink-dim">{e.detail}</p>}
+      {remembered.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {remembered.map((f) => {
+            const missing = unfilled.has(f.recName) || f.value == null || String(f.value).trim() === "";
+            const isAi = typeof f.filled_by === "string" && f.filled_by.indexOf("ai-") === 0;
+            return (
+              <li key={f.recName} className="flex items-center gap-2 text-xs">
+                <span className="min-w-0 flex-1 truncate text-ink-faint">{f.label || f.recName}</span>
+                <span className={clsx("truncate text-right", missing ? "text-amber" : "text-ink")}>
+                  {missing ? "— you'll supply this —" : f.value}
+                </span>
+                {isAi && !missing && (
+                  <span className="shrink-0 rounded bg-amber/20 px-1 text-[10px] uppercase tracking-label text-amber">AI</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {!accepted && (
+        <div className="mt-3 flex items-center gap-2">
+          <button className="ap-add" onClick={() => ctx.addBack(e)}>
+            ↩ Add it back (prefilled)
+          </button>
+          <button className="btn-ghost text-xs" onClick={() => ctx.leaveRemoved(e)}>
+            Leave removed
+          </button>
+        </div>
+      )}
     </div>
   );
 }

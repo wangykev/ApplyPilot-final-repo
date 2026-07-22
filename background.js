@@ -116,9 +116,194 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // Resume removal: the website deleted the stored resume, so clear it here too
+  // (keeps the extension's IndexedDB in step with the website — the inverse of
+  // AP_SYNC_RESUME). Idempotent: no stored resume still resolves ok.
+  if (type === "AP_CLEAR_RESUME") {
+    (async () => {
+      try {
+        await deleteResume();
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      }
+    })();
+    return true;
+  }
+
+  // FULL-FLOW RUN (the website "Run" button). This is the ONE external message that
+  // ACTUATES — every other AP_* handler above only PERSISTS the handoff. It drives the
+  // whole pipeline hands-off: open the job link in a FRESH tab → grab the job description
+  // → Apply → sign-in / create-account → email verification (if the tenant needs it) →
+  // fill every page → STOP on the review page. It NEVER submits (runCdpWalk's double
+  // guard is untouched). Reachable only from an externally_connectable origin (localhost),
+  // so a random web page cannot trigger it. Mirrors the popup's RUN_CDP_ONBOARD chaining,
+  // but for a website-initiated run in its own tab, and always continues into the fill walk
+  // (the website Run button IS the explicit opt-in the popup's continueToWalk toggle gates).
+  if (type === "AP_RUN_APPLICATION") {
+    (async () => {
+      try {
+        const startUrl = typeof message.startUrl === "string" ? message.startUrl.trim() : "";
+        if (!/^https?:\/\/\S+$/i.test(startUrl)) {
+          sendResponse({ ok: false, error: "bad-url", detail: "Pass a full https:// job link." });
+          return;
+        }
+        const store = await new Promise((r) =>
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r)
+        );
+        if (!store.profile) {
+          sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
+          return;
+        }
+        const cfg = store.onboardConfig || {};
+        // Gmail auto-verify defaults ON for a website run (an email-verify tenant would otherwise
+        // halt); the message may override, and the stored toggle wins if explicitly OFF.
+        const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
+
+        // Open the job link in a new tab and wait for the first load to settle.
+        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: true }, res));
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const tabId = tab.id;
+        await waitTabComplete(tabId, 20000);
+        await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
+
+        // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
+        // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
+        let jd = null;
+        try {
+          const results = await chrome.scripting.executeScript({ target: { tabId }, func: scrapeJobDescription });
+          jd = (results && results[0] && results[0].result) || null;
+          console.log("[ApplyPilot][RUN] job description scraped:", jd ? `"${(jd.title || "").slice(0, 60)}" (${(jd.text || "").length} chars)` : "none");
+        } catch (e) {
+          console.log("[ApplyPilot][RUN] JD scrape skipped:", String((e && e.message) || e));
+        }
+
+        // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
+        // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
+        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        if (!onb.ok || !onb.reached_form) {
+          sendResponse({ ...onb, walked: false, jd, tabId, startUrl });
+          return;
+        }
+
+        console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
+        const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, store.jobContext || {});
+        // reportApplication (in the walk's finally) upserts the tracker row keyed by the BUNDLE url —
+        // the form page, which differs from the pasted startUrl once Apply/login navigates. Return that
+        // url so the web side saves the JD onto the SAME row instead of creating a second, empty one.
+        const { reviewSummary } = await new Promise((r) => chrome.storage.local.get("reviewSummary", r));
+        const reportedUrl = (reviewSummary && reviewSummary.url) || null;
+        sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl, reportedUrl });
+      } catch (e) {
+        sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      }
+    })();
+    return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
+  }
+
+  // Account sign-in credentials (email + password) → chrome.storage.local.credentials, the
+  // SAME slot the popup's "Load credentials" writes and runCdpOnboard reads for sign-in /
+  // create-account. Website-managed now (the Credentials page), autosynced like the profile.
+  // Both blank ⇒ CLEAR (so removing them on the site removes them here too). Persist only —
+  // no sign-in happens here.
+  if (type === "AP_SET_CREDENTIALS") {
+    const email = typeof message.email === "string" ? message.email.trim() : "";
+    const password = typeof message.password === "string" ? message.password : "";
+    if (!email && !password) {
+      chrome.storage.local.remove("credentials", () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true, cleared: true });
+      });
+      return true;
+    }
+    chrome.storage.local.set({ credentials: { email, password } }, () => {
+      const err = chrome.runtime.lastError;
+      sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+    });
+    return true;
+  }
+
+  // Onboarding config patch (e.g. { gmailEnabled }) → merged into chrome.storage.local.onboardConfig,
+  // read-modify-write exactly like the popup's onboarding toggles. The website surfaces the Gmail
+  // auto-verify toggle; continueToWalk/startUrl stay popup-only (the website Run passes the URL
+  // directly and always walks).
+  if (type === "AP_SET_ONBOARD_CONFIG") {
+    const patch = message.onboardConfig && typeof message.onboardConfig === "object" ? message.onboardConfig : null;
+    if (!patch) { sendResponse({ ok: false, error: "no onboardConfig" }); return true; }
+    chrome.storage.local.get("onboardConfig", ({ onboardConfig }) => {
+      chrome.storage.local.set({ onboardConfig: { ...(onboardConfig || {}), ...patch } }, () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+      });
+    });
+    return true;
+  }
+
+  // Gmail connect / status from the website. The OAuth itself is Chrome-owned (chrome.identity
+  // getAuthToken) and can only run in the extension — this lets the website TRIGGER it:
+  // interactive:true shows Chrome's account picker/consent (the "Connect" button); interactive:false
+  // is a silent check that reports whether a cached token already works (the status line on load).
+  // Reuses the same runGmailSmokeTest the popup's "Connect Gmail" uses → { ok, email, messagesTotal }.
+  if (type === "AP_GMAIL_CONNECT") {
+    (async () => {
+      const out = await runGmailSmokeTest(message.interactive !== false);
+      sendResponse(out);
+    })();
+    return true;
+  }
+
   sendResponse({ ok: false, error: "unknown message type: " + type });
   return true;
 });
+
+// Resolve once a tab finishes loading (status "complete"), bounded by timeoutMs. Resolves
+// either way — the caller's next step (JD scrape / onboarding scan) is itself guarded, so a
+// too-early return only costs a retry, never a wrong action. Used by AP_RUN_APPLICATION to
+// wait for the freshly-created job-link tab before scraping + onboarding.
+function waitTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpd); } catch (e) { /* ignore */ }
+      resolve();
+    };
+    const onUpd = (id, info) => { if (id === tabId && info.status === "complete") finish(); };
+    chrome.tabs.onUpdated.addListener(onUpd);
+    chrome.tabs.get(tabId, (t) => { if (!chrome.runtime.lastError && t && t.status === "complete") finish(); });
+    setTimeout(finish, timeoutMs || 20000);
+  });
+}
+
+// Injected into the job-description page (chrome.scripting, page context) to grab a best-effort
+// job description before Apply navigates away. Self-contained (closes over nothing). Workday JD
+// pages carry a jobPostingHeader/jobPostingDescription; company falls back to the tenant subdomain
+// (comcast.wd5.myworkdayjobs.com → "comcast"). All caps are generous but bounded.
+function scrapeJobDescription() {
+  const pick = (sels) => {
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      const t = el && ((el.innerText || el.textContent || "").trim());
+      if (t) return t;
+    }
+    return "";
+  };
+  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || (document.title || "").trim();
+  let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
+  if (!company) {
+    const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
+    if (m) company = m[1].replace(/[-_]+/g, " ");
+  }
+  const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
+  return {
+    title: title.slice(0, 300),
+    company: (company || "").slice(0, 120),
+    text: (body || "").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
+    url: location.href,
+    scrapedAt: new Date().toISOString(),
+  };
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
@@ -1850,6 +2035,28 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
   // SW does I/O) and hands them to the driver, which consults them before the AI pass.
   const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
+  // Let the flat field set finish rendering BEFORE the first fill pass. Workday form pages mount
+  // their fields progressively; on page 1 the walk enters straight from onboarding (no
+  // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
+  // slow-to-mount fields — they then get caught by the cascade re-scan and mis-tagged "REVEALED by
+  // an earlier field's value", which is misleading in review AND makes the submit gate force a second
+  // review of each. Poll cdpPageScan until the flat count holds steady across two consecutive
+  // non-zero reads (adaptive render-pacing, 12s ceiling); a page with no flat fields (repeating-only,
+  // e.g. My Experience) bails after a short all-zero grace so it never burns the ceiling. Genuine
+  // value-triggered cascades still appear only AFTER a commit → they stay the cascade re-scan's job.
+  {
+    let last = -1, stable = 0, zeroReads = 0;
+    const settleDeadline = Date.now() + 12000;
+    while (Date.now() < settleDeadline) {
+      let n = 0;
+      try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → keep polling */ }
+      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayRender(400); continue; }
+      zeroReads = 0;
+      if (n === last) { if (++stable >= 2) break; } else stable = 0;
+      last = n;
+      await act.delayRender(400);
+    }
+  }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
   LOG("page:", out.url);
@@ -2043,6 +2250,37 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       didSomething = true;
     }
 
+    // ── Tier 0 (websites, HARDCODED, DETERMINISTIC, no AI): the Workday phantom "You can't add
+    //    duplicate website URLs" bug — on repeat fills with the same account the backend keeps the
+    //    prior run's links, so a freshly-added URL is rejected as a duplicate of a link the FORM no
+    //    longer shows. Mirror of the dup-language tier: delete the website rows so Save & Continue
+    //    proceeds; the stale links may still surface on the review page, which is expected. NOTE the
+    //    prefix split — results are keyed `website[i].url`, but the DOM entry containers use the
+    //    `webAddress-` fkit prefix, so entryCount/clickDeleteEntry MUST use `webAddress-`. ──
+    if (!didSomething && isDuplicateWebsiteError(prevErrors)) {
+      const entries = websiteEntriesFromResults(out.results);
+      const plan = websiteDeletionPlan(entries);
+      LOG(`  attempt ${attempt} (Tier 0, dup-website ${plan.mode}): deleting ${plan.deleteIndices.length}/${entries.length} entry(ies) [${plan.summary}]`);
+      let deleted = 0;
+      for (const idx of plan.deleteIndices.slice().sort((a, b) => b - a)) { // highest-first → lower indices stay valid
+        const before = await act.entryCount("webAddress-");
+        if (before <= 0) break;
+        const clicked = await act.clickDeleteEntry("webAddress-", idx);
+        if (!clicked || !clicked.ok) break;
+        let now = before, polls = 0;
+        while (polls++ < 20) { now = await act.entryCount("webAddress-"); if (now < before) break; await act.delay(DEFAULT_BUDGETS.interFieldMs); }
+        if (now >= before) break; // NO PROGRESS (count didn't drop) → stop, don't spin the bound
+        deleted++;
+      }
+      mergeRemediationRecord(out, {
+        fieldName: "website.duplicate-fix", label: "Duplicate-website-URL workaround", widgetType: "remediation",
+        status: "needs_review", flag: "ai-remediation", after: null,
+        detail: `AI-4 hardcoded Workday duplicate-website-URL fix (${plan.mode}): deleted ${deleted}/${entries.length} entry(ies). Workday's stale links may still show on the review page — that's expected/acceptable. Removed: ${plan.summary}`
+      });
+      actions.push({ tier: 0, action: "delete-website-" + plan.mode, deleted, websites: plan.summary });
+      didSomething = true;
+    }
+
     // ── Tier 1 (DETERMINISTIC, no AI): re-fill the MAPPED fields the error TEXT names, from the
     //    profile, through the SAME drivePageFill path. Replaces the old anchor-click-to-focus
     //    (which didn't fire on Magna; the text-parse does). Unmapped named fields fall through to
@@ -2130,12 +2368,29 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       if (decision.action === "refill") {
         const f = scan.fields.find((x) => x.fieldName === decision.field);
         if (f) {
-          const r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+          let r, refillNote;
+          if (f.widgetType === "hierarchical") {
+            // Source is a click-TREE — NEVER flat-type the AI's guess ("job boards" is what that produced).
+            // Re-run the ordered drill from the profile's how_did_you_hear fallback (LinkedIn first) WITH
+            // the tree-drill AI context, so it drills category → recon leaves → pick leaf → commit. Required.
+            const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
+            const cands = hdyh && Array.isArray(hdyh.preferred) && (hdyh.preferred.length || hdyh.fallback)
+              ? [...hdyh.preferred, ...(hdyh.fallback ? [hdyh.fallback] : [])]
+              : [decision.value];
+            const aiForSource = act.aiEnabled
+              ? { profile, jobContext, isRequired: true, label: f.label, fieldName: f.fieldName, sourceTree: true }
+              : undefined;
+            r = await fillSourceCdp(act, { wrapperSel: f.wrapperSel }, cands, DEFAULT_BUDGETS, { ai: aiForSource, sourceTree: true });
+            refillNote = `AI-4 Tier-2 re-drill source from how_did_you_hear [${cands.slice(0, 3).join(", ")}…] — `;
+          } else {
+            r = await refillFieldWithValue(act, f, decision.value, DEFAULT_BUDGETS);
+            refillNote = `AI-4 Tier-2 refill "${decision.value}" — `;
+          }
           mergeRemediationRecord(out, Object.assign({ fieldName: f.fieldName, label: f.label, widgetType: f.widgetType }, r, {
             flag: "ai-remediation", status: r.status === "filled" ? "filled_review" : r.status,
-            detail: `AI-4 Tier-2 refill "${decision.value}" — ` + (r.detail || decision.reason || "")
+            detail: refillNote + (r.detail || decision.reason || "")
           }));
-          actions.push({ tier: 2, action: "refill", field: decision.field, value: decision.value });
+          actions.push({ tier: 2, action: "refill", field: decision.field, value: f.widgetType === "hierarchical" ? "(source drill)" : decision.value });
           didSomething = true;
         } else { LOG(`    AI named field "${decision.field}" not on the page — skipping.`); }
       } else if (decision.action === "delete_entry") {
@@ -2469,6 +2724,7 @@ async function runCdpReplayWalk(tabId, opts) {
 
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1; a clean finish / halt / review-terminal returns out of the function
     pagesReplayed = []; findings = { mismatches: [], cascadeRevealed: [] }; submitFired = false; // reset per attempt
+    let prevPageIdentity = null; // flat-fields+sections identity of the page just replayed — to catch a false "advanced" (see the same-page guard)
     for (let page = 1; page <= REPLAY_MAX_PAGES; page++) {
       walkPage = page;
       // ── TOP-OF-ITERATION guards (SUBMIT-NEVER: review terminal checked BEFORE any replay/click). ──
@@ -2556,13 +2812,23 @@ async function runCdpReplayWalk(tabId, opts) {
 
       LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
       await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const scan = await cdpEval(cdpPageScan);
       const fields = (scan && scan.fields) || [];
       const liveNames = fields.map((f) => f.fieldName);
       // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
       let rscanLive = null;
       try { rscanLive = await act.repeatingScan(); } catch (e) { /* no repeating substrate → flat-only match */ }
+      // ── SAME-PAGE GUARD (backstop for a premature "advanced"): if the live page is IDENTICAL to the
+      //    one just replayed — same flat field-set AND same repeating sections — then the prior Save &
+      //    Continue did NOT actually move the form (a slow/blocked transition read as advanced). NEVER
+      //    re-replay the same page; HALT honestly. Skips a wholly-empty (loading) scan. ──
+      const liveSecKey = rscanLive && rscanLive.sections ? Object.keys(rscanLive.sections).sort().join(",") : "";
+      const pageIdentity = liveNames.slice().sort().join(",") + "||" + liveSecKey;
+      if (prevPageIdentity !== null && (liveNames.length || liveSecKey) && pageIdentity === prevPageIdentity) {
+        LOG(`⚠ page ${page}: the form did NOT advance — the live page is IDENTICAL to the step just replayed (Save & Continue was blocked, or the transition didn't settle). HALT — never re-replaying the same page. Eyeball the form; a re-run usually clears a transient race.`);
+        return { ok: true, stopped: "did-not-advance", page, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+      }
+      prevPageIdentity = pageIdentity;
       const sel = selectPageBundleEntries(bundle.entries, liveNames, rscanLive);
       if (!sel.entries.length || sel.score <= 0) {
         const liveSecs = (rscanLive && rscanLive.sections) ? Object.keys(rscanLive.sections) : [];
@@ -2644,6 +2910,10 @@ async function runCdpReplayWalk(tabId, opts) {
         LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
         return { ok: true, stopped: "no-next-button", pages_replayed: pagesReplayed.length, pages: pagesReplayed };
       }
+      // Snapshot the transition signature AFTER the replay/refill (they mutate this page's field set —
+      // preferred name, Country cascade), so cdpWaitNextPage detects only a REAL Save & Continue and not
+      // the fill's own DOM changes (a pre-replay sig would FALSELY read "advanced" on a blocked page).
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       await cdpWakePage(); // wake a frozen hidden tab so the transition can run
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
@@ -2764,11 +3034,17 @@ async function runCdpPageRecon(tabId) {
 // refuses on the review marker. Review-page reached = SUCCESS (walked the whole app).
 // ============================================================================
 
-// Page signature for transition detection: url + the sorted formField name set
-// (the field-set delta is the load-bearing signal — pageId alone is shared across
-// pages on some tenants; dom-patterns).
+// Page signature for transition detection: URL PATHNAME (query stripped) + the sorted formField name
+// set. The field-set delta is the load-bearing signal (pageId alone is shared across pages on some
+// tenants; dom-patterns). The query is dropped for the SAME reason cdpPageKey drops it — a session /
+// tracking token in the query (Magna carries ?utm_source=…&ref=…) mutating mid-transition would flip
+// the sig and be read as a FALSE advance while the same page is still mounted. Pathname + field-set
+// means only a REAL page change (different questions) registers as an advance.
 function cdpPageSig(scan) {
-  return (scan && scan.fields) ? scan.url + "|" + scan.fields.map((f) => f.fieldName).sort().join(",") : null;
+  if (!scan || !scan.fields) return null;
+  let path = scan.url || "";
+  try { path = new URL(scan.url).pathname; } catch (e) { /* non-URL → keep raw (still stable) */ }
+  return path + "|" + scan.fields.map((f) => f.fieldName).sort().join(",");
 }
 
 // A CLEAN no-advance fallback (operator ask, 2026-07-10, Magna page 1): Save & Continue registered
@@ -2926,7 +3202,6 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
-      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
@@ -2964,6 +3239,13 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──
+      // Capture the transition signature AFTER the fill (not before it): the fill itself mutates this
+      // page's field set — leaving "preferred name" unchecked removes its two fields, a Country cascade
+      // adds/removes others — so a PRE-fill signature already differs from the settled post-fill DOM.
+      // With a stale pre-fill sig, cdpWaitNextPage FALSELY reads "advanced" when Save & Continue was
+      // actually BLOCKED (e.g. an invalid ZIP), and the walk re-fills the SAME page as a phantom next
+      // page. Snapshotting here means ONLY a real Save & Continue transition changes the signature.
+      const prevSig = cdpPageSig(await cdpEval(cdpPageScan));
       await cdpWakePage(); // wake a frozen hidden tab so the Save & Continue transition can run (hidden page-N→N+1 stall)
       const click = await act.clickPageNext();
       LOG(`page ${page} Save & Continue:`, JSON.stringify(click));
@@ -2989,7 +3271,17 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // error (sessionLooksDead already excluded above). Attempt BOUNDED remediation before the
         // dirty halt: Tier-0 dup-language / Tier-1 deterministic re-fill → Tier-2 AI, capped + halt-on-no-progress.
         if (res.errorDetected) LOG(`page ${page} Save & Continue blocked — error markers detected fast (~1s).`);
-        const rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        // OPERATOR RULE: with AI fill OFF, do NOT auto-remediate — the deterministic Tier-1/1.6 re-fill
+        // is the unwanted "refill on error" (and, pre-M-overwrite, a duplicate-page vector). Skip
+        // remediation entirely and HALT on any error the deterministic pass couldn't clear; only a
+        // harmless re-click (a SWALLOWED Save & Continue, never a re-fill) is still attempted below. AI
+        // ON keeps the full AI-4 remediation ladder.
+        let rem = { attempts: 0, advanced: false, reason: "ai-off (no remediation — halt on error)", actions: [] };
+        if (act.aiEnabled) {
+          rem = await remediatePageErrors(act, prepared, defaults, jobContext, out, pageKey, page, LOG);
+        } else {
+          LOG(`page ${page} nav-timeout with AI fill OFF — NOT re-filling the page (halt-on-error, operator rule). Only a re-click for a swallowed Save & Continue will be tried.`);
+        }
         // refresh the page-summary entry with the remediation outcome
         pagesFilled[pagesFilled.length - 1].remediation = { attempts: rem.attempts, advanced: !!rem.advanced, reason: rem.reason || null, actions: rem.actions };
         if (rem.sessionDead) {
@@ -3015,7 +3307,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
           continue;
         }
-        LOG(`⚠ nav-timeout on page ${page} — AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason}) ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        LOG(`⚠ nav-timeout on page ${page} — ${act.aiEnabled ? `AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason})` : "AI fill OFF (no re-fill — operator halt-on-error rule)"} ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
