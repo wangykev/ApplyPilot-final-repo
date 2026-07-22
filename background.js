@@ -2062,7 +2062,6 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       last = n;
       await act.delayFull(500);
     }
-    LOG(`field-set render settle: ${last < 0 ? 0 : last} flat field(s) stable after ${Date.now() - t0}ms (before first fill)`);
   }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
