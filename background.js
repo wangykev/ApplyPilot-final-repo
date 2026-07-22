@@ -289,11 +289,20 @@ function scrapeJobDescription() {
     }
     return "";
   };
-  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || (document.title || "").trim();
+  const clean = (s) => (s || "").replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+  const titleCase = (s) => clean(s).split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
+  // TITLE (deterministic, no AI): the posting header first; else the URL slug ".../<slug>_R<reqid>/…"
+  // (the most reliable source — e.g. "Junior-Full-Stack-Developer-Coop_R00244793" → "Junior Full Stack
+  // Developer Coop"); else the document title with any " | Company" suffix stripped.
+  const slugM = (location.pathname || "").match(/\/([^/]+)_R\d+(?:\/|$)/i);
+  const urlTitle = slugM ? clean(decodeURIComponent(slugM[1])) : "";
+  const docTitle = (document.title || "").split(/\s[|–—-]\s/)[0].trim();
+  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || urlTitle || docTitle;
+  // COMPANY: a company element if present; else the tenant subdomain, title-cased (magna → Magna).
   let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
   if (!company) {
     const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
-    if (m) company = m[1].replace(/[-_]+/g, " ");
+    if (m) company = titleCase(m[1]);
   }
   const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
   return {
@@ -2494,6 +2503,10 @@ async function reportApplication(bundle, jobContext) {
       company: (jobContext && jobContext.company) || bundle.tenant || null,
       role: null,
       url: bundle.url || null,
+      // Stable per-job dedup key (tenant + requisition id) — the raw url varies every run, so the
+      // backend upserts by (user_id, job_key) instead. See canonicalJobUrl (lib.js, lockstep with
+      // web/lib/job-key.ts). null when there's no url (report still works, falls back to url dedup).
+      job_key: bundle.url ? canonicalJobUrl(bundle.url) : null,
       status: needs > 0 ? "needs_review" : "filling",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),

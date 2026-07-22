@@ -5216,7 +5216,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, expandErrorSamples } = require("../lib.js");
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -5381,6 +5381,21 @@ test("AI-4 websiteDeletionPlan: a REAL duplicate URL (trailing-slash-insensitive
   const plan = websiteDeletionPlan(websiteEntriesFromResults(results));
   assert.strictEqual(plan.mode, "real");
   assert.deepStrictEqual(plan.deleteIndices, [2]);
+});
+
+test("canonicalJobUrl: jobs + site + instance/query variants of the same job collapse to ONE key", () => {
+  const posting = "https://magna.wd3.myworkdayjobs.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply";
+  const form = "https://magna.wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply/applyManually?locale=en_US";
+  const key = "magna.wd3:r00244793";
+  assert.strictEqual(canonicalJobUrl(posting), key, "posting (myworkdayjobs)");
+  assert.strictEqual(canonicalJobUrl(form), key, "form (myworkdaysite + instance tail + query)");
+});
+test("canonicalJobUrl: different reqs differ; non-Workday falls back to origin+path (no query/apply)", () => {
+  const base = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Foo_R111/apply";
+  const other = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Bar_R222/apply";
+  assert.notStrictEqual(canonicalJobUrl(base), canonicalJobUrl(other));
+  assert.strictEqual(canonicalJobUrl("https://careers.example.com/jobs/123/apply?x=1"), "https://careers.example.com/jobs/123");
+  assert.strictEqual(canonicalJobUrl(""), "");
 });
 
 // ── Read-back self-heal (in-fill retry + M40 re-fill) ───────────────────────
