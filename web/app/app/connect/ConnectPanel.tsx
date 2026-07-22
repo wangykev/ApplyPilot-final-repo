@@ -118,6 +118,33 @@ export function ConnectPanel({ initialExtId }: { initialExtId: string }) {
     }
     setSteps([...log]);
 
+    if (b.credentials.email || b.credentials.password) {
+      log.push(
+        rowFor(
+          "Sign-in credentials",
+          await sendToExtension(id, {
+            type: "AP_SET_CREDENTIALS",
+            email: b.credentials.email,
+            password: b.credentials.password,
+          })
+        )
+      );
+    } else {
+      log.push({ label: "Sign-in credentials", ok: null, msg: "none set — skipped" });
+    }
+    setSteps([...log]);
+
+    log.push(
+      rowFor(
+        "Gmail setting",
+        await sendToExtension(id, {
+          type: "AP_SET_ONBOARD_CONFIG",
+          onboardConfig: { gmailEnabled: b.onboardConfig.gmailEnabled },
+        })
+      )
+    );
+    setSteps([...log]);
+
     setSyncing(false);
     check();
   }

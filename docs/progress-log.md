@@ -772,3 +772,61 @@ not-flagged, and `deleteEmptyErrorRows` keep-value-holding-partial-row tests. Th
 on Magna** (fills LinkedIn deterministically once the tree loads). **Live-verify PENDING** (eyes-on,
 disposable app): the duplicate-overwrite, the AI-off halt, and the replay reload-recovery on a real
 Workday page.
+
+## 2026-07-21 — Website "Run" full-flow trigger (JD → onboard → walk → review) (branch `web-run-home-flow`)
+
+The website can now drive the WHOLE pipeline from one button — the missing link was a *trigger*: the
+extension's `onMessageExternal` contract only ever PERSISTED the handoff (`AP_PING`/`AP_SYNC_PROFILE`/
+`AP_SET_LLM`/`AP_SET_SESSION`/`AP_SYNC_RESUME`/`AP_CLEAR_RESUME`) — its comment literally said "NOTHING
+here fills or submits." Everything downstream already existed (`runCdpOnboard` → `runCdpWalk`, triggered
+only by the popup's `RUN_CDP_ONBOARD`).
+
+- **Extension — one new external message `AP_RUN_APPLICATION` (background.js).** The ONE external message
+  that ACTUATES (all the others only persist); reachable only from an `externally_connectable` origin
+  (localhost), so a random page can't fire it. It `chrome.tabs.create({url})` a FRESH tab, waits for load
+  (`waitTabComplete` + a hydration beat), scrapes the job description (`scrapeJobDescription`, injected via
+  `chrome.scripting` — jobPostingHeader/description + tenant-subdomain company fallback) BEFORE Apply
+  navigates away, then runs `runCdpOnboard(tabId,{startUrl:null,gmailEnabled,credentials})` on the
+  already-loaded page and — reached_form — ALWAYS chains into `runCdpWalk` (the website Run IS the explicit
+  opt-in the popup's `continueToWalk` toggle gates). Returns `{...onb, walked, walk, jd, tabId, startUrl}`.
+  The submit double-guard is UNTOUCHED — it stops at review, never submits. `runCdpOnboard`/`runCdpWalk`
+  themselves are unchanged (pure additive: +114 lines, 0 deletions).
+- **Web — a `/app/run` page** (`RunPanel.tsx` client + `page.tsx`): URL field + Run button →
+  `sendToExtension(extId,{type:"AP_RUN_APPLICATION",startUrl})` (same channel the Connect page uses), a
+  connected-here guard, a spinner-then-outcome card that translates the onboarding/walk `stopped` reasons to
+  friendly copy (`reached-review` → success; SSO/no-creds/verify/nav-timeout → "needs you"), a link to the
+  tracker row, and the captured JD (collapsible). Sidebar gains a **Run** entry (top, after Overview) + a
+  hero card on the `/app` overview.
+- **JD save** — migration `0006_job_description.sql` adds `applications.job_description`; the new server
+  action `saveRunJob` upserts by (user_id,url) — the same key the extension's report path uses — so it and
+  the walk's own status report converge on ONE row (never clobbers the review bundle; the report path never
+  clobbers the JD). Feeds the existing cover-letter generator + the tracker.
+
+Verified: `background.js` parses; web `tsc --noEmit` clean; `next build` green with `/app/run` compiled as
+a route. **Live-verify PENDING** (eyes-on, disposable app): the end-to-end website→extension round-trip on a
+real tenant (needs Supabase wired + `/app/connect` linked + Gmail connected for verify tenants). For a
+non-localhost deploy, add the prod origin to `manifest.json` `externally_connectable` (already a known TODO).
+
+## 2026-07-21 — Sign-in & email page: credentials + Gmail sync from the website (branch `web-run-home-flow`)
+
+The Run flow needs a Workday account to sign in with; until now that only came from `data/credentials.json`
+loaded in the popup. Added a website page that supplies it (and Gmail auto-verify) the same autosync way the
+profile/AI/resume already do.
+
+- **Extension — 3 new external messages (background.js, additive):** `AP_SET_CREDENTIALS` ({email,password}
+  → `chrome.storage.local.credentials`, the SAME slot the popup writes + `runCdpOnboard` reads; both blank ⇒
+  CLEAR); `AP_SET_ONBOARD_CONFIG` ({onboardConfig} merged read-modify-write, for the `gmailEnabled` toggle);
+  `AP_GMAIL_CONNECT` ({interactive}) → reuses the popup's `runGmailSmokeTest` — interactive:true pops Chrome's
+  account picker (the OAuth is Chrome-owned and can ONLY run in the extension; the website merely TRIGGERS it),
+  interactive:false is a silent "already connected?" check. Persist/trigger only — no sign-in happens here.
+- **Web — `/app/credentials` ("Sign-in & email"):** a credentials card (email + password, show/hide, dirty-gated
+  Save → `saveCredentials` + `liveSync("credentials")`) and a Gmail card (a `gmailEnabled` toggle that saves +
+  `liveSync("onboard")` on flip, a "Connect Gmail" button → `AP_GMAIL_CONNECT` interactive, and a silent status
+  line on mount). New `lib/credentials.ts` (zod `credentialsSchema` + `onboardConfigSchema`, mirroring the AI
+  pattern), server actions, `extension-sync` gains `credentials` + `onboard` kinds, migration `0007` adds
+  `profiles.credentials_json` + `onboard_config`. "Sync everything" (Connect) + the overview setup grid +
+  sidebar now include Sign-in. Password stored plaintext on the owner-only profile row — SAME posture as the
+  existing `ai_config` API key; the UI warns to use a throwaway account.
+
+Verified: `background.js` parses; web `tsc --noEmit` clean; `next build` green with `/app/credentials` +
+`/app/run` compiled. **Live-verify PENDING** with the round-trip (same gate as the Run entry above).

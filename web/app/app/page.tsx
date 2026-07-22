@@ -3,11 +3,13 @@ import {
   FileText,
   IdCard,
   Sparkles,
+  KeyRound,
   Cable,
   ListChecks,
   Activity,
   BarChart3,
   ArrowRight,
+  Rocket,
 } from "lucide-react";
 import { PageHeader } from "@/components/app/PageHeader";
 
@@ -34,9 +36,16 @@ const SETUP = [
     body: "Pick a model and add a key so the extension can answer screening questions for you.",
   },
   {
+    href: "/app/credentials",
+    icon: KeyRound,
+    step: "04",
+    title: "Sign-in & email",
+    body: "Add the Workday account to sign in with, and turn on Gmail auto-verify for tenants that email a link.",
+  },
+  {
     href: "/app/connect",
     icon: Cable,
-    step: "04",
+    step: "05",
     title: "Connect the extension",
     body: "Link your installed extension and sync your resume + profile straight into it.",
   },
@@ -50,6 +59,23 @@ export default function OverviewPage() {
         title="Get set up"
         description="Four steps to apply on autopilot. Work through them in order — each one feeds the extension."
       />
+
+      <Link
+        href="/app/run"
+        className="group bezel flex items-center gap-5 p-6 transition-colors hover:border-amber/40"
+      >
+        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-amber/10 text-amber">
+          <Rocket className="h-6 w-6" strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 className="font-display text-lg font-medium">Run an application</h2>
+          <p className="mt-1 text-sm leading-relaxed text-ink-dim">
+            Paste a Workday link and press Run — the extension applies, signs in, verifies email, and fills every
+            page through to review. Set up below first.
+          </p>
+        </div>
+        <ArrowRight className="hidden h-4 w-4 shrink-0 text-ink-dim transition-colors group-hover:text-amber sm:block" />
+      </Link>
 
       <div className="grid gap-4 sm:grid-cols-2">
         {SETUP.map((s) => (

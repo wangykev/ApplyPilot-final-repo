@@ -5216,7 +5216,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, expandErrorSamples } = require("../lib.js");
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, expandErrorSamples } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -5351,6 +5351,36 @@ test("AI-4 languageDeletionPlan: a REAL duplicate value → delete only the late
   const plan = languageDeletionPlan(languageEntriesFromResults(results));
   assert.strictEqual(plan.mode, "real");
   assert.deepStrictEqual(plan.deleteIndices, [2]); // keep the first English, delete the dupe — NOT all
+});
+
+test("AI-4 isDuplicateWebsiteError: matches the live 'duplicate website URLs' text; false otherwise", () => {
+  assert.strictEqual(isDuplicateWebsiteError(["Error-URLYou can't add duplicate website URLs."]), true);
+  assert.strictEqual(isDuplicateWebsiteError(["You can't add duplicate website URLs"]), true);
+  assert.strictEqual(isDuplicateWebsiteError(["Duplicate language entries are not allowed."]), false); // scoped to websites/URLs
+  assert.strictEqual(isDuplicateWebsiteError(["The field <URL> is required."]), false);
+  assert.strictEqual(isDuplicateWebsiteError([]), false);
+});
+test("AI-4 websiteDeletionPlan: distinct URLs → PHANTOM (delete all — the stale-backend bug)", () => {
+  const results = [
+    { fieldName: "website[0].url", after: "https://github.com/kevin" },
+    { fieldName: "website[1].url", after: "https://linkedin.com/in/kevin" }
+  ];
+  const entries = websiteEntriesFromResults(results);
+  assert.strictEqual(entries.length, 2);
+  assert.strictEqual(entries[0].summary, "https://github.com/kevin");
+  const plan = websiteDeletionPlan(entries);
+  assert.strictEqual(plan.mode, "phantom");
+  assert.deepStrictEqual(plan.deleteIndices.slice().sort(), [0, 1]); // ALL
+});
+test("AI-4 websiteDeletionPlan: a REAL duplicate URL (trailing-slash-insensitive) → delete only the later one", () => {
+  const results = [
+    { fieldName: "website[0].url", after: "https://github.com/kevin" },
+    { fieldName: "website[1].url", after: "https://linkedin.com/in/kevin" },
+    { fieldName: "website[2].url", after: "https://github.com/kevin/" } // same as [0] modulo trailing slash
+  ];
+  const plan = websiteDeletionPlan(websiteEntriesFromResults(results));
+  assert.strictEqual(plan.mode, "real");
+  assert.deepStrictEqual(plan.deleteIndices, [2]);
 });
 
 // ── Read-back self-heal (in-fill retry + M40 re-fill) ───────────────────────

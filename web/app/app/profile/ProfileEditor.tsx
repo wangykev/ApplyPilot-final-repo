@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useState, useMemo, useTransition } from "react";
 import { Plus, Trash2, Save, ShieldAlert, Settings2 } from "lucide-react";
 import {
   TextField,
@@ -93,12 +93,21 @@ const VETERAN_STATUS = opt(VETERAN_STATUS_OPTIONS);
 const DISABILITY_STATUS = opt(DISABILITY_STATUS_OPTIONS);
 
 export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
-  const [profile, setProfile] = useState<Profile>(() => ({
-    ...initial,
-    websites: withDefaultWebsites(initial.websites),
-    how_did_you_hear: withDefaultSources(initial.how_did_you_hear),
-  }));
+  // The seeded baseline (initial + default website/source rows). Used for BOTH the live
+  // profile state and the "last saved" snapshot the dirty check compares against, so applying
+  // those defaults on load never counts as an unsaved change.
+  const seededInitial = useMemo<Profile>(
+    () => ({
+      ...initial,
+      websites: withDefaultWebsites(initial.websites),
+      how_did_you_hear: withDefaultSources(initial.how_did_you_hear),
+    }),
+    [initial]
+  );
+  const [profile, setProfile] = useState<Profile>(seededInitial);
+  const [savedProfile, setSavedProfile] = useState<Profile>(seededInitial);
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
+  const [savedBuckets, setSavedBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
   // the Add / Advanced popup works on a DRAFT — nothing is written to `buckets` until Done.
   const [adv, setAdv] = useState<{ mode: "add" | "edit"; index: number; draft: Bucket } | null>(null);
@@ -114,12 +123,21 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       return next;
     });
 
+  // Save is enabled only when the profile or buckets differ from the last-saved snapshot
+  // (deep value compare — every edit goes through structuredClone / object spreads, so key
+  // order stays stable and JSON.stringify is a reliable equality test here).
+  const dirty =
+    JSON.stringify(profile) !== JSON.stringify(savedProfile) ||
+    JSON.stringify(buckets) !== JSON.stringify(savedBuckets);
+
   // One Save persists both the profile and the answer buckets edited via the labels.
   const save = () =>
     startTransition(async () => {
       setStatus({ kind: "idle" });
       const [pr, br] = await Promise.all([saveProfile(profile), saveBuckets(buckets)]);
       if (pr.ok && br.ok) {
+        setSavedProfile(profile); // new clean baseline → Save disables until the next edit
+        setSavedBuckets(buckets);
         setStatus({ kind: "ok", msg: "Saved" });
         liveSync("profile"); // push profile + buckets to a connected extension (no-op if not connected)
       } else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
@@ -523,14 +541,25 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <span
             className={clsx(
               "font-mono text-[11px] tracking-label",
-              status.kind === "ok" && "text-verified",
               status.kind === "err" && "text-signal",
-              status.kind === "idle" && "text-ink-faint"
+              !dirty && status.kind === "ok" && "text-verified",
+              (dirty || status.kind === "idle") && "text-ink-faint"
             )}
           >
-            {status.kind === "ok" ? "✓ SAVED" : status.kind === "err" ? status.msg : "EDITS ARE LOCAL UNTIL SAVED"}
+            {status.kind === "err"
+              ? status.msg
+              : dirty
+                ? "EDITS ARE LOCAL UNTIL SAVED"
+                : status.kind === "ok"
+                  ? "✓ SAVED"
+                  : "NO CHANGES TO SAVE"}
           </span>
-          <button onClick={save} disabled={pending} className="btn-primary">
+          <button
+            onClick={save}
+            disabled={pending || !dirty}
+            className="btn-primary"
+            title={!dirty ? "No changes to save" : undefined}
+          >
             <Save className="h-4 w-4" />
             {pending ? "Saving…" : "Save profile"}
           </button>

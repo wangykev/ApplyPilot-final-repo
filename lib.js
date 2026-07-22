@@ -423,6 +423,47 @@ function languageDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
+// AI-4 Tier-0 trigger: the Workday phantom "You can't add duplicate website URLs" bug. On repeat
+// fills with the same account Workday sometimes fails to clear the PRIOR run's website links on its
+// backend, so a freshly-added URL is rejected as a duplicate of a link the FORM no longer shows.
+// Handled like dup-language: delete the website rows so Save & Continue proceeds; the stale links may
+// still surface on the final review page, which is expected/acceptable (they're Workday's state, not
+// ours). NOT a catch-all "duplicate" match — scoped to website/URL text so real duplicate errors in
+// other sections aren't blindly deleted.
+function isDuplicateWebsiteError(errorTexts) {
+  return (Array.isArray(errorTexts) ? errorTexts : []).some((t) => /duplicate\s+(?:website|web\s?address)\s+urls?/i.test(String(t == null ? "" : t)));
+}
+
+// Parse the FILLED website entries out of a page's results (records keyed `website[i].url`) into
+// [{index, url, summary}] sorted by index.
+function websiteEntriesFromResults(results) {
+  const byIdx = {};
+  for (const r of (Array.isArray(results) ? results : [])) {
+    const m = /^website\[(\d+)\]\.url/.exec((r && r.fieldName) || "");
+    if (!m) continue;
+    const i = parseInt(m[1], 10);
+    (byIdx[i] = byIdx[i] || { index: i }).url = r.after;
+  }
+  return Object.keys(byIdx).map((k) => byIdx[k]).sort((a, b) => a.index - b.index)
+    .map((e) => ({ index: e.index, url: e.url || null, summary: e.url || "?" }));
+}
+
+// AI-4 Tier-0 plan for websites (DETERMINISTIC, no AI) — mirrors languageDeletionPlan: two entries
+// sharing a normalized URL ⇒ a REAL duplicate → delete only the later occurrence(s); all-distinct ⇒
+// the PHANTOM backend bug → delete ALL (the rejected URL isn't a visible in-form row to keep).
+function websiteDeletionPlan(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const seen = new Set(), dupes = [];
+  for (const e of list) {
+    const v = String((e && e.url) || "").trim().toLowerCase().replace(/\/+$/, "");
+    if (!v) continue;
+    if (seen.has(v)) dupes.push(e.index); else seen.add(v);
+  }
+  const summary = list.map((e) => e.summary).join(", ");
+  if (dupes.length) return { mode: "real", deleteIndices: dupes.slice(), summary };
+  return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
+}
+
 // US + Canada region name → postal abbreviation. Workday review pages render the address as ONE blob
 // with the abbreviation ("Tallahassee, FL"), not the spelled-out region a dropdown stored ("Florida"),
 // so a name↔abbrev equivalence stops a stored region from reading as a false "missing".
@@ -770,5 +811,5 @@ function looksLikeSso(state) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
 }

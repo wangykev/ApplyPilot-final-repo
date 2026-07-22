@@ -131,9 +131,179 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // FULL-FLOW RUN (the website "Run" button). This is the ONE external message that
+  // ACTUATES — every other AP_* handler above only PERSISTS the handoff. It drives the
+  // whole pipeline hands-off: open the job link in a FRESH tab → grab the job description
+  // → Apply → sign-in / create-account → email verification (if the tenant needs it) →
+  // fill every page → STOP on the review page. It NEVER submits (runCdpWalk's double
+  // guard is untouched). Reachable only from an externally_connectable origin (localhost),
+  // so a random web page cannot trigger it. Mirrors the popup's RUN_CDP_ONBOARD chaining,
+  // but for a website-initiated run in its own tab, and always continues into the fill walk
+  // (the website Run button IS the explicit opt-in the popup's continueToWalk toggle gates).
+  if (type === "AP_RUN_APPLICATION") {
+    (async () => {
+      try {
+        const startUrl = typeof message.startUrl === "string" ? message.startUrl.trim() : "";
+        if (!/^https?:\/\/\S+$/i.test(startUrl)) {
+          sendResponse({ ok: false, error: "bad-url", detail: "Pass a full https:// job link." });
+          return;
+        }
+        const store = await new Promise((r) =>
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r)
+        );
+        if (!store.profile) {
+          sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
+          return;
+        }
+        const cfg = store.onboardConfig || {};
+        // Gmail auto-verify defaults ON for a website run (an email-verify tenant would otherwise
+        // halt); the message may override, and the stored toggle wins if explicitly OFF.
+        const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
+
+        // Open the job link in a new tab and wait for the first load to settle.
+        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: true }, res));
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const tabId = tab.id;
+        await waitTabComplete(tabId, 20000);
+        await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
+
+        // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
+        // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
+        let jd = null;
+        try {
+          const results = await chrome.scripting.executeScript({ target: { tabId }, func: scrapeJobDescription });
+          jd = (results && results[0] && results[0].result) || null;
+          console.log("[ApplyPilot][RUN] job description scraped:", jd ? `"${(jd.title || "").slice(0, 60)}" (${(jd.text || "").length} chars)` : "none");
+        } catch (e) {
+          console.log("[ApplyPilot][RUN] JD scrape skipped:", String((e && e.message) || e));
+        }
+
+        // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
+        // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
+        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        if (!onb.ok || !onb.reached_form) {
+          sendResponse({ ...onb, walked: false, jd, tabId, startUrl });
+          return;
+        }
+
+        console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
+        const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, store.jobContext || {});
+        // reportApplication (in the walk's finally) upserts the tracker row keyed by the BUNDLE url —
+        // the form page, which differs from the pasted startUrl once Apply/login navigates. Return that
+        // url so the web side saves the JD onto the SAME row instead of creating a second, empty one.
+        const { reviewSummary } = await new Promise((r) => chrome.storage.local.get("reviewSummary", r));
+        const reportedUrl = (reviewSummary && reviewSummary.url) || null;
+        sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl, reportedUrl });
+      } catch (e) {
+        sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      }
+    })();
+    return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
+  }
+
+  // Account sign-in credentials (email + password) → chrome.storage.local.credentials, the
+  // SAME slot the popup's "Load credentials" writes and runCdpOnboard reads for sign-in /
+  // create-account. Website-managed now (the Credentials page), autosynced like the profile.
+  // Both blank ⇒ CLEAR (so removing them on the site removes them here too). Persist only —
+  // no sign-in happens here.
+  if (type === "AP_SET_CREDENTIALS") {
+    const email = typeof message.email === "string" ? message.email.trim() : "";
+    const password = typeof message.password === "string" ? message.password : "";
+    if (!email && !password) {
+      chrome.storage.local.remove("credentials", () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true, cleared: true });
+      });
+      return true;
+    }
+    chrome.storage.local.set({ credentials: { email, password } }, () => {
+      const err = chrome.runtime.lastError;
+      sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+    });
+    return true;
+  }
+
+  // Onboarding config patch (e.g. { gmailEnabled }) → merged into chrome.storage.local.onboardConfig,
+  // read-modify-write exactly like the popup's onboarding toggles. The website surfaces the Gmail
+  // auto-verify toggle; continueToWalk/startUrl stay popup-only (the website Run passes the URL
+  // directly and always walks).
+  if (type === "AP_SET_ONBOARD_CONFIG") {
+    const patch = message.onboardConfig && typeof message.onboardConfig === "object" ? message.onboardConfig : null;
+    if (!patch) { sendResponse({ ok: false, error: "no onboardConfig" }); return true; }
+    chrome.storage.local.get("onboardConfig", ({ onboardConfig }) => {
+      chrome.storage.local.set({ onboardConfig: { ...(onboardConfig || {}), ...patch } }, () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+      });
+    });
+    return true;
+  }
+
+  // Gmail connect / status from the website. The OAuth itself is Chrome-owned (chrome.identity
+  // getAuthToken) and can only run in the extension — this lets the website TRIGGER it:
+  // interactive:true shows Chrome's account picker/consent (the "Connect" button); interactive:false
+  // is a silent check that reports whether a cached token already works (the status line on load).
+  // Reuses the same runGmailSmokeTest the popup's "Connect Gmail" uses → { ok, email, messagesTotal }.
+  if (type === "AP_GMAIL_CONNECT") {
+    (async () => {
+      const out = await runGmailSmokeTest(message.interactive !== false);
+      sendResponse(out);
+    })();
+    return true;
+  }
+
   sendResponse({ ok: false, error: "unknown message type: " + type });
   return true;
 });
+
+// Resolve once a tab finishes loading (status "complete"), bounded by timeoutMs. Resolves
+// either way — the caller's next step (JD scrape / onboarding scan) is itself guarded, so a
+// too-early return only costs a retry, never a wrong action. Used by AP_RUN_APPLICATION to
+// wait for the freshly-created job-link tab before scraping + onboarding.
+function waitTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpd); } catch (e) { /* ignore */ }
+      resolve();
+    };
+    const onUpd = (id, info) => { if (id === tabId && info.status === "complete") finish(); };
+    chrome.tabs.onUpdated.addListener(onUpd);
+    chrome.tabs.get(tabId, (t) => { if (!chrome.runtime.lastError && t && t.status === "complete") finish(); });
+    setTimeout(finish, timeoutMs || 20000);
+  });
+}
+
+// Injected into the job-description page (chrome.scripting, page context) to grab a best-effort
+// job description before Apply navigates away. Self-contained (closes over nothing). Workday JD
+// pages carry a jobPostingHeader/jobPostingDescription; company falls back to the tenant subdomain
+// (comcast.wd5.myworkdayjobs.com → "comcast"). All caps are generous but bounded.
+function scrapeJobDescription() {
+  const pick = (sels) => {
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      const t = el && ((el.innerText || el.textContent || "").trim());
+      if (t) return t;
+    }
+    return "";
+  };
+  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || (document.title || "").trim();
+  let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
+  if (!company) {
+    const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
+    if (m) company = m[1].replace(/[-_]+/g, " ");
+  }
+  const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
+  return {
+    title: title.slice(0, 300),
+    company: (company || "").slice(0, 120),
+    text: (body || "").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
+    url: location.href,
+    scrapedAt: new Date().toISOString(),
+  };
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
@@ -1865,6 +2035,28 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
   // SW does I/O) and hands them to the driver, which consults them before the AI pass.
   const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
+  // Let the flat field set finish rendering BEFORE the first fill pass. Workday form pages mount
+  // their fields progressively; on page 1 the walk enters straight from onboarding (no
+  // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
+  // slow-to-mount fields — they then get caught by the cascade re-scan and mis-tagged "REVEALED by
+  // an earlier field's value", which is misleading in review AND makes the submit gate force a second
+  // review of each. Poll cdpPageScan until the flat count holds steady across two consecutive
+  // non-zero reads (adaptive render-pacing, 12s ceiling); a page with no flat fields (repeating-only,
+  // e.g. My Experience) bails after a short all-zero grace so it never burns the ceiling. Genuine
+  // value-triggered cascades still appear only AFTER a commit → they stay the cascade re-scan's job.
+  {
+    let last = -1, stable = 0, zeroReads = 0;
+    const settleDeadline = Date.now() + 12000;
+    while (Date.now() < settleDeadline) {
+      let n = 0;
+      try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → keep polling */ }
+      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayRender(400); continue; }
+      zeroReads = 0;
+      if (n === last) { if (++stable >= 2) break; } else stable = 0;
+      last = n;
+      await act.delayRender(400);
+    }
+  }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
   LOG("page:", out.url);
@@ -2055,6 +2247,37 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
         detail: `AI-4 hardcoded Workday duplicate-language fix (${plan.mode}): deleted ${deleted}/${entries.length} entry(ies) — re-add manually if needed: ${plan.summary}`
       });
       actions.push({ tier: 0, action: "delete-language-" + plan.mode, deleted, languages: plan.summary });
+      didSomething = true;
+    }
+
+    // ── Tier 0 (websites, HARDCODED, DETERMINISTIC, no AI): the Workday phantom "You can't add
+    //    duplicate website URLs" bug — on repeat fills with the same account the backend keeps the
+    //    prior run's links, so a freshly-added URL is rejected as a duplicate of a link the FORM no
+    //    longer shows. Mirror of the dup-language tier: delete the website rows so Save & Continue
+    //    proceeds; the stale links may still surface on the review page, which is expected. NOTE the
+    //    prefix split — results are keyed `website[i].url`, but the DOM entry containers use the
+    //    `webAddress-` fkit prefix, so entryCount/clickDeleteEntry MUST use `webAddress-`. ──
+    if (!didSomething && isDuplicateWebsiteError(prevErrors)) {
+      const entries = websiteEntriesFromResults(out.results);
+      const plan = websiteDeletionPlan(entries);
+      LOG(`  attempt ${attempt} (Tier 0, dup-website ${plan.mode}): deleting ${plan.deleteIndices.length}/${entries.length} entry(ies) [${plan.summary}]`);
+      let deleted = 0;
+      for (const idx of plan.deleteIndices.slice().sort((a, b) => b - a)) { // highest-first → lower indices stay valid
+        const before = await act.entryCount("webAddress-");
+        if (before <= 0) break;
+        const clicked = await act.clickDeleteEntry("webAddress-", idx);
+        if (!clicked || !clicked.ok) break;
+        let now = before, polls = 0;
+        while (polls++ < 20) { now = await act.entryCount("webAddress-"); if (now < before) break; await act.delay(DEFAULT_BUDGETS.interFieldMs); }
+        if (now >= before) break; // NO PROGRESS (count didn't drop) → stop, don't spin the bound
+        deleted++;
+      }
+      mergeRemediationRecord(out, {
+        fieldName: "website.duplicate-fix", label: "Duplicate-website-URL workaround", widgetType: "remediation",
+        status: "needs_review", flag: "ai-remediation", after: null,
+        detail: `AI-4 hardcoded Workday duplicate-website-URL fix (${plan.mode}): deleted ${deleted}/${entries.length} entry(ies). Workday's stale links may still show on the review page — that's expected/acceptable. Removed: ${plan.summary}`
+      });
+      actions.push({ tier: 0, action: "delete-website-" + plan.mode, deleted, websites: plan.summary });
       didSomething = true;
     }
 

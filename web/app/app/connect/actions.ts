@@ -5,6 +5,7 @@ import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
 import { coerceBuckets, STARTER_BUCKETS } from "@/lib/buckets";
 import { coerceAiConfig } from "@/lib/ai-config";
+import { coerceCredentials, coerceOnboardConfig, type Credentials, type OnboardConfig } from "@/lib/credentials";
 import { generateApiKey, hashApiKey } from "@/lib/api-key";
 
 /** The website→extension data slices (everything AP_SYNC_PROFILE / AP_SET_LLM /
@@ -22,6 +23,8 @@ export type SyncBundle = ProfileSlice &
   AiSlice &
   ResumeSlice & {
     session: { ingestUrl: string; ingestKey: string; reviewUrl: string };
+    credentials: Credentials;
+    onboardConfig: OnboardConfig;
   };
 
 export type BundleResult = { ok: true; bundle: SyncBundle } | { ok: false; error: string };
@@ -147,12 +150,14 @@ export async function getSyncBundle(): Promise<BundleResult> {
 
     const { data: prow } = await supabase
       .from("profiles")
-      .select("profile_json, job_context_json, ai_config, buckets_json")
+      .select("profile_json, job_context_json, ai_config, buckets_json, credentials_json, onboard_config")
       .eq("id", user.id)
       .maybeSingle();
 
     const profileSlice = shapeProfileSlice(prow);
     const aiSlice = shapeAiSlice(prow);
+    const credentials = coerceCredentials((prow as { credentials_json?: unknown } | null)?.credentials_json);
+    const onboardConfig = coerceOnboardConfig((prow as { onboard_config?: unknown } | null)?.onboard_config);
     const resume = await downloadResume(supabase, user.id);
 
     // mint a fresh ingest key (rotates prior keys); only the hash is stored
@@ -169,7 +174,7 @@ export async function getSyncBundle(): Promise<BundleResult> {
       reviewUrl: `${SITE_URL}/api/extension/review`,
     };
 
-    return { ok: true, bundle: { ...profileSlice, ...aiSlice, resume, session } };
+    return { ok: true, bundle: { ...profileSlice, ...aiSlice, resume, session, credentials, onboardConfig } };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }
