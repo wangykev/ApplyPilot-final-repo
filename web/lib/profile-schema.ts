@@ -14,8 +14,22 @@ import { z } from "zod";
 const str = z.string().default("");
 /** tri-state boolean: true / false / null (unanswered). For genuine yes/no QUESTIONS (work
  *  authorization, screening) where "unanswered" is meaningful — the tool leaves it blank rather
- *  than guess — and for languages[].fluent (null = auto-derive from reading∧speaking∧writing). */
-const triBool = z.boolean().nullable().default(null);
+ *  than guess — and for languages[].fluent (null = auto-derive from reading∧speaking∧writing).
+ *  TOLERANT of legacy string values ("yes"/"no"/"true"/"false"; anything else → null) — before
+ *  this, ONE string tri-bool anywhere failed the whole parse and coerceProfile silently returned
+ *  an EMPTY profile (hit live: the extension's data/profile.json carries string values here). */
+const triBool = z
+  .preprocess((v) => {
+    if (v === true || v === false || v === null) return v;
+    if (typeof v === "string") {
+      const t = v.trim().toLowerCase();
+      if (t === "true" || t === "yes" || t === "y") return true;
+      if (t === "false" || t === "no" || t === "n") return false;
+      return null; // "", "unknown", prose → unanswered
+    }
+    return null;
+  }, z.boolean().nullable())
+  .default(null);
 /** plain CHECKBOX boolean. A checkbox has no "unanswered" state on a form — it's checked or it isn't —
  *  so absent / null / legacy values coerce to false. Migrates old triBool nulls → false. */
 const bool = z
