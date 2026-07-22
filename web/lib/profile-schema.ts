@@ -130,10 +130,12 @@ export const howDidYouHearSchema = z
     // Deterministic fallback ladder for the "How did you hear about us?" source
     // picker — tried in order, most-preferred first, BEFORE the AI drill. The
     // primary/per-application answer is deferred, so this ladder is what fills.
-    // "Other" is the always-matching last resort → it lives in `fallback` (appended
-    // LAST), never in `preferred`, so it can't short-circuit LinkedIn/Handshake/GitHub.
-    preferred: z.array(z.string()).default(["LinkedIn", "Handshake", "GitHub"]),
-    fallback: z.string().default("Other"),
+    // "Other" ships as the LAST default entry — an always-matching catch-all most tenants
+    // offer, tried last so it can't short-circuit LinkedIn/Handshake/GitHub. The user can
+    // remove or reorder it. `fallback` is retained (default empty) ONLY for backward-compat
+    // with older stored profiles; the extension still appends it after `preferred` if non-empty.
+    preferred: z.array(z.string()).default(["LinkedIn", "Handshake", "GitHub", "Other"]),
+    fallback: z.string().default(""),
   })
   .default({});
 
