@@ -196,6 +196,57 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
   }
 
+  // Account sign-in credentials (email + password) → chrome.storage.local.credentials, the
+  // SAME slot the popup's "Load credentials" writes and runCdpOnboard reads for sign-in /
+  // create-account. Website-managed now (the Credentials page), autosynced like the profile.
+  // Both blank ⇒ CLEAR (so removing them on the site removes them here too). Persist only —
+  // no sign-in happens here.
+  if (type === "AP_SET_CREDENTIALS") {
+    const email = typeof message.email === "string" ? message.email.trim() : "";
+    const password = typeof message.password === "string" ? message.password : "";
+    if (!email && !password) {
+      chrome.storage.local.remove("credentials", () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true, cleared: true });
+      });
+      return true;
+    }
+    chrome.storage.local.set({ credentials: { email, password } }, () => {
+      const err = chrome.runtime.lastError;
+      sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+    });
+    return true;
+  }
+
+  // Onboarding config patch (e.g. { gmailEnabled }) → merged into chrome.storage.local.onboardConfig,
+  // read-modify-write exactly like the popup's onboarding toggles. The website surfaces the Gmail
+  // auto-verify toggle; continueToWalk/startUrl stay popup-only (the website Run passes the URL
+  // directly and always walks).
+  if (type === "AP_SET_ONBOARD_CONFIG") {
+    const patch = message.onboardConfig && typeof message.onboardConfig === "object" ? message.onboardConfig : null;
+    if (!patch) { sendResponse({ ok: false, error: "no onboardConfig" }); return true; }
+    chrome.storage.local.get("onboardConfig", ({ onboardConfig }) => {
+      chrome.storage.local.set({ onboardConfig: { ...(onboardConfig || {}), ...patch } }, () => {
+        const err = chrome.runtime.lastError;
+        sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+      });
+    });
+    return true;
+  }
+
+  // Gmail connect / status from the website. The OAuth itself is Chrome-owned (chrome.identity
+  // getAuthToken) and can only run in the extension — this lets the website TRIGGER it:
+  // interactive:true shows Chrome's account picker/consent (the "Connect" button); interactive:false
+  // is a silent check that reports whether a cached token already works (the status line on load).
+  // Reuses the same runGmailSmokeTest the popup's "Connect Gmail" uses → { ok, email, messagesTotal }.
+  if (type === "AP_GMAIL_CONNECT") {
+    (async () => {
+      const out = await runGmailSmokeTest(message.interactive !== false);
+      sendResponse(out);
+    })();
+    return true;
+  }
+
   sendResponse({ ok: false, error: "unknown message type: " + type });
   return true;
 });

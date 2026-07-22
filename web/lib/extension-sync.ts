@@ -15,6 +15,7 @@
 
 import { sendToExtension, extensionMessagingAvailable, type ExtResponse } from "./extension";
 import { getProfileSyncSlice, getAiSyncSlice, getResumeSyncSlice } from "@/app/app/connect/actions";
+import { getCredentialsSyncSlice, getOnboardSyncSlice } from "@/app/app/credentials/actions";
 
 // Same localStorage key the Connect page writes the pasted extension id to.
 export const EXT_ID_KEY = "applypilot.extensionId";
@@ -39,7 +40,7 @@ export function liveSyncActive(): boolean {
   return linkedExtensionId() !== null && extensionMessagingAvailable();
 }
 
-export type SyncKind = "profile" | "ai" | "resume" | "resume-clear";
+export type SyncKind = "profile" | "ai" | "resume" | "resume-clear" | "credentials" | "onboard";
 
 // Human label for the toast, per kind.
 const SYNC_LABEL: Record<SyncKind, string> = {
@@ -47,6 +48,8 @@ const SYNC_LABEL: Record<SyncKind, string> = {
   ai: "AI config",
   resume: "resume",
   "resume-clear": "resume",
+  credentials: "sign-in credentials",
+  onboard: "Gmail setting",
 };
 
 // ── Toast bus: a single <LiveSyncToast/> in the app shell listens for these. ──
@@ -72,6 +75,16 @@ async function buildMessage(kind: SyncKind): Promise<Built> {
     const r = await getAiSyncSlice();
     if (!r.ok) return r;
     return { ok: true, message: { type: "AP_SET_LLM", llmConfig: r.slice.llmConfig } };
+  }
+  if (kind === "credentials") {
+    const r = await getCredentialsSyncSlice();
+    if (!r.ok) return r;
+    return { ok: true, message: { type: "AP_SET_CREDENTIALS", email: r.slice.email, password: r.slice.password } };
+  }
+  if (kind === "onboard") {
+    const r = await getOnboardSyncSlice();
+    if (!r.ok) return r;
+    return { ok: true, message: { type: "AP_SET_ONBOARD_CONFIG", onboardConfig: { gmailEnabled: r.slice.gmailEnabled } } };
   }
   // resume (upload / replace)
   const r = await getResumeSyncSlice();

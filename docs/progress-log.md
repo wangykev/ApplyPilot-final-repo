@@ -806,3 +806,27 @@ Verified: `background.js` parses; web `tsc --noEmit` clean; `next build` green w
 a route. **Live-verify PENDING** (eyes-on, disposable app): the end-to-end website→extension round-trip on a
 real tenant (needs Supabase wired + `/app/connect` linked + Gmail connected for verify tenants). For a
 non-localhost deploy, add the prod origin to `manifest.json` `externally_connectable` (already a known TODO).
+
+## 2026-07-21 — Sign-in & email page: credentials + Gmail sync from the website (branch `web-run-home-flow`)
+
+The Run flow needs a Workday account to sign in with; until now that only came from `data/credentials.json`
+loaded in the popup. Added a website page that supplies it (and Gmail auto-verify) the same autosync way the
+profile/AI/resume already do.
+
+- **Extension — 3 new external messages (background.js, additive):** `AP_SET_CREDENTIALS` ({email,password}
+  → `chrome.storage.local.credentials`, the SAME slot the popup writes + `runCdpOnboard` reads; both blank ⇒
+  CLEAR); `AP_SET_ONBOARD_CONFIG` ({onboardConfig} merged read-modify-write, for the `gmailEnabled` toggle);
+  `AP_GMAIL_CONNECT` ({interactive}) → reuses the popup's `runGmailSmokeTest` — interactive:true pops Chrome's
+  account picker (the OAuth is Chrome-owned and can ONLY run in the extension; the website merely TRIGGERS it),
+  interactive:false is a silent "already connected?" check. Persist/trigger only — no sign-in happens here.
+- **Web — `/app/credentials` ("Sign-in & email"):** a credentials card (email + password, show/hide, dirty-gated
+  Save → `saveCredentials` + `liveSync("credentials")`) and a Gmail card (a `gmailEnabled` toggle that saves +
+  `liveSync("onboard")` on flip, a "Connect Gmail" button → `AP_GMAIL_CONNECT` interactive, and a silent status
+  line on mount). New `lib/credentials.ts` (zod `credentialsSchema` + `onboardConfigSchema`, mirroring the AI
+  pattern), server actions, `extension-sync` gains `credentials` + `onboard` kinds, migration `0007` adds
+  `profiles.credentials_json` + `onboard_config`. "Sync everything" (Connect) + the overview setup grid +
+  sidebar now include Sign-in. Password stored plaintext on the owner-only profile row — SAME posture as the
+  existing `ai_config` API key; the UI warns to use a throwaway account.
+
+Verified: `background.js` parses; web `tsc --noEmit` clean; `next build` green with `/app/credentials` +
+`/app/run` compiled. **Live-verify PENDING** with the round-trip (same gate as the Run entry above).
