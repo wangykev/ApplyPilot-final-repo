@@ -3753,8 +3753,11 @@ async function runCdpOnboard(tabId, opts) {
         // ENABLES/validates the Sign In submit a beat AFTER the fields fill, and a submit click has
         // no self-correcting gate (unlike fills/tab-clicks, which cdpRectReady/waitFor re-poll). A
         // scaled ~50ms wait on a visible tab clicked the not-yet-ready button and no-op'd ("it
-        // doesn't click the sign in", 2026-07-09). 500ms is the reference-proven value.
-        await cdpDelay(500);
+        // doesn't click the sign in", 2026-07-09). 500ms was the reference value; bumped to 1000ms
+        // after live runs still occasionally MISSED the first submit click — submitAndWait's re-click
+        // recovers it, but only after the ~20s outcome timeout, so a bigger pre-click settle is well
+        // worth the extra ~500ms on the happy path (sign-in happens once per application). 2026-07-22.
+        await cdpDelay(1000);
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
