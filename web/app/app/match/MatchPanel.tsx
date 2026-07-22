@@ -7,6 +7,7 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { TextAreaField } from "@/components/form/fields";
 import { clsx } from "@/lib/clsx";
 import { scoreMatch, type ScoreActionResult } from "./actions";
+import type { JdApplication } from "@/app/app/tailor/actions";
 import type { ScoreResult, Verdict } from "@/lib/score";
 
 const VERDICT: Record<Verdict, { label: string; cls: string; dot: string }> = {
@@ -15,11 +16,18 @@ const VERDICT: Record<Verdict, { label: string; cls: string; dot: string }> = {
   weak: { label: "Weak — probably skip", cls: "border-signal/40 text-signal", dot: "bg-signal" },
 };
 
-export function MatchPanel() {
+export function MatchPanel({ apps = [] }: { apps?: JdApplication[] }) {
   const [jd, setJd] = useState("");
+  const [appId, setAppId] = useState("");
   const [result, setResult] = useState<ScoreResult | null>(null);
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<{ text: string; aiLink?: boolean } | null>(null);
+
+  const pickApp = (id: string) => {
+    setAppId(id);
+    const app = apps.find((a) => a.id === id);
+    if (app) setJd(app.job_description);
+  };
 
   const run = () =>
     startTransition(async () => {
@@ -40,6 +48,25 @@ export function MatchPanel() {
         title="The job"
         subtitle="Paste the posting — ApplyPilot grades how well your profile fits, so you can decide whether it's worth your time."
       >
+        {apps.length > 0 && (
+          <label className="mb-4 block">
+            <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">
+              From a tracked application
+            </span>
+            <select
+              value={appId}
+              onChange={(e) => pickApp(e.target.value)}
+              className="mt-1.5 w-full appearance-none rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors focus:border-amber"
+            >
+              <option value="">Paste manually…</option>
+              {apps.map((a) => (
+                <option key={a.id} value={a.id} className="bg-panel">
+                  {[a.company, a.role].filter(Boolean).join(" — ") || a.url}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <TextAreaField
           label="Job description"
           value={jd}
