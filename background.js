@@ -2040,22 +2040,29 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
   // slow-to-mount fields — they then get caught by the cascade re-scan and mis-tagged "REVEALED by
   // an earlier field's value", which is misleading in review AND makes the submit gate force a second
-  // review of each. Poll cdpPageScan until the flat count holds steady across two consecutive
-  // non-zero reads (adaptive render-pacing, 12s ceiling); a page with no flat fields (repeating-only,
-  // e.g. My Experience) bails after a short all-zero grace so it never burns the ceiling. Genuine
-  // value-triggered cascades still appear only AFTER a commit → they stay the cascade re-scan's job.
+  // review of each.
+  //
+  // MUST poll on delayFull (REAL wall-clock), NOT delayRender: delayRender is adaptive and on a
+  // VISIBLE tab collapses to ~40ms, so three reads land within ~120ms — far faster than the page
+  // renders — and the count looks "stable" while only the first field (e.g. Country) exists, exactly
+  // the bug this is meant to fix. We are waiting on the PAGE's own render, which takes real time
+  // regardless of our pacing. Break only after the count holds UNCHANGED across 3 consecutive reads
+  // (~1.5s of no growth); bounded at 12s; a page with no flat fields (repeating-only, e.g. My
+  // Experience) bails after a short all-zero grace. Genuine value-triggered cascades still appear
+  // only AFTER a commit → they remain the cascade re-scan's job; this settles the INITIAL load only.
   {
     let last = -1, stable = 0, zeroReads = 0;
-    const settleDeadline = Date.now() + 12000;
-    while (Date.now() < settleDeadline) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12000) {
       let n = 0;
       try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → keep polling */ }
-      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayRender(400); continue; }
+      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayFull(500); continue; }
       zeroReads = 0;
-      if (n === last) { if (++stable >= 2) break; } else stable = 0;
+      if (n === last) { if (++stable >= 3) break; } else stable = 0;
       last = n;
-      await act.delayRender(400);
+      await act.delayFull(500);
     }
+    LOG(`field-set render settle: ${last < 0 ? 0 : last} flat field(s) stable after ${Date.now() - t0}ms (before first fill)`);
   }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
 
