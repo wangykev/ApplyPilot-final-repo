@@ -131,9 +131,123 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // FULL-FLOW RUN (the website "Run" button). This is the ONE external message that
+  // ACTUATES — every other AP_* handler above only PERSISTS the handoff. It drives the
+  // whole pipeline hands-off: open the job link in a FRESH tab → grab the job description
+  // → Apply → sign-in / create-account → email verification (if the tenant needs it) →
+  // fill every page → STOP on the review page. It NEVER submits (runCdpWalk's double
+  // guard is untouched). Reachable only from an externally_connectable origin (localhost),
+  // so a random web page cannot trigger it. Mirrors the popup's RUN_CDP_ONBOARD chaining,
+  // but for a website-initiated run in its own tab, and always continues into the fill walk
+  // (the website Run button IS the explicit opt-in the popup's continueToWalk toggle gates).
+  if (type === "AP_RUN_APPLICATION") {
+    (async () => {
+      try {
+        const startUrl = typeof message.startUrl === "string" ? message.startUrl.trim() : "";
+        if (!/^https?:\/\/\S+$/i.test(startUrl)) {
+          sendResponse({ ok: false, error: "bad-url", detail: "Pass a full https:// job link." });
+          return;
+        }
+        const store = await new Promise((r) =>
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r)
+        );
+        if (!store.profile) {
+          sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
+          return;
+        }
+        const cfg = store.onboardConfig || {};
+        // Gmail auto-verify defaults ON for a website run (an email-verify tenant would otherwise
+        // halt); the message may override, and the stored toggle wins if explicitly OFF.
+        const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
+
+        // Open the job link in a new tab and wait for the first load to settle.
+        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: true }, res));
+        if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+        const tabId = tab.id;
+        await waitTabComplete(tabId, 20000);
+        await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
+
+        // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
+        // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
+        let jd = null;
+        try {
+          const results = await chrome.scripting.executeScript({ target: { tabId }, func: scrapeJobDescription });
+          jd = (results && results[0] && results[0].result) || null;
+          console.log("[ApplyPilot][RUN] job description scraped:", jd ? `"${(jd.title || "").slice(0, 60)}" (${(jd.text || "").length} chars)` : "none");
+        } catch (e) {
+          console.log("[ApplyPilot][RUN] JD scrape skipped:", String((e && e.message) || e));
+        }
+
+        // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
+        // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
+        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        if (!onb.ok || !onb.reached_form) {
+          sendResponse({ ...onb, walked: false, jd, tabId, startUrl });
+          return;
+        }
+
+        console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
+        const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, store.jobContext || {});
+        sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl });
+      } catch (e) {
+        sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      }
+    })();
+    return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
+  }
+
   sendResponse({ ok: false, error: "unknown message type: " + type });
   return true;
 });
+
+// Resolve once a tab finishes loading (status "complete"), bounded by timeoutMs. Resolves
+// either way — the caller's next step (JD scrape / onboarding scan) is itself guarded, so a
+// too-early return only costs a retry, never a wrong action. Used by AP_RUN_APPLICATION to
+// wait for the freshly-created job-link tab before scraping + onboarding.
+function waitTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpd); } catch (e) { /* ignore */ }
+      resolve();
+    };
+    const onUpd = (id, info) => { if (id === tabId && info.status === "complete") finish(); };
+    chrome.tabs.onUpdated.addListener(onUpd);
+    chrome.tabs.get(tabId, (t) => { if (!chrome.runtime.lastError && t && t.status === "complete") finish(); });
+    setTimeout(finish, timeoutMs || 20000);
+  });
+}
+
+// Injected into the job-description page (chrome.scripting, page context) to grab a best-effort
+// job description before Apply navigates away. Self-contained (closes over nothing). Workday JD
+// pages carry a jobPostingHeader/jobPostingDescription; company falls back to the tenant subdomain
+// (comcast.wd5.myworkdayjobs.com → "comcast"). All caps are generous but bounded.
+function scrapeJobDescription() {
+  const pick = (sels) => {
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      const t = el && ((el.innerText || el.textContent || "").trim());
+      if (t) return t;
+    }
+    return "";
+  };
+  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || (document.title || "").trim();
+  let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
+  if (!company) {
+    const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$/i);
+    if (m) company = m[1].replace(/[-_]+/g, " ");
+  }
+  const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
+  return {
+    title: title.slice(0, 300),
+    company: (company || "").slice(0, 120),
+    text: (body || "").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
+    url: location.href,
+    scrapedAt: new Date().toISOString(),
+  };
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what

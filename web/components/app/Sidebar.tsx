@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
+  Rocket,
   FileText,
   FileSignature,
   IdCard,
@@ -20,6 +21,7 @@ import { clsx } from "@/lib/clsx";
 
 const PRIMARY = [
   { href: "/app", label: "Overview", icon: LayoutDashboard, exact: true },
+  { href: "/app/run", label: "Run", icon: Rocket },
   { href: "/app/resume", label: "Resume", icon: FileText },
   { href: "/app/cover-letter", label: "Cover letter", icon: FileSignature },
   { href: "/app/profile", label: "Profile", icon: IdCard },
