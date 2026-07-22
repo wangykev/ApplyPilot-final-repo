@@ -35,6 +35,7 @@ import {
   DISABILITY_STATUS_OPTIONS,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
+import { liveSync } from "@/lib/extension-sync";
 import { type Bucket } from "@/lib/buckets";
 import {
   type Profile,
@@ -118,8 +119,10 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
     startTransition(async () => {
       setStatus({ kind: "idle" });
       const [pr, br] = await Promise.all([saveProfile(profile), saveBuckets(buckets)]);
-      if (pr.ok && br.ok) setStatus({ kind: "ok", msg: "Saved" });
-      else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
+      if (pr.ok && br.ok) {
+        setStatus({ kind: "ok", msg: "Saved" });
+        liveSync("profile"); // push profile + buckets to a connected extension (no-op if not connected)
+      } else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
     });
 
   const pi = profile.personal_info;

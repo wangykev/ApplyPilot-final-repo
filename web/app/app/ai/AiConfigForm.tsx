@@ -7,6 +7,7 @@ import { SelectField, FieldLabel } from "@/components/form/fields";
 import { LLM_MODELS, LLM_DEFAULT_MODELS, LLM_PROVIDER_LABELS, type LlmProvider } from "@/lib/llm";
 import { PROVIDERS, type AiConfig } from "@/lib/ai-config";
 import { saveAiConfig, testLlm } from "./actions";
+import { liveSync } from "@/lib/extension-sync";
 import { clsx } from "@/lib/clsx";
 
 export function AiConfigForm({ initial }: { initial: AiConfig }) {
@@ -43,6 +44,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
       if (res.ok) {
         setSavedCfg(cfg); // now clean — Save disables until the next change
         setSaveMsg({ kind: "ok", text: "Saved" });
+        liveSync("ai"); // mirror the AI config into a connected extension (no-op if not connected)
       } else {
         setSaveMsg({ kind: "err", text: res.error });
       }

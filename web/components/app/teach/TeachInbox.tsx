@@ -13,6 +13,7 @@ import {
   isFuzzyTier,
 } from "@/lib/teach";
 import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
+import { liveSync } from "@/lib/extension-sync";
 import { saveDismissed, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
 import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
@@ -61,10 +62,12 @@ export function TeachInbox({
   const persistProfile = async (p: Profile) => {
     const r = await saveProfile(p);
     setPanelNote(r.ok ? "Saved ✓" : `Couldn't save: ${r.error}`);
+    if (r.ok) liveSync("profile"); // mirror the edit into a connected extension
   };
   const persistBuckets = async (b: Bucket[]) => {
     const r = await saveBuckets(b);
     setPanelNote(r.ok ? "Saved ✓" : `Couldn't save: ${r.error}`);
+    if (r.ok) liveSync("profile"); // profile slice carries buckets too
   };
   const onAnswerChange = (next: Profile) => {
     profileRef.current = next;
@@ -176,6 +179,7 @@ export function TeachInbox({
     }
     setSaving(false);
     if (ok) {
+      liveSync("profile"); // taught answer persisted — push profile + buckets to a connected extension
       setNote(r.toast);
       setConfirm(null);
       setNewOpen(false);

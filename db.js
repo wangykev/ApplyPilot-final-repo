@@ -66,8 +66,26 @@ async function getResume(key = RESUME_KEY) {
   }
 }
 
+// Delete a stored resume record. Used by the AP_CLEAR_RESUME handoff so removing
+// the resume on the website propagates to the extension (idempotent — deleting a
+// missing key is a no-op that still resolves).
+async function deleteResume(key = RESUME_KEY) {
+  const db = await openDB();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(RESUME_STORE, "readwrite");
+      tx.objectStore(RESUME_STORE).delete(key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
 // UMD-lite: export for the Node test runner; in the popup/SW `module` is undefined
 // so the functions simply stay as globals (from <script> / importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { openDB, saveResume, getResume, RESUME_KEY, RESUME_STORE, DB_NAME };
+  module.exports = { openDB, saveResume, getResume, deleteResume, RESUME_KEY, RESUME_STORE, DB_NAME };
 }
