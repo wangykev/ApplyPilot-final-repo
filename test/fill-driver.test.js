@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6839,6 +6839,30 @@ test("resolve: coercion matrix — a triBool answer is fillable as checkbox/radi
   // A plain string still passes through as a single candidate; empty string skips.
   assert.deepEqual(resolve("Male", "dropdown").candidates, ["Male"]);
   assert.equal(resolve("", "dropdown").skip, true);
+});
+
+test("boolLadderCandidates: a custom per-field yes/no ladder overrides the default; empty/absent → default", () => {
+  const profile = { answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: [] } } };
+  assert.deepEqual(boolLadderCandidates(profile, "screening.at_least_18_years_old", true), ["Yes", "True", "Affirmative"], "custom yes ladder used");
+  assert.deepEqual(boolLadderCandidates(profile, "screening.at_least_18_years_old", false), ["No", "False"], "empty no list → default");
+  assert.deepEqual(boolLadderCandidates(profile, "work_authorization.permanent_resident", true), ["Yes", "True"], "absent path → default");
+  assert.deepEqual(boolLadderCandidates({}, "x", false), ["No", "False"], "no answer_ladders map → default");
+  assert.deepEqual(boolLadderCandidates(null, "x", true), ["Yes", "True"], "null profile → default");
+  // blanks are filtered — an all-blank custom list falls back to the default
+  assert.deepEqual(boolLadderCandidates({ answer_ladders: { p: { yes: ["", "  "] } } }, "p", true), ["Yes", "True"], "all-blank custom → default");
+});
+
+test("bucket Mode A + custom answer_ladders: a yes/no dropdown fills the operator's custom label (Affirmative)", async () => {
+  // The full path: bucket Mode-A → boolean true → boolLadderCandidates(custom) → the ladder matches a
+  // tenant that labels the option "Affirmative" instead of Yes/True.
+  const field = { wrapperSel: "#aff", fieldName: "hashedAff", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Affirmative" }, { text: "Negative" }] };
+  const bucket = { id: "over_18", profile_path: "screening.at_least_18_years_old", value: [], widget_hint: "radio", questions: ["Are you over the age of 18?"], selectors: {} };
+  const profile = { screening: { at_least_18_years_old: true }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: ["No", "False"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "hashedAff");
+  assert.equal(rec.flag, "bucket", "filled deterministically from the bucket + custom ladder");
+  assert.equal(rec.after, "Affirmative", "the custom candidate matched the tenant's 'Affirmative' option");
 });
 
 test("bucket Mode A: a Yes/No triBool fills a DROPDOWN (boolean → Yes), not just radio — the over-18 legally-loaded bug", async () => {

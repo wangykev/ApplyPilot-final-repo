@@ -423,6 +423,20 @@ const resolve = (raw, widgetType) => {
   return { skip: true, reason: `unsupported widget type "${widgetType}"` };
 };
 
+// The candidate ladder for a boolean (yes/no) answer at `path`: the operator's editable per-field ladder
+// (profile.answer_ladders[path].yes|no, set on the website) when non-empty, else the default
+// ["Yes","True"] / ["No","False"]. Used for dropdown/radio/typeahead (a CHECKBOX uses the boolean
+// directly). resolve() has no field path, so callers that know the path (the mapped dispatch + a Mode-A
+// bucket) apply this after resolve. Empty/absent map → the same default resolve() already produces.
+function boolLadderCandidates(profile, path, boolVal) {
+  const key = boolVal ? "yes" : "no";
+  const map = profile && typeof profile.answer_ladders === "object" ? profile.answer_ladders : null;
+  const entry = map && path ? map[path] : null;
+  const custom = entry && Array.isArray(entry[key]) ? entry[key].map((c) => String(c)).filter((s) => s.trim() !== "") : null;
+  if (custom && custom.length) return custom;
+  return boolVal ? ["Yes", "True"] : ["No", "False"];
+}
+
 // ── "Previously employed here?" — company matcher (verbatim M12/M13.3 port).
 // "Yes" is NEVER asserted without a review flag (it sits beside a truthfulness
 // certification and unfurls follow-up fields).
@@ -2341,9 +2355,15 @@ function buildBucketIndex(buckets) {
 const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
   let arg;
   if (bucket.profile_path) {
-    const r = resolve(getByPath(profile, bucket.profile_path), f.widgetType);
+    const rawVal = getByPath(profile, bucket.profile_path);
+    const r = resolve(rawVal, f.widgetType);
     if (!r || r.skip) return null;
     arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
+    // A yes/no (boolean) answer on a text-matched widget uses the operator's editable per-field ladder
+    // (custom candidates → both Yes/No AND True/False by default); a checkbox keeps the boolean path.
+    if (typeof rawVal === "boolean" && (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead")) {
+      arg = boolLadderCandidates(profile, bucket.profile_path, rawVal);
+    }
   } else {
     // Mode B: `value` is a CANDIDATE LIST (most-specific first); a legacy single string is tolerated.
     const cands = (Array.isArray(bucket.value) ? bucket.value : (bucket.value != null ? [bucket.value] : []))
@@ -2489,7 +2509,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           record.status = "skipped";
           record.detail = r.reason || `empty value at ${mappedPath}`;
         } else {
-          const arg = r.value !== undefined ? r.value : r.candidates;
+          let arg = r.value !== undefined ? r.value : r.candidates;
+          // A mapped yes/no (boolean) answer on a text-matched widget uses the operator's editable
+          // per-field ladder (custom candidates → both Yes/No AND True/False by default); a checkbox
+          // is handled by its own branch above (uses the boolean directly).
+          if (typeof rawValue === "boolean" && (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead")) {
+            arg = boolLadderCandidates(profile, mappedPath, rawValue);
+          }
           record.resolved = arg;
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
@@ -5311,5 +5337,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

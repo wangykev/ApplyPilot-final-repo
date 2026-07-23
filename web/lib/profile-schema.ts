@@ -178,6 +178,16 @@ export const profileSchema = z.object({
   self_identification: selfIdentificationSchema,
   screening: screeningSchema,
   additional_files: z.array(additionalFileSchema).default([]),
+  // Editable per-field candidate "fill ladders" for yes/no (triBool) questions, keyed by field path
+  // (e.g. "screening.at_least_18_years_old"). The field itself stays a boolean; this holds the STRING
+  // candidates the extension tries against a dropdown/radio/typeahead option (a CHECKBOX still uses the
+  // boolean). Empty / absent for a path → the extension's default ["Yes","True"] / ["No","False"].
+  answer_ladders: z
+    .record(
+      z.string(),
+      z.object({ yes: z.array(z.string()).default([]), no: z.array(z.string()).default([]) }),
+    )
+    .default({}),
 });
 
 export type Profile = z.infer<typeof profileSchema>;

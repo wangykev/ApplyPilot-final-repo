@@ -259,21 +259,40 @@ export function TriBoolField({
   onChange,
   hint,
   bucketPath,
+  ladder,
+  onLadderChange,
 }: {
   label: string;
   value: boolean | null;
   onChange: (v: boolean | null) => void;
   hint?: string;
   bucketPath?: string;
+  /** Editable per-option fill ladders (custom candidates). Absent → the defaults are shown. */
+  ladder?: { yes: string[]; no: string[] };
+  /** When provided, the ladder popup is EDITABLE and persists via this callback; else it's view-only. */
+  onLadderChange?: (next: { yes: string[]; no: string[] }) => void;
 }) {
-  // Which option's fill ladder is revealed. Click an UNSELECTED option to select it; click the
-  // ALREADY-SELECTED option's word again to toggle its (view-only) ladder open/closed.
+  // Which option's fill-ladder popup is open. Click an UNSELECTED option to select it; click the
+  // ALREADY-SELECTED option's word again to open/close its ladder popup.
   const [ladderFor, setLadderFor] = useState<boolean | null>(null);
   const opts: { v: boolean; t: string }[] = [
     { v: true, t: "Yes" },
     { v: false, t: "No" },
   ];
   const escHint = value !== null ? (hint ? hint + " · Esc clears" : "Esc clears") : hint;
+
+  // The effective candidate list for a polarity: the operator's custom ladder if set, else the default
+  // ["Yes","True"] / ["No","False"] (kept in lockstep with the extension via boolAnswerCandidates).
+  const listFor = (v: boolean): string[] => {
+    const custom = v ? ladder?.yes : ladder?.no;
+    return custom && custom.length ? custom : boolAnswerCandidates(v ? "Yes" : "No");
+  };
+  const setListFor = (v: boolean, next: string[]) => {
+    if (!onLadderChange) return;
+    const base = { yes: ladder?.yes ?? [], no: ladder?.no ?? [] };
+    onLadderChange(v ? { ...base, yes: next } : { ...base, no: next });
+  };
+
   return (
     <div className="group">
       <FieldLabel hint={escHint} bucketPath={bucketPath} bucketWidget="radio">{label}</FieldLabel>
@@ -294,16 +313,16 @@ export function TriBoolField({
               key={String(o.v)}
               type="button"
               onClick={() => {
-                if (active) setLadderFor((f) => (f === o.v ? null : o.v)); // selected → toggle its ladder
+                if (active) setLadderFor((f) => (f === o.v ? null : o.v)); // selected → open/close its ladder popup
                 else { onChange(o.v); setLadderFor(null); }                // not selected → select it
               }}
-              title={active ? "Click again to see the fill ladder" : `Select ${o.t}`}
+              title={active ? "Click again to edit the fill ladder" : `Select ${o.t}`}
               aria-expanded={active ? ladderFor === o.v : undefined}
               className={clsx(
                 "flex-1 py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
                 active
-                  ? "bg-amber font-semibold text-cockpit" // bold, unmistakably selected
+                  ? "bg-amber font-semibold text-cockpit hover:bg-amber/80" // selected; hover shift hints "click again for the ladder"
                   : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
               )}
             >
@@ -313,25 +332,82 @@ export function TriBoolField({
         })}
       </div>
 
-      {/* Fill ladder (view-only) — the candidates the extension tries against the form's live options,
-          in order. Revealed by clicking the already-selected option's word (see onClick above). */}
       {ladderFor !== null && (
-        <div className="mt-1.5 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2 text-xs">
-          <p className="text-ink-dim">
-            Fill ladder for <span className="font-medium text-ink">{ladderFor ? "Yes" : "No"}</span> — the
-            extension tries these against the form&apos;s options, in order:
-          </p>
-          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-            {boolAnswerCandidates(ladderFor ? "Yes" : "No").map((c, i) => (
+        <TriBoolLadderPopup
+          fieldLabel={label}
+          polarity={ladderFor}
+          list={listFor(ladderFor)}
+          editable={!!onLadderChange}
+          onChange={(next) => setListFor(ladderFor, next)}
+          onClose={() => setLadderFor(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** The Yes/No "fill ladder" popup — the candidates the extension tries against a form's options when the
+ *  answer is this polarity. EDITABLE (add/remove/reorder via TieredField) when `onChange` persists; a
+ *  view-only chip list otherwise. Reached by clicking the already-selected Yes/No option again. */
+function TriBoolLadderPopup({
+  fieldLabel,
+  polarity,
+  list,
+  editable,
+  onChange,
+  onClose,
+}: {
+  fieldLabel: string;
+  polarity: boolean;
+  list: string[];
+  editable: boolean;
+  onChange: (next: string[]) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [onClose]);
+  const word = polarity ? "Yes" : "No";
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
+      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
+            {fieldLabel} — &ldquo;{word}&rdquo; fill ladder
+          </h3>
+          <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <p className="mb-3 text-xs leading-relaxed text-ink-dim">
+          When this answer is <span className="font-medium text-ink">{word}</span>, the extension tries these
+          against the form&apos;s options, in order.{editable ? " Add wordings a form might use (e.g. “Affirmative”)." : ""}
+        </p>
+        {editable ? (
+          <TieredField label="Candidates it tries (most-specific first)" value={list} onChange={onChange} />
+        ) : (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {list.map((c, i) => (
               <span key={c} className="flex items-center gap-1.5">
                 {i > 0 && <span className="text-ink-faint" aria-hidden>→</span>}
-                <span className="rounded border border-hairline bg-cockpit px-1.5 py-0.5 font-mono text-ink">{c}</span>
+                <span className="rounded border border-hairline bg-cockpit px-1.5 py-0.5 font-mono text-xs text-ink">{c}</span>
               </span>
             ))}
           </div>
-          <p className="mt-1.5 text-ink-faint">Matches whether the form labels the option Yes/No or True/False.</p>
+        )}
+        <p className="mt-3 text-xs text-ink-faint">
+          Matches whether the form labels the option Yes/No or True/False. Clear it to fall back to the default.
+        </p>
+        <div className="mt-4 flex justify-end">
+          <button type="button" onClick={onClose} className="btn-primary">
+            Done
+          </button>
         </div>
-      )}
+      </div>
     </div>
   );
 }
