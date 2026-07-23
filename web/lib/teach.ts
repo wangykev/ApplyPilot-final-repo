@@ -144,7 +144,13 @@ export function teachableCards(
     for (const e of app.bundle?.entries || []) {
       if (!isTeachable(e)) continue;
       const key = normalizeQuestion(e.question_label as string);
-      if (covered.has(key) || skipped.has(key) || seen.has(key)) continue;
+      // #4: a bucket "covers" a question only when it actually filled it. If THIS entry was AI-filled
+      // (flag ai-*), the bucket did NOT answer it this run — its saved value didn't match the tenant's
+      // options — so `covered` must not hide it: surface it so the operator can add the tenant's
+      // variant/wording. (A clean or fuzzy BUCKET fill, flag "bucket", stays covered — the bucket works.)
+      // skip (dismissed) + dedup (seen) still always apply.
+      const aiFilled = typeof e.flag === "string" && /^ai/i.test(e.flag);
+      if ((covered.has(key) && !aiFilled) || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
       // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
       // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).

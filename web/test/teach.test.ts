@@ -101,6 +101,19 @@ test("teachableCards: excludes non-approved / deterministic / essay / empty / al
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");
 });
 
+test("teachableCards: #4 — an AI-filled question still teaches even if a bucket nominally covers it", () => {
+  // The bucket has a value (so it 'covers' the wording), but the fill was AI (the saved value didn't
+  // match THIS tenant's options) → surface it so the operator can add the tenant's variant.
+  const bkt = bucket({ id: "edu", questions: ["Highest level of education"], value: ["Bachelor's Degree"] });
+  const aiEntry = entry({ question_label: "Highest level of education", widget_type: "dropdown", flag: "ai-choice", current_value: "Undergraduate Degree", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}).length, 1, "AI fill surfaces despite the covering bucket (#4)");
+  // A clean/fuzzy BUCKET fill (flag 'bucket') of the SAME covered question stays hidden — the bucket works.
+  const bucketEntry = entry({ question_label: "Highest level of education", widget_type: "dropdown", flag: "bucket", current_value: "Bachelor's Degree", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("b", [bucketEntry])], [bkt], {}).length, 0, "a bucket fill of a covered question stays hidden");
+  // And a skipped AI fill stays skipped even though it's covered+AI.
+  assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}, ["highest level of education"]).length, 0, "dismissed still wins");
+});
+
 test("teachableCards: a repeating entry's AI-filled field TEACHES; a deterministically-filled one does NOT", () => {
   // Operator rule (2026-07-21): the AI/manually-supplied field of a repeating entry is worth learning
   // (an AI-canonicalized education[0].degree teaches), but a clean deterministic fill isn't (already known).
