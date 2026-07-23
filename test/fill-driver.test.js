@@ -5216,7 +5216,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, expandErrorSamples } = require("../lib.js");
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -5381,6 +5381,24 @@ test("AI-4 websiteDeletionPlan: a REAL duplicate URL (trailing-slash-insensitive
   const plan = websiteDeletionPlan(websiteEntriesFromResults(results));
   assert.strictEqual(plan.mode, "real");
   assert.deepStrictEqual(plan.deleteIndices, [2]);
+});
+
+test("canonicalJobUrl: posting (tenant-subdomain) + logged-in form (tenant-in-path, myworkdaysite) collapse to ONE key", () => {
+  // posting: tenant in the SUBDOMAIN (magna.wd3.myworkdayjobs.com); form after login: tenant only in
+  // the PATH (host is bare wd3.myworkdaysite.com) + a per-application-instance tail + query. The
+  // data-center token "wd3" is the only common host part → both must key to "wd3:r00244793".
+  const posting = "https://magna.wd3.myworkdayjobs.com/en-US/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply";
+  const form = "https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply/applyManually?locale=en_US";
+  const key = "wd3:r00244793";
+  assert.strictEqual(canonicalJobUrl(posting), key, "posting (myworkdayjobs, tenant in subdomain)");
+  assert.strictEqual(canonicalJobUrl(form), key, "form (myworkdaysite, tenant in path, instance tail + query)");
+});
+test("canonicalJobUrl: different reqs differ; non-Workday falls back to origin+path (no query/apply)", () => {
+  const base = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Foo_R111/apply";
+  const other = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Bar_R222/apply";
+  assert.notStrictEqual(canonicalJobUrl(base), canonicalJobUrl(other));
+  assert.strictEqual(canonicalJobUrl("https://careers.example.com/jobs/123/apply?x=1"), "https://careers.example.com/jobs/123");
+  assert.strictEqual(canonicalJobUrl(""), "");
 });
 
 // ── Read-back self-heal (in-fill retry + M40 re-fill) ───────────────────────

@@ -830,3 +830,66 @@ profile/AI/resume already do.
 
 Verified: `background.js` parses; web `tsc --noEmit` clean; `next build` green with `/app/credentials` +
 `/app/run` compiled. **Live-verify PENDING** with the round-trip (same gate as the Run entry above).
+
+## 2026-07-22 — Run-tab hardening + teach-flow fixes (live-testing the website Run on Magna wd3) (branch `web-run-home-flow`)
+
+Follow-ups from live-testing the one-button website Run end-to-end. Web changes hot-reload; extension
+changes (`background.js`/`cdp.js`/`lib.js`) need an extension reload.
+
+**Onboarding sign-in.** The pre-submit settle before the FIRST "Sign In" click was a flat 500ms; a miss
+then stalled the full ~20s `submitAndWait` timeout before the re-click. Reworked into an escalating ladder:
+a 200ms pre-click settle, and `submitAndWait` now takes a per-attempt `timeouts` ladder — Sign In uses
+`[500, 20000]` (fast re-click at 500ms, then the full 20s for a genuinely slow sign-in). Happy path is
+200ms; a missed first click recovers in ~500ms. Create-Account submit unchanged.
+
+**Fill walk — Workday soft-error.** The transient "Something went wrong / please refresh" page had NO
+handling in the walk (only onboarding did) — after login the walk saw a form-less page, called it terminal,
+and stopped. Added `softErrorPresent` to `cdpReadSessionState` (lockstep with lib.js `isWorkdaySoftError`);
+the walk detects it at the top of each page AND at the post-fill terminal spot → `reloadAndSettle` +
+`continue restartWalk` (a refresh restarts the Workday form at page 1, so the walk restarts too), bounded
+at 3/run; a reload landing on the login page is caught by the existing `sessionLooksDead` guard.
+
+**Fill walk — render-settle.** The page-render settle added in the Run milestone polled on `act.delayRender`
+(adaptive → ~40ms on a visible tab), so it "confirmed stable" before the form rendered and most fields got
+cascade-mis-tagged. Switched to `act.delayFull` (real wall-clock) + require the flat field count unchanged
+across 3 reads. LIVE-VERIFIED on Magna ("14 flat field(s) stable after 3144ms").
+
+**Tracker — dedup + display.** (1) Re-running the same job piled up a new row each time: a Workday
+application url changes every run (after login the form is on `wdN.myworkdaysite.com` with a
+per-application-instance path). Fixed with a stable `job_key = "<datacenter>:r<reqid>"` (`canonicalJobUrl`,
+`lib.js` ↔ `web/lib/job-key.ts` lockstep) — the data-center token + requisition id is identical across the
+posting host (`<tenant>.wdN.myworkdayjobs.com`) and the form host (`wdN.myworkdaysite.com`).
+`reportApplication` + `saveRunJob` upsert by (user_id, job_key); migration `0008` adds the column. (First
+attempt keyed on the tenant SUBDOMAIN, which the myworkdaysite host lacks → split the two apart; the
+data-center token is the fix.) (2) The row showed the host, not company/title: the JD scrape
+(`chrome.scripting.executeScript`) is host-permission-gated and `host_permissions` lacked
+`myworkdaysite.com` → the scrape threw. Added `*://*.myworkdaysite.com/*`; `scrapeJobDescription` also
+derives the title from the URL slug + company from the tenant path segment. JD saved to
+`applications.job_description` (migration `0006`), shown via a "Job description" modal button on the
+review/detail page.
+
+**Profile.** Save is dirty-gated (disabled until profile/buckets actually change). "How did you hear about
+us?" — "Other" is now the last DEFAULT entry of the single source list; the separate "last resort" field is
+retired (kept in the schema, defaulted empty, for backward-compat). Added `web/supabase/schema.sql` — a
+consolidated one-paste snapshot of all migrations (the numbered files stay the source of truth).
+
+**Teach flow** (`isTeachable` = AI-filled + approved, or a manual edit — UNCHANGED throughout):
+- A **"Skipped (N)"** section reveals skipped teach cards + a Restore that drops them back into the queue.
+- **`coveredKeys(buckets, profile)`** — a bucket "covers" (hides from teach) a question ONLY when it can
+  actually answer it (Mode-A bound field non-empty, or Mode-B value non-empty). An empty/unanswered bucket
+  (e.g. the `over_18` starter bound to a blank `screening.at_least_18_years_old`, or a field the operator
+  removed) no longer hides its question → it resurfaces in teach with the "add it back" warning.
+- **#4:** an AI-filled entry is NOT hidden by `covered` even when a bucket nominally covers it (the AI fill
+  proves the bucket's saved value didn't match this tenant) → surface it so the operator can add the tenant
+  variant. A clean/fuzzy bucket fill stays covered; skip + dedup still apply.
+- The card recommends the matching Mode-A bucket's bound field (`bucket_path`) over the AI's `maps_to` hint
+  (which had hallucinated "education" for over-18); `profileValueAt` returns "" for object/array-of-objects
+  paths (no more "[object Object]").
+- Fixed a "Remember wording" popup flash: `commit()` applied the optimistic profile/bucket update while the
+  confirm popup was still open (→ `decideTeachRoute` flipped "answer"→"wording"); now it persists first and
+  applies the store update only on success, batched with closing the popup + advancing.
+
+Verified per change: extension unit suites green where runnable (fill-driver 443, session/onboarding + the
+lib-dependent suites); web `tsc --noEmit` clean + `next build` green. LIVE-VERIFIED on Magna wd3: the Run
+tab onboards → fills → soft-error recovers → reaches review; the tracker shows one row with company/title.
+Remaining: exercise more tenants; the JD-scrape host-permission covers myworkdayjobs + myworkdaysite only.

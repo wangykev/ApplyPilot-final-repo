@@ -74,14 +74,17 @@ function withDefaultWebsites(list: { type: string; url: string }[] | undefined) 
   });
   return [...fixed, ...arr]; // fixed defaults first, then any custom links
 }
-// The "How did you hear about us?" fallback ladder, shown pre-filled so the user
-// can see and edit it. Seeded ONLY when the stored list is empty (mirrors
-// withDefaultWebsites): a user who trimmed it to a non-empty list keeps theirs.
-const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub"];
+// The "How did you hear about us?" ladder, shown pre-filled so the user can see and edit it.
+// Seeded ONLY when the stored list is empty (mirrors withDefaultWebsites): a user who trimmed it
+// to a non-empty list keeps theirs. "Other" ships as the last default entry (the catch-all), so
+// there's no separate "last resort" field anymore.
+const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub", "Other"];
 function withDefaultSources(h: Profile["how_did_you_hear"] | undefined) {
   const preferred =
     Array.isArray(h?.preferred) && h!.preferred.length > 0 ? h!.preferred : [...DEFAULT_SOURCE_LADDER];
-  const fallback = (h?.fallback ?? "").trim() ? h!.fallback : "Other";
+  // fallback is legacy (kept in the schema for backward-compat with older profiles); no longer
+  // seeded or shown — the catch-all "Other" now lives in `preferred` as its last item.
+  const fallback = h?.fallback ?? "";
   return { preferred, fallback };
 }
 // Standard US EEO option sets (canonical lists live in lib/profile-fields.ts, shared with the teach
@@ -441,27 +444,19 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <p className="text-xs leading-relaxed text-ink-dim">
             The extension fills the <span className="text-ink">real source</span> when it&apos;s known
             (from how the job was queued). For a manually pasted link, or when no source is available, it
-            works down this fallback list <span className="text-ink">in order</span> — the first one the
-            form offers wins. The last resort below is tried only if none of these match.
+            works down this list <span className="text-ink">in order</span> — the first one the form offers
+            wins. <span className="text-ink">Other</span> comes last by default as a catch-all; remove or
+            reorder any of them.
           </p>
         </div>
         <TieredField
           label="Fallback sources (in order)"
           horizontal
-          hint="reorder with the ◄ ► arrows; the first one the form offers wins"
+          hint="reorder with the ◄ ► arrows; the first one the form offers wins — Other is the catch-all"
           value={profile.how_did_you_hear.preferred}
           placeholder="Add a source — e.g. LinkedIn"
           onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })}
         />
-        <div className="mt-4 sm:max-w-xs">
-          <TextField
-            label="Last resort"
-            hint="tried last, after the list above — a catch-all most forms offer"
-            value={profile.how_did_you_hear.fallback}
-            placeholder="Other"
-            onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })}
-          />
-        </div>
       </SectionCard>
 
       {/* Employment history companies — safety-critical */}

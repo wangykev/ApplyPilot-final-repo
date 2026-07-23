@@ -15,14 +15,17 @@ export function isBucketEligibleWidget(w?: string | null): boolean {
   return BUCKET_ELIGIBLE.has(String(w || ""));
 }
 
-/** Read a dotted profile path → a display string (a tiered array shows its first candidate). */
+/** Read a dotted profile path → a display string (a tiered array shows its first candidate). A path
+ *  that lands on an OBJECT or an array-of-objects (e.g. a whole repeating section like `education`) has
+ *  no scalar display → "" (guards against rendering "[object Object]"). */
 export function profileValueAt(profile: unknown, path: string): string {
   if (!path) return "";
   const v = String(path)
     .split(".")
     .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
-  if (Array.isArray(v)) return v.length ? String(v[0]) : "";
-  return v == null ? "" : String(v);
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.length && typeof v[0] !== "object" ? String(v[0]) : "";
+  return typeof v === "object" ? "" : String(v);
 }
 
 export type TeachCard = {
@@ -31,6 +34,7 @@ export type TeachCard = {
   answer: string; // the approved / edited value
   widget: string; // widget_type
   sensitive: boolean; // legally-loaded / EEO (from the flag)
+  bucket_path: string; // AUTHORITATIVE: the profile field a Mode-A bucket binds this question to (wording match), "" = none
   maps_to: string; // fill-time AI piggyback hint: the profile field this Q maps to ("" = none)
   canonical_field: string; // the field's MAPPED home (FIELD_MAP), if any — a KNOWN target, no LLM needed
   match_tier: string; // how it filled ("containment"/"fuzzy-NN"/…) — a fuzzy/containment tier ⇒ possible typo/variant
@@ -53,6 +57,20 @@ export function isFuzzyTier(matchTier?: string | null): boolean {
  *  and can't be edited. A flat path (no brackets) passes through unchanged. */
 export function dottedPath(path?: string | null): string {
   return String(path == null ? "" : path).replace(/\[(\d+)\]/g, ".$1");
+}
+
+/** The profile field a Mode-A bucket binds this question (by matching wording) to — the AUTHORITATIVE
+ *  mapping (a bucket the operator or the starter set defined), preferred over a FIELD_MAP guess or the
+ *  AI's `maps_to` hint. This is what fixes e.g. the over-18 card recommending its real field
+ *  (screening.at_least_18_years_old) instead of the AI's hallucinated "education". "" when no Mode-A
+ *  bucket wording matches. */
+export function bucketBindingFor(buckets: Bucket[], questionKey: string): string {
+  for (const b of buckets || []) {
+    const path = String(b.profile_path || "").trim();
+    if (!path) continue; // Mode-B (no bound field) → nothing to recommend
+    if ((b.questions || []).some((q) => normalizeQuestion(q) === questionKey)) return dottedPath(path);
+  }
+  return "";
 }
 
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
@@ -92,12 +110,37 @@ function isTeachable(e: ReviewEntry): boolean {
   );
 }
 
-/** Normalized wordings already covered by SOME bucket (so a taught question won't reappear). */
-export function coveredKeys(buckets: Bucket[]): Set<string> {
+/** Whether a bucket would actually PRODUCE an answer — so it truly "covers" its questions.
+ *  Mode-A (bound to a profile field) needs that field to hold a value; Mode-B needs a non-empty
+ *  `value`. An EMPTY / unanswered bucket (e.g. the `over_18` starter bound to a profile field the
+ *  operator left blank or ACCIDENTALLY REMOVED) does NOT cover: the fill can't use it (it AI-guesses
+ *  instead), so the question must resurface in teach — where the operator is notified (the card's
+ *  "no profile value" warning) and can add it back. Otherwise it's invisible to teach AND re-guessed
+ *  on every fill, with no way to fix it except hunting through the profile. */
+export function bucketAnswers(b: Bucket, profile: unknown): boolean {
+  const path = String(b.profile_path || "").trim();
+  if (path) {
+    const raw = rawAt(profile, dottedPath(path)); // Mode-A → the bound profile value
+    if (raw == null) return false;
+    if (Array.isArray(raw)) return raw.some((v) => String(v).trim() !== "");
+    if (typeof raw === "string") return raw.trim() !== "";
+    return true; // boolean / number is a real answer (e.g. a triBool "No" / false)
+  }
+  const val = (b as { value?: unknown }).value; // Mode-B → its own candidate value
+  if (Array.isArray(val)) return val.some((v) => String(v).trim() !== "");
+  return String(val == null ? "" : val).trim() !== "";
+}
+
+/** Normalized wordings covered by an ANSWERABLE bucket (an empty/unanswered bucket does NOT hide its
+ *  questions — see bucketAnswers). Takes the profile to resolve Mode-A buckets' bound values. */
+export function coveredKeys(buckets: Bucket[], profile: unknown): Set<string> {
   const s = new Set<string>();
-  for (const b of buckets) for (const q of b.questions || []) {
-    const k = normalizeQuestion(q);
-    if (k) s.add(k);
+  for (const b of buckets) {
+    if (!bucketAnswers(b, profile)) continue;
+    for (const q of b.questions || []) {
+      const k = normalizeQuestion(q);
+      if (k) s.add(k);
+    }
   }
   return s;
 }
@@ -111,7 +154,7 @@ export function teachableCards(
   profile: unknown,
   dismissed?: Iterable<string>,
 ): TeachCard[] {
-  const covered = coveredKeys(buckets);
+  const covered = coveredKeys(buckets, profile);
   const skipped = new Set<string>(dismissed || []);
   const seen = new Set<string>();
   const cards: TeachCard[] = [];
@@ -119,19 +162,27 @@ export function teachableCards(
     for (const e of app.bundle?.entries || []) {
       if (!isTeachable(e)) continue;
       const key = normalizeQuestion(e.question_label as string);
-      if (covered.has(key) || skipped.has(key) || seen.has(key)) continue;
+      // #4: a bucket "covers" a question only when it actually filled it. If THIS entry was AI-filled
+      // (flag ai-*), the bucket did NOT answer it this run — its saved value didn't match the tenant's
+      // options — so `covered` must not hide it: surface it so the operator can add the tenant's
+      // variant/wording. (A clean or fuzzy BUCKET fill, flag "bucket", stays covered — the bucket works.)
+      // skip (dismissed) + dedup (seen) still always apply.
+      const aiFilled = typeof e.flag === "string" && /^ai/i.test(e.flag);
+      if ((covered.has(key) && !aiFilled) || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
       // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
       // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).
+      const bucket_path = bucketBindingFor(buckets, key); // authoritative Mode-A binding (wording match)
       const maps_to = dottedPath(e.maps_to || "");
       const canonical_field = dottedPath(e.canonical_field || "");
-      const known = canonical_field || maps_to; // the deterministic mapped home wins over the AI hint
+      const known = bucket_path || canonical_field || maps_to; // bucket binding wins, then FIELD_MAP, then the AI hint
       cards.push({
         key,
         question: e.question_label as string,
         answer: String(e.current_value),
         widget: String(e.widget_type || "text"),
         sensitive: typeof e.flag === "string" && /sensitive|eeo/.test(e.flag),
+        bucket_path,
         maps_to,
         canonical_field,
         match_tier: e.match_tier || "",

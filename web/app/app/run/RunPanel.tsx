@@ -116,9 +116,10 @@ export function RunPanel() {
     let appId: string | null = null;
     try {
       const saved = await saveRunJob({
-        // Prefer the URL the extension actually reported the tracker row under (the form page after
-        // Apply/login navigation) so the JD lands on that SAME row instead of a second empty one.
-        url: (resp.reportedUrl as string) || startUrl,
+        // The pasted posting URL — saveRunJob derives a stable job_key from it (tenant + req id) that
+        // matches the extension's report key, so both converge on ONE tracker row across runs, and it
+        // stays the durable clickable link (unlike the ephemeral form url).
+        url: startUrl,
         company: jd?.company,
         role: jd?.title,
         jobDescription: jd?.text,

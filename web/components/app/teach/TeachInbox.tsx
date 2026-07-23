@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine } from "lucide-react";
+import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine, ChevronDown, RotateCcw } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
 import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
@@ -26,11 +26,13 @@ const BASE_CATEGORIES = ["Screening", "Work authorization", "Demographics", "Per
 
 export function TeachInbox({
   initialCards,
+  initialSkipped,
   initialBuckets,
   initialDismissed,
   profile: initialProfile,
 }: {
   initialCards: TeachCard[];
+  initialSkipped: TeachCard[];
   initialBuckets: Bucket[];
   initialDismissed: string[];
   profile: Profile;
@@ -39,6 +41,9 @@ export function TeachInbox({
   const [done, setDone] = useState(0);
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
   const [dismissed, setDismissed] = useState<string[]>(initialDismissed);
+  // Cards the user SKIPPED — shown in a collapsible "Skipped" section so they can be restored.
+  const [skipped, setSkipped] = useState<TeachCard[]>(initialSkipped);
+  const [showSkipped, setShowSkipped] = useState(false);
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   // the three add surfaces: the end-step confirm popup (a chosen target), the "wrong field" picker, and
@@ -82,7 +87,10 @@ export function TeachInbox({
 
   // The recommendation, in precedence order: the field's KNOWN mapped home (canonical_field) →
   // the fill-time AI hint (maps_to) → the teach-time LLM fallback (only when nothing is known).
-  const stampedPath = card ? card.canonical_field || card.maps_to : "";
+  // A Mode-A bucket that already binds this question's wording to a profile field is AUTHORITATIVE
+  // (the over_18 starter → screening.at_least_18_years_old) — prefer it over a FIELD_MAP home or the
+  // AI's maps_to hint, which can be wrong (e.g. hallucinating "education" for the age question).
+  const stampedPath = card ? card.bucket_path || card.canonical_field || card.maps_to : "";
   const fallback = card && !stampedPath ? recCache[card.key] : undefined;
   const recPath = stampedPath || (fallback ? fallback.maps_to : "");
   const recCat = card ? card.suggested_category || (fallback ? fallback.suggested_category : "") : "";
@@ -160,8 +168,11 @@ export function TeachInbox({
     setSaving(true);
     let ok = true;
     let err = "";
+    // Persist FIRST; apply the optimistic store updates only on success, in the SAME batch that closes
+    // the popup + advances. Updating `profile`/`buckets` while the confirm popup is STILL OPEN made it
+    // re-render — the field now held the answer, so decideTeachRoute flipped "answer" → "wording" and
+    // flashed a spurious "Remember wording — …" screen for the length of the save. (2026-07-23)
     if (r.buckets) {
-      setBuckets(r.buckets);
       const res = await saveBuckets(r.buckets);
       if (!res.ok) {
         ok = false;
@@ -169,8 +180,6 @@ export function TeachInbox({
       }
     }
     if (ok && r.profile) {
-      setProfile(r.profile);
-      profileRef.current = r.profile;
       const res = await saveProfile(r.profile);
       if (!res.ok) {
         ok = false;
@@ -179,6 +188,11 @@ export function TeachInbox({
     }
     setSaving(false);
     if (ok) {
+      if (r.buckets) setBuckets(r.buckets);
+      if (r.profile) {
+        setProfile(r.profile);
+        profileRef.current = r.profile;
+      }
       liveSync("profile"); // taught answer persisted — push profile + buckets to a connected extension
       setNote(r.toast);
       setConfirm(null);
@@ -195,9 +209,23 @@ export function TeachInbox({
       const next = Array.from(new Set([...dismissed, card.key]));
       setDismissed(next);
       void saveDismissed(next);
+      // keep the card so it shows in the "Skipped" section (restorable) without a refresh
+      setSkipped((s) => (s.some((x) => x.key === card.key) ? s : [card, ...s]));
     }
     setNote(null);
     advance();
+  };
+
+  // Un-skip: drop the key from the dismissed set (persist), pull it out of the Skipped list, and
+  // put the card back at the END of the active queue (so it never jumps the card you're on).
+  const restore = (c: TeachCard) => {
+    const next = dismissed.filter((k) => k !== c.key);
+    setDismissed(next);
+    void saveDismissed(next);
+    handledRef.current.delete(c.key); // allow the background poll to see it again if it leaves the queue
+    setSkipped((s) => s.filter((x) => x.key !== c.key));
+    setCards((prev) => (prev.some((x) => x.key === c.key) ? prev : [...prev, c]));
+    setNote(null);
   };
 
   // ── new-answer popup (shared with the profile page) ──
@@ -229,6 +257,7 @@ export function TeachInbox({
   };
 
   return (
+    <div className="space-y-6">
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
       {/* LEFT — the current teach card */}
       {!card ? (
@@ -393,6 +422,45 @@ export function TeachInbox({
           onCancel={() => setNewOpen(false)}
           onDelete={() => setNewOpen(false)}
         />
+      )}
+    </div>
+
+      {/* SKIPPED — questions you passed on, collapsible, restorable back into the queue */}
+      {skipped.length > 0 && (
+        <div className="bezel p-5">
+          <button
+            type="button"
+            onClick={() => setShowSkipped((v) => !v)}
+            className="flex w-full items-center justify-between text-left"
+          >
+            <span className="flex items-center gap-2 text-sm text-ink">
+              <SkipForward className="h-4 w-4 text-ink-dim" />
+              Skipped ({skipped.length})
+            </span>
+            <ChevronDown className={"h-4 w-4 text-ink-dim transition-transform" + (showSkipped ? " rotate-180" : "")} />
+          </button>
+          {showSkipped && (
+            <ul className="mt-4 space-y-2">
+              {skipped.map((c) => (
+                <li key={c.key} className="flex items-center gap-3 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2.5">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm text-ink">{c.question}</p>
+                    <p className="truncate text-xs text-ink-dim">{c.answer}</p>
+                  </div>
+                  <button
+                    onClick={() => restore(c)}
+                    className="btn-ghost shrink-0 px-3 py-1.5 text-xs"
+                    disabled={saving}
+                    title="Move back into the teach queue"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    Restore
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </div>
   );

@@ -2,6 +2,7 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
+import { canonicalJobUrl } from "@/lib/job-key";
 
 /**
  * Persist the job the Run flow just started. The extension scrapes the posting
@@ -22,6 +23,10 @@ export async function saveRunJob(input: {
 }): Promise<SaveRunJobResult> {
   const url = (input.url || "").trim();
   if (!url) return { ok: false, error: "No posting URL." };
+  // Stable per-job key (tenant + requisition id) — the extension's reportApplication computes the
+  // SAME key from the form url, so both writers converge on ONE row across runs even though the raw
+  // form url changes every run. LOCKSTEP: web/lib/job-key.ts ↔ lib.js canonicalJobUrl.
+  const jobKey = canonicalJobUrl(url);
   if (!isSupabaseConfigured()) {
     return { ok: false, error: "Backend not connected — set Supabase env vars (see WEBSITE.md)." };
   }
@@ -32,33 +37,46 @@ export async function saveRunJob(input: {
     } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "You're not signed in." };
 
-    const patch: Record<string, unknown> = {};
+    // deleted_at: null un-hides a soft-deleted row; url refreshed to the pasted POSTING link
+    // (durable + clickable, unlike the ephemeral form url the report path stores) — saveRunJob runs
+    // after reportApplication, so this write wins.
+    const patch: Record<string, unknown> = { job_key: jobKey, url, deleted_at: null };
     if (input.company && input.company.trim()) patch.company = input.company.trim().slice(0, 200);
     if (input.role && input.role.trim()) patch.role = input.role.trim().slice(0, 200);
     if (input.jobDescription && input.jobDescription.trim()) {
       patch.job_description = input.jobDescription.slice(0, 100000);
     }
 
-    const { data: existing } = await supabase
-      .from("applications")
-      .select("id")
-      .eq("user_id", user.id)
-      .eq("url", url)
-      .maybeSingle();
+    // Dedupe by job_key (the raw url varies per run); bridge to a legacy url-keyed row if present.
+    let existing: { id: string } | null = null;
+    {
+      const { data } = await supabase
+        .from("applications")
+        .select("id")
+        .eq("user_id", user.id)
+        .eq("job_key", jobKey)
+        .maybeSingle();
+      existing = data ?? null;
+    }
+    if (!existing) {
+      const { data } = await supabase
+        .from("applications")
+        .select("id")
+        .eq("user_id", user.id)
+        .eq("url", url)
+        .maybeSingle();
+      existing = data ?? null;
+    }
 
     if (existing) {
-      // deleted_at: null — restarting a posting un-hides a previously soft-deleted row.
-      const { error } = await supabase
-        .from("applications")
-        .update({ ...patch, deleted_at: null })
-        .eq("id", existing.id);
+      const { error } = await supabase.from("applications").update(patch).eq("id", existing.id);
       if (error) return { ok: false, error: error.message };
       return { ok: true, id: existing.id };
     }
 
     const { data: ins, error } = await supabase
       .from("applications")
-      .insert({ user_id: user.id, url, status: "filling", ...patch })
+      .insert({ user_id: user.id, status: "filling", ...patch })
       .select("id")
       .maybeSingle();
     if (error) return { ok: false, error: error.message };

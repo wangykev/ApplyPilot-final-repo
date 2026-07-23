@@ -1393,6 +1393,12 @@ function cdpReadSessionState() {
     // Workday PLANNED-MAINTENANCE page ("Workday is currently unavailable") — a transient retry-later
     // state, NOT a dead session (recon 2026-06-27). isWorkdayMaintenance keys off this (+ title/bodyText).
     maintenancePresent: /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(bodyText),
+    // Workday's TRANSIENT "Something went wrong / please refresh" soft-error (apology + refresh cue).
+    // LOCKSTEP with lib.js isWorkdaySoftError — computed here (full bodyText in scope) because the walk
+    // only gets bodyTextSample SW-side; the walk reloads-and-retries the page when this is set.
+    softErrorPresent:
+      (/something went wrong|an? (unexpected )?error (has )?occurred|we('| ?a)?re sorry/i.test(bodyText)) &&
+      (/refresh (the|this) page|please refresh|try again/i.test(bodyText)),
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
     // M31: error-element detail for the validation-vs-VPS recon diff. Samples are now DECISION
     // INPUTS (the AI-4 tiers key off them via lib.js expandErrorSamples), not just diagnostics —

@@ -42,12 +42,33 @@ test("profileValueAt: nested path; a tiered array → its first candidate; missi
   assert.equal(profileValueAt(p, "work_authorization.citizenship_country"), "United States of America");
   assert.equal(profileValueAt(p, "personal_info.missing"), "");
   assert.equal(profileValueAt(p, ""), "");
+  // a path landing on an OBJECT or array-of-objects (a whole repeating section) → "" (never "[object Object]")
+  assert.equal(profileValueAt({ education: [{ degree: "BS" }] }, "education"), "", "array-of-objects → ''");
+  assert.equal(profileValueAt({ personal_info: { city: "X" } }, "personal_info"), "", "nested object → ''");
 });
 
-test("coveredKeys: normalized wordings from every bucket", () => {
-  const c = coveredKeys([bucket({ questions: ["Are you over 18?*", "Gender"] })]);
-  assert.equal(c.has("are you over 18?"), true); // trailing * + case stripped
-  assert.equal(c.has("gender"), true);
+test("coveredKeys: wordings from ANSWERABLE buckets only (an empty/unanswered bucket does NOT cover)", () => {
+  // Mode-B with a value, and Mode-A whose bound profile field is set → both cover their wordings.
+  const answerable = coveredKeys(
+    [
+      bucket({ questions: ["Are you over 18?*"], value: ["Yes"] }),
+      bucket({ id: "g", profile_path: "self_identification.gender", questions: ["Gender"] }),
+    ],
+    { self_identification: { gender: "Male" } },
+  );
+  assert.equal(answerable.has("are you over 18?"), true); // trailing * + case stripped
+  assert.equal(answerable.has("gender"), true);
+  // An EMPTY Mode-B (no value) and a Mode-A bound to an UNSET/removed field do NOT cover — the
+  // questions resurface in teach (the over_18-starter-bound-to-empty-profile case this fixes).
+  const empty = coveredKeys(
+    [
+      bucket({ questions: ["Are you over 18?*"], value: [] }),
+      bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you at least 18 years of age?"] }),
+    ],
+    { screening: {} },
+  );
+  assert.equal(empty.has("are you over 18?"), false);
+  assert.equal(empty.has("are you at least 18 years of age?"), false);
 });
 
 test("sameAnswer: caps/whitespace insensitive; different → false; empty → false", () => {
@@ -76,10 +97,36 @@ test("teachableCards: excludes non-approved / deterministic / essay / empty / al
   assert.equal(teachableCards([src("a", [mk({ needs_review: false })])], [], {}).length, 0, "filled deterministically (no review)");
   assert.equal(teachableCards([src("a", [mk({ widget_type: "textarea" })])], [], {}).length, 0, "essay excluded");
   assert.equal(teachableCards([src("a", [mk({ current_value: "" })])], [], {}).length, 0, "empty value");
-  assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"] })], {}).length, 0, "already covered");
+  assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"], value: ["Yes"] })], {}).length, 0, "already covered by an ANSWERABLE bucket");
+  assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"], value: [] })], {}).length, 1, "an EMPTY bucket with the wording does NOT cover → resurfaces (removed-profile-field notify)");
   assert.equal(teachableCards([src("a", [mk({})])], [], {}, ["reliable transport?"]).length, 0, "dismissed");
   assert.equal(teachableCards([src("a", [mk({ flag: null })])], [], {}).length, 1, "a REVIEWED non-AI field is teachable too (Req B)");
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");
+});
+
+test("teachableCards: #4 — an AI-filled question still teaches even if a bucket nominally covers it", () => {
+  // The bucket has a value (so it 'covers' the wording), but the fill was AI (the saved value didn't
+  // match THIS tenant's options) → surface it so the operator can add the tenant's variant.
+  const bkt = bucket({ id: "edu", questions: ["Highest level of education"], value: ["Bachelor's Degree"] });
+  const aiEntry = entry({ question_label: "Highest level of education", widget_type: "dropdown", flag: "ai-choice", current_value: "Undergraduate Degree", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}).length, 1, "AI fill surfaces despite the covering bucket (#4)");
+  // A clean/fuzzy BUCKET fill (flag 'bucket') of the SAME covered question stays hidden — the bucket works.
+  const bucketEntry = entry({ question_label: "Highest level of education", widget_type: "dropdown", flag: "bucket", current_value: "Bachelor's Degree", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("b", [bucketEntry])], [bkt], {}).length, 0, "a bucket fill of a covered question stays hidden");
+  // And a skipped AI fill stays skipped even though it's covered+AI.
+  assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}, ["highest level of education"]).length, 0, "dismissed still wins");
+});
+
+test("teachableCards: recommends the matching Mode-A bucket's field via bucket_path (not the AI maps_to)", () => {
+  // over_18-style: an EMPTY Mode-A bucket bound to screening.at_least_18_years_old; the AI filled the
+  // question and (wrongly) stamped maps_to "education". The card must recommend the BUCKET's field,
+  // and show it as empty (not "[object Object]" from the education array-of-objects).
+  const bkt = bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you over the age of 18?"] });
+  const aiEntry = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Yes", is_approved: true, needs_review: true, maps_to: "education" });
+  const cards = teachableCards([src("a", [aiEntry])], [bkt], { screening: {} });
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].bucket_path, "screening.at_least_18_years_old", "recommends the bucket's bound field");
+  assert.equal(cards[0].profile_value, "", "the bound field is empty → '' (not [object Object])");
 });
 
 test("teachableCards: a repeating entry's AI-filled field TEACHES; a deterministically-filled one does NOT", () => {

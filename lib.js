@@ -464,6 +464,27 @@ function websiteDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
+// Stable per-JOB identity for tracker dedup. A Workday application URL VARIES across runs AND hosts:
+// the POSTING the user pastes is <tenant>.wdN.myworkdayjobs.com (tenant in the SUBDOMAIN), but after
+// login the form is on wdN.myworkdaysite.com (tenant in the PATH, /recruiting/<tenant>/ — NOT the
+// subdomain), with a per-application-instance tail. The one token common to BOTH hosts is the
+// data-center (wd3, wd5, …); combined with the requisition id (…_R00244793, present in both paths) it
+// gives a key — "<dc>:r<reqid>" — that collapses the posting + every form/instance/query variant to
+// ONE row. (Keying on the subdomain split myworkdayjobs from myworkdaysite — the 2026-07-22 bug.)
+// No _R match (non-Workday / odd URL) → origin+pathname minus query and the /apply… tail. LOCKSTEP
+// with the web copy in web/lib/job-key.ts (reportApplication + saveRunJob must produce identical keys).
+function canonicalJobUrl(u) {
+  try {
+    const p = new URL(String(u));
+    const req = (p.pathname.match(/_R(\d+)\b/i) || [])[1];
+    const dc = (p.hostname.match(/\bwd\d+\b/i) || [""])[0].toLowerCase(); // "wd3" — on both hosts
+    if (req) return (dc || "wd") + ":r" + req;
+    return (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/+$/, "");
+  } catch (e) {
+    return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();
+  }
+}
+
 // US + Canada region name → postal abbreviation. Workday review pages render the address as ONE blob
 // with the abbreviation ("Tallahassee, FL"), not the spelled-out region a dropdown stored ("Florida"),
 // so a name↔abbrev equivalence stops a stored region from reading as a false "missing".
@@ -811,5 +832,5 @@ function looksLikeSso(state) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
 }

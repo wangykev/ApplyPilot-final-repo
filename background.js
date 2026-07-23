@@ -289,11 +289,27 @@ function scrapeJobDescription() {
     }
     return "";
   };
-  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || (document.title || "").trim();
+  const clean = (s) => (s || "").replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+  const titleCase = (s) => clean(s).split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
+  // TITLE (deterministic, no AI): the posting header first; else the URL slug ".../<slug>_R<reqid>/…"
+  // (the most reliable source — e.g. "Junior-Full-Stack-Developer-Coop_R00244793" → "Junior Full Stack
+  // Developer Coop"); else the document title with any " | Company" suffix stripped.
+  const slugM = (location.pathname || "").match(/\/([^/]+)_R\d+(?:\/|$)/i);
+  const urlTitle = slugM ? clean(decodeURIComponent(slugM[1])) : "";
+  const docTitle = (document.title || "").split(/\s[|–—-]\s/)[0].trim();
+  const title = pick(['[data-automation-id="jobPostingHeader"]', '[data-automation-id="jobTitle"]', "h1"]) || urlTitle || docTitle;
+  // COMPANY: a company element if present; else the tenant subdomain (posting host), title-cased
+  // (magna → Magna); else the career-site/tenant display segment right before "/job/" in the path —
+  // needed on the myworkdaysite host, where the tenant is in the PATH, not the subdomain
+  // (…/recruiting/magna/Magna/job/… → "Magna").
   let company = pick(['[data-automation-id="company"]', '[data-automation-id="jobPostingCompany"]']);
   if (!company) {
     const m = (location.hostname || "").match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
-    if (m) company = m[1].replace(/[-_]+/g, " ");
+    if (m) company = titleCase(m[1]);
+  }
+  if (!company) {
+    const pm = (location.pathname || "").match(/\/([^/]+)\/job\//i);
+    if (pm) company = titleCase(decodeURIComponent(pm[1]));
   }
   const body = pick(['[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]', "main", "body"]);
   return {
@@ -2040,21 +2056,27 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
   // slow-to-mount fields — they then get caught by the cascade re-scan and mis-tagged "REVEALED by
   // an earlier field's value", which is misleading in review AND makes the submit gate force a second
-  // review of each. Poll cdpPageScan until the flat count holds steady across two consecutive
-  // non-zero reads (adaptive render-pacing, 12s ceiling); a page with no flat fields (repeating-only,
-  // e.g. My Experience) bails after a short all-zero grace so it never burns the ceiling. Genuine
-  // value-triggered cascades still appear only AFTER a commit → they stay the cascade re-scan's job.
+  // review of each.
+  //
+  // MUST poll on delayFull (REAL wall-clock), NOT delayRender: delayRender is adaptive and on a
+  // VISIBLE tab collapses to ~40ms, so three reads land within ~120ms — far faster than the page
+  // renders — and the count looks "stable" while only the first field (e.g. Country) exists, exactly
+  // the bug this is meant to fix. We are waiting on the PAGE's own render, which takes real time
+  // regardless of our pacing. Break only after the count holds UNCHANGED across 3 consecutive reads
+  // (~1.5s of no growth); bounded at 12s; a page with no flat fields (repeating-only, e.g. My
+  // Experience) bails after a short all-zero grace. Genuine value-triggered cascades still appear
+  // only AFTER a commit → they remain the cascade re-scan's job; this settles the INITIAL load only.
   {
     let last = -1, stable = 0, zeroReads = 0;
-    const settleDeadline = Date.now() + 12000;
-    while (Date.now() < settleDeadline) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12000) {
       let n = 0;
       try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → keep polling */ }
-      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayRender(400); continue; }
+      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayFull(500); continue; }
       zeroReads = 0;
-      if (n === last) { if (++stable >= 2) break; } else stable = 0;
+      if (n === last) { if (++stable >= 3) break; } else stable = 0;
       last = n;
-      await act.delayRender(400);
+      await act.delayFull(500);
     }
   }
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
@@ -2488,6 +2510,10 @@ async function reportApplication(bundle, jobContext) {
       company: (jobContext && jobContext.company) || bundle.tenant || null,
       role: null,
       url: bundle.url || null,
+      // Stable per-job dedup key (tenant + requisition id) — the raw url varies every run, so the
+      // backend upserts by (user_id, job_key) instead. See canonicalJobUrl (lib.js, lockstep with
+      // web/lib/job-key.ts). null when there's no url (report still works, falls back to url dedup).
+      job_key: bundle.url ? canonicalJobUrl(bundle.url) : null,
       status: needs > 0 ? "needs_review" : "filling",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),
@@ -3176,6 +3202,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     const act = makeCdpActuation(await getLlmConfig()); // AI-0 seam: act.llm bound to the operator's config (OFF unless the toggle is on)
     let pagesFilled = [];
     let reloadsUsed = 0; // RUN-level reload-retry budget: a transient render-flake reloads (→ page 1) + RESTARTS the walk
+    let softReloads = 0; const MAX_SOFT_RELOADS = 3; // RUN-level budget for Workday's "Something went wrong / please refresh" soft-error
 
     restartWalk: while (true) { // a transient-flake reload restarts here from page 1 (the bundle clear stays ABOVE, once per run)
     pagesFilled = []; // reset per attempt
@@ -3185,6 +3212,22 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // checked BEFORE any fill/click, so we never fill or advance the review page). ──
       let nav = null;
       try { nav = await cdpEval(cdpReadSessionState); } catch (e) { /* treat as not-ready below */ }
+      // ── (a0) TRANSIENT SOFT-ERROR: Workday's "Something went wrong / please refresh" can appear on
+      //    ANY page (right after login, or mid-walk). A refresh RESTARTS the application at page 1, so
+      //    reload + restart the walk from page 1 (bounded per run); the already-filled sweep makes the
+      //    good pages fast. Checked FIRST so the error page (no form) isn't misread as session-death or
+      //    a terminal page. If the reload drops to the LOGIN page instead, the sessionLooksDead guard
+      //    below catches it on the restart and halts session-expired. ──
+      if (nav && nav.softErrorPresent) {
+        if (softReloads >= MAX_SOFT_RELOADS) {
+          LOG(`⚠ Workday soft-error ("Something went wrong / please refresh") persisted after ${softReloads} reload(s) — halting for the operator (refresh the page + re-run).`);
+          return { ok: true, stopped: "workday-soft-error", needs_operator: true, detail: "Workday kept showing 'Something went wrong — please refresh' after reloads.", pages_filled: pagesFilled.length, pages: pagesFilled };
+        }
+        softReloads++;
+        LOG(`⚠ Workday soft-error on page ${page} ("Something went wrong / please refresh") — reloading + restarting the walk from page 1 (soft-reload ${softReloads}/${MAX_SOFT_RELOADS}).`);
+        await reloadAndSettle(LOG);
+        continue restartWalk;
+      }
       if (nav && isWorkdayMaintenance(nav)) {
         LOG(`⛔ WORKDAY PLANNED MAINTENANCE at page ${page} ("Workday is currently unavailable") — NOT a dead session, no re-login needed. Retry after the maintenance window, then re-run.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
@@ -3233,6 +3276,14 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (d) Terminal page with no Save & Continue (not the review marker — unusual). ──
       const navAfter = await cdpEval(cdpReadSessionState);
+      // A soft-error surfacing during/after the fill (no form → no next button) must reload+restart,
+      // not be misread as a terminal page — this is exactly the spot the reported bug stopped at.
+      if (navAfter && navAfter.softErrorPresent && softReloads < MAX_SOFT_RELOADS) {
+        softReloads++;
+        LOG(`⚠ Workday soft-error after filling page ${page} ("Something went wrong / please refresh") — reloading + restarting the walk from page 1 (soft-reload ${softReloads}/${MAX_SOFT_RELOADS}).`);
+        await reloadAndSettle(LOG);
+        continue restartWalk;
+      }
       if (!navAfter || !navAfter.nextButtonPresent) {
         LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
         return { ok: true, stopped: "no-next-button", pages_filled: pagesFilled.length, pages: pagesFilled };
@@ -3539,18 +3590,26 @@ async function runCdpOnboard(tabId, opts) {
   // moved on. Returns { scan } (final scan) or { notFound, blockedBy } if the button was never clickable.
   // tries = 3 → the initial click + up to TWO re-clicks, so a Sign In / Create Account that "does
   // nothing" keeps getting retried (operator ask 2026-07-10). Both submits go through this.
-  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000 }) => {
+  // `timeouts`: optional per-attempt wait LADDER, e.g. [500, 20000] — a FAST re-click if the first
+  // click no-ops (500ms), then the full wait for a genuinely slow submit (20s). Escalating so the
+  // common case is fast and a missed first click recovers quickly instead of stalling the whole 20s.
+  // Falls back to `timeoutMs` for every attempt when no ladder is given; `tries` derives from the
+  // ladder length when a ladder is passed.
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null }) => {
+    const ladder = (timeouts && timeouts.length) ? timeouts : null;
+    const n = ladder ? ladder.length : tries;
     let st = null;
-    for (let t = 1; t <= tries; t++) {
+    for (let t = 1; t <= n; t++) {
       const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
       if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
-      const w = await waitFor((s) => done(s) || isWorkdaySoftError(s.bodyText), timeoutMs, `${label} outcome`);
+      const wait = ladder ? ladder[t - 1] : timeoutMs;
+      const w = await waitFor((s) => done(s) || isWorkdaySoftError(s.bodyText), wait, `${label} outcome`);
       st = w.scan || st;
       if (st && await maybeRefresh(st)) st = await scan() || st;
       if (st && done(st)) return { scan: st };
       // Timed out. Re-click ONLY if still on this submit form; else the page advanced (done just
       // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
-      if (t < tries && st && formStillUp(st)) { LOG(`${label}: no outcome after ${Math.round(timeoutMs / 1000)}s and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
+      if (t < n && st && formStillUp(st)) { LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
       return { scan: st };
     }
     return { scan: st };
@@ -3698,12 +3757,13 @@ async function runCdpOnboard(tabId, opts) {
         // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
         await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
         await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
-        // FIXED (not paced) — a real page-reaction wait, like the 5s activation settle: Workday
-        // ENABLES/validates the Sign In submit a beat AFTER the fields fill, and a submit click has
-        // no self-correcting gate (unlike fills/tab-clicks, which cdpRectReady/waitFor re-poll). A
-        // scaled ~50ms wait on a visible tab clicked the not-yet-ready button and no-op'd ("it
-        // doesn't click the sign in", 2026-07-09). 500ms is the reference-proven value.
-        await cdpDelay(500);
+        // FIXED (not paced) — a real page-reaction wait: Workday enables/wires the Sign In submit a
+        // beat AFTER the fields fill, and a submit click has no self-correcting gate. Keep it SHORT
+        // (200ms) so the common case is fast; if the first click still no-ops, submitAndWait's
+        // ESCALATING re-click ladder recovers it — a fast re-click at 500ms, then the full 20s for a
+        // genuinely slow sign-in (the `timeouts` below). Tuned from a flat 500ms after the operator
+        // found that too slow on the happy path (2026-07-22).
+        await cdpDelay(200);
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
@@ -3711,7 +3771,8 @@ async function runCdpOnboard(tabId, opts) {
           selectors: ['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'],
           label: "Sign In submit",
           done: (s) => classifyAuthOutcome(s) !== "unknown",
-          formStillUp: (s) => !!s.markers.signInSubmit
+          formStillUp: (s) => !!s.markers.signInSubmit,
+          timeouts: [500, 20000] // fast re-click at 500ms if the first click no-op'd; then the full 20s for a genuinely slow sign-in
         });
         if (r.notFound) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: r.blockedBy || "no Sign In button" };
         st = r.scan || st;
