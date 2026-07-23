@@ -43,7 +43,12 @@ async function loadSources(): Promise<{ apps: TeachSource[]; profile: Profile }>
 
 export default async function TeachPage() {
   const [{ apps, profile }, buckets, dismissed] = await Promise.all([loadSources(), loadBuckets(), loadDismissed()]);
-  const cards = teachableCards(apps, buckets, profile, dismissed);
+  // Compute ALL teachable cards (no dismissed filter), then partition: the active queue (not skipped)
+  // vs. the SKIPPED ones, so the inbox can show a "Skipped (N)" section with a restore path back.
+  const allCards = teachableCards(apps, buckets, profile, []);
+  const dismissedSet = new Set(dismissed);
+  const cards = allCards.filter((c) => !dismissedSet.has(c.key));
+  const skippedCards = allCards.filter((c) => dismissedSet.has(c.key));
   return (
     <div className="space-y-8 pb-28">
       <PageHeader
@@ -51,7 +56,7 @@ export default async function TeachPage() {
         title="Teach"
         description="Questions the AI had to guess — that you approved on review. Add each to your saved answers so the next application fills it deterministically, with no review."
       />
-      <TeachInbox initialCards={cards} initialBuckets={buckets} initialDismissed={dismissed} profile={profile} />
+      <TeachInbox initialCards={cards} initialSkipped={skippedCards} initialBuckets={buckets} initialDismissed={dismissed} profile={profile} />
     </div>
   );
 }
