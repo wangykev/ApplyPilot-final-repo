@@ -461,35 +461,36 @@ export function TeachInbox({
           <div className="flex items-center justify-between gap-3">
             <button
               type="button"
-              onClick={() => setShowSkipped((v) => !v)}
+              onClick={() => { setConfirmClear(false); setShowSkipped((v) => !v); }}
               className="flex flex-1 items-center gap-2 text-left text-sm text-ink"
             >
               <SkipForward className="h-4 w-4 text-ink-dim" />
               Skipped ({skipped.length})
               <ChevronDown className={"h-4 w-4 text-ink-dim transition-transform" + (showSkipped ? " rotate-180" : "")} />
             </button>
-            {/* Delete all — permanently discards every skipped card (two-click confirm) */}
-            {confirmClear ? (
-              <span className="flex items-center gap-2">
-                <span className="text-xs text-ink-dim">Delete all {skipped.length}?</span>
-                <button onClick={clearSkipped} className="btn-ghost px-2 py-1 text-xs text-signal" disabled={saving} title="Permanently remove all skipped">
-                  {saving ? "Deleting…" : "Confirm"}
+            {/* Delete all — only while the list is EXPANDED (permanently discards every skipped card; two-click confirm) */}
+            {showSkipped &&
+              (confirmClear ? (
+                <span className="flex items-center gap-2">
+                  <span className="text-xs text-ink-dim">Delete all {skipped.length}?</span>
+                  <button onClick={clearSkipped} className="btn-ghost px-2 py-1 text-xs text-signal" disabled={saving} title="Permanently remove all skipped">
+                    {saving ? "Deleting…" : "Confirm"}
+                  </button>
+                  <button onClick={() => setConfirmClear(false)} className="btn-ghost px-2 py-1 text-xs" disabled={saving}>
+                    Cancel
+                  </button>
+                </span>
+              ) : (
+                <button
+                  onClick={() => setConfirmClear(true)}
+                  className="btn-ghost shrink-0 px-2 py-1 text-xs text-ink-dim hover:text-signal"
+                  disabled={saving}
+                  title="Permanently remove all skipped questions"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete all
                 </button>
-                <button onClick={() => setConfirmClear(false)} className="btn-ghost px-2 py-1 text-xs" disabled={saving}>
-                  Cancel
-                </button>
-              </span>
-            ) : (
-              <button
-                onClick={() => setConfirmClear(true)}
-                className="btn-ghost shrink-0 px-2 py-1 text-xs text-ink-dim hover:text-signal"
-                disabled={saving}
-                title="Permanently remove all skipped questions"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                Delete all
-              </button>
-            )}
+              ))}
           </div>
           {showSkipped && (
             <ul className="mt-4 space-y-2">
