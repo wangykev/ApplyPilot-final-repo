@@ -274,16 +274,37 @@ export function seedLadderDraft(profile: unknown, path: string, polarity: boolea
 export function setLadderList(profile: unknown, path: string, polarity: boolean, list: string[]): unknown {
   const p: Record<string, unknown> = profile && typeof profile === "object" ? { ...(profile as Record<string, unknown>) } : {};
   const key = polarity ? "yes" : "no";
-  const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[] }>) || {};
-  const ladders: Record<string, { yes: string[]; no: string[] }> = {};
-  for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])] };
-  const entry = ladders[path] || { yes: [], no: [] };
+  const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[]; values?: string[] }>) || {};
+  const ladders: Record<string, { yes: string[]; no: string[]; values: string[] }> = {};
+  for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])], values: [...(src[k]?.values || [])] };
+  const entry = ladders[path] || { yes: [], no: [], values: [] };
   const clean: string[] = [];
   for (const c of list) {
     const t = String(c).trim();
     if (t && !clean.some((x) => sameAnswer(x, t))) clean.push(t);
   }
   entry[key] = clean;
+  ladders[path] = entry;
+  p.answer_ladders = ladders;
+  return p;
+}
+
+/** Return a NEW profile with a SCALAR field's answer variants (answer_ladders[path].values) set to `list`
+ *  (blanks dropped, deduped case-insensitively, ORDER preserved). Deep-copies answer_ladders (the yes/no
+ *  polarity ladders are preserved) so the caller's profile is never mutated. The teach answer editor + the
+ *  profile page's in-field arrow both edit this. */
+export function setFieldVariants(profile: unknown, path: string, list: string[]): unknown {
+  const p: Record<string, unknown> = profile && typeof profile === "object" ? { ...(profile as Record<string, unknown>) } : {};
+  const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[]; values?: string[] }>) || {};
+  const ladders: Record<string, { yes: string[]; no: string[]; values: string[] }> = {};
+  for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])], values: [...(src[k]?.values || [])] };
+  const entry = ladders[path] || { yes: [], no: [], values: [] };
+  const clean: string[] = [];
+  for (const c of list) {
+    const t = String(c).trim();
+    if (t && !clean.some((x) => sameAnswer(x, t))) clean.push(t);
+  }
+  entry.values = clean;
   ladders[path] = entry;
   p.answer_ladders = ladders;
   return p;

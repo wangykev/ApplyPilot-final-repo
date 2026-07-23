@@ -16,6 +16,8 @@ import {
   FieldLabel,
   FileField,
   BucketLabelContext,
+  AnswerLadderContext,
+  AdvancedChoices,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
@@ -33,8 +35,6 @@ import {
   RACE_ETHNICITY_OPTIONS,
   VETERAN_STATUS_OPTIONS,
   DISABILITY_STATUS_OPTIONS,
-  profileFieldMeta,
-  getAtPath,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
 import { liveSync } from "@/lib/extension-sync";
@@ -114,6 +114,8 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
   const [savedBuckets, setSavedBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
+  // the field whose ANSWER LADDER (variants) popup is open — the in-field arrow on a scalar field.
+  const [ladderOpen, setLadderOpen] = useState<{ path: string; label: string } | null>(null);
   // the Add / Advanced popup works on a DRAFT — nothing is written to `buckets` until Done.
   const [adv, setAdv] = useState<{ mode: "add" | "edit"; index: number; draft: Bucket } | null>(null);
   const [pending, startTransition] = useTransition();
@@ -192,6 +194,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
 
   return (
     <BucketLabelContext.Provider value={(path, label, widget) => setBucketOpen({ path, label, widget })}>
+    <AnswerLadderContext.Provider value={(path, label) => setLadderOpen({ path, label })}>
     <div className="space-y-6 pb-24">
       {/* Personal info */}
       <SectionCard title="Personal information" subtitle="The basics ApplyPilot maps onto the form's contact fields.">
@@ -563,38 +566,33 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         </div>
       </div>
 
-      {bucketOpen &&
-        (() => {
-          const raw = getAtPath(profile, bucketOpen.path);
-          const w = profileFieldMeta(bucketOpen.path, raw).widget;
-          // Answer variants apply to FLAT SCALAR fields (text / plain dropdown / state) — a candidate/tiered
-          // field's value IS its ladder, yes/no has its own, and dates/checkboxes don't take a list.
-          // Repeating-section fields (education.0.gpa, work_experience.0.*) are excluded: they fill with a
-          // FIXED widget from the section map (they type your value), so a variant list wouldn't change it.
-          const scalar = (w === "text" || w === "dropdown" || w === "state") && !/\.\d/.test(bucketOpen.path);
-          return (
-            <BucketFieldPopup
-              path={bucketOpen.path}
-              label={bucketOpen.label}
-              widget={bucketOpen.widget}
-              buckets={buckets}
-              onBucketsChange={setBuckets}
-              onClose={() => setBucketOpen(null)}
-              variants={scalar ? profile.answer_ladders?.[bucketOpen.path]?.values ?? [] : undefined}
-              onVariantsChange={
-                scalar
-                  ? (next) =>
-                      update((p) => {
-                        const map = (p.answer_ladders ||= {});
-                        const cur = map[bucketOpen.path] || { yes: [], no: [], values: [] };
-                        map[bucketOpen.path] = { yes: cur.yes || [], no: cur.no || [], values: next };
-                      })
-                  : undefined
-              }
-              fieldValue={scalar && raw != null && typeof raw !== "object" ? String(raw) : undefined}
-            />
-          );
-        })()}
+      {/* Question bucket (wordings) — opened from a field's label */}
+      {bucketOpen && (
+        <BucketFieldPopup
+          path={bucketOpen.path}
+          label={bucketOpen.label}
+          widget={bucketOpen.widget}
+          buckets={buckets}
+          onBucketsChange={setBuckets}
+          onClose={() => setBucketOpen(null)}
+        />
+      )}
+
+      {/* Answer ladder (variants) — opened from a scalar field's in-field arrow */}
+      {ladderOpen && (
+        <AdvancedChoices
+          label={ladderOpen.label}
+          value={profile.answer_ladders?.[ladderOpen.path]?.values ?? []}
+          onChange={(next) =>
+            update((p) => {
+              const map = (p.answer_ladders ||= {});
+              const cur = map[ladderOpen.path] || { yes: [], no: [], values: [] };
+              map[ladderOpen.path] = { yes: cur.yes || [], no: cur.no || [], values: next };
+            })
+          }
+          onClose={() => setLadderOpen(null)}
+        />
+      )}
 
       {adv && (
         <RememberedAnswerPopup
@@ -607,6 +605,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         />
       )}
     </div>
+    </AnswerLadderContext.Provider>
     </BucketLabelContext.Provider>
   );
 }

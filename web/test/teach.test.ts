@@ -11,6 +11,7 @@ import {
   isBoolAnswer,
   seedLadderDraft,
   setLadderList,
+  setFieldVariants,
   ensureModeABucket,
   createModeBBucket,
   bucketLabel,
@@ -397,6 +398,16 @@ test("teach a NON-standard yes/no label: seedLadderDraft/setLadderList/isBoolAns
   const aiAff = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Affirmative", is_approved: true, needs_review: true });
   assert.equal(teachableCards([src("a", [aiAff])], [a18], p1).length, 0, "taught non-standard label → covered → not resurfaced");
   assert.equal(teachableCards([src("b", [aiAff])], [a18], p0).length, 1, "before teaching → surfaces");
+});
+
+test("setFieldVariants: sets a scalar field's variants (answer_ladders[path].values), deduped + immutable, preserving yes/no", () => {
+  const p0 = { self_identification: { gender: "Male" }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True"], no: [] } } };
+  const p1 = setFieldVariants(p0, "self_identification.gender", ["Man", "man", "  ", "M"]) as {
+    answer_ladders: Record<string, { yes: string[]; no: string[]; values: string[] }>;
+  };
+  assert.deepEqual(p1.answer_ladders["self_identification.gender"].values, ["Man", "M"], "deduped (case-insensitive), blanks dropped, order kept");
+  assert.deepEqual(p1.answer_ladders["screening.at_least_18_years_old"].yes, ["Yes", "True"], "other field's yes/no ladder preserved");
+  assert.equal((p0 as { answer_ladders: Record<string, { values?: string[] }> }).answer_ladders["self_identification.gender"], undefined, "input profile not mutated");
 });
 
 test("yes/no teach correctness: boolean fields cover Yes/True AND No/False + custom ladders (no false resurface, no 'true' display)", () => {

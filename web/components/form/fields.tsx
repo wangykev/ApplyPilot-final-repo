@@ -13,6 +13,14 @@ import { boolAnswerCandidates } from "@/lib/teach";
  */
 export const BucketLabelContext = createContext<((path: string, label: string, widget: string) => void) | null>(null);
 
+/**
+ * Optional hook: when a provider supplies an opener, a scalar field (text / plain dropdown / state) with
+ * a `bucketPath` renders a small in-field arrow → that field's ANSWER LADDER (the ordered variants the
+ * extension tries when the field is a dropdown/select). This is SEPARATE from the question-bucket label.
+ * Absent a provider → no arrow.
+ */
+export const AnswerLadderContext = createContext<((path: string, label: string) => void) | null>(null);
+
 const inputCls =
   "w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
 
@@ -59,6 +67,36 @@ export function FieldLabel({
   );
 }
 
+/** Whether a scalar field should show the in-field answer-ladder arrow: a provider wired the
+ *  AnswerLadderContext, the field has a bucketPath, and it's NOT a repeating-section field (those fill
+ *  with a fixed widget, so a variant list wouldn't change their fill). */
+function useHasLadder(bucketPath?: string): boolean {
+  const openLadder = useContext(AnswerLadderContext);
+  return !!openLadder && !!bucketPath && !/\.\d/.test(bucketPath);
+}
+
+/** The small in-field arrow → the field's ANSWER LADDER popup (its ordered variants). Absolute-right;
+ *  the enclosing control needs `relative` + right padding. Render only when useHasLadder is true. */
+function LadderArrow({ bucketPath, label }: { bucketPath: string; label: string }) {
+  const openLadder = useContext(AnswerLadderContext);
+  if (!openLadder) return null;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openLadder(bucketPath, label);
+      }}
+      title="Answer variants — other wordings a form might use for this answer"
+      aria-label="Answer variants"
+      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-ink-faint transition-colors hover:text-amber/70 group-hover:text-amber/70"
+    >
+      <ChevronRight className="h-4 w-4" />
+    </button>
+  );
+}
+
 export function TextField({
   label,
   value,
@@ -78,17 +116,21 @@ export function TextField({
   bucketPath?: string;
   disabled?: boolean;
 }) {
+  const hasLadder = useHasLadder(bucketPath);
   return (
     <label className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="text">{label}</FieldLabel>
-      <input
-        type={type}
-        value={value}
-        placeholder={placeholder}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value)}
-        className={clsx(inputCls, "mt-1.5", disabled && "cursor-not-allowed text-ink-dim opacity-70")}
-      />
+      <div className="relative mt-1.5">
+        <input
+          type={type}
+          value={value}
+          placeholder={placeholder}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          className={clsx(inputCls, disabled && "cursor-not-allowed text-ink-dim opacity-70", hasLadder && "pr-9")}
+        />
+        {hasLadder && <LadderArrow bucketPath={bucketPath!} label={label} />}
+      </div>
     </label>
   );
 }
@@ -164,20 +206,24 @@ export function SelectField({
   hint?: string;
   bucketPath?: string;
 }) {
+  const hasLadder = useHasLadder(bucketPath);
   return (
     <label className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="dropdown">{label}</FieldLabel>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className={clsx(inputCls, "mt-1.5 appearance-none")}
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value} className="bg-panel">
-            {o.label}
-          </option>
-        ))}
-      </select>
+      <div className="relative mt-1.5">
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={clsx(inputCls, "appearance-none", hasLadder && "pr-9")}
+        >
+          {options.map((o) => (
+            <option key={o.value} value={o.value} className="bg-panel">
+              {o.label}
+            </option>
+          ))}
+        </select>
+        {hasLadder && <LadderArrow bucketPath={bucketPath!} label={label} />}
+      </div>
     </label>
   );
 }
@@ -710,7 +756,7 @@ export function CandidateField({
 }
 
 /** Modal for the ordered fallback candidate list. Backdrop click or Escape closes. */
-function AdvancedChoices({
+export function AdvancedChoices({
   label,
   value,
   onChange,

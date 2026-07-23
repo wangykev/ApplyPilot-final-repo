@@ -78,7 +78,7 @@ export function ProfilePanel({
       </div>
       <p className="mt-1 text-xs text-ink-faint">
         Click a field&apos;s <span className="text-ink-dim">name</span> for its question wordings, or its{" "}
-        <span className="text-ink-dim">answer</span> to edit it.
+        <span className="text-ink-dim">answer</span> to edit it and its answer variants.
       </p>
       <div className="mt-4 space-y-5">
         {sections.map((s) => (
