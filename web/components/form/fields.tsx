@@ -4,6 +4,7 @@ import { useState, useEffect, createContext, useContext } from "react";
 import { X, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Plus, ChevronRight, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import { US_STATES, resolveUsState, isUnitedStates } from "@/lib/us-states";
+import { boolAnswerCandidates } from "@/lib/teach";
 
 /**
  * Optional hook: when a provider supplies an opener, a FieldLabel given a
@@ -265,6 +266,9 @@ export function TriBoolField({
   hint?: string;
   bucketPath?: string;
 }) {
+  // Which option's fill ladder is revealed. Click an UNSELECTED option to select it; click the
+  // ALREADY-SELECTED option's word again to toggle its (view-only) ladder open/closed.
+  const [ladderFor, setLadderFor] = useState<boolean | null>(null);
   const opts: { v: boolean; t: string }[] = [
     { v: true, t: "Yes" },
     { v: false, t: "No" },
@@ -279,6 +283,7 @@ export function TriBoolField({
           if (e.key === "Escape" && value !== null) {
             e.preventDefault();
             onChange(null);
+            setLadderFor(null);
           }
         }}
       >
@@ -288,7 +293,12 @@ export function TriBoolField({
             <button
               key={String(o.v)}
               type="button"
-              onClick={() => onChange(o.v)}
+              onClick={() => {
+                if (active) setLadderFor((f) => (f === o.v ? null : o.v)); // selected → toggle its ladder
+                else { onChange(o.v); setLadderFor(null); }                // not selected → select it
+              }}
+              title={active ? "Click again to see the fill ladder" : `Select ${o.t}`}
+              aria-expanded={active ? ladderFor === o.v : undefined}
               className={clsx(
                 "flex-1 py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
@@ -302,6 +312,26 @@ export function TriBoolField({
           );
         })}
       </div>
+
+      {/* Fill ladder (view-only) — the candidates the extension tries against the form's live options,
+          in order. Revealed by clicking the already-selected option's word (see onClick above). */}
+      {ladderFor !== null && (
+        <div className="mt-1.5 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2 text-xs">
+          <p className="text-ink-dim">
+            Fill ladder for <span className="font-medium text-ink">{ladderFor ? "Yes" : "No"}</span> — the
+            extension tries these against the form&apos;s options, in order:
+          </p>
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {boolAnswerCandidates(ladderFor ? "Yes" : "No").map((c, i) => (
+              <span key={c} className="flex items-center gap-1.5">
+                {i > 0 && <span className="text-ink-faint" aria-hidden>→</span>}
+                <span className="rounded border border-hairline bg-cockpit px-1.5 py-0.5 font-mono text-ink">{c}</span>
+              </span>
+            ))}
+          </div>
+          <p className="mt-1.5 text-ink-faint">Matches whether the form labels the option Yes/No or True/False.</p>
+        </div>
+      )}
     </div>
   );
 }
