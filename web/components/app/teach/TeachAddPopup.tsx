@@ -10,6 +10,7 @@ import {
   ensureModeABucket,
   bucketLabel,
   decideTeachRoute,
+  boolAnswerCandidates,
 } from "@/lib/teach";
 import { profileFieldMeta, getAtPath, setAtPath, type ProfileWidget } from "@/lib/profile-fields";
 import type { Bucket } from "@/lib/buckets";
@@ -110,9 +111,11 @@ export function TeachAddPopup({
     } else if (existing) {
       let next = buckets.map((b) => (b.id === existing.id ? { ...b, questions: dedupWordings(wordings) } : b));
       if (alsoLadder) {
-        next = next.map((b) =>
-          b.id === existing.id ? { ...b, value: b.value.includes(card.answer) ? b.value : [...b.value, card.answer] } : b,
-        );
+        // A yes/no / checkbox answer adds BOTH labelings so it resolves whether the tenant words the
+        // option Yes/No or True/False; a non-boolean answer adds itself. Deduped case-insensitively.
+        const have = new Set(existing.value.map((v) => v.trim().toLowerCase()));
+        const add = boolAnswerCandidates(card.answer).filter((v) => !have.has(v.toLowerCase()));
+        next = next.map((b) => (b.id === existing.id ? { ...b, value: [...b.value, ...add] } : b));
       }
       onConfirm({ buckets: next, toast: `Added to ${bucketLabel(existing)} ✓` });
     }

@@ -232,6 +232,19 @@ export function sameAnswer(a: string, b: string): boolean {
   return !!n(a) && n(a) === n(b);
 }
 
+/** A yes/no / true-false / checkbox answer → the tiered candidate list that matches EITHER labeling a
+ *  tenant renders (Yes/No OR True/False), so a taught standalone (Mode-B) answer resolves automatically
+ *  regardless of how the form words its options. Mirrors the extension resolve()'s boolean coercion
+ *  (boolean → ["Yes","True"] / ["No","False"]) so a taught bucket behaves like a triBool profile field.
+ *  A non-boolean answer passes through as a single candidate (empty → []). */
+export function boolAnswerCandidates(answer: string): string[] {
+  const n = String(answer || "").trim().toLowerCase();
+  if (["yes", "true", "checked", "on"].includes(n)) return ["Yes", "True"];
+  if (["no", "false", "unchecked", "off"].includes(n)) return ["No", "False"];
+  const t = String(answer || "").trim();
+  return t ? [t] : [];
+}
+
 /** Raw value at a dotted path (arrays PRESERVED, unlike profileValueAt which collapses to the first). */
 function rawAt(profile: unknown, path: string): unknown {
   if (!path) return undefined;

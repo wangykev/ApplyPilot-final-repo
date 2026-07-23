@@ -7,6 +7,7 @@ import {
   coveredKeys,
   sameAnswer,
   addWordingToBucket,
+  boolAnswerCandidates,
   ensureModeABucket,
   createModeBBucket,
   bucketLabel,
@@ -69,6 +70,17 @@ test("coveredKeys: wordings from ANSWERABLE buckets only (an empty/unanswered bu
   );
   assert.equal(empty.has("are you over 18?"), false);
   assert.equal(empty.has("are you at least 18 years of age?"), false);
+});
+
+test("boolAnswerCandidates: yes/no/true/false/checkbox answers expand to BOTH labelings; others pass through", () => {
+  // A taught yes/no or checkbox answer must resolve whether a tenant labels the option Yes/No or
+  // True/False — so a standalone (Mode-B) bucket stores the tiered pair.
+  for (const y of ["Yes", "yes", "true", "TRUE", "checked", "on"]) assert.deepEqual(boolAnswerCandidates(y), ["Yes", "True"], y);
+  for (const n of ["No", "no", "false", "FALSE", "unchecked", "off"]) assert.deepEqual(boolAnswerCandidates(n), ["No", "False"], n);
+  // a non-boolean answer passes through unchanged; empty → []
+  assert.deepEqual(boolAnswerCandidates("Blue"), ["Blue"]);
+  assert.deepEqual(boolAnswerCandidates("  Chicago "), ["Chicago"]);
+  assert.deepEqual(boolAnswerCandidates(""), []);
 });
 
 test("sameAnswer: caps/whitespace insensitive; different → false; empty → false", () => {

@@ -8,6 +8,7 @@ import type { Profile } from "@/lib/profile-schema";
 import {
   type TeachCard,
   sameAnswer,
+  boolAnswerCandidates,
   profileValueAt,
   humanize,
   isFuzzyTier,
@@ -266,7 +267,10 @@ export function TeachInbox({
   const seedNewBucket = (): Bucket => ({
     id: "custom_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     profile_path: "",
-    value: card && card.answer.trim() !== "" ? [card.answer] : [],
+    // A yes/no / checkbox answer stores BOTH labelings (["Yes","True"] / ["No","False"]) so the saved
+    // answer resolves whether a tenant renders the option as Yes/No or True/False; other answers pass
+    // through unchanged. (Mode-A teaches already get this — they set a boolean profile field.)
+    value: card ? boolAnswerCandidates(card.answer) : [],
     category: recCat || "Other",
     widget_hint: card && (card.widget === "radio" || card.widget === "checkbox") ? card.widget : "text",
     questions: card ? [card.question] : [],
