@@ -33,6 +33,8 @@ import {
   RACE_ETHNICITY_OPTIONS,
   VETERAN_STATUS_OPTIONS,
   DISABILITY_STATUS_OPTIONS,
+  profileFieldMeta,
+  getAtPath,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
 import { liveSync } from "@/lib/extension-sync";
@@ -561,16 +563,38 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         </div>
       </div>
 
-      {bucketOpen && (
-        <BucketFieldPopup
-          path={bucketOpen.path}
-          label={bucketOpen.label}
-          widget={bucketOpen.widget}
-          buckets={buckets}
-          onBucketsChange={setBuckets}
-          onClose={() => setBucketOpen(null)}
-        />
-      )}
+      {bucketOpen &&
+        (() => {
+          const raw = getAtPath(profile, bucketOpen.path);
+          const w = profileFieldMeta(bucketOpen.path, raw).widget;
+          // Answer variants apply to FLAT SCALAR fields (text / plain dropdown / state) — a candidate/tiered
+          // field's value IS its ladder, yes/no has its own, and dates/checkboxes don't take a list.
+          // Repeating-section fields (education.0.gpa, work_experience.0.*) are excluded: they fill with a
+          // FIXED widget from the section map (they type your value), so a variant list wouldn't change it.
+          const scalar = (w === "text" || w === "dropdown" || w === "state") && !/\.\d/.test(bucketOpen.path);
+          return (
+            <BucketFieldPopup
+              path={bucketOpen.path}
+              label={bucketOpen.label}
+              widget={bucketOpen.widget}
+              buckets={buckets}
+              onBucketsChange={setBuckets}
+              onClose={() => setBucketOpen(null)}
+              variants={scalar ? profile.answer_ladders?.[bucketOpen.path]?.values ?? [] : undefined}
+              onVariantsChange={
+                scalar
+                  ? (next) =>
+                      update((p) => {
+                        const map = (p.answer_ladders ||= {});
+                        const cur = map[bucketOpen.path] || { yes: [], no: [], values: [] };
+                        map[bucketOpen.path] = { yes: cur.yes || [], no: cur.no || [], values: next };
+                      })
+                  : undefined
+              }
+              fieldValue={scalar && raw != null && typeof raw !== "object" ? String(raw) : undefined}
+            />
+          );
+        })()}
 
       {adv && (
         <RememberedAnswerPopup

@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6850,6 +6850,29 @@ test("boolLadderCandidates: a custom per-field yes/no ladder overrides the defau
   assert.deepEqual(boolLadderCandidates(null, "x", true), ["Yes", "True"], "null profile → default");
   // blanks are filtered — an all-blank custom list falls back to the default
   assert.deepEqual(boolLadderCandidates({ answer_ladders: { p: { yes: ["", "  "] } } }, "p", true), ["Yes", "True"], "all-blank custom → default");
+});
+
+test("appendFieldVariants: appends a scalar field's variants (answer_ladders[path].values) after the primary, deduped", () => {
+  const profile = { answer_ladders: { "self_identification.gender": { yes: [], no: [], values: ["Man", "M"] } } };
+  assert.deepEqual(appendFieldVariants(profile, "self_identification.gender", ["Male"]), ["Male", "Man", "M"]);
+  assert.deepEqual(appendFieldVariants(profile, "self_identification.gender", "Male"), ["Male", "Man", "M"], "scalar arg wrapped");
+  assert.deepEqual(appendFieldVariants({}, "x", ["A"]), ["A"], "no answer_ladders → unchanged");
+  assert.deepEqual(appendFieldVariants(null, "x", ["A"]), ["A"], "null profile → unchanged");
+  assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["male"] } } }, "p", ["Male"]), ["Male"], "dup (case-insensitive) dropped");
+  assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["", "  "] } } }, "p", ["A"]), ["A"], "blanks dropped");
+});
+
+test("bucket + field variants: a flat scalar dropdown matches a VARIANT option (e.g. gender 'Man')", async () => {
+  // gender is "Male" in the profile; a tenant labels the option "Man". The editable per-field variant
+  // ["Man"] lets the dropdown match (tried after the primary "Male").
+  const field = { wrapperSel: "#g", fieldName: "genderHashed", widgetType: "dropdown", label: "Gender identity?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }] };
+  const bucket = { id: "g", profile_path: "self_identification.gender", value: [], widget_hint: "dropdown", questions: ["Gender identity?"], selectors: {} };
+  const profile = { self_identification: { gender: "Male" }, answer_ladders: { "self_identification.gender": { yes: [], no: [], values: ["Man"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "genderHashed");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(rec.after, "Man", "primary 'Male' missed the options; the 'Man' variant matched");
 });
 
 test("bucket Mode A + custom answer_ladders: a yes/no dropdown fills the operator's custom label (Affirmative)", async () => {

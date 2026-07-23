@@ -2,14 +2,15 @@
 
 import { useEffect } from "react";
 import { X } from "lucide-react";
-import { TagListField } from "@/components/form/fields";
+import { TagListField, TieredField } from "@/components/form/fields";
 import { type Bucket } from "@/lib/buckets";
 
 /**
  * The "advanced options" popup a field label opens: edit the question wordings
- * that map to that field's answer (a Mode-A bucket, created on first use). Shared
- * by the profile page (ProfileEditor) and the teach page's ProfilePanel.
- * Backdrop / Esc / Done close.
+ * that map to that field's answer (a Mode-A bucket, created on first use), and —
+ * for a scalar (text/dropdown) field — its "answer variants" (extra candidates the
+ * extension tries when the field renders as a dropdown/select). Shared by the profile
+ * page (ProfileEditor) and the teach page's ProfilePanel. Backdrop / Esc / Done close.
  */
 export function BucketFieldPopup({
   path,
@@ -18,6 +19,9 @@ export function BucketFieldPopup({
   buckets,
   onBucketsChange,
   onClose,
+  variants,
+  onVariantsChange,
+  fieldValue,
 }: {
   path: string;
   label: string;
@@ -25,6 +29,13 @@ export function BucketFieldPopup({
   buckets: Bucket[];
   onBucketsChange: (b: Bucket[]) => void;
   onClose: () => void;
+  /** Editable "answer variants" (profile.answer_ladders[path].values) — extra candidates the extension
+   *  tries (after the field's own value) when this field renders as a dropdown/select. Provided ONLY for
+   *  scalar text/dropdown fields; when omitted the variants section is hidden. */
+  variants?: string[];
+  onVariantsChange?: (next: string[]) => void;
+  /** The field's own value, shown as context (the variants are tried after it). */
+  fieldValue?: string;
 }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -67,6 +78,21 @@ export function BucketFieldPopup({
           placeholder="Add a wording a form might use, press Enter"
           onChange={(v) => upsert({ questions: v })}
         />
+
+        {onVariantsChange && (
+          <div className="mt-4 border-t border-hairline pt-4">
+            <p className="mb-2 text-xs leading-relaxed text-ink-dim">
+              Answer variants — other ways a form might word this answer (e.g. a GPA range picker, or a
+              differently-labeled option). The extension tries them, in order, when this field is a
+              dropdown/select.
+              {fieldValue ? (
+                <> Your value <span className="font-mono text-ink">{fieldValue}</span> is always tried first.</>
+              ) : null}
+            </p>
+            <TieredField label="Variants" value={variants || []} onChange={onVariantsChange} />
+          </div>
+        )}
+
         <div className="mt-4 flex justify-end">
           <button type="button" onClick={onClose} className="btn-primary">
             Done

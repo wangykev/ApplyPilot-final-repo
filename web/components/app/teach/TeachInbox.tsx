@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
+import { profileFieldMeta, getAtPath } from "@/lib/profile-fields";
 import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
 import {
@@ -404,20 +405,47 @@ export function TeachInbox({
         onOpenAnswer={(path, label) => setAnswerPopup({ path, label })}
       />
 
-      {/* advanced options — the question wordings that map to a field's answer */}
-      {bucketPopup && (
-        <BucketFieldPopup
-          path={bucketPopup.path}
-          label={bucketPopup.label}
-          widget={bucketPopup.widget}
-          buckets={buckets}
-          onBucketsChange={(next) => {
-            setBuckets(next);
-            void persistBuckets(next);
-          }}
-          onClose={() => setBucketPopup(null)}
-        />
-      )}
+      {/* advanced options — the question wordings + answer variants for a field */}
+      {bucketPopup &&
+        (() => {
+          const raw = getAtPath(profile, bucketPopup.path);
+          const w = profileFieldMeta(bucketPopup.path, raw).widget;
+          // variants apply to FLAT scalar fields; repeating-section fields (…\.0\.…) fill with a fixed
+          // widget (they type your value), so a variant list wouldn't change their fill.
+          const scalar = (w === "text" || w === "dropdown" || w === "state") && !/\.\d/.test(bucketPopup.path);
+          return (
+            <BucketFieldPopup
+              path={bucketPopup.path}
+              label={bucketPopup.label}
+              widget={bucketPopup.widget}
+              buckets={buckets}
+              onBucketsChange={(next) => {
+                setBuckets(next);
+                void persistBuckets(next);
+              }}
+              onClose={() => setBucketPopup(null)}
+              variants={scalar ? profile.answer_ladders?.[bucketPopup.path]?.values ?? [] : undefined}
+              onVariantsChange={
+                scalar
+                  ? (next) => {
+                      const cur = profile.answer_ladders?.[bucketPopup.path] || { yes: [], no: [], values: [] };
+                      const np: Profile = {
+                        ...profile,
+                        answer_ladders: {
+                          ...(profile.answer_ladders || {}),
+                          [bucketPopup.path]: { yes: cur.yes || [], no: cur.no || [], values: next },
+                        },
+                      };
+                      setProfile(np);
+                      profileRef.current = np;
+                      void persistProfile(np);
+                    }
+                  : undefined
+              }
+              fieldValue={scalar && raw != null && typeof raw !== "object" ? String(raw) : undefined}
+            />
+          );
+        })()}
 
       {/* modify an answer (with the ladder, where one exists) */}
       {answerPopup && (
