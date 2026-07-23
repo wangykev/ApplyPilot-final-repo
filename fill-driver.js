@@ -397,6 +397,12 @@ const resolve = (raw, widgetType) => {
       const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
       return candidates.length ? { candidates } : { skip: true };
     }
+    // A Yes/No triBool (screening.at_least_18_years_old, authorized_to_work_in_us, …) can render as a
+    // DROPDOWN on some tenants — coerce boolean → "Yes"/"No" exactly like the radio branch. Without this,
+    // String(true) → "true" never matches the "Yes" option, so a bucket bound to the triBool produces
+    // nothing and the field falls to the AI — the over-18 "LEGALLY-LOADED — VERIFY" every-fill bug
+    // (radio worked, dropdown didn't). Mirrors teach's fieldHoldsAnswer boolean map (keep in lockstep).
+    if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }

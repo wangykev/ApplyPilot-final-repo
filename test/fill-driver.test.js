@@ -6819,6 +6819,29 @@ test("bucket Mode A: reads the bound profile field", async () => {
   assert.match(rec.detail, /personal_info\.first_name/);
 });
 
+test("bucket Mode A: a Yes/No triBool fills a DROPDOWN (boolean → Yes), not just radio — the over-18 legally-loaded bug", async () => {
+  // screening.at_least_18_years_old is a triBool (boolean). On tenants that render the question as a
+  // DROPDOWN, resolve() used to String(true) → "true", which never matched the "Yes" option, so the
+  // bucket produced nothing and the field fell to the AI (flag ai-choice-sensitive, "LEGALLY-LOADED —
+  // VERIFY") on EVERY fill even though the profile answers it. resolve() now coerces boolean → Yes/No
+  // for dropdowns too, so the bucket fills it deterministically (flag "bucket", no review, no AI).
+  const field = { wrapperSel: "#a18", fieldName: "hashed18", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  const bucket = { id: "over_18", profile_path: "screening.at_least_18_years_old", value: [], widget_hint: "radio", questions: ["Are you over the age of 18?"], selectors: {} };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"No","justification":"x","confidence":"Low"}' }); // AI (if reached) would say No
+  const out = await drivePageFill(act, { screening: { at_least_18_years_old: true } }, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "hashed18");
+  assert.equal(rec.flag, "bucket", "the triBool bucket filled the dropdown deterministically");
+  assert.equal(rec.after, "Yes", "boolean true → Yes matched the live option");
+  assert.ok(!act.log.some((e) => e[0] === "llm"), "the AI pass never ran — no legally-loaded guess");
+  // and the false → No direction
+  const field2 = { wrapperSel: "#a18b", fieldName: "hashed18b", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  const out2 = await drivePageFill(makeFakeAct([field2]), { screening: { at_least_18_years_old: false } }, {}, {}, T_BUDGETS, { buckets: [{ ...bucket }] });
+  const rec2 = out2.results.find((r) => r.fieldName === "hashed18b");
+  assert.equal(rec2.after, "No", "boolean false → No");
+});
+
 test("bucket Mode A: an EMPTY bound profile value produces nothing (falls through, never blind-fills)", async () => {
   const field = { wrapperSel: "#b6", fieldName: "legalGiven", widgetType: "text", label: "Legal given name", value: "" };
   const bucket = { id: "fn", profile_path: "personal_info.first_name", value: "", widget_hint: "text", questions: ["Legal given name"], selectors: {} };

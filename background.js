@@ -3743,6 +3743,23 @@ async function runCdpOnboard(tabId, opts) {
         continue;
       }
 
+      // RACE GUARD before the SSO decision: the sign-in email/password fields can still be PAINTING
+      // right after "Apply Manually", or sit behind a "Sign In" tab that must be clicked to reveal them.
+      // looksLikeSso's field-absence signal (a "Sign In" button but no email/password field) then
+      // false-fires on the not-yet-rendered form → a spurious "SSO / step in" halt that clears on a
+      // re-run (operator-observed, 2026-07-23). So REVEAL the form first: click the Sign In tab if
+      // present, then poll for the fields (or the chooser) to appear. A genuine SSO screen never shows
+      // them → the poll times out and looksLikeSso still halts below. (Additive; when the fields are
+      // already present this whole block is skipped, so the live-verified happy paths are unchanged.)
+      if (!st.passwordInput && !st.emailInput && !st.signInWithEmail) {
+        if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await pace(800); st = await scan() || st; }
+        if (!st.passwordInput && !st.emailInput && !st.signInWithEmail) {
+          const w = await waitFor((s) => s.passwordInput || s.emailInput || s.signInWithEmail, 8000, "sign-in-form-render");
+          st = w.scan || st;
+        }
+        if (st.signInWithEmail) continue; // a chooser appeared during the wait → re-loop so the chooser handler runs
+      }
+
       if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
       if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/credentials.json) in the popup, or sign in manually then re-run." };
 
@@ -4647,6 +4664,11 @@ async function fillEngine(profile, defaults, jobContext) {
         const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
         return candidates.length ? { candidates } : { skip: true };
       }
+      // A Yes/No triBool (over-18, authorized_to_work_in_us, …) can render as a DROPDOWN on some tenants —
+      // coerce boolean → "Yes"/"No" like the radio branch, else String(true) → "true" never matches the
+      // "Yes" option and the field falls to the AI (the over-18 legally-loaded every-fill bug). LOCKSTEP
+      // with fill-driver.js resolve().
+      if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
       if (isEmpty(raw)) return { skip: true };
       return { candidates: [String(raw)] };
     }
