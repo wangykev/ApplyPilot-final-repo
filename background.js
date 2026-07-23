@@ -3590,18 +3590,26 @@ async function runCdpOnboard(tabId, opts) {
   // moved on. Returns { scan } (final scan) or { notFound, blockedBy } if the button was never clickable.
   // tries = 3 → the initial click + up to TWO re-clicks, so a Sign In / Create Account that "does
   // nothing" keeps getting retried (operator ask 2026-07-10). Both submits go through this.
-  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000 }) => {
+  // `timeouts`: optional per-attempt wait LADDER, e.g. [500, 20000] — a FAST re-click if the first
+  // click no-ops (500ms), then the full wait for a genuinely slow submit (20s). Escalating so the
+  // common case is fast and a missed first click recovers quickly instead of stalling the whole 20s.
+  // Falls back to `timeoutMs` for every attempt when no ladder is given; `tries` derives from the
+  // ladder length when a ladder is passed.
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null }) => {
+    const ladder = (timeouts && timeouts.length) ? timeouts : null;
+    const n = ladder ? ladder.length : tries;
     let st = null;
-    for (let t = 1; t <= tries; t++) {
+    for (let t = 1; t <= n; t++) {
       const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
       if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
-      const w = await waitFor((s) => done(s) || isWorkdaySoftError(s.bodyText), timeoutMs, `${label} outcome`);
+      const wait = ladder ? ladder[t - 1] : timeoutMs;
+      const w = await waitFor((s) => done(s) || isWorkdaySoftError(s.bodyText), wait, `${label} outcome`);
       st = w.scan || st;
       if (st && await maybeRefresh(st)) st = await scan() || st;
       if (st && done(st)) return { scan: st };
       // Timed out. Re-click ONLY if still on this submit form; else the page advanced (done just
       // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
-      if (t < tries && st && formStillUp(st)) { LOG(`${label}: no outcome after ${Math.round(timeoutMs / 1000)}s and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
+      if (t < n && st && formStillUp(st)) { LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
       return { scan: st };
     }
     return { scan: st };
@@ -3749,15 +3757,13 @@ async function runCdpOnboard(tabId, opts) {
         // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
         await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
         await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
-        // FIXED (not paced) — a real page-reaction wait, like the 5s activation settle: Workday
-        // ENABLES/validates the Sign In submit a beat AFTER the fields fill, and a submit click has
-        // no self-correcting gate (unlike fills/tab-clicks, which cdpRectReady/waitFor re-poll). A
-        // scaled ~50ms wait on a visible tab clicked the not-yet-ready button and no-op'd ("it
-        // doesn't click the sign in", 2026-07-09). 500ms was the reference value; bumped to 1000ms
-        // after live runs still occasionally MISSED the first submit click — submitAndWait's re-click
-        // recovers it, but only after the ~20s outcome timeout, so a bigger pre-click settle is well
-        // worth the extra ~500ms on the happy path (sign-in happens once per application). 2026-07-22.
-        await cdpDelay(1000);
+        // FIXED (not paced) — a real page-reaction wait: Workday enables/wires the Sign In submit a
+        // beat AFTER the fields fill, and a submit click has no self-correcting gate. Keep it SHORT
+        // (200ms) so the common case is fast; if the first click still no-ops, submitAndWait's
+        // ESCALATING re-click ladder recovers it — a fast re-click at 500ms, then the full 20s for a
+        // genuinely slow sign-in (the `timeouts` below). Tuned from a flat 500ms after the operator
+        // found that too slow on the happy path (2026-07-22).
+        await cdpDelay(200);
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
@@ -3765,7 +3771,8 @@ async function runCdpOnboard(tabId, opts) {
           selectors: ['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'],
           label: "Sign In submit",
           done: (s) => classifyAuthOutcome(s) !== "unknown",
-          formStillUp: (s) => !!s.markers.signInSubmit
+          formStillUp: (s) => !!s.markers.signInSubmit,
+          timeouts: [500, 20000] // fast re-click at 500ms if the first click no-op'd; then the full 20s for a genuinely slow sign-in
         });
         if (r.notFound) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: r.blockedBy || "no Sign In button" };
         st = r.scan || st;
