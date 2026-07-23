@@ -145,6 +145,30 @@ export function coveredKeys(buckets: Bucket[], profile: unknown): Set<string> {
   return s;
 }
 
+/** Whether an ANSWERABLE bucket both COVERS `questionKey` (a wording match) AND already HOLDS `answer`
+ *  — i.e. it would fill this question with THIS value next time, so the question is genuinely handled.
+ *  This is the #4 reconciliation: an AI fill on a covered wording means the bucket's saved value did
+ *  NOT match the tenant's options this run, so the card must keep surfacing — UNTIL the operator TEACHES
+ *  the value (sets the bound profile field, or adds it to a Mode-B bucket's candidates; see TeachAddPopup).
+ *  Once the bucket holds the value, the card disappears and STAYS gone — no resurface on re-approve /
+ *  reload even though the stored bundle entry keeps its `ai-*` flag forever (the bug this fixes). A
+ *  no-value / value-mismatch covering bucket returns false → the card still surfaces. */
+export function bucketCoversAnswer(buckets: Bucket[], profile: unknown, questionKey: string, answer: string): boolean {
+  for (const b of buckets || []) {
+    if (!bucketAnswers(b, profile)) continue; // an empty/unanswered bucket never covers
+    if (!(b.questions || []).some((q) => normalizeQuestion(q) === questionKey)) continue; // wording not in this bucket
+    const path = String(b.profile_path || "").trim();
+    if (path) {
+      if (fieldHoldsAnswer(profile, dottedPath(path), answer)) return true; // Mode-A: the bound field holds it
+    } else {
+      const val = (b as { value?: unknown }).value; // Mode-B: its candidate list holds it
+      const arr = Array.isArray(val) ? val : val == null ? [] : [val];
+      if (arr.some((v) => sameAnswer(String(v), answer))) return true;
+    }
+  }
+  return false;
+}
+
 /** Teachable cards across the user's reviewed applications — deduped by question, excluding
  *  anything already covered by a bucket OR explicitly dismissed (skipped). Most-recent application
  *  wins a duplicate. */
@@ -162,13 +186,19 @@ export function teachableCards(
     for (const e of app.bundle?.entries || []) {
       if (!isTeachable(e)) continue;
       const key = normalizeQuestion(e.question_label as string);
-      // #4: a bucket "covers" a question only when it actually filled it. If THIS entry was AI-filled
-      // (flag ai-*), the bucket did NOT answer it this run — its saved value didn't match the tenant's
-      // options — so `covered` must not hide it: surface it so the operator can add the tenant's
-      // variant/wording. (A clean or fuzzy BUCKET fill, flag "bucket", stays covered — the bucket works.)
+      // #4 + the resurface fix: a bucket "covers" a question only when it would actually fill it. For an
+      // AI fill (flag ai-*), the bar is HIGHER — the covering bucket must already HOLD the value that got
+      // filled: an AI fill means the bucket's saved value didn't match the tenant this run, so the card
+      // keeps surfacing so the operator can add the variant — UNTIL they TEACH the value (set the bound
+      // field / add the candidate), after which the bucket holds it and the card disappears and STAYS gone
+      // (the stored bundle keeps its ai-* flag forever, so plain coverage never hid it → it resurfaced on
+      // every re-approve/reload). A non-AI (deterministic/bucket) fill uses plain coverage, unchanged.
       // skip (dismissed) + dedup (seen) still always apply.
       const aiFilled = typeof e.flag === "string" && /^ai/i.test(e.flag);
-      if ((covered.has(key) && !aiFilled) || skipped.has(key) || seen.has(key)) continue;
+      const isCovered = aiFilled
+        ? bucketCoversAnswer(buckets, profile, key, String(e.current_value))
+        : covered.has(key);
+      if (isCovered || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
       // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
       // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).

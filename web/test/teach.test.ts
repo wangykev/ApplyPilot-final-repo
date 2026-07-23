@@ -117,6 +117,44 @@ test("teachableCards: #4 — an AI-filled question still teaches even if a bucke
   assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}, ["highest level of education"]).length, 0, "dismissed still wins");
 });
 
+test("teachableCards: #4 resurface fix — a TAUGHT AI card stays gone even though its bundle keeps the ai-* flag", () => {
+  // The bug: the operator teaches an AI-filled card (its value is now in a covering bucket), but the
+  // stored bundle entry keeps flag ai-* forever, so re-approving / reloading the SAME bundle resurfaced
+  // it. The fix: an AI card is hidden once the covering bucket HOLDS the filled value.
+  const aiEntry = entry({ question_label: "Highest level of education", widget_type: "dropdown", flag: "ai-choice", current_value: "Undergraduate Degree", is_approved: true, needs_review: true });
+  const apps = [src("a", [aiEntry])];
+  // Before teaching: a bucket covers the wording but holds a DIFFERENT value → still surfaces (#4).
+  const before = bucket({ id: "edu", questions: ["Highest level of education"], value: ["Bachelor's Degree"] });
+  assert.equal(teachableCards(apps, [before], {}).length, 1, "value-mismatch bucket → still surfaces");
+  // After teaching (Mode-B): the filled value is now in the bucket's candidates → gone, and STAYS gone
+  // when the SAME (still-ai-flagged) bundle is re-approved.
+  const taughtB = bucket({ id: "edu", questions: ["Highest level of education"], value: ["Bachelor's Degree", "Undergraduate Degree"] });
+  assert.equal(teachableCards(apps, [taughtB], {}).length, 0, "taught (Mode-B value added) → gone");
+  assert.equal(teachableCards(apps, [taughtB], {}).length, 0, "re-approve the same bundle → still gone");
+  // After teaching (Mode-A): the bound profile field now holds the value → gone.
+  const taughtA = bucket({ id: "edu", profile_path: "education[0].degree", questions: ["Highest level of education"] });
+  assert.equal(teachableCards(apps, [taughtA], { education: [{ degree: ["Undergraduate Degree"] }] }).length, 0, "taught (Mode-A field holds it) → gone");
+});
+
+test("teachableCards: resurface fix is bucket-agnostic — the user's OWN field / OWN new answer closes it, not just the AI's suggestion", () => {
+  // The card's AI hint (maps_to) points at "self_identification.gender", but the operator DISAGREES and
+  // files it under their OWN chosen field / their OWN new standalone answer. Coverage is decided by which
+  // bucket actually HOLDS the value — never by the AI's suggestion — so any of these close the card.
+  const ai = entry({ question_label: "Which best describes you?", widget_type: "dropdown", flag: "ai-choice", current_value: "Prefer to self-describe", is_approved: true, needs_review: true, maps_to: "self_identification.gender" });
+  const apps = [src("a", [ai])];
+  assert.equal(teachableCards(apps, [], {}).length, 1, "untaught → surfaces");
+  // (a) filed under a DIFFERENT profile field than the AI suggested (Mode-A) → gone
+  const ownField = bucket({ id: "own", profile_path: "self_identification.custom", questions: ["Which best describes you?"] });
+  assert.equal(teachableCards(apps, [ownField], { self_identification: { custom: "Prefer to self-describe" } }).length, 0, "own field holds it → gone");
+  // (b) saved as the user's OWN brand-new standalone answer (Mode-B, seeded with the answer) → gone
+  const ownNew = bucket({ id: "mine", questions: ["Which best describes you?"], value: ["Prefer to self-describe"], category: "Demographics" });
+  assert.equal(teachableCards(apps, [ownNew], {}).length, 0, "own new answer holds it → gone");
+  // (c) filed under an existing answer WITHOUT adding the value (the value doesn't match) → still surfaces:
+  //     the bucket wouldn't reproduce the answer, so it isn't truly taught yet (tick "also add to options").
+  const wordingOnly = bucket({ id: "other", questions: ["Which best describes you?"], value: ["Man"] });
+  assert.equal(teachableCards(apps, [wordingOnly], {}).length, 1, "wording filed but value absent → not yet covered");
+});
+
 test("teachableCards: recommends the matching Mode-A bucket's field via bucket_path (not the AI maps_to)", () => {
   // over_18-style: an EMPTY Mode-A bucket bound to screening.at_least_18_years_old; the AI filled the
   // question and (wrongly) stamped maps_to "education". The card must recommend the BUCKET's field,
