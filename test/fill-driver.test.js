@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6817,6 +6817,28 @@ test("bucket Mode A: reads the bound profile field", async () => {
   assert.equal(rec.flag, "bucket");
   assert.equal(field.value, "Ada");
   assert.match(rec.detail, /personal_info\.first_name/);
+});
+
+test("resolve: coercion matrix — a triBool answer is fillable as checkbox/radio/dropdown, Yes/No AND True/False labels", () => {
+  // The class of bug: a value PRESENT in the profile that resolve() turns into a candidate that can
+  // never match the live options → silent fall-through to AI. A boolean triBool must resolve to a tiered
+  // ["Yes","True"] / ["No","False"] list for BOTH dropdown and radio (checkbox has its own path), so the
+  // match ladder hits whether the options are labeled Yes/No or True/False.
+  for (const w of ["dropdown", "typeahead", "radio"]) {
+    assert.deepEqual(resolve(true, w).candidates, ["Yes", "True"], `${w}: true → Yes/True ladder`);
+    assert.deepEqual(resolve(false, w).candidates, ["No", "False"], `${w}: false → No/False ladder`);
+    assert.equal(resolve(null, w).skip, true, `${w}: null (unanswered) → skip, never guessed`);
+    assert.equal(resolve(undefined, w).skip, true, `${w}: undefined → skip`);
+  }
+  // A tiered candidate list passes through as the ladder for ALL choice widgets — including radio (the
+  // gap this closes: resolve(array,"radio") used to become String(array) → "a,b" → never matched).
+  for (const w of ["dropdown", "typeahead", "radio"]) {
+    assert.deepEqual(resolve(["Bachelor of Science", "Bachelors"], w).candidates, ["Bachelor of Science", "Bachelors"], `${w}: tiered array → ladder`);
+    assert.equal(resolve([], w).skip, true, `${w}: empty array → skip`);
+  }
+  // A plain string still passes through as a single candidate; empty string skips.
+  assert.deepEqual(resolve("Male", "dropdown").candidates, ["Male"]);
+  assert.equal(resolve("", "dropdown").skip, true);
 });
 
 test("bucket Mode A: a Yes/No triBool fills a DROPDOWN (boolean → Yes), not just radio — the over-18 legally-loaded bug", async () => {

@@ -4668,13 +4668,19 @@ async function fillEngine(profile, defaults, jobContext) {
       // coerce boolean → "Yes"/"No" like the radio branch, else String(true) → "true" never matches the
       // "Yes" option and the field falls to the AI (the over-18 legally-loaded every-fill bug). LOCKSTEP
       // with fill-driver.js resolve().
-      if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+      if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
       if (isEmpty(raw)) return { skip: true };
       return { candidates: [String(raw)] };
     }
     if (widgetType === "radio") {
+      // A tiered candidate list (e.g. a degree rendered as radio) passes through as the ladder — same
+      // as dropdown/typeahead — else String(array) never matches (the triBool-dropdown bug's radio twin).
+      if (Array.isArray(raw)) {
+        const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
+        return candidates.length ? { candidates } : { skip: true };
+      }
       if (raw === null || raw === undefined) return { skip: true };
-      if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+      if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
       if (isEmpty(raw)) return { skip: true };
       return { candidates: [String(raw)] };
     }

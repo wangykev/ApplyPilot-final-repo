@@ -398,17 +398,25 @@ const resolve = (raw, widgetType) => {
       return candidates.length ? { candidates } : { skip: true };
     }
     // A Yes/No triBool (screening.at_least_18_years_old, authorized_to_work_in_us, …) can render as a
-    // DROPDOWN on some tenants — coerce boolean → "Yes"/"No" exactly like the radio branch. Without this,
-    // String(true) → "true" never matches the "Yes" option, so a bucket bound to the triBool produces
-    // nothing and the field falls to the AI — the over-18 "LEGALLY-LOADED — VERIFY" every-fill bug
-    // (radio worked, dropdown didn't). Mirrors teach's fieldHoldsAnswer boolean map (keep in lockstep).
-    if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+    // DROPDOWN on some tenants — coerce boolean → a tiered ["Yes","True"] / ["No","False"] candidate list
+    // (the ladder matches whether the options are labeled Yes/No OR True/False). Without this,
+    // String(true) → "true" never matched the "Yes" option, so a bucket bound to the triBool produced
+    // nothing and the field fell to the AI — the over-18 "LEGALLY-LOADED — VERIFY" every-fill bug (radio
+    // worked, dropdown didn't). Mirrors teach's fieldHoldsAnswer boolean map (keep in lockstep).
+    if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
   if (widgetType === "radio") {
+    // A tiered candidate list (e.g. a degree/field_of_study rendered as radio on some tenant) must pass
+    // through as the ladder — same as dropdown/typeahead. Without this, String(array) → "a,b" never
+    // matches an option → the field falls to the AI (the triBool-dropdown bug's radio twin).
+    if (Array.isArray(raw)) {
+      const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
+      return candidates.length ? { candidates } : { skip: true };
+    }
     if (raw === null || raw === undefined) return { skip: true };
-    if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+    if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
