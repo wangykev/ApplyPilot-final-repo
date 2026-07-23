@@ -255,21 +255,35 @@ export function isBoolAnswer(answer: string): boolean {
   );
 }
 
-/** Return a NEW profile with `label` added to field `path`'s fill ladder for the given polarity
- *  (answer_ladders[path][yes|no]), seeded with the defaults (["Yes","True"] / ["No","False"]) so a
- *  custom label AUGMENTS them, deduped case-insensitively. Lets the teach flow remember a tenant's
- *  NON-STANDARD yes/no wording so it fills deterministically next time (and stops resurfacing). The
- *  answer_ladders map + every entry are deep-copied so the caller's profile is never mutated. */
-export function addLadderLabel(profile: unknown, path: string, polarity: boolean, label: string): unknown {
+/** The initial editable ladder shown when teaching a NON-STANDARD yes/no label: the field's existing
+ *  ladder for the polarity (answer_ladders[path][yes|no]) or the defaults (["Yes","True"] / ["No","False"]),
+ *  with `label` appended if not already present (deduped, case-insensitive). The operator can then reorder
+ *  or trim it (via the same ladder editor as the profile page) before confirming. */
+export function seedLadderDraft(profile: unknown, path: string, polarity: boolean, label: string): string[] {
+  const src = (profile as { answer_ladders?: Record<string, { yes?: string[]; no?: string[] }> } | null)?.answer_ladders?.[path];
+  const existing = polarity ? src?.yes : src?.no;
+  const base = Array.isArray(existing) && existing.length ? [...existing] : boolAnswerCandidates(polarity ? "Yes" : "No");
+  const t = String(label).trim();
+  return t && !base.some((c) => sameAnswer(c, t)) ? [...base, t] : base;
+}
+
+/** Return a NEW profile with field `path`'s ladder for `polarity` set to `list` (the operator's
+ *  edited/reordered ladder from the teach popup; blanks dropped, deduped case-insensitively, ORDER
+ *  preserved). Deep-copies answer_ladders so the caller's profile is never mutated. An empty result
+ *  clears that polarity's custom ladder → the extension falls back to its default. */
+export function setLadderList(profile: unknown, path: string, polarity: boolean, list: string[]): unknown {
   const p: Record<string, unknown> = profile && typeof profile === "object" ? { ...(profile as Record<string, unknown>) } : {};
   const key = polarity ? "yes" : "no";
   const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[] }>) || {};
   const ladders: Record<string, { yes: string[]; no: string[] }> = {};
   for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])] };
   const entry = ladders[path] || { yes: [], no: [] };
-  const cur = entry[key].length ? entry[key] : boolAnswerCandidates(polarity ? "Yes" : "No"); // seed defaults on the first custom add
-  const trimmed = String(label).trim();
-  entry[key] = trimmed && !cur.some((c) => sameAnswer(c, trimmed)) ? [...cur, trimmed] : cur;
+  const clean: string[] = [];
+  for (const c of list) {
+    const t = String(c).trim();
+    if (t && !clean.some((x) => sameAnswer(x, t))) clean.push(t);
+  }
+  entry[key] = clean;
   ladders[path] = entry;
   p.answer_ladders = ladders;
   return p;

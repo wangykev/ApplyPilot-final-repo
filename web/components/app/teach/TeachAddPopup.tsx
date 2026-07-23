@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { X, Check } from "lucide-react";
-import { CheckboxField, TagListField } from "@/components/form/fields";
+import { CheckboxField, TagListField, TieredField } from "@/components/form/fields";
 import { ProfileFieldEditor, arrv } from "@/components/app/teach/AnswerEditPopup";
 import {
   type TeachCard,
@@ -12,7 +12,8 @@ import {
   decideTeachRoute,
   boolAnswerCandidates,
   isBoolAnswer,
-  addLadderLabel,
+  seedLadderDraft,
+  setLadderList,
 } from "@/lib/teach";
 import { profileFieldMeta, getAtPath, setAtPath, type ProfileWidget } from "@/lib/profile-fields";
 import type { Bucket } from "@/lib/buckets";
@@ -99,6 +100,20 @@ export function TeachAddPopup({
   // ── existing (Mode-B) answer: optionally add the card's answer to its candidate ladder ──
   const [alsoLadder, setAlsoLadder] = useState(false);
 
+  // ── non-standard yes/no label: the editable fill-ladder draft (same reorderable editor as the profile
+  // page), seeded with the polarity's defaults + the card's label; re-seeded when the Yes/No toggle flips. ──
+  const [ladderDraft, setLadderDraft] = useState<string[]>(() =>
+    nonStandardBool && typeof fieldValue === "boolean" ? seedLadderDraft(profile, path, fieldValue, card.answer) : [],
+  );
+  const lastPolRef = useRef<boolean | null>(typeof fieldValue === "boolean" ? fieldValue : null);
+  useEffect(() => {
+    if (!nonStandardBool) return;
+    const pol = typeof fieldValue === "boolean" ? fieldValue : null;
+    if (pol === lastPolRef.current) return; // only re-seed on an ACTUAL polarity change (not every render)
+    lastPolRef.current = pol;
+    setLadderDraft(pol === null ? [] : seedLadderDraft(profile, path, pol, card.answer));
+  }, [fieldValue, nonStandardBool, profile, path, card.answer]);
+
   const confirm = () => {
     if (isField && route === "answer" && meta) {
       // set the profile value AND remember the wording, so the card is fully taught (covered next time)
@@ -106,7 +121,7 @@ export function TeachAddPopup({
       // Remember a NON-STANDARD yes/no label for the chosen polarity (fieldValue is a definite Yes/No),
       // so the extension fills THIS tenant's wording deterministically and the card stops resurfacing.
       if (nonStandardBool && typeof fieldValue === "boolean") {
-        withValue = addLadderLabel(withValue, path, fieldValue, card.answer) as Profile;
+        withValue = setLadderList(withValue, path, fieldValue, ladderDraft) as Profile;
       }
       const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
       onConfirm({
@@ -180,18 +195,23 @@ export function TeachAddPopup({
               countryForState={arrv(getAtPath(profile, "personal_info.country"))}
               onChange={setFieldValue}
             />
-            {nonStandardBool && (
-              <p className="text-xs">
-                {typeof fieldValue === "boolean" ? (
-                  <span className="text-ink-dim">
-                    &ldquo;<span className="font-medium text-ink">{card.answer}</span>&rdquo; will be remembered as a{" "}
-                    <span className="font-medium text-ink">{fieldValue ? "Yes" : "No"}</span> label for this question.
-                  </span>
-                ) : (
-                  <span className="text-signal">Pick Yes or No above so we know which &ldquo;{card.answer}&rdquo; means.</span>
-                )}
-              </p>
-            )}
+            {nonStandardBool &&
+              (typeof fieldValue === "boolean" ? (
+                <div className="rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
+                  <p className="mb-2 text-xs text-ink-dim">
+                    <span className="font-medium text-ink">{fieldValue ? "Yes" : "No"}</span> fill ladder — the extension tries
+                    these against the form&apos;s options, in order. Reorder or remove as needed.
+                  </p>
+                  <TieredField
+                    label="Candidates it tries (most-specific first)"
+                    value={ladderDraft}
+                    onChange={setLadderDraft}
+                    highlight={card.answer}
+                  />
+                </div>
+              ) : (
+                <p className="text-xs text-signal">Pick Yes or No above so we know which &ldquo;{card.answer}&rdquo; means.</p>
+              ))}
           </div>
         )}
 
