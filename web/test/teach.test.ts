@@ -42,6 +42,9 @@ test("profileValueAt: nested path; a tiered array → its first candidate; missi
   assert.equal(profileValueAt(p, "work_authorization.citizenship_country"), "United States of America");
   assert.equal(profileValueAt(p, "personal_info.missing"), "");
   assert.equal(profileValueAt(p, ""), "");
+  // a path landing on an OBJECT or array-of-objects (a whole repeating section) → "" (never "[object Object]")
+  assert.equal(profileValueAt({ education: [{ degree: "BS" }] }, "education"), "", "array-of-objects → ''");
+  assert.equal(profileValueAt({ personal_info: { city: "X" } }, "personal_info"), "", "nested object → ''");
 });
 
 test("coveredKeys: wordings from ANSWERABLE buckets only (an empty/unanswered bucket does NOT cover)", () => {
@@ -112,6 +115,18 @@ test("teachableCards: #4 — an AI-filled question still teaches even if a bucke
   assert.equal(teachableCards([src("b", [bucketEntry])], [bkt], {}).length, 0, "a bucket fill of a covered question stays hidden");
   // And a skipped AI fill stays skipped even though it's covered+AI.
   assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}, ["highest level of education"]).length, 0, "dismissed still wins");
+});
+
+test("teachableCards: recommends the matching Mode-A bucket's field via bucket_path (not the AI maps_to)", () => {
+  // over_18-style: an EMPTY Mode-A bucket bound to screening.at_least_18_years_old; the AI filled the
+  // question and (wrongly) stamped maps_to "education". The card must recommend the BUCKET's field,
+  // and show it as empty (not "[object Object]" from the education array-of-objects).
+  const bkt = bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you over the age of 18?"] });
+  const aiEntry = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Yes", is_approved: true, needs_review: true, maps_to: "education" });
+  const cards = teachableCards([src("a", [aiEntry])], [bkt], { screening: {} });
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].bucket_path, "screening.at_least_18_years_old", "recommends the bucket's bound field");
+  assert.equal(cards[0].profile_value, "", "the bound field is empty → '' (not [object Object])");
 });
 
 test("teachableCards: a repeating entry's AI-filled field TEACHES; a deterministically-filled one does NOT", () => {

@@ -87,7 +87,10 @@ export function TeachInbox({
 
   // The recommendation, in precedence order: the field's KNOWN mapped home (canonical_field) →
   // the fill-time AI hint (maps_to) → the teach-time LLM fallback (only when nothing is known).
-  const stampedPath = card ? card.canonical_field || card.maps_to : "";
+  // A Mode-A bucket that already binds this question's wording to a profile field is AUTHORITATIVE
+  // (the over_18 starter → screening.at_least_18_years_old) — prefer it over a FIELD_MAP home or the
+  // AI's maps_to hint, which can be wrong (e.g. hallucinating "education" for the age question).
+  const stampedPath = card ? card.bucket_path || card.canonical_field || card.maps_to : "";
   const fallback = card && !stampedPath ? recCache[card.key] : undefined;
   const recPath = stampedPath || (fallback ? fallback.maps_to : "");
   const recCat = card ? card.suggested_category || (fallback ? fallback.suggested_category : "") : "";

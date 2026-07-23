@@ -15,14 +15,17 @@ export function isBucketEligibleWidget(w?: string | null): boolean {
   return BUCKET_ELIGIBLE.has(String(w || ""));
 }
 
-/** Read a dotted profile path → a display string (a tiered array shows its first candidate). */
+/** Read a dotted profile path → a display string (a tiered array shows its first candidate). A path
+ *  that lands on an OBJECT or an array-of-objects (e.g. a whole repeating section like `education`) has
+ *  no scalar display → "" (guards against rendering "[object Object]"). */
 export function profileValueAt(profile: unknown, path: string): string {
   if (!path) return "";
   const v = String(path)
     .split(".")
     .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
-  if (Array.isArray(v)) return v.length ? String(v[0]) : "";
-  return v == null ? "" : String(v);
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.length && typeof v[0] !== "object" ? String(v[0]) : "";
+  return typeof v === "object" ? "" : String(v);
 }
 
 export type TeachCard = {
@@ -31,6 +34,7 @@ export type TeachCard = {
   answer: string; // the approved / edited value
   widget: string; // widget_type
   sensitive: boolean; // legally-loaded / EEO (from the flag)
+  bucket_path: string; // AUTHORITATIVE: the profile field a Mode-A bucket binds this question to (wording match), "" = none
   maps_to: string; // fill-time AI piggyback hint: the profile field this Q maps to ("" = none)
   canonical_field: string; // the field's MAPPED home (FIELD_MAP), if any — a KNOWN target, no LLM needed
   match_tier: string; // how it filled ("containment"/"fuzzy-NN"/…) — a fuzzy/containment tier ⇒ possible typo/variant
@@ -53,6 +57,20 @@ export function isFuzzyTier(matchTier?: string | null): boolean {
  *  and can't be edited. A flat path (no brackets) passes through unchanged. */
 export function dottedPath(path?: string | null): string {
   return String(path == null ? "" : path).replace(/\[(\d+)\]/g, ".$1");
+}
+
+/** The profile field a Mode-A bucket binds this question (by matching wording) to — the AUTHORITATIVE
+ *  mapping (a bucket the operator or the starter set defined), preferred over a FIELD_MAP guess or the
+ *  AI's `maps_to` hint. This is what fixes e.g. the over-18 card recommending its real field
+ *  (screening.at_least_18_years_old) instead of the AI's hallucinated "education". "" when no Mode-A
+ *  bucket wording matches. */
+export function bucketBindingFor(buckets: Bucket[], questionKey: string): string {
+  for (const b of buckets || []) {
+    const path = String(b.profile_path || "").trim();
+    if (!path) continue; // Mode-B (no bound field) → nothing to recommend
+    if ((b.questions || []).some((q) => normalizeQuestion(q) === questionKey)) return dottedPath(path);
+  }
+  return "";
 }
 
 export type TeachSource = { id: string; company?: string | null; bundle: ReviewBundle | null };
@@ -154,15 +172,17 @@ export function teachableCards(
       seen.add(key);
       // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
       // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).
+      const bucket_path = bucketBindingFor(buckets, key); // authoritative Mode-A binding (wording match)
       const maps_to = dottedPath(e.maps_to || "");
       const canonical_field = dottedPath(e.canonical_field || "");
-      const known = canonical_field || maps_to; // the deterministic mapped home wins over the AI hint
+      const known = bucket_path || canonical_field || maps_to; // bucket binding wins, then FIELD_MAP, then the AI hint
       cards.push({
         key,
         question: e.question_label as string,
         answer: String(e.current_value),
         widget: String(e.widget_type || "text"),
         sensitive: typeof e.flag === "string" && /sensitive|eeo/.test(e.flag),
+        bucket_path,
         maps_to,
         canonical_field,
         match_tier: e.match_tier || "",
