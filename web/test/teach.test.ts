@@ -44,10 +44,28 @@ test("profileValueAt: nested path; a tiered array → its first candidate; missi
   assert.equal(profileValueAt(p, ""), "");
 });
 
-test("coveredKeys: normalized wordings from every bucket", () => {
-  const c = coveredKeys([bucket({ questions: ["Are you over 18?*", "Gender"] })]);
-  assert.equal(c.has("are you over 18?"), true); // trailing * + case stripped
-  assert.equal(c.has("gender"), true);
+test("coveredKeys: wordings from ANSWERABLE buckets only (an empty/unanswered bucket does NOT cover)", () => {
+  // Mode-B with a value, and Mode-A whose bound profile field is set → both cover their wordings.
+  const answerable = coveredKeys(
+    [
+      bucket({ questions: ["Are you over 18?*"], value: ["Yes"] }),
+      bucket({ id: "g", profile_path: "self_identification.gender", questions: ["Gender"] }),
+    ],
+    { self_identification: { gender: "Male" } },
+  );
+  assert.equal(answerable.has("are you over 18?"), true); // trailing * + case stripped
+  assert.equal(answerable.has("gender"), true);
+  // An EMPTY Mode-B (no value) and a Mode-A bound to an UNSET/removed field do NOT cover — the
+  // questions resurface in teach (the over_18-starter-bound-to-empty-profile case this fixes).
+  const empty = coveredKeys(
+    [
+      bucket({ questions: ["Are you over 18?*"], value: [] }),
+      bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you at least 18 years of age?"] }),
+    ],
+    { screening: {} },
+  );
+  assert.equal(empty.has("are you over 18?"), false);
+  assert.equal(empty.has("are you at least 18 years of age?"), false);
 });
 
 test("sameAnswer: caps/whitespace insensitive; different → false; empty → false", () => {
@@ -76,7 +94,8 @@ test("teachableCards: excludes non-approved / deterministic / essay / empty / al
   assert.equal(teachableCards([src("a", [mk({ needs_review: false })])], [], {}).length, 0, "filled deterministically (no review)");
   assert.equal(teachableCards([src("a", [mk({ widget_type: "textarea" })])], [], {}).length, 0, "essay excluded");
   assert.equal(teachableCards([src("a", [mk({ current_value: "" })])], [], {}).length, 0, "empty value");
-  assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"] })], {}).length, 0, "already covered");
+  assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"], value: ["Yes"] })], {}).length, 0, "already covered by an ANSWERABLE bucket");
+  assert.equal(teachableCards([src("a", [mk({})])], [bucket({ questions: ["Reliable transport?"], value: [] })], {}).length, 1, "an EMPTY bucket with the wording does NOT cover → resurfaces (removed-profile-field notify)");
   assert.equal(teachableCards([src("a", [mk({})])], [], {}, ["reliable transport?"]).length, 0, "dismissed");
   assert.equal(teachableCards([src("a", [mk({ flag: null })])], [], {}).length, 1, "a REVIEWED non-AI field is teachable too (Req B)");
   assert.equal(teachableCards([src("a", [mk({})]), src("b", [mk({})])], [], {}).length, 1, "dedup across apps");

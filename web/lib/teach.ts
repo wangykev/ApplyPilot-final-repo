@@ -92,12 +92,37 @@ function isTeachable(e: ReviewEntry): boolean {
   );
 }
 
-/** Normalized wordings already covered by SOME bucket (so a taught question won't reappear). */
-export function coveredKeys(buckets: Bucket[]): Set<string> {
+/** Whether a bucket would actually PRODUCE an answer — so it truly "covers" its questions.
+ *  Mode-A (bound to a profile field) needs that field to hold a value; Mode-B needs a non-empty
+ *  `value`. An EMPTY / unanswered bucket (e.g. the `over_18` starter bound to a profile field the
+ *  operator left blank or ACCIDENTALLY REMOVED) does NOT cover: the fill can't use it (it AI-guesses
+ *  instead), so the question must resurface in teach — where the operator is notified (the card's
+ *  "no profile value" warning) and can add it back. Otherwise it's invisible to teach AND re-guessed
+ *  on every fill, with no way to fix it except hunting through the profile. */
+export function bucketAnswers(b: Bucket, profile: unknown): boolean {
+  const path = String(b.profile_path || "").trim();
+  if (path) {
+    const raw = rawAt(profile, dottedPath(path)); // Mode-A → the bound profile value
+    if (raw == null) return false;
+    if (Array.isArray(raw)) return raw.some((v) => String(v).trim() !== "");
+    if (typeof raw === "string") return raw.trim() !== "";
+    return true; // boolean / number is a real answer (e.g. a triBool "No" / false)
+  }
+  const val = (b as { value?: unknown }).value; // Mode-B → its own candidate value
+  if (Array.isArray(val)) return val.some((v) => String(v).trim() !== "");
+  return String(val == null ? "" : val).trim() !== "";
+}
+
+/** Normalized wordings covered by an ANSWERABLE bucket (an empty/unanswered bucket does NOT hide its
+ *  questions — see bucketAnswers). Takes the profile to resolve Mode-A buckets' bound values. */
+export function coveredKeys(buckets: Bucket[], profile: unknown): Set<string> {
   const s = new Set<string>();
-  for (const b of buckets) for (const q of b.questions || []) {
-    const k = normalizeQuestion(q);
-    if (k) s.add(k);
+  for (const b of buckets) {
+    if (!bucketAnswers(b, profile)) continue;
+    for (const q of b.questions || []) {
+      const k = normalizeQuestion(q);
+      if (k) s.add(k);
+    }
   }
   return s;
 }
@@ -111,7 +136,7 @@ export function teachableCards(
   profile: unknown,
   dismissed?: Iterable<string>,
 ): TeachCard[] {
-  const covered = coveredKeys(buckets);
+  const covered = coveredKeys(buckets, profile);
   const skipped = new Set<string>(dismissed || []);
   const seen = new Set<string>();
   const cards: TeachCard[] = [];
