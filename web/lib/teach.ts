@@ -24,6 +24,7 @@ export function profileValueAt(profile: unknown, path: string): string {
     .split(".")
     .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
   if (v == null) return "";
+  if (typeof v === "boolean") return v ? "Yes" : "No"; // a yes/no (triBool) field → readable label, not "true"/"false"
   if (Array.isArray(v)) return v.length && typeof v[0] !== "object" ? String(v[0]) : "";
   return typeof v === "object" ? "" : String(v);
 }
@@ -254,11 +255,20 @@ function rawAt(profile: unknown, path: string): unknown {
 }
 
 /** Whether the profile field at `path` ALREADY holds `answer` — for a tiered array, ANY candidate
- *  counts; a boolean is compared as Yes/No; a scalar is compared normalized. */
+ *  counts; a scalar is compared normalized; a boolean (yes/no triBool) holds the answer when its
+ *  POLARITY matches, recognizing BOTH labelings (Yes/True, No/False) AND any custom candidate the
+ *  operator added to this field's ladder (profile.answer_ladders[path][yes|no]). The boolean handling is
+ *  kept in lockstep with the extension's fill (boolLadderCandidates) so a True-labeled or custom-labeled
+ *  answer the profile already covers does NOT resurface in teach after being taught. */
 export function fieldHoldsAnswer(profile: unknown, path: string, answer: string): boolean {
   const raw = rawAt(profile, path);
   if (Array.isArray(raw)) return raw.some((v) => typeof v === "string" && sameAnswer(v, answer));
-  if (typeof raw === "boolean") return sameAnswer(raw ? "Yes" : "No", answer);
+  if (typeof raw === "boolean") {
+    const ladders = (profile as { answer_ladders?: Record<string, { yes?: string[]; no?: string[] }> } | null)?.answer_ladders;
+    const custom = ladders && path ? ladders[path]?.[raw ? "yes" : "no"] : undefined;
+    if (Array.isArray(custom) && custom.some((c) => sameAnswer(String(c), answer))) return true;
+    return boolAnswerCandidates(answer).some((c) => sameAnswer(c, raw ? "Yes" : "No"));
+  }
   return raw != null && sameAnswer(String(raw), answer);
 }
 
@@ -365,6 +375,7 @@ export function flattenProfileFields(profile: unknown): ProfileFieldRow[] {
   for (const section of Object.keys(p)) {
     const sv = p[section];
     if (!sv || typeof sv !== "object") continue;
+    if (section === "answer_ladders") continue; // internal fill-ladder metadata, not a displayable profile field
     if (Array.isArray(sv)) {
       // REPEATING section (arrays of OBJECTS: work_experience / education / languages / certifications /
       // additional_files) → one grouped box PER ENTRY, so the teach page shows EVERYTHING the profile

@@ -9,6 +9,7 @@ import {
   type TeachCard,
   sameAnswer,
   boolAnswerCandidates,
+  fieldHoldsAnswer,
   profileValueAt,
   humanize,
   isFuzzyTier,
@@ -102,7 +103,9 @@ export function TeachInbox({
   const recCat = card ? card.suggested_category || (fallback ? fallback.suggested_category : "") : "";
   const recProfileValue = recPath ? profileValueAt(profile, recPath) : "";
   const fuzzy = !!stampedPath && isFuzzyTier(card?.match_tier); // matched a known field by near/typo
-  const matches = !!recPath && sameAnswer(card?.answer || "", recProfileValue);
+  // Boolean-aware: a "Yes"/"True" card answer matches a true triBool field, a tiered array matches ANY
+  // candidate, etc. (sameAnswer vs the collapsed display string would falsely read "differs" for yes/no).
+  const matches = !!recPath && fieldHoldsAnswer(profile, recPath, card?.answer || "");
 
   // Fetch the fallback recommendation ONLY for a card with no known home (no canonical_field + no hint).
   useEffect(() => {

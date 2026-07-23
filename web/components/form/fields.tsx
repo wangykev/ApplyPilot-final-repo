@@ -319,7 +319,9 @@ export function TriBoolField({
               title={active ? "Click again to edit the fill ladder" : `Select ${o.t}`}
               aria-expanded={active ? ladderFor === o.v : undefined}
               className={clsx(
-                "flex-1 py-1.5 text-sm transition-colors",
+                // hover:underline highlights the actual Yes/No text so it reads as clickable (select, or
+                // open the ladder when already selected); underline-offset keeps it legible.
+                "flex-1 py-1.5 text-sm transition-colors hover:underline hover:underline-offset-2",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
                 active
                   ? "bg-amber font-semibold text-cockpit hover:bg-amber/80" // selected; hover shift hints "click again for the ladder"

@@ -368,3 +368,39 @@ test("decideTeachRoute: value already present → 'wording'; missing/different �
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
   assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
 });
+
+test("yes/no teach correctness: boolean fields cover Yes/True AND No/False + custom ladders (no false resurface, no 'true' display)", () => {
+  // profileValueAt: a boolean shows the readable label, NOT "true"/"false"
+  assert.equal(profileValueAt({ screening: { at_least_18_years_old: true } }, "screening.at_least_18_years_old"), "Yes");
+  assert.equal(profileValueAt({ screening: { at_least_18_years_old: false } }, "screening.at_least_18_years_old"), "No");
+
+  // fieldHoldsAnswer: a TRUE field holds BOTH "Yes" and "True" (+ case variants); a FALSE field holds No/False.
+  const pt = { screening: { at_least_18_years_old: true } };
+  const pf = { work_authorization: { requires_sponsorship_now: false } };
+  for (const a of ["Yes", "yes", "True", "true"]) assert.equal(fieldHoldsAnswer(pt, "screening.at_least_18_years_old", a), true, `true holds ${a}`);
+  for (const a of ["No", "false", "False", "Negative"]) assert.equal(fieldHoldsAnswer(pt, "screening.at_least_18_years_old", a), false, `true does NOT hold ${a}`);
+  for (const a of ["No", "no", "False", "false"]) assert.equal(fieldHoldsAnswer(pf, "work_authorization.requires_sponsorship_now", a), true, `false holds ${a}`);
+  assert.equal(fieldHoldsAnswer(pf, "work_authorization.requires_sponsorship_now", "Yes"), false);
+
+  // custom ladder: a true field holds a custom Yes-synonym; not a label outside its ladder
+  const pc = { screening: { at_least_18_years_old: true }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: [] } } };
+  assert.equal(fieldHoldsAnswer(pc, "screening.at_least_18_years_old", "Affirmative"), true, "custom Yes label held");
+  assert.equal(fieldHoldsAnswer(pc, "screening.at_least_18_years_old", "Negative"), false, "not a Yes-ladder label");
+
+  // decideTeachRoute: a True-answered card on a true field is already answered → 'wording' (not 'answer')
+  assert.equal(decideTeachRoute(pt, "screening.at_least_18_years_old", "True"), "wording");
+  assert.equal(decideTeachRoute(pt, "screening.at_least_18_years_old", "No"), "answer"); // opposite polarity → set
+
+  // RESURFACE GUARD: an AI card answered "True" whose Mode-A boolean field is true must NOT resurface.
+  const a18 = bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you over the age of 18?"] });
+  const aiTrue = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "True", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("a", [aiTrue])], [a18], pt).length, 0, "a True-answered AI card is covered by the true boolean → not resurfaced");
+  // a custom-label "Affirmative" card is covered once the field's custom ladder holds it…
+  const aiAff = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Affirmative", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("b", [aiAff])], [a18], pc).length, 0, "custom-ladder label covered → not resurfaced");
+  // …but WITHOUT the custom ladder it surfaces (so the operator can add the tenant's variant to the ladder)
+  assert.equal(teachableCards([src("c", [aiAff])], [a18], pt).length, 1, "Affirmative not in any ladder yet → surfaces");
+
+  // flattenProfileFields ignores the answer_ladders metadata (no junk rows / phantom section)
+  assert.equal(flattenProfileFields(pc).some((r) => r.section === "answer_ladders" || r.path.startsWith("answer_ladders")), false);
+});
