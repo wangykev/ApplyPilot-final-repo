@@ -292,6 +292,10 @@ export function TriBoolField({
     const base = { yes: ladder?.yes ?? [], no: ladder?.no ?? [] };
     onLadderChange(v ? { ...base, yes: next } : { ...base, no: next });
   };
+  // The ladder popup is only reachable when a persist handler is wired (the profile page). Elsewhere the
+  // toggle just selects — so the "click into the ladder" highlight is shown ONLY on the SELECTED option
+  // AND only where it's editable (you can't open a ladder for an option you haven't selected).
+  const canEditLadder = !!onLadderChange;
 
   return (
     <div className="group">
@@ -313,22 +317,30 @@ export function TriBoolField({
               key={String(o.v)}
               type="button"
               onClick={() => {
-                if (active) setLadderFor((f) => (f === o.v ? null : o.v)); // selected → open/close its ladder popup
-                else { onChange(o.v); setLadderFor(null); }                // not selected → select it
+                if (active) { if (canEditLadder) setLadderFor((f) => (f === o.v ? null : o.v)); } // selected → open/close its ladder popup (editable only)
+                else { onChange(o.v); setLadderFor(null); }                                       // not selected → select it
               }}
-              title={active ? "Click again to edit the fill ladder" : `Select ${o.t}`}
-              aria-expanded={active ? ladderFor === o.v : undefined}
+              title={active ? (canEditLadder ? "Click again to edit the fill ladder" : "Selected") : `Select ${o.t}`}
+              aria-expanded={active && canEditLadder ? ladderFor === o.v : undefined}
               className={clsx(
-                // hover:underline highlights the actual Yes/No text so it reads as clickable (select, or
-                // open the ladder when already selected); underline-offset keeps it legible.
-                "flex-1 py-1.5 text-sm transition-colors hover:underline hover:underline-offset-2",
+                "group/tri flex-1 py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
                 active
                   ? "bg-amber font-semibold text-cockpit hover:bg-amber/80" // selected; hover shift hints "click again for the ladder"
                   : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
               )}
             >
-              {o.t}
+              {/* Highlight the actual Yes/No text on hover — ONLY when this option is SELECTED and its
+                  ladder is editable, since that's the only time clicking the word does something (opens
+                  the ladder). An unselected option shows no text highlight (clicking it just selects). */}
+              <span
+                className={clsx(
+                  "rounded px-2 py-0.5 transition-colors",
+                  active && canEditLadder && "cursor-pointer group-hover/tri:bg-cockpit/20"
+                )}
+              >
+                {o.t}
+              </span>
             </button>
           );
         })}
