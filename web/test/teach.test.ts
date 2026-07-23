@@ -8,6 +8,8 @@ import {
   sameAnswer,
   addWordingToBucket,
   boolAnswerCandidates,
+  isBoolAnswer,
+  addLadderLabel,
   ensureModeABucket,
   createModeBBucket,
   bucketLabel,
@@ -367,6 +369,31 @@ test("decideTeachRoute: value already present → 'wording'; missing/different �
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Male"), "wording"); // already holds it
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
   assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
+});
+
+test("teach a NON-standard yes/no label: addLadderLabel/isBoolAnswer file it in the field's ladder → covered, no resurface", () => {
+  // isBoolAnswer: standard tokens vs a tenant's custom label
+  for (const a of ["Yes", "no", "True", "FALSE", "checked", "off"]) assert.equal(isBoolAnswer(a), true, a);
+  for (const a of ["Affirmative", "Yes, I am authorized", "Blue", ""]) assert.equal(isBoolAnswer(a), false, a);
+
+  // addLadderLabel seeds the defaults + appends the custom label to the chosen polarity, deduped, immutably
+  const p0 = { screening: { at_least_18_years_old: true } };
+  const p1 = addLadderLabel(p0, "screening.at_least_18_years_old", true, "Affirmative") as {
+    answer_ladders: Record<string, { yes: string[]; no: string[] }>;
+  };
+  assert.deepEqual(p1.answer_ladders["screening.at_least_18_years_old"].yes, ["Yes", "True", "Affirmative"], "seeded defaults + custom label");
+  assert.deepEqual(p1.answer_ladders["screening.at_least_18_years_old"].no, [], "other polarity untouched");
+  assert.equal((p0 as { answer_ladders?: unknown }).answer_ladders, undefined, "input profile not mutated");
+  // dedup (case-insensitive) — adding again is a no-op
+  const p2 = addLadderLabel(p1, "screening.at_least_18_years_old", true, "affirmative") as typeof p1;
+  assert.deepEqual(p2.answer_ladders["screening.at_least_18_years_old"].yes, ["Yes", "True", "Affirmative"], "no duplicate");
+
+  // the taught label is now HELD by the field, and the AI card no longer resurfaces in teach
+  assert.equal(fieldHoldsAnswer(p1, "screening.at_least_18_years_old", "Affirmative"), true);
+  const a18 = bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you over the age of 18?"] });
+  const aiAff = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Affirmative", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("a", [aiAff])], [a18], p1).length, 0, "taught non-standard label → covered → not resurfaced");
+  assert.equal(teachableCards([src("b", [aiAff])], [a18], p0).length, 1, "before teaching → surfaces");
 });
 
 test("yes/no teach correctness: boolean fields cover Yes/True AND No/False + custom ladders (no false resurface, no 'true' display)", () => {

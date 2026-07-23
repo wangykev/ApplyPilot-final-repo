@@ -246,6 +246,35 @@ export function boolAnswerCandidates(answer: string): string[] {
   return t ? [t] : [];
 }
 
+/** Whether an answer is a recognized yes/no TOKEN (Yes/No/True/False/checked/…) — vs a NON-STANDARD
+ *  label a tenant used for a yes/no option (e.g. "Affirmative", "Yes, I am authorized"), which the
+ *  default ladder can't match and so must be remembered in the field's ladder. */
+export function isBoolAnswer(answer: string): boolean {
+  return ["yes", "true", "checked", "on", "no", "false", "unchecked", "off"].includes(
+    String(answer || "").trim().toLowerCase(),
+  );
+}
+
+/** Return a NEW profile with `label` added to field `path`'s fill ladder for the given polarity
+ *  (answer_ladders[path][yes|no]), seeded with the defaults (["Yes","True"] / ["No","False"]) so a
+ *  custom label AUGMENTS them, deduped case-insensitively. Lets the teach flow remember a tenant's
+ *  NON-STANDARD yes/no wording so it fills deterministically next time (and stops resurfacing). The
+ *  answer_ladders map + every entry are deep-copied so the caller's profile is never mutated. */
+export function addLadderLabel(profile: unknown, path: string, polarity: boolean, label: string): unknown {
+  const p: Record<string, unknown> = profile && typeof profile === "object" ? { ...(profile as Record<string, unknown>) } : {};
+  const key = polarity ? "yes" : "no";
+  const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[] }>) || {};
+  const ladders: Record<string, { yes: string[]; no: string[] }> = {};
+  for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])] };
+  const entry = ladders[path] || { yes: [], no: [] };
+  const cur = entry[key].length ? entry[key] : boolAnswerCandidates(polarity ? "Yes" : "No"); // seed defaults on the first custom add
+  const trimmed = String(label).trim();
+  entry[key] = trimmed && !cur.some((c) => sameAnswer(c, trimmed)) ? [...cur, trimmed] : cur;
+  ladders[path] = entry;
+  p.answer_ladders = ladders;
+  return p;
+}
+
 /** Raw value at a dotted path (arrays PRESERVED, unlike profileValueAt which collapses to the first). */
 function rawAt(profile: unknown, path: string): unknown {
   if (!path) return undefined;

@@ -11,6 +11,8 @@ import {
   bucketLabel,
   decideTeachRoute,
   boolAnswerCandidates,
+  isBoolAnswer,
+  addLadderLabel,
 } from "@/lib/teach";
 import { profileFieldMeta, getAtPath, setAtPath, type ProfileWidget } from "@/lib/profile-fields";
 import type { Bucket } from "@/lib/buckets";
@@ -77,6 +79,10 @@ export function TeachAddPopup({
   // For a field: does it already hold this answer (→ wording) or not (→ answer)?
   const route = isField ? decideTeachRoute(profile, path, card.answer) : "answer";
   const meta = isField ? profileFieldMeta(path, getAtPath(profile, path)) : null;
+  // A NON-STANDARD yes/no label (e.g. "Affirmative") a tenant used — the default Yes/No+True/False ladder
+  // can't match it, so remember it in this field's ladder (answer_ladders) for the chosen polarity, so it
+  // fills deterministically next time. A standard Yes/No/True/False answer needs no ladder entry.
+  const nonStandardBool = isField && meta?.widget === "tribool" && !isBoolAnswer(card.answer);
 
   // ── field · answer route: the field value seeded with the card's answer ──
   const [fieldValue, setFieldValue] = useState<unknown>(() =>
@@ -96,12 +102,17 @@ export function TeachAddPopup({
   const confirm = () => {
     if (isField && route === "answer" && meta) {
       // set the profile value AND remember the wording, so the card is fully taught (covered next time)
-      const withValue = setAtPath(profile, path, fieldValue);
+      let withValue = setAtPath(profile, path, fieldValue);
+      // Remember a NON-STANDARD yes/no label for the chosen polarity (fieldValue is a definite Yes/No),
+      // so the extension fills THIS tenant's wording deterministically and the card stops resurfacing.
+      if (nonStandardBool && typeof fieldValue === "boolean") {
+        withValue = addLadderLabel(withValue, path, fieldValue, card.answer) as Profile;
+      }
       const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
       onConfirm({
         profile: withValue,
         buckets: addWordingToBucket(withB, bucketId, card.question),
-        toast: `Added to your ${fieldLabel} ✓`,
+        toast: nonStandardBool ? `Remembered “${card.answer}” for your ${fieldLabel} ✓` : `Added to your ${fieldLabel} ✓`,
       });
     } else if (isField) {
       // wording route — the value's already there, only the phrasing is new
@@ -121,7 +132,9 @@ export function TeachAddPopup({
     }
   };
 
-  const canConfirm = isField && route === "answer" ? true : wordings.length > 0;
+  // A non-standard yes/no label needs a definite polarity (Yes or No) before we can file it in a ladder.
+  const canConfirm =
+    isField && route === "answer" ? (nonStandardBool ? typeof fieldValue === "boolean" : true) : wordings.length > 0;
 
   const title =
     isField && route === "answer"
@@ -154,7 +167,9 @@ export function TeachAddPopup({
             <p className="text-xs text-ink-dim">
               {isListWidget(meta.widget)
                 ? "Added to your field's answer options (the ladder the extension tries — reorder if needed)."
-                : "Sets your profile field — the extension fills it from here."}{" "}
+                : nonStandardBool
+                  ? "This form used a non-standard label — pick whether it means Yes or No, and it'll be remembered so the tool fills it automatically next time."
+                  : "Sets your profile field — the extension fills it from here."}{" "}
               <span className="text-ink-faint">The question wording is saved too.</span>
             </p>
             <ProfileFieldEditor
@@ -165,6 +180,18 @@ export function TeachAddPopup({
               countryForState={arrv(getAtPath(profile, "personal_info.country"))}
               onChange={setFieldValue}
             />
+            {nonStandardBool && (
+              <p className="text-xs">
+                {typeof fieldValue === "boolean" ? (
+                  <span className="text-ink-dim">
+                    &ldquo;<span className="font-medium text-ink">{card.answer}</span>&rdquo; will be remembered as a{" "}
+                    <span className="font-medium text-ink">{fieldValue ? "Yes" : "No"}</span> label for this question.
+                  </span>
+                ) : (
+                  <span className="text-signal">Pick Yes or No above so we know which &ldquo;{card.answer}&rdquo; means.</span>
+                )}
+              </p>
+            )}
           </div>
         )}
 
