@@ -168,8 +168,11 @@ export function TeachInbox({
     setSaving(true);
     let ok = true;
     let err = "";
+    // Persist FIRST; apply the optimistic store updates only on success, in the SAME batch that closes
+    // the popup + advances. Updating `profile`/`buckets` while the confirm popup is STILL OPEN made it
+    // re-render — the field now held the answer, so decideTeachRoute flipped "answer" → "wording" and
+    // flashed a spurious "Remember wording — …" screen for the length of the save. (2026-07-23)
     if (r.buckets) {
-      setBuckets(r.buckets);
       const res = await saveBuckets(r.buckets);
       if (!res.ok) {
         ok = false;
@@ -177,8 +180,6 @@ export function TeachInbox({
       }
     }
     if (ok && r.profile) {
-      setProfile(r.profile);
-      profileRef.current = r.profile;
       const res = await saveProfile(r.profile);
       if (!res.ok) {
         ok = false;
@@ -187,6 +188,11 @@ export function TeachInbox({
     }
     setSaving(false);
     if (ok) {
+      if (r.buckets) setBuckets(r.buckets);
+      if (r.profile) {
+        setProfile(r.profile);
+        profileRef.current = r.profile;
+      }
       liveSync("profile"); // taught answer persisted — push profile + buckets to a connected extension
       setNote(r.toast);
       setConfirm(null);
