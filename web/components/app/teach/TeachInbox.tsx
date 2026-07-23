@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine, ChevronDown, RotateCcw } from "lucide-react";
+import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
 import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
@@ -14,7 +14,7 @@ import {
 } from "@/lib/teach";
 import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
 import { liveSync } from "@/lib/extension-sync";
-import { saveDismissed, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
+import { saveDismissed, saveDeleted, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
 import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
 import { TeachAddPopup, type ConfirmTarget, type AddResult } from "@/components/app/teach/TeachAddPopup";
@@ -29,12 +29,14 @@ export function TeachInbox({
   initialSkipped,
   initialBuckets,
   initialDismissed,
+  initialDeleted,
   profile: initialProfile,
 }: {
   initialCards: TeachCard[];
   initialSkipped: TeachCard[];
   initialBuckets: Bucket[];
   initialDismissed: string[];
+  initialDeleted: string[];
   profile: Profile;
 }) {
   const [cards, setCards] = useState<TeachCard[]>(initialCards);
@@ -44,6 +46,9 @@ export function TeachInbox({
   // Cards the user SKIPPED — shown in a collapsible "Skipped" section so they can be restored.
   const [skipped, setSkipped] = useState<TeachCard[]>(initialSkipped);
   const [showSkipped, setShowSkipped] = useState(false);
+  // Permanently-deleted skipped keys (subset of `dismissed`, hidden from the Skipped section too).
+  const [deleted, setDeleted] = useState<string[]>(initialDeleted);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   // the three add surfaces: the end-step confirm popup (a chosen target), the "wrong field" picker, and
@@ -226,6 +231,31 @@ export function TeachInbox({
     setSkipped((s) => s.filter((x) => x.key !== c.key));
     setCards((prev) => (prev.some((x) => x.key === c.key) ? prev : [...prev, c]));
     setNote(null);
+  };
+
+  // Delete ALL skipped: permanently discard them. They stay in `dismissed` (out of the active queue)
+  // and are added to `deleted` so they're hidden from the Skipped section too — no restore path, and
+  // they won't resurface on reload (the teach page renders Skipped as dismissed − deleted). One write.
+  const clearSkipped = async () => {
+    const keys = skipped.map((c) => c.key);
+    if (keys.length === 0) {
+      setConfirmClear(false);
+      return;
+    }
+    setSaving(true);
+    const nextDeleted = Array.from(new Set([...deleted, ...keys]));
+    const r = await saveDeleted(nextDeleted);
+    setSaving(false);
+    if (r.ok) {
+      setDeleted(nextDeleted);
+      keys.forEach((k) => handledRef.current.add(k)); // belt-and-suspenders: never re-append via the poll
+      setSkipped([]);
+      setConfirmClear(false);
+      setShowSkipped(false);
+      setNote(`Deleted ${keys.length} skipped ✓`);
+    } else {
+      setNote(`Couldn't save: ${r.error}`);
+    }
   };
 
   // ── new-answer popup (shared with the profile page) ──
@@ -428,17 +458,39 @@ export function TeachInbox({
       {/* SKIPPED — questions you passed on, collapsible, restorable back into the queue */}
       {skipped.length > 0 && (
         <div className="bezel p-5">
-          <button
-            type="button"
-            onClick={() => setShowSkipped((v) => !v)}
-            className="flex w-full items-center justify-between text-left"
-          >
-            <span className="flex items-center gap-2 text-sm text-ink">
+          <div className="flex items-center justify-between gap-3">
+            <button
+              type="button"
+              onClick={() => setShowSkipped((v) => !v)}
+              className="flex flex-1 items-center gap-2 text-left text-sm text-ink"
+            >
               <SkipForward className="h-4 w-4 text-ink-dim" />
               Skipped ({skipped.length})
-            </span>
-            <ChevronDown className={"h-4 w-4 text-ink-dim transition-transform" + (showSkipped ? " rotate-180" : "")} />
-          </button>
+              <ChevronDown className={"h-4 w-4 text-ink-dim transition-transform" + (showSkipped ? " rotate-180" : "")} />
+            </button>
+            {/* Delete all — permanently discards every skipped card (two-click confirm) */}
+            {confirmClear ? (
+              <span className="flex items-center gap-2">
+                <span className="text-xs text-ink-dim">Delete all {skipped.length}?</span>
+                <button onClick={clearSkipped} className="btn-ghost px-2 py-1 text-xs text-signal" disabled={saving} title="Permanently remove all skipped">
+                  {saving ? "Deleting…" : "Confirm"}
+                </button>
+                <button onClick={() => setConfirmClear(false)} className="btn-ghost px-2 py-1 text-xs" disabled={saving}>
+                  Cancel
+                </button>
+              </span>
+            ) : (
+              <button
+                onClick={() => setConfirmClear(true)}
+                className="btn-ghost shrink-0 px-2 py-1 text-xs text-ink-dim hover:text-signal"
+                disabled={saving}
+                title="Permanently remove all skipped questions"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Delete all
+              </button>
+            )}
+          </div>
           {showSkipped && (
             <ul className="mt-4 space-y-2">
               {skipped.map((c) => (
