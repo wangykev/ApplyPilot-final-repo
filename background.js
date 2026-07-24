@@ -159,11 +159,18 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // Gmail auto-verify defaults ON for a website run (an email-verify tenant would otherwise
         // halt); the message may override, and the stored toggle wins if explicitly OFF.
         const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
+        // Background fill (the website "Run in background" button): open the job tab UNFOCUSED
+        // (active:false) so the operator stays on the Run page while the pipeline works. The whole
+        // CDP substrate is already hidden-safe (worker-timers override + adaptive pacing + cdpWakePage),
+        // so nothing downstream changes — a genuinely-unrenderable step still halts self-explaining
+        // (e.g. hidden-render-stalled) rather than guessing.
+        const background = message.background === true;
 
         // Open the job link in a new tab and wait for the first load to settle.
-        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: true }, res));
+        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
         const tabId = tab.id;
+        console.log(`[ApplyPilot][RUN] opened job tab ${tabId} (${background ? "BACKGROUND — unfocused, hidden-safe pacing" : "foreground"})`);
         await waitTabComplete(tabId, 20000);
         await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
 

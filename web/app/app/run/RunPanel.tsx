@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Rocket, Loader2, Check, AlertTriangle, X, Cable, ChevronDown, ExternalLink } from "lucide-react";
+import { Rocket, Loader2, Check, AlertTriangle, X, Cable, ChevronDown, ExternalLink, EyeOff } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { sendToExtension, extensionMessagingAvailable, type ExtResponse } from "@/lib/extension";
 import { linkedExtensionId } from "@/lib/extension-sync";
@@ -12,7 +12,7 @@ import { clsx } from "@/lib/clsx";
 type Jd = { title?: string; company?: string; text?: string; url?: string };
 type Phase =
   | { s: "idle" }
-  | { s: "running" }
+  | { s: "running"; background: boolean }
   | { s: "done"; resp: ExtResponse; jd: Jd | null; appId: string | null };
 
 type Outcome = { tone: "ok" | "warn" | "err"; headline: string; detail?: string };
@@ -109,7 +109,7 @@ export function RunPanel() {
   const running = phase.s === "running";
   const validUrl = /^https?:\/\/\S+$/i.test(url.trim());
 
-  async function run() {
+  async function run(background: boolean) {
     const startUrl = url.trim();
     if (!validUrl || running) return;
     const extId = linkedExtensionId();
@@ -117,9 +117,11 @@ export function RunPanel() {
       setConnected(false);
       return;
     }
-    setPhase({ s: "running" });
+    setPhase({ s: "running", background });
 
-    const resp = await sendToExtension(extId, { type: "AP_RUN_APPLICATION", startUrl });
+    // background:true → the extension opens the job tab UNFOCUSED and the whole pipeline runs
+    // hidden (the CDP substrate is throttle-immune) — you stay right here on the Run page.
+    const resp = await sendToExtension(extId, { type: "AP_RUN_APPLICATION", startUrl, background });
 
     // Save whatever the extension scraped to the tracker row for this posting.
     const jd = (resp.jd as Jd | null) ?? null;
@@ -162,34 +164,57 @@ export function RunPanel() {
 
       <SectionCard
         title="Job link"
-        subtitle="A Workday posting URL (myworkdayjobs.com). Run opens it in a new tab — keep that tab visible to watch it work."
+        subtitle="A Workday posting URL (myworkdayjobs.com). Run opens it in a new tab and works through it — foreground to watch, or in the background while you stay here."
       >
         <div className="flex flex-col gap-3 sm:flex-row">
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") run();
+              if (e.key === "Enter") run(false);
             }}
             disabled={running}
             placeholder="https://company.wd5.myworkdayjobs.com/…/job/…/apply"
             className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber disabled:opacity-60"
           />
           <button
-            onClick={run}
+            onClick={() => run(false)}
             disabled={!validUrl || running || connected === false}
             className="btn-primary shrink-0"
           >
             {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
             {running ? "Running…" : "Run"}
           </button>
+          <button
+            onClick={() => run(true)}
+            disabled={!validUrl || running || connected === false}
+            className="btn-ghost shrink-0"
+            title="Fills in an unfocused tab — you stay on this page while it works."
+          >
+            {phase.s === "running" && phase.background ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <EyeOff className="h-4 w-4" />
+            )}
+            {phase.s === "running" && phase.background ? "Filling in background…" : "Background fill"}
+          </button>
         </div>
 
         {running && (
           <p className="mt-4 text-xs leading-relaxed text-ink-dim">
-            Working through Apply → sign-in → email verification → fill. This takes a minute or two — the
-            tab shows Chrome&apos;s &ldquo;started debugging&rdquo; bar while the extension drives it. It will
-            stop at the review page and never submit.
+            {phase.s === "running" && phase.background ? (
+              <>
+                Working through Apply → sign-in → email verification → fill in an <em>unfocused</em> tab —
+                stay on this page; the result lands here and in your Tracker. It stops at the review page
+                and never submits.
+              </>
+            ) : (
+              <>
+                Working through Apply → sign-in → email verification → fill. This takes a minute or two —
+                the tab shows Chrome&apos;s &ldquo;started debugging&rdquo; bar while the extension drives
+                it. It will stop at the review page and never submit.
+              </>
+            )}
           </p>
         )}
       </SectionCard>
