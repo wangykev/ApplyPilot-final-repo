@@ -25,6 +25,7 @@ const ONBOARD_STOP: Record<string, string> = {
   "verification-email-not-found": "Couldn't find the verification email. Check the inbox, click the link, then run again.",
   "verify-link-invalid": "The verification link was rejected — open it manually in this browser, then run again.",
   "hidden-render-stalled": "The sign-in form didn't render while the tab was in the background. Bring the tab to the front and run again.",
+  "password-breach-dialog": "Chrome is blocking sign-in with a “password found in a data breach” warning. Dismiss it in the tab — or use a unique Workday password (the Credentials page enforces a strong one), or turn off Chrome’s breach warning — then run again.",
   "workday-maintenance": "Workday is in planned maintenance. Try again after the maintenance window.",
   "unknown-page": "Couldn't find an Apply / sign-in / form on that page. Make sure the link is the job posting.",
   "already-applied": "You've already applied to this job — Workday won't reopen the application, so there's nothing to fill.",
