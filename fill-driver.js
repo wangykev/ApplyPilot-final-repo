@@ -595,9 +595,21 @@ const recognizeEmploymentQuestion = (label, company) => {
   let hit = false;
   for (const s of text.split(/[.?!;]+/)) {
     const sTokens = companyTokens(s);
-    const coStart = seqStart(sTokens, coTokens);
+    // Anchor where the sentence NAMES the company. Prefer the full token sequence (most
+    // precise). But the JD scrape can yield a fuller corporate name than the question asks
+    // — "Magna International" / "Magna Powertrain" scraped vs a bare "MAGNA" in the question
+    // — so if the full sequence isn't present, fall back to the company's distinctive BRAND
+    // token (coTokens[0], when it's ≥5 chars and not a generic descriptor — the SAME brand
+    // token the "worked for «co»" phrase keys on). A generic head ("Bank of America" → "bank")
+    // still requires the full sequence, so this can't false-anchor on a common word.
+    let coStart = seqStart(sTokens, coTokens);
+    let coSpan = coTokens.length;
+    if (coStart === -1 && coTokens[0].length >= 5 && !GENERIC_SINGLE.has(coTokens[0])) {
+      coStart = sTokens.indexOf(coTokens[0]);
+      coSpan = 1;
+    }
     if (coStart === -1) continue; // this sentence doesn't name the company
-    const coEnd = coStart + coTokens.length - 1;
+    const coEnd = coStart + coSpan - 1;
     let empNear = false;
     for (let i = Math.max(0, coStart - WINDOW); i <= Math.min(sTokens.length - 1, coEnd + WINDOW); i++) {
       if (EMPLOY_TERM_RE.test(sTokens[i])) { empNear = true; break; }

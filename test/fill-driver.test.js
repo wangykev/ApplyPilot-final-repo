@@ -636,6 +636,25 @@ test("employment recognizer: no false positives on lookalikes", () => {
   assert.strictEqual(recognizeEmploymentQuestion("Are you authorized to work in Canada?", "Magna"), null, "company not named");
   assert.strictEqual(recognizeEmploymentQuestion("Are you a former employee?", ""), null, "no application company → can't anchor");
 });
+test("employment recognizer: anchors on the BRAND token when the JD scrape yields a fuller name than the question", () => {
+  // The Magna questions say bare "MAGNA", but the JD scrape can produce the fuller corporate name
+  // ("Magna International") — the anchor must still fire on the brand token, not bail to the AI.
+  const Q1 = "If you are a former MAGNA employee, please select Yes and enter all the applicable information below. If you are not a former MAGNA employee, please select No.";
+  const Q2 = 'Are you currently employed with Magna? (If you are a current Magna employee, please use the "Jobs Hub" in Workday to apply for this role. If you are a current contingent/supplemental/contract worker, please select "No".)';
+  for (const co of ["Magna International", "Magna Powertrain", "Magna International Inc.", "Magna Careers"]) {
+    assert.strictEqual(recognizeEmploymentQuestion(Q1, co) && recognizeEmploymentQuestion(Q1, co).tense, "former", `Q1 must anchor for scraped company "${co}"`);
+    assert.strictEqual(recognizeEmploymentQuestion(Q2, co) && recognizeEmploymentQuestion(Q2, co).tense, "current", `Q2 must anchor for scraped company "${co}"`);
+  }
+  // A GENERIC head still requires the full sequence — the brand fallback can't false-anchor on "bank".
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former Bank employee?", "Bank of America"), null, "generic head 'bank' alone must not anchor");
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former Bank of America employee?", "Bank of America"), { tense: "former", company: "Bank of America" }, "full sequence still anchors");
+});
+test("employment question — multi-word scraped company (Magna International) still fills 'No' SILENTLY", async () => {
+  const [rec] = await run([empField("If you are a former MAGNA employee, please select Yes. If you are not a former MAGNA employee, please select No.")], { employment_history_companies: ["Google"] }, { company: "Magna International" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "a grounded No fills silently even when the scrape yielded the fuller corporate name");
+  assert.ok(!rec.flag, "no LEGALLY-LOADED flag");
+});
 test("decideCurrentlyEmployed: derived from the 'currently work here' flags (operator decision #2)", () => {
   const p = (we, emp) => ({ work_experience: we, employment_history_companies: emp || ["Google"] });
   assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Google", currently_work_here: true }]))), { fill: "No", review: false }, "current job elsewhere → confident No");
