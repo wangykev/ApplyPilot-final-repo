@@ -794,6 +794,97 @@ test("employment — GENUINELY ambiguous options (no bare option, two Yes-leadin
   assert.ok(rec.flag && rec.flag.indexOf("ai-") === 0, "the AI (flagged) handles granularity the polarity map can't disambiguate");
 });
 
+// ── ALL WIDGET TYPES (2026-07-24) — the same question renders as a checkbox assertion or a free-text box.
+test("employment recognizer: FIRST-PERSON checkbox assertion fires; the negated form bails", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("I am a former Magna employee.", "Magna"), { tense: "former", company: "Magna" });
+  assert.strictEqual(recognizeEmploymentQuestion("I am not a former Magna employee.", "Magna"), null, "negated first-person assertion → inverted polarity → bail");
+});
+const empCheckbox = (label, flags) => Object.assign({
+  wrapperSel: "[w-empcb]", fieldName: "customScreeningCb", widgetType: "checkbox", label,
+  inputId: "empcb-input", checked: false
+}, flags || {});
+test("employment REQUIRED checkbox — STILL auto-checked (required can't stay blank), but a grounded-No contradiction is review-flagged", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.", { isRequired: true })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true", "the box IS checked — the auto-consent rule holds");
+  assert.strictEqual(rec.status, "filled_review", "…but silently asserting what the profile contradicts is flagged");
+  assert.strictEqual(rec.flag, "employer-match");
+  assert.match(rec.detail, /grounded employment answer is "No"/);
+});
+test("employment REQUIRED checkbox — agreement (company IS a past employer) stays a silent auto-check", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.", { isRequired: true })], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true");
+  assert.strictEqual(rec.status, "filled", "the grounded answer agrees with the check — no flag needed");
+  assert.ok(!rec.flag);
+});
+test("ordinary REQUIRED consent checkbox — auto-check behavior byte-identical (no employment question → no flag)", async () => {
+  const [rec] = await run([empCheckbox("I agree to the terms and conditions and authorize a background check.", { isRequired: true })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true");
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!rec.flag, "consent auto-check unchanged — 'agree'/'authorize' bail the recognizer");
+});
+test("employment OPTIONAL checkbox — clean No leaves it unchecked SILENTLY (zero value actuation)", async () => {
+  const act = makeFakeAct([empCheckbox("I am a former Magna employee.")]);
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "false", "stays unchecked — the grounded No");
+  assert.ok(!rec.flag);
+  assert.ok(!act.log.some(([m]) => m === "clickCheckboxLabel"), "a virgin box already matches 'No' — no actuation");
+});
+test("employment OPTIONAL checkbox — Yes (company in history) → CHECKED + review, never silent", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+});
+test("employment OPTIONAL checkbox — a pre-TICKED box cleared by a grounded No is forced to review", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.", { checked: true })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "false", "unchecked — the grounded No commits");
+  assert.strictEqual(rec.status, "filled_review", "clearing a pre-existing tick is ALWAYS review-flagged");
+  assert.match(rec.detail, /unchecked the pre-ticked box/);
+});
+const empText = (label, flags) => Object.assign({
+  wrapperSel: "[w-emptx]", fieldName: "customScreeningTx", widgetType: "text", isRequired: true, label, value: ""
+}, flags || {});
+test("employment TEXT — clean No types \"No\" silently; the AI is never consulted even when enabled", async () => {
+  const act = makeFakeAct([empText("Are you a former MAGNA employee?")], { aiEnabled: true, ai: '{"answer":"trap — must not be called"}' });
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!rec.flag);
+  assert.ok(!act.log.some(([m]) => m === "llm"), "deterministic — no LLM call");
+});
+test("employment TEXT — Yes (company in history) → filled_review + employer-match", async () => {
+  const [rec] = await run([empText("Have you ever worked for Magna?")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+});
+test("employment TEXT — a detail-REQUEST field ('enter your employee ID') is NOT answered with a bare No", async () => {
+  const [rec] = await run([empText("If you are a former MAGNA employee, please enter your employee ID below.")], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.notStrictEqual(rec.mappedPath, "(employment-status)", "detail-request → not a yes/no ask → left for AI-2/blank");
+  assert.notStrictEqual(rec.after, "No");
+});
+test("employment TEXT — a pre-existing DIFFERENT value is never silently overwritten", async () => {
+  const [rec] = await run([empText("Are you a former MAGNA employee?", { value: "Yes" })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No", "the grounded answer commits");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.match(rec.detail, /overwrote "Yes"/);
+});
+test("employment TEXTAREA — clean No types \"No\" silently", async () => {
+  const f = empText("Are you currently employed with Magna?");
+  f.widgetType = "textarea";
+  const [rec] = await run([f], { work_experience: [{ company: "Google", currently_work_here: true }], employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled");
+});
+test("employment OPTIONAL radio — the deterministic tier runs for optional fields too (like buckets)", async () => {
+  const f = empField("Are you a former MAGNA employee?");
+  f.isRequired = false;
+  const [rec] = await run([f], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "grounded + deterministic → fills optional fields too");
+});
+
 // ── AI required-radio fallback (aiFillRadio) — the deferred required-radio path ──────────────
 // A REQUIRED radio the deterministic pass can't answer would BLOCK Save & Continue → guess-to-reach-
 // review (never blind-trust): infer + commit + ALWAYS filled_review, flagged HARD. AI OFF / OPTIONAL → blank.

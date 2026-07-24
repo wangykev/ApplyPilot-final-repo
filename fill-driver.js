@@ -572,9 +572,10 @@ const EMPLOY_BAIL_RE = new RegExp([
   "would\\s+you", "willing", "consider", "interested", "in\\s+the\\s+future", "want\\s+to", "plan\\s+to", "\\baccept\\b", "availab", "\\bable\\s+to\\b" // \b — "applicABLE TO you" must not bail (Magna Q1 boilerplate says "applicable")
 ].join("|"), "i");
 // The ASK must be about YOUR employment, in the SAME sentence as the company: a second-person employment
-// clause ("are/were/have/do/if you … employee/employed/worked"), a terse "Former «co» employee?" opener,
-// or "your former/current employer".
-const EMPLOY_ASK_RE = /\b(?:are|were|have|has|do|does|did|is|was|if)\s+you\b[\s\S]{0,80}?\b(?:employ\w*|payroll|work(?:ed|ing))\b|^[\s"'(]*(?:a\s+)?(?:current|former|previous)(?:ly)?\b[\s\S]{0,50}?\b(?:employee|employed)\b|\byour\s+(?:current|former|previous|prior|past)\s+employer\b/i;
+// clause ("are/were/have/do/if you … employee/employed/worked"), a FIRST-person assertion ("I am/was a
+// «co» employee" — the CHECKBOX rendering; the negated "I am not…" form is bailed above), a terse
+// "Former «co» employee?" opener, or "your former/current employer".
+const EMPLOY_ASK_RE = /\b(?:are|were|have|has|do|does|did|is|was|if)\s+you\b[\s\S]{0,80}?\b(?:employ\w*|payroll|work(?:ed|ing))\b|\bi\s+(?:am|was|have\s+been|used\s+to\s+be)\b[\s\S]{0,60}?\b(?:employ\w*|payroll|work(?:ed|ing))\b|^[\s"'(]*(?:a\s+)?(?:current|former|previous)(?:ly)?\b[\s\S]{0,50}?\b(?:employee|employed)\b|\byour\s+(?:current|former|previous|prior|past)\s+employer\b/i;
 const recognizeEmploymentQuestion = (label, company) => {
   const co = (company || "").trim();
   if (!co) return null;
@@ -2657,6 +2658,23 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         if (f.isRequired && !refused) {
           record.resolved = true;
           Object.assign(record, await fillCheckboxCdp(act, loc, true, budgets)); // auto-consent
+          // Employment-status CONTRADICTION flag (2026-07-24): a REQUIRED checkbox is still ALWAYS checked
+          // (operator rule — required can't stay blank; the box must be ticked for the walk to advance).
+          // But if the label is a recognized employment-status ASSERTION ("I am a former «co» employee")
+          // and the GROUNDED answer is "No", a silent auto-consent would silently assert what the profile
+          // contradicts — keep the check, FLAG it for review. Agreement / unevaluable → silent, as before.
+          if (!mappedPath && record.status === "filled") {
+            try {
+              const empCompany = jobContext && jobContext.company;
+              const emp = recognizeEmploymentQuestion(f.label, empCompany);
+              const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+              if (d && d.fill === "No") {
+                record.status = "filled_review"; record.flag = "employer-match";
+                record.detail = (record.detail ? record.detail + "; " : "")
+                  + `required checkbox auto-checked, but the grounded employment answer is "No" (${d.detail}) — verify this assertion`;
+              }
+            } catch (e) { /* keep the plain silent auto-check */ }
+          }
         } else if (!mappedPath) {
           record.status = "skipped";
           record.detail = "no mapping";
@@ -2725,18 +2743,24 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       }
     }
 
-    // ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) ── a yes/no RADIO or DROPDOWN
-    // like "Are you a former MAGNA employee?" / "Are you currently employed with Magna?" is answerable from
-    // the profile's employment history. Recognize it by TEXT (anchored on jobContext.company + a same-
-    // sentence employment ask about YOU; adversarial wordings — relatives/referral, competitor/any-employer,
-    // work-auth/termination/consent, inverted polarity, aspirational — all BAIL to the AI+review fallback)
-    // and answer via the GROUNDED membership check: a clean "No" fills SILENTLY (no LEGALLY-LOADED flag, no
-    // review — the whole point), a "Yes"/uncertain is flagged for review (truthfulness-adjacent, NEVER
-    // auto-"Yes"). MUST run BEFORE the AI FALLBACK below (the dropdown AI would otherwise fill it first);
-    // a pre-existing DIFFERENT real value is never silently overwritten (forced review). Unrecognized /
-    // unevaluable / polarity-unmappable / commit-failed → the AI/blank fallback (a commit-fail sets
-    // `resolved`, so producedNothing stays false and the AI can never override a made decision).
-    if (f.isRequired && (f.widgetType === "radio" || f.widgetType === "dropdown") && record.resolved == null
+    // ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) ── a question like "Are you a
+    // former MAGNA employee?" / "Are you currently employed with Magna?" / the checkbox assertion "I am a
+    // former Magna employee" is answerable from the profile's employment history — on EVERY yes/no-capable
+    // widget: radio, dropdown, text/textarea (types "Yes"/"No"), checkbox (check/uncheck). Recognize it by
+    // TEXT (anchored on jobContext.company + a same-sentence employment ask about YOU; adversarial wordings
+    // — relatives/referral, competitor/any-employer, work-auth/termination/consent, inverted polarity,
+    // aspirational — all BAIL to the AI+review fallback) and answer via the GROUNDED membership check: a
+    // clean "No" fills SILENTLY (no LEGALLY-LOADED flag, no review — the whole point), a "Yes"/uncertain is
+    // flagged for review (truthfulness-adjacent, NEVER auto-"Yes"). A DETERMINISTIC tier like the bucket
+    // consult → runs for REQUIRED and OPTIONAL alike (the AI fallbacks below stay required-only). MUST run
+    // BEFORE the AI FALLBACK below (the dropdown/text AI would otherwise fill it first); a pre-existing
+    // DIFFERENT real value is never silently overwritten (forced review). A REQUIRED checkbox never reaches
+    // here — the dispatch auto-checks it (required can't stay blank; a grounded-"No" contradiction is
+    // review-flagged there). Unrecognized / unevaluable / polarity-unmappable / commit-failed → the
+    // AI/blank fallback (a commit-fail sets `resolved`, so producedNothing stays false and the AI can
+    // never override a made decision).
+    if ((f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "text"
+         || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
         const empCompany = jobContext && jobContext.company;
@@ -2765,7 +2789,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
               if (decision.likelyYes) record.matchTier = "likely-yes";
             }
             // target == null (ambiguous options, e.g. two Yes-leading granularities) → the AI fallback below
-          } else {
+          } else if (f.widgetType === "dropdown") {
             // DROPDOWN: open + read the live options (the proven reader), map the polarity to the exact
             // option, commit via the AI path's proven text-keyed click + persistence re-read (an EMPTY
             // fill never races → single commit; a prefilled-equal value keeps with ZERO value actuation).
@@ -2807,6 +2831,51 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
                 record.status = "needs_review"; record.flag = "employer-match";
                 record.after = post ? post.triggerText : null;
                 record.detail = `${decision.detail}; chose "${target}" but the commit did not persist`;
+              }
+            }
+          } else if (f.widgetType === "checkbox") {
+            // OPTIONAL unmapped checkbox (a REQUIRED one was auto-checked in the dispatch and never reaches
+            // here). check = "Yes" (asserting employment — always review via decision.review), uncheck =
+            // "No" (a virgin box → zero actuation, silent; a pre-TICKED box being cleared → forced review).
+            const want = decision.fill === "Yes";
+            const st = await act.readCheckboxState(loc);
+            const beforeChecked = st ? !!st.checked : null;
+            record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+            record.resolved = want;
+            const hr = await fillCheckboxCdp(act, loc, want, budgets);
+            Object.assign(record, hr);
+            record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
+            const overwrote = beforeChecked === true && !want;
+            if (hr.status === "filled" && (decision.review || overwrote)) {
+              record.status = "filled_review"; record.flag = "employer-match";
+              if (overwrote) record.detail += "; unchecked the pre-ticked box — verify";
+            }
+            if (decision.likelyYes) record.matchTier = "likely-yes";
+          } else {
+            // TEXT / TEXTAREA: type the polarity word ("Yes"/"No"). A detail-REQUEST field ("please
+            // enter/list/provide your employee ID / dates…") is NOT a yes/no ask — typing a bare "No"
+            // silently would be sloppy → leave it for the AI-2 fallback (flagged) / blank.
+            if (!/\b(?:list|provide|describe|explain|specify|details?|dates?|id|number|enter)\b/i.test(String(f.label || ""))) {
+              const tag = f.widgetType === "textarea" ? "textarea" : undefined;
+              const pre = await act.readTextValue(loc, tag);
+              const before = pre ? pre.value : null;
+              record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              if (before != null && String(before).trim() !== "" && textValuesMatch(before, decision.fill)) {
+                record.status = decision.review ? "filled_review" : "filled";
+                if (decision.review) record.flag = "employer-match";
+                record.after = before; record.verified = true;
+                record.detail = `${decision.detail}; already held "${before}" — kept (no actuation)`;
+              } else {
+                const hr = await fillTextCdp(act, loc, decision.fill, budgets, tag);
+                Object.assign(record, hr);
+                record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
+                const overwrote = before != null && String(before).trim() !== "";
+                if (hr.status === "filled" && (decision.review || overwrote)) {
+                  record.status = "filled_review"; record.flag = "employer-match";
+                  if (overwrote) record.detail += `; overwrote "${before}" — verify`;
+                }
+                if (decision.likelyYes) record.matchTier = "likely-yes";
               }
             }
           }

@@ -1087,3 +1087,29 @@ AI fallback — the safe direction):**
 Verified: extension suite green — 661 pass, 0 fail (+16 tests: the full adversarial battery, the two REAL
 Magna labels verbatim as survivors, dropdown parity incl. silent-No/verbose/Yes-review/prefill-kept/
 overwrite-forced-review, and the bare-vs-granular Yes option semantics). Live-confirmation on Magna pending.
+
+## 2026-07-24 — Employment-status: ALL widget types (text/textarea + checkbox join radio/dropdown) (branch `web-run-home-flow`)
+
+Operator: the employment-status questions must fill correctly on EVERY answer widget, not just radio +
+dropdown. Extended the deterministic tier to text/textarea and checkbox; also made it run for OPTIONAL
+fields (it's a deterministic tier like buckets — the AI fallbacks stay required-only).
+
+- **Recognizer:** `EMPLOY_ASK_RE` gains the FIRST-person assertion form ("I am/was a «co» employee") — the
+  checkbox rendering; the negated "I am not…" was already an inverted-polarity bail.
+- **Text/textarea:** types the polarity word ("Yes"/"No") via `fillTextCdp`; clean No silent, Yes/uncertain
+  review-flagged; a pre-existing DIFFERENT value → commit + forced review; already-equal → kept, zero
+  actuation. A **detail-REQUEST** field ("please enter/list/provide your employee ID/dates…") is NOT a
+  yes/no ask → bailed to AI-2 (a bare silent "No" in an ID box would be sloppy). Note the Magna Q1 wording
+  ("…enter all the applicable information below") self-selects OUT of the text path via "enter".
+- **Checkbox (operator decisions mid-build):** a REQUIRED checkbox is STILL always auto-checked — required
+  can't stay blank ("still keep the auto check for every required checkbox"). But when the label is a
+  recognized employment ASSERTION and the grounded answer is "No", the silent auto-consent would silently
+  assert what the profile contradicts → the check stays, FLAGGED `filled_review`+`employer-match`.
+  Agreement (grounded Yes) / unevaluable → silent as before; ordinary consent checkboxes are byte-identical
+  (their agree/authorize/policy wording bails the recognizer). An OPTIONAL checkbox is DETERMINED ("this is
+  if the checkbox is not required then you can determine whether to check it or not"): check="Yes" (always
+  review), uncheck="No" (virgin box → zero actuation, silent; clearing a pre-TICKED box → forced review).
+- Verified: extension suite green — 674 pass, 0 fail (+13 tests: first-person recognition, required-checkbox
+  contradiction flag + agreement-silent + consent-unchanged, optional-checkbox No/Yes/pre-ticked, text
+  silent-No/Yes-review/detail-request-bail/overwrite, textarea, optional-radio tier). Live-confirmation on
+  Magna pending.
