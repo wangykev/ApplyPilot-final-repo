@@ -7,6 +7,7 @@ import {
   coerceOnboardConfig,
   credentialsSchema,
   onboardConfigSchema,
+  passwordMeetsRequirements,
   type Credentials,
   type OnboardConfig,
 } from "@/lib/credentials";
@@ -29,6 +30,11 @@ async function requireUser() {
 export async function saveCredentials(raw: unknown): Promise<SaveResult> {
   const parsed = credentialsSchema.safeParse(raw);
   if (!parsed.success) return { ok: false, error: "Credentials didn't validate." };
+  // A present password must satisfy Workday's account-creation policy so first-run create-account
+  // never fails on the password rules. An EMPTY password is allowed (that's how you clear credentials).
+  if (parsed.data.password && !passwordMeetsRequirements(parsed.data.password)) {
+    return { ok: false, error: "Password must be 8+ characters with an uppercase, lowercase, number, and special character." };
+  }
   try {
     const auth = await requireUser();
     if (!auth.ok) return auth;
