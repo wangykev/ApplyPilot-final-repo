@@ -994,3 +994,54 @@ an `already-applied` fallback line.
 Verified: extension `node --test test/*.test.js` green (0 fail; +3 `isAlreadyApplied` tests — marker,
 body-text fallback, and no-false-positive on form/auth/apply pages); web `tsc --noEmit` clean + tests 43/43.
 Live-confirmation on the operator's browser pending (reload the extension, re-run a job already applied to).
+
+## 2026-07-24 — Employment-status screening radios fill deterministically (no AI, no "LEGALLY-LOADED" flag) (branch `web-run-home-flow`)
+
+A tenant's own worded yes/no question — "If you are a former MAGNA employee, please select Yes… No.",
+"Are you currently employed with Magna?" — is NOT Workday's standard `candidateIsPreviousWorker` field, so
+it bypassed the deterministic employer-match decider and fell to the required-radio AI fallback
+(`aiFillRadio`), which reasons from ABSENCE and is force-flagged `ai-choice-sensitive` → the loud
+"LEGALLY-LOADED — VERIFY" badge on EVERY fill, even though the answer is in the profile. The operator wants
+these answered confidently without review. Root causes: (a) no handler for these custom-worded questions
+(only the standard field routed to the decider); (b) no handler for CURRENT employment (only past); (c)
+`jobContext.company` wasn't wired from the JD scrape, so even the standard path was unevaluable.
+
+**The safety principle.** The system already splits "profile answers directly" (deterministic, no flag)
+from "AI inferred from absence" (flagged). The fix MOVES these into the first bucket — a "No" becomes a
+GROUNDED negative ("the company I'm applying to isn't in my complete employer list") instead of an
+absence-guess. It does NOT weaken the flag; it stops these from being guesses.
+
+**Deterministic recognizer, no AI** (`recognizeEmploymentQuestion`, fill-driver.js — a post-pass BEFORE
+`aiFillRadio`). Fires when a REQUIRED yes/no RADIO **names the application company** (`jobContext.company`)
+**adjacent to an employment word** ("«co» employee", "employed with/at/by «co»", "worked/working
+for/at/with «co»"). Anchored on the company you're applying to → **generalizes across tenants, zero
+per-tenant config, never calls the LLM**. AI is never the answerer.
+
+**Grounded membership check** (`decideEmploymentStatus`): former/ever reuse the proven `decidePreviousWorker`
+(exact match / affiliate-named-in-the-question / partial overlap / clean-miss → No); current →
+`decideCurrentlyEmployed`, derived from the work-history `currently_work_here` flags. `optionForPolarity`
+maps the Yes/No decision to the LIVE option by leading token, so it commits the verbose "No, I'm NOT
+currently employed with Magna" label as well as a plain "No".
+
+**Asymmetric commit** (all existing safety kept): a clean **"No" fills SILENTLY** — status `filled`, no
+flag, no review (the whole point). A **"Yes"/uncertain → `filled_review` + `employer-match` flag** →
+renders as `employer_match_uncertain` (NOT AI-inferred); **never auto-"Yes"** (truthfulness-adjacent,
+unfurls follow-ups). Unrecognized / unevaluable / polarity-unmappable → falls through to the AI/blank
+fallback, unchanged.
+
+**Operator decisions (2026-07-24):** (#1) a NON-EMPTY employer list is treated as complete (no extra
+affirmation); (#2) current employment is derived from the work-history "I currently work here" flags (no
+new field); (#3) a clean miss is always "No" even when the question broadens to affiliates/subsidiaries (we
+trust your list — there is no company-ownership database).
+
+**Foundational wiring:** `jobContext.company` is now populated from the JD scrape in the website Run
+(`jd.company` → `jobContext.company`, background.js) — the anchor the recognizer needs; also improves the
+tracker row. No false fires: "Do you agree Magna may contact your former employers?", "willing to work
+weekends at Magna?", and "want to work at Magna?" don't trip it (adjacency window + past/progressive-only
+`work` guard).
+
+Scope: the CDP path (fill-driver.js — what the Run flow uses); the legacy page-engine (background.js) is
+unchanged (it already lacks the AI radio fallback). Verified: extension `node --test test/*.test.js` green
+(645 pass, 0 fail; +9 tests — recognizer positive/negative, `decideCurrentlyEmployed`, `optionForPolarity`,
+and end-to-end silent-No / verbose-No / Yes-review / no-anchor-not-filled). Live-confirmation on Magna
+pending (reload the extension, re-run — the two Magna questions should fill "No" with no review flag).

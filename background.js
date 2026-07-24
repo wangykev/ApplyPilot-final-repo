@@ -178,6 +178,14 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           console.log("[ApplyPilot][RUN] JD scrape skipped:", String((e && e.message) || e));
         }
 
+        // The company for THIS application (scraped from the posting we opened) is authoritative for the
+        // run — it's what the "are you a former/current «company» employee?" screening questions name, and
+        // it feeds the deterministic employment-status recognizer (fill-driver) + the tracker row. Prefer
+        // the freshly-scraped company over any stale stored jobContext.company.
+        const jobContext = { ...(store.jobContext || {}) };
+        if (jd && jd.company) jobContext.company = jd.company;
+        if (jobContext.company) console.log("[ApplyPilot][RUN] job context company:", jobContext.company);
+
         // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
         // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
         const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
@@ -187,7 +195,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         }
 
         console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
-        const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, store.jobContext || {});
+        const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, jobContext);
         // reportApplication (in the walk's finally) upserts the tracker row keyed by the BUNDLE url —
         // the form page, which differs from the pasted startUrl once Apply/login navigates. Return that
         // url so the web side saves the JD onto the SAME row instead of creating a second, empty one.
