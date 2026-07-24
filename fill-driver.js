@@ -543,31 +543,77 @@ const seqStart = (hay, needle) => {
   }
   return -1;
 };
+// BAIL patterns — any hit ⇒ NOT a membership question about YOU at THIS company ⇒ return null (falls to
+// the AI+review fallback: a flagged guess, never a silent wrong deterministic answer — the safe direction).
+// Grouped by failure mode, each one an adversarial wording that WOULD have produced a wrong answer:
+//   wrong SUBJECT — "Do you have any relatives currently employed with Magna?" / "Were you referred by a
+//     current Magna employee?" (the question is about someone ELSE; answering from YOUR history is wrong);
+//   wrong OBJECT / broadened scope — "employed by a competitor/supplier of Magna?", "terminated by any
+//     employer, including Magna?" (the membership being asked isn't at the application company);
+//   different FACT — authorization/eligibility ("eligible for employment with Magna" is a WORK-AUTH
+//     question), termination manner, reference-contact consent, policy/handbook agreement;
+//   inverted POLARITY — "I certify that I am not a current employee of Magna" (the right answer for a
+//     non-employee is YES; our polarity map would say No). NOTE the Magna conditional instruction "If you
+//     are not a former MAGNA employee, please select No" is STANDARD polarity — the "you are not" pattern
+//     is exempted when the same sentence tells you what to select;
+//   ASPIRATIONAL / future — "Would you accept employment with Magna?" (they're applying; the clean-miss
+//     "No" would be absurd).
+const EMPLOY_BAIL_RE = new RegExp([
+  // wrong SUBJECT (someone other than the applicant)
+  "relative", "family", "spouse", "domestic partner", "\\bpartners?\\b", "sibling", "\\bparents?\\b", "child(?:ren)?\\b", "\\bson\\b", "daughter", "friend", "anyone", "someone", "somebody", "acquaintance", "household", "\\bknow\\b", "\\breferr",
+  // wrong OBJECT / broadened scope (not the application company itself)
+  "competitor", "vendor", "supplier", "\\bclients?\\b", "customer", "any\\s+(?:other\\s+)?(?:employer|company|organi[sz]ation)", "another\\s+(?:employer|company)", "other\\s+(?:employers|companies)",
+  // a different FACT than membership (work-auth / termination manner / references / consent / restrictions)
+  "authoriz", "eligib", "legally", "lawfully", "\\bvisa\\b", "sponsor", "permit", "terminat", "\\bfired\\b", "dismiss", "resign", "laid\\s+off", "let\\s+go", "contact", "reference", "\\bagree\\b", "consent", "acknowledge", "comply", "abide", "policy", "handbook", "non-?compete", "conflict\\s+of\\s+interest",
+  // inverted POLARITY (negated first-person assertion / certification; bare "are you not" without a
+  // select-instruction) — the conditional "if you are not …, please select No" form stays recognized
+  "\\bnever\\b", "no\\s+longer", "i\\s+(?:am|was|have\\s+been)\\s+(?:not|no)\\b", "(?:certify|confirm|attest|declare)[^.?!;]*\\bnot\\b", "\\b(?:are\\s+you\\s+not|you\\s+are\\s+not)\\b(?![^.?!;]*\\b(?:select|choose|answer|mark|check|indicate|enter)\\b)",
+  // ASPIRATIONAL / future / availability
+  "would\\s+you", "willing", "consider", "interested", "in\\s+the\\s+future", "want\\s+to", "plan\\s+to", "\\baccept\\b", "availab", "\\bable\\s+to\\b" // \b — "applicABLE TO you" must not bail (Magna Q1 boilerplate says "applicable")
+].join("|"), "i");
+// The ASK must be about YOUR employment, in the SAME sentence as the company: a second-person employment
+// clause ("are/were/have/do/if you … employee/employed/worked"), a terse "Former «co» employee?" opener,
+// or "your former/current employer".
+const EMPLOY_ASK_RE = /\b(?:are|were|have|has|do|does|did|is|was|if)\s+you\b[\s\S]{0,80}?\b(?:employ\w*|payroll|work(?:ed|ing))\b|^[\s"'(]*(?:a\s+)?(?:current|former|previous)(?:ly)?\b[\s\S]{0,50}?\b(?:employee|employed)\b|\byour\s+(?:current|former|previous|prior|past)\s+employer\b/i;
 const recognizeEmploymentQuestion = (label, company) => {
   const co = (company || "").trim();
   if (!co) return null;
   const coTokens = companyTokens(co);
   if (!coTokens.length || !distinctiveForQuestion(coTokens)) return null; // a generic 1-word company can't safely anchor
-  const labelTokens = companyTokens(label || "");
-  const coStart = seqStart(labelTokens, coTokens);
-  if (coStart === -1) return null; // the question doesn't name the company we're applying to → not ours
-  const coEnd = coStart + coTokens.length - 1;
-  // An employment word must sit WITHIN a small window of the company mention (the adjacency guard) …
-  const WINDOW = 4;
-  let empNear = false;
-  for (let i = Math.max(0, coStart - WINDOW); i <= Math.min(labelTokens.length - 1, coEnd + WINDOW); i++) {
-    if (EMPLOY_TERM_RE.test(labelTokens[i])) { empNear = true; break; }
-  }
-  // … OR the tight "worked/working for/at/with «company»" phrasing (past/progressive only — NOT bare
-  // "work", so aspirational "want to work at Magna" is excluded; preposition + company IMMEDIATELY after,
-  // so "worked for a competitor of Magna" / "willing to work weekends at Magna" do NOT match either).
+  const text = String(label || "");
+  if (EMPLOY_BAIL_RE.test(text)) return null; // any adversarial pattern → not ours; AI+review handles it
+  // SENTENCE-SCOPED match: ONE sentence must (a) name the application company, (b) hold an employment
+  // word within 3 tokens of it (or the tight "worked/working for/at/with «co»" phrasing — bare "work"
+  // is deliberately excluded: "willing to work weekends at Magna" isn't membership), and (c) ask about
+  // YOU (EMPLOY_ASK_RE). Sentence scoping kills cross-sentence contamination ("Do you have a criminal
+  // record? Magna requires all employees to disclose." — the employment word sits near the company but
+  // the ASK is a different sentence).
   const coFirst = coTokens[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rawWorkFor = new RegExp("\\bwork(?:ed|ing)\\s+(?:for|at|with)\\s+(?:the\\s+)?" + coFirst + "\\b", "i").test(String(label || ""));
-  if (!empNear && !rawWorkFor) return null;
-  const text = String(label || "").toLowerCase();
+  const workForRe = new RegExp("\\bwork(?:ed|ing)\\s+(?:for|at|with)\\s+(?:the\\s+)?" + coFirst + "\\b", "i");
+  const WINDOW = 3;
+  let hit = false;
+  for (const s of text.split(/[.?!;]+/)) {
+    const sTokens = companyTokens(s);
+    const coStart = seqStart(sTokens, coTokens);
+    if (coStart === -1) continue; // this sentence doesn't name the company
+    const coEnd = coStart + coTokens.length - 1;
+    let empNear = false;
+    for (let i = Math.max(0, coStart - WINDOW); i <= Math.min(sTokens.length - 1, coEnd + WINDOW); i++) {
+      if (EMPLOY_TERM_RE.test(sTokens[i])) { empNear = true; break; }
+    }
+    if (!empNear && !workForRe.test(s)) continue;
+    if (!EMPLOY_ASK_RE.test(s)) continue; // employment near the company but not an ask about YOU
+    hit = true; break;
+  }
+  if (!hit) return null;
+  // Tense: BOTH markers ("current or former") → "ever" (membership at ANY time — decidePreviousWorker:
+  // in-list → Yes+review, clean miss → No), so a former employee is never mis-answered by a current-only check.
+  const t = text.toLowerCase();
+  const hasCurrent = /\bcurrent(?:ly)?\b/.test(t);
+  const hasFormer = /\b(?:former(?:ly)?|previous(?:ly)?|prior|ever|in the past|used to)\b/.test(t);
   let tense = "ever";
-  if (/\bcurrent(?:ly)?\b/.test(text)) tense = "current";
-  else if (/\b(?:former(?:ly)?|previous(?:ly)?|prior|ever|in the past|used to)\b/.test(text)) tense = "former";
+  if (hasCurrent && !hasFormer) tense = "current";
+  else if (hasFormer && !hasCurrent) tense = "former";
   return { tense, company: co };
 };
 
@@ -2679,6 +2725,95 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       }
     }
 
+    // ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) ── a yes/no RADIO or DROPDOWN
+    // like "Are you a former MAGNA employee?" / "Are you currently employed with Magna?" is answerable from
+    // the profile's employment history. Recognize it by TEXT (anchored on jobContext.company + a same-
+    // sentence employment ask about YOU; adversarial wordings — relatives/referral, competitor/any-employer,
+    // work-auth/termination/consent, inverted polarity, aspirational — all BAIL to the AI+review fallback)
+    // and answer via the GROUNDED membership check: a clean "No" fills SILENTLY (no LEGALLY-LOADED flag, no
+    // review — the whole point), a "Yes"/uncertain is flagged for review (truthfulness-adjacent, NEVER
+    // auto-"Yes"). MUST run BEFORE the AI FALLBACK below (the dropdown AI would otherwise fill it first);
+    // a pre-existing DIFFERENT real value is never silently overwritten (forced review). Unrecognized /
+    // unevaluable / polarity-unmappable / commit-failed → the AI/blank fallback (a commit-fail sets
+    // `resolved`, so producedNothing stays false and the AI can never override a made decision).
+    if (f.isRequired && (f.widgetType === "radio" || f.widgetType === "dropdown") && record.resolved == null
+        && record.status !== "filled" && record.status !== "filled_review") {
+      try {
+        const empCompany = jobContext && jobContext.company;
+        const emp = recognizeEmploymentQuestion(f.label, empCompany);
+        const decision = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+        if (decision && decision.fill) {
+          const norm = apMatch.normalize;
+          if (f.widgetType === "radio") {
+            const opts = await act.readRadioState(loc);
+            const optionLabels = (opts || []).map((o) => o.labelText).filter(Boolean);
+            const target = optionForPolarity(optionLabels, decision.fill);
+            if (target) {
+              const beforeOpt = (opts || []).find((o) => o.checked) || null; // pre-existing selection (a prior run / human)
+              record.mappedPath = "(employment-status)";
+              record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              const hr = await fillRadioCdp(act, loc, [target], budgets);
+              Object.assign(record, hr);
+              record.options = optionLabels;
+              record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
+              const overwrote = beforeOpt && norm(beforeOpt.labelText) !== norm(target);
+              if (hr.status === "filled" && (decision.review || overwrote)) {
+                record.status = "filled_review"; record.flag = "employer-match";
+                if (overwrote) record.detail += `; overwrote the pre-selected "${beforeOpt.labelText}" — verify`;
+              }
+              if (decision.likelyYes) record.matchTier = "likely-yes";
+            }
+            // target == null (ambiguous options, e.g. two Yes-leading granularities) → the AI fallback below
+          } else {
+            // DROPDOWN: open + read the live options (the proven reader), map the polarity to the exact
+            // option, commit via the AI path's proven text-keyed click + persistence re-read (an EMPTY
+            // fill never races → single commit; a prefilled-equal value keeps with ZERO value actuation).
+            const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+            const enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+            const target = enabledTexts.length ? optionForPolarity(enabledTexts, decision.fill) : null;
+            if (!target) {
+              await closeAndVerifyBlank(act, loc, before, budgets); // options unreadable/ambiguous → close clean, AI fallback below
+            } else if (hasLiveValue(before) && norm(before) === norm(target)) {
+              const cz = await closeAndVerifyBlank(act, loc, before, budgets); // already holds the answer → zero value-actuation
+              record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              record.status = decision.review ? "filled_review" : "filled";
+              if (decision.review) record.flag = "employer-match";
+              record.after = cz.after != null ? cz.after : target; record.verified = true; record.matchTier = "label-exact";
+              record.options = enabledTexts;
+              record.detail = `${decision.detail}; already held "${before}" — kept (no actuation)`;
+            } else {
+              await act.clickDropdownOptionByText(loc, target);
+              await act.delayFull(budgets.reopenSettleMs);
+              let post = await act.readDropdownState(loc);
+              let committed = post && norm(post.triggerText) === norm(target);
+              if (committed) { // persistence re-read — a momentary pick that reverts is NOT a commit
+                await act.delayFull(budgets.reopenSettleMs);
+                post = await act.readDropdownState(loc);
+                committed = post && norm(post.triggerText) === norm(target);
+              }
+              record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              record.options = enabledTexts;
+              if (committed) {
+                const overwrote = hasLiveValue(before) && norm(before) !== norm(target);
+                record.status = (decision.review || overwrote) ? "filled_review" : "filled";
+                if (decision.review || overwrote) record.flag = "employer-match";
+                record.after = target; record.verified = true;
+                record.matchTier = decision.likelyYes ? "likely-yes" : "label-exact";
+                record.detail = decision.detail + (overwrote ? `; overwrote prefilled "${before}" — verify` : "");
+              } else {
+                record.status = "needs_review"; record.flag = "employer-match";
+                record.after = post ? post.triggerText : null;
+                record.detail = `${decision.detail}; chose "${target}" but the commit did not persist`;
+              }
+            }
+          }
+        }
+      } catch (e) { /* any read/commit failure → fall through to the AI/blank fallback */ }
+    }
+
     // ── AI FALLBACK ── if AI is ON and the deterministic pass produced NOTHING usable. Additive +
     // gated — the deterministic record above is untouched unless this fires (existing paths
     // unchanged when AI is OFF). TWO distinct paths, never confused:
@@ -2736,43 +2871,6 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         && (AI_EEO_RE.test(String(f.label || "")) || AI_EEO_RE.test(String(f.fieldName || "")))) {
       try { Object.assign(record, await aiInferEeoField(act, loc, f, profile, budgets)); }
       catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI EEO infer error: " + String((e && e.message) || e); }
-    }
-
-    // ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) ── a yes/no radio like "Are
-    // you a former MAGNA employee?" / "Are you currently employed with Magna?" is answerable from the
-    // profile's employment history. Recognize it by TEXT (anchored on jobContext.company + an employment
-    // word) and answer via the GROUNDED membership check: a clean "No" fills SILENTLY (no LEGALLY-LOADED
-    // flag, no review — the whole point), a "Yes"/uncertain is flagged for review (truthfulness-adjacent,
-    // NEVER auto-"Yes"). Runs BEFORE aiFillRadio so a recognized question never becomes an AI guess.
-    // Unrecognized / unevaluable / polarity-unmappable → falls through to the AI/blank fallback (unchanged).
-    if (f.isRequired && f.widgetType === "radio" && record.resolved == null
-        && record.status !== "filled" && record.status !== "filled_review") {
-      try {
-        const empCompany = jobContext && jobContext.company;
-        const emp = recognizeEmploymentQuestion(f.label, empCompany);
-        if (emp) {
-          const decision = decideEmploymentStatus(emp.tense, empCompany, profile, f.label);
-          if (decision && decision.fill) {
-            const opts = await act.readRadioState(loc);
-            const optionLabels = (opts || []).map((o) => o.labelText).filter(Boolean);
-            const target = optionForPolarity(optionLabels, decision.fill);
-            if (target) {
-              record.mappedPath = "(employment-status)";
-              record.rawValue = empCompany || null;
-              record.resolved = [decision.fill];
-              const hr = await fillRadioCdp(act, loc, [target], budgets);
-              Object.assign(record, hr);
-              record.options = optionLabels;
-              record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
-              // A "Yes" / uncertain "No" → review, rendered as an employer-match item (NOT AI-inferred).
-              // A clean grounded "No" (decision.review false) stays status:"filled", NO flag → no review.
-              if (hr.status === "filled" && decision.review) { record.status = "filled_review"; record.flag = "employer-match"; }
-              if (decision.likelyYes) record.matchTier = "likely-yes";
-            }
-            // target == null (ambiguous options) → leave the record for the AI/blank fallback below
-          }
-        }
-      } catch (e) { /* any read/commit failure → fall through to the AI/blank fallback */ }
     }
 
     // ── Required-RADIO AI fallback (the deferred required-radio path) ── a REQUIRED radio the deterministic
