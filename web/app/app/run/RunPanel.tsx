@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Rocket, Loader2, Check, AlertTriangle, X, Cable, ChevronDown, ExternalLink, EyeOff } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
-import { sendToExtension, extensionMessagingAvailable, type ExtResponse } from "@/lib/extension";
+import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type ExtResponse, type RunProgress } from "@/lib/extension";
 import { linkedExtensionId } from "@/lib/extension-sync";
 import { saveRunJob } from "./actions";
 import { clsx } from "@/lib/clsx";
@@ -101,10 +101,15 @@ export function RunPanel() {
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [connected, setConnected] = useState<boolean | null>(null);
   const [showJd, setShowJd] = useState(false);
+  const [progress, setProgress] = useState<RunProgress | null>(null);
+  const portRef = useRef<{ disconnect: () => void } | null>(null);
 
   useEffect(() => {
     setConnected(linkedExtensionId() !== null && extensionMessagingAvailable());
   }, []);
+
+  // Tear down a live-progress port if the panel unmounts mid-run (client-side nav).
+  useEffect(() => () => portRef.current?.disconnect(), []);
 
   const running = phase.s === "running";
   const validUrl = /^https?:\/\/\S+$/i.test(url.trim());
@@ -118,10 +123,20 @@ export function RunPanel() {
       return;
     }
     setPhase({ s: "running", background });
+    setProgress({ phase: background ? "Starting in the background…" : "Starting…", detail: "", at: 0 });
+
+    // Open a live-progress port BEFORE kicking off the run so we catch the earliest phases. The
+    // extension streams { phase, detail } over it as onboard/fill progresses; it's UI sugar only —
+    // the authoritative outcome still arrives on the sendToExtension response below.
+    portRef.current = openRunProgressPort(extId, (p) => setProgress(p));
 
     // background:true → the extension opens the job tab UNFOCUSED and the whole pipeline runs
     // hidden (the CDP substrate is throttle-immune) — you stay right here on the Run page.
     const resp = await sendToExtension(extId, { type: "AP_RUN_APPLICATION", startUrl, background });
+
+    portRef.current?.disconnect();
+    portRef.current = null;
+    setProgress(null);
 
     // Save whatever the extension scraped to the tracker row for this posting.
     const jd = (resp.jd as Jd | null) ?? null;
@@ -201,21 +216,21 @@ export function RunPanel() {
         </div>
 
         {running && (
-          <p className="mt-4 text-xs leading-relaxed text-ink-dim">
-            {phase.s === "running" && phase.background ? (
-              <>
-                Working through Apply → sign-in → email verification → fill in an <em>unfocused</em> tab —
-                stay on this page; the result lands here and in your Tracker. It stops at the review page
-                and never submits.
-              </>
-            ) : (
-              <>
-                Working through Apply → sign-in → email verification → fill. This takes a minute or two —
-                the tab shows Chrome&apos;s &ldquo;started debugging&rdquo; bar while the extension drives
-                it. It will stop at the review page and never submit.
-              </>
-            )}
-          </p>
+          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-hairline bg-cockpit px-3.5 py-3">
+            <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-ink">
+                {progress?.phase ||
+                  (phase.s === "running" && phase.background ? "Starting in the background…" : "Starting…")}
+              </p>
+              {progress?.detail && <p className="mt-0.5 text-xs text-ink-dim">{progress.detail}</p>}
+              <p className="mt-1.5 text-xs leading-relaxed text-ink-faint">
+                {phase.s === "running" && phase.background
+                  ? "Running in an unfocused tab — stay here; the result lands here and in your Tracker. Stops at the review page, never submits."
+                  : "Watch the tab (Chrome shows a “started debugging” bar). Stops at the review page, never submits."}
+              </p>
+            </div>
+          </div>
         )}
       </SectionCard>
 

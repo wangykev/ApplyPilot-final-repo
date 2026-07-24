@@ -14,6 +14,30 @@ importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js
 // so the fill engine reads them unchanged. The engine is agnostic to how they
 // got there. NOTHING here fills or submits — it only persists the handoff.
 // ============================================================================
+
+// ── Live run progress → the website Run page, over a long-lived external Port. ──
+// The website opens a `chrome.runtime.connect(extId, { name: "ap-run-progress" })` port; the
+// AP_RUN_APPLICATION pipeline (this handler → runCdpOnboard → runCdpWalk, all in THIS file) calls the
+// module-level emitRunProgress() at each phase — NO parameter threading, since they're all module-scope.
+// No port connected (a popup-triggered run) ⇒ emitRunProgress just logs to the SW console. The port
+// also counts as activity, keeping the MV3 SW warm for the duration of the run (a free bonus).
+let runProgressPort = null;
+let lastRunProgress = null;
+let runInFlight = false;
+chrome.runtime.onConnectExternal.addListener((port) => {
+  if (!port || port.name !== "ap-run-progress") return;
+  runProgressPort = port;
+  // Replay the latest phase so a port that connects a beat after the run started isn't blank
+  // (gated on an active run so a fresh port never sees a stale prior-run phase).
+  if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
+  port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
+});
+function emitRunProgress(phase, detail) {
+  lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
+  try { console.log(`[ApplyPilot][RUN] » ${phase}${detail ? " — " + detail : ""}`); } catch (e) { /* ignore */ }
+  try { if (runProgressPort) runProgressPort.postMessage(lastRunProgress); } catch (e) { /* port closed */ }
+}
+
 chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
   const type = message && message.type;
 
@@ -166,6 +190,8 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // (e.g. hidden-render-stalled) rather than guessing.
         const background = message.background === true;
 
+        runInFlight = true;
+        emitRunProgress("Opening the job posting", background ? "in a background tab" : "");
         // Open the job link in a new tab and wait for the first load to settle.
         const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
@@ -177,6 +203,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
         // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
         let jd = null;
+        emitRunProgress("Reading the job description");
         try {
           const results = await chrome.scripting.executeScript({ target: { tabId }, func: scrapeJobDescription });
           jd = (results && results[0] && results[0].result) || null;
@@ -202,6 +229,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         }
 
         console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
+        emitRunProgress("Filling the application", "working through the form to the review page");
         const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, jobContext);
         // reportApplication (in the walk's finally) upserts the tracker row keyed by the BUNDLE url —
         // the form page, which differs from the pasted startUrl once Apply/login navigates. Return that
@@ -211,6 +239,8 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl, reportedUrl });
       } catch (e) {
         sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      } finally {
+        runInFlight = false; // stop replaying stale progress to a port that connects after this run
       }
     })();
     return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
@@ -3255,11 +3285,13 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       if (nav && nav.applyFlowReviewPresent) {
         reachedReview = true;
         LOG(`✓✓ reached the REVIEW page after ${pagesFilled.length} page(s) — the whole application is filled. NOT submitting (terminal). "View last summary" for the accumulated bundle.`);
+        emitRunProgress("Reached the review page", "the application is filled — nothing submitted");
         return { ok: true, stopped: "reached-review", reached_review: true, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
 
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
+      emitRunProgress(`Filling page ${page}`);
       const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
@@ -3674,6 +3706,7 @@ async function runCdpOnboard(tabId, opts) {
   // navigate the tab to it. Returns { ok } or a needs_operator halt object.
   const doVerify = async (st) => {
     if (!gmailEnabled) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-required-gmail-off", detail: "Workday requires email verification but Gmail auto-verify is OFF. Enable it (and Connect Gmail) in the popup, or click the link in the email yourself and re-run." };
+    emitRunProgress("Verifying your email", "checking Gmail for the verification link");
     const host = st.host || "";
     // Account-exists-but-UNVERIFIED (a prior run created it, verification never completed): Workday's
     // sign-in page shows a "Resend Account Verification" button, and the ORIGINAL email may be stale
@@ -3728,6 +3761,7 @@ async function runCdpOnboard(tabId, opts) {
   // re-check outcome (past-auth / verify / already-exists→sign-in).
   const doCreateAccount = async (st) => {
     LOG(`creating a Workday account as ${creds.email}…`);
+    emitRunProgress("Creating your account");
     if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await pace(900); st = await scan() || st; }
     await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
     await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
@@ -3760,6 +3794,7 @@ async function runCdpOnboard(tabId, opts) {
     // re-sign-in) consumes an iteration, and a stray SECOND verify cycle doubles that — PANW hit
     // exactly 8 with a double-cycle (2026-07-09), i.e. no margin. 12 comfortably survives a
     // chooser→create→verify→(re-verify)→re-sign-in chain while still backstopping a genuinely stuck page.
+    emitRunProgress("Signing in");
     const maxAttempts = 12;
     let revealStalls = 0; // consecutive "Sign in with email" reveals where the form never rendered (hidden-tab repaint stall)
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -3898,6 +3933,7 @@ async function runCdpOnboard(tabId, opts) {
     const target = pickApplyTarget(applyChain);
     if (target) {
       LOG(`Stage 1 — clicking "${target.label}".`);
+      emitRunProgress("Starting the application", `clicking "${target.label}"`);
       const c = await clickTarget([target.sel], target.label);
       if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-click-blocked", detail: c.blockedBy || "Apply button not clickable" };
       const w = await waitFor((s) => s.markers.applyManually || s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply");
