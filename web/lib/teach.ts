@@ -24,6 +24,7 @@ export function profileValueAt(profile: unknown, path: string): string {
     .split(".")
     .reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), profile);
   if (v == null) return "";
+  if (typeof v === "boolean") return v ? "Yes" : "No"; // a yes/no (triBool) field → readable label, not "true"/"false"
   if (Array.isArray(v)) return v.length && typeof v[0] !== "object" ? String(v[0]) : "";
   return typeof v === "object" ? "" : String(v);
 }
@@ -145,6 +146,30 @@ export function coveredKeys(buckets: Bucket[], profile: unknown): Set<string> {
   return s;
 }
 
+/** Whether an ANSWERABLE bucket both COVERS `questionKey` (a wording match) AND already HOLDS `answer`
+ *  — i.e. it would fill this question with THIS value next time, so the question is genuinely handled.
+ *  This is the #4 reconciliation: an AI fill on a covered wording means the bucket's saved value did
+ *  NOT match the tenant's options this run, so the card must keep surfacing — UNTIL the operator TEACHES
+ *  the value (sets the bound profile field, or adds it to a Mode-B bucket's candidates; see TeachAddPopup).
+ *  Once the bucket holds the value, the card disappears and STAYS gone — no resurface on re-approve /
+ *  reload even though the stored bundle entry keeps its `ai-*` flag forever (the bug this fixes). A
+ *  no-value / value-mismatch covering bucket returns false → the card still surfaces. */
+export function bucketCoversAnswer(buckets: Bucket[], profile: unknown, questionKey: string, answer: string): boolean {
+  for (const b of buckets || []) {
+    if (!bucketAnswers(b, profile)) continue; // an empty/unanswered bucket never covers
+    if (!(b.questions || []).some((q) => normalizeQuestion(q) === questionKey)) continue; // wording not in this bucket
+    const path = String(b.profile_path || "").trim();
+    if (path) {
+      if (fieldHoldsAnswer(profile, dottedPath(path), answer)) return true; // Mode-A: the bound field holds it
+    } else {
+      const val = (b as { value?: unknown }).value; // Mode-B: its candidate list holds it
+      const arr = Array.isArray(val) ? val : val == null ? [] : [val];
+      if (arr.some((v) => sameAnswer(String(v), answer))) return true;
+    }
+  }
+  return false;
+}
+
 /** Teachable cards across the user's reviewed applications — deduped by question, excluding
  *  anything already covered by a bucket OR explicitly dismissed (skipped). Most-recent application
  *  wins a duplicate. */
@@ -162,13 +187,19 @@ export function teachableCards(
     for (const e of app.bundle?.entries || []) {
       if (!isTeachable(e)) continue;
       const key = normalizeQuestion(e.question_label as string);
-      // #4: a bucket "covers" a question only when it actually filled it. If THIS entry was AI-filled
-      // (flag ai-*), the bucket did NOT answer it this run — its saved value didn't match the tenant's
-      // options — so `covered` must not hide it: surface it so the operator can add the tenant's
-      // variant/wording. (A clean or fuzzy BUCKET fill, flag "bucket", stays covered — the bucket works.)
+      // #4 + the resurface fix: a bucket "covers" a question only when it would actually fill it. For an
+      // AI fill (flag ai-*), the bar is HIGHER — the covering bucket must already HOLD the value that got
+      // filled: an AI fill means the bucket's saved value didn't match the tenant this run, so the card
+      // keeps surfacing so the operator can add the variant — UNTIL they TEACH the value (set the bound
+      // field / add the candidate), after which the bucket holds it and the card disappears and STAYS gone
+      // (the stored bundle keeps its ai-* flag forever, so plain coverage never hid it → it resurfaced on
+      // every re-approve/reload). A non-AI (deterministic/bucket) fill uses plain coverage, unchanged.
       // skip (dismissed) + dedup (seen) still always apply.
       const aiFilled = typeof e.flag === "string" && /^ai/i.test(e.flag);
-      if ((covered.has(key) && !aiFilled) || skipped.has(key) || seen.has(key)) continue;
+      const isCovered = aiFilled
+        ? bucketCoversAnswer(buckets, profile, key, String(e.current_value))
+        : covered.has(key);
+      if (isCovered || skipped.has(key) || seen.has(key)) continue;
       seen.add(key);
       // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
       // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).
@@ -202,6 +233,83 @@ export function sameAnswer(a: string, b: string): boolean {
   return !!n(a) && n(a) === n(b);
 }
 
+/** A yes/no / true-false / checkbox answer → the tiered candidate list that matches EITHER labeling a
+ *  tenant renders (Yes/No OR True/False), so a taught standalone (Mode-B) answer resolves automatically
+ *  regardless of how the form words its options. Mirrors the extension resolve()'s boolean coercion
+ *  (boolean → ["Yes","True"] / ["No","False"]) so a taught bucket behaves like a triBool profile field.
+ *  A non-boolean answer passes through as a single candidate (empty → []). */
+export function boolAnswerCandidates(answer: string): string[] {
+  const n = String(answer || "").trim().toLowerCase();
+  if (["yes", "true", "checked", "on"].includes(n)) return ["Yes", "True"];
+  if (["no", "false", "unchecked", "off"].includes(n)) return ["No", "False"];
+  const t = String(answer || "").trim();
+  return t ? [t] : [];
+}
+
+/** Whether an answer is a recognized yes/no TOKEN (Yes/No/True/False/checked/…) — vs a NON-STANDARD
+ *  label a tenant used for a yes/no option (e.g. "Affirmative", "Yes, I am authorized"), which the
+ *  default ladder can't match and so must be remembered in the field's ladder. */
+export function isBoolAnswer(answer: string): boolean {
+  return ["yes", "true", "checked", "on", "no", "false", "unchecked", "off"].includes(
+    String(answer || "").trim().toLowerCase(),
+  );
+}
+
+/** The initial editable ladder shown when teaching a NON-STANDARD yes/no label: the field's existing
+ *  ladder for the polarity (answer_ladders[path][yes|no]) or the defaults (["Yes","True"] / ["No","False"]),
+ *  with `label` appended if not already present (deduped, case-insensitive). The operator can then reorder
+ *  or trim it (via the same ladder editor as the profile page) before confirming. */
+export function seedLadderDraft(profile: unknown, path: string, polarity: boolean, label: string): string[] {
+  const src = (profile as { answer_ladders?: Record<string, { yes?: string[]; no?: string[] }> } | null)?.answer_ladders?.[path];
+  const existing = polarity ? src?.yes : src?.no;
+  const base = Array.isArray(existing) && existing.length ? [...existing] : boolAnswerCandidates(polarity ? "Yes" : "No");
+  const t = String(label).trim();
+  return t && !base.some((c) => sameAnswer(c, t)) ? [...base, t] : base;
+}
+
+/** Return a NEW profile with field `path`'s ladder for `polarity` set to `list` (the operator's
+ *  edited/reordered ladder from the teach popup; blanks dropped, deduped case-insensitively, ORDER
+ *  preserved). Deep-copies answer_ladders so the caller's profile is never mutated. An empty result
+ *  clears that polarity's custom ladder → the extension falls back to its default. */
+export function setLadderList(profile: unknown, path: string, polarity: boolean, list: string[]): unknown {
+  const p: Record<string, unknown> = profile && typeof profile === "object" ? { ...(profile as Record<string, unknown>) } : {};
+  const key = polarity ? "yes" : "no";
+  const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[]; values?: string[] }>) || {};
+  const ladders: Record<string, { yes: string[]; no: string[]; values: string[] }> = {};
+  for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])], values: [...(src[k]?.values || [])] };
+  const entry = ladders[path] || { yes: [], no: [], values: [] };
+  const clean: string[] = [];
+  for (const c of list) {
+    const t = String(c).trim();
+    if (t && !clean.some((x) => sameAnswer(x, t))) clean.push(t);
+  }
+  entry[key] = clean;
+  ladders[path] = entry;
+  p.answer_ladders = ladders;
+  return p;
+}
+
+/** Return a NEW profile with a SCALAR field's answer variants (answer_ladders[path].values) set to `list`
+ *  (blanks dropped, deduped case-insensitively, ORDER preserved). Deep-copies answer_ladders (the yes/no
+ *  polarity ladders are preserved) so the caller's profile is never mutated. The teach answer editor + the
+ *  profile page's in-field arrow both edit this. */
+export function setFieldVariants(profile: unknown, path: string, list: string[]): unknown {
+  const p: Record<string, unknown> = profile && typeof profile === "object" ? { ...(profile as Record<string, unknown>) } : {};
+  const src = (p.answer_ladders as Record<string, { yes?: string[]; no?: string[]; values?: string[] }>) || {};
+  const ladders: Record<string, { yes: string[]; no: string[]; values: string[] }> = {};
+  for (const k of Object.keys(src)) ladders[k] = { yes: [...(src[k]?.yes || [])], no: [...(src[k]?.no || [])], values: [...(src[k]?.values || [])] };
+  const entry = ladders[path] || { yes: [], no: [], values: [] };
+  const clean: string[] = [];
+  for (const c of list) {
+    const t = String(c).trim();
+    if (t && !clean.some((x) => sameAnswer(x, t))) clean.push(t);
+  }
+  entry.values = clean;
+  ladders[path] = entry;
+  p.answer_ladders = ladders;
+  return p;
+}
+
 /** Raw value at a dotted path (arrays PRESERVED, unlike profileValueAt which collapses to the first). */
 function rawAt(profile: unknown, path: string): unknown {
   if (!path) return undefined;
@@ -211,11 +319,20 @@ function rawAt(profile: unknown, path: string): unknown {
 }
 
 /** Whether the profile field at `path` ALREADY holds `answer` — for a tiered array, ANY candidate
- *  counts; a boolean is compared as Yes/No; a scalar is compared normalized. */
+ *  counts; a scalar is compared normalized; a boolean (yes/no triBool) holds the answer when its
+ *  POLARITY matches, recognizing BOTH labelings (Yes/True, No/False) AND any custom candidate the
+ *  operator added to this field's ladder (profile.answer_ladders[path][yes|no]). The boolean handling is
+ *  kept in lockstep with the extension's fill (boolLadderCandidates) so a True-labeled or custom-labeled
+ *  answer the profile already covers does NOT resurface in teach after being taught. */
 export function fieldHoldsAnswer(profile: unknown, path: string, answer: string): boolean {
   const raw = rawAt(profile, path);
   if (Array.isArray(raw)) return raw.some((v) => typeof v === "string" && sameAnswer(v, answer));
-  if (typeof raw === "boolean") return sameAnswer(raw ? "Yes" : "No", answer);
+  if (typeof raw === "boolean") {
+    const ladders = (profile as { answer_ladders?: Record<string, { yes?: string[]; no?: string[] }> } | null)?.answer_ladders;
+    const custom = ladders && path ? ladders[path]?.[raw ? "yes" : "no"] : undefined;
+    if (Array.isArray(custom) && custom.some((c) => sameAnswer(String(c), answer))) return true;
+    return boolAnswerCandidates(answer).some((c) => sameAnswer(c, raw ? "Yes" : "No"));
+  }
   return raw != null && sameAnswer(String(raw), answer);
 }
 
@@ -322,6 +439,7 @@ export function flattenProfileFields(profile: unknown): ProfileFieldRow[] {
   for (const section of Object.keys(p)) {
     const sv = p[section];
     if (!sv || typeof sv !== "object") continue;
+    if (section === "answer_ladders") continue; // internal fill-ladder metadata, not a displayable profile field
     if (Array.isArray(sv)) {
       // REPEATING section (arrays of OBJECTS: work_experience / education / languages / certifications /
       // additional_files) → one grouped box PER ENTRY, so the teach page shows EVERYTHING the profile

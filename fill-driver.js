@@ -397,17 +397,63 @@ const resolve = (raw, widgetType) => {
       const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
       return candidates.length ? { candidates } : { skip: true };
     }
+    // A Yes/No triBool (screening.at_least_18_years_old, authorized_to_work_in_us, …) can render as a
+    // DROPDOWN on some tenants — coerce boolean → a tiered ["Yes","True"] / ["No","False"] candidate list
+    // (the ladder matches whether the options are labeled Yes/No OR True/False). Without this,
+    // String(true) → "true" never matched the "Yes" option, so a bucket bound to the triBool produced
+    // nothing and the field fell to the AI — the over-18 "LEGALLY-LOADED — VERIFY" every-fill bug (radio
+    // worked, dropdown didn't). Mirrors teach's fieldHoldsAnswer boolean map (keep in lockstep).
+    if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
   if (widgetType === "radio") {
+    // A tiered candidate list (e.g. a degree/field_of_study rendered as radio on some tenant) must pass
+    // through as the ladder — same as dropdown/typeahead. Without this, String(array) → "a,b" never
+    // matches an option → the field falls to the AI (the triBool-dropdown bug's radio twin).
+    if (Array.isArray(raw)) {
+      const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
+      return candidates.length ? { candidates } : { skip: true };
+    }
     if (raw === null || raw === undefined) return { skip: true };
-    if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+    if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
   return { skip: true, reason: `unsupported widget type "${widgetType}"` };
 };
+
+// The candidate ladder for a boolean (yes/no) answer at `path`: the operator's editable per-field ladder
+// (profile.answer_ladders[path].yes|no, set on the website) when non-empty, else the default
+// ["Yes","True"] / ["No","False"]. Used for dropdown/radio/typeahead (a CHECKBOX uses the boolean
+// directly). resolve() has no field path, so callers that know the path (the mapped dispatch + a Mode-A
+// bucket) apply this after resolve. Empty/absent map → the same default resolve() already produces.
+function boolLadderCandidates(profile, path, boolVal) {
+  const key = boolVal ? "yes" : "no";
+  const map = profile && typeof profile.answer_ladders === "object" ? profile.answer_ladders : null;
+  const entry = map && path ? map[path] : null;
+  const custom = entry && Array.isArray(entry[key]) ? entry[key].map((c) => String(c)).filter((s) => s.trim() !== "") : null;
+  if (custom && custom.length) return custom;
+  return boolVal ? ["Yes", "True"] : ["No", "False"];
+}
+
+// Append the operator's editable per-field VARIANTS (profile.answer_ladders[path].values, set on the
+// website) to a scalar field's candidate list, so a field rendered as a dropdown/radio/typeahead can match
+// a tenant's alternate wording (e.g. gpa → "3.5+", gender → "Man"). Primary candidate(s) first, then the
+// variants; deduped case-insensitively. A text box types the field's own value (not reached here — its arg
+// is the value, not a candidate list). Empty/absent variants → `cands` unchanged.
+function appendFieldVariants(profile, path, cands) {
+  const base = Array.isArray(cands) ? cands.slice() : cands != null ? [String(cands)] : [];
+  const map = profile && typeof profile.answer_ladders === "object" ? profile.answer_ladders : null;
+  const entry = map && path ? map[path] : null;
+  const extra = entry && Array.isArray(entry.values) ? entry.values : [];
+  const seen = new Set(base.map((c) => String(c).trim().toLowerCase()));
+  for (const v of extra) {
+    const s = String(v).trim();
+    if (s && !seen.has(s.toLowerCase())) { base.push(s); seen.add(s.toLowerCase()); }
+  }
+  return base;
+}
 
 // ── "Previously employed here?" — company matcher (verbatim M12/M13.3 port).
 // "Yes" is NEVER asserted without a review flag (it sits beside a truthfulness
@@ -2327,9 +2373,18 @@ function buildBucketIndex(buckets) {
 const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
   let arg;
   if (bucket.profile_path) {
-    const r = resolve(getByPath(profile, bucket.profile_path), f.widgetType);
+    const rawVal = getByPath(profile, bucket.profile_path);
+    const r = resolve(rawVal, f.widgetType);
     if (!r || r.skip) return null;
     arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
+    // On a text-matched widget, augment the candidates with the operator's editable per-field ladder: a
+    // yes/no boolean → its Yes/No(+True/False) ladder; any other (scalar) value → the field's variants
+    // (e.g. gpa "3.5+", gender "Man"). A text box uses the value directly (not a choice widget → skipped).
+    if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead") {
+      arg = typeof rawVal === "boolean"
+        ? boolLadderCandidates(profile, bucket.profile_path, rawVal)
+        : appendFieldVariants(profile, bucket.profile_path, arg);
+    }
   } else {
     // Mode B: `value` is a CANDIDATE LIST (most-specific first); a legacy single string is tolerated.
     const cands = (Array.isArray(bucket.value) ? bucket.value : (bucket.value != null ? [bucket.value] : []))
@@ -2475,7 +2530,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           record.status = "skipped";
           record.detail = r.reason || `empty value at ${mappedPath}`;
         } else {
-          const arg = r.value !== undefined ? r.value : r.candidates;
+          let arg = r.value !== undefined ? r.value : r.candidates;
+          // On a text-matched widget, augment with the operator's editable per-field ladder: a mapped
+          // yes/no boolean → its Yes/No(+True/False) ladder; any other (scalar) value → the field's
+          // variants (e.g. gpa "3.5+", gender "Man"). A checkbox uses the boolean (its own branch above);
+          // a text box types the value (not a choice widget → skipped).
+          if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead") {
+            arg = typeof rawValue === "boolean"
+              ? boolLadderCandidates(profile, mappedPath, rawValue)
+              : appendFieldVariants(profile, mappedPath, arg);
+          }
           record.resolved = arg;
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
@@ -5297,5 +5361,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

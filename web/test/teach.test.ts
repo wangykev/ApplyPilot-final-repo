@@ -7,6 +7,11 @@ import {
   coveredKeys,
   sameAnswer,
   addWordingToBucket,
+  boolAnswerCandidates,
+  isBoolAnswer,
+  seedLadderDraft,
+  setLadderList,
+  setFieldVariants,
   ensureModeABucket,
   createModeBBucket,
   bucketLabel,
@@ -19,7 +24,7 @@ import {
   wasManuallyEdited,
   type TeachSource,
 } from "@/lib/teach";
-import type { Bucket } from "@/lib/buckets";
+import { ensureStarterBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 const bucket = (over: Partial<Bucket>): Bucket => ({
@@ -71,6 +76,17 @@ test("coveredKeys: wordings from ANSWERABLE buckets only (an empty/unanswered bu
   assert.equal(empty.has("are you at least 18 years of age?"), false);
 });
 
+test("boolAnswerCandidates: yes/no/true/false/checkbox answers expand to BOTH labelings; others pass through", () => {
+  // A taught yes/no or checkbox answer must resolve whether a tenant labels the option Yes/No or
+  // True/False — so a standalone (Mode-B) bucket stores the tiered pair.
+  for (const y of ["Yes", "yes", "true", "TRUE", "checked", "on"]) assert.deepEqual(boolAnswerCandidates(y), ["Yes", "True"], y);
+  for (const n of ["No", "no", "false", "FALSE", "unchecked", "off"]) assert.deepEqual(boolAnswerCandidates(n), ["No", "False"], n);
+  // a non-boolean answer passes through unchanged; empty → []
+  assert.deepEqual(boolAnswerCandidates("Blue"), ["Blue"]);
+  assert.deepEqual(boolAnswerCandidates("  Chicago "), ["Chicago"]);
+  assert.deepEqual(boolAnswerCandidates(""), []);
+});
+
 test("sameAnswer: caps/whitespace insensitive; different → false; empty → false", () => {
   assert.equal(sameAnswer("United States", " united  states "), true);
   assert.equal(sameAnswer("Yes", "No"), false);
@@ -115,6 +131,44 @@ test("teachableCards: #4 — an AI-filled question still teaches even if a bucke
   assert.equal(teachableCards([src("b", [bucketEntry])], [bkt], {}).length, 0, "a bucket fill of a covered question stays hidden");
   // And a skipped AI fill stays skipped even though it's covered+AI.
   assert.equal(teachableCards([src("a", [aiEntry])], [bkt], {}, ["highest level of education"]).length, 0, "dismissed still wins");
+});
+
+test("teachableCards: #4 resurface fix — a TAUGHT AI card stays gone even though its bundle keeps the ai-* flag", () => {
+  // The bug: the operator teaches an AI-filled card (its value is now in a covering bucket), but the
+  // stored bundle entry keeps flag ai-* forever, so re-approving / reloading the SAME bundle resurfaced
+  // it. The fix: an AI card is hidden once the covering bucket HOLDS the filled value.
+  const aiEntry = entry({ question_label: "Highest level of education", widget_type: "dropdown", flag: "ai-choice", current_value: "Undergraduate Degree", is_approved: true, needs_review: true });
+  const apps = [src("a", [aiEntry])];
+  // Before teaching: a bucket covers the wording but holds a DIFFERENT value → still surfaces (#4).
+  const before = bucket({ id: "edu", questions: ["Highest level of education"], value: ["Bachelor's Degree"] });
+  assert.equal(teachableCards(apps, [before], {}).length, 1, "value-mismatch bucket → still surfaces");
+  // After teaching (Mode-B): the filled value is now in the bucket's candidates → gone, and STAYS gone
+  // when the SAME (still-ai-flagged) bundle is re-approved.
+  const taughtB = bucket({ id: "edu", questions: ["Highest level of education"], value: ["Bachelor's Degree", "Undergraduate Degree"] });
+  assert.equal(teachableCards(apps, [taughtB], {}).length, 0, "taught (Mode-B value added) → gone");
+  assert.equal(teachableCards(apps, [taughtB], {}).length, 0, "re-approve the same bundle → still gone");
+  // After teaching (Mode-A): the bound profile field now holds the value → gone.
+  const taughtA = bucket({ id: "edu", profile_path: "education[0].degree", questions: ["Highest level of education"] });
+  assert.equal(teachableCards(apps, [taughtA], { education: [{ degree: ["Undergraduate Degree"] }] }).length, 0, "taught (Mode-A field holds it) → gone");
+});
+
+test("teachableCards: resurface fix is bucket-agnostic — the user's OWN field / OWN new answer closes it, not just the AI's suggestion", () => {
+  // The card's AI hint (maps_to) points at "self_identification.gender", but the operator DISAGREES and
+  // files it under their OWN chosen field / their OWN new standalone answer. Coverage is decided by which
+  // bucket actually HOLDS the value — never by the AI's suggestion — so any of these close the card.
+  const ai = entry({ question_label: "Which best describes you?", widget_type: "dropdown", flag: "ai-choice", current_value: "Prefer to self-describe", is_approved: true, needs_review: true, maps_to: "self_identification.gender" });
+  const apps = [src("a", [ai])];
+  assert.equal(teachableCards(apps, [], {}).length, 1, "untaught → surfaces");
+  // (a) filed under a DIFFERENT profile field than the AI suggested (Mode-A) → gone
+  const ownField = bucket({ id: "own", profile_path: "self_identification.custom", questions: ["Which best describes you?"] });
+  assert.equal(teachableCards(apps, [ownField], { self_identification: { custom: "Prefer to self-describe" } }).length, 0, "own field holds it → gone");
+  // (b) saved as the user's OWN brand-new standalone answer (Mode-B, seeded with the answer) → gone
+  const ownNew = bucket({ id: "mine", questions: ["Which best describes you?"], value: ["Prefer to self-describe"], category: "Demographics" });
+  assert.equal(teachableCards(apps, [ownNew], {}).length, 0, "own new answer holds it → gone");
+  // (c) filed under an existing answer WITHOUT adding the value (the value doesn't match) → still surfaces:
+  //     the bucket wouldn't reproduce the answer, so it isn't truly taught yet (tick "also add to options").
+  const wordingOnly = bucket({ id: "other", questions: ["Which best describes you?"], value: ["Man"] });
+  assert.equal(teachableCards(apps, [wordingOnly], {}).length, 1, "wording filed but value absent → not yet covered");
 });
 
 test("teachableCards: recommends the matching Mode-A bucket's field via bucket_path (not the AI maps_to)", () => {
@@ -317,4 +371,99 @@ test("decideTeachRoute: value already present → 'wording'; missing/different �
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Male"), "wording"); // already holds it
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
   assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
+});
+
+test("teach a NON-standard yes/no label: seedLadderDraft/setLadderList/isBoolAnswer → editable ladder, covered, no resurface", () => {
+  // isBoolAnswer: standard tokens vs a tenant's custom label
+  for (const a of ["Yes", "no", "True", "FALSE", "checked", "off"]) assert.equal(isBoolAnswer(a), true, a);
+  for (const a of ["Affirmative", "Yes, I am authorized", "Blue", ""]) assert.equal(isBoolAnswer(a), false, a);
+
+  const p0 = { screening: { at_least_18_years_old: true } };
+  const PATH = "screening.at_least_18_years_old";
+  // seedLadderDraft: the polarity's defaults + the label appended (deduped); each polarity independent
+  assert.deepEqual(seedLadderDraft(p0, PATH, true, "Affirmative"), ["Yes", "True", "Affirmative"]);
+  assert.deepEqual(seedLadderDraft(p0, PATH, false, "Negative"), ["No", "False", "Negative"]);
+  assert.deepEqual(seedLadderDraft(p0, PATH, true, "Yes"), ["Yes", "True"], "already present → no dup");
+
+  // setLadderList persists the user's REORDERED list, deduped, immutably; other polarity untouched
+  const reordered = ["Affirmative", "Yes", "True"]; // user moved Affirmative to the top before confirming
+  const p1 = setLadderList(p0, PATH, true, reordered) as { answer_ladders: Record<string, { yes: string[]; no: string[] }> };
+  assert.deepEqual(p1.answer_ladders[PATH].yes, ["Affirmative", "Yes", "True"], "stored in the user's order");
+  assert.deepEqual(p1.answer_ladders[PATH].no, [], "other polarity untouched");
+  assert.equal((p0 as { answer_ladders?: unknown }).answer_ladders, undefined, "input profile not mutated");
+
+  // the taught label is now HELD by the field, and the AI card no longer resurfaces in teach
+  assert.equal(fieldHoldsAnswer(p1, PATH, "Affirmative"), true);
+  const a18 = bucket({ id: "a18", profile_path: PATH, questions: ["Are you over the age of 18?"] });
+  const aiAff = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Affirmative", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("a", [aiAff])], [a18], p1).length, 0, "taught non-standard label → covered → not resurfaced");
+  assert.equal(teachableCards([src("b", [aiAff])], [a18], p0).length, 1, "before teaching → surfaces");
+});
+
+test("STARTER_BUCKETS + ensureStarterBuckets: ships flat education/WE field bindings; merge is additive + dedup by profile_path", () => {
+  const paths = STARTER_BUCKETS.map((b) => b.profile_path);
+  assert.ok(paths.includes("education.0.gpa"), "ships an education.0.gpa binding");
+  assert.ok(paths.includes("education.0.school_or_university"), "ships an education.0.school binding");
+  assert.ok(paths.includes("work_experience.0.job_title"), "ships a work_experience.0.job_title binding");
+
+  // empty user → all starters added
+  assert.equal(ensureStarterBuckets([]).length, STARTER_BUCKETS.length);
+
+  // an existing bucket for a starter path is PRESERVED (not duplicated / not overwritten); others still added
+  const mine: Bucket[] = [
+    { id: "x", profile_path: "education.0.gpa", value: [], category: "", widget_hint: "text", questions: ["My GPA wording"], selectors: {} },
+  ];
+  const merged = ensureStarterBuckets(mine);
+  const gpa = merged.filter((b) => b.profile_path === "education.0.gpa");
+  assert.equal(gpa.length, 1, "no duplicate for an existing profile_path");
+  assert.deepEqual(gpa[0].questions, ["My GPA wording"], "existing wordings preserved (not overwritten)");
+  assert.ok(merged.some((b) => b.profile_path === "education.0.school_or_university"), "a missing starter is still added");
+  // idempotent
+  assert.equal(ensureStarterBuckets(merged).length, merged.length, "running twice adds nothing");
+});
+
+test("setFieldVariants: sets a scalar field's variants (answer_ladders[path].values), deduped + immutable, preserving yes/no", () => {
+  const p0 = { self_identification: { gender: "Male" }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True"], no: [] } } };
+  const p1 = setFieldVariants(p0, "self_identification.gender", ["Man", "man", "  ", "M"]) as {
+    answer_ladders: Record<string, { yes: string[]; no: string[]; values: string[] }>;
+  };
+  assert.deepEqual(p1.answer_ladders["self_identification.gender"].values, ["Man", "M"], "deduped (case-insensitive), blanks dropped, order kept");
+  assert.deepEqual(p1.answer_ladders["screening.at_least_18_years_old"].yes, ["Yes", "True"], "other field's yes/no ladder preserved");
+  assert.equal((p0 as { answer_ladders: Record<string, { values?: string[] }> }).answer_ladders["self_identification.gender"], undefined, "input profile not mutated");
+});
+
+test("yes/no teach correctness: boolean fields cover Yes/True AND No/False + custom ladders (no false resurface, no 'true' display)", () => {
+  // profileValueAt: a boolean shows the readable label, NOT "true"/"false"
+  assert.equal(profileValueAt({ screening: { at_least_18_years_old: true } }, "screening.at_least_18_years_old"), "Yes");
+  assert.equal(profileValueAt({ screening: { at_least_18_years_old: false } }, "screening.at_least_18_years_old"), "No");
+
+  // fieldHoldsAnswer: a TRUE field holds BOTH "Yes" and "True" (+ case variants); a FALSE field holds No/False.
+  const pt = { screening: { at_least_18_years_old: true } };
+  const pf = { work_authorization: { requires_sponsorship_now: false } };
+  for (const a of ["Yes", "yes", "True", "true"]) assert.equal(fieldHoldsAnswer(pt, "screening.at_least_18_years_old", a), true, `true holds ${a}`);
+  for (const a of ["No", "false", "False", "Negative"]) assert.equal(fieldHoldsAnswer(pt, "screening.at_least_18_years_old", a), false, `true does NOT hold ${a}`);
+  for (const a of ["No", "no", "False", "false"]) assert.equal(fieldHoldsAnswer(pf, "work_authorization.requires_sponsorship_now", a), true, `false holds ${a}`);
+  assert.equal(fieldHoldsAnswer(pf, "work_authorization.requires_sponsorship_now", "Yes"), false);
+
+  // custom ladder: a true field holds a custom Yes-synonym; not a label outside its ladder
+  const pc = { screening: { at_least_18_years_old: true }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: [] } } };
+  assert.equal(fieldHoldsAnswer(pc, "screening.at_least_18_years_old", "Affirmative"), true, "custom Yes label held");
+  assert.equal(fieldHoldsAnswer(pc, "screening.at_least_18_years_old", "Negative"), false, "not a Yes-ladder label");
+
+  // decideTeachRoute: a True-answered card on a true field is already answered → 'wording' (not 'answer')
+  assert.equal(decideTeachRoute(pt, "screening.at_least_18_years_old", "True"), "wording");
+  assert.equal(decideTeachRoute(pt, "screening.at_least_18_years_old", "No"), "answer"); // opposite polarity → set
+
+  // RESURFACE GUARD: an AI card answered "True" whose Mode-A boolean field is true must NOT resurface.
+  const a18 = bucket({ id: "a18", profile_path: "screening.at_least_18_years_old", questions: ["Are you over the age of 18?"] });
+  const aiTrue = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "True", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("a", [aiTrue])], [a18], pt).length, 0, "a True-answered AI card is covered by the true boolean → not resurfaced");
+  // a custom-label "Affirmative" card is covered once the field's custom ladder holds it…
+  const aiAff = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Affirmative", is_approved: true, needs_review: true });
+  assert.equal(teachableCards([src("b", [aiAff])], [a18], pc).length, 0, "custom-ladder label covered → not resurfaced");
+  // …but WITHOUT the custom ladder it surfaces (so the operator can add the tenant's variant to the ladder)
+  assert.equal(teachableCards([src("c", [aiAff])], [a18], pt).length, 1, "Affirmative not in any ladder yet → surfaces");
+
+  // flattenProfileFields ignores the answer_ladders metadata (no junk rows / phantom section)
+  assert.equal(flattenProfileFields(pc).some((r) => r.section === "answer_ladders" || r.path.startsWith("answer_ladders")), false);
 });

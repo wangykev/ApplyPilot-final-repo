@@ -15,7 +15,7 @@ import {
 import { COUNTRIES, countryCandidates, phoneCandidates, type CountryEntry } from "@/lib/countries";
 import { profileFieldMeta, getAtPath, setAtPath } from "@/lib/profile-fields";
 import type { Profile } from "@/lib/profile-schema";
-import { humanize } from "@/lib/teach";
+import { humanize, setFieldVariants } from "@/lib/teach";
 
 const opt = (vals: string[]) => vals.map((v) => ({ value: v, label: v === "" ? "—" : v }));
 
@@ -92,6 +92,13 @@ export function AnswerEditPopup({
   const raw = getAtPath(profile, path);
   const label = labelProp || humanize(path);
   const set = (value: unknown) => onChange(setAtPath(profile, path, value));
+  // A scalar field (text / plain dropdown / state) also shows its ANSWER LADDER (variants) here — the
+  // "advanced options". A candidate/tiered field already edits its ladder as the value; yes/no has its own.
+  // Repeating-section entry fields (education.0.gpa, …) ARE included — on flat forms they fill from the
+  // primary entry via a Mode-A bucket, which honors these variants.
+  const meta = profileFieldMeta(path, raw);
+  const scalarLadder = meta.widget === "text" || meta.widget === "dropdown" || meta.widget === "state";
+  const variants = (profile.answer_ladders as Record<string, { values?: string[] }> | undefined)?.[path]?.values ?? [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
@@ -110,6 +117,16 @@ export function AnswerEditPopup({
           countryForState={arrv(getAtPath(profile, "personal_info.country"))}
           onChange={(v) => set(v)}
         />
+
+        {scalarLadder && (
+          <div className="mt-4 border-t border-hairline pt-4">
+            <p className="mb-2 text-xs leading-relaxed text-ink-dim">
+              Answer variants — other wordings a form might use for this answer. The extension tries them,
+              in order, when the field is a dropdown/select.
+            </p>
+            <TieredField label="Variants" value={variants} onChange={(next) => onChange(setFieldVariants(profile, path, next) as Profile)} />
+          </div>
+        )}
 
         <div className="mt-4 flex justify-end">
           <button type="button" onClick={onClose} className="btn-primary">

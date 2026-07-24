@@ -178,6 +178,24 @@ export const profileSchema = z.object({
   self_identification: selfIdentificationSchema,
   screening: screeningSchema,
   additional_files: z.array(additionalFileSchema).default([]),
+  // Editable per-field candidate "fill ladders", keyed by field path (e.g. "screening.at_least_18_years_old"
+  // or "education.0.gpa"). The field itself keeps its own value; this holds EXTRA string candidates the
+  // extension tries against a dropdown/radio/typeahead option (a text box types the field's own value; a
+  // CHECKBOX uses the boolean). `yes`/`no` are the per-polarity ladders for a yes/no (triBool) field;
+  // `values` are the variants for a text/dropdown field (e.g. gpa → ["3.5+"], gender → ["Man"]). Empty /
+  // absent → the extension's defaults (["Yes","True"] / ["No","False"] for yes/no; just the field value otherwise).
+  answer_ladders: z
+    .record(
+      z.string(),
+      z.object({
+        yes: z.array(z.string()).default([]),
+        no: z.array(z.string()).default([]),
+        // Optional so a yes/no entry ({yes,no}) stays valid; scalar fields set it. Consumers treat
+        // absent as empty (extension appendFieldVariants / the UI's `?? []`).
+        values: z.array(z.string()).optional(),
+      }),
+    )
+    .default({}),
 });
 
 export type Profile = z.infer<typeof profileSchema>;

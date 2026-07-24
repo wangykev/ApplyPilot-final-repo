@@ -3595,7 +3595,40 @@ async function runCdpOnboard(tabId, opts) {
   // common case is fast and a missed first click recovers quickly instead of stalling the whole 20s.
   // Falls back to `timeoutMs` for every attempt when no ladder is given; `tries` derives from the
   // ladder length when a ladder is passed.
+  // Chrome's password-manager autofill dropdown renders OVER the focused credential field. It's BROWSER
+  // chrome (painted above the page), so cdpCoverCheck/elementFromPoint can't see it and a coordinate click
+  // on the Sign In / Create Account button below it silently MISSES (operator hit this live, 2026-07-23).
+  // The dropdown only shows while a credential field is FOCUSED — there's no DOM node to query — so the
+  // reliable proxy for "it's gone" is "no credential field is focused". Escape CLOSES the visible dropdown
+  // but KEEPS focus (so it can reappear); pressing TAB actually moves focus OFF the field (operator, 2026-
+  // 07-23), which is what truly dismisses it. We do both, then CONFIRM (poll) no email/password input is
+  // focused before clicking. Bounded; best-effort.
+  const credentialFieldFocused = () => cdpEval(() => {
+    const a = document.activeElement;
+    if (!a || a.tagName !== "INPUT") return false;
+    const t = (a.getAttribute("type") || "").toLowerCase();
+    const aid = (a.getAttribute("data-automation-id") || "").toLowerCase();
+    return t === "password" || t === "email" || /password|email/.test(aid);
+  });
+  const dismissPasswordManager = async () => {
+    const deadline = Date.now() + 1500;
+    do {
+      try { await cdpKeyTap(CDP_KEYS.escape); } catch (e) {} // close the visible dropdown
+      try { await cdpKeyTap(CDP_KEYS.tab); } catch (e) {}    // Escape keeps focus; Tab moves focus OFF the field to truly dismiss it
+      let focused = true;
+      try { focused = await credentialFieldFocused(); } catch (e) { focused = false; }
+      if (!focused) return true; // no credential field focused → the autofill dropdown is dismissed
+      await cdpDelay(150);
+    } while (Date.now() < deadline);
+    LOG("⚠ could not confirm Chrome's password-manager overlay is gone before clicking — proceeding anyway.");
+    return false;
+  };
+
   const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null }) => {
+    // Clear Chrome's password-manager autofill dropdown (it can cover the submit button and swallow the
+    // coordinate click) and CONFIRM it's gone before clicking. Both onboarding submits follow credential
+    // fields, so this is a no-op cost when nothing is focused.
+    await dismissPasswordManager();
     const ladder = (timeouts && timeouts.length) ? timeouts : null;
     const n = ladder ? ladder.length : tries;
     let st = null;
@@ -3741,6 +3774,23 @@ async function runCdpOnboard(tabId, opts) {
           return { ok: true, reached_form: false, needs_operator: true, stopped: "hidden-render-stalled", detail: 'the sign-in form did not render after "Sign in with email" — this Workday page does not repaint while the tab is hidden/backgrounded. Bring the tab to the FOREGROUND (visible) and re-run; the account is already created, so it will sign straight in.' };
         }
         continue;
+      }
+
+      // RACE GUARD before the SSO decision: the sign-in email/password fields can still be PAINTING
+      // right after "Apply Manually", or sit behind a "Sign In" tab that must be clicked to reveal them.
+      // looksLikeSso's field-absence signal (a "Sign In" button but no email/password field) then
+      // false-fires on the not-yet-rendered form → a spurious "SSO / step in" halt that clears on a
+      // re-run (operator-observed, 2026-07-23). So REVEAL the form first: click the Sign In tab if
+      // present, then poll for the fields (or the chooser) to appear. A genuine SSO screen never shows
+      // them → the poll times out and looksLikeSso still halts below. (Additive; when the fields are
+      // already present this whole block is skipped, so the live-verified happy paths are unchanged.)
+      if (!st.passwordInput && !st.emailInput && !st.signInWithEmail) {
+        if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await pace(800); st = await scan() || st; }
+        if (!st.passwordInput && !st.emailInput && !st.signInWithEmail) {
+          const w = await waitFor((s) => s.passwordInput || s.emailInput || s.signInWithEmail, 8000, "sign-in-form-render");
+          st = w.scan || st;
+        }
+        if (st.signInWithEmail) continue; // a chooser appeared during the wait → re-loop so the chooser handler runs
       }
 
       if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
@@ -4647,12 +4697,23 @@ async function fillEngine(profile, defaults, jobContext) {
         const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
         return candidates.length ? { candidates } : { skip: true };
       }
+      // A Yes/No triBool (over-18, authorized_to_work_in_us, …) can render as a DROPDOWN on some tenants —
+      // coerce boolean → "Yes"/"No" like the radio branch, else String(true) → "true" never matches the
+      // "Yes" option and the field falls to the AI (the over-18 legally-loaded every-fill bug). LOCKSTEP
+      // with fill-driver.js resolve().
+      if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
       if (isEmpty(raw)) return { skip: true };
       return { candidates: [String(raw)] };
     }
     if (widgetType === "radio") {
+      // A tiered candidate list (e.g. a degree rendered as radio) passes through as the ladder — same
+      // as dropdown/typeahead — else String(array) never matches (the triBool-dropdown bug's radio twin).
+      if (Array.isArray(raw)) {
+        const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
+        return candidates.length ? { candidates } : { skip: true };
+      }
       if (raw === null || raw === undefined) return { skip: true };
-      if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+      if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
       if (isEmpty(raw)) return { skip: true };
       return { candidates: [String(raw)] };
     }

@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -6817,6 +6817,121 @@ test("bucket Mode A: reads the bound profile field", async () => {
   assert.equal(rec.flag, "bucket");
   assert.equal(field.value, "Ada");
   assert.match(rec.detail, /personal_info\.first_name/);
+});
+
+test("resolve: coercion matrix — a triBool answer is fillable as checkbox/radio/dropdown, Yes/No AND True/False labels", () => {
+  // The class of bug: a value PRESENT in the profile that resolve() turns into a candidate that can
+  // never match the live options → silent fall-through to AI. A boolean triBool must resolve to a tiered
+  // ["Yes","True"] / ["No","False"] list for BOTH dropdown and radio (checkbox has its own path), so the
+  // match ladder hits whether the options are labeled Yes/No or True/False.
+  for (const w of ["dropdown", "typeahead", "radio"]) {
+    assert.deepEqual(resolve(true, w).candidates, ["Yes", "True"], `${w}: true → Yes/True ladder`);
+    assert.deepEqual(resolve(false, w).candidates, ["No", "False"], `${w}: false → No/False ladder`);
+    assert.equal(resolve(null, w).skip, true, `${w}: null (unanswered) → skip, never guessed`);
+    assert.equal(resolve(undefined, w).skip, true, `${w}: undefined → skip`);
+  }
+  // A tiered candidate list passes through as the ladder for ALL choice widgets — including radio (the
+  // gap this closes: resolve(array,"radio") used to become String(array) → "a,b" → never matched).
+  for (const w of ["dropdown", "typeahead", "radio"]) {
+    assert.deepEqual(resolve(["Bachelor of Science", "Bachelors"], w).candidates, ["Bachelor of Science", "Bachelors"], `${w}: tiered array → ladder`);
+    assert.equal(resolve([], w).skip, true, `${w}: empty array → skip`);
+  }
+  // A plain string still passes through as a single candidate; empty string skips.
+  assert.deepEqual(resolve("Male", "dropdown").candidates, ["Male"]);
+  assert.equal(resolve("", "dropdown").skip, true);
+});
+
+test("boolLadderCandidates: a custom per-field yes/no ladder overrides the default; empty/absent → default", () => {
+  const profile = { answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: [] } } };
+  assert.deepEqual(boolLadderCandidates(profile, "screening.at_least_18_years_old", true), ["Yes", "True", "Affirmative"], "custom yes ladder used");
+  assert.deepEqual(boolLadderCandidates(profile, "screening.at_least_18_years_old", false), ["No", "False"], "empty no list → default");
+  assert.deepEqual(boolLadderCandidates(profile, "work_authorization.permanent_resident", true), ["Yes", "True"], "absent path → default");
+  assert.deepEqual(boolLadderCandidates({}, "x", false), ["No", "False"], "no answer_ladders map → default");
+  assert.deepEqual(boolLadderCandidates(null, "x", true), ["Yes", "True"], "null profile → default");
+  // blanks are filtered — an all-blank custom list falls back to the default
+  assert.deepEqual(boolLadderCandidates({ answer_ladders: { p: { yes: ["", "  "] } } }, "p", true), ["Yes", "True"], "all-blank custom → default");
+});
+
+test("appendFieldVariants: appends a scalar field's variants (answer_ladders[path].values) after the primary, deduped", () => {
+  const profile = { answer_ladders: { "self_identification.gender": { yes: [], no: [], values: ["Man", "M"] } } };
+  assert.deepEqual(appendFieldVariants(profile, "self_identification.gender", ["Male"]), ["Male", "Man", "M"]);
+  assert.deepEqual(appendFieldVariants(profile, "self_identification.gender", "Male"), ["Male", "Man", "M"], "scalar arg wrapped");
+  assert.deepEqual(appendFieldVariants({}, "x", ["A"]), ["A"], "no answer_ladders → unchanged");
+  assert.deepEqual(appendFieldVariants(null, "x", ["A"]), ["A"], "null profile → unchanged");
+  assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["male"] } } }, "p", ["Male"]), ["Male"], "dup (case-insensitive) dropped");
+  assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["", "  "] } } }, "p", ["A"]), ["A"], "blanks dropped");
+});
+
+test("flat education: a Mode-A bucket bound to education.0.gpa fills a flat GPA field from education[0] (+ honors variants)", async () => {
+  // Many forms ask education as a single flat question. A Mode-A bucket bound to "education.0.gpa"
+  // resolves education[0].gpa via getByPath; on a range-dropdown the field's variant matches.
+  const field = { wrapperSel: "#gpa", fieldName: "gpaHashed", widgetType: "dropdown", label: "GPA range?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "3.5+" }, { text: "3.0-3.5" }] };
+  const bucket = { id: "edu_gpa", profile_path: "education.0.gpa", value: [], widget_hint: "text", questions: ["GPA range?"], selectors: {} };
+  const profile = { education: [{ gpa: "4.0/4.0" }], answer_ladders: { "education.0.gpa": { yes: [], no: [], values: ["3.5+"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "gpaHashed");
+  assert.equal(rec.flag, "bucket", "filled from the education.0.gpa bucket (education[0])");
+  assert.equal(rec.after, "3.5+", "primary '4.0/4.0' missed; the education.0.gpa variant matched the range option");
+});
+
+test("flat education: a Mode-A bucket bound to education.0.school_or_university types education[0] school on a text field", async () => {
+  const field = { wrapperSel: "#sch", fieldName: "schoolHashed", widgetType: "text", label: "School", value: "" };
+  const bucket = { id: "edu_school", profile_path: "education.0.school_or_university", value: [], widget_hint: "text", questions: ["School"], selectors: {} };
+  const profile = { education: [{ school_or_university: "Carnegie Mellon University" }] };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "schoolHashed");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(field.value, "Carnegie Mellon University", "flat school field filled from education[0]");
+});
+
+test("bucket + field variants: a flat scalar dropdown matches a VARIANT option (e.g. gender 'Man')", async () => {
+  // gender is "Male" in the profile; a tenant labels the option "Man". The editable per-field variant
+  // ["Man"] lets the dropdown match (tried after the primary "Male").
+  const field = { wrapperSel: "#g", fieldName: "genderHashed", widgetType: "dropdown", label: "Gender identity?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }] };
+  const bucket = { id: "g", profile_path: "self_identification.gender", value: [], widget_hint: "dropdown", questions: ["Gender identity?"], selectors: {} };
+  const profile = { self_identification: { gender: "Male" }, answer_ladders: { "self_identification.gender": { yes: [], no: [], values: ["Man"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "genderHashed");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(rec.after, "Man", "primary 'Male' missed the options; the 'Man' variant matched");
+});
+
+test("bucket Mode A + custom answer_ladders: a yes/no dropdown fills the operator's custom label (Affirmative)", async () => {
+  // The full path: bucket Mode-A → boolean true → boolLadderCandidates(custom) → the ladder matches a
+  // tenant that labels the option "Affirmative" instead of Yes/True.
+  const field = { wrapperSel: "#aff", fieldName: "hashedAff", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Affirmative" }, { text: "Negative" }] };
+  const bucket = { id: "over_18", profile_path: "screening.at_least_18_years_old", value: [], widget_hint: "radio", questions: ["Are you over the age of 18?"], selectors: {} };
+  const profile = { screening: { at_least_18_years_old: true }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: ["No", "False"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "hashedAff");
+  assert.equal(rec.flag, "bucket", "filled deterministically from the bucket + custom ladder");
+  assert.equal(rec.after, "Affirmative", "the custom candidate matched the tenant's 'Affirmative' option");
+});
+
+test("bucket Mode A: a Yes/No triBool fills a DROPDOWN (boolean → Yes), not just radio — the over-18 legally-loaded bug", async () => {
+  // screening.at_least_18_years_old is a triBool (boolean). On tenants that render the question as a
+  // DROPDOWN, resolve() used to String(true) → "true", which never matched the "Yes" option, so the
+  // bucket produced nothing and the field fell to the AI (flag ai-choice-sensitive, "LEGALLY-LOADED —
+  // VERIFY") on EVERY fill even though the profile answers it. resolve() now coerces boolean → Yes/No
+  // for dropdowns too, so the bucket fills it deterministically (flag "bucket", no review, no AI).
+  const field = { wrapperSel: "#a18", fieldName: "hashed18", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  const bucket = { id: "over_18", profile_path: "screening.at_least_18_years_old", value: [], widget_hint: "radio", questions: ["Are you over the age of 18?"], selectors: {} };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"No","justification":"x","confidence":"Low"}' }); // AI (if reached) would say No
+  const out = await drivePageFill(act, { screening: { at_least_18_years_old: true } }, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "hashed18");
+  assert.equal(rec.flag, "bucket", "the triBool bucket filled the dropdown deterministically");
+  assert.equal(rec.after, "Yes", "boolean true → Yes matched the live option");
+  assert.ok(!act.log.some((e) => e[0] === "llm"), "the AI pass never ran — no legally-loaded guess");
+  // and the false → No direction
+  const field2 = { wrapperSel: "#a18b", fieldName: "hashed18b", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  const out2 = await drivePageFill(makeFakeAct([field2]), { screening: { at_least_18_years_old: false } }, {}, {}, T_BUDGETS, { buckets: [{ ...bucket }] });
+  const rec2 = out2.results.find((r) => r.fieldName === "hashed18b");
+  assert.equal(rec2.after, "No", "boolean false → No");
 });
 
 test("bucket Mode A: an EMPTY bound profile value produces nothing (falls through, never blind-fills)", async () => {

@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { X, Check } from "lucide-react";
-import { CheckboxField, TagListField } from "@/components/form/fields";
+import { CheckboxField, TagListField, TieredField } from "@/components/form/fields";
 import { ProfileFieldEditor, arrv } from "@/components/app/teach/AnswerEditPopup";
 import {
   type TeachCard,
@@ -10,6 +10,10 @@ import {
   ensureModeABucket,
   bucketLabel,
   decideTeachRoute,
+  boolAnswerCandidates,
+  isBoolAnswer,
+  seedLadderDraft,
+  setLadderList,
 } from "@/lib/teach";
 import { profileFieldMeta, getAtPath, setAtPath, type ProfileWidget } from "@/lib/profile-fields";
 import type { Bucket } from "@/lib/buckets";
@@ -76,6 +80,10 @@ export function TeachAddPopup({
   // For a field: does it already hold this answer (→ wording) or not (→ answer)?
   const route = isField ? decideTeachRoute(profile, path, card.answer) : "answer";
   const meta = isField ? profileFieldMeta(path, getAtPath(profile, path)) : null;
+  // A NON-STANDARD yes/no label (e.g. "Affirmative") a tenant used — the default Yes/No+True/False ladder
+  // can't match it, so remember it in this field's ladder (answer_ladders) for the chosen polarity, so it
+  // fills deterministically next time. A standard Yes/No/True/False answer needs no ladder entry.
+  const nonStandardBool = isField && meta?.widget === "tribool" && !isBoolAnswer(card.answer);
 
   // ── field · answer route: the field value seeded with the card's answer ──
   const [fieldValue, setFieldValue] = useState<unknown>(() =>
@@ -92,15 +100,34 @@ export function TeachAddPopup({
   // ── existing (Mode-B) answer: optionally add the card's answer to its candidate ladder ──
   const [alsoLadder, setAlsoLadder] = useState(false);
 
+  // ── non-standard yes/no label: the editable fill-ladder draft (same reorderable editor as the profile
+  // page), seeded with the polarity's defaults + the card's label; re-seeded when the Yes/No toggle flips. ──
+  const [ladderDraft, setLadderDraft] = useState<string[]>(() =>
+    nonStandardBool && typeof fieldValue === "boolean" ? seedLadderDraft(profile, path, fieldValue, card.answer) : [],
+  );
+  const lastPolRef = useRef<boolean | null>(typeof fieldValue === "boolean" ? fieldValue : null);
+  useEffect(() => {
+    if (!nonStandardBool) return;
+    const pol = typeof fieldValue === "boolean" ? fieldValue : null;
+    if (pol === lastPolRef.current) return; // only re-seed on an ACTUAL polarity change (not every render)
+    lastPolRef.current = pol;
+    setLadderDraft(pol === null ? [] : seedLadderDraft(profile, path, pol, card.answer));
+  }, [fieldValue, nonStandardBool, profile, path, card.answer]);
+
   const confirm = () => {
     if (isField && route === "answer" && meta) {
       // set the profile value AND remember the wording, so the card is fully taught (covered next time)
-      const withValue = setAtPath(profile, path, fieldValue);
+      let withValue = setAtPath(profile, path, fieldValue);
+      // Remember a NON-STANDARD yes/no label for the chosen polarity (fieldValue is a definite Yes/No),
+      // so the extension fills THIS tenant's wording deterministically and the card stops resurfacing.
+      if (nonStandardBool && typeof fieldValue === "boolean") {
+        withValue = setLadderList(withValue, path, fieldValue, ladderDraft) as Profile;
+      }
       const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
       onConfirm({
         profile: withValue,
         buckets: addWordingToBucket(withB, bucketId, card.question),
-        toast: `Added to your ${fieldLabel} ✓`,
+        toast: nonStandardBool ? `Remembered “${card.answer}” for your ${fieldLabel} ✓` : `Added to your ${fieldLabel} ✓`,
       });
     } else if (isField) {
       // wording route — the value's already there, only the phrasing is new
@@ -110,15 +137,19 @@ export function TeachAddPopup({
     } else if (existing) {
       let next = buckets.map((b) => (b.id === existing.id ? { ...b, questions: dedupWordings(wordings) } : b));
       if (alsoLadder) {
-        next = next.map((b) =>
-          b.id === existing.id ? { ...b, value: b.value.includes(card.answer) ? b.value : [...b.value, card.answer] } : b,
-        );
+        // A yes/no / checkbox answer adds BOTH labelings so it resolves whether the tenant words the
+        // option Yes/No or True/False; a non-boolean answer adds itself. Deduped case-insensitively.
+        const have = new Set(existing.value.map((v) => v.trim().toLowerCase()));
+        const add = boolAnswerCandidates(card.answer).filter((v) => !have.has(v.toLowerCase()));
+        next = next.map((b) => (b.id === existing.id ? { ...b, value: [...b.value, ...add] } : b));
       }
       onConfirm({ buckets: next, toast: `Added to ${bucketLabel(existing)} ✓` });
     }
   };
 
-  const canConfirm = isField && route === "answer" ? true : wordings.length > 0;
+  // A non-standard yes/no label needs a definite polarity (Yes or No) before we can file it in a ladder.
+  const canConfirm =
+    isField && route === "answer" ? (nonStandardBool ? typeof fieldValue === "boolean" : true) : wordings.length > 0;
 
   const title =
     isField && route === "answer"
@@ -151,7 +182,9 @@ export function TeachAddPopup({
             <p className="text-xs text-ink-dim">
               {isListWidget(meta.widget)
                 ? "Added to your field's answer options (the ladder the extension tries — reorder if needed)."
-                : "Sets your profile field — the extension fills it from here."}{" "}
+                : nonStandardBool
+                  ? "This form used a non-standard label — pick whether it means Yes or No, and it'll be remembered so the tool fills it automatically next time."
+                  : "Sets your profile field — the extension fills it from here."}{" "}
               <span className="text-ink-faint">The question wording is saved too.</span>
             </p>
             <ProfileFieldEditor
@@ -162,6 +195,23 @@ export function TeachAddPopup({
               countryForState={arrv(getAtPath(profile, "personal_info.country"))}
               onChange={setFieldValue}
             />
+            {nonStandardBool &&
+              (typeof fieldValue === "boolean" ? (
+                <div className="rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
+                  <p className="mb-2 text-xs text-ink-dim">
+                    <span className="font-medium text-ink">{fieldValue ? "Yes" : "No"}</span> fill ladder — the extension tries
+                    these against the form&apos;s options, in order. Reorder or remove as needed.
+                  </p>
+                  <TieredField
+                    label="Candidates it tries (most-specific first)"
+                    value={ladderDraft}
+                    onChange={setLadderDraft}
+                    highlight={card.answer}
+                  />
+                </div>
+              ) : (
+                <p className="text-xs text-signal">Pick Yes or No above so we know which &ldquo;{card.answer}&rdquo; means.</p>
+              ))}
           </div>
         )}
 

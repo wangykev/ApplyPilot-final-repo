@@ -893,3 +893,78 @@ Verified per change: extension unit suites green where runnable (fill-driver 443
 lib-dependent suites); web `tsc --noEmit` clean + `next build` green. LIVE-VERIFIED on Magna wd3: the Run
 tab onboards → fills → soft-error recovers → reaches review; the tracker shows one row with company/title.
 Remaining: exercise more tenants; the JD-scrape host-permission covers myworkdayjobs + myworkdaysite only.
+
+## 2026-07-23 — triBool→AI leak, answer ladders as their own thing, education dual-shape, password-manager overlay (branch `web-run-home-flow`)
+
+Live-testing follow-ups + a class of "value is in the profile but the fill still goes to AI" bugs.
+
+**triBool / boolean → AI leak (the over-18 bug).** "Are you over the age of 18?*" was flagged
+`ai-choice-sensitive` "LEGALLY-LOADED — VERIFY" on EVERY fill even though the profile answered it. Root
+cause: `resolve()` coerced a boolean profile value to a bare `"true"`/`"false"` string for the RADIO path
+only — a yes/no **dropdown** got `"true"`, which never matches a "Yes"/"No" option → escalated to the AI
+post-pass. Fixed in BOTH copies (fill-driver.js + the background.js engine, lockstep): a boolean now
+resolves to the tiered candidate list `["Yes","True"]` / `["No","False"]` for dropdown/typeahead AND radio
+(with array handling), so a checkbox, a true/false dropdown, a yes/no dropdown, and yes/no radios all fill
+deterministically from the stored boolean. Regression-pinned in `test/fill-driver.test.js`.
+
+**Answer ladders are their own thing (separate from the question bucket).** The question **bucket** (the
+wordings that map a tenant's question to a field) and the **answer ladder** (the acceptable answer variants
+for that field) were conflated. Split them, modeled on how Country's tiered list works:
+- `answer_ladders: Record<path, {yes:string[], no:string[], values?:string[]}>` lives in `profile_json`
+  (NO migration — it rides the existing profile blob). `yes`/`no` = triBool polarity ladders; `values` =
+  scalar-field answer variants.
+- **Profile page:** every `TextField`/`SelectField` renders an in-field `›` arrow → `AdvancedChoices`
+  popup editing `answer_ladders[path].values` — proactively, for EVERY field, so the operator can pre-load
+  variants (e.g. GPA `["4.0/4.0","3.5+","3.0+"]`) WITHOUT waiting for a teach. A triBool field's arrow edits
+  its yes/no polarity ladder.
+- **Teach page:** click the ANSWER → the AdvancedChoices popup shows (mirrors the profile arrow). A
+  non-standard yes/no label teaches via a tiered-field ladder draft.
+- Fill: `appendFieldVariants`/`boolLadderCandidates` (fill-driver.js) append the ladder's variants as extra
+  candidates for choice widgets, keyed by the bucket's `profile_path` VERBATIM (dotted, incl. numeric
+  `education.0.gpa`). UI polish: the yes/no toggle HIGHLIGHTS the selected text (not underline) and only
+  after it's clicked (you can't open the ladder until a polarity is selected).
+
+**Teach resurface — value-based coverage.** A taught field reappeared on re-approving the same bundle even
+though the answer was now in the profile. `bucketCoversAnswer`/`fieldHoldsAnswer`/`profileValueAt`
+(web/lib/teach.ts) are now BOOLEAN-aware (a boolean profile value matches "Yes"/"True"/"No"/"False" via
+`boolAnswerCandidates`, and honors the custom `answer_ladders`), so a covered+answered question stays
+hidden — including when the operator files under their OWN bucket rather than the AI's suggestion.
+
+**Delete-all-skipped (teach).** A "Delete all" button in the teach **Skipped** section clears skipped cards
+(distinct from Restore, which requeues them); shown ONLY when the Skipped list is expanded. Persisted via a
+`teach_deleted_json` column (migration `0009`) so a hard-deleted skip doesn't resurface.
+
+**Education dual-shape (repeating AND flat).** Workday-style forms ask Education either as a repeat-add
+section OR as flat single questions (School / GPA / Degree). The extension only filled the repeating shape.
+Now flat education (+ work-experience) fills too, via **Mode-A starter buckets** bound to entry-0 paths
+(`education.0.{school_or_university,gpa,degree,field_of_study}`, `work_experience.0.{job_title,company}`),
+matched on the tenant's label wording — `getByPath(profile,"education.0.gpa")` reads straight from the
+primary entry. No double-fill: the flat driver loop SKIPS fields inside repeating containers (`isRepeating`),
+so a repeating tenant fills via the section and the flat buckets don't fire; a flat tenant fills via the
+buckets. `ensureStarterBuckets(buckets)` merges the new starters into EXISTING profiles (dedup by
+`profile_path`, idempotent, non-destructive), applied where buckets load/sync. Repeating-section fields also
+got the answer-ladder affordance (dropped the `\.\d` exclusion). Repeating fill + schema untouched.
+
+**SSO false-positive (a race).** The Run flow halted "This tenant uses SSO / federated login" then worked
+on a manual retry. `looksLikeSso` fired before the login form finished rendering (a sign-in button visible,
+email/password not yet painted). `doAuth` now waits for the credential form to reveal before the SSO
+classification.
+
+**Certification date fields overlapping / off-page.** The Issued/Expiration month-day-year `DateField`
+couldn't shrink in a `grid-cols-3` row (fixed segment widths, `flex-1` month, no `min-w-0`), so the two
+dates overlapped and ran off the page. Fixed: `DateField` root `group min-w-0`, month input `min-w-0
+flex-1`, and the cert/specialty date rows use `sm:grid-cols-2`.
+
+**Password-manager overlay before submit (live).** During live-testing the "Sign In" coordinate click
+silently missed and the walk halted `auth-unknown` after the full 20s timeout. Cause: Chrome's
+password-manager autofill dropdown is BROWSER chrome painted above the page — `cdpCoverCheck`/
+`elementFromPoint` can't see it, so the coordinate click landed on the dropdown. The dropdown only shows
+while a credential field is FOCUSED and has no DOM node to query, so the proxy for "gone" is "no credential
+field focused". `dismissPasswordManager()` (background.js, wired into `submitAndWait` → covers both the
+sign-in and create-account submits): Escape (closes the visible dropdown) + Tab (Escape KEEPS focus; Tab
+actually moves focus off the field) then POLL-confirm no email/password input is focused before clicking.
+Bounded, best-effort.
+
+Verified per change: extension `node --test test/*.test.js` green (0 fail); web `tsc --noEmit` clean +
+`next build` green. The password-manager fix is implemented + compiles/tests-green but LIVE-CONFIRMATION on
+the operator's browser is pending (reload the extension from this worktree, re-run the sign-in).
