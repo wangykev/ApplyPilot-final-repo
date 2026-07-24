@@ -27,6 +27,7 @@ const ONBOARD_STOP: Record<string, string> = {
   "hidden-render-stalled": "The sign-in form didn't render while the tab was in the background. Bring the tab to the front and run again.",
   "workday-maintenance": "Workday is in planned maintenance. Try again after the maintenance window.",
   "unknown-page": "Couldn't find an Apply / sign-in / form on that page. Make sure the link is the job posting.",
+  "already-applied": "You've already applied to this job — Workday won't reopen the application, so there's nothing to fill.",
 };
 
 // Friendly one-liners for the fill-walk stops (from runCdpWalk).
@@ -54,6 +55,15 @@ function interpret(resp: ExtResponse): Outcome {
       };
     }
     return { tone: "err", headline: "The run hit an error", detail };
+  }
+
+  // Already applied — a clean terminal state (you applied before), not an error or a to-do.
+  if (resp.already_applied) {
+    return {
+      tone: "ok",
+      headline: "You've already applied to this job",
+      detail: (resp.detail as string) || ONBOARD_STOP["already-applied"],
+    };
   }
 
   // Reached the form but stopped before / instead of walking → needs a human.

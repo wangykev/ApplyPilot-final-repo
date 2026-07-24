@@ -810,6 +810,19 @@ function isWorkdaySoftError(bodyText) {
     && /refresh (the|this) page|please refresh|try again/i.test(t);
 }
 
+// "You've already applied for this job." Workday shows a dedicated already-applied page instead of the
+// application form when the signed-in candidate has already submitted for this requisition. It's a CLEAN
+// terminal state, NOT an error — the onboarding halts gracefully ("already-applied") rather than timing
+// out on a form/auth screen that will never appear. Primary signal is the marker
+// (data-automation-id="alreadyAppliedPage"); the body-text fallback catches a tenant that omits it. The
+// page TITLE is unreliable (observed as a stale "Create Account" on Magna wd3, 2026-07-24), so it's ignored.
+function isAlreadyApplied(state) {
+  const s = state || {};
+  if (s.markers && s.markers.alreadyAppliedPage) return true;
+  const t = String(s.bodyText || "");
+  return /you.{0,3}ve already applied|you have already applied|already applied for this (job|position|requisition|role)/i.test(t);
+}
+
 // SSO / federated-login detection. The reference REFUSES SSO (a Workday tenant that
 // bounces to Okta/Ping/Azure/etc can't be driven with an email+password) — so we halt
 // for operator takeover rather than fumble. Two signals: an SSO-looking URL, or an
@@ -832,5 +845,5 @@ function looksLikeSso(state) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isAlreadyApplied };
 }

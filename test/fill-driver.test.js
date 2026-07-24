@@ -611,6 +611,73 @@ test("radio: no candidate matches the labels → needs_review with the options",
   assert.deepStrictEqual(rec.options, ["Yeah", "Nope"]);
 });
 
+// ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) — 2026-07-24 ──────────────
+// A yes/no screening question naming the company you're applying to ("former MAGNA employee?",
+// "currently employed with Magna?") fills from the profile's employment history: a clean "No" SILENTLY
+// (no LEGALLY-LOADED flag, no review — the whole point), a "Yes"/uncertain review-flagged, NEVER auto-
+// "Yes". Recognized by TEXT, anchored on jobContext.company; unrecognized/unevaluable → the AI/blank fallback.
+const { recognizeEmploymentQuestion, decideCurrentlyEmployed, optionForPolarity } = require("../fill-driver.js");
+const empField = (label, options) => ({
+  wrapperSel: "[w-emp]", fieldName: "customScreeningQuestion", widgetType: "radio", isRequired: true, label,
+  options: options || [{ id: "y", labelText: "Yes", checked: false }, { id: "n", labelText: "No", checked: false }]
+});
+const pickFR = (d) => ({ fill: d.fill, review: d.review });
+
+test("employment recognizer: fires on the company named adjacent to an employment word (any tenant)", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former MAGNA employee?", "Magna"), { tense: "former", company: "Magna" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you currently employed with Magna?", "Magna"), { tense: "current", company: "Magna" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Have you ever worked for Magna?", "Magna"), { tense: "former", company: "Magna" });
+  assert.strictEqual(recognizeEmploymentQuestion("Are you employed by Bosch?", "Bosch").tense, "ever"); // generalizes — no per-tenant config
+});
+test("employment recognizer: no false positives on lookalikes", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Do you agree Magna may contact your former employers?", "Magna"), null, "company not adjacent to an employment claim about YOU");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you willing to work weekends at Magna?", "Magna"), null, "bare 'work', no for/at/with-employment phrase");
+  assert.strictEqual(recognizeEmploymentQuestion("Why do you want to work at Magna?", "Magna"), null, "aspirational 'want to work', not employment history");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you authorized to work in Canada?", "Magna"), null, "company not named");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former employee?", ""), null, "no application company → can't anchor");
+});
+test("decideCurrentlyEmployed: derived from the 'currently work here' flags (operator decision #2)", () => {
+  const p = (we, emp) => ({ work_experience: we, employment_history_companies: emp || ["Google"] });
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Google", currently_work_here: true }]))), { fill: "No", review: false }, "current job elsewhere → confident No");
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Magna Steyr", currently_work_here: true }], ["Magna Steyr"]))), { fill: "Yes", review: true }, "current Magna entry → Yes + review, never auto-Yes");
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Magna", currently_work_here: false }], ["Magna"]))), { fill: "No", review: true }, "in history but not current → No + review");
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", { work_experience: [], employment_history_companies: ["none"] })), { fill: "No", review: false }, '["none"] → never employed → No');
+  assert.strictEqual(decideCurrentlyEmployed("Magna", { employment_history_companies: [] }).fill, null, "[] unfilled → blank + review");
+});
+test("optionForPolarity: maps Yes/No to simple AND verbose option labels", () => {
+  assert.strictEqual(optionForPolarity(["Yes", "No"], "No"), "No");
+  assert.strictEqual(optionForPolarity(["Yes, I am currently employed with Magna", "No, I'm NOT currently employed with Magna"], "No"), "No, I'm NOT currently employed with Magna");
+  assert.strictEqual(optionForPolarity(["Nope", "Yeah"], "No"), null, "no leading-No option → ambiguous → null (never guess)");
+});
+test("employment question — clean 'No' fills SILENTLY (no flag, no review)", async () => {
+  const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "a grounded No fills silently — the whole point");
+  assert.ok(!rec.flag, "no LEGALLY-LOADED flag on a clean No");
+  assert.strictEqual(buildReviewBundle([rec], {}).entries[0].needs_review, false, "clean No must NOT go to review");
+});
+test("employment question — verbose options (Q2): 'currently employed' maps to the verbose No label", async () => {
+  const opts = [{ id: "y", labelText: "Yes, I am currently employed with Magna", checked: false }, { id: "n", labelText: "No, I'm NOT currently employed with Magna", checked: false }];
+  const [rec] = await run([empField("Are you currently employed with Magna?", opts)], { work_experience: [{ company: "Google", currently_work_here: true }], employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No, I'm NOT currently employed with Magna");
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!rec.flag);
+});
+test("employment question — 'Yes' (company in history) → filled_review + employer-match (never auto-Yes)", async () => {
+  const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+  const e = buildReviewBundle([rec], {}).entries[0];
+  assert.strictEqual(e.needs_review, true);
+  assert.strictEqual(e.needs_review_reason, "employer_match_uncertain", "renders as an employer match, NOT AI-inferred");
+  assert.strictEqual(e.confidence_source, "employer_match");
+});
+test("employment question — no company anchor → NOT recognized → not silently filled (falls to blank/AI)", async () => {
+  const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Google"] }, {});
+  assert.notStrictEqual(rec.status, "filled", "no company → not recognized → never a silent deterministic fill");
+});
+
 // ── AI required-radio fallback (aiFillRadio) — the deferred required-radio path ──────────────
 // A REQUIRED radio the deterministic pass can't answer would BLOCK Save & Continue → guess-to-reach-
 // review (never blind-trust): infer + commit + ALWAYS filled_review, flagged HARD. AI OFF / OPTIONAL → blank.

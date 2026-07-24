@@ -1441,6 +1441,11 @@ function cdpOnboardScan() {
     agreementCheckbox: present('[data-automation-id="agreementCheckbox"]'),
     applyFlowPage: present('[data-automation-id="applyFlowPage"]'),
     applyFlowReviewPage: present('[data-automation-id="applyFlowReviewPage"]'),
+    // "You've already applied for this job." — Workday shows a dedicated page (no form, no apply/auth
+    // chrome) when the signed-in candidate already submitted for this requisition. A clean terminal
+    // state, NOT an error (see isAlreadyApplied); the title can be a stale "Create Account", so the
+    // automation-id is the reliable signal.
+    alreadyAppliedPage: present('[data-automation-id="alreadyAppliedPage"]'),
     formField: formFields.length > 0
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
