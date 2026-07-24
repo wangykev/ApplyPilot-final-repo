@@ -114,4 +114,77 @@ export const STARTER_BUCKETS: Bucket[] = [
     questions: ["Gender", "What is your gender?"],
     selectors: {},
   },
+  // Education / work-experience FLAT fields: many forms ask these as individual questions (a single
+  // "School", "GPA", etc.) rather than a repeat-add section. These Mode-A bindings to the PRIMARY entry
+  // (education[0] / work_experience[0]) let a flat question fill from the profile by matching its label.
+  // On a REPEATING tenant these never fire (the flat scan excludes fields inside repeating containers),
+  // so the section fill still owns those. Dates/textareas aren't bucket-fillable yet, so they're omitted.
+  {
+    id: "edu_school",
+    profile_path: "education.0.school_or_university",
+    value: [],
+    category: "Education",
+    widget_hint: "text",
+    questions: ["School", "University", "College", "Institution", "School or University", "School name"],
+    selectors: {},
+  },
+  {
+    id: "edu_gpa",
+    profile_path: "education.0.gpa",
+    value: [],
+    category: "Education",
+    widget_hint: "text",
+    questions: ["GPA", "Grade point average", "Cumulative GPA", "Grade Point Average (GPA)"],
+    selectors: {},
+  },
+  {
+    id: "edu_degree",
+    profile_path: "education.0.degree",
+    value: [],
+    category: "Education",
+    widget_hint: "typeahead",
+    questions: ["Degree", "Degree earned", "Degree type", "Degree received", "Level of education"],
+    selectors: {},
+  },
+  {
+    id: "edu_field_of_study",
+    profile_path: "education.0.field_of_study",
+    value: [],
+    category: "Education",
+    widget_hint: "typeahead",
+    questions: ["Major", "Field of study", "Area of study", "Major / Field of study", "Concentration"],
+    selectors: {},
+  },
+  {
+    id: "we_job_title",
+    profile_path: "work_experience.0.job_title",
+    value: [],
+    category: "Experience",
+    widget_hint: "text",
+    questions: ["Job title", "Title", "Position", "Job Title", "Role"],
+    selectors: {},
+  },
+  {
+    id: "we_company",
+    profile_path: "work_experience.0.company",
+    value: [],
+    category: "Experience",
+    widget_hint: "text",
+    questions: ["Company", "Employer", "Company name", "Organization", "Employer name"],
+    selectors: {},
+  },
 ];
+
+/**
+ * Add any Mode-A starter bucket whose `profile_path` isn't already present in `buckets` — so an EXISTING
+ * user (whose buckets_json predates a newly-shipped starter, e.g. the education/work-experience field
+ * bindings) still gets those bindings. Dedup is by `profile_path`; an existing bucket's wordings/values
+ * are never touched. Applied on LOAD (not persisted), so it's idempotent. Caveat: a starter the user
+ * fully DELETED reappears — acceptable for these wording-only Mode-A bindings (the value still comes
+ * from the profile, and an extra wording only makes the field match more questions).
+ */
+export function ensureStarterBuckets(buckets: Bucket[]): Bucket[] {
+  const havePaths = new Set(buckets.map((b) => b.profile_path.trim()).filter(Boolean));
+  const add = STARTER_BUCKETS.filter((s) => s.profile_path.trim() && !havePaths.has(s.profile_path.trim()));
+  return add.length ? [...buckets, ...add] : buckets;
+}

@@ -6862,6 +6862,29 @@ test("appendFieldVariants: appends a scalar field's variants (answer_ladders[pat
   assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["", "  "] } } }, "p", ["A"]), ["A"], "blanks dropped");
 });
 
+test("flat education: a Mode-A bucket bound to education.0.gpa fills a flat GPA field from education[0] (+ honors variants)", async () => {
+  // Many forms ask education as a single flat question. A Mode-A bucket bound to "education.0.gpa"
+  // resolves education[0].gpa via getByPath; on a range-dropdown the field's variant matches.
+  const field = { wrapperSel: "#gpa", fieldName: "gpaHashed", widgetType: "dropdown", label: "GPA range?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "3.5+" }, { text: "3.0-3.5" }] };
+  const bucket = { id: "edu_gpa", profile_path: "education.0.gpa", value: [], widget_hint: "text", questions: ["GPA range?"], selectors: {} };
+  const profile = { education: [{ gpa: "4.0/4.0" }], answer_ladders: { "education.0.gpa": { yes: [], no: [], values: ["3.5+"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "gpaHashed");
+  assert.equal(rec.flag, "bucket", "filled from the education.0.gpa bucket (education[0])");
+  assert.equal(rec.after, "3.5+", "primary '4.0/4.0' missed; the education.0.gpa variant matched the range option");
+});
+
+test("flat education: a Mode-A bucket bound to education.0.school_or_university types education[0] school on a text field", async () => {
+  const field = { wrapperSel: "#sch", fieldName: "schoolHashed", widgetType: "text", label: "School", value: "" };
+  const bucket = { id: "edu_school", profile_path: "education.0.school_or_university", value: [], widget_hint: "text", questions: ["School"], selectors: {} };
+  const profile = { education: [{ school_or_university: "Carnegie Mellon University" }] };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "schoolHashed");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(field.value, "Carnegie Mellon University", "flat school field filled from education[0]");
+});
+
 test("bucket + field variants: a flat scalar dropdown matches a VARIANT option (e.g. gender 'Man')", async () => {
   // gender is "Male" in the profile; a tenant labels the option "Man". The editable per-field variant
   // ["Man"] lets the dropdown match (tried after the primary "Male").

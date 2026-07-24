@@ -24,7 +24,7 @@ import {
   wasManuallyEdited,
   type TeachSource,
 } from "@/lib/teach";
-import type { Bucket } from "@/lib/buckets";
+import { ensureStarterBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 const bucket = (over: Partial<Bucket>): Bucket => ({
@@ -398,6 +398,28 @@ test("teach a NON-standard yes/no label: seedLadderDraft/setLadderList/isBoolAns
   const aiAff = entry({ question_label: "Are you over the age of 18?*", widget_type: "dropdown", flag: "ai-choice-sensitive", current_value: "Affirmative", is_approved: true, needs_review: true });
   assert.equal(teachableCards([src("a", [aiAff])], [a18], p1).length, 0, "taught non-standard label → covered → not resurfaced");
   assert.equal(teachableCards([src("b", [aiAff])], [a18], p0).length, 1, "before teaching → surfaces");
+});
+
+test("STARTER_BUCKETS + ensureStarterBuckets: ships flat education/WE field bindings; merge is additive + dedup by profile_path", () => {
+  const paths = STARTER_BUCKETS.map((b) => b.profile_path);
+  assert.ok(paths.includes("education.0.gpa"), "ships an education.0.gpa binding");
+  assert.ok(paths.includes("education.0.school_or_university"), "ships an education.0.school binding");
+  assert.ok(paths.includes("work_experience.0.job_title"), "ships a work_experience.0.job_title binding");
+
+  // empty user → all starters added
+  assert.equal(ensureStarterBuckets([]).length, STARTER_BUCKETS.length);
+
+  // an existing bucket for a starter path is PRESERVED (not duplicated / not overwritten); others still added
+  const mine: Bucket[] = [
+    { id: "x", profile_path: "education.0.gpa", value: [], category: "", widget_hint: "text", questions: ["My GPA wording"], selectors: {} },
+  ];
+  const merged = ensureStarterBuckets(mine);
+  const gpa = merged.filter((b) => b.profile_path === "education.0.gpa");
+  assert.equal(gpa.length, 1, "no duplicate for an existing profile_path");
+  assert.deepEqual(gpa[0].questions, ["My GPA wording"], "existing wordings preserved (not overwritten)");
+  assert.ok(merged.some((b) => b.profile_path === "education.0.school_or_university"), "a missing starter is still added");
+  // idempotent
+  assert.equal(ensureStarterBuckets(merged).length, merged.length, "running twice adds nothing");
 });
 
 test("setFieldVariants: sets a scalar field's variants (answer_ladders[path].values), deduped + immutable, preserving yes/no", () => {

@@ -92,11 +92,12 @@ export function AnswerEditPopup({
   const raw = getAtPath(profile, path);
   const label = labelProp || humanize(path);
   const set = (value: unknown) => onChange(setAtPath(profile, path, value));
-  // A FLAT scalar field (text / plain dropdown / state) also shows its ANSWER LADDER (variants) here —
-  // the "advanced options". A candidate/tiered field already edits its ladder as the value; yes/no has its
-  // own; repeating-section fields (…\.0\.…) fill with a fixed widget, so a variant list wouldn't help them.
+  // A scalar field (text / plain dropdown / state) also shows its ANSWER LADDER (variants) here — the
+  // "advanced options". A candidate/tiered field already edits its ladder as the value; yes/no has its own.
+  // Repeating-section entry fields (education.0.gpa, …) ARE included — on flat forms they fill from the
+  // primary entry via a Mode-A bucket, which honors these variants.
   const meta = profileFieldMeta(path, raw);
-  const scalarLadder = (meta.widget === "text" || meta.widget === "dropdown" || meta.widget === "state") && !/\.\d/.test(path);
+  const scalarLadder = meta.widget === "text" || meta.widget === "dropdown" || meta.widget === "state";
   const variants = (profile.answer_ladders as Record<string, { values?: string[] }> | undefined)?.[path]?.values ?? [];
 
   return (

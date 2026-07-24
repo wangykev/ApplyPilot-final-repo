@@ -68,11 +68,12 @@ export function FieldLabel({
 }
 
 /** Whether a scalar field should show the in-field answer-ladder arrow: a provider wired the
- *  AnswerLadderContext, the field has a bucketPath, and it's NOT a repeating-section field (those fill
- *  with a fixed widget, so a variant list wouldn't change their fill). */
+ *  AnswerLadderContext and the field has a bucketPath. Repeating-section entry fields (education.0.gpa,
+ *  work_experience.0.*) are INCLUDED — many forms ask them as flat questions that fill from the primary
+ *  entry via a Mode-A bucket, and that flat/bucket fill path honors the field's answer_ladders variants. */
 function useHasLadder(bucketPath?: string): boolean {
   const openLadder = useContext(AnswerLadderContext);
-  return !!openLadder && !!bucketPath && !/\.\d/.test(bucketPath);
+  return !!openLadder && !!bucketPath;
 }
 
 /** The small in-field arrow → the field's ANSWER LADDER popup (its ordered variants). Absolute-right;

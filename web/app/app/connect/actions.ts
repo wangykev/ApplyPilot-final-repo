@@ -3,7 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
-import { coerceBuckets, STARTER_BUCKETS } from "@/lib/buckets";
+import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
 import { coerceAiConfig } from "@/lib/ai-config";
 import { coerceCredentials, coerceOnboardConfig, type Credentials, type OnboardConfig } from "@/lib/credentials";
 import { generateApiKey, hashApiKey } from "@/lib/api-key";
@@ -45,7 +45,9 @@ function shapeProfileSlice(row: ProfileRow): ProfileSlice {
   const defaults = { how_did_you_hear: profile.how_did_you_hear };
   // Buckets: provision the starter set into the payload if never set (so a sync
   // before the first profile-page visit still ships them). Extension merges/stores.
-  const buckets = row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS;
+  // Ship any newly-added starter bindings (education/work-experience flat fields) to the extension too,
+  // even for existing users whose buckets_json predates them (dedup by profile_path; non-destructive).
+  const buckets = ensureStarterBuckets(row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS);
   const jc = row?.job_context_json as { company?: string } | null;
   const jobContext = jc?.company !== undefined ? { company: jc.company as string } : { company: "" };
   return { profile, defaults, buckets, jobContext };
