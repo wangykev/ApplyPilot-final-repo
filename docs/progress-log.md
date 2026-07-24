@@ -968,3 +968,29 @@ Bounded, best-effort.
 Verified per change: extension `node --test test/*.test.js` green (0 fail); web `tsc --noEmit` clean +
 `next build` green. The password-manager fix is implemented + compiles/tests-green but LIVE-CONFIRMATION on
 the operator's browser is pending (reload the extension from this worktree, re-run the sign-in).
+
+## 2026-07-24 — "Already applied" detector (onboarding halts cleanly, no random error) (branch `web-run-home-flow`)
+
+Live-testing surfaced it: when the signed-in candidate has already applied for a requisition, Workday shows
+a dedicated "You've already applied for this job" page (`data-automation-id="alreadyAppliedPage"`) instead
+of the form — no form fields, no apply/auth chrome. The onboarding had no detector for it, so it wasted the
+12s Stage-3 auth-or-form wait and then halted with a confusing `unknown-page` (or `auth-unknown` after a
+fresh sign-in). NOTE the page TITLE is a stale "Create Account" on Magna wd3, so title-matching is useless —
+the automation-id is the reliable signal.
+
+**`isAlreadyApplied(state)` (lib.js, pure + unit-pinned).** Primary signal: the `alreadyAppliedPage` marker
+(added to `cdpOnboardScan`); body-text fallback (`/you.{0,3}ve already applied|already applied for this
+(job|position|requisition|role)/i`) for a tenant that omits it. `runCdpOnboard` checks it at three points —
+the initial scan (the common Run case: already signed in → navigate to Apply → redirected here), the start
+of Stage 3 (revealed after Apply/Apply Manually, before the 12s wait), and in `doAuth` after a successful
+sign-in (Workday shows already-applied instead of the form) — and returns a CLEAN terminal outcome
+`{ ok:true, reached_form:false, already_applied:true, stopped:"already-applied", detail:… }`. It is NOT
+`needs_operator`: the operator already applied, there's nothing to fix or fill.
+
+**Website (RunPanel).** `interpret` gets a dedicated `already_applied` branch → an "ok"-tone "You've already
+applied to this job" result (was falling through to the amber "Needs you to step in"). `ONBOARD_STOP` gains
+an `already-applied` fallback line.
+
+Verified: extension `node --test test/*.test.js` green (0 fail; +3 `isAlreadyApplied` tests — marker,
+body-text fallback, and no-false-positive on form/auth/apply pages); web `tsc --noEmit` clean + tests 43/43.
+Live-confirmation on the operator's browser pending (reload the extension, re-run a job already applied to).

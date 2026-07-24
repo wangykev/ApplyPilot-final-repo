@@ -3462,6 +3462,13 @@ async function runCdpOnboard(tabId, opts) {
 
   const scan = async () => { try { return await cdpEval(cdpOnboardScan); } catch (e) { return null; } };
   const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
+  // "You've already applied for this job." — a CLEAN terminal state (the operator already applied), not an
+  // error. Halt gracefully so the Run reports "already applied" instead of stalling on a form that never
+  // appears then halting `unknown-page`/`auth-unknown`. Checked at each stage the page can reveal it.
+  const alreadyAppliedResult = () => {
+    LOG("⛔ ALREADY APPLIED — Workday shows the \"You've already applied for this job\" page; nothing to fill. Halting cleanly.");
+    return { ok: true, reached_form: false, already_applied: true, stopped: "already-applied", detail: "You've already applied for this job — Workday won't reopen the application, so there's nothing to fill." };
+  };
   const presentApply = (s) => {
     const out = [];
     if (s.markers.adventureButton) out.push('[data-automation-id="adventureButton"]');
@@ -3831,6 +3838,7 @@ async function runCdpOnboard(tabId, opts) {
         if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
         if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
         if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
+        if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
         return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unknown", detail: `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}` };
       }
 
@@ -3863,6 +3871,7 @@ async function runCdpOnboard(tabId, opts) {
     if (!st) return { ok: false, error: "no-page-state (is the tab on a Workday page?)" };
     if (await maybeRefresh(st)) st = await scan() || st;
 
+    if (isAlreadyApplied(st)) return alreadyAppliedResult(); // already signed in + applied (the common Run case: navigated to Apply, Workday redirects here)
     if (isPastAuth(st)) { LOG("already on the application form — nothing to onboard."); return { ok: true, reached_form: true, stopped: "already-on-form" }; }
     if (isWorkdayMaintenance({ title: st.title, bodyText: st.bodyText, formFieldCount: st.formFieldCount, passwordInputPresent: st.passwordInput, signInButtonPresent: st.signInButtonPresent })) {
       LOG("⛔ Workday planned-maintenance page — retry after the maintenance window.");
@@ -3894,6 +3903,7 @@ async function runCdpOnboard(tabId, opts) {
 
     // ── STAGE 3: Auth (+ create-account + verify) ──
     st = await scan() || st;
+    if (isAlreadyApplied(st)) return alreadyAppliedResult(); // revealed after Apply / Apply Manually — halt before the 12s auth-or-form wait
     if (isPastAuth(st)) { LOG("reached the form (no auth needed)."); return { ok: true, reached_form: true, stopped: "reached-form" }; }
     if (!st.hasAuthEl && !st.signInButtonPresent && st.formFieldCount === 0) {
       const w = await waitFor((s) => s.hasAuthEl || s.signInButtonPresent || s.formFieldCount > 0, 12000, "auth-or-form");
