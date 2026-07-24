@@ -1045,3 +1045,45 @@ unchanged (it already lacks the AI radio fallback). Verified: extension `node --
 (645 pass, 0 fail; +9 tests — recognizer positive/negative, `decideCurrentlyEmployed`, `optionForPolarity`,
 and end-to-end silent-No / verbose-No / Yes-review / no-anchor-not-filled). Live-confirmation on Magna
 pending (reload the extension, re-run — the two Magna questions should fill "No" with no review flag).
+
+## 2026-07-24 — Employment-status hardening: dropdown parity + adversarial-wording guards (branch `web-run-home-flow`)
+
+Operator asked for a double-check of the morning's employment-status feature: does a yes/no DROPDOWN fill
+deterministically too, and can adversarial wordings break the recognizer into a WRONG deterministic answer?
+Both audits found real holes; all fixed, all unit-pinned.
+
+**Dropdown parity (a real ordering bug).** The check gated on `widgetType === "radio"` only AND sat AFTER
+the generic AI FALLBACK block — so a yes/no DROPDOWN version of the same question was AI-filled (flagged)
+before the employment check could ever run. Moved the block ABOVE the AI FALLBACK (right after the bucket
+consult — placement is load-bearing) and widened to radio + dropdown. Dropdown commit reuses the proven
+pieces: `openAndReadDropdown` → `optionForPolarity` vs the live options → the AI path's text-keyed click +
+persistence re-read. Prefilled-equal → kept with ZERO value actuation; commit-fail → `needs_review` with
+`resolved` set, so `producedNothing` stays false and the AI can never override a made decision.
+
+**Adversarial wordings (each WOULD have silently produced a wrong answer; all now BAIL to the flagged
+AI fallback — the safe direction):**
+- **Wrong SUBJECT** — "Do you have any relatives currently employed with Magna?", "Were you referred by a
+  current Magna employee?", "Is your spouse employed by Magna?" (the question is about someone ELSE).
+- **Wrong OBJECT / scope** — "employed by a competitor/supplier of Magna?", "terminated by ANY employer,
+  including Magna?" (membership being asked isn't at the application company).
+- **Different FACT** — "eligible/legally authorized for employment with Magna" (a WORK-AUTH question — a
+  clean-miss "No" would be wrong), termination manner, reference-contact consent, policy/handbook agreement.
+- **Inverted POLARITY** — "I certify that I am not a current employee of Magna" (the right answer for a
+  non-employee is YES; the polarity map would say No), "are you not / no longer employed". The REAL Magna
+  Q1 ("If you are not a former MAGNA employee, please select No.") is EXEMPTED by its same-sentence
+  select-instruction — the target question survives every guard (pinned).
+- **ASPIRATIONAL** — "Would you accept employment with Magna?", "able to begin employment immediately?"
+  (they're applying; a clean-miss "No" would be absurd).
+- **Cross-sentence contamination** — "Do you have a criminal record? Magna requires all employees to
+  disclose." The recognizer is now SENTENCE-SCOPED: one sentence must name the company, hold an employment
+  word within 3 tokens, AND ask about YOU (`EMPLOY_ASK_RE`); bails otherwise.
+- **Tense combination** — "current or former Magna employee?" now → "ever" (decidePreviousWorker), so a
+  former employee is never mis-answered by a current-only check.
+- **Overwrite guard (both widgets)** — a pre-existing DIFFERENT real value (a prior run / human answer) is
+  never silently overwritten: the grounded answer commits but is FORCE-flagged for review.
+- **Regex sharpening** — `\bable\s+to\b` (bare "able to" matched inside "applicABLE TO you" — Magna Q1
+  boilerplate says "applicable"); `\breferr` (matched inside "pReferred").
+
+Verified: extension suite green — 661 pass, 0 fail (+16 tests: the full adversarial battery, the two REAL
+Magna labels verbatim as survivors, dropdown parity incl. silent-No/verbose/Yes-review/prefill-kept/
+overwrite-forced-review, and the bare-vs-granular Yes option semantics). Live-confirmation on Magna pending.
