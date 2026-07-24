@@ -3595,7 +3595,40 @@ async function runCdpOnboard(tabId, opts) {
   // common case is fast and a missed first click recovers quickly instead of stalling the whole 20s.
   // Falls back to `timeoutMs` for every attempt when no ladder is given; `tries` derives from the
   // ladder length when a ladder is passed.
+  // Chrome's password-manager autofill dropdown renders OVER the focused credential field. It's BROWSER
+  // chrome (painted above the page), so cdpCoverCheck/elementFromPoint can't see it and a coordinate click
+  // on the Sign In / Create Account button below it silently MISSES (operator hit this live, 2026-07-23).
+  // The dropdown only shows while a credential field is FOCUSED — there's no DOM node to query — so the
+  // reliable proxy for "it's gone" is "no credential field is focused". Escape CLOSES the visible dropdown
+  // but KEEPS focus (so it can reappear); pressing TAB actually moves focus OFF the field (operator, 2026-
+  // 07-23), which is what truly dismisses it. We do both, then CONFIRM (poll) no email/password input is
+  // focused before clicking. Bounded; best-effort.
+  const credentialFieldFocused = () => cdpEval(() => {
+    const a = document.activeElement;
+    if (!a || a.tagName !== "INPUT") return false;
+    const t = (a.getAttribute("type") || "").toLowerCase();
+    const aid = (a.getAttribute("data-automation-id") || "").toLowerCase();
+    return t === "password" || t === "email" || /password|email/.test(aid);
+  });
+  const dismissPasswordManager = async () => {
+    const deadline = Date.now() + 1500;
+    do {
+      try { await cdpKeyTap(CDP_KEYS.escape); } catch (e) {} // close the visible dropdown
+      try { await cdpKeyTap(CDP_KEYS.tab); } catch (e) {}    // Escape keeps focus; Tab moves focus OFF the field to truly dismiss it
+      let focused = true;
+      try { focused = await credentialFieldFocused(); } catch (e) { focused = false; }
+      if (!focused) return true; // no credential field focused → the autofill dropdown is dismissed
+      await cdpDelay(150);
+    } while (Date.now() < deadline);
+    LOG("⚠ could not confirm Chrome's password-manager overlay is gone before clicking — proceeding anyway.");
+    return false;
+  };
+
   const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null }) => {
+    // Clear Chrome's password-manager autofill dropdown (it can cover the submit button and swallow the
+    // coordinate click) and CONFIRM it's gone before clicking. Both onboarding submits follow credential
+    // fields, so this is a no-op cost when nothing is focused.
+    await dismissPasswordManager();
     const ladder = (timeouts && timeouts.length) ? timeouts : null;
     const n = ladder ? ladder.length : tries;
     let st = null;
