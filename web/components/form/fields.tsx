@@ -867,7 +867,10 @@ export function DateField({
   const seg =
     "rounded-lg border border-hairline bg-cockpit px-2.5 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
   return (
-    <div className="group">
+    // min-w-0 lets the field shrink to its grid/flex cell instead of forcing overflow (grid/flex items
+    // default to min-width:auto). Without it, a month-day-year field's intrinsic width pushed adjacent
+    // fields to overlap and run off the page (the certifications Issued/Expiration row).
+    <div className="group min-w-0">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="date">{label}</FieldLabel>
       <div className="mt-1.5 flex gap-2">
         {granularity !== "year" && (
@@ -883,7 +886,7 @@ export function DateField({
               const n = Number(parts.month);
               if (!(n >= 1 && n <= 12)) set({ month: "" }); // invalid → clear
             }}
-            className={clsx(seg, "flex-1")}
+            className={clsx(seg, "min-w-0 flex-1")}
           />
         )}
         {granularity === "month-day-year" && (

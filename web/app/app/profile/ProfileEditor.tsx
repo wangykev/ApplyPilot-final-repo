@@ -354,7 +354,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           {profile.certifications.map((c, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.certifications.splice(i, 1); })}>
               <CandidateField label="Certification" bucketPath={i === 0 ? "certifications.0.certification" : undefined} value={c.certification} placeholder="Certification name" onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
-              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <TextField label="Number" bucketPath={i === 0 ? "certifications.0.certification_number" : undefined} value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
                 <DateField label="Issued date" granularity="month-day-year" bucketPath={i === 0 ? "certifications.0.issued_date" : undefined} value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
                 <DateField label="Expiration date" granularity="month-day-year" bucketPath={i === 0 ? "certifications.0.expiration_date" : undefined} value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
@@ -389,7 +389,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
                       </div>
-                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                         <TextField label="Specialty" value={s.specialty} onChange={(v) => update((p) => { p.certifications[i].specialties[j].specialty = v; })} />
                         <DateField label="Start date" granularity="month-day-year" value={s.start_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].start_date = v; })} />
                         <DateField label="End date" granularity="month-day-year" value={s.end_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].end_date = v; })} />
