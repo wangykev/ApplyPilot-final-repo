@@ -2194,9 +2194,17 @@ async function cdpSourceRowRect(label) {
   const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
   const want = norm(label);
   // The deepest LABEL node (promptOption); the drill handler is on its promptLeafNode ancestor.
-  const matchPO = () => Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
-    .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'))
-    .find((o) => { const t = norm(o.textContent), d = norm(o.getAttribute("data-automation-label")); return t === want || t.indexOf(want) === 0 || d === want; });
+  // EXACT match FIRST (textContent OR data-automation-label), then a textContent startsWith as a FALLBACK
+  // only when nothing matches exactly. Without exact-first, the startsWith made a request for "Other" land
+  // on "Others" ("others".indexOf("other")===0) — whichever came first in DOM order won, committing the
+  // wrong leaf (the live "How did you hear about us?" → chip "Others" ≠ "Other" bug). The startsWith stays
+  // as a fallback so a leaf whose textContent carries an extra suffix/whitespace its label omits still hits.
+  const matchPO = () => {
+    const opts = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+      .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'));
+    return opts.find((o) => { const t = norm(o.textContent), d = norm(o.getAttribute("data-automation-label")); return t === want || d === want; })
+        || opts.find((o) => norm(o.textContent).indexOf(want) === 0);
+  };
   const leafOf = (po) => (po && (po.closest('[data-automation-id="promptLeafNode"]') || po)) || null;
   const findScroller = () => {
     // From a DROPDOWN promptOption (identical to cdpScrapeSourceRows's curOpts), excluding selectedItemList —
