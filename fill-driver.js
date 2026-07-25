@@ -67,7 +67,12 @@ function commitOutcome(overwrite, commitKind, matchTier) {
     // that matches no candidate is an overwrite-stray (destructive — see CLAUDE/
     // dom-patterns; accepted).
     if (tier === "none") return { status: "needs_review", confidence: "none", flag: "overwrite-stray" };
-    return { status: "filled_review", confidence: tier === "exact" ? "high" : "low", flag: "overwrite-success" };
+    // An EXACT overwrite is a deterministic profile match — trust it like an exact EMPTY-field fill
+    // (filled, no review). Only a NON-exact overwrite (containment/fuzzy) is a GUESS that replaced a real
+    // value → keep that flagged. (Operator: a deterministic fill shouldn't nag for approval just because
+    // the field held a prior value — e.g. re-running over a leftover "Others" and committing exact "Other".)
+    if (tier === "exact") return { status: "filled", confidence: "high", flag: "overwrite-success" };
+    return { status: "filled_review", confidence: "low", flag: "overwrite-success" };
   }
   if (commitKind === "auto") {
     if (tier === "exact") return { status: "filled", confidence: "high", flag: "autocommit-exact" };
@@ -1358,10 +1363,30 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
     return { status: "needs_review", detail: "options did not render (skipped_no_option_match)", after: before };
   }
 
-  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  let enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   // DROPDOWN = select from a full list → NO containment (a substring match is a guess: "PA" must not
   // silently become "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate to review. (2026-07-16)
-  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
+  let m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
+  if (m.targetIndex === -1) {
+    // RENDER-RACE re-match (bounded): GATE-2 settles on 2 stable reads, which can PRECEDE a chunked list
+    // finishing its render — so a real option (e.g. "Male") may mount just AFTER GATE-2 exited, and a
+    // STATED value would then wrongly fall to the AI canonicalize ("the dropdown didn't wait to render").
+    // Keep polling the OPEN list; the instant it grows to include a candidate, re-match and commit
+    // deterministically. Bounded by openCeilingMs, and breaks early once the list goes stable again with
+    // still no match (genuinely not offered) — so a true no-match costs only a few extra reads.
+    let seenCount = enabledTexts.length, stableAtNoMatch = 0;
+    const raceDeadline = Date.now() + budgets.openCeilingMs;
+    while (m.targetIndex === -1 && Date.now() < raceDeadline) {
+      await delayRender(budgets.settleIntervalMs);
+      const s2 = await act.readDropdownState(loc);
+      if (!s2 || s2.ariaExpanded !== "true" || !s2.optionCount) break; // list closed/emptied → genuine handling below
+      const et2 = s2.options.filter((o) => !o.disabled).map((o) => o.text);
+      if (et2.length !== seenCount) { seenCount = et2.length; stableAtNoMatch = 0; } else { stableAtNoMatch++; }
+      const m2 = apMatch.matchCandidates(overwriteCandidates, et2, { containment: false });
+      if (m2.targetIndex !== -1) { state = s2; enabledTexts = et2; m = m2; break; } // late option mounted → deterministic match
+      if (stableAtNoMatch >= budgets.stableReads) break; // list settled and still no candidate → genuinely not offered
+    }
+  }
   if (m.targetIndex === -1) {
     // CLOSE-CONFIRMED before returning: the open list OVERLAPS the next field, so a lingering
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study

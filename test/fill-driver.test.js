@@ -2503,12 +2503,12 @@ test("countryPhoneCode pre-filled-correct → kept, chip never re-typed/cleared 
 // pre-fill now ACTUATES: search-while-populated, commit REPLACES, no-match keeps
 // the original. The behavior change is intentional and sanctioned by M27.)
 
-test("overwrite: mismatched pre-fill + matching candidate → filled_review / overwrite-success, original recorded, single chip (REPLACE)", async () => {
+test("overwrite: mismatched pre-fill + EXACT matching candidate → filled (deterministic, no review) / overwrite-success, original recorded, single chip (REPLACE)", async () => {
   const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } } });
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT overwrite is deterministic → no review (only a non-exact overwrite is filled_review)
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.confidence, "high");
   assert.strictEqual(rec.after, "United States of America (+1)");
@@ -2612,7 +2612,7 @@ test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available,
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering", "electrical engineering"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "Other", "the HIGHEST offered tier, NOT tier-2 'computer engineering'");
   assert.deepStrictEqual(rec.overwrite, { original: "electrical engineering", refilled: true });
@@ -2673,7 +2673,7 @@ test("M36.1 typeahead k===-1: a mismatched pre-fill walks the FULL list (down to
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "computer engineering", "Other"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "Other");
   assert.deepStrictEqual(rec.overwrite, { original: "Mechanical Engineering", refilled: true });
@@ -2764,8 +2764,11 @@ test("M27 commitOutcome table: (overwrite?, commitKind, matchTier) → (status, 
   assert.deepStrictEqual(commitOutcome(false, "directed", "exact-normalized"), { status: "filled", confidence: "high", flag: "directed-exact" });
   assert.deepStrictEqual(commitOutcome(false, "directed", "containment"), { status: "filled_review", confidence: "low", flag: "directed-containment" });
   assert.deepStrictEqual(commitOutcome(false, "directed", "fuzzy-90"), { status: "filled_review", confidence: "low", flag: "directed-fuzzy" });
-  // overwrite: flag is ALWAYS overwrite-success regardless of commitKind/tier; confidence tracks tier
-  assert.deepStrictEqual(commitOutcome(true, "auto", "exact-normalized"), { status: "filled_review", confidence: "high", flag: "overwrite-success" });
+  // overwrite: an EXACT overwrite is a deterministic profile match → FILLED (no review), like an exact
+  // empty-field fill; a NON-exact overwrite (containment/fuzzy) is a GUESS that replaced a real value →
+  // filled_review. The flag stays overwrite-* in EVERY case (the precedence invariant below).
+  assert.deepStrictEqual(commitOutcome(true, "auto", "exact-normalized"), { status: "filled", confidence: "high", flag: "overwrite-success" });
+  assert.deepStrictEqual(commitOutcome(true, "directed", "exact-normalized"), { status: "filled", confidence: "high", flag: "overwrite-success" });
   assert.deepStrictEqual(commitOutcome(true, "directed", "containment"), { status: "filled_review", confidence: "low", flag: "overwrite-success" });
   assert.deepStrictEqual(commitOutcome(true, "auto", "fuzzy-91"), { status: "filled_review", confidence: "low", flag: "overwrite-success" });
   assert.deepStrictEqual(commitOutcome(true, "directed", null), { status: "needs_review", confidence: "none", flag: "overwrite-stray" });
@@ -2978,10 +2981,10 @@ test("source: pre-filled chip matching a candidate → kept with ZERO actuation"
   assert.strictEqual(act.log.length, 0, "pre-filled-correct source must not be touched");
 });
 
-test("source overwrite: mismatched pre-fill + matching candidate → filled_review / overwrite-success (lockstep with typeahead)", async () => {
+test("source overwrite: mismatched pre-fill + EXACT matching candidate → filled (deterministic, no review) / overwrite-success (lockstep with typeahead)", async () => {
   const field = srcField({ chips: ["Family"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } });
   const { rec } = await runSource(field, ["LinkedIn"]);
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "LinkedIn");
   assert.deepStrictEqual(rec.overwrite, { original: "Family", refilled: true });
@@ -3007,7 +3010,7 @@ test("M36.1 source k>0: upgrades to the HIGHEST offered tier (lockstep)", async 
   // upgrade to tier-0 "LinkedIn" (the highest), STOP (tier-1 never tried).
   const field = srcField({ chips: ["Friend"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" }, Other: { autoCommit: "Other" } } });
   const { rec, act } = await runSource(field, ["LinkedIn", "Other", "Friend"]);
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "LinkedIn", "the HIGHEST offered tier, NOT tier-1 'Other'");
   assert.deepStrictEqual(rec.overwrite, { original: "Friend", refilled: true });
