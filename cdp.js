@@ -1393,6 +1393,12 @@ function cdpReadSessionState() {
     // Workday PLANNED-MAINTENANCE page ("Workday is currently unavailable") — a transient retry-later
     // state, NOT a dead session (recon 2026-06-27). isWorkdayMaintenance keys off this (+ title/bodyText).
     maintenancePresent: /workday is currently unavailable|performing (planned )?maintenance|scheduled maintenance|temporarily unavailable|check back later/i.test(bodyText),
+    // Workday's TRANSIENT "Something went wrong / please refresh" soft-error (apology + refresh cue).
+    // LOCKSTEP with lib.js isWorkdaySoftError — computed here (full bodyText in scope) because the walk
+    // only gets bodyTextSample SW-side; the walk reloads-and-retries the page when this is set.
+    softErrorPresent:
+      (/something went wrong|an? (unexpected )?error (has )?occurred|we('| ?a)?re sorry/i.test(bodyText)) &&
+      (/refresh (the|this) page|please refresh|try again/i.test(bodyText)),
     errorPageText: errMatch ? errMatch[0].replace(/\s+/g, " ").trim().slice(0, 200) : null,
     // M31: error-element detail for the validation-vs-VPS recon diff. Samples are now DECISION
     // INPUTS (the AI-4 tiers key off them via lib.js expandErrorSamples), not just diagnostics —
@@ -1435,6 +1441,11 @@ function cdpOnboardScan() {
     agreementCheckbox: present('[data-automation-id="agreementCheckbox"]'),
     applyFlowPage: present('[data-automation-id="applyFlowPage"]'),
     applyFlowReviewPage: present('[data-automation-id="applyFlowReviewPage"]'),
+    // "You've already applied for this job." — Workday shows a dedicated page (no form, no apply/auth
+    // chrome) when the signed-in candidate already submitted for this requisition. A clean terminal
+    // state, NOT an error (see isAlreadyApplied); the title can be a stale "Create Account", so the
+    // automation-id is the reliable signal.
+    alreadyAppliedPage: present('[data-automation-id="alreadyAppliedPage"]'),
     formField: formFields.length > 0
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
@@ -1712,8 +1723,21 @@ function cdpDropdownOptionRectByText(wrapperSel, text) {
   if (!el) return null;
   if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
   const r = el.getBoundingClientRect();
-  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
-           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
+  // READ-ONLY diagnostic (no behavior change — the caller still clicks (cx,cy) exactly as before): is the
+  // target option ACTUALLY at the click point? `hitTarget` false / `atPointText` != text ⇒ a still-settling
+  // /virtualizing list shifted the row or an overlay occludes it (a coordinate MIS-CLICK). `hitTarget` true
+  // but no commit ⇒ the click lands right but the list isn't INTERACTIVE yet (the 2026-07-06 root cause).
+  // `collisions` > 1 ⇒ the aria-controls id is shared by multiple elements (getElementById picked the wrong one).
+  let hitTarget = null, atPointText = null, collisions = null;
+  try {
+    const hit = document.elementFromPoint(cx, cy);
+    const ho = hit && hit.closest ? (hit.closest('[role="option"]') || hit) : hit;
+    hitTarget = !!(hit && (hit === el || el.contains(hit) || ho === el));
+    atPointText = ho ? (ho.textContent || "").trim().slice(0, 40) : null;
+    collisions = id ? document.querySelectorAll("#" + ((window.CSS && CSS.escape) ? CSS.escape(id) : id)).length : null;
+  } catch (e) {}
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx, cy, hitTarget, atPointText, collisions };
 }
 
 function cdpReadRadioState(wrapperSel) {
@@ -2183,9 +2207,17 @@ async function cdpSourceRowRect(label) {
   const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
   const want = norm(label);
   // The deepest LABEL node (promptOption); the drill handler is on its promptLeafNode ancestor.
-  const matchPO = () => Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
-    .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'))
-    .find((o) => { const t = norm(o.textContent), d = norm(o.getAttribute("data-automation-label")); return t === want || t.indexOf(want) === 0 || d === want; });
+  // EXACT match FIRST (textContent OR data-automation-label), then a textContent startsWith as a FALLBACK
+  // only when nothing matches exactly. Without exact-first, the startsWith made a request for "Other" land
+  // on "Others" ("others".indexOf("other")===0) — whichever came first in DOM order won, committing the
+  // wrong leaf (the live "How did you hear about us?" → chip "Others" ≠ "Other" bug). The startsWith stays
+  // as a fallback so a leaf whose textContent carries an extra suffix/whitespace its label omits still hits.
+  const matchPO = () => {
+    const opts = Array.from(document.querySelectorAll('[data-automation-id="promptOption"]'))
+      .filter((o) => isVisible(o) && !o.closest('[data-automation-id="selectedItemList"]'));
+    return opts.find((o) => { const t = norm(o.textContent), d = norm(o.getAttribute("data-automation-label")); return t === want || d === want; })
+        || opts.find((o) => norm(o.textContent).indexOf(want) === 0);
+  };
   const leafOf = (po) => (po && (po.closest('[data-automation-id="promptLeafNode"]') || po)) || null;
   const findScroller = () => {
     // From a DROPDOWN promptOption (identical to cdpScrapeSourceRows's curOpts), excluding selectedItemList —
@@ -2739,6 +2771,11 @@ function makeCdpActuation(llmConfig) {
     clickDropdownOptionByText: async (loc, text) => {
       const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
       if (!rect || rect.w <= 0) return false;
+      // READ-ONLY diagnostic for the intermittent dropdown first-commit stray: capture whether the click
+      // point actually holds the target option AT CLICK TIME. Compare across the first commit + the fallback
+      // re-commit to tell a MIS-CLICK (hitTarget=false / atPoint≠text) from an interactive-readiness no-commit
+      // (hitTarget=true, click lands right but the value doesn't take). collisions>1 = aria-controls id shared.
+      try { console.log(`[ApplyPilot][CDP-DD-COMMIT] "${text}" hitTarget=${rect.hitTarget} atPoint=${JSON.stringify(rect.atPointText)} collisions=${rect.collisions} rect=${rect.cx},${rect.cy}${rect.hitTarget === false ? " ⚠ OFF-TARGET" : ""}`); } catch (e) {}
       await cdpClickAt(rect.cx, rect.cy);
       return true;
     },

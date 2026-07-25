@@ -54,21 +54,33 @@ export async function POST(req: Request) {
     : "needs_review";
 
   const url = str(body.url);
+  const jobKey = str(body.job_key);
   const fields = {
     user_id: row.user_id,
     company: str(body.company),
     role: str(body.role),
     url,
+    job_key: jobKey,
     status,
     needs_review_count: typeof body.needs_review_count === "number" ? body.needs_review_count : 0,
     review_bundle_json: body.review_bundle ?? null,
     applied_at: typeof body.captured_at === "string" ? body.captured_at : null,
   };
 
-  // Dedupe by posting URL: re-running the same application updates its row rather
-  // than piling up duplicates. (No unique constraint on (user_id,url) — match by hand.)
+  // Dedupe by the stable job_key when present (a Workday application url changes every run — see
+  // canonicalJobUrl), else fall back to the raw url (older reports / non-run fills). Re-running the
+  // same job updates its row rather than piling up duplicates. (No unique constraint — match by hand.)
   let existing: { id: string } | null = null;
-  if (url) {
+  if (jobKey) {
+    const { data } = await admin
+      .from("applications")
+      .select("id")
+      .eq("user_id", row.user_id)
+      .eq("job_key", jobKey)
+      .maybeSingle();
+    existing = data ?? null;
+  }
+  if (!existing && url) {
     const { data } = await admin
       .from("applications")
       .select("id")

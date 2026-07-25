@@ -3,7 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile, emptyProfile, type Profile } from "@/lib/profile-schema";
 import { loadBuckets } from "../profile/actions";
-import { loadDismissed } from "./actions";
+import { loadDismissed, loadDeleted } from "./actions";
 import type { ReviewBundle } from "@/lib/review-summary";
 import { teachableCards, type TeachSource } from "@/lib/teach";
 import { TeachInbox } from "@/components/app/teach/TeachInbox";
@@ -42,8 +42,21 @@ async function loadSources(): Promise<{ apps: TeachSource[]; profile: Profile }>
 }
 
 export default async function TeachPage() {
-  const [{ apps, profile }, buckets, dismissed] = await Promise.all([loadSources(), loadBuckets(), loadDismissed()]);
-  const cards = teachableCards(apps, buckets, profile, dismissed);
+  const [{ apps, profile }, buckets, dismissed, deleted] = await Promise.all([
+    loadSources(),
+    loadBuckets(),
+    loadDismissed(),
+    loadDeleted(),
+  ]);
+  // Compute ALL teachable cards (no dismissed filter), then partition: the active queue (not skipped)
+  // vs. the SKIPPED ones, so the inbox can show a "Skipped (N)" section with a restore path back.
+  // DELETED keys are a subset of dismissed (still out of the active queue) that the user permanently
+  // discarded — hidden from the Skipped section too (Skipped = dismissed − deleted).
+  const allCards = teachableCards(apps, buckets, profile, []);
+  const dismissedSet = new Set(dismissed);
+  const deletedSet = new Set(deleted);
+  const cards = allCards.filter((c) => !dismissedSet.has(c.key));
+  const skippedCards = allCards.filter((c) => dismissedSet.has(c.key) && !deletedSet.has(c.key));
   return (
     <div className="space-y-8 pb-28">
       <PageHeader
@@ -51,7 +64,14 @@ export default async function TeachPage() {
         title="Teach"
         description="Questions the AI had to guess — that you approved on review. Add each to your saved answers so the next application fills it deterministically, with no review."
       />
-      <TeachInbox initialCards={cards} initialBuckets={buckets} initialDismissed={dismissed} profile={profile} />
+      <TeachInbox
+        initialCards={cards}
+        initialSkipped={skippedCards}
+        initialBuckets={buckets}
+        initialDismissed={dismissed}
+        initialDeleted={deleted}
+        profile={profile}
+      />
     </div>
   );
 }

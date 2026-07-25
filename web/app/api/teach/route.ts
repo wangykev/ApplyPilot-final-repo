@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile, emptyProfile } from "@/lib/profile-schema";
-import { coerceBuckets, STARTER_BUCKETS } from "@/lib/buckets";
+import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
 import { teachableCards, type TeachSource } from "@/lib/teach";
 import type { ReviewBundle } from "@/lib/review-summary";
 
@@ -39,8 +39,9 @@ export async function GET() {
       bundle: (a.review_bundle_json as ReviewBundle | null) ?? null,
     }));
     const profile = profRes.data?.profile_json ? coerceProfile(profRes.data.profile_json) : emptyProfile();
-    // Mirror loadBuckets: a NULL buckets_json means a not-yet-seeded user → the starter set (read-only here).
-    const buckets = profRes.data?.buckets_json != null ? coerceBuckets(profRes.data.buckets_json) : STARTER_BUCKETS;
+    // Mirror loadBuckets: NULL buckets_json → the starter set; otherwise the user's buckets + any newly
+    // shipped starter bindings they don't have yet (dedup by profile_path, non-destructive).
+    const buckets = ensureStarterBuckets(profRes.data?.buckets_json != null ? coerceBuckets(profRes.data.buckets_json) : STARTER_BUCKETS);
     const dismissed = Array.isArray(profRes.data?.teach_dismissed_json) ? (profRes.data!.teach_dismissed_json as string[]) : [];
     const cards = teachableCards(apps, buckets, profile, dismissed);
     return NextResponse.json({ ok: true, cards });

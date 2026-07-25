@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex } = require("../fill-driver.js");
+const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -97,7 +97,7 @@ function makeFakeAct(fields, opts) {
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     scanPage: async () => ({
-      url: "fake://page",
+      url: o.scanUrl || "fake://page", // o.scanUrl lets a test model a real tenant URL (the employment anchor's tenant fallback)
       repeatingFieldCount: 0,
       fields: fields.map((f) => ({
         wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType,
@@ -565,6 +565,9 @@ test('previous-worker radio is NEVER left "Yes" without a needs_review flag', as
     { name: "employer named in the question text", company: null, employers: ["US Bancorp Investments"], expect: { after: "Yes", status: "filled_review" } },
     { name: "partial overlap → No + review", company: "Magna", employers: ["Magna Steyr"], expect: { after: "No", status: "filled_review" } },
     { name: "clean miss → confident No, no review", company: "Magna", employers: ["Google"], expect: { after: "No", status: "filled" } },
+    // 2026-07-24 (operator "trust your list"): a clean miss with NO company anchor STILL fills a confident
+    // "No" from the complete (non-empty) list — the anchor only corroborates the Yes/overlap paths.
+    { name: "clean miss, NO company anchor → still confident No (trust the complete list)", company: null, employers: ["Google"], expect: { after: "No", status: "filled" } },
     { name: '["none"] sentinel → confident No', company: "Magna", employers: ["none"], expect: { after: "No", status: "filled" } },
     { name: "[] unfilled → blank + review", company: "Magna", employers: [], expect: { after: null, status: "needs_review" } },
     { name: "unconfigured → blank + review", company: "Magna", employers: undefined, expect: { after: null, status: "needs_review" } },
@@ -611,16 +614,384 @@ test("radio: no candidate matches the labels → needs_review with the options",
   assert.deepStrictEqual(rec.options, ["Yeah", "Nope"]);
 });
 
+// ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) — 2026-07-24 ──────────────
+// A yes/no screening question naming the company you're applying to ("former MAGNA employee?",
+// "currently employed with Magna?") fills from the profile's employment history: a clean "No" SILENTLY
+// (no LEGALLY-LOADED flag, no review — the whole point), a "Yes"/uncertain review-flagged, NEVER auto-
+// "Yes". Recognized by TEXT, anchored on jobContext.company; unrecognized/unevaluable → the AI/blank fallback.
+const { recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity } = require("../fill-driver.js");
+const empField = (label, options) => ({
+  wrapperSel: "[w-emp]", fieldName: "customScreeningQuestion", widgetType: "radio", isRequired: true, label,
+  options: options || [{ id: "y", labelText: "Yes", checked: false }, { id: "n", labelText: "No", checked: false }]
+});
+const pickFR = (d) => ({ fill: d.fill, review: d.review });
+
+test("employment recognizer: fires on the company named adjacent to an employment word (any tenant)", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former MAGNA employee?", "Magna"), { tense: "former", company: "Magna" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you currently employed with Magna?", "Magna"), { tense: "current", company: "Magna" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Have you ever worked for Magna?", "Magna"), { tense: "former", company: "Magna" });
+  assert.strictEqual(recognizeEmploymentQuestion("Are you employed by Bosch?", "Bosch").tense, "ever"); // generalizes — no per-tenant config
+});
+test("employment recognizer: no false positives on lookalikes", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Do you agree Magna may contact your former employers?", "Magna"), null, "company not adjacent to an employment claim about YOU");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you willing to work weekends at Magna?", "Magna"), null, "bare 'work', no for/at/with-employment phrase");
+  assert.strictEqual(recognizeEmploymentQuestion("Why do you want to work at Magna?", "Magna"), null, "aspirational 'want to work', not employment history");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you authorized to work in Canada?", "Magna"), null, "company not named");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former employee?", ""), null, "no application company → can't anchor");
+});
+test("employment recognizer: anchors on the BRAND token when the JD scrape yields a fuller name than the question", () => {
+  // The Magna questions say bare "MAGNA", but the JD scrape can produce the fuller corporate name
+  // ("Magna International") — the anchor must still fire on the brand token, not bail to the AI.
+  const Q1 = "If you are a former MAGNA employee, please select Yes and enter all the applicable information below. If you are not a former MAGNA employee, please select No.";
+  const Q2 = 'Are you currently employed with Magna? (If you are a current Magna employee, please use the "Jobs Hub" in Workday to apply for this role. If you are a current contingent/supplemental/contract worker, please select "No".)';
+  for (const co of ["Magna International", "Magna Powertrain", "Magna International Inc.", "Magna Careers"]) {
+    assert.strictEqual(recognizeEmploymentQuestion(Q1, co) && recognizeEmploymentQuestion(Q1, co).tense, "former", `Q1 must anchor for scraped company "${co}"`);
+    assert.strictEqual(recognizeEmploymentQuestion(Q2, co) && recognizeEmploymentQuestion(Q2, co).tense, "current", `Q2 must anchor for scraped company "${co}"`);
+  }
+  // A GENERIC head still requires the full sequence — the brand fallback can't false-anchor on "bank".
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former Bank employee?", "Bank of America"), null, "generic head 'bank' alone must not anchor");
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former Bank of America employee?", "Bank of America"), { tense: "former", company: "Bank of America" }, "full sequence still anchors");
+});
+test("employment question — multi-word scraped company (Magna International) still fills 'No' SILENTLY", async () => {
+  const [rec] = await run([empField("If you are a former MAGNA employee, please select Yes. If you are not a former MAGNA employee, please select No.")], { employment_history_companies: ["Google"] }, { company: "Magna International" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "a grounded No fills silently even when the scrape yielded the fuller corporate name");
+  assert.ok(!rec.flag, "no LEGALLY-LOADED flag");
+});
+test("decideCurrentlyEmployed: derived from the 'currently work here' flags (operator decision #2)", () => {
+  const p = (we, emp) => ({ work_experience: we, employment_history_companies: emp || ["Google"] });
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Google", currently_work_here: true }]))), { fill: "No", review: false }, "current job elsewhere → confident No");
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Magna Steyr", currently_work_here: true }], ["Magna Steyr"]))), { fill: "Yes", review: true }, "current Magna entry → Yes + review, never auto-Yes");
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", p([{ company: "Magna", currently_work_here: false }], ["Magna"]))), { fill: "No", review: true }, "in history but not current → No + review");
+  assert.deepStrictEqual(pickFR(decideCurrentlyEmployed("Magna", { work_experience: [], employment_history_companies: ["none"] })), { fill: "No", review: false }, '["none"] → never employed → No');
+  assert.strictEqual(decideCurrentlyEmployed("Magna", { employment_history_companies: [] }).fill, null, "[] unfilled → blank + review");
+});
+test("optionForPolarity: maps Yes/No to simple AND verbose option labels", () => {
+  assert.strictEqual(optionForPolarity(["Yes", "No"], "No"), "No");
+  assert.strictEqual(optionForPolarity(["Yes, I am currently employed with Magna", "No, I'm NOT currently employed with Magna"], "No"), "No, I'm NOT currently employed with Magna");
+  assert.strictEqual(optionForPolarity(["Nope", "Yeah"], "No"), null, "no leading-No option → ambiguous → null (never guess)");
+});
+test("employment question — clean 'No' fills SILENTLY (no flag, no review)", async () => {
+  const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "a grounded No fills silently — the whole point");
+  assert.ok(!rec.flag, "no LEGALLY-LOADED flag on a clean No");
+  assert.strictEqual(buildReviewBundle([rec], {}).entries[0].needs_review, false, "clean No must NOT go to review");
+});
+test("employment question — verbose options (Q2): 'currently employed' maps to the verbose No label", async () => {
+  const opts = [{ id: "y", labelText: "Yes, I am currently employed with Magna", checked: false }, { id: "n", labelText: "No, I'm NOT currently employed with Magna", checked: false }];
+  const [rec] = await run([empField("Are you currently employed with Magna?", opts)], { work_experience: [{ company: "Google", currently_work_here: true }], employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No, I'm NOT currently employed with Magna");
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!rec.flag);
+});
+test("employment question — 'Yes' (company in history) → filled_review + employer-match (never auto-Yes)", async () => {
+  const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+  const e = buildReviewBundle([rec], {}).entries[0];
+  assert.strictEqual(e.needs_review, true);
+  assert.strictEqual(e.needs_review_reason, "employer_match_uncertain", "renders as an employer match, NOT AI-inferred");
+  assert.strictEqual(e.confidence_source, "employer_match");
+});
+test("employment question — no company anchor AND a non-tenant URL → NOT recognized → not silently filled (falls to blank/AI)", async () => {
+  // run() uses the default fake scan url ("fake://page" → no tenant), so with jobContext.company empty
+  // there's NO anchor at all → the recognizer can't fire. (Contrast the URL-tenant test just below.)
+  const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Google"] }, {});
+  assert.notStrictEqual(rec.status, "filled", "no anchor (no company + non-tenant url) → not recognized → never a silent deterministic fill");
+});
+
+// ── Option 1 (2026-07-25): the employment anchor falls back to the page URL's tenant subdomain ──
+// so the recognizer + employer-match logic anchor RELIABLY off the URL (always present) instead of a
+// scraped jobContext.company that may be empty. The decision still comes from the profile employer list.
+const { tenantCompanyFromUrl } = require("../lib.js");
+test("tenantCompanyFromUrl: extracts the company brand from a Workday tenant URL (subdomain AND path)", () => {
+  // JD / careers host → the brand is the SUBDOMAIN
+  assert.strictEqual(tenantCompanyFromUrl("https://magna.wd3.myworkdayjobs.com/en-US/x"), "Magna");
+  assert.strictEqual(tenantCompanyFromUrl("https://comcast.wd5.myworkdayjobs.com/z"), "Comcast");
+  assert.strictEqual(tenantCompanyFromUrl("https://acme-corp.wd1.myworkdayjobs.com/a"), "Acme Corp");
+  // LOGGED-IN FORM host → NO subdomain; the brand is in the PATH (/recruiting/<tenant>/…). This is the
+  // load-bearing case — the fill actually runs here (the live Magna URL that made the anchor go missing).
+  assert.strictEqual(tenantCompanyFromUrl("https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton/Junior_R00244793/apply"), "Magna");
+  assert.strictEqual(tenantCompanyFromUrl("https://wd5.myworkdaysite.com/en-US/recruiting/comcast/Comcast_Careers/job/x"), "Comcast");
+  // non-Workday / junk
+  assert.strictEqual(tenantCompanyFromUrl("https://careers.google.com/j"), null, "non-Workday → null");
+  assert.strictEqual(tenantCompanyFromUrl(""), null);
+  assert.strictEqual(tenantCompanyFromUrl(null), null);
+});
+test("employment anchor via URL tenant: a custom 'former «co» employee?' with EMPTY jobContext.company is recognized + filled 'No' deterministically (no AI)", async () => {
+  // jobContext.company is empty ({}), but the page URL is a Magna tenant → the anchor falls back to
+  // "Magna" (from the URL), so the recognizer fires and fills a deterministic clean-miss "No" from the
+  // employer list — instead of the AI safety-reversal (LEGALLY-LOADED review). The LLM is never called.
+  const act = makeFakeAct([empField("Are you a former MAGNA employee?")],
+    { scanUrl: "https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton/Junior_R00244793/apply", aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "recognized via the URL tenant → deterministic No, no review");
+  assert.ok(!rec.flag, "no ai / LEGALLY-LOADED flag");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "LLM NOT called — the URL tenant anchor made it deterministic");
+});
+
+// ── ADVERSARIAL WORDINGS (2026-07-24) — each of these WOULD have produced a silent WRONG deterministic
+// answer if recognized; all must bail (→ the AI+review fallback: a flagged guess, never a silent wrong).
+test("employment recognizer BAILS: wrong SUBJECT (relatives / referral / spouse / know-anyone)", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Do you have any relatives or family members currently employed with Magna?", "Magna"), null, "asks about RELATIVES — answering from YOUR history is the wrong subject");
+  assert.strictEqual(recognizeEmploymentQuestion("Were you referred to this position by a current Magna employee?", "Magna"), null, "asks about the REFERRER's employment, not yours");
+  assert.strictEqual(recognizeEmploymentQuestion("Is your spouse currently employed by Magna?", "Magna"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Do you know anyone employed at Magna?", "Magna"), null);
+});
+test("employment recognizer BAILS: wrong OBJECT / broadened scope (competitor / any employer)", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Are you currently employed by a competitor of Magna?", "Magna"), null, "membership at a COMPETITOR, not at Magna");
+  assert.strictEqual(recognizeEmploymentQuestion("Have you ever been terminated by any employer, including Magna?", "Magna"), null, "scope is ANY employer — a clean-miss No could hide a real Yes elsewhere");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you currently employed by a supplier or vendor of Magna?", "Magna"), null);
+});
+test("employment recognizer BAILS: a different FACT than membership (work-auth / termination / reference / policy)", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Are you legally authorized for employment at Magna?", "Magna"), null, "a WORK-AUTHORIZATION question — a clean-miss No would be wrong");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you eligible for employment with Magna?", "Magna"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Were you ever terminated from employment with Magna?", "Magna"), null, "asks the MANNER employment ended, not membership");
+  assert.strictEqual(recognizeEmploymentQuestion("May we contact Magna, your former employer, for a reference?", "Magna"), null, "reference-contact consent — No would refuse the reference");
+  assert.strictEqual(recognizeEmploymentQuestion("Do you agree to comply with the Magna employee handbook?", "Magna"), null);
+});
+test("employment recognizer BAILS: inverted polarity — but the Magna conditional instruction still fires", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("I certify that I am not a current employee of Magna.", "Magna"), null, "inverted assertion — the right answer for a non-employee is YES, our polarity map would say No");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you not currently employed by Magna?", "Magna"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Are you no longer employed by Magna?", "Magna"), null);
+  // The REAL Magna Q1 contains "If you are not a former MAGNA employee, please select No." — that is a
+  // STANDARD-polarity instruction (the same-sentence "select" exempts it) → still recognized.
+  const q1 = "If you are a former MAGNA employee, please select Yes and enter all the applicable information below. If you are not a former MAGNA employee, please select No.";
+  assert.deepStrictEqual(recognizeEmploymentQuestion(q1, "Magna"), { tense: "former", company: "Magna" }, "the target question must survive every guard");
+});
+test("employment recognizer BAILS: aspirational / future / availability", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Would you accept employment with Magna?", "Magna"), null, "they're APPLYING — a clean-miss No would be absurd");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you interested in future employment with Magna?", "Magna"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Are you able to begin employment with Magna immediately?", "Magna"), null, "start-availability, not membership");
+});
+test("employment recognizer: sentence scoping kills cross-sentence contamination", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Do you have a criminal record? Magna requires all employees to disclose.", "Magna"), null, "the employment word sits near the company but the ASK is a criminal-record question");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you employed full-time? Magna offers flexible schedules.", "Magna"), null, "general employment-status ask; the company is boilerplate in another sentence");
+});
+test("employment recognizer: 'current or former' → tense 'ever' (a former employee is never mis-answered by a current-only check)", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a current or former Magna employee?", "Magna"), { tense: "ever", company: "Magna" });
+});
+test("employment recognizer: the REAL Magna Q2 (verbose parenthetical) still fires as 'current'", () => {
+  const q2 = 'Are you currently employed with Magna? (If you are a current Magna employee, please use the "Jobs Hub" in Workday to apply for this role. If you are a current contingent/supplemental/contract worker, please select "No".)';
+  assert.deepStrictEqual(recognizeEmploymentQuestion(q2, "Magna"), { tense: "current", company: "Magna" });
+});
+
+// ── ADVERSARIAL SAFETY SWEEP (2026-07-25) — a deterministic "No"/"Yes" must NEVER be silently WRONG;
+// surfacing for review is always the safe outcome. These pin the trickiest company + question wordings.
+test("employment recognizer: common-descriptor company brands need the FULL name (never a lone descriptor)", () => {
+  // A company whose FIRST token is a common English word ("General Motors", "Federal Signal", "American
+  // Express") must be NAMED IN FULL — else a role/status question ("a GENERAL employee or a manager?",
+  // "a FEDERAL employee?") would be misread as company membership → a WRONG silent "No".
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a general employee or a manager?", "General Motors"), null, "lone 'General' is a role word");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former General employee?", "General Motors"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a federal employee?", "Federal Signal"), null, "'federal employee' is a status, not this company");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you an American worker?", "American Express"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Are you generally employed elsewhere?", "General Motors"), null, "'generally' must not match the brand token 'general'");
+  // …but the FULL company name still anchors and fires:
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former General Motors employee?", "General Motors"), { tense: "former", company: "General Motors" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former Federal Signal employee?", "Federal Signal"), { tense: "former", company: "Federal Signal" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former American Express employee?", "American Express"), { tense: "former", company: "American Express" });
+});
+test("employment recognizer: 'payroll' counts as an employment word", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you currently on Magna's payroll?", "Magna"), { tense: "current", company: "Magna" });
+});
+test("employment recognizer: contractor/consultant/services broadening → NOT recognized (employment word >3 tokens from the company)", () => {
+  // The formal-employer list can't answer a contractor/consultant relationship, so these must surface for
+  // review, never a silent "No". Sentence scoping handles it: "employee" ends up far from "«co»".
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former employee, contractor, or consultant of Magna?", "Magna"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Have you ever provided contract or consulting services to Magna?", "Magna"), null, "'services' is not an employment word");
+});
+test("employment recognizer BAILS: more different-fact wordings (rehire eligibility / dismissal)", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Are you eligible to be rehired by Magna?", "Magna"), null, "rehire ELIGIBILITY, not membership");
+  assert.strictEqual(recognizeEmploymentQuestion("Were you dismissed for cause from Magna?", "Magna"), null);
+});
+test("employment recognizer: bare 'work' (not worked/working for/at/with) is not membership", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Do you currently work for a company that competes with Magna?", "Magna"), null, "bare 'work' + competitor scope");
+});
+test("employment decision: subsidiaries broadening → clean-miss 'No' (operator #3: trust your list, no ownership DB)", () => {
+  const p = { employment_history_companies: ["Rivian"], work_experience: [{ company: "Rivian", currently_work_here: true }] };
+  const q = "Have you been employed by Magna or any of its subsidiaries?";
+  const emp = recognizeEmploymentQuestion(q, "Magna");
+  assert.deepStrictEqual(emp, { tense: "ever", company: "Magna" });
+  assert.deepStrictEqual(pickFR(decideEmploymentStatus(emp.tense, "Magna", p, q)), { fill: "No", review: false });
+});
+
+// ── DROPDOWN parity (2026-07-24) — the same question rendered as a yes/no dropdown fills the same way.
+const empDropdown = (label, opts) => ({
+  wrapperSel: "[w-empdd]", fieldName: "customScreeningDd", widgetType: "dropdown", isRequired: true, label,
+  triggerText: "Select One",
+  options: opts || [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }]
+});
+test("employment DROPDOWN — clean No fills silently; the AI is never consulted even when enabled", async () => {
+  const act = makeFakeAct([empDropdown("Are you a former MAGNA employee?")], { aiEnabled: true, ai: '{"choice":"Yes","justification":"trap — must not be called","confidence":"High"}' });
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "a grounded No fills silently on a dropdown too");
+  assert.ok(!rec.flag, "no flag on a clean No");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "the employment check runs BEFORE the dropdown AI — no LLM call");
+  assert.strictEqual(buildReviewBundle([rec], {}).entries[0].needs_review, false);
+});
+test("employment DROPDOWN — verbose options map by polarity", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Yes, I am currently employed with Magna" }, { text: "No, I'm NOT currently employed with Magna" }];
+  const [rec] = await run([empDropdown("Are you currently employed with Magna?", opts)], { work_experience: [{ company: "Google", currently_work_here: true }], employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No, I'm NOT currently employed with Magna");
+  assert.strictEqual(rec.status, "filled");
+});
+test("employment DROPDOWN — Yes (company in history) → filled_review + employer-match, never silent", async () => {
+  const [rec] = await run([empDropdown("Are you a former MAGNA employee?")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+  assert.strictEqual(buildReviewBundle([rec], {}).entries[0].needs_review_reason, "employer_match_uncertain");
+});
+test("employment DROPDOWN — a DIFFERENT prefilled real value is never silently overwritten (forced review)", async () => {
+  const dd = empDropdown("Are you a former MAGNA employee?");
+  dd.triggerText = "Yes"; // a prior run / human left "Yes"
+  const [rec] = await run([dd], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No", "the grounded answer commits");
+  assert.strictEqual(rec.status, "filled_review", "an overwrite of a real value is ALWAYS review-flagged");
+  assert.match(rec.detail, /overwrote prefilled "Yes"/);
+});
+test("employment DROPDOWN — already holds the grounded answer → kept with ZERO value actuation", async () => {
+  const dd = empDropdown("Are you a former MAGNAemployee?".replace("MAGNAemployee", "MAGNA employee"));
+  dd.triggerText = "No";
+  const act = makeFakeAct([dd]);
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "no value actuation on an already-correct field");
+});
+test("employment RADIO — a DIFFERENT pre-selected option is never silently overwritten (forced review)", async () => {
+  const f = empField("Are you a former MAGNA employee?");
+  f.options = [{ id: "y", labelText: "Yes", checked: true }, { id: "n", labelText: "No", checked: false }]; // "Yes" pre-selected
+  const [rec] = await run([f], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled_review", "flipping a pre-selected answer is ALWAYS review-flagged");
+  assert.match(rec.detail, /overwrote the pre-selected "Yes"/);
+});
+test("employment — a bare exact 'Yes' option commits even beside a granular variant (review-flagged as every Yes is)", async () => {
+  const f = empField("Are you a former MAGNA employee?");
+  f.options = [{ id: "a", labelText: "Yes", checked: false }, { id: "b", labelText: "Yes, within the last 2 years", checked: false }, { id: "c", labelText: "No", checked: false }];
+  const [rec] = await run([f], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "Yes", "exact tier: the bare option is a valid polarity commit");
+  assert.strictEqual(rec.status, "filled_review", "every Yes is review-flagged — the human picks the granularity if needed");
+  assert.strictEqual(rec.flag, "employer-match");
+});
+test("employment — GENUINELY ambiguous options (no bare option, two Yes-leading) → falls to the flagged AI, never a wrong pick", async () => {
+  const f = empField("Are you a former MAGNA employee?");
+  f.options = [{ id: "a", labelText: "Yes, within the last 2 years", checked: false }, { id: "b", labelText: "Yes, more than 2 years ago", checked: false }, { id: "c", labelText: "No", checked: false }];
+  const act = makeFakeAct([f], { aiEnabled: true, ai: '{"choice":"Yes, within the last 2 years","justification":"worked there per history","confidence":"Medium"}' });
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Magna"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  // decision is "Yes" but NO exact option and TWO Yes-leading → optionForPolarity refuses → AI picks (flagged)
+  assert.strictEqual(rec.status, "filled_review");
+  assert.ok(rec.flag && rec.flag.indexOf("ai-") === 0, "the AI (flagged) handles granularity the polarity map can't disambiguate");
+});
+
+// ── ALL WIDGET TYPES (2026-07-24) — the same question renders as a checkbox assertion or a free-text box.
+test("employment recognizer: FIRST-PERSON checkbox assertion fires; the negated form bails", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("I am a former Magna employee.", "Magna"), { tense: "former", company: "Magna" });
+  assert.strictEqual(recognizeEmploymentQuestion("I am not a former Magna employee.", "Magna"), null, "negated first-person assertion → inverted polarity → bail");
+});
+const empCheckbox = (label, flags) => Object.assign({
+  wrapperSel: "[w-empcb]", fieldName: "customScreeningCb", widgetType: "checkbox", label,
+  inputId: "empcb-input", checked: false
+}, flags || {});
+test("employment REQUIRED checkbox — STILL auto-checked (required can't stay blank), but a grounded-No contradiction is review-flagged", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.", { isRequired: true })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true", "the box IS checked — the auto-consent rule holds");
+  assert.strictEqual(rec.status, "filled_review", "…but silently asserting what the profile contradicts is flagged");
+  assert.strictEqual(rec.flag, "employer-match");
+  assert.match(rec.detail, /grounded employment answer is "No"/);
+});
+test("employment REQUIRED checkbox — agreement (company IS a past employer) stays a silent auto-check", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.", { isRequired: true })], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true");
+  assert.strictEqual(rec.status, "filled", "the grounded answer agrees with the check — no flag needed");
+  assert.ok(!rec.flag);
+});
+test("ordinary REQUIRED consent checkbox — auto-check behavior byte-identical (no employment question → no flag)", async () => {
+  const [rec] = await run([empCheckbox("I agree to the terms and conditions and authorize a background check.", { isRequired: true })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true");
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!rec.flag, "consent auto-check unchanged — 'agree'/'authorize' bail the recognizer");
+});
+test("employment OPTIONAL checkbox — clean No leaves it unchecked SILENTLY (zero value actuation)", async () => {
+  const act = makeFakeAct([empCheckbox("I am a former Magna employee.")]);
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "false", "stays unchecked — the grounded No");
+  assert.ok(!rec.flag);
+  assert.ok(!act.log.some(([m]) => m === "clickCheckboxLabel"), "a virgin box already matches 'No' — no actuation");
+});
+test("employment OPTIONAL checkbox — Yes (company in history) → CHECKED + review, never silent", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "true");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+});
+test("employment OPTIONAL checkbox — a pre-TICKED box cleared by a grounded No is forced to review", async () => {
+  const [rec] = await run([empCheckbox("I am a former Magna employee.", { checked: true })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "false", "unchecked — the grounded No commits");
+  assert.strictEqual(rec.status, "filled_review", "clearing a pre-existing tick is ALWAYS review-flagged");
+  assert.match(rec.detail, /unchecked the pre-ticked box/);
+});
+const empText = (label, flags) => Object.assign({
+  wrapperSel: "[w-emptx]", fieldName: "customScreeningTx", widgetType: "text", isRequired: true, label, value: ""
+}, flags || {});
+test("employment TEXT — clean No types \"No\" silently; the AI is never consulted even when enabled", async () => {
+  const act = makeFakeAct([empText("Are you a former MAGNA employee?")], { aiEnabled: true, ai: '{"answer":"trap — must not be called"}' });
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, { company: "Magna" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled");
+  assert.ok(!rec.flag);
+  assert.ok(!act.log.some(([m]) => m === "llm"), "deterministic — no LLM call");
+});
+test("employment TEXT — Yes (company in history) → filled_review + employer-match", async () => {
+  const [rec] = await run([empText("Have you ever worked for Magna?")], { employment_history_companies: ["Magna"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "employer-match");
+});
+test("employment TEXT — a detail-REQUEST field ('enter your employee ID') is NOT answered with a bare No", async () => {
+  const [rec] = await run([empText("If you are a former MAGNA employee, please enter your employee ID below.")], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.notStrictEqual(rec.mappedPath, "(employment-status)", "detail-request → not a yes/no ask → left for AI-2/blank");
+  assert.notStrictEqual(rec.after, "No");
+});
+test("employment TEXT — a pre-existing DIFFERENT value is never silently overwritten", async () => {
+  const [rec] = await run([empText("Are you a former MAGNA employee?", { value: "Yes" })], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No", "the grounded answer commits");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.match(rec.detail, /overwrote "Yes"/);
+});
+test("employment TEXTAREA — clean No types \"No\" silently", async () => {
+  const f = empText("Are you currently employed with Magna?");
+  f.widgetType = "textarea";
+  const [rec] = await run([f], { work_experience: [{ company: "Google", currently_work_here: true }], employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled");
+});
+test("employment OPTIONAL radio — the deterministic tier runs for optional fields too (like buckets)", async () => {
+  const f = empField("Are you a former MAGNA employee?");
+  f.isRequired = false;
+  const [rec] = await run([f], { employment_history_companies: ["Google"] }, { company: "Magna" });
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "grounded + deterministic → fills optional fields too");
+});
+
 // ── AI required-radio fallback (aiFillRadio) — the deferred required-radio path ──────────────
 // A REQUIRED radio the deterministic pass can't answer would BLOCK Save & Continue → guess-to-reach-
 // review (never blind-trust): infer + commit + ALWAYS filled_review, flagged HARD. AI OFF / OPTIONAL → blank.
 const aiPwField = (flags) => pwField(Object.assign({ isRequired: true }, flags || {}));
 
 test("AI radio (prev-worker unevaluable): infers No → filled_review + ai-choice-sensitive (LOUD), committed, confidence carried", async () => {
-  // no company set + Magna not in employment history → decidePreviousWorker is UNEVALUABLE (blank);
-  // the required-radio AI fallback then infers "No" from the ABSENCE of Magna in the profile.
+  // employment_history_companies:[] (unfilled) → decidePreviousWorker is UNEVALUABLE (blank — an empty
+  // list can't confirm non-membership); the required-radio AI fallback then infers "No" from the absence.
+  // (A NON-empty list is now a deterministic clean-miss "No" even without a company — so [] is the genuine
+  // unevaluable input that still exercises the AI path.)
   const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"No","justification":"Magna not in employment history","confidence":"High"}' });
-  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(rec.status, "filled_review", "an AI guess is never silently filled");
   assert.strictEqual(rec.after, "No");
   assert.strictEqual(rec.flag, "ai-choice-sensitive", "prev-worker sits next to a truthfulness cert → always LOUD");
@@ -635,7 +1006,7 @@ test("AI radio (prev-worker unevaluable): infers No → filled_review + ai-choic
 
 test('AI radio: an inferred "Yes" is STILL filled_review, never plain filled (the truthfulness-cert invariant holds under AI)', async () => {
   const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"Yes","justification":"prior tenure suggested","confidence":"Low"}' });
-  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0]; // [] = genuinely unevaluable → AI path
   assert.strictEqual(rec.after, "Yes");
   assert.notStrictEqual(rec.status, "filled", "a Yes is never silently filled");
   assert.strictEqual(rec.status, "filled_review");
@@ -673,7 +1044,7 @@ test("AI radio: a demographic (EEO) required radio → re-tagged ai-eeo-guess (D
 
 test("AI radio: the AI's pick is not one of the labels → needs_review (ai-nomatch), no commit", async () => {
   const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"Maybe","justification":"unsure","confidence":"Low"}' });
-  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0]; // [] = unevaluable → AI path (a non-empty list now fills a deterministic "No")
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.flag, "ai-nomatch");
   assert.strictEqual(rec.after, null);
@@ -2210,12 +2581,12 @@ test("countryPhoneCode pre-filled-correct → kept, chip never re-typed/cleared 
 // pre-fill now ACTUATES: search-while-populated, commit REPLACES, no-match keeps
 // the original. The behavior change is intentional and sanctioned by M27.)
 
-test("overwrite: mismatched pre-fill + matching candidate → filled_review / overwrite-success, original recorded, single chip (REPLACE)", async () => {
+test("overwrite: mismatched pre-fill + EXACT matching candidate → filled (deterministic, no review) / overwrite-success, original recorded, single chip (REPLACE)", async () => {
   const field = taField({ chips: ["Canada (+1)"], filterMap: { "United States of America (+1)": { autoCommit: "United States of America (+1)" } } });
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["United States of America (+1)"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT overwrite is deterministic → no review (only a non-exact overwrite is filled_review)
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.confidence, "high");
   assert.strictEqual(rec.after, "United States of America (+1)");
@@ -2319,7 +2690,7 @@ test("M36.1 typeahead k>0: upgrades to the HIGHEST offered tier (best-available,
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Other", "computer engineering", "electrical engineering"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "Other", "the HIGHEST offered tier, NOT tier-2 'computer engineering'");
   assert.deepStrictEqual(rec.overwrite, { original: "electrical engineering", refilled: true });
@@ -2380,7 +2751,7 @@ test("M36.1 typeahead k===-1: a mismatched pre-fill walks the FULL list (down to
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "computer engineering", "Other"]), {}, {}, T_BUDGETS);
   const rec = out.results[0];
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "Other");
   assert.deepStrictEqual(rec.overwrite, { original: "Mechanical Engineering", refilled: true });
@@ -2471,8 +2842,11 @@ test("M27 commitOutcome table: (overwrite?, commitKind, matchTier) → (status, 
   assert.deepStrictEqual(commitOutcome(false, "directed", "exact-normalized"), { status: "filled", confidence: "high", flag: "directed-exact" });
   assert.deepStrictEqual(commitOutcome(false, "directed", "containment"), { status: "filled_review", confidence: "low", flag: "directed-containment" });
   assert.deepStrictEqual(commitOutcome(false, "directed", "fuzzy-90"), { status: "filled_review", confidence: "low", flag: "directed-fuzzy" });
-  // overwrite: flag is ALWAYS overwrite-success regardless of commitKind/tier; confidence tracks tier
-  assert.deepStrictEqual(commitOutcome(true, "auto", "exact-normalized"), { status: "filled_review", confidence: "high", flag: "overwrite-success" });
+  // overwrite: an EXACT overwrite is a deterministic profile match → FILLED (no review), like an exact
+  // empty-field fill; a NON-exact overwrite (containment/fuzzy) is a GUESS that replaced a real value →
+  // filled_review. The flag stays overwrite-* in EVERY case (the precedence invariant below).
+  assert.deepStrictEqual(commitOutcome(true, "auto", "exact-normalized"), { status: "filled", confidence: "high", flag: "overwrite-success" });
+  assert.deepStrictEqual(commitOutcome(true, "directed", "exact-normalized"), { status: "filled", confidence: "high", flag: "overwrite-success" });
   assert.deepStrictEqual(commitOutcome(true, "directed", "containment"), { status: "filled_review", confidence: "low", flag: "overwrite-success" });
   assert.deepStrictEqual(commitOutcome(true, "auto", "fuzzy-91"), { status: "filled_review", confidence: "low", flag: "overwrite-success" });
   assert.deepStrictEqual(commitOutcome(true, "directed", null), { status: "needs_review", confidence: "none", flag: "overwrite-stray" });
@@ -2685,10 +3059,10 @@ test("source: pre-filled chip matching a candidate → kept with ZERO actuation"
   assert.strictEqual(act.log.length, 0, "pre-filled-correct source must not be touched");
 });
 
-test("source overwrite: mismatched pre-fill + matching candidate → filled_review / overwrite-success (lockstep with typeahead)", async () => {
+test("source overwrite: mismatched pre-fill + EXACT matching candidate → filled (deterministic, no review) / overwrite-success (lockstep with typeahead)", async () => {
   const field = srcField({ chips: ["Family"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" } } });
   const { rec } = await runSource(field, ["LinkedIn"]);
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "LinkedIn");
   assert.deepStrictEqual(rec.overwrite, { original: "Family", refilled: true });
@@ -2714,7 +3088,7 @@ test("M36.1 source k>0: upgrades to the HIGHEST offered tier (lockstep)", async 
   // upgrade to tier-0 "LinkedIn" (the highest), STOP (tier-1 never tried).
   const field = srcField({ chips: ["Friend"], filterMap: { LinkedIn: { autoCommit: "LinkedIn" }, Other: { autoCommit: "Other" } } });
   const { rec, act } = await runSource(field, ["LinkedIn", "Other", "Friend"]);
-  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.status, "filled"); // EXACT-match overwrite → deterministic, no review
   assert.strictEqual(rec.flag, "overwrite-success");
   assert.strictEqual(rec.after, "LinkedIn", "the HIGHEST offered tier, NOT tier-1 'Other'");
   assert.deepStrictEqual(rec.overwrite, { original: "Friend", refilled: true });
@@ -5216,7 +5590,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, expandErrorSamples } = require("../lib.js");
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -5381,6 +5755,24 @@ test("AI-4 websiteDeletionPlan: a REAL duplicate URL (trailing-slash-insensitive
   const plan = websiteDeletionPlan(websiteEntriesFromResults(results));
   assert.strictEqual(plan.mode, "real");
   assert.deepStrictEqual(plan.deleteIndices, [2]);
+});
+
+test("canonicalJobUrl: posting (tenant-subdomain) + logged-in form (tenant-in-path, myworkdaysite) collapse to ONE key", () => {
+  // posting: tenant in the SUBDOMAIN (magna.wd3.myworkdayjobs.com); form after login: tenant only in
+  // the PATH (host is bare wd3.myworkdaysite.com) + a per-application-instance tail + query. The
+  // data-center token "wd3" is the only common host part → both must key to "wd3:r00244793".
+  const posting = "https://magna.wd3.myworkdayjobs.com/en-US/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply";
+  const form = "https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton%2C-Ontario%2C-CA/Junior-Full-Stack-Developer-Coop_R00244793/apply/applyManually?locale=en_US";
+  const key = "wd3:r00244793";
+  assert.strictEqual(canonicalJobUrl(posting), key, "posting (myworkdayjobs, tenant in subdomain)");
+  assert.strictEqual(canonicalJobUrl(form), key, "form (myworkdaysite, tenant in path, instance tail + query)");
+});
+test("canonicalJobUrl: different reqs differ; non-Workday falls back to origin+path (no query/apply)", () => {
+  const base = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Foo_R111/apply";
+  const other = "https://magna.wd3.myworkdayjobs.com/en-US/job/x/Bar_R222/apply";
+  assert.notStrictEqual(canonicalJobUrl(base), canonicalJobUrl(other));
+  assert.strictEqual(canonicalJobUrl("https://careers.example.com/jobs/123/apply?x=1"), "https://careers.example.com/jobs/123");
+  assert.strictEqual(canonicalJobUrl(""), "");
 });
 
 // ── Read-back self-heal (in-fill retry + M40 re-fill) ───────────────────────
@@ -6799,6 +7191,121 @@ test("bucket Mode A: reads the bound profile field", async () => {
   assert.equal(rec.flag, "bucket");
   assert.equal(field.value, "Ada");
   assert.match(rec.detail, /personal_info\.first_name/);
+});
+
+test("resolve: coercion matrix — a triBool answer is fillable as checkbox/radio/dropdown, Yes/No AND True/False labels", () => {
+  // The class of bug: a value PRESENT in the profile that resolve() turns into a candidate that can
+  // never match the live options → silent fall-through to AI. A boolean triBool must resolve to a tiered
+  // ["Yes","True"] / ["No","False"] list for BOTH dropdown and radio (checkbox has its own path), so the
+  // match ladder hits whether the options are labeled Yes/No or True/False.
+  for (const w of ["dropdown", "typeahead", "radio"]) {
+    assert.deepEqual(resolve(true, w).candidates, ["Yes", "True"], `${w}: true → Yes/True ladder`);
+    assert.deepEqual(resolve(false, w).candidates, ["No", "False"], `${w}: false → No/False ladder`);
+    assert.equal(resolve(null, w).skip, true, `${w}: null (unanswered) → skip, never guessed`);
+    assert.equal(resolve(undefined, w).skip, true, `${w}: undefined → skip`);
+  }
+  // A tiered candidate list passes through as the ladder for ALL choice widgets — including radio (the
+  // gap this closes: resolve(array,"radio") used to become String(array) → "a,b" → never matched).
+  for (const w of ["dropdown", "typeahead", "radio"]) {
+    assert.deepEqual(resolve(["Bachelor of Science", "Bachelors"], w).candidates, ["Bachelor of Science", "Bachelors"], `${w}: tiered array → ladder`);
+    assert.equal(resolve([], w).skip, true, `${w}: empty array → skip`);
+  }
+  // A plain string still passes through as a single candidate; empty string skips.
+  assert.deepEqual(resolve("Male", "dropdown").candidates, ["Male"]);
+  assert.equal(resolve("", "dropdown").skip, true);
+});
+
+test("boolLadderCandidates: a custom per-field yes/no ladder overrides the default; empty/absent → default", () => {
+  const profile = { answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: [] } } };
+  assert.deepEqual(boolLadderCandidates(profile, "screening.at_least_18_years_old", true), ["Yes", "True", "Affirmative"], "custom yes ladder used");
+  assert.deepEqual(boolLadderCandidates(profile, "screening.at_least_18_years_old", false), ["No", "False"], "empty no list → default");
+  assert.deepEqual(boolLadderCandidates(profile, "work_authorization.permanent_resident", true), ["Yes", "True"], "absent path → default");
+  assert.deepEqual(boolLadderCandidates({}, "x", false), ["No", "False"], "no answer_ladders map → default");
+  assert.deepEqual(boolLadderCandidates(null, "x", true), ["Yes", "True"], "null profile → default");
+  // blanks are filtered — an all-blank custom list falls back to the default
+  assert.deepEqual(boolLadderCandidates({ answer_ladders: { p: { yes: ["", "  "] } } }, "p", true), ["Yes", "True"], "all-blank custom → default");
+});
+
+test("appendFieldVariants: appends a scalar field's variants (answer_ladders[path].values) after the primary, deduped", () => {
+  const profile = { answer_ladders: { "self_identification.gender": { yes: [], no: [], values: ["Man", "M"] } } };
+  assert.deepEqual(appendFieldVariants(profile, "self_identification.gender", ["Male"]), ["Male", "Man", "M"]);
+  assert.deepEqual(appendFieldVariants(profile, "self_identification.gender", "Male"), ["Male", "Man", "M"], "scalar arg wrapped");
+  assert.deepEqual(appendFieldVariants({}, "x", ["A"]), ["A"], "no answer_ladders → unchanged");
+  assert.deepEqual(appendFieldVariants(null, "x", ["A"]), ["A"], "null profile → unchanged");
+  assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["male"] } } }, "p", ["Male"]), ["Male"], "dup (case-insensitive) dropped");
+  assert.deepEqual(appendFieldVariants({ answer_ladders: { p: { values: ["", "  "] } } }, "p", ["A"]), ["A"], "blanks dropped");
+});
+
+test("flat education: a Mode-A bucket bound to education.0.gpa fills a flat GPA field from education[0] (+ honors variants)", async () => {
+  // Many forms ask education as a single flat question. A Mode-A bucket bound to "education.0.gpa"
+  // resolves education[0].gpa via getByPath; on a range-dropdown the field's variant matches.
+  const field = { wrapperSel: "#gpa", fieldName: "gpaHashed", widgetType: "dropdown", label: "GPA range?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "3.5+" }, { text: "3.0-3.5" }] };
+  const bucket = { id: "edu_gpa", profile_path: "education.0.gpa", value: [], widget_hint: "text", questions: ["GPA range?"], selectors: {} };
+  const profile = { education: [{ gpa: "4.0/4.0" }], answer_ladders: { "education.0.gpa": { yes: [], no: [], values: ["3.5+"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "gpaHashed");
+  assert.equal(rec.flag, "bucket", "filled from the education.0.gpa bucket (education[0])");
+  assert.equal(rec.after, "3.5+", "primary '4.0/4.0' missed; the education.0.gpa variant matched the range option");
+});
+
+test("flat education: a Mode-A bucket bound to education.0.school_or_university types education[0] school on a text field", async () => {
+  const field = { wrapperSel: "#sch", fieldName: "schoolHashed", widgetType: "text", label: "School", value: "" };
+  const bucket = { id: "edu_school", profile_path: "education.0.school_or_university", value: [], widget_hint: "text", questions: ["School"], selectors: {} };
+  const profile = { education: [{ school_or_university: "Carnegie Mellon University" }] };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "schoolHashed");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(field.value, "Carnegie Mellon University", "flat school field filled from education[0]");
+});
+
+test("bucket + field variants: a flat scalar dropdown matches a VARIANT option (e.g. gender 'Man')", async () => {
+  // gender is "Male" in the profile; a tenant labels the option "Man". The editable per-field variant
+  // ["Man"] lets the dropdown match (tried after the primary "Male").
+  const field = { wrapperSel: "#g", fieldName: "genderHashed", widgetType: "dropdown", label: "Gender identity?",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Man" }, { text: "Woman" }] };
+  const bucket = { id: "g", profile_path: "self_identification.gender", value: [], widget_hint: "dropdown", questions: ["Gender identity?"], selectors: {} };
+  const profile = { self_identification: { gender: "Male" }, answer_ladders: { "self_identification.gender": { yes: [], no: [], values: ["Man"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "genderHashed");
+  assert.equal(rec.flag, "bucket");
+  assert.equal(rec.after, "Man", "primary 'Male' missed the options; the 'Man' variant matched");
+});
+
+test("bucket Mode A + custom answer_ladders: a yes/no dropdown fills the operator's custom label (Affirmative)", async () => {
+  // The full path: bucket Mode-A → boolean true → boolLadderCandidates(custom) → the ladder matches a
+  // tenant that labels the option "Affirmative" instead of Yes/True.
+  const field = { wrapperSel: "#aff", fieldName: "hashedAff", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Affirmative" }, { text: "Negative" }] };
+  const bucket = { id: "over_18", profile_path: "screening.at_least_18_years_old", value: [], widget_hint: "radio", questions: ["Are you over the age of 18?"], selectors: {} };
+  const profile = { screening: { at_least_18_years_old: true }, answer_ladders: { "screening.at_least_18_years_old": { yes: ["Yes", "True", "Affirmative"], no: ["No", "False"] } } };
+  const out = await drivePageFill(makeFakeAct([field]), profile, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "hashedAff");
+  assert.equal(rec.flag, "bucket", "filled deterministically from the bucket + custom ladder");
+  assert.equal(rec.after, "Affirmative", "the custom candidate matched the tenant's 'Affirmative' option");
+});
+
+test("bucket Mode A: a Yes/No triBool fills a DROPDOWN (boolean → Yes), not just radio — the over-18 legally-loaded bug", async () => {
+  // screening.at_least_18_years_old is a triBool (boolean). On tenants that render the question as a
+  // DROPDOWN, resolve() used to String(true) → "true", which never matched the "Yes" option, so the
+  // bucket produced nothing and the field fell to the AI (flag ai-choice-sensitive, "LEGALLY-LOADED —
+  // VERIFY") on EVERY fill even though the profile answers it. resolve() now coerces boolean → Yes/No
+  // for dropdowns too, so the bucket fills it deterministically (flag "bucket", no review, no AI).
+  const field = { wrapperSel: "#a18", fieldName: "hashed18", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  const bucket = { id: "over_18", profile_path: "screening.at_least_18_years_old", value: [], widget_hint: "radio", questions: ["Are you over the age of 18?"], selectors: {} };
+  const act = makeFakeAct([field], { aiEnabled: true, ai: '{"choice":"No","justification":"x","confidence":"Low"}' }); // AI (if reached) would say No
+  const out = await drivePageFill(act, { screening: { at_least_18_years_old: true } }, {}, {}, T_BUDGETS, { buckets: [bucket] });
+  const rec = out.results.find((r) => r.fieldName === "hashed18");
+  assert.equal(rec.flag, "bucket", "the triBool bucket filled the dropdown deterministically");
+  assert.equal(rec.after, "Yes", "boolean true → Yes matched the live option");
+  assert.ok(!act.log.some((e) => e[0] === "llm"), "the AI pass never ran — no legally-loaded guess");
+  // and the false → No direction
+  const field2 = { wrapperSel: "#a18b", fieldName: "hashed18b", widgetType: "dropdown", label: "Are you over the age of 18?*",
+    triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] };
+  const out2 = await drivePageFill(makeFakeAct([field2]), { screening: { at_least_18_years_old: false } }, {}, {}, T_BUDGETS, { buckets: [{ ...bucket }] });
+  const rec2 = out2.results.find((r) => r.fieldName === "hashed18b");
+  assert.equal(rec2.after, "No", "boolean false → No");
 });
 
 test("bucket Mode A: an EMPTY bound profile value produces nothing (falls through, never blind-fills)", async () => {

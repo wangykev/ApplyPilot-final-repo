@@ -2269,3 +2269,24 @@ scraper had to learn from tracing it:
 Approach that fell out: pass the bundle's claimed values as HINTS, value-anchor each onto the page, and
 reconcile by presence (distinctive values) + label-anchoring (short values / checkboxes). See
 `cdpReadReviewPage` / `reconcileReviewPage` and progress-log 2026-07-07.
+
+## 2026-07-22 — logged-in host is `wdN.myworkdaysite.com` (tenant in the PATH, not the subdomain)
+
+Observed driving the website Run end-to-end on Magna wd3. Two facts that shaped the tracker dedup + the JD scrape:
+
+- **Two hosts, one job.** The public POSTING the operator pastes is `<tenant>.wdN.myworkdayjobs.com` (tenant
+  in the SUBDOMAIN). After Apply + login, the application FORM is on **`wdN.myworkdaysite.com`** — the tenant
+  is now only in the PATH (`/en-US/recruiting/<tenant>/<Display>/job/…`), NOT the subdomain — and the path
+  carries a per-application-instance segment that CHANGES every run. So the full url is NOT a stable per-job
+  key. The one token common to both hosts is the **data-center** (`wd3`/`wd5`/…); combined with the
+  **requisition id** (`…_R00244793`, present in both paths) it gives a stable key `"<datacenter>:r<reqid>"`
+  (`canonicalJobUrl`). Keying on the tenant subdomain splits the posting from the form (the myworkdaysite
+  host has no tenant subdomain) — a real bug that produced two tracker rows per job.
+- **`chrome.scripting.executeScript` is host-permission-gated.** The CDP walk works on myworkdaysite because
+  `chrome.debugger` is NOT host-gated, but the JD scrape (executeScript) threw "Cannot access contents of the
+  page" until `*://*.myworkdaysite.com/*` was added to `host_permissions`. Company/title can be read from the
+  URL even structurally: title from the `…/<slug>_R<reqid>/…` slug, company from the `/…/<Display>/job/` path
+  segment (the tenant subdomain works only on the myworkdayjobs posting host).
+- **The "Something went wrong / please refresh" soft-error can appear right after login**, mid-Run — the fill
+  walk now detects it (`cdpReadSessionState.softErrorPresent`) and reloads + restarts from page 1 (a refresh
+  restarts the Workday application), same as onboarding's `maybeRefresh`. See progress-log 2026-07-22.

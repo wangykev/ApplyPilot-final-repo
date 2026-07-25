@@ -30,7 +30,8 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio, normalizeLabel: normalizeLabel,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
-      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders };
+      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
+      tenantCompanyFromUrl: tenantCompanyFromUrl };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -67,7 +68,12 @@ function commitOutcome(overwrite, commitKind, matchTier) {
     // that matches no candidate is an overwrite-stray (destructive — see CLAUDE/
     // dom-patterns; accepted).
     if (tier === "none") return { status: "needs_review", confidence: "none", flag: "overwrite-stray" };
-    return { status: "filled_review", confidence: tier === "exact" ? "high" : "low", flag: "overwrite-success" };
+    // An EXACT overwrite is a deterministic profile match — trust it like an exact EMPTY-field fill
+    // (filled, no review). Only a NON-exact overwrite (containment/fuzzy) is a GUESS that replaced a real
+    // value → keep that flagged. (Operator: a deterministic fill shouldn't nag for approval just because
+    // the field held a prior value — e.g. re-running over a leftover "Others" and committing exact "Other".)
+    if (tier === "exact") return { status: "filled", confidence: "high", flag: "overwrite-success" };
+    return { status: "filled_review", confidence: "low", flag: "overwrite-success" };
   }
   if (commitKind === "auto") {
     if (tier === "exact") return { status: "filled", confidence: "high", flag: "autocommit-exact" };
@@ -397,17 +403,63 @@ const resolve = (raw, widgetType) => {
       const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
       return candidates.length ? { candidates } : { skip: true };
     }
+    // A Yes/No triBool (screening.at_least_18_years_old, authorized_to_work_in_us, …) can render as a
+    // DROPDOWN on some tenants — coerce boolean → a tiered ["Yes","True"] / ["No","False"] candidate list
+    // (the ladder matches whether the options are labeled Yes/No OR True/False). Without this,
+    // String(true) → "true" never matched the "Yes" option, so a bucket bound to the triBool produced
+    // nothing and the field fell to the AI — the over-18 "LEGALLY-LOADED — VERIFY" every-fill bug (radio
+    // worked, dropdown didn't). Mirrors teach's fieldHoldsAnswer boolean map (keep in lockstep).
+    if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
   if (widgetType === "radio") {
+    // A tiered candidate list (e.g. a degree/field_of_study rendered as radio on some tenant) must pass
+    // through as the ladder — same as dropdown/typeahead. Without this, String(array) → "a,b" never
+    // matches an option → the field falls to the AI (the triBool-dropdown bug's radio twin).
+    if (Array.isArray(raw)) {
+      const candidates = raw.map((v) => String(v)).filter((s) => s.trim() !== "");
+      return candidates.length ? { candidates } : { skip: true };
+    }
     if (raw === null || raw === undefined) return { skip: true };
-    if (typeof raw === "boolean") return { candidates: [raw ? "Yes" : "No"] };
+    if (typeof raw === "boolean") return { candidates: raw ? ["Yes", "True"] : ["No", "False"] };
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
   return { skip: true, reason: `unsupported widget type "${widgetType}"` };
 };
+
+// The candidate ladder for a boolean (yes/no) answer at `path`: the operator's editable per-field ladder
+// (profile.answer_ladders[path].yes|no, set on the website) when non-empty, else the default
+// ["Yes","True"] / ["No","False"]. Used for dropdown/radio/typeahead (a CHECKBOX uses the boolean
+// directly). resolve() has no field path, so callers that know the path (the mapped dispatch + a Mode-A
+// bucket) apply this after resolve. Empty/absent map → the same default resolve() already produces.
+function boolLadderCandidates(profile, path, boolVal) {
+  const key = boolVal ? "yes" : "no";
+  const map = profile && typeof profile.answer_ladders === "object" ? profile.answer_ladders : null;
+  const entry = map && path ? map[path] : null;
+  const custom = entry && Array.isArray(entry[key]) ? entry[key].map((c) => String(c)).filter((s) => s.trim() !== "") : null;
+  if (custom && custom.length) return custom;
+  return boolVal ? ["Yes", "True"] : ["No", "False"];
+}
+
+// Append the operator's editable per-field VARIANTS (profile.answer_ladders[path].values, set on the
+// website) to a scalar field's candidate list, so a field rendered as a dropdown/radio/typeahead can match
+// a tenant's alternate wording (e.g. gpa → "3.5+", gender → "Man"). Primary candidate(s) first, then the
+// variants; deduped case-insensitively. A text box types the field's own value (not reached here — its arg
+// is the value, not a candidate list). Empty/absent variants → `cands` unchanged.
+function appendFieldVariants(profile, path, cands) {
+  const base = Array.isArray(cands) ? cands.slice() : cands != null ? [String(cands)] : [];
+  const map = profile && typeof profile.answer_ladders === "object" ? profile.answer_ladders : null;
+  const entry = map && path ? map[path] : null;
+  const extra = entry && Array.isArray(entry.values) ? entry.values : [];
+  const seen = new Set(base.map((c) => String(c).trim().toLowerCase()));
+  for (const v of extra) {
+    const s = String(v).trim();
+    if (s && !seen.has(s.toLowerCase())) { base.push(s); seen.add(s.toLowerCase()); }
+  }
+  return base;
+}
 
 // ── "Previously employed here?" — company matcher (verbatim M12/M13.3 port).
 // "Yes" is NEVER asserted without a review flag (it sits beside a truthfulness
@@ -417,7 +469,12 @@ const companyTight = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 const companyTokens = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/)
     .filter((t) => t.length >= 2 && !COMPANY_STOP.has(t));
-const GENERIC_SINGLE = new Set(["bank","tech","global","systems","solutions","services","capital","financial","national","health","media","digital","consulting","ventures","labs","online","store","center"]);
+// Words that are as often a common ENGLISH word as a company brand — a company whose FIRST token is one of
+// these ("General Motors", "American Express", "United Airlines", "Federal ...") must be NAMED IN FULL in
+// the question; the lone token can't brand-anchor, so a role/status question ("are you a GENERAL employee
+// or a manager?", "are you a FEDERAL employee?") is never misread as a company-membership question. (2026-07-25.)
+const GENERIC_SINGLE = new Set(["bank","tech","global","systems","solutions","services","capital","financial","national","health","media","digital","consulting","ventures","labs","online","store","center",
+  "general","federal","american","united","international","standard","central","premier","continental","associated","allied","republic","mutual","liberty","eastern","western","northern","southern","pacific","atlantic","industries","enterprises","worldwide","universal"]);
 const containsSeq = (hay, needle) => {
   if (!needle.length) return false;
   for (let i = 0; i + needle.length <= hay.length; i++) {
@@ -468,10 +525,176 @@ const decidePreviousWorker = (company, questionText, employers) => {
   if (overlapHits.length) {
     return { fill: "No", review: true, detail: `company "${co}" partially overlaps known employer(s): ${overlapHits.join(", ")} → filled "No"; REVIEW (could be the same employer)` };
   }
-  if (tightC) {
-    return { fill: "No", review: false, detail: `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))` };
+  // Clean miss → confident "No". A COMPLETE (non-empty) employer list is what makes non-membership safe
+  // (operator 2026-07-24: "trust your list"), so the "No" no longer REQUIRES jobContext.company — the
+  // company anchor only corroborates the "Yes"/overlap paths above. Without it we STILL fill "No" (your
+  // complete list names no company the question asks about); the missing corroboration is noted in the
+  // detail, NOT a review flag. (An EMPTY/unconfigured list already returned null above → stays blank+review.)
+  return { fill: "No", review: false, detail: tightC
+    ? `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))`
+    : `no known employer appears in the question → No (clean miss vs ${employers.length} known employer(s); no application company set to corroborate)` };
+};
+
+// ── Employment-status-at-the-application-company recognizer (DETERMINISTIC, no AI) ──────────────
+// A yes/no screening question like "Are you a former MAGNA employee?" or "Are you currently employed
+// with Magna?" is answerable from the profile's employment history — it should fill DETERMINISTICALLY
+// (a grounded "No" from your complete employer list → NO "LEGALLY-LOADED" flag, no review), NOT fall to
+// the AI guess (which reasons from ABSENCE and is force-flagged). Anchored on jobContext.company (the
+// company you're applying to, from the JD scrape), so it generalizes across tenants with NO per-tenant
+// config. The company must be NAMED in the question, ADJACENT to an employment word — so "Do you agree
+// Magna may contact your former employers?" (company not adjacent to an employment claim about YOU) and
+// "Are you willing to work weekends at Magna?" ("work" not a for/at/with-employment phrase) do NOT trip
+// it. Operator decisions 2026-07-24: (#1) a NON-EMPTY employer list is treated as COMPLETE; (#2) current
+// employment is derived from the work-history "I currently work here" flags; (#3) a clean miss is always
+// "No" even when the question broadens to affiliates/subsidiaries (we trust your list — there is no
+// company-ownership database). NEVER auto-"Yes" (truthfulness-adjacent + unfurls follow-ups → review).
+const EMPLOY_TERM_RE = /^(employ|payroll)/; // "employee"/"employed"/"employment"/"employer"/"payroll"
+const seqStart = (hay, needle) => {
+  if (!needle.length) return -1;
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) { ok = false; break; }
+    if (ok) return i;
   }
-  return { fill: null, review: true, detail: "no company set for this application and no known employer named in the question — left blank" };
+  return -1;
+};
+// BAIL patterns — any hit ⇒ NOT a membership question about YOU at THIS company ⇒ return null (falls to
+// the AI+review fallback: a flagged guess, never a silent wrong deterministic answer — the safe direction).
+// Grouped by failure mode, each one an adversarial wording that WOULD have produced a wrong answer:
+//   wrong SUBJECT — "Do you have any relatives currently employed with Magna?" / "Were you referred by a
+//     current Magna employee?" (the question is about someone ELSE; answering from YOUR history is wrong);
+//   wrong OBJECT / broadened scope — "employed by a competitor/supplier of Magna?", "terminated by any
+//     employer, including Magna?" (the membership being asked isn't at the application company);
+//   different FACT — authorization/eligibility ("eligible for employment with Magna" is a WORK-AUTH
+//     question), termination manner, reference-contact consent, policy/handbook agreement;
+//   inverted POLARITY — "I certify that I am not a current employee of Magna" (the right answer for a
+//     non-employee is YES; our polarity map would say No). NOTE the Magna conditional instruction "If you
+//     are not a former MAGNA employee, please select No" is STANDARD polarity — the "you are not" pattern
+//     is exempted when the same sentence tells you what to select;
+//   ASPIRATIONAL / future — "Would you accept employment with Magna?" (they're applying; the clean-miss
+//     "No" would be absurd).
+const EMPLOY_BAIL_RE = new RegExp([
+  // wrong SUBJECT (someone other than the applicant)
+  "relative", "family", "spouse", "domestic partner", "\\bpartners?\\b", "sibling", "\\bparents?\\b", "child(?:ren)?\\b", "\\bson\\b", "daughter", "friend", "anyone", "someone", "somebody", "acquaintance", "household", "\\bknow\\b", "\\breferr",
+  // wrong OBJECT / broadened scope (not the application company itself)
+  "competitor", "vendor", "supplier", "\\bclients?\\b", "customer", "any\\s+(?:other\\s+)?(?:employer|company|organi[sz]ation)", "another\\s+(?:employer|company)", "other\\s+(?:employers|companies)",
+  // a different FACT than membership (work-auth / termination manner / references / consent / restrictions)
+  "authoriz", "eligib", "legally", "lawfully", "\\bvisa\\b", "sponsor", "permit", "terminat", "\\bfired\\b", "dismiss", "resign", "laid\\s+off", "let\\s+go", "contact", "reference", "\\bagree\\b", "consent", "acknowledge", "comply", "abide", "policy", "handbook", "non-?compete", "conflict\\s+of\\s+interest",
+  // inverted POLARITY (negated first-person assertion / certification; bare "are you not" without a
+  // select-instruction) — the conditional "if you are not …, please select No" form stays recognized
+  "\\bnever\\b", "no\\s+longer", "i\\s+(?:am|was|have\\s+been)\\s+(?:not|no)\\b", "(?:certify|confirm|attest|declare)[^.?!;]*\\bnot\\b", "\\b(?:are\\s+you\\s+not|you\\s+are\\s+not)\\b(?![^.?!;]*\\b(?:select|choose|answer|mark|check|indicate|enter)\\b)",
+  // ASPIRATIONAL / future / availability
+  "would\\s+you", "willing", "consider", "interested", "in\\s+the\\s+future", "want\\s+to", "plan\\s+to", "\\baccept\\b", "availab", "\\bable\\s+to\\b" // \b — "applicABLE TO you" must not bail (Magna Q1 boilerplate says "applicable")
+].join("|"), "i");
+// The ASK must be about YOUR employment, in the SAME sentence as the company: a second-person employment
+// clause ("are/were/have/do/if you … employee/employed/worked"), a FIRST-person assertion ("I am/was a
+// «co» employee" — the CHECKBOX rendering; the negated "I am not…" form is bailed above), a terse
+// "Former «co» employee?" opener, or "your former/current employer".
+const EMPLOY_ASK_RE = /\b(?:are|were|have|has|do|does|did|is|was|if)\s+you\b[\s\S]{0,80}?\b(?:employ\w*|payroll|work(?:ed|ing))\b|\bi\s+(?:am|was|have\s+been|used\s+to\s+be)\b[\s\S]{0,60}?\b(?:employ\w*|payroll|work(?:ed|ing))\b|^[\s"'(]*(?:a\s+)?(?:current|former|previous)(?:ly)?\b[\s\S]{0,50}?\b(?:employee|employed)\b|\byour\s+(?:current|former|previous|prior|past)\s+employer\b/i;
+const recognizeEmploymentQuestion = (label, company) => {
+  const co = (company || "").trim();
+  if (!co) return null;
+  const coTokens = companyTokens(co);
+  if (!coTokens.length || !distinctiveForQuestion(coTokens)) return null; // a generic 1-word company can't safely anchor
+  const text = String(label || "");
+  if (EMPLOY_BAIL_RE.test(text)) return null; // any adversarial pattern → not ours; AI+review handles it
+  // SENTENCE-SCOPED match: ONE sentence must (a) name the application company, (b) hold an employment
+  // word within 3 tokens of it (or the tight "worked/working for/at/with «co»" phrasing — bare "work"
+  // is deliberately excluded: "willing to work weekends at Magna" isn't membership), and (c) ask about
+  // YOU (EMPLOY_ASK_RE). Sentence scoping kills cross-sentence contamination ("Do you have a criminal
+  // record? Magna requires all employees to disclose." — the employment word sits near the company but
+  // the ASK is a different sentence).
+  const coFirst = coTokens[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const workForRe = new RegExp("\\bwork(?:ed|ing)\\s+(?:for|at|with)\\s+(?:the\\s+)?" + coFirst + "\\b", "i");
+  const WINDOW = 3;
+  let hit = false;
+  for (const s of text.split(/[.?!;]+/)) {
+    const sTokens = companyTokens(s);
+    // Anchor where the sentence NAMES the company. Prefer the full token sequence (most
+    // precise). But the JD scrape can yield a fuller corporate name than the question asks
+    // — "Magna International" / "Magna Powertrain" scraped vs a bare "MAGNA" in the question
+    // — so if the full sequence isn't present, fall back to the company's distinctive BRAND
+    // token (coTokens[0], when it's ≥5 chars and not a generic descriptor — the SAME brand
+    // token the "worked for «co»" phrase keys on). A generic head ("Bank of America" → "bank")
+    // still requires the full sequence, so this can't false-anchor on a common word.
+    let coStart = seqStart(sTokens, coTokens);
+    let coSpan = coTokens.length;
+    if (coStart === -1 && coTokens[0].length >= 5 && !GENERIC_SINGLE.has(coTokens[0])) {
+      coStart = sTokens.indexOf(coTokens[0]);
+      coSpan = 1;
+    }
+    if (coStart === -1) continue; // this sentence doesn't name the company
+    const coEnd = coStart + coSpan - 1;
+    let empNear = false;
+    for (let i = Math.max(0, coStart - WINDOW); i <= Math.min(sTokens.length - 1, coEnd + WINDOW); i++) {
+      if (EMPLOY_TERM_RE.test(sTokens[i])) { empNear = true; break; }
+    }
+    if (!empNear && !workForRe.test(s)) continue;
+    if (!EMPLOY_ASK_RE.test(s)) continue; // employment near the company but not an ask about YOU
+    hit = true; break;
+  }
+  if (!hit) return null;
+  // Tense: BOTH markers ("current or former") → "ever" (membership at ANY time — decidePreviousWorker:
+  // in-list → Yes+review, clean miss → No), so a former employee is never mis-answered by a current-only check.
+  const t = text.toLowerCase();
+  const hasCurrent = /\bcurrent(?:ly)?\b/.test(t);
+  const hasFormer = /\b(?:former(?:ly)?|previous(?:ly)?|prior|ever|in the past|used to)\b/.test(t);
+  let tense = "ever";
+  if (hasCurrent && !hasFormer) tense = "current";
+  else if (hasFormer && !hasCurrent) tense = "former";
+  return { tense, company: co };
+};
+
+// "Are you CURRENTLY employed at «company»?" — derived from the work-history "I currently work here"
+// flags (operator decision #2). Same shape as decidePreviousWorker. A clean "No" (not currently there)
+// is confident; a "Yes" (a current work entry matches) is truthfulness-adjacent → review; the company in
+// your history-but-not-current → "No" + review (verify you've left). Unconfigured/empty history → blank.
+const decideCurrentlyEmployed = (company, profile) => {
+  const employers = profile && profile.employment_history_companies;
+  if (!Array.isArray(employers)) return { fill: null, review: true, detail: "employment_history_companies not configured — left blank" };
+  if (employers.length === 1 && String(employers[0]).trim().toLowerCase() === "none")
+    return { fill: "No", review: false, detail: 'never formally employed (["none"]) → not currently employed → No' };
+  if (employers.length === 0) return { fill: null, review: true, detail: "employment history empty ([]) — cannot confirm current employment; add employers or set [\"none\"]" };
+  const tightC = companyTight(company || "");
+  if (!tightC) return { fill: null, review: true, detail: "no application company set to check current employment — left blank" };
+  const coTokens = companyTokens(company || "");
+  const we = (profile && Array.isArray(profile.work_experience)) ? profile.work_experience : [];
+  const isCurrentAtCompany = we.some((e) => {
+    if (!e) return false;
+    const cur = e.currently_work_here === true || /^(true|yes)$/i.test(String(e.currently_work_here == null ? "" : e.currently_work_here));
+    if (!cur) return false;
+    const tightE = companyTight(e.company || "");
+    const eTokens = companyTokens(e.company || "");
+    return (tightE && tightE === tightC) || (coTokens.length && containsSeq(eTokens, coTokens)) || (eTokens.length && containsSeq(coTokens, eTokens));
+  });
+  if (isCurrentAtCompany)
+    return { fill: "Yes", review: true, likelyYes: true, detail: `you have a CURRENT work entry at "${company}" → filled "Yes"; confirm before submitting (a wrong "Yes" is a false statement)` };
+  const inHistory = employers.some((e) => { const te = companyTight(e); return te && te === tightC; });
+  if (inHistory)
+    return { fill: "No", review: true, detail: `"${company}" is in your employment history but not marked as a CURRENT job → filled "No" (not currently employed); verify you've left` };
+  return { fill: "No", review: false, detail: `no current employment at "${company}" (not among ${we.length} work entr${we.length === 1 ? "y" : "ies"}; not in your ${employers.length}-employer list) → No` };
+};
+
+// Route a recognized employment question to the right grounded decider. "former"/"ever" reuse the proven
+// decidePreviousWorker (exact match, affiliate-named-in-the-question, partial overlap, clean-miss → No).
+const decideEmploymentStatus = (tense, company, profile, questionText) => {
+  if (tense === "current") return decideCurrentlyEmployed(company, profile);
+  const employers = profile && profile.employment_history_companies;
+  return decidePreviousWorker(company, questionText || "", employers);
+};
+
+// Map a decided Yes/No polarity to the ACTUAL live option label — handles simple ("Yes"/"No") AND verbose
+// ("No, I'm NOT currently employed with Magna") options by the LEADING token. Returns the exact option
+// text, or null when 0 or 2+ options lead with the polarity (ambiguous → the caller escalates, never guesses).
+const optionForPolarity = (optionLabels, polarity) => {
+  const want = String(polarity || "").trim().toLowerCase();
+  if (!want) return null;
+  const labels = (optionLabels || []).map((o) => String(o == null ? "" : o));
+  const exact = labels.find((o) => o.trim().toLowerCase() === want);
+  if (exact) return exact;
+  const re = new RegExp("^" + want.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+  const leads = labels.filter((o) => re.test(o.trim()));
+  return leads.length === 1 ? leads[0] : null;
 };
 
 // ── Per-widget fill paths (actuation via `act`, decisions per M22) ──────────
@@ -1150,10 +1373,30 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
     return { status: "needs_review", detail: "options did not render (skipped_no_option_match)", after: before };
   }
 
-  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  let enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   // DROPDOWN = select from a full list → NO containment (a substring match is a guess: "PA" must not
   // silently become "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate to review. (2026-07-16)
-  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
+  let m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
+  if (m.targetIndex === -1) {
+    // RENDER-RACE re-match (bounded): GATE-2 settles on 2 stable reads, which can PRECEDE a chunked list
+    // finishing its render — so a real option (e.g. "Male") may mount just AFTER GATE-2 exited, and a
+    // STATED value would then wrongly fall to the AI canonicalize ("the dropdown didn't wait to render").
+    // Keep polling the OPEN list; the instant it grows to include a candidate, re-match and commit
+    // deterministically. Bounded by openCeilingMs, and breaks early once the list goes stable again with
+    // still no match (genuinely not offered) — so a true no-match costs only a few extra reads.
+    let seenCount = enabledTexts.length, stableAtNoMatch = 0;
+    const raceDeadline = Date.now() + budgets.openCeilingMs;
+    while (m.targetIndex === -1 && Date.now() < raceDeadline) {
+      await delayRender(budgets.settleIntervalMs);
+      const s2 = await act.readDropdownState(loc);
+      if (!s2 || s2.ariaExpanded !== "true" || !s2.optionCount) break; // list closed/emptied → genuine handling below
+      const et2 = s2.options.filter((o) => !o.disabled).map((o) => o.text);
+      if (et2.length !== seenCount) { seenCount = et2.length; stableAtNoMatch = 0; } else { stableAtNoMatch++; }
+      const m2 = apMatch.matchCandidates(overwriteCandidates, et2, { containment: false });
+      if (m2.targetIndex !== -1) { state = s2; enabledTexts = et2; m = m2; break; } // late option mounted → deterministic match
+      if (stableAtNoMatch >= budgets.stableReads) break; // list settled and still no candidate → genuinely not offered
+    }
+  }
   if (m.targetIndex === -1) {
     // CLOSE-CONFIRMED before returning: the open list OVERLAPS the next field, so a lingering
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
@@ -2327,9 +2570,18 @@ function buildBucketIndex(buckets) {
 const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
   let arg;
   if (bucket.profile_path) {
-    const r = resolve(getByPath(profile, bucket.profile_path), f.widgetType);
+    const rawVal = getByPath(profile, bucket.profile_path);
+    const r = resolve(rawVal, f.widgetType);
     if (!r || r.skip) return null;
     arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
+    // On a text-matched widget, augment the candidates with the operator's editable per-field ladder: a
+    // yes/no boolean → its Yes/No(+True/False) ladder; any other (scalar) value → the field's variants
+    // (e.g. gpa "3.5+", gender "Man"). A text box uses the value directly (not a choice widget → skipped).
+    if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead") {
+      arg = typeof rawVal === "boolean"
+        ? boolLadderCandidates(profile, bucket.profile_path, rawVal)
+        : appendFieldVariants(profile, bucket.profile_path, arg);
+    }
   } else {
     // Mode B: `value` is a CANDIDATE LIST (most-specific first); a legacy single string is tolerated.
     const cands = (Array.isArray(bucket.value) ? bucket.value : (bucket.value != null ? [bucket.value] : []))
@@ -2365,6 +2617,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
   const bucketIndex = buildBucketIndex(opts && opts.buckets); // Profile v2: wording → answer buckets (consulted before AI)
   const scan = await act.scanPage();
+  // Employment-question anchor (the company you're applying to): prefer the scraped jobContext.company,
+  // else the tenant subdomain from THIS page's URL (always present — magna.wd…myworkday{jobs,site}.com →
+  // "Magna"). So the employer-match / employment-status logic anchors RELIABLY off the URL instead of a
+  // scrape/hand-off that may not have populated a company (Option 1, 2026-07-25). The recognizer still
+  // confirms the company is NAMED in the question; the answer comes from your employer list. Display keeps
+  // jobContext.company untouched. Used at every employment site below (candidateIsPreviousWorker + the
+  // recognizer post-pass + the checkbox contradiction flag) instead of reading jobContext.company directly.
+  // Employment-question anchor (the company you're applying to): the page URL's tenant subdomain/path is
+  // the company brand on every Workday tenant and is ALWAYS present, so PREFER it; the scraped
+  // jobContext.company is only a fallback for a non-Workday URL. A wrong/empty scrape no longer blocks the
+  // recognizer. The recognizer confirms the company is NAMED in the question; the answer comes from your
+  // employer list. (2026-07-25.)
+  const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
 
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
@@ -2423,7 +2688,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
         // "Yes" carries a review flag; unevaluable stays blank + review.
-        const company = jobContext && jobContext.company;
+        const company = empCompany; // scrape OR the URL tenant — reliable anchor (Option 1)
         const employers = profile.employment_history_companies;
         record.mappedPath = "(employer-match)";
         record.rawValue = company || null;
@@ -2453,6 +2718,22 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         if (f.isRequired && !refused) {
           record.resolved = true;
           Object.assign(record, await fillCheckboxCdp(act, loc, true, budgets)); // auto-consent
+          // Employment-status CONTRADICTION flag (2026-07-24): a REQUIRED checkbox is still ALWAYS checked
+          // (operator rule — required can't stay blank; the box must be ticked for the walk to advance).
+          // But if the label is a recognized employment-status ASSERTION ("I am a former «co» employee")
+          // and the GROUNDED answer is "No", a silent auto-consent would silently assert what the profile
+          // contradicts — keep the check, FLAG it for review. Agreement / unevaluable → silent, as before.
+          if (!mappedPath && record.status === "filled") {
+            try {
+              const emp = recognizeEmploymentQuestion(f.label, empCompany);
+              const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+              if (d && d.fill === "No") {
+                record.status = "filled_review"; record.flag = "employer-match";
+                record.detail = (record.detail ? record.detail + "; " : "")
+                  + `required checkbox auto-checked, but the grounded employment answer is "No" (${d.detail}) — verify this assertion`;
+              }
+            } catch (e) { /* keep the plain silent auto-check */ }
+          }
         } else if (!mappedPath) {
           record.status = "skipped";
           record.detail = "no mapping";
@@ -2475,7 +2756,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           record.status = "skipped";
           record.detail = r.reason || `empty value at ${mappedPath}`;
         } else {
-          const arg = r.value !== undefined ? r.value : r.candidates;
+          let arg = r.value !== undefined ? r.value : r.candidates;
+          // On a text-matched widget, augment with the operator's editable per-field ladder: a mapped
+          // yes/no boolean → its Yes/No(+True/False) ladder; any other (scalar) value → the field's
+          // variants (e.g. gpa "3.5+", gender "Man"). A checkbox uses the boolean (its own branch above);
+          // a text box types the value (not a choice widget → skipped).
+          if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead") {
+            arg = typeof rawValue === "boolean"
+              ? boolLadderCandidates(profile, mappedPath, rawValue)
+              : appendFieldVariants(profile, mappedPath, arg);
+          }
           record.resolved = arg;
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
@@ -2510,6 +2800,145 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           if (bkRes) Object.assign(record, bkRes);
         } catch (e) { /* leave the record as-is → the AI post-pass / blank handles it */ }
       }
+    }
+
+    // ── Employment-status-at-the-application-company (DETERMINISTIC, no AI) ── a question like "Are you a
+    // former MAGNA employee?" / "Are you currently employed with Magna?" / the checkbox assertion "I am a
+    // former Magna employee" is answerable from the profile's employment history — on EVERY yes/no-capable
+    // widget: radio, dropdown, text/textarea (types "Yes"/"No"), checkbox (check/uncheck). Recognize it by
+    // TEXT (anchored on jobContext.company + a same-sentence employment ask about YOU; adversarial wordings
+    // — relatives/referral, competitor/any-employer, work-auth/termination/consent, inverted polarity,
+    // aspirational — all BAIL to the AI+review fallback) and answer via the GROUNDED membership check: a
+    // clean "No" fills SILENTLY (no LEGALLY-LOADED flag, no review — the whole point), a "Yes"/uncertain is
+    // flagged for review (truthfulness-adjacent, NEVER auto-"Yes"). A DETERMINISTIC tier like the bucket
+    // consult → runs for REQUIRED and OPTIONAL alike (the AI fallbacks below stay required-only). MUST run
+    // BEFORE the AI FALLBACK below (the dropdown/text AI would otherwise fill it first); a pre-existing
+    // DIFFERENT real value is never silently overwritten (forced review). A REQUIRED checkbox never reaches
+    // here — the dispatch auto-checks it (required can't stay blank; a grounded-"No" contradiction is
+    // review-flagged there). Unrecognized / unevaluable / polarity-unmappable / commit-failed → the
+    // AI/blank fallback (a commit-fail sets `resolved`, so producedNothing stays false and the AI can
+    // never override a made decision).
+    if ((f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "text"
+         || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
+        && record.status !== "filled" && record.status !== "filled_review") {
+      try {
+        const emp = recognizeEmploymentQuestion(f.label, empCompany);
+        const decision = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+        if (decision && decision.fill) {
+          const norm = apMatch.normalize;
+          if (f.widgetType === "radio") {
+            const opts = await act.readRadioState(loc);
+            const optionLabels = (opts || []).map((o) => o.labelText).filter(Boolean);
+            const target = optionForPolarity(optionLabels, decision.fill);
+            if (target) {
+              const beforeOpt = (opts || []).find((o) => o.checked) || null; // pre-existing selection (a prior run / human)
+              record.mappedPath = "(employment-status)";
+              record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              const hr = await fillRadioCdp(act, loc, [target], budgets);
+              Object.assign(record, hr);
+              record.options = optionLabels;
+              record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
+              const overwrote = beforeOpt && norm(beforeOpt.labelText) !== norm(target);
+              if (hr.status === "filled" && (decision.review || overwrote)) {
+                record.status = "filled_review"; record.flag = "employer-match";
+                if (overwrote) record.detail += `; overwrote the pre-selected "${beforeOpt.labelText}" — verify`;
+              }
+              if (decision.likelyYes) record.matchTier = "likely-yes";
+            }
+            // target == null (ambiguous options, e.g. two Yes-leading granularities) → the AI fallback below
+          } else if (f.widgetType === "dropdown") {
+            // DROPDOWN: open + read the live options (the proven reader), map the polarity to the exact
+            // option, commit via the AI path's proven text-keyed click + persistence re-read (an EMPTY
+            // fill never races → single commit; a prefilled-equal value keeps with ZERO value actuation).
+            const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+            const enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+            const target = enabledTexts.length ? optionForPolarity(enabledTexts, decision.fill) : null;
+            if (!target) {
+              await closeAndVerifyBlank(act, loc, before, budgets); // options unreadable/ambiguous → close clean, AI fallback below
+            } else if (hasLiveValue(before) && norm(before) === norm(target)) {
+              const cz = await closeAndVerifyBlank(act, loc, before, budgets); // already holds the answer → zero value-actuation
+              record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              record.status = decision.review ? "filled_review" : "filled";
+              if (decision.review) record.flag = "employer-match";
+              record.after = cz.after != null ? cz.after : target; record.verified = true; record.matchTier = "label-exact";
+              record.options = enabledTexts;
+              record.detail = `${decision.detail}; already held "${before}" — kept (no actuation)`;
+            } else {
+              await act.clickDropdownOptionByText(loc, target);
+              await act.delayFull(budgets.reopenSettleMs);
+              let post = await act.readDropdownState(loc);
+              let committed = post && norm(post.triggerText) === norm(target);
+              if (committed) { // persistence re-read — a momentary pick that reverts is NOT a commit
+                await act.delayFull(budgets.reopenSettleMs);
+                post = await act.readDropdownState(loc);
+                committed = post && norm(post.triggerText) === norm(target);
+              }
+              record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              record.options = enabledTexts;
+              if (committed) {
+                const overwrote = hasLiveValue(before) && norm(before) !== norm(target);
+                record.status = (decision.review || overwrote) ? "filled_review" : "filled";
+                if (decision.review || overwrote) record.flag = "employer-match";
+                record.after = target; record.verified = true;
+                record.matchTier = decision.likelyYes ? "likely-yes" : "label-exact";
+                record.detail = decision.detail + (overwrote ? `; overwrote prefilled "${before}" — verify` : "");
+              } else {
+                record.status = "needs_review"; record.flag = "employer-match";
+                record.after = post ? post.triggerText : null;
+                record.detail = `${decision.detail}; chose "${target}" but the commit did not persist`;
+              }
+            }
+          } else if (f.widgetType === "checkbox") {
+            // OPTIONAL unmapped checkbox (a REQUIRED one was auto-checked in the dispatch and never reaches
+            // here). check = "Yes" (asserting employment — always review via decision.review), uncheck =
+            // "No" (a virgin box → zero actuation, silent; a pre-TICKED box being cleared → forced review).
+            const want = decision.fill === "Yes";
+            const st = await act.readCheckboxState(loc);
+            const beforeChecked = st ? !!st.checked : null;
+            record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+            record.resolved = want;
+            const hr = await fillCheckboxCdp(act, loc, want, budgets);
+            Object.assign(record, hr);
+            record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
+            const overwrote = beforeChecked === true && !want;
+            if (hr.status === "filled" && (decision.review || overwrote)) {
+              record.status = "filled_review"; record.flag = "employer-match";
+              if (overwrote) record.detail += "; unchecked the pre-ticked box — verify";
+            }
+            if (decision.likelyYes) record.matchTier = "likely-yes";
+          } else {
+            // TEXT / TEXTAREA: type the polarity word ("Yes"/"No"). A detail-REQUEST field ("please
+            // enter/list/provide your employee ID / dates…") is NOT a yes/no ask — typing a bare "No"
+            // silently would be sloppy → leave it for the AI-2 fallback (flagged) / blank.
+            if (!/\b(?:list|provide|describe|explain|specify|details?|dates?|id|number|enter)\b/i.test(String(f.label || ""))) {
+              const tag = f.widgetType === "textarea" ? "textarea" : undefined;
+              const pre = await act.readTextValue(loc, tag);
+              const before = pre ? pre.value : null;
+              record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
+              record.resolved = [decision.fill];
+              if (before != null && String(before).trim() !== "" && textValuesMatch(before, decision.fill)) {
+                record.status = decision.review ? "filled_review" : "filled";
+                if (decision.review) record.flag = "employer-match";
+                record.after = before; record.verified = true;
+                record.detail = `${decision.detail}; already held "${before}" — kept (no actuation)`;
+              } else {
+                const hr = await fillTextCdp(act, loc, decision.fill, budgets, tag);
+                Object.assign(record, hr);
+                record.detail = hr.detail ? `${decision.detail}; ${hr.detail}` : decision.detail;
+                const overwrote = before != null && String(before).trim() !== "";
+                if (hr.status === "filled" && (decision.review || overwrote)) {
+                  record.status = "filled_review"; record.flag = "employer-match";
+                  if (overwrote) record.detail += `; overwrote "${before}" — verify`;
+                }
+                if (decision.likelyYes) record.matchTier = "likely-yes";
+              }
+            }
+          }
+        }
+      } catch (e) { /* any read/commit failure → fall through to the AI/blank fallback */ }
     }
 
     // ── AI FALLBACK ── if AI is ON and the deterministic pass produced NOTHING usable. Additive +
@@ -5100,7 +5529,7 @@ function buildReviewBundle(results, meta) {
     }
     const flagged = rec.status === "needs_review" || rec.status === "filled_review" || rec.status === "error";
     let source;
-    if (rec.fieldName === "candidateIsPreviousWorker") source = "employer_match";
+    if (rec.fieldName === "candidateIsPreviousWorker" || rec.flag === "employer-match") source = "employer_match";
     else if ((rec.widgetType === "text" || rec.widgetType === "date" || rec.widgetType === "textarea") && rec.status === "filled") source = "profile_direct";
     else if (rec.matchTier === "exact-normalized" || rec.matchTier === "label-exact") source = "exact";
     else if (rec.matchTier === "containment") source = "containment";
@@ -5160,7 +5589,7 @@ function buildReviewBundle(results, meta) {
       else reason = "ai_no_answer"; // ai-nomatch / ai-no-options / ai-commit-failed / ai-text-commit-failed / ai-canon-* / ai-eeo-* / ai-error
     }
     else if (rec.flag === "eeo_declined") reason = "eeo_declined";             // AI-3: the AI declined to guess a required demographic → neutral decline
-    else if (rec.fieldName === "candidateIsPreviousWorker") reason = "employer_match_uncertain";
+    else if (rec.fieldName === "candidateIsPreviousWorker" || rec.flag === "employer-match") reason = "employer_match_uncertain";
     else if (rec.status === "error") reason = "fill_error";
     else if (rec.status === "skipped" && required && !rec.mappedPath) reason = "unmapped_required_field";
     else if (rec.status === "skipped" && required) reason = "required_field_empty";
@@ -5297,5 +5726,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, decidePreviousWorker, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

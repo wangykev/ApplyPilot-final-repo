@@ -55,6 +55,52 @@ export async function saveDismissed(raw: unknown): Promise<SaveResult> {
   }
 }
 
+/** Load the user's permanently-deleted teach keys — a SUBSET of the dismissed set that's ALSO
+ *  hidden from the Skipped section (the "Delete all skipped" action; see teach page partition). */
+export async function loadDeleted(): Promise<string[]> {
+  if (!isSupabaseConfigured()) return [];
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return [];
+    const { data } = await supabase
+      .from("profiles")
+      .select("teach_deleted_json")
+      .eq("id", user.id)
+      .maybeSingle();
+    const parsed = dismissedSchema.safeParse(data?.teach_deleted_json);
+    return parsed.success ? parsed.data : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Persist the full set of permanently-deleted teach keys (the client sends the merged list). The
+ *  deleted keys stay in teach_dismissed_json too (so they're out of the active queue) — this only
+ *  hides them from the Skipped section. */
+export async function saveDeleted(raw: unknown): Promise<SaveResult> {
+  const parsed = dismissedSchema.safeParse(raw);
+  if (!parsed.success) return { ok: false, error: "Deleted list didn't validate." };
+  if (!isSupabaseConfigured()) return { ok: false, error: "Backend not connected." };
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "You're not signed in." };
+    const unique = Array.from(new Set(parsed.data));
+    const { error } = await supabase
+      .from("profiles")
+      .upsert({ id: user.id, teach_deleted_json: unique }, { onConflict: "id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
 /** Parse the LLM's {maps_to, suggested_category} reply; tolerant of fences / embedded JSON. */
 function parseRecommendation(text: string): FieldRecommendation {
   const clean = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();

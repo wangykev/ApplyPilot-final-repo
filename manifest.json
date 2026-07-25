@@ -10,6 +10,7 @@
   "permissions": ["activeTab", "scripting", "storage", "debugger", "identity"],
   "host_permissions": [
     "*://*.myworkdayjobs.com/*",
+    "*://*.myworkdaysite.com/*",
     "https://gmail.googleapis.com/*",
     "https://api.anthropic.com/*",
     "https://generativelanguage.googleapis.com/*",

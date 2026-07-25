@@ -4,7 +4,7 @@
 // classifier, the Workday soft-error (refresh) detector, and SSO detection.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso } = require("../lib.js");
+const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied } = require("../lib.js");
 
 const A = '[data-automation-id="adventureButton"]';
 const C = '[data-automation-id="continueButton"]';
@@ -62,4 +62,19 @@ test("looksLikeSso: a sign-in button with no email/password field → true (redi
 test("looksLikeSso: a social-login chooser with a 'Sign in with email' button → NOT sso", () => {
   // Palo Alto Networks variant: Apple/Google/LinkedIn buttons + SignInWithEmailButton, no form yet.
   assert.strictEqual(looksLikeSso({ url: "https://paloaltonetworks.wd5.myworkdayjobs.com/…/applyManually", signInButtonPresent: true, emailInput: false, passwordInput: false, signInWithEmail: true }), false);
+});
+
+test("isAlreadyApplied: the alreadyAppliedPage marker → true (Magna wd3 — title is a stale 'Create Account')", () => {
+  assert.strictEqual(isAlreadyApplied({ title: "Create Account", markers: { alreadyAppliedPage: true }, bodyText: "" }), true);
+});
+test("isAlreadyApplied: body-text fallback when the marker is absent", () => {
+  assert.strictEqual(isAlreadyApplied({ markers: {}, bodyText: "Junior Full Stack Developer Coop You've already applied for this job. View My Applications" }), true);
+  assert.strictEqual(isAlreadyApplied({ markers: {}, bodyText: "You have already applied for this position." }), true);
+});
+test("isAlreadyApplied: an ordinary form / auth / apply page → false (no false positive)", () => {
+  assert.strictEqual(isAlreadyApplied({ markers: { formField: true }, bodyText: "My Information First name Last name" }), false);
+  assert.strictEqual(isAlreadyApplied({ markers: { signInSubmit: true }, bodyText: "Sign In Email Password" }), false);
+  assert.strictEqual(isAlreadyApplied({ markers: {}, bodyText: "Apply Apply Manually Use My Last Application" }), false);
+  assert.strictEqual(isAlreadyApplied(null), false);
+  assert.strictEqual(isAlreadyApplied({}), false);
 });

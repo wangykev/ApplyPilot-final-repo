@@ -4,6 +4,7 @@ import { ArrowLeft, ExternalLink } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
 import { ReviewEditor } from "@/components/app/review/ReviewEditor";
+import { JobDescriptionButton } from "./JobDescriptionButton";
 import type { ReviewBundle } from "@/lib/review-summary";
 import type { Application } from "../shared";
 import { SAMPLE_APPS, SAMPLE_BUNDLE_BY_ID } from "../sample";
@@ -11,11 +12,11 @@ import { SAMPLE_APPS, SAMPLE_BUNDLE_BY_ID } from "../sample";
 export const dynamic = "force-dynamic";
 
 // persistable = the bundle came from a real DB row we can UPDATE (not a DEV_PREVIEW sample).
-type Loaded = { app: Application; bundle: ReviewBundle | null; persistable: boolean };
+type Loaded = { app: Application; bundle: ReviewBundle | null; persistable: boolean; jobDescription: string | null };
 
 function sampleLookup(id: string): Loaded | null {
   const app = SAMPLE_APPS.find((a) => a.id === id);
-  return app ? { app, bundle: SAMPLE_BUNDLE_BY_ID[id] ?? null, persistable: false } : null;
+  return app ? { app, bundle: SAMPLE_BUNDLE_BY_ID[id] ?? null, persistable: false, jobDescription: null } : null;
 }
 
 async function loadApp(id: string): Promise<Loaded | null> {
@@ -28,13 +29,16 @@ async function loadApp(id: string): Promise<Loaded | null> {
     if (!user) return DEV_PREVIEW ? sampleLookup(id) : null;
     const { data } = await supabase
       .from("applications")
-      .select("id, company, role, url, status, needs_review_count, applied_at, created_at, review_bundle_json")
+      .select("id, company, role, url, status, needs_review_count, applied_at, created_at, review_bundle_json, job_description")
       .eq("id", id)
       .eq("user_id", user.id)
       .maybeSingle();
     if (!data) return DEV_PREVIEW ? sampleLookup(id) : null;
-    const { review_bundle_json, ...app } = data as Application & { review_bundle_json: ReviewBundle | null };
-    return { app: app as Application, bundle: review_bundle_json ?? null, persistable: true };
+    const { review_bundle_json, job_description, ...app } = data as Application & {
+      review_bundle_json: ReviewBundle | null;
+      job_description: string | null;
+    };
+    return { app: app as Application, bundle: review_bundle_json ?? null, persistable: true, jobDescription: job_description ?? null };
   } catch {
     return DEV_PREVIEW ? sampleLookup(id) : null;
   }
@@ -44,7 +48,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
   const { id } = await params;
   const loaded = await loadApp(id);
   if (!loaded) notFound();
-  const { app, bundle, persistable } = loaded;
+  const { app, bundle, persistable, jobDescription } = loaded;
 
   return (
     <div className="space-y-8">
@@ -61,12 +65,15 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
             </h1>
             {app.role && <p className="mt-1 text-sm text-ink-dim">{app.role}</p>}
           </div>
-          {app.url && (
-            <a href={app.url} target="_blank" rel="noreferrer" className="btn-ghost">
-              Open posting
-              <ExternalLink className="h-4 w-4" />
-            </a>
-          )}
+          <div className="flex shrink-0 items-center gap-3">
+            <JobDescriptionButton text={jobDescription} />
+            {app.url && (
+              <a href={app.url} target="_blank" rel="noreferrer" className="btn-ghost">
+                Open posting
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            )}
+          </div>
         </div>
       </div>
 

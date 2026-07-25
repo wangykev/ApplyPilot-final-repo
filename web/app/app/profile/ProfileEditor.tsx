@@ -16,6 +16,8 @@ import {
   FieldLabel,
   FileField,
   BucketLabelContext,
+  AnswerLadderContext,
+  AdvancedChoices,
 } from "@/components/form/fields";
 import { SectionCard } from "@/components/app/SectionCard";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
@@ -74,14 +76,17 @@ function withDefaultWebsites(list: { type: string; url: string }[] | undefined) 
   });
   return [...fixed, ...arr]; // fixed defaults first, then any custom links
 }
-// The "How did you hear about us?" fallback ladder, shown pre-filled so the user
-// can see and edit it. Seeded ONLY when the stored list is empty (mirrors
-// withDefaultWebsites): a user who trimmed it to a non-empty list keeps theirs.
-const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub"];
+// The "How did you hear about us?" ladder, shown pre-filled so the user can see and edit it.
+// Seeded ONLY when the stored list is empty (mirrors withDefaultWebsites): a user who trimmed it
+// to a non-empty list keeps theirs. "Other" ships as the last default entry (the catch-all), so
+// there's no separate "last resort" field anymore.
+const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub", "Other"];
 function withDefaultSources(h: Profile["how_did_you_hear"] | undefined) {
   const preferred =
     Array.isArray(h?.preferred) && h!.preferred.length > 0 ? h!.preferred : [...DEFAULT_SOURCE_LADDER];
-  const fallback = (h?.fallback ?? "").trim() ? h!.fallback : "Other";
+  // fallback is legacy (kept in the schema for backward-compat with older profiles); no longer
+  // seeded or shown — the catch-all "Other" now lives in `preferred` as its last item.
+  const fallback = h?.fallback ?? "";
   return { preferred, fallback };
 }
 // Standard US EEO option sets (canonical lists live in lib/profile-fields.ts, shared with the teach
@@ -109,6 +114,8 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
   const [buckets, setBuckets] = useState<Bucket[]>(initialBuckets);
   const [savedBuckets, setSavedBuckets] = useState<Bucket[]>(initialBuckets);
   const [bucketOpen, setBucketOpen] = useState<{ path: string; label: string; widget: string } | null>(null);
+  // the field whose ANSWER LADDER (variants) popup is open — the in-field arrow on a scalar field.
+  const [ladderOpen, setLadderOpen] = useState<{ path: string; label: string } | null>(null);
   // the Add / Advanced popup works on a DRAFT — nothing is written to `buckets` until Done.
   const [adv, setAdv] = useState<{ mode: "add" | "edit"; index: number; draft: Bucket } | null>(null);
   const [pending, startTransition] = useTransition();
@@ -187,6 +194,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
 
   return (
     <BucketLabelContext.Provider value={(path, label, widget) => setBucketOpen({ path, label, widget })}>
+    <AnswerLadderContext.Provider value={(path, label) => setLadderOpen({ path, label })}>
     <div className="space-y-6 pb-24">
       {/* Personal info */}
       <SectionCard title="Personal information" subtitle="The basics ApplyPilot maps onto the form's contact fields.">
@@ -346,7 +354,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           {profile.certifications.map((c, i) => (
             <EntryCard key={i} index={i} onRemove={() => update((p) => { p.certifications.splice(i, 1); })}>
               <CandidateField label="Certification" bucketPath={i === 0 ? "certifications.0.certification" : undefined} value={c.certification} placeholder="Certification name" onChange={(v) => update((p) => { p.certifications[i].certification = v; })} />
-              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <TextField label="Number" bucketPath={i === 0 ? "certifications.0.certification_number" : undefined} value={c.certification_number} onChange={(v) => update((p) => { p.certifications[i].certification_number = v; })} />
                 <DateField label="Issued date" granularity="month-day-year" bucketPath={i === 0 ? "certifications.0.issued_date" : undefined} value={c.issued_date} onChange={(v) => update((p) => { p.certifications[i].issued_date = v; })} />
                 <DateField label="Expiration date" granularity="month-day-year" bucketPath={i === 0 ? "certifications.0.expiration_date" : undefined} value={c.expiration_date} onChange={(v) => update((p) => { p.certifications[i].expiration_date = v; })} />
@@ -381,7 +389,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
                       </div>
-                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                         <TextField label="Specialty" value={s.specialty} onChange={(v) => update((p) => { p.certifications[i].specialties[j].specialty = v; })} />
                         <DateField label="Start date" granularity="month-day-year" value={s.start_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].start_date = v; })} />
                         <DateField label="End date" granularity="month-day-year" value={s.end_date} onChange={(v) => update((p) => { p.certifications[i].specialties[j].end_date = v; })} />
@@ -420,10 +428,10 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       {/* Work authorization */}
       <SectionCard title="Work authorization">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TriBoolField label="Authorized to work in the US" bucketPath="work_authorization.authorized_to_work_in_us" value={profile.work_authorization.authorized_to_work_in_us} onChange={(v) => update((p) => { p.work_authorization.authorized_to_work_in_us = v; })} />
-          <TriBoolField label="Need sponsorship now" bucketPath="work_authorization.requires_sponsorship_now" value={profile.work_authorization.requires_sponsorship_now} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_now = v; })} />
-          <TriBoolField label="Need sponsorship in future" bucketPath="work_authorization.requires_sponsorship_future" value={profile.work_authorization.requires_sponsorship_future} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_future = v; })} />
-          <TriBoolField label="Permanent resident" bucketPath="work_authorization.permanent_resident" value={profile.work_authorization.permanent_resident} onChange={(v) => update((p) => { p.work_authorization.permanent_resident = v; })} />
+          <TriBoolField label="Authorized to work in the US" bucketPath="work_authorization.authorized_to_work_in_us" value={profile.work_authorization.authorized_to_work_in_us} onChange={(v) => update((p) => { p.work_authorization.authorized_to_work_in_us = v; })} ladder={profile.answer_ladders?.["work_authorization.authorized_to_work_in_us"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_authorization.authorized_to_work_in_us"] = n; })} />
+          <TriBoolField label="Need sponsorship now" bucketPath="work_authorization.requires_sponsorship_now" value={profile.work_authorization.requires_sponsorship_now} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_now = v; })} ladder={profile.answer_ladders?.["work_authorization.requires_sponsorship_now"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_authorization.requires_sponsorship_now"] = n; })} />
+          <TriBoolField label="Need sponsorship in future" bucketPath="work_authorization.requires_sponsorship_future" value={profile.work_authorization.requires_sponsorship_future} onChange={(v) => update((p) => { p.work_authorization.requires_sponsorship_future = v; })} ladder={profile.answer_ladders?.["work_authorization.requires_sponsorship_future"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_authorization.requires_sponsorship_future"] = n; })} />
+          <TriBoolField label="Permanent resident" bucketPath="work_authorization.permanent_resident" value={profile.work_authorization.permanent_resident} onChange={(v) => update((p) => { p.work_authorization.permanent_resident = v; })} ladder={profile.answer_ladders?.["work_authorization.permanent_resident"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_authorization.permanent_resident"] = n; })} />
           <TextField label="Current visa status" bucketPath="work_authorization.current_visa_status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
         <div className="mt-4">
@@ -441,27 +449,19 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <p className="text-xs leading-relaxed text-ink-dim">
             The extension fills the <span className="text-ink">real source</span> when it&apos;s known
             (from how the job was queued). For a manually pasted link, or when no source is available, it
-            works down this fallback list <span className="text-ink">in order</span> — the first one the
-            form offers wins. The last resort below is tried only if none of these match.
+            works down this list <span className="text-ink">in order</span> — the first one the form offers
+            wins. <span className="text-ink">Other</span> comes last by default as a catch-all; remove or
+            reorder any of them.
           </p>
         </div>
         <TieredField
           label="Fallback sources (in order)"
           horizontal
-          hint="reorder with the ◄ ► arrows; the first one the form offers wins"
+          hint="reorder with the ◄ ► arrows; the first one the form offers wins — Other is the catch-all"
           value={profile.how_did_you_hear.preferred}
           placeholder="Add a source — e.g. LinkedIn"
           onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })}
         />
-        <div className="mt-4 sm:max-w-xs">
-          <TextField
-            label="Last resort"
-            hint="tried last, after the list above — a catch-all most forms offer"
-            value={profile.how_did_you_hear.fallback}
-            placeholder="Other"
-            onChange={(v) => update((p) => { p.how_did_you_hear.fallback = v; })}
-          />
-        </div>
       </SectionCard>
 
       {/* Employment history companies — safety-critical */}
@@ -499,12 +499,12 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       {/* Screening */}
       <SectionCard title="Screening" subtitle="Common yes/no questions and preferences the extension fills when asked.">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <TriBoolField label="At least 18 years old" bucketPath="screening.at_least_18_years_old" value={profile.screening.at_least_18_years_old} onChange={(v) => update((p) => { p.screening.at_least_18_years_old = v; })} />
-          <TriBoolField label="Willing to do a background check" bucketPath="screening.willing_background_check" value={profile.screening.willing_background_check} onChange={(v) => update((p) => { p.screening.willing_background_check = v; })} />
-          <TriBoolField label="Willing to do a drug test" bucketPath="screening.willing_drug_test" value={profile.screening.willing_drug_test} onChange={(v) => update((p) => { p.screening.willing_drug_test = v; })} />
-          <TriBoolField label="Valid driver's license" bucketPath="screening.has_valid_drivers_license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} />
-          <TriBoolField label="Willing to relocate" bucketPath="screening.willing_to_relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} />
-          <TriBoolField label="Open to remote" bucketPath="screening.remote_ok" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} />
+          <TriBoolField label="At least 18 years old" bucketPath="screening.at_least_18_years_old" value={profile.screening.at_least_18_years_old} onChange={(v) => update((p) => { p.screening.at_least_18_years_old = v; })} ladder={profile.answer_ladders?.["screening.at_least_18_years_old"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.at_least_18_years_old"] = n; })} />
+          <TriBoolField label="Willing to do a background check" bucketPath="screening.willing_background_check" value={profile.screening.willing_background_check} onChange={(v) => update((p) => { p.screening.willing_background_check = v; })} ladder={profile.answer_ladders?.["screening.willing_background_check"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.willing_background_check"] = n; })} />
+          <TriBoolField label="Willing to do a drug test" bucketPath="screening.willing_drug_test" value={profile.screening.willing_drug_test} onChange={(v) => update((p) => { p.screening.willing_drug_test = v; })} ladder={profile.answer_ladders?.["screening.willing_drug_test"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.willing_drug_test"] = n; })} />
+          <TriBoolField label="Valid driver's license" bucketPath="screening.has_valid_drivers_license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} ladder={profile.answer_ladders?.["screening.has_valid_drivers_license"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.has_valid_drivers_license"] = n; })} />
+          <TriBoolField label="Willing to relocate" bucketPath="screening.willing_to_relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} ladder={profile.answer_ladders?.["screening.willing_to_relocate"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.willing_to_relocate"] = n; })} />
+          <TriBoolField label="Open to remote" bucketPath="screening.remote_ok" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} ladder={profile.answer_ladders?.["screening.remote_ok"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.remote_ok"] = n; })} />
           <DateField label="Earliest start date" granularity="month-day-year" bucketPath="screening.earliest_start_date" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
           <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
           <TextField label="Salary expectation" bucketPath="screening.salary_expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
@@ -566,6 +566,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         </div>
       </div>
 
+      {/* Question bucket (wordings) — opened from a field's label */}
       {bucketOpen && (
         <BucketFieldPopup
           path={bucketOpen.path}
@@ -574,6 +575,22 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           buckets={buckets}
           onBucketsChange={setBuckets}
           onClose={() => setBucketOpen(null)}
+        />
+      )}
+
+      {/* Answer ladder (variants) — opened from a scalar field's in-field arrow */}
+      {ladderOpen && (
+        <AdvancedChoices
+          label={ladderOpen.label}
+          value={profile.answer_ladders?.[ladderOpen.path]?.values ?? []}
+          onChange={(next) =>
+            update((p) => {
+              const map = (p.answer_ladders ||= {});
+              const cur = map[ladderOpen.path] || { yes: [], no: [], values: [] };
+              map[ladderOpen.path] = { yes: cur.yes || [], no: cur.no || [], values: next };
+            })
+          }
+          onClose={() => setLadderOpen(null)}
         />
       )}
 
@@ -588,6 +605,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         />
       )}
     </div>
+    </AnswerLadderContext.Provider>
     </BucketLabelContext.Provider>
   );
 }

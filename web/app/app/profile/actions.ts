@@ -3,7 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { profileSchema, type Profile } from "@/lib/profile-schema";
-import { bucketsSchema, coerceBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
+import { bucketsSchema, coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
 
 export type SaveResult = { ok: true } | { ok: false; error: string };
 
@@ -80,7 +80,9 @@ export async function loadBuckets(): Promise<Bucket[]> {
       .select("buckets_json")
       .eq("id", user.id)
       .maybeSingle();
-    if (data && data.buckets_json != null) return coerceBuckets(data.buckets_json);
+    // Existing user → their buckets + any newly-shipped starter bindings they don't have yet
+    // (e.g. the education/work-experience flat-field bindings). Non-destructive; merge is on-read.
+    if (data && data.buckets_json != null) return ensureStarterBuckets(coerceBuckets(data.buckets_json));
 
     // Never provisioned → seed the approved starter set (Mode-A bindings only).
     await supabase

@@ -830,3 +830,286 @@ profile/AI/resume already do.
 
 Verified: `background.js` parses; web `tsc --noEmit` clean; `next build` green with `/app/credentials` +
 `/app/run` compiled. **Live-verify PENDING** with the round-trip (same gate as the Run entry above).
+
+## 2026-07-22 — Run-tab hardening + teach-flow fixes (live-testing the website Run on Magna wd3) (branch `web-run-home-flow`)
+
+Follow-ups from live-testing the one-button website Run end-to-end. Web changes hot-reload; extension
+changes (`background.js`/`cdp.js`/`lib.js`) need an extension reload.
+
+**Onboarding sign-in.** The pre-submit settle before the FIRST "Sign In" click was a flat 500ms; a miss
+then stalled the full ~20s `submitAndWait` timeout before the re-click. Reworked into an escalating ladder:
+a 200ms pre-click settle, and `submitAndWait` now takes a per-attempt `timeouts` ladder — Sign In uses
+`[500, 20000]` (fast re-click at 500ms, then the full 20s for a genuinely slow sign-in). Happy path is
+200ms; a missed first click recovers in ~500ms. Create-Account submit unchanged.
+
+**Fill walk — Workday soft-error.** The transient "Something went wrong / please refresh" page had NO
+handling in the walk (only onboarding did) — after login the walk saw a form-less page, called it terminal,
+and stopped. Added `softErrorPresent` to `cdpReadSessionState` (lockstep with lib.js `isWorkdaySoftError`);
+the walk detects it at the top of each page AND at the post-fill terminal spot → `reloadAndSettle` +
+`continue restartWalk` (a refresh restarts the Workday form at page 1, so the walk restarts too), bounded
+at 3/run; a reload landing on the login page is caught by the existing `sessionLooksDead` guard.
+
+**Fill walk — render-settle.** The page-render settle added in the Run milestone polled on `act.delayRender`
+(adaptive → ~40ms on a visible tab), so it "confirmed stable" before the form rendered and most fields got
+cascade-mis-tagged. Switched to `act.delayFull` (real wall-clock) + require the flat field count unchanged
+across 3 reads. LIVE-VERIFIED on Magna ("14 flat field(s) stable after 3144ms").
+
+**Tracker — dedup + display.** (1) Re-running the same job piled up a new row each time: a Workday
+application url changes every run (after login the form is on `wdN.myworkdaysite.com` with a
+per-application-instance path). Fixed with a stable `job_key = "<datacenter>:r<reqid>"` (`canonicalJobUrl`,
+`lib.js` ↔ `web/lib/job-key.ts` lockstep) — the data-center token + requisition id is identical across the
+posting host (`<tenant>.wdN.myworkdayjobs.com`) and the form host (`wdN.myworkdaysite.com`).
+`reportApplication` + `saveRunJob` upsert by (user_id, job_key); migration `0008` adds the column. (First
+attempt keyed on the tenant SUBDOMAIN, which the myworkdaysite host lacks → split the two apart; the
+data-center token is the fix.) (2) The row showed the host, not company/title: the JD scrape
+(`chrome.scripting.executeScript`) is host-permission-gated and `host_permissions` lacked
+`myworkdaysite.com` → the scrape threw. Added `*://*.myworkdaysite.com/*`; `scrapeJobDescription` also
+derives the title from the URL slug + company from the tenant path segment. JD saved to
+`applications.job_description` (migration `0006`), shown via a "Job description" modal button on the
+review/detail page.
+
+**Profile.** Save is dirty-gated (disabled until profile/buckets actually change). "How did you hear about
+us?" — "Other" is now the last DEFAULT entry of the single source list; the separate "last resort" field is
+retired (kept in the schema, defaulted empty, for backward-compat). Added `web/supabase/schema.sql` — a
+consolidated one-paste snapshot of all migrations (the numbered files stay the source of truth).
+
+**Teach flow** (`isTeachable` = AI-filled + approved, or a manual edit — UNCHANGED throughout):
+- A **"Skipped (N)"** section reveals skipped teach cards + a Restore that drops them back into the queue.
+- **`coveredKeys(buckets, profile)`** — a bucket "covers" (hides from teach) a question ONLY when it can
+  actually answer it (Mode-A bound field non-empty, or Mode-B value non-empty). An empty/unanswered bucket
+  (e.g. the `over_18` starter bound to a blank `screening.at_least_18_years_old`, or a field the operator
+  removed) no longer hides its question → it resurfaces in teach with the "add it back" warning.
+- **#4:** an AI-filled entry is NOT hidden by `covered` even when a bucket nominally covers it (the AI fill
+  proves the bucket's saved value didn't match this tenant) → surface it so the operator can add the tenant
+  variant. A clean/fuzzy bucket fill stays covered; skip + dedup still apply.
+- The card recommends the matching Mode-A bucket's bound field (`bucket_path`) over the AI's `maps_to` hint
+  (which had hallucinated "education" for over-18); `profileValueAt` returns "" for object/array-of-objects
+  paths (no more "[object Object]").
+- Fixed a "Remember wording" popup flash: `commit()` applied the optimistic profile/bucket update while the
+  confirm popup was still open (→ `decideTeachRoute` flipped "answer"→"wording"); now it persists first and
+  applies the store update only on success, batched with closing the popup + advancing.
+
+Verified per change: extension unit suites green where runnable (fill-driver 443, session/onboarding + the
+lib-dependent suites); web `tsc --noEmit` clean + `next build` green. LIVE-VERIFIED on Magna wd3: the Run
+tab onboards → fills → soft-error recovers → reaches review; the tracker shows one row with company/title.
+Remaining: exercise more tenants; the JD-scrape host-permission covers myworkdayjobs + myworkdaysite only.
+
+## 2026-07-23 — triBool→AI leak, answer ladders as their own thing, education dual-shape, password-manager overlay (branch `web-run-home-flow`)
+
+Live-testing follow-ups + a class of "value is in the profile but the fill still goes to AI" bugs.
+
+**triBool / boolean → AI leak (the over-18 bug).** "Are you over the age of 18?*" was flagged
+`ai-choice-sensitive` "LEGALLY-LOADED — VERIFY" on EVERY fill even though the profile answered it. Root
+cause: `resolve()` coerced a boolean profile value to a bare `"true"`/`"false"` string for the RADIO path
+only — a yes/no **dropdown** got `"true"`, which never matches a "Yes"/"No" option → escalated to the AI
+post-pass. Fixed in BOTH copies (fill-driver.js + the background.js engine, lockstep): a boolean now
+resolves to the tiered candidate list `["Yes","True"]` / `["No","False"]` for dropdown/typeahead AND radio
+(with array handling), so a checkbox, a true/false dropdown, a yes/no dropdown, and yes/no radios all fill
+deterministically from the stored boolean. Regression-pinned in `test/fill-driver.test.js`.
+
+**Answer ladders are their own thing (separate from the question bucket).** The question **bucket** (the
+wordings that map a tenant's question to a field) and the **answer ladder** (the acceptable answer variants
+for that field) were conflated. Split them, modeled on how Country's tiered list works:
+- `answer_ladders: Record<path, {yes:string[], no:string[], values?:string[]}>` lives in `profile_json`
+  (NO migration — it rides the existing profile blob). `yes`/`no` = triBool polarity ladders; `values` =
+  scalar-field answer variants.
+- **Profile page:** every `TextField`/`SelectField` renders an in-field `›` arrow → `AdvancedChoices`
+  popup editing `answer_ladders[path].values` — proactively, for EVERY field, so the operator can pre-load
+  variants (e.g. GPA `["4.0/4.0","3.5+","3.0+"]`) WITHOUT waiting for a teach. A triBool field's arrow edits
+  its yes/no polarity ladder.
+- **Teach page:** click the ANSWER → the AdvancedChoices popup shows (mirrors the profile arrow). A
+  non-standard yes/no label teaches via a tiered-field ladder draft.
+- Fill: `appendFieldVariants`/`boolLadderCandidates` (fill-driver.js) append the ladder's variants as extra
+  candidates for choice widgets, keyed by the bucket's `profile_path` VERBATIM (dotted, incl. numeric
+  `education.0.gpa`). UI polish: the yes/no toggle HIGHLIGHTS the selected text (not underline) and only
+  after it's clicked (you can't open the ladder until a polarity is selected).
+
+**Teach resurface — value-based coverage.** A taught field reappeared on re-approving the same bundle even
+though the answer was now in the profile. `bucketCoversAnswer`/`fieldHoldsAnswer`/`profileValueAt`
+(web/lib/teach.ts) are now BOOLEAN-aware (a boolean profile value matches "Yes"/"True"/"No"/"False" via
+`boolAnswerCandidates`, and honors the custom `answer_ladders`), so a covered+answered question stays
+hidden — including when the operator files under their OWN bucket rather than the AI's suggestion.
+
+**Delete-all-skipped (teach).** A "Delete all" button in the teach **Skipped** section clears skipped cards
+(distinct from Restore, which requeues them); shown ONLY when the Skipped list is expanded. Persisted via a
+`teach_deleted_json` column (migration `0009`) so a hard-deleted skip doesn't resurface.
+
+**Education dual-shape (repeating AND flat).** Workday-style forms ask Education either as a repeat-add
+section OR as flat single questions (School / GPA / Degree). The extension only filled the repeating shape.
+Now flat education (+ work-experience) fills too, via **Mode-A starter buckets** bound to entry-0 paths
+(`education.0.{school_or_university,gpa,degree,field_of_study}`, `work_experience.0.{job_title,company}`),
+matched on the tenant's label wording — `getByPath(profile,"education.0.gpa")` reads straight from the
+primary entry. No double-fill: the flat driver loop SKIPS fields inside repeating containers (`isRepeating`),
+so a repeating tenant fills via the section and the flat buckets don't fire; a flat tenant fills via the
+buckets. `ensureStarterBuckets(buckets)` merges the new starters into EXISTING profiles (dedup by
+`profile_path`, idempotent, non-destructive), applied where buckets load/sync. Repeating-section fields also
+got the answer-ladder affordance (dropped the `\.\d` exclusion). Repeating fill + schema untouched.
+
+**SSO false-positive (a race).** The Run flow halted "This tenant uses SSO / federated login" then worked
+on a manual retry. `looksLikeSso` fired before the login form finished rendering (a sign-in button visible,
+email/password not yet painted). `doAuth` now waits for the credential form to reveal before the SSO
+classification.
+
+**Certification date fields overlapping / off-page.** The Issued/Expiration month-day-year `DateField`
+couldn't shrink in a `grid-cols-3` row (fixed segment widths, `flex-1` month, no `min-w-0`), so the two
+dates overlapped and ran off the page. Fixed: `DateField` root `group min-w-0`, month input `min-w-0
+flex-1`, and the cert/specialty date rows use `sm:grid-cols-2`.
+
+**Password-manager overlay before submit (live).** During live-testing the "Sign In" coordinate click
+silently missed and the walk halted `auth-unknown` after the full 20s timeout. Cause: Chrome's
+password-manager autofill dropdown is BROWSER chrome painted above the page — `cdpCoverCheck`/
+`elementFromPoint` can't see it, so the coordinate click landed on the dropdown. The dropdown only shows
+while a credential field is FOCUSED and has no DOM node to query, so the proxy for "gone" is "no credential
+field focused". `dismissPasswordManager()` (background.js, wired into `submitAndWait` → covers both the
+sign-in and create-account submits): Escape (closes the visible dropdown) + Tab (Escape KEEPS focus; Tab
+actually moves focus off the field) then POLL-confirm no email/password input is focused before clicking.
+Bounded, best-effort.
+
+Verified per change: extension `node --test test/*.test.js` green (0 fail); web `tsc --noEmit` clean +
+`next build` green. The password-manager fix is implemented + compiles/tests-green but LIVE-CONFIRMATION on
+the operator's browser is pending (reload the extension from this worktree, re-run the sign-in).
+
+## 2026-07-24 — "Already applied" detector (onboarding halts cleanly, no random error) (branch `web-run-home-flow`)
+
+Live-testing surfaced it: when the signed-in candidate has already applied for a requisition, Workday shows
+a dedicated "You've already applied for this job" page (`data-automation-id="alreadyAppliedPage"`) instead
+of the form — no form fields, no apply/auth chrome. The onboarding had no detector for it, so it wasted the
+12s Stage-3 auth-or-form wait and then halted with a confusing `unknown-page` (or `auth-unknown` after a
+fresh sign-in). NOTE the page TITLE is a stale "Create Account" on Magna wd3, so title-matching is useless —
+the automation-id is the reliable signal.
+
+**`isAlreadyApplied(state)` (lib.js, pure + unit-pinned).** Primary signal: the `alreadyAppliedPage` marker
+(added to `cdpOnboardScan`); body-text fallback (`/you.{0,3}ve already applied|already applied for this
+(job|position|requisition|role)/i`) for a tenant that omits it. `runCdpOnboard` checks it at three points —
+the initial scan (the common Run case: already signed in → navigate to Apply → redirected here), the start
+of Stage 3 (revealed after Apply/Apply Manually, before the 12s wait), and in `doAuth` after a successful
+sign-in (Workday shows already-applied instead of the form) — and returns a CLEAN terminal outcome
+`{ ok:true, reached_form:false, already_applied:true, stopped:"already-applied", detail:… }`. It is NOT
+`needs_operator`: the operator already applied, there's nothing to fix or fill.
+
+**Website (RunPanel).** `interpret` gets a dedicated `already_applied` branch → an "ok"-tone "You've already
+applied to this job" result (was falling through to the amber "Needs you to step in"). `ONBOARD_STOP` gains
+an `already-applied` fallback line.
+
+Verified: extension `node --test test/*.test.js` green (0 fail; +3 `isAlreadyApplied` tests — marker,
+body-text fallback, and no-false-positive on form/auth/apply pages); web `tsc --noEmit` clean + tests 43/43.
+Live-confirmation on the operator's browser pending (reload the extension, re-run a job already applied to).
+
+## 2026-07-24 — Employment-status screening radios fill deterministically (no AI, no "LEGALLY-LOADED" flag) (branch `web-run-home-flow`)
+
+A tenant's own worded yes/no question — "If you are a former MAGNA employee, please select Yes… No.",
+"Are you currently employed with Magna?" — is NOT Workday's standard `candidateIsPreviousWorker` field, so
+it bypassed the deterministic employer-match decider and fell to the required-radio AI fallback
+(`aiFillRadio`), which reasons from ABSENCE and is force-flagged `ai-choice-sensitive` → the loud
+"LEGALLY-LOADED — VERIFY" badge on EVERY fill, even though the answer is in the profile. The operator wants
+these answered confidently without review. Root causes: (a) no handler for these custom-worded questions
+(only the standard field routed to the decider); (b) no handler for CURRENT employment (only past); (c)
+`jobContext.company` wasn't wired from the JD scrape, so even the standard path was unevaluable.
+
+**The safety principle.** The system already splits "profile answers directly" (deterministic, no flag)
+from "AI inferred from absence" (flagged). The fix MOVES these into the first bucket — a "No" becomes a
+GROUNDED negative ("the company I'm applying to isn't in my complete employer list") instead of an
+absence-guess. It does NOT weaken the flag; it stops these from being guesses.
+
+**Deterministic recognizer, no AI** (`recognizeEmploymentQuestion`, fill-driver.js — a post-pass BEFORE
+`aiFillRadio`). Fires when a REQUIRED yes/no RADIO **names the application company** (`jobContext.company`)
+**adjacent to an employment word** ("«co» employee", "employed with/at/by «co»", "worked/working
+for/at/with «co»"). Anchored on the company you're applying to → **generalizes across tenants, zero
+per-tenant config, never calls the LLM**. AI is never the answerer.
+
+**Grounded membership check** (`decideEmploymentStatus`): former/ever reuse the proven `decidePreviousWorker`
+(exact match / affiliate-named-in-the-question / partial overlap / clean-miss → No); current →
+`decideCurrentlyEmployed`, derived from the work-history `currently_work_here` flags. `optionForPolarity`
+maps the Yes/No decision to the LIVE option by leading token, so it commits the verbose "No, I'm NOT
+currently employed with Magna" label as well as a plain "No".
+
+**Asymmetric commit** (all existing safety kept): a clean **"No" fills SILENTLY** — status `filled`, no
+flag, no review (the whole point). A **"Yes"/uncertain → `filled_review` + `employer-match` flag** →
+renders as `employer_match_uncertain` (NOT AI-inferred); **never auto-"Yes"** (truthfulness-adjacent,
+unfurls follow-ups). Unrecognized / unevaluable / polarity-unmappable → falls through to the AI/blank
+fallback, unchanged.
+
+**Operator decisions (2026-07-24):** (#1) a NON-EMPTY employer list is treated as complete (no extra
+affirmation); (#2) current employment is derived from the work-history "I currently work here" flags (no
+new field); (#3) a clean miss is always "No" even when the question broadens to affiliates/subsidiaries (we
+trust your list — there is no company-ownership database).
+
+**Foundational wiring:** `jobContext.company` is now populated from the JD scrape in the website Run
+(`jd.company` → `jobContext.company`, background.js) — the anchor the recognizer needs; also improves the
+tracker row. No false fires: "Do you agree Magna may contact your former employers?", "willing to work
+weekends at Magna?", and "want to work at Magna?" don't trip it (adjacency window + past/progressive-only
+`work` guard).
+
+Scope: the CDP path (fill-driver.js — what the Run flow uses); the legacy page-engine (background.js) is
+unchanged (it already lacks the AI radio fallback). Verified: extension `node --test test/*.test.js` green
+(645 pass, 0 fail; +9 tests — recognizer positive/negative, `decideCurrentlyEmployed`, `optionForPolarity`,
+and end-to-end silent-No / verbose-No / Yes-review / no-anchor-not-filled). Live-confirmation on Magna
+pending (reload the extension, re-run — the two Magna questions should fill "No" with no review flag).
+
+## 2026-07-24 — Employment-status hardening: dropdown parity + adversarial-wording guards (branch `web-run-home-flow`)
+
+Operator asked for a double-check of the morning's employment-status feature: does a yes/no DROPDOWN fill
+deterministically too, and can adversarial wordings break the recognizer into a WRONG deterministic answer?
+Both audits found real holes; all fixed, all unit-pinned.
+
+**Dropdown parity (a real ordering bug).** The check gated on `widgetType === "radio"` only AND sat AFTER
+the generic AI FALLBACK block — so a yes/no DROPDOWN version of the same question was AI-filled (flagged)
+before the employment check could ever run. Moved the block ABOVE the AI FALLBACK (right after the bucket
+consult — placement is load-bearing) and widened to radio + dropdown. Dropdown commit reuses the proven
+pieces: `openAndReadDropdown` → `optionForPolarity` vs the live options → the AI path's text-keyed click +
+persistence re-read. Prefilled-equal → kept with ZERO value actuation; commit-fail → `needs_review` with
+`resolved` set, so `producedNothing` stays false and the AI can never override a made decision.
+
+**Adversarial wordings (each WOULD have silently produced a wrong answer; all now BAIL to the flagged
+AI fallback — the safe direction):**
+- **Wrong SUBJECT** — "Do you have any relatives currently employed with Magna?", "Were you referred by a
+  current Magna employee?", "Is your spouse employed by Magna?" (the question is about someone ELSE).
+- **Wrong OBJECT / scope** — "employed by a competitor/supplier of Magna?", "terminated by ANY employer,
+  including Magna?" (membership being asked isn't at the application company).
+- **Different FACT** — "eligible/legally authorized for employment with Magna" (a WORK-AUTH question — a
+  clean-miss "No" would be wrong), termination manner, reference-contact consent, policy/handbook agreement.
+- **Inverted POLARITY** — "I certify that I am not a current employee of Magna" (the right answer for a
+  non-employee is YES; the polarity map would say No), "are you not / no longer employed". The REAL Magna
+  Q1 ("If you are not a former MAGNA employee, please select No.") is EXEMPTED by its same-sentence
+  select-instruction — the target question survives every guard (pinned).
+- **ASPIRATIONAL** — "Would you accept employment with Magna?", "able to begin employment immediately?"
+  (they're applying; a clean-miss "No" would be absurd).
+- **Cross-sentence contamination** — "Do you have a criminal record? Magna requires all employees to
+  disclose." The recognizer is now SENTENCE-SCOPED: one sentence must name the company, hold an employment
+  word within 3 tokens, AND ask about YOU (`EMPLOY_ASK_RE`); bails otherwise.
+- **Tense combination** — "current or former Magna employee?" now → "ever" (decidePreviousWorker), so a
+  former employee is never mis-answered by a current-only check.
+- **Overwrite guard (both widgets)** — a pre-existing DIFFERENT real value (a prior run / human answer) is
+  never silently overwritten: the grounded answer commits but is FORCE-flagged for review.
+- **Regex sharpening** — `\bable\s+to\b` (bare "able to" matched inside "applicABLE TO you" — Magna Q1
+  boilerplate says "applicable"); `\breferr` (matched inside "pReferred").
+
+Verified: extension suite green — 661 pass, 0 fail (+16 tests: the full adversarial battery, the two REAL
+Magna labels verbatim as survivors, dropdown parity incl. silent-No/verbose/Yes-review/prefill-kept/
+overwrite-forced-review, and the bare-vs-granular Yes option semantics). Live-confirmation on Magna pending.
+
+## 2026-07-24 — Employment-status: ALL widget types (text/textarea + checkbox join radio/dropdown) (branch `web-run-home-flow`)
+
+Operator: the employment-status questions must fill correctly on EVERY answer widget, not just radio +
+dropdown. Extended the deterministic tier to text/textarea and checkbox; also made it run for OPTIONAL
+fields (it's a deterministic tier like buckets — the AI fallbacks stay required-only).
+
+- **Recognizer:** `EMPLOY_ASK_RE` gains the FIRST-person assertion form ("I am/was a «co» employee") — the
+  checkbox rendering; the negated "I am not…" was already an inverted-polarity bail.
+- **Text/textarea:** types the polarity word ("Yes"/"No") via `fillTextCdp`; clean No silent, Yes/uncertain
+  review-flagged; a pre-existing DIFFERENT value → commit + forced review; already-equal → kept, zero
+  actuation. A **detail-REQUEST** field ("please enter/list/provide your employee ID/dates…") is NOT a
+  yes/no ask → bailed to AI-2 (a bare silent "No" in an ID box would be sloppy). Note the Magna Q1 wording
+  ("…enter all the applicable information below") self-selects OUT of the text path via "enter".
+- **Checkbox (operator decisions mid-build):** a REQUIRED checkbox is STILL always auto-checked — required
+  can't stay blank ("still keep the auto check for every required checkbox"). But when the label is a
+  recognized employment ASSERTION and the grounded answer is "No", the silent auto-consent would silently
+  assert what the profile contradicts → the check stays, FLAGGED `filled_review`+`employer-match`.
+  Agreement (grounded Yes) / unevaluable → silent as before; ordinary consent checkboxes are byte-identical
+  (their agree/authorize/policy wording bails the recognizer). An OPTIONAL checkbox is DETERMINED ("this is
+  if the checkbox is not required then you can determine whether to check it or not"): check="Yes" (always
+  review), uncheck="No" (virgin box → zero actuation, silent; clearing a pre-TICKED box → forced review).
+- Verified: extension suite green — 674 pass, 0 fail (+13 tests: first-person recognition, required-checkbox
+  contradiction flag + agreement-silent + consent-unchanged, optional-checkbox No/Yes/pre-ticked, text
+  silent-No/Yes-review/detail-request-bail/overwrite, textarea, optional-radio tier). Live-confirmation on
+  Magna pending.

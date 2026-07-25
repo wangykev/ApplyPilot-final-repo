@@ -464,6 +464,27 @@ function websiteDeletionPlan(entries) {
   return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
 }
 
+// Stable per-JOB identity for tracker dedup. A Workday application URL VARIES across runs AND hosts:
+// the POSTING the user pastes is <tenant>.wdN.myworkdayjobs.com (tenant in the SUBDOMAIN), but after
+// login the form is on wdN.myworkdaysite.com (tenant in the PATH, /recruiting/<tenant>/ — NOT the
+// subdomain), with a per-application-instance tail. The one token common to BOTH hosts is the
+// data-center (wd3, wd5, …); combined with the requisition id (…_R00244793, present in both paths) it
+// gives a key — "<dc>:r<reqid>" — that collapses the posting + every form/instance/query variant to
+// ONE row. (Keying on the subdomain split myworkdayjobs from myworkdaysite — the 2026-07-22 bug.)
+// No _R match (non-Workday / odd URL) → origin+pathname minus query and the /apply… tail. LOCKSTEP
+// with the web copy in web/lib/job-key.ts (reportApplication + saveRunJob must produce identical keys).
+function canonicalJobUrl(u) {
+  try {
+    const p = new URL(String(u));
+    const req = (p.pathname.match(/_R(\d+)\b/i) || [])[1];
+    const dc = (p.hostname.match(/\bwd\d+\b/i) || [""])[0].toLowerCase(); // "wd3" — on both hosts
+    if (req) return (dc || "wd") + ":r" + req;
+    return (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/+$/, "");
+  } catch (e) {
+    return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();
+  }
+}
+
 // US + Canada region name → postal abbreviation. Workday review pages render the address as ONE blob
 // with the abbreviation ("Tallahassee, FL"), not the spelled-out region a dropdown stored ("Florida"),
 // so a name↔abbrev equivalence stops a stored region from reading as a false "missing".
@@ -789,6 +810,19 @@ function isWorkdaySoftError(bodyText) {
     && /refresh (the|this) page|please refresh|try again/i.test(t);
 }
 
+// "You've already applied for this job." Workday shows a dedicated already-applied page instead of the
+// application form when the signed-in candidate has already submitted for this requisition. It's a CLEAN
+// terminal state, NOT an error — the onboarding halts gracefully ("already-applied") rather than timing
+// out on a form/auth screen that will never appear. Primary signal is the marker
+// (data-automation-id="alreadyAppliedPage"); the body-text fallback catches a tenant that omits it. The
+// page TITLE is unreliable (observed as a stale "Create Account" on Magna wd3, 2026-07-24), so it's ignored.
+function isAlreadyApplied(state) {
+  const s = state || {};
+  if (s.markers && s.markers.alreadyAppliedPage) return true;
+  const t = String(s.bodyText || "");
+  return /you.{0,3}ve already applied|you have already applied|already applied for this (job|position|requisition|role)/i.test(t);
+}
+
 // SSO / federated-login detection. The reference REFUSES SSO (a Workday tenant that
 // bounces to Okta/Ping/Azure/etc can't be driven with an email+password) — so we halt
 // for operator takeover rather than fumble. Two signals: an SSO-looking URL, or an
@@ -808,8 +842,34 @@ function looksLikeSso(state) {
   return false;
 }
 
+// The company brand from a Workday tenant URL — magna.wd3.myworkdayjobs.com → "Magna" (also the
+// logged-in myworkdaysite.com form host). The tenant subdomain IS the company brand on virtually every
+// Workday tenant AND is always present in the page URL, so it's a reliable employment-question anchor when
+// the scraped jobContext.company is missing (Option 1, 2026-07-25 — anchor on the URL tenant, still
+// confirmed-in-question by the recognizer; the answer comes from the profile employer list). Returns null
+// on a non-Workday / unparseable URL. Mirrors scrapeJobDescription's subdomain+titleCase fallback.
+function tenantCompanyFromUrl(url) {
+  let host = "", path = "";
+  try { const u = new URL(String(url == null ? "" : url)); host = u.hostname; path = u.pathname || ""; } catch (e) {}
+  if (!/\.myworkday(?:jobs|site)\.com$/i.test(host)) return null; // trust ONLY Workday hosts
+  const titleCase = (s) => (String(s || "").replace(/[-_+]+/g, " ").replace(/\s+/g, " ").trim()
+    .split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ") || null);
+  const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+  // The brand lives in the SUBDOMAIN on the careers/JD host (magna.wd3.myworkdayjobs.com), but in the PATH
+  // on the LOGGED-IN FORM host — wd3.myworkdaysite.com/en-US/recruiting/<tenant>/<Tenant>/job/… (no company
+  // subdomain there). The fill runs on the form host, so the path fallback is the load-bearing one. Mirrors
+  // scrapeJobDescription's subdomain → path fallbacks.
+  const sub = host.match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
+  if (sub) return titleCase(sub[1]);
+  const rec = path.match(/\/recruiting\/([^/]+)/i);      // /recruiting/<tenant>/… — the clean tenant slug (preferred)
+  if (rec) return titleCase(dec(rec[1]));
+  const job = path.match(/\/([^/]+)\/job\//i);           // fallback: the segment right before "/job/"
+  if (job) return titleCase(dec(job[1]));
+  return null;
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, tenantCompanyFromUrl };
 }

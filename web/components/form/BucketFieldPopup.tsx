@@ -6,10 +6,10 @@ import { TagListField } from "@/components/form/fields";
 import { type Bucket } from "@/lib/buckets";
 
 /**
- * The "advanced options" popup a field label opens: edit the question wordings
- * that map to that field's answer (a Mode-A bucket, created on first use). Shared
- * by the profile page (ProfileEditor) and the teach page's ProfilePanel.
- * Backdrop / Esc / Done close.
+ * The "question bucket" popup a field label opens: edit the question WORDINGS that map to that field's
+ * answer (a Mode-A bucket, created on first use). This is ONLY the wordings — the field's answer LADDER
+ * (variants the extension tries) is a separate thing, reached by the in-field arrow (profile page) or by
+ * clicking the answer (teach page). Shared by ProfileEditor + the teach ProfilePanel. Backdrop/Esc/Done close.
  */
 export function BucketFieldPopup({
   path,

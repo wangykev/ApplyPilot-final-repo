@@ -4,6 +4,7 @@ import { useState, useEffect, createContext, useContext } from "react";
 import { X, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Plus, ChevronRight, Paperclip, Upload } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import { US_STATES, resolveUsState, isUnitedStates } from "@/lib/us-states";
+import { boolAnswerCandidates } from "@/lib/teach";
 
 /**
  * Optional hook: when a provider supplies an opener, a FieldLabel given a
@@ -11,6 +12,14 @@ import { US_STATES, resolveUsState, isUnitedStates } from "@/lib/us-states";
  * popup. Absent a provider it stays a plain label (unchanged elsewhere).
  */
 export const BucketLabelContext = createContext<((path: string, label: string, widget: string) => void) | null>(null);
+
+/**
+ * Optional hook: when a provider supplies an opener, a scalar field (text / plain dropdown / state) with
+ * a `bucketPath` renders a small in-field arrow → that field's ANSWER LADDER (the ordered variants the
+ * extension tries when the field is a dropdown/select). This is SEPARATE from the question-bucket label.
+ * Absent a provider → no arrow.
+ */
+export const AnswerLadderContext = createContext<((path: string, label: string) => void) | null>(null);
 
 const inputCls =
   "w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
@@ -58,6 +67,37 @@ export function FieldLabel({
   );
 }
 
+/** Whether a scalar field should show the in-field answer-ladder arrow: a provider wired the
+ *  AnswerLadderContext and the field has a bucketPath. Repeating-section entry fields (education.0.gpa,
+ *  work_experience.0.*) are INCLUDED — many forms ask them as flat questions that fill from the primary
+ *  entry via a Mode-A bucket, and that flat/bucket fill path honors the field's answer_ladders variants. */
+function useHasLadder(bucketPath?: string): boolean {
+  const openLadder = useContext(AnswerLadderContext);
+  return !!openLadder && !!bucketPath;
+}
+
+/** The small in-field arrow → the field's ANSWER LADDER popup (its ordered variants). Absolute-right;
+ *  the enclosing control needs `relative` + right padding. Render only when useHasLadder is true. */
+function LadderArrow({ bucketPath, label }: { bucketPath: string; label: string }) {
+  const openLadder = useContext(AnswerLadderContext);
+  if (!openLadder) return null;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openLadder(bucketPath, label);
+      }}
+      title="Answer variants — other wordings a form might use for this answer"
+      aria-label="Answer variants"
+      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-ink-faint transition-colors hover:text-amber/70 group-hover:text-amber/70"
+    >
+      <ChevronRight className="h-4 w-4" />
+    </button>
+  );
+}
+
 export function TextField({
   label,
   value,
@@ -77,17 +117,21 @@ export function TextField({
   bucketPath?: string;
   disabled?: boolean;
 }) {
+  const hasLadder = useHasLadder(bucketPath);
   return (
     <label className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="text">{label}</FieldLabel>
-      <input
-        type={type}
-        value={value}
-        placeholder={placeholder}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value)}
-        className={clsx(inputCls, "mt-1.5", disabled && "cursor-not-allowed text-ink-dim opacity-70")}
-      />
+      <div className="relative mt-1.5">
+        <input
+          type={type}
+          value={value}
+          placeholder={placeholder}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          className={clsx(inputCls, disabled && "cursor-not-allowed text-ink-dim opacity-70", hasLadder && "pr-9")}
+        />
+        {hasLadder && <LadderArrow bucketPath={bucketPath!} label={label} />}
+      </div>
     </label>
   );
 }
@@ -163,20 +207,24 @@ export function SelectField({
   hint?: string;
   bucketPath?: string;
 }) {
+  const hasLadder = useHasLadder(bucketPath);
   return (
     <label className="group block">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="dropdown">{label}</FieldLabel>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className={clsx(inputCls, "mt-1.5 appearance-none")}
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value} className="bg-panel">
-            {o.label}
-          </option>
-        ))}
-      </select>
+      <div className="relative mt-1.5">
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={clsx(inputCls, "appearance-none", hasLadder && "pr-9")}
+        >
+          {options.map((o) => (
+            <option key={o.value} value={o.value} className="bg-panel">
+              {o.label}
+            </option>
+          ))}
+        </select>
+        {hasLadder && <LadderArrow bucketPath={bucketPath!} label={label} />}
+      </div>
     </label>
   );
 }
@@ -258,18 +306,44 @@ export function TriBoolField({
   onChange,
   hint,
   bucketPath,
+  ladder,
+  onLadderChange,
 }: {
   label: string;
   value: boolean | null;
   onChange: (v: boolean | null) => void;
   hint?: string;
   bucketPath?: string;
+  /** Editable per-option fill ladders (custom candidates). Absent → the defaults are shown. */
+  ladder?: { yes: string[]; no: string[] };
+  /** When provided, the ladder popup is EDITABLE and persists via this callback; else it's view-only. */
+  onLadderChange?: (next: { yes: string[]; no: string[] }) => void;
 }) {
+  // Which option's fill-ladder popup is open. Click an UNSELECTED option to select it; click the
+  // ALREADY-SELECTED option's word again to open/close its ladder popup.
+  const [ladderFor, setLadderFor] = useState<boolean | null>(null);
   const opts: { v: boolean; t: string }[] = [
     { v: true, t: "Yes" },
     { v: false, t: "No" },
   ];
   const escHint = value !== null ? (hint ? hint + " · Esc clears" : "Esc clears") : hint;
+
+  // The effective candidate list for a polarity: the operator's custom ladder if set, else the default
+  // ["Yes","True"] / ["No","False"] (kept in lockstep with the extension via boolAnswerCandidates).
+  const listFor = (v: boolean): string[] => {
+    const custom = v ? ladder?.yes : ladder?.no;
+    return custom && custom.length ? custom : boolAnswerCandidates(v ? "Yes" : "No");
+  };
+  const setListFor = (v: boolean, next: string[]) => {
+    if (!onLadderChange) return;
+    const base = { yes: ladder?.yes ?? [], no: ladder?.no ?? [] };
+    onLadderChange(v ? { ...base, yes: next } : { ...base, no: next });
+  };
+  // The ladder popup is only reachable when a persist handler is wired (the profile page). Elsewhere the
+  // toggle just selects — so the "click into the ladder" highlight is shown ONLY on the SELECTED option
+  // AND only where it's editable (you can't open a ladder for an option you haven't selected).
+  const canEditLadder = !!onLadderChange;
+
   return (
     <div className="group">
       <FieldLabel hint={escHint} bucketPath={bucketPath} bucketWidget="radio">{label}</FieldLabel>
@@ -279,6 +353,7 @@ export function TriBoolField({
           if (e.key === "Escape" && value !== null) {
             e.preventDefault();
             onChange(null);
+            setLadderFor(null);
           }
         }}
       >
@@ -288,19 +363,111 @@ export function TriBoolField({
             <button
               key={String(o.v)}
               type="button"
-              onClick={() => onChange(o.v)}
+              onClick={() => {
+                if (active) { if (canEditLadder) setLadderFor((f) => (f === o.v ? null : o.v)); } // selected → open/close its ladder popup (editable only)
+                else { onChange(o.v); setLadderFor(null); }                                       // not selected → select it
+              }}
+              title={active ? (canEditLadder ? "Click again to edit the fill ladder" : "Selected") : `Select ${o.t}`}
+              aria-expanded={active && canEditLadder ? ladderFor === o.v : undefined}
               className={clsx(
-                "flex-1 py-1.5 text-sm transition-colors",
+                "group/tri flex-1 py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline", // divider bar between Yes and No
                 active
-                  ? "bg-amber font-semibold text-cockpit" // bold, unmistakably selected
+                  ? "bg-amber font-semibold text-cockpit hover:bg-amber/80" // selected; hover shift hints "click again for the ladder"
                   : "text-ink-dim hover:bg-panel-raised/40 hover:text-ink"
               )}
             >
-              {o.t}
+              {/* Highlight the actual Yes/No text on hover — ONLY when this option is SELECTED and its
+                  ladder is editable, since that's the only time clicking the word does something (opens
+                  the ladder). An unselected option shows no text highlight (clicking it just selects). */}
+              <span
+                className={clsx(
+                  "rounded px-2 py-0.5 transition-colors",
+                  active && canEditLadder && "cursor-pointer group-hover/tri:bg-cockpit/20"
+                )}
+              >
+                {o.t}
+              </span>
             </button>
           );
         })}
+      </div>
+
+      {ladderFor !== null && (
+        <TriBoolLadderPopup
+          fieldLabel={label}
+          polarity={ladderFor}
+          list={listFor(ladderFor)}
+          editable={!!onLadderChange}
+          onChange={(next) => setListFor(ladderFor, next)}
+          onClose={() => setLadderFor(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** The Yes/No "fill ladder" popup — the candidates the extension tries against a form's options when the
+ *  answer is this polarity. EDITABLE (add/remove/reorder via TieredField) when `onChange` persists; a
+ *  view-only chip list otherwise. Reached by clicking the already-selected Yes/No option again. */
+function TriBoolLadderPopup({
+  fieldLabel,
+  polarity,
+  list,
+  editable,
+  onChange,
+  onClose,
+}: {
+  fieldLabel: string;
+  polarity: boolean;
+  list: string[];
+  editable: boolean;
+  onChange: (next: string[]) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [onClose]);
+  const word = polarity ? "Yes" : "No";
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
+      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
+            {fieldLabel} — &ldquo;{word}&rdquo; fill ladder
+          </h3>
+          <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <p className="mb-3 text-xs leading-relaxed text-ink-dim">
+          When this answer is <span className="font-medium text-ink">{word}</span>, the extension tries these
+          against the form&apos;s options, in order.{editable ? " Add wordings a form might use (e.g. “Affirmative”)." : ""}
+        </p>
+        {editable ? (
+          <TieredField label="Candidates it tries (most-specific first)" value={list} onChange={onChange} />
+        ) : (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {list.map((c, i) => (
+              <span key={c} className="flex items-center gap-1.5">
+                {i > 0 && <span className="text-ink-faint" aria-hidden>→</span>}
+                <span className="rounded border border-hairline bg-cockpit px-1.5 py-0.5 font-mono text-xs text-ink">{c}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        <p className="mt-3 text-xs text-ink-faint">
+          Matches whether the form labels the option Yes/No or True/False. Clear it to fall back to the default.
+        </p>
+        <div className="mt-4 flex justify-end">
+          <button type="button" onClick={onClose} className="btn-primary">
+            Done
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -590,7 +757,7 @@ export function CandidateField({
 }
 
 /** Modal for the ordered fallback candidate list. Backdrop click or Escape closes. */
-function AdvancedChoices({
+export function AdvancedChoices({
   label,
   value,
   onChange,
@@ -700,7 +867,10 @@ export function DateField({
   const seg =
     "rounded-lg border border-hairline bg-cockpit px-2.5 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber";
   return (
-    <div className="group">
+    // min-w-0 lets the field shrink to its grid/flex cell instead of forcing overflow (grid/flex items
+    // default to min-width:auto). Without it, a month-day-year field's intrinsic width pushed adjacent
+    // fields to overlap and run off the page (the certifications Issued/Expiration row).
+    <div className="group min-w-0">
       <FieldLabel hint={hint} bucketPath={bucketPath} bucketWidget="date">{label}</FieldLabel>
       <div className="mt-1.5 flex gap-2">
         {granularity !== "year" && (
@@ -716,7 +886,7 @@ export function DateField({
               const n = Number(parts.month);
               if (!(n >= 1 && n <= 12)) set({ month: "" }); // invalid → clear
             }}
-            className={clsx(seg, "flex-1")}
+            className={clsx(seg, "min-w-0 flex-1")}
           />
         )}
         {granularity === "month-day-year" && (
