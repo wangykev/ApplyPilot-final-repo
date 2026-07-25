@@ -8,7 +8,6 @@ import { TextAreaField } from "@/components/form/fields";
 import { clsx } from "@/lib/clsx";
 import { tailorResume, type JdApplication } from "./actions";
 import type { TailorMode, TailoredResume } from "@/lib/tailor";
-import { dateRange } from "@/lib/resume-doc";
 
 /** The untailored resume (from the profile) + its exportable documents. */
 export type OriginalResume = { resume: TailoredResume; printHtml: string; tex: string };
@@ -93,15 +92,26 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
     if (!r) return { edited: 0, reverted: 0, risks: 0 };
     let edited = 0,
       risks = 0;
-    for (const e of r.experiences)
-      for (const b of e.bullets) {
+    for (const sec of [...r.experiences, ...r.projects])
+      for (const b of sec.bullets) {
         if (b.edited) edited++;
         if (b.fabrication_risk) risks++;
       }
     return { edited, reverted: r.reverted_count, risks };
   }, [r]);
 
-  const preview = active?.r ?? null;
+  // The per-bullet diff rows: experiences + projects, labeled by their section.
+  const changedRows = useMemo(() => {
+    if (!r) return [];
+    const rows: { label: string; b: (typeof r.experiences)[number]["bullets"][number] }[] = [];
+    for (const e of r.experiences)
+      for (const b of e.bullets)
+        if (b.edited || b.violation || b.fabrication_risk) rows.push({ label: `${e.company} · ${e.job_title}`, b });
+    for (const p of r.projects)
+      for (const b of p.bullets)
+        if (b.edited || b.violation || b.fabrication_risk) rows.push({ label: `Project · ${p.name}`, b });
+    return rows;
+  }, [r]);
 
   return (
     <div className="space-y-6">
@@ -184,7 +194,7 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
         </div>
       </SectionCard>
 
-      {preview && (
+      {active && (
         <>
           <SectionCard
             title={showingOriginal ? "Your resume — original" : "Tailored resume"}
@@ -245,74 +255,49 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
               </div>
             )}
 
-            {/* document preview — a light “paper” card inside the dark cockpit */}
-            <div className="rounded-lg bg-white p-8 text-[13px] leading-relaxed text-neutral-900 shadow-inner">
-              {preview.summary && (
-                <p className="mb-3 border-l-2 border-amber pl-2 italic">
-                  {preview.summary} <span className="not-italic text-[10px] text-amber">✦ AI summary — review</span>
-                </p>
-              )}
-              {preview.experiences
-                .filter((e) => e.include && e.bullets.length)
-                .map((e, i) => (
-                  <div key={i} className="mb-3">
-                    <div className="flex justify-between">
-                      <span className="font-semibold">{e.company || e.job_title}</span>
-                      <span className="text-xs text-neutral-500">{dateRange(e.from, e.to, e.currently_work_here)}</span>
-                    </div>
-                    <div className="text-xs italic text-neutral-600">{e.job_title}</div>
-                    <ul className="ml-5 mt-1 list-disc space-y-0.5">
-                      {e.bullets.map((b, j) => (
-                        <li key={j} className={clsx(b.fabrication_risk ? "text-red-700" : b.edited ? "text-amber-800" : "")}>
-                          {b.text}
-                          {b.edited && <span className="ml-1 align-middle text-[10px] text-amber-600">✦</span>}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ))}
-              {preview.skills.length > 0 && (
-                <p className="mt-2 text-xs">
-                  <span className="font-semibold">Skills:</span> {preview.skills.join(", ")}
-                </p>
-              )}
-            </div>
+            {/* document preview — the EXACT print document (what Save-as-PDF emits),
+                full page: header, education, experience, projects, skills */}
+            <iframe
+              title={showingOriginal ? "Original resume" : "Tailored resume"}
+              srcDoc={active.printHtml}
+              sandbox=""
+              className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner"
+            />
+            {!showingOriginal && (review.edited > 0 || review.risks > 0) && (
+              <p className="mt-2 font-mono text-[11px] tracking-label text-ink-faint">
+                the preview is the exact PDF — AI-changed bullets are itemized below
+              </p>
+            )}
           </SectionCard>
 
-          {!showingOriginal && r && (review.edited > 0 || review.risks > 0 || r.reverted_count > 0) && (
-            <SectionCard title="What the AI changed" subtitle="Original vs tailored, per bullet. Reverted rewrites failed the deterministic fact-check.">
+          {!showingOriginal && r && changedRows.length > 0 && (
+            <SectionCard title="What the AI changed" subtitle="Original vs tailored, per bullet — experiences and projects. Reverted rewrites failed the deterministic fact-check.">
               <ul className="space-y-3">
-                {r.experiences.flatMap((e, i) =>
-                  e.bullets
-                    .filter((b) => b.edited || b.violation || b.fabrication_risk)
-                    .map((b, j) => (
-                      <li key={`${i}-${j}`} className="rounded-lg border border-hairline bg-panel-raised p-3 text-sm">
-                        <div className="mb-1 font-mono text-[10px] uppercase tracking-label text-ink-faint">
-                          {e.company} · {e.job_title}
-                        </div>
-                        {b.source_text && (
-                          <p className="text-ink-dim">
-                            <span className="font-mono text-[10px] text-ink-faint">was&nbsp;&nbsp;</span>
-                            {b.source_text}
-                          </p>
-                        )}
-                        <p className={clsx("mt-1", b.fabrication_risk ? "text-signal" : b.violation ? "text-ink" : "text-amber")}>
-                          <span className="font-mono text-[10px] text-ink-faint">now&nbsp;</span>
-                          {b.text}
-                        </p>
-                        {b.violation && (
-                          <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-verified">
-                            <ShieldCheck className="h-3.5 w-3.5" /> rewrite reverted — {b.violation}
-                          </p>
-                        )}
-                        {b.fabrication_risk && (
-                          <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-signal">
-                            <AlertTriangle className="h-3.5 w-3.5" /> {b.fabrication_risk}
-                          </p>
-                        )}
-                      </li>
-                    ))
-                )}
+                {changedRows.map(({ label, b }, i) => (
+                  <li key={i} className="rounded-lg border border-hairline bg-panel-raised p-3 text-sm">
+                    <div className="mb-1 font-mono text-[10px] uppercase tracking-label text-ink-faint">{label}</div>
+                    {b.source_text && (
+                      <p className="text-ink-dim">
+                        <span className="font-mono text-[10px] text-ink-faint">was&nbsp;&nbsp;</span>
+                        {b.source_text}
+                      </p>
+                    )}
+                    <p className={clsx("mt-1", b.fabrication_risk ? "text-signal" : b.violation ? "text-ink" : "text-amber")}>
+                      <span className="font-mono text-[10px] text-ink-faint">now&nbsp;</span>
+                      {b.text}
+                    </p>
+                    {b.violation && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-verified">
+                        <ShieldCheck className="h-3.5 w-3.5" /> rewrite reverted — {b.violation}
+                      </p>
+                    )}
+                    {b.fabrication_risk && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-signal">
+                        <AlertTriangle className="h-3.5 w-3.5" /> {b.fabrication_risk}
+                      </p>
+                    )}
+                  </li>
+                ))}
               </ul>
             </SectionCard>
           )}

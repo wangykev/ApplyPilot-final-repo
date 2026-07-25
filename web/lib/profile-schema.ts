@@ -54,6 +54,25 @@ export const educationSchema = z.object({
   to_year: str, // "YYYY"
   graduation_date: str, // "YYYY-MM"
   currently_enrolled: bool, // checkbox
+  // Resume-only: the "Relevant Coursework: …" line under this school. coerceProfile
+  // bridges the extension profile's application_questions.role_specific.coursework_relevant
+  // into entry 0 so an imported profile keeps its education section intact.
+  coursework: z.array(z.string()).default([]),
+});
+
+// Resume-only section (not on any Workday fill path) — LOCKSTEP with the extension's
+// data/profile.example.json projects shape. `bullets[]` stays an array here (unlike
+// work_experience's role_description textarea) because no editor renders it yet.
+export const projectSchema = z.object({
+  name: str,
+  role: str,
+  from: str, // "YYYY-MM"
+  to: str, // "YYYY-MM"
+  summary: str,
+  bullets: z.array(z.string()).default([]),
+  tech_stack: z.array(z.string()).default([]),
+  link: str,
+  github: str,
 });
 
 export const workExperienceSchema = z.object({
@@ -183,6 +202,7 @@ export const profileSchema = z.object({
   websites: z.array(websiteSchema).default([]),
   work_experience: z.array(workExperienceSchema).default([]),
   education: z.array(educationSchema).default([]),
+  projects: z.array(projectSchema).default([]),
   skills: z.array(z.string()).default([]),
   languages: z.array(languageSchema).default([]),
   certifications: z.array(certificationSchema).default([]),
@@ -216,6 +236,7 @@ export type Profile = z.infer<typeof profileSchema>;
 export type Website = z.infer<typeof websiteSchema>;
 export type Education = z.infer<typeof educationSchema>;
 export type WorkExperience = z.infer<typeof workExperienceSchema>;
+export type Project = z.infer<typeof projectSchema>;
 export type Language = z.infer<typeof languageSchema>;
 export type Certification = z.infer<typeof certificationSchema>;
 export type FileRef = z.infer<typeof fileRefSchema>;
@@ -279,6 +300,18 @@ export function coerceProfile(raw: unknown): Profile {
   }
   obj.work_authorization = wa;
 
+  // Bridge the extension profile's global coursework list into education[0].coursework
+  // (the resume renders it as the "Relevant Coursework: …" line under the school).
+  const aq = obj.application_questions as Record<string, unknown> | undefined;
+  const rs = aq?.role_specific as Record<string, unknown> | undefined;
+  const coursework = rs?.coursework_relevant;
+  if (Array.isArray(coursework) && coursework.length && Array.isArray(obj.education) && obj.education[0] && typeof obj.education[0] === "object") {
+    const e0 = obj.education[0] as Record<string, unknown>;
+    if (!Array.isArray(e0.coursework) || !e0.coursework.length) {
+      obj.education = [{ ...e0, coursework: coursework.filter(Boolean).map(String) }, ...(obj.education as unknown[]).slice(1)];
+    }
+  }
+
   const parsed = profileSchema.safeParse(obj);
   return parsed.success ? parsed.data : emptyProfile();
 }
@@ -305,6 +338,7 @@ export function mergeProfile(base: Profile, incoming: Profile): Profile {
     "websites",
     "work_experience",
     "education",
+    "projects",
     "skills",
     "languages",
     "certifications",
