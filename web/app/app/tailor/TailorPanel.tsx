@@ -1,13 +1,17 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
-import { WandSparkles, Printer, FileDown, FileCheck2, AlertTriangle, ShieldCheck, Sparkles } from "lucide-react";
+import { WandSparkles, Printer, FileDown, FileCheck2, FileUp, X, AlertTriangle, ShieldCheck, Sparkles } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { TextAreaField } from "@/components/form/fields";
 import { clsx } from "@/lib/clsx";
-import { tailorResume, compileLatexPdf, type JdApplication } from "./actions";
+import { tailorResume, tailorResumeTex, compileLatexPdf, type JdApplication } from "./actions";
 import type { TailorMode, TailoredResume } from "@/lib/tailor";
+import type { TexTailorResult } from "@/lib/tex-tailor";
+
+const TEX_LS_KEY = "applypilot.tailor.tex";
+const TEX_NAME_LS_KEY = "applypilot.tailor.texName";
 
 /** The "Original" view: the uploaded PDF when one is stored (`uploadedUrl` — the
  *  REAL original), plus the profile-generated rendition + exports as fallback. */
@@ -46,12 +50,52 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
   const [latexPdf, setLatexPdf] = useState<string | null>(null);
   const [compiling, setCompiling] = useState(false);
   const [compileErr, setCompileErr] = useState<string | null>(null);
+  // RESUME-FIRST source: the user's actual .tex (kept on this device) + its tailoring result.
+  const [texSrc, setTexSrc] = useState<string | null>(null);
+  const [texName, setTexName] = useState<string>("");
+  const [texOut, setTexOut] = useState<TexTailorResult | null>(null);
 
-  async function compilePdf() {
-    if (!out) return;
+  useEffect(() => {
+    try {
+      const t = localStorage.getItem(TEX_LS_KEY);
+      if (t) {
+        setTexSrc(t);
+        setTexName(localStorage.getItem(TEX_NAME_LS_KEY) || "resume.tex");
+      }
+    } catch {
+      /* private mode etc. */
+    }
+  }, []);
+
+  async function onTexFile(f: File) {
+    const text = await f.text();
+    setTexSrc(text);
+    setTexName(f.name);
+    setTexOut(null);
+    try {
+      localStorage.setItem(TEX_LS_KEY, text);
+      localStorage.setItem(TEX_NAME_LS_KEY, f.name);
+    } catch {
+      /* too big / private mode — session-only then */
+    }
+  }
+
+  function clearTex() {
+    setTexSrc(null);
+    setTexName("");
+    setTexOut(null);
+    try {
+      localStorage.removeItem(TEX_LS_KEY);
+      localStorage.removeItem(TEX_NAME_LS_KEY);
+    } catch {
+      /* noop */
+    }
+  }
+
+  async function compileFrom(tex: string) {
     setCompiling(true);
     setCompileErr(null);
-    const res = await compileLatexPdf({ tex: out.tex });
+    const res = await compileLatexPdf({ tex });
     setCompiling(false);
     if (!res.ok) {
       setCompileErr(res.error);
@@ -65,6 +109,8 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
     });
   }
 
+  const compilePdf = () => out && compileFrom(out.tex);
+
   const pickApp = (id: string) => {
     setAppId(id);
     const app = apps.find((a) => a.id === id);
@@ -74,15 +120,31 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
   const run = () =>
     startTransition(async () => {
       setErr(null);
+      setCompileErr(null);
+      setLatexPdf((prev) => {
+        if (prev) URL.revokeObjectURL(prev); // stale compile of the previous tailoring
+        return null;
+      });
+
+      if (texSrc) {
+        // RESUME-FIRST: edit the actual .tex; profile is not involved.
+        setOut(null);
+        const res = await tailorResumeTex({ jobDescription: jd, mode, tex: texSrc });
+        if (res.ok) {
+          setTexOut(res.result);
+          void compileFrom(res.result.tex); // the preview IS the compiled document
+        } else {
+          setTexOut(null);
+          setErr({ text: res.error, aiLink: res.error.toLowerCase().includes("api key") });
+        }
+        return;
+      }
+
       const res = await tailorResume({ jobDescription: jd, mode });
       if (res.ok) {
+        setTexOut(null);
         setOut({ result: res.result, tex: res.tex, printHtml: res.printHtml });
         setView("tailored");
-        setCompileErr(null);
-        setLatexPdf((prev) => {
-          if (prev) URL.revokeObjectURL(prev); // stale compile of the previous tailoring
-          return null;
-        });
       } else {
         setOut(null);
         setErr({ text: res.error, aiLink: res.error.toLowerCase().includes("api key") });
@@ -170,6 +232,45 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
       </SectionCard>
 
       <SectionCard
+        title="Resume source"
+        subtitle="Best: upload your resume's .tex — tailoring edits ITS bullets and leaves every other line of your document byte-identical. Without it, the resume is rebuilt from your profile data."
+      >
+        {texSrc ? (
+          <div className="flex items-center gap-3 rounded-lg border border-hairline bg-panel-raised/50 p-3">
+            <FileCheck2 className="h-5 w-5 shrink-0 text-verified" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm text-ink">{texName}</div>
+              <div className="font-mono text-[11px] text-ink-faint">
+                your .tex is the base — only bullet lines can change (kept on this device)
+              </div>
+            </div>
+            <button
+              onClick={clearTex}
+              className="inline-flex items-center gap-1.5 text-xs text-ink-faint transition-colors hover:text-signal"
+              title="Remove — fall back to profile-based tailoring"
+            >
+              <X className="h-3.5 w-3.5" /> Remove
+            </button>
+          </div>
+        ) : (
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-4 py-3 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
+            <FileUp className="h-4 w-4" />
+            Upload your resume .tex
+            <input
+              type="file"
+              accept=".tex,text/x-tex,application/x-tex"
+              className="sr-only"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) onTexFile(f);
+              }}
+            />
+          </label>
+        )}
+      </SectionCard>
+
+      <SectionCard
         title="Tailoring mode"
         subtitle="Three levels, escalating from safest to most aggressive. Every AI change is shown for review — never silent."
       >
@@ -221,6 +322,125 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
           )}
         </div>
       </SectionCard>
+
+      {texOut && (
+        <>
+          <SectionCard
+            title="Tailored resume — your .tex, edited"
+            subtitle="Only bullet lines changed; the rest of your document is byte-identical. The preview is the compiled PDF."
+            actions={
+              <div className="flex items-center gap-2">
+                {latexPdf && (
+                  <a href={latexPdf} download="resume-tailored.pdf" className="btn-ghost px-3 py-1.5 text-xs text-verified">
+                    <FileCheck2 className="h-3.5 w-3.5" /> Download PDF
+                  </a>
+                )}
+                <button
+                  onClick={() => {
+                    const blob = new Blob([texOut.tex], { type: "application/x-tex" });
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = "resume-tailored.tex";
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                  }}
+                  className="btn-ghost px-3 py-1.5 text-xs"
+                >
+                  <FileDown className="h-3.5 w-3.5" /> Download .tex
+                </button>
+              </div>
+            }
+          >
+            <div className="mb-4 flex flex-wrap gap-2 font-mono text-[11px]">
+              <span className="rounded-md border border-hairline px-2 py-1 text-ink-dim">mode: {mode}</span>
+              {(() => {
+                const replaced = texOut.records.filter((x) => x.action === "replaced").length;
+                const dropped = texOut.records.filter((x) => x.action === "dropped").length;
+                const risks = texOut.records.filter((x) => x.fabrication_risk).length;
+                return (
+                  <>
+                    {replaced > 0 && <span className="rounded-md border border-amber/40 px-2 py-1 text-amber">{replaced} AI-reworded</span>}
+                    {dropped > 0 && <span className="rounded-md border border-hairline px-2 py-1 text-ink-dim">{dropped} dropped</span>}
+                    {texOut.reverted_count > 0 && (
+                      <span className="rounded-md border border-verified/40 px-2 py-1 text-verified">
+                        {texOut.reverted_count} rewrite{texOut.reverted_count === 1 ? "" : "s"} reverted by the fact-check
+                      </span>
+                    )}
+                    {risks > 0 && (
+                      <span className="rounded-md border border-signal/40 px-2 py-1 text-signal">{risks} fabrication risk{risks === 1 ? "" : "s"} — verify below</span>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+            {compileErr && <p className="mb-3 text-sm text-signal">{compileErr}</p>}
+            {latexPdf ? (
+              <iframe title="Tailored resume (LaTeX PDF)" src={latexPdf} className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner" />
+            ) : (
+              <div className="flex h-40 items-center justify-center rounded-lg border border-hairline text-sm text-ink-dim">
+                {compiling ? "Compiling your LaTeX…" : "Compile pending"}
+              </div>
+            )}
+          </SectionCard>
+
+          {texOut.records.some((x) => x.action !== "kept" || x.violation || x.fabrication_risk) && (
+            <SectionCard title="What the AI changed" subtitle="Per bullet: was vs now. Reverted rewrites failed the deterministic fact-check.">
+              <ul className="space-y-3">
+                {texOut.records
+                  .filter((x) => x.action !== "kept" || x.violation || x.fabrication_risk)
+                  .map((x) => (
+                    <li key={x.id} className="rounded-lg border border-hairline bg-panel-raised p-3 text-sm">
+                      <div className="mb-1 font-mono text-[10px] uppercase tracking-label text-ink-faint">{x.context || x.id}</div>
+                      <p className="text-ink-dim">
+                        <span className="font-mono text-[10px] text-ink-faint">was&nbsp;&nbsp;</span>
+                        {x.was}
+                      </p>
+                      {x.action === "dropped" ? (
+                        <p className="mt-1 font-mono text-[11px] text-ink-dim">dropped for this job</p>
+                      ) : (
+                        <p className={clsx("mt-1", x.fabrication_risk ? "text-signal" : x.violation ? "text-ink" : "text-amber")}>
+                          <span className="font-mono text-[10px] text-ink-faint">now&nbsp;</span>
+                          {x.now}
+                        </p>
+                      )}
+                      {x.violation && (
+                        <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-verified">
+                          <ShieldCheck className="h-3.5 w-3.5" /> rewrite reverted — {x.violation}
+                        </p>
+                      )}
+                      {x.fabrication_risk && (
+                        <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-signal">
+                          <AlertTriangle className="h-3.5 w-3.5" /> {x.fabrication_risk}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+              </ul>
+            </SectionCard>
+          )}
+
+          {(texOut.gaps.length > 0 || texOut.rationale) && (
+            <SectionCard title="Honest read" subtitle="What this job asks for that your resume can't claim — surfaced, never papered over.">
+              {texOut.gaps.length > 0 && (
+                <ul className="space-y-1.5 text-sm text-ink">
+                  {texOut.gaps.map((g, i) => (
+                    <li key={i} className="flex gap-2">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber" />
+                      <span>{g}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {texOut.rationale && (
+                <p className="mt-3 flex gap-2 text-xs leading-relaxed text-ink-dim">
+                  <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-ink-faint" />
+                  {texOut.rationale}
+                </p>
+              )}
+            </SectionCard>
+          )}
+        </>
+      )}
 
       {active && (
         <>
