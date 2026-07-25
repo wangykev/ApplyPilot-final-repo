@@ -346,6 +346,13 @@ test("documents: Projects + coursework/GPA render in BOTH tex and print HTML", (
   assert.match(html, /Relevant Coursework: Intro to Computer Systems/);
 });
 
+test("tailoredToTex: pdfTeX-only lines are \\ifdefined-guarded (same .tex compiles under tectonic/XeTeX)", () => {
+  const tex = tailoredToTex(PROFILE, identityResume(PROFILE));
+  assert.match(tex, /\\ifdefined\\pdfgentounicode\\input\{glyphtounicode\}\\fi/);
+  assert.match(tex, /\\ifdefined\\pdfgentounicode\\pdfgentounicode=1\\fi/);
+  assert.ok(!/^\\pdfgentounicode=1$/m.test(tex), "no unguarded pdfTeX primitive");
+});
+
 test("tailoredToTex: sb2nov skeleton + escaped content + only included experiences", () => {
   const tailored = parseTailorReply(
     JSON.stringify({

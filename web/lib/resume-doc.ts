@@ -94,7 +94,9 @@ const TEX_PREAMBLE = String.raw`%-------------------------
 \usepackage{fancyhdr}
 \usepackage[english]{babel}
 \usepackage{tabularx}
-\input{glyphtounicode}
+% pdfTeX-only (machine-readable text mapping) — guarded so the SAME .tex also
+% compiles under XeTeX engines (tectonic), which emit Unicode-native PDFs anyway.
+\ifdefined\pdfgentounicode\input{glyphtounicode}\fi
 
 \pagestyle{fancy}
 \fancyhf{}
@@ -117,8 +119,8 @@ const TEX_PREAMBLE = String.raw`%-------------------------
   \vspace{-4pt}\scshape\raggedright\large
 }{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
 
-% Ensure the generated pdf is machine readable/ATS parsable
-\pdfgentounicode=1
+% Ensure the generated pdf is machine readable/ATS parsable (pdfTeX engines)
+\ifdefined\pdfgentounicode\pdfgentounicode=1\fi
 
 \newcommand{\resumeItem}[1]{
   \item\small{

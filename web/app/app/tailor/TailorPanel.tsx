@@ -2,11 +2,11 @@
 
 import { useMemo, useState, useTransition } from "react";
 import Link from "next/link";
-import { WandSparkles, Printer, FileDown, AlertTriangle, ShieldCheck, Sparkles } from "lucide-react";
+import { WandSparkles, Printer, FileDown, FileCheck2, AlertTriangle, ShieldCheck, Sparkles } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { TextAreaField } from "@/components/form/fields";
 import { clsx } from "@/lib/clsx";
-import { tailorResume, type JdApplication } from "./actions";
+import { tailorResume, compileLatexPdf, type JdApplication } from "./actions";
 import type { TailorMode, TailoredResume } from "@/lib/tailor";
 
 /** The "Original" view: the uploaded PDF when one is stored (`uploadedUrl` — the
@@ -42,6 +42,28 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
   const [view, setView] = useState<"tailored" | "original">("tailored");
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<{ text: string; aiLink?: boolean } | null>(null);
+  // The compiled LaTeX PDF of the TAILORED resume (blob URL) — the exact template.
+  const [latexPdf, setLatexPdf] = useState<string | null>(null);
+  const [compiling, setCompiling] = useState(false);
+  const [compileErr, setCompileErr] = useState<string | null>(null);
+
+  async function compilePdf() {
+    if (!out) return;
+    setCompiling(true);
+    setCompileErr(null);
+    const res = await compileLatexPdf({ tex: out.tex });
+    setCompiling(false);
+    if (!res.ok) {
+      setCompileErr(res.error);
+      return;
+    }
+    const bytes = Uint8Array.from(atob(res.pdfBase64), (c) => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    setLatexPdf((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return url;
+    });
+  }
 
   const pickApp = (id: string) => {
     setAppId(id);
@@ -56,6 +78,11 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
       if (res.ok) {
         setOut({ result: res.result, tex: res.tex, printHtml: res.printHtml });
         setView("tailored");
+        setCompileErr(null);
+        setLatexPdf((prev) => {
+          if (prev) URL.revokeObjectURL(prev); // stale compile of the previous tailoring
+          return null;
+        });
       } else {
         setOut(null);
         setErr({ text: res.error, aiLink: res.error.toLowerCase().includes("api key") });
@@ -204,7 +231,7 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
                 ? original?.uploadedUrl
                   ? "Your uploaded PDF — exactly what gets attached to applications. Tailoring rebuilds the document from your PROFILE data, so the tailored version's layout will differ from this file."
                   : "Generated from your PROFILE data — no uploaded PDF stored (upload one on the Resume page to see the real file here). If content is missing, your profile is missing it — parse your resume or edit the profile."
-                : "Save as PDF opens the print dialog (choose “Save as PDF”). The .tex compiles in Overleaf with your exact template."
+                : "“LaTeX PDF” compiles your tailored resume in your EXACT sb2nov template (needs the local engine — see .env.example). Quick PDF is the plain print-dialog fallback; the .tex opens in Overleaf."
             }
             actions={
               <div className="flex items-center gap-2">
@@ -231,8 +258,18 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
                     is already a file (the browser's PDF viewer has its own download) */}
                 {!(showingOriginal && original?.uploadedUrl) && (
                   <>
+                    {!showingOriginal &&
+                      (latexPdf ? (
+                        <a href={latexPdf} download="resume-tailored.pdf" className="btn-ghost px-3 py-1.5 text-xs text-verified">
+                          <FileCheck2 className="h-3.5 w-3.5" /> Download PDF
+                        </a>
+                      ) : (
+                        <button onClick={compilePdf} disabled={compiling} className="btn-ghost px-3 py-1.5 text-xs">
+                          <FileCheck2 className="h-3.5 w-3.5" /> {compiling ? "Compiling…" : "LaTeX PDF (your template)"}
+                        </button>
+                      ))}
                     <button onClick={savePdf} className="btn-ghost px-3 py-1.5 text-xs">
-                      <Printer className="h-3.5 w-3.5" /> Save as PDF
+                      <Printer className="h-3.5 w-3.5" /> Quick PDF
                     </button>
                     <button onClick={downloadTex} className="btn-ghost px-3 py-1.5 text-xs">
                       <FileDown className="h-3.5 w-3.5" /> Download .tex
@@ -262,13 +299,22 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
               </div>
             )}
 
-            {/* Original + PDF stored → the ACTUAL uploaded file; otherwise the EXACT
-                print document (what Save-as-PDF emits), full page. The PDF iframe is
-                unsandboxed — the browser's PDF viewer needs its own scripts. */}
+            {compileErr && !showingOriginal && (
+              <p className="mb-3 text-sm text-signal">{compileErr}</p>
+            )}
+            {/* Original + PDF stored → the ACTUAL uploaded file. Tailored + compiled →
+                the LaTeX PDF (exact template). Otherwise the print document (what
+                Quick-PDF emits). PDF iframes are unsandboxed — the viewer needs scripts. */}
             {showingOriginal && original?.uploadedUrl ? (
               <iframe
                 title="Uploaded resume PDF"
                 src={original.uploadedUrl}
+                className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner"
+              />
+            ) : !showingOriginal && latexPdf ? (
+              <iframe
+                title="Tailored resume (LaTeX PDF)"
+                src={latexPdf}
                 className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner"
               />
             ) : (
