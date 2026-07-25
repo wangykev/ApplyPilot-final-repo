@@ -184,9 +184,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // halt); the message may override, and the stored toggle wins if explicitly OFF.
         const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
         // Background fill (the website "Run in background" button): open the job tab UNFOCUSED
-        // (active:false) so the operator stays on the Run page while the pipeline works. The whole
-        // CDP substrate is already hidden-safe (worker-timers override + adaptive pacing + cdpWakePage),
-        // so nothing downstream changes — a genuinely-unrenderable step still halts self-explaining
+        // (active:false) so the operator stays on the Run page while the pipeline works — TRULY
+        // hidden (operator requirement 2026-07-25; the visible mini-window variant was built and
+        // REVERTED same day — see progress-log). Hidden-tab speed comes from the SYNTHETIC-INPUT
+        // mode (cdp.js): page-side event dispatch via Runtime.evaluate replaces the frame-gated
+        // Input.* pipeline (~1.2–1.5s/event hidden), with worker-timers + CSP bypass keeping the
+        // page's own reactions fast. A genuinely-unrenderable step still halts self-explaining
         // (e.g. hidden-render-stalled) rather than guessing.
         const background = message.background === true;
 
@@ -196,7 +199,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
         const tabId = tab.id;
-        console.log(`[ApplyPilot][RUN] opened job tab ${tabId} (${background ? "BACKGROUND — unfocused, hidden-safe pacing" : "foreground"})`);
+        console.log(`[ApplyPilot][RUN] opened job tab ${tabId} (${background ? "BACKGROUND — hidden; synthetic-input fast path" : "foreground"})`);
         await waitTabComplete(tabId, 20000);
         await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
 
@@ -2071,7 +2074,8 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
   // on a same-pathname SPA). Computed BEFORE the fill (a field-revealing fill could change
   // the field-set). NOT cdpPageSig (full url incl. query).
-  const pageKey = cdpPageKey(await cdpEval(cdpPageScan));
+  const preScan = await cdpEval(cdpPageScan);
+  const pageKey = cdpPageKey(preScan);
   // Plan 2: the walk passes its 1..N ordinal so the bundle carries a stable page_number (display
   // order) + a friendly page_label; single-page fills (no ordinal) leave them null (viewer derives).
   const pageNumber = (opts && opts.pageNumber != null) ? opts.pageNumber : null;
@@ -2104,27 +2108,65 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // review of each.
   //
   // MUST poll on delayFull (REAL wall-clock), NOT delayRender: delayRender is adaptive and on a
-  // VISIBLE tab collapses to ~40ms, so three reads land within ~120ms — far faster than the page
-  // renders — and the count looks "stable" while only the first field (e.g. Country) exists, exactly
-  // the bug this is meant to fix. We are waiting on the PAGE's own render, which takes real time
-  // regardless of our pacing. Break only after the count holds UNCHANGED across 3 consecutive reads
-  // (~1.5s of no growth); bounded at 12s; a page with no flat fields (repeating-only, e.g. My
-  // Experience) bails after a short all-zero grace. Genuine value-triggered cascades still appear
-  // only AFTER a commit → they remain the cascade re-scan's job; this settles the INITIAL load only.
+  // VISIBLE tab collapses to ~40ms, so a read-count-based stability check would span ~120ms — far
+  // faster than the page renders — and the count looks "stable" while only the first field (e.g.
+  // Country) exists, exactly the bug this is meant to fix. We are waiting on the PAGE's own render,
+  // which takes real time regardless of our pacing. The guarantee is therefore WALL-CLOCK: break only
+  // after a NON-ZERO count has held UNCHANGED for ≥1.2s of real time (2026-07-25 speed round — was "3
+  // consecutive reads at 500ms" ≈ the same ~1.5s window but paying its full discretization every page;
+  // polling at 150ms keeps the guarantee measured in wall-clock while shaving the slop). Bounded at
+  // 12s; a page with no flat fields (repeating-only, e.g. My Experience) bails after ~1s of all-zero
+  // reads. Genuine value-triggered cascades still appear only AFTER a commit → they remain the cascade
+  // re-scan's job; this settles the INITIAL load only.
+  const _settleT0 = Date.now();
   {
-    let last = -1, stable = 0, zeroReads = 0;
+    const NO_GROWTH_MS = 1200, ZERO_BAIL_MS = 1000, POLL_MS = 150;
+    let last = -1, lastChangeAt = 0, zeroSince = null;
     const t0 = Date.now();
     while (Date.now() - t0 < 12000) {
       let n = 0;
-      try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → keep polling */ }
-      if (n === 0) { if (++zeroReads >= 3) break; stable = 0; last = 0; await act.delayFull(500); continue; }
-      zeroReads = 0;
-      if (n === last) { if (++stable >= 3) break; } else stable = 0;
-      last = n;
-      await act.delayFull(500);
+      try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → counts as a zero read (keep polling) */ }
+      const now = Date.now();
+      if (n === 0) { if (zeroSince == null) zeroSince = now; if (now - zeroSince >= ZERO_BAIL_MS) break; last = -1; await act.delayFull(POLL_MS); continue; }
+      zeroSince = null;
+      if (n !== last) { last = n; lastChangeAt = now; }
+      else if (now - lastChangeAt >= NO_GROWTH_MS) break;
+      await act.delayFull(POLL_MS);
     }
   }
-  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets });
+  const settleMs = Date.now() - _settleT0;
+  // Cross-run option-list cache (cosmetic — feeds the review editor's choice lists; see
+  // captureChoiceOptions in fill-driver.js). SW does the I/O (engine computes): load THIS tenant's
+  // slice, hand the plain object to the driver (mutated in place), persist the merged store after the
+  // fill. A stale list can never cause a wrong fill — the fill/match ladder always reads live options.
+  const tenantKey = (() => { try { return new URL(preScan.url).hostname; } catch (e) { return null; } })();
+  let optionStore = {}, optionCache = {};
+  if (tenantKey) {
+    try {
+      optionStore = await new Promise((r) => chrome.storage.local.get("optionListCache", (s) => r((s && s.optionListCache) || {})));
+      optionCache = (optionStore && typeof optionStore[tenantKey] === "object" && optionStore[tenantKey]) || {};
+    } catch (e) { optionStore = {}; optionCache = {}; }
+  }
+  const _fillT0 = Date.now();
+  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets, optionCache });
+  const fillMs = Date.now() - _fillT0;
+  // Persist the (possibly grown) option cache — best-effort, TTL-pruned + bounded so storage stays small.
+  if (tenantKey) {
+    try {
+      const TTL = 7 * 24 * 3600 * 1000;
+      const pruned = {};
+      Object.keys(optionCache)
+        .filter((k) => optionCache[k] && Array.isArray(optionCache[k].options) && (Date.now() - (optionCache[k].at || 0)) < TTL)
+        .sort((a, b) => (optionCache[b].at || 0) - (optionCache[a].at || 0))
+        .slice(0, 64)
+        .forEach((k) => { pruned[k] = optionCache[k]; });
+      optionStore[tenantKey] = pruned;
+      const newestAt = (t) => Object.keys(optionStore[t] || {}).reduce((m, k) => Math.max(m, (optionStore[t][k] && optionStore[t][k].at) || 0), 0);
+      const tenants = Object.keys(optionStore).sort((a, b) => newestAt(b) - newestAt(a));
+      for (const stale of tenants.slice(12)) delete optionStore[stale]; // cap tenants (newest 12)
+      await new Promise((r) => chrome.storage.local.set({ optionListCache: optionStore }, r));
+    } catch (e) { /* cache persist is best-effort — never fail the page over it */ }
+  }
 
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
@@ -2160,6 +2202,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // Exclude nested-attachment records (a cert's per-entry Attachments — its own in-section attach
   // path): on a page with no top-level upload, the bare find() would grab a cert's record and
   // patch the résumé onto the WRONG field.
+  const _attachT0 = Date.now();
   const uploadRec = out.results.find((r) => r.widgetType === "file_upload" && r.flag !== "nested-attachment");
   if (uploadRec) {
     let resumeRec = null;
@@ -2190,6 +2233,22 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
         LOG("resume: NOT attached —", uploadRec.detail);
       }
     }
+  }
+
+  // [CDP-TIME] per-page wall-clock breakdown (2026-07-25 speed round): where the page's time actually
+  // went — the pre-fill settle, the fill phases (from drivePageFill's timings), the resume attach —
+  // plus the slowest individual fields (rec.elapsedMs). Log-only; this is the evidence future pacing
+  // rounds retune from (the fast/slow regime, cold option lists, server-bound typeahead filters…).
+  {
+    const attachMs = Date.now() - _attachT0;
+    const ph = out.timings || {};
+    const s = (ms) => (typeof ms === "number" ? (Math.round(ms / 100) / 10) + "s" : "–");
+    const slow = (out.results || [])
+      .filter((r) => (r.elapsedMs || 0) >= 1500)
+      .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
+      .map((r) => `${r.fieldName} ${s(r.elapsedMs)}`).join(", ");
+    let pacing = "?"; try { pacing = await cdpPacingLabel(); } catch (e) { /* label only */ }
+    LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
   }
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
@@ -2638,6 +2697,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
       return { ok: false, error: "attach-failed:" + attached.error };
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so a hidden single-page fill behaves like the walk
+    cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); auth/onboarding/recon stay trusted
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
@@ -2784,6 +2844,8 @@ async function runCdpReplayWalk(tabId, opts) {
       else LOG("⚠ REFILL: no profile in storage — a page not in the bundle can't be fresh-filled and will HALT. Click 'Load default profile' first to enable fresh-fill of never-reached pages.");
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
+    // NOTE: synthetic input stays OFF for the REPLAY walk (default) — the submit-adjacent path keeps
+    // the battle-tested trusted primitives until the fill walk's synthetic mode is live-verified.
     LOG(authorize
       ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
       : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
@@ -3149,11 +3211,17 @@ async function reclickNextWhenClean(act, prevSig, tries, LOG) {
 // shows VPS banners on the SAME page — no transition — so sessionLooksDead is what
 // fires), else a hydrated page-signature change (steady across two reads). Mid-nav
 // read errors are "not ready, keep polling".
+// ADAPTIVE poll interval (2026-07-25 speed round): the old fixed 500ms cdpDelay paid up to ~1s of
+// discretization per page transition (detection + the two-read steady confirm). Every exit condition
+// here is a STATE check (session-dead / maintenance / sig-changed / hydrated-steady), so a shorter
+// beat only re-polls sooner — and fillAndPersistPage's own pre-fill settle (the wall-clock no-growth
+// window) still guards progressive field mounting after we return. Hidden+throttled (no worker
+// timers) keeps the full 500ms beat, byte-identical to the proven slow path.
 async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
   const start = Date.now();
-  let steady = -1, errSteady = 0;
+  let steady = -1, errSince = 0;
   while (Date.now() - start < timeoutMs) {
-    await cdpDelay(intervalMs);
+    await cdpAdaptiveDelay(intervalMs);
     // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
     // hidden page-2→3 stall (2026-07-03). No-op when visible/not-frozen. See cdpWakePage.
     await cdpWakePage();
@@ -3170,17 +3238,21 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
       // FAST validation-error exit: the page did NOT advance AND shows error markers → it errored
       // (Workday never advances past a validation error). errors-present ⟺ won't-advance, so this
       // can't skip a real advance (a successful re-fill clears the errors AND changes sig → the
-      // advanced path below fires instead). Two consecutive reads guard a transient flicker during a
-      // real transition → ~1s instead of burning the full ceiling. sessionLooksDead is checked first.
+      // advanced path below fires instead). The transient-flicker guard is WALL-CLOCK (errors must
+      // persist ≥600ms before we conclude) — was "two consecutive reads", which at the old fixed
+      // 500ms beat meant ~1s; the adaptive beat would have collapsed it to ~100ms, too weak against
+      // a flicker during a real transition. sessionLooksDead is checked first.
       // Count EXPANDED errors, not raw markers: the raw count includes [role=alert] SUCCESS toasts
       // ("resume successfully uploaded"), which persist through a slow clean transition — a toast-only
       // page must never fast-exit as a validation error (2026-07-02).
       const errCount = state ? expandErrorSamples((state.errorMarkers && state.errorMarkers.samples) || []).length : 0;
-      errSteady = errCount > 0 ? errSteady + 1 : 0;
-      if (errSteady >= 2) return { advanced: false, timeout: true, errorDetected: true, errors: (state.errorMarkers.samples || []) };
+      if (errCount > 0) {
+        if (!errSince) errSince = Date.now();
+        if (Date.now() - errSince >= 600) return { advanced: false, timeout: true, errorDetected: true, errors: (state.errorMarkers.samples || []) };
+      } else errSince = 0;
       continue;
     }
-    errSteady = 0;
+    errSince = 0;
     if (scan.fields.length === steady) return { advanced: true, sig };
     steady = scan.fields.length;
   }
@@ -3232,6 +3304,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so page-to-page advancement runs while backgrounded
+    cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); onboarding/auth ran trusted on its own attach
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
@@ -3926,6 +3999,10 @@ async function runCdpOnboard(tabId, opts) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides();
+    // NOTE: synthetic input stays OFF for ONBOARDING (default) — the auth screens are the one surface
+    // the synthetic repertoire failed live (2026-07-25: fields read back OK but the Sign In submit
+    // never fired — the auth app doesn't register native-setter values / untrusted clicks the way the
+    // application form does). Trusted input costs only ~15-25s here (a few fields + clicks).
     await cdpSetFocusEmulation(true); // best-effort: keep a hidden/backgrounded tab repainting (SPA sub-view transitions defer on rAF, paused when hidden)
     LOG("attached. Onboarding: JD → Apply → Apply Manually → sign-in/create-account → verify → land on the form. Keep the tab VISIBLE to watch. Never submits.");
 

@@ -85,6 +85,12 @@ function cdpAttach(tabId) {
         await cdpSend("Page.enable", {}); // required for Page.addScriptToEvaluateOnNewDocument (cdpInstallPageOverrides)
         // Refresh the debug input-trace toggle per run (popup checkbox → chrome.storage.local).
         try { const { debugInputTrace } = await new Promise((r) => chrome.storage.local.get("debugInputTrace", r)); setInputTrace(!!debugInputTrace); } catch (e) { /* default stays OFF */ }
+        // Synthetic-input kill-switch (2026-07-25): forceTrustedInput=true reverts HIDDEN fills to the
+        // trusted Input.* path (slow-but-battle-tested) — the escape hatch if a tenant's widgets
+        // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
+        try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
+        _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
+        console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
         resolve({ ok: true });
       } catch (e) {
         resolve({ ok: false, error: String((e && e.message) || e) });
@@ -210,11 +216,12 @@ async function cdpSetFocusEmulation(enabled) {
 // path can be exercised on demand (Workday's real CSP is an empirical unknown).
 let _workerTimersActive = false; // did the worker-timers polyfill install on the CURRENT doc? (set by cdpInstallPageOverrides readback; reset at attach)
 
-function buildOverrideSrc(opts) {
-  const forceNoWorker = !!(opts && opts.forceNoWorker);
-  const workerBlock = forceNoWorker
-    ? `window.__apWorkerTimers = false; /* forceWorkerTimersOff — simulate a CSP-blocked tenant (slow-path test) */`
-    : `try {
+// The worker-timers block, extracted (2026-07-25) so the CSP-bypass RETRY (cdpInstallPageOverrides)
+// can re-run JUST this block on a doc whose first attempt was CSP-blocked — without re-running the
+// full override (guarded by __apOverridesInstalled) or duplicating the source. Sets
+// window.__apWorkerTimers true/false itself; rAF picks up the replaced window.setTimeout dynamically
+// (it resolves window.setTimeout at call time, not install time).
+const WORKER_TIMERS_SRC = `try {
       var __wsrc = "var m={};onmessage=function(e){var d=e.data;" +
         "if(d.c==='s'){m[d.i]=setTimeout(function(){delete m[d.i];postMessage(d.i);},d.ms);}" +
         "else if(d.c==='v'){m[d.i]=setInterval(function(){postMessage(d.i);},d.ms);}" +
@@ -229,6 +236,23 @@ function buildOverrideSrc(opts) {
       window.clearInterval = function (i) { delete __cbs[i]; __w.postMessage({ c: "x", i: i }); };
       window.__apWorkerTimers = true;
     } catch (e) { window.__apWorkerTimers = false; }`;
+
+// Re-run ONLY the worker-timers block on a doc where the full override already installed but the
+// worker did NOT take (window.__apWorkerTimers !== true) — used after Page.setBypassCSP flips CSP
+// enforcement off so the blob: worker that was blocked on the first attempt can now install.
+// Idempotent: no-ops when the override never installed or the worker is already live.
+function buildWorkerRetrySrc() {
+  return `(function () { try {
+    if (!window.__apOverridesInstalled || window.__apWorkerTimers === true) return;
+    ${WORKER_TIMERS_SRC}
+  } catch (e) { /* best-effort */ } })();`;
+}
+
+function buildOverrideSrc(opts) {
+  const forceNoWorker = !!(opts && opts.forceNoWorker);
+  const workerBlock = forceNoWorker
+    ? `window.__apWorkerTimers = false; /* forceWorkerTimersOff — simulate a CSP-blocked tenant (slow-path test) */`
+    : WORKER_TIMERS_SRC;
   return `(function () {
   try {
     if (window.__apOverridesInstalled) return;
@@ -259,6 +283,18 @@ function buildOverrideSrc(opts) {
 async function cdpInstallPageOverrides() {
   let forceNoWorker = false;
   try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
+  // CSP BYPASS (2026-07-25 — the wd3.myworkdaysite.com slow-run diagnosis): a tenant whose CSP blocks
+  // blob: workers silently killed the WHOLE fast hidden path — the worker-timers install threw, the
+  // readback stayed false, and every page-side debounce/render quantized to the ~1Hz throttle (the
+  // live run's uniform ~11s/field). We are ALREADY attached via chrome.debugger, so ask the browser
+  // to bypass CSP enforcement for this page (the standard Puppeteer page.setBypassCSP technique) —
+  // then the blob: worker installs and the measured-fast gate does the rest. BEST-EFFORT + logged:
+  // an old Chrome / restricted command just leaves CSP on → the readback stays false → the safe
+  // slow path, byte-identical to before. Scoped to the debugger attach (detach restores enforcement).
+  let cspBypassed = false;
+  if (!forceNoWorker) {
+    try { await cdpSend("Page.setBypassCSP", { enabled: true }); cspBypassed = true; } catch (e) { /* stay CSP-bound */ }
+  }
   try {
     const src = buildOverrideSrc({ forceNoWorker });
     await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: src }); // future loads / re-auth
@@ -266,8 +302,17 @@ async function cdpInstallPageOverrides() {
     // Read back whether the worker-timers polyfill actually installed on the CURRENT
     // doc (CSP could block blob: workers → false → we stay on the safe slow path).
     try { _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers)); } catch (e) { _workerTimersActive = false; }
-    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : "OFF (CSP?)");
-    console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
+    // RETRY once (worker-only): the doc may carry __apOverridesInstalled from an EARLIER attach that
+    // ran without the bypass (SPA — no reload between runs), so the full override no-ops and the
+    // worker stays dead. buildWorkerRetrySrc re-runs JUST the worker block when the worker isn't live.
+    if (!_workerTimersActive && !forceNoWorker && cspBypassed) {
+      try {
+        await cdpSend("Runtime.evaluate", { expression: buildWorkerRetrySrc() });
+        _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers));
+      } catch (e) { /* stays slow/safe */ }
+    }
+    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)"));
+    console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; CSP bypass ${cspBypassed ? "ON" : "unavailable"}; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
   } catch (e) {
     _workerTimersActive = false;
     console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
@@ -392,6 +437,16 @@ async function cdpAdaptiveDelay(ms) {
 // TRUTHFUL even after the page's visibilityState is spoofed. Cheap (TTL-cached).
 async function cdpVisibilityLabel() { return (await cdpVisible()) ? "visible" : "hidden"; }
 
+// The PACING REGIME label for the per-page [CDP-TIME] log (2026-07-25) — makes every timing line
+// self-diagnosing: a slow page with "hidden-SLOW (no worker timers)" means the tenant's CSP (or the
+// forced flag) killed the worker install and EVERY page-side debounce is riding the ~1Hz throttle —
+// the whole-run bottleneck class, not something the adaptive budgets can fix. Cheap (TTL-cached reads).
+async function cdpPacingLabel() {
+  if (await cdpVisible()) return "visible-fast";
+  if (!_workerTimersActive) return "hidden-SLOW (no worker timers)";
+  return (await cdpTimersFast()) ? "hidden-fast (worker timers)" : "hidden-SLOW (worker throttled)";
+}
+
 // ── Operator input-lock (recon 2026-06-22) ──────────────────────────────────
 // While the bot actuates a VISIBLE tab the operator could accidentally click/type and
 // corrupt the fill. The bot's CDP input is isTrusted through the SAME pipeline as the
@@ -441,6 +496,128 @@ async function installInputLock() { try { await cdpEval(cdpInstallInputLock); in
 async function removeInputLock() { inputLockActive = false; try { await cdpEval(cdpRemoveInputLock); } catch (e) { /* tab gone / detached — nothing to remove */ } }
 async function actingDelta(d) { try { await cdpEval((dd) => { window.__apActing = (window.__apActing || 0) + dd; }, d); } catch (e) { /* ignore */ } }
 
+// ── SYNTHETIC input mode (2026-07-25 — the truly-hidden fast path) ───────────
+// The [CDP-TIME] evidence (two live Magna runs): trusted Input.dispatch* to a HIDDEN tab stalls
+// ~1.2–1.5s PER EVENT (input processing rides compositor-frame scheduling; a hidden tab produces no
+// frames), while Runtime.evaluate stays fast (27-field audit batch ~0.1s). So when the tab is hidden,
+// the input primitives below dispatch SYNTHETIC events INSIDE the page via one cdpEval instead of the
+// Input domain — the page-engine's PROVEN repertoire (robustClick pointer→mouse→click sequence;
+// native-setter + input/change = the React fill technique; label activation; searchBox set + synthetic
+// Enter — all live-verified on Comcast/LiveRamp/US Bank on the page path). Every downstream verify
+// gate is UNCHANGED (read-backs, chip/persistence re-reads, M40 audit), so a tenant where a synthetic
+// event no-ops ends needs_review — never a wrong/silent fill. A VISIBLE tab keeps the trusted path
+// (battle-tested, and input acks are ms there). Kill-switch: chrome.storage.local.forceTrustedInput
+// (read at attach) reverts hidden runs to the trusted path (slow-but-proven).
+//
+// Semantics deltas (deliberate, documented):
+//   • Synthetic events run NO browser default actions. The two we rely on are recreated: Tab → blur()
+//     (the typeahead's clean non-commit exit is Workday's blur handler) and Space → click() (the
+//     focus+Space radio fallback). Focus-on-click is mimicked (a trusted mousedown's default) so
+//     follow-on key dispatches land on the element a real click would have focused.
+//   • Synthetic text entry REPLACES the whole value (native setter + input/change) instead of
+//     inserting at a cursor/selection — every call site types after a clear or a select-all, where
+//     replace ≡ what select+type does; the read-back poll gates the result either way.
+//   • elementFromPoint descends OPEN shadow roots (the Simplify-dismiss X lives in one) and steps
+//     past Workday's own click_filter overlay to the control beneath it.
+let _forceTrustedInput = false; // storage kill-switch, read at cdpAttach
+// SCOPED opt-in (2026-07-25, after the live sign-in stall): synthetic input is enabled ONLY by the
+// FILL entry points (runCdpWalk / runCdpFillPage) — the surface the synthetic repertoire was proven
+// on (application FORM pages). The ONBOARDING/AUTH screens stay on the trusted path: the live run
+// showed the auth form's Sign In submit never fired under synthetic input (fields read back OK but
+// no outcome — the auth app likely doesn't register native-setter values in its own state, leaving
+// the submit inert), and auth is a tiny fraction of run time (~4 fields + a few clicks), so trusted
+// is the right trade there. Reset to false at every cdpAttach; recon/replay/onboarding never enable it.
+let _synthInputEnabled = false;
+function cdpSetSyntheticInput(on) {
+  _synthInputEnabled = !!on;
+  if (on) console.log("[ApplyPilot][CDP] synthetic input ENABLED for this run's fill — hidden-tab actuation dispatches page-side (trusted when visible; forceTrustedInput overrides).");
+}
+async function cdpSynthInput() {
+  if (!_synthInputEnabled || _forceTrustedInput) return false;
+  return !(await cdpVisible()); // hidden ⇒ synthetic page-side dispatch (fast); visible ⇒ trusted Input.* (proven)
+}
+
+// In-page synthetic click (self-contained; evaluated via cdpEval). Dispatches the page-engine's
+// proven pointer→mouse→click sequence on the element at (x,y) — clickCount/detail 1..n for a
+// triple-click. Bumps window.__apActing around the dispatch so the operator input-lock's
+// capture-phase blockers pass the bot's own events (the attachResume lesson).
+function cdpSynthClickAt(x, y, clicks) {
+  const els = (document.elementsFromPoint && document.elementsFromPoint(x, y)) || [];
+  let el = els[0] || document.elementFromPoint(x, y);
+  if (el && el.getAttribute && el.getAttribute("data-automation-id") === "click_filter" && els[1]) el = els[1]; // Workday's transparent overlay — the control beneath is the real target
+  while (el && el.shadowRoot && el.shadowRoot.elementFromPoint) { // descend OPEN shadow roots (Simplify's dismiss X)
+    const inner = el.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+  if (!el) return { ok: false, reason: "no element at point" };
+  window.__apActing = (window.__apActing || 0) + 1;
+  try {
+    const mouse = (type, detail) => { try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, detail })); } catch (e) {} };
+    const pointer = (type, detail) => { try { el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", clientX: x, clientY: y, button: 0, detail })); } catch (e) {} };
+    const n = Math.max(1, clicks || 1);
+    for (let i = 1; i <= n; i++) {
+      pointer("pointerdown", i);
+      mouse("mousedown", i);
+      // Mimic trusted mousedown's default action: FOCUS the target (or its focusable self) so
+      // follow-on activeElement-targeted key dispatches (Escape/Enter/typing) land correctly.
+      try { if (i === 1 && el.focus && el.matches && el.matches("input,textarea,button,select,a[href],[tabindex]")) el.focus(); } catch (e) {}
+      pointer("pointerup", i);
+      mouse("mouseup", i);
+      mouse("click", i);
+    }
+    const tag = (el.getAttribute && (el.getAttribute("data-automation-id") || el.id)) || el.tagName;
+    return { ok: true, hit: String(tag || "") };
+  } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+}
+
+// In-page synthetic key tap (keydown+keyup on the FOCUSED element). Recreates the two default
+// actions the fill relies on (Tab → blur; Space → activation click). Legacy keyCode/which are
+// defined for widgets that still read them.
+function cdpSynthKeyTap(key, code, vk, modifiers) {
+  const el = document.activeElement || document.body;
+  window.__apActing = (window.__apActing || 0) + 1;
+  try {
+    const m = modifiers || 0;
+    const init = { key, code, bubbles: true, cancelable: true, composed: true, view: window,
+      altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8) };
+    const mk = (type) => {
+      const e = new KeyboardEvent(type, init);
+      try { Object.defineProperty(e, "keyCode", { get: () => vk }); Object.defineProperty(e, "which", { get: () => vk }); } catch (x) { /* legacy props best-effort */ }
+      return e;
+    };
+    el.dispatchEvent(mk("keydown"));
+    el.dispatchEvent(mk("keyup"));
+    if (key === "Tab") { try { el.blur(); } catch (e) {} }   // the Tab-blur clean non-commit exit (Workday's blur handler does the abandoning)
+    if (key === " ") { try { el.click(); } catch (e) {} }    // focus+Space radio fallback → activation
+    return true;
+  } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+}
+
+// In-page synthetic text entry: native-setter REPLACE of the focused editable's whole value +
+// input/change (the React fill technique — the page engine's proven text path). withKeystroke
+// wraps the set in a keydown/keyup of the LAST character so keystroke-armed listeners (the
+// typeahead highlight) still see a key — the closest synthetic analog of finishing real typing.
+function cdpSynthSetValue(text, withKeystroke) {
+  const el = document.activeElement;
+  if (!el || !("value" in el)) return { ok: false, reason: "no editable element focused" };
+  window.__apActing = (window.__apActing || 0) + 1;
+  try {
+    const s = String(text == null ? "" : text);
+    const ch = withKeystroke && s.length ? s.slice(-1) : null;
+    const keyInit = ch ? { key: ch, bubbles: true, cancelable: true, composed: true } : null;
+    if (keyInit) { try { el.dispatchEvent(new KeyboardEvent("keydown", keyInit)); } catch (e) {} }
+    const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) desc.set.call(el, s); else el.value = s;
+    try { el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: s })); }
+    catch (e) { try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (x) {} }
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
+    if (keyInit) { try { el.dispatchEvent(new KeyboardEvent("keyup", keyInit)); } catch (e) {} }
+    return { ok: true, value: el.value };
+  } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+}
+
 // ── Input primitives (trusted, off-loop) ────────────────────────────────────
 
 // Debug trace of EVERY trusted input the bot fires (each click / triple-click / key / insertText),
@@ -455,14 +632,30 @@ function inputLog(...a) { if (inputTraceEnabled) console.log("[ApplyPilot][INPUT
 
 // Full mouse click at viewport CSS-pixel coords: move → press → release — the
 // closest CDP analog to a real click; the resulting page events are isTrusted.
+// BATCHED SEND (2026-07-25 — the hidden input-pipeline stall): on a HIDDEN tab each awaited
+// Input.dispatch* ack stalls ~1.2–1.5s (input processing rides compositor-frame scheduling, and a
+// hidden tab produces no frames — the [CDP-TIME] evidence: per-field cost scaled with the input-event
+// count across BOTH pacing regimes). chrome.debugger.sendCommand delivers in order per target, so we
+// ISSUE the sequence back-to-back and await the acks together — the renderer's input queue drains the
+// whole burst in one beat instead of paying one stall per event. Event order/semantics unchanged.
 async function cdpClickAt(x, y) {
+  // HIDDEN → synthetic page-side dispatch (fast; see the synthetic-input block above). A miss
+  // (no element at the point / eval hiccup) falls through to the trusted path below.
+  if (await cdpSynthInput()) {
+    try {
+      const r = await cdpEval(cdpSynthClickAt, Math.round(x), Math.round(y), 1);
+      if (r && r.ok) { inputLog("click(synth)", "(" + Math.round(x) + "," + Math.round(y) + ") → " + r.hit); return; }
+    } catch (e) { /* fall through to trusted */ }
+  }
   inputLog("click", "(" + Math.round(x) + "," + Math.round(y) + ")");
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 });
-    await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 });
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
+    await Promise.all([
+      cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 }),
+      cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 }),
+      cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 })
+    ]);
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -470,15 +663,29 @@ async function cdpClickAt(x, y) {
 // `-input` by clicking its VISIBLE `-display` sibling (M33 proven recipe; the
 // masked input can't be coordinate-clicked directly).
 async function cdpTripleClickAt(x, y) {
+  // HIDDEN → synthetic triple-click. NOTE: synthetic events don't run the browser's select-on-
+  // triple-click default — the date path tolerates this because (a) focusDateSegment's ladder
+  // falls to el.focus() when the click didn't focus, and (b) synthetic typing REPLACES the whole
+  // segment value (cdpSynthSetValue), which is exactly what select+type achieved.
+  if (await cdpSynthInput()) {
+    try {
+      const r = await cdpEval(cdpSynthClickAt, Math.round(x), Math.round(y), 3);
+      if (r && r.ok) { inputLog("triple-click(synth)", "(" + Math.round(x) + "," + Math.round(y) + ") → " + r.hit); return; }
+    } catch (e) { /* fall through to trusted */ }
+  }
   inputLog("triple-click", "(" + Math.round(x) + "," + Math.round(y) + ")");
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" });
+    // BATCHED SEND (2026-07-25): issue the whole move + 3×(press/release) sequence back-to-back and
+    // await together — in-order delivery holds, and a hidden tab pays ONE input-pipeline drain for
+    // the burst instead of seven (see cdpClickAt).
+    const sends = [cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" })];
     for (let i = 1; i <= 3; i++) {
-      await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i });
-      await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i });
+      sends.push(cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i }));
+      sends.push(cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i }));
     }
+    await Promise.all(sends);
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -486,6 +693,14 @@ async function cdpTripleClickAt(x, y) {
 // beforeinput/input (no per-key events). Recon (a) decides if this is enough
 // for Workday's React or whether per-char key events are needed.
 async function cdpInsertText(text) {
+  // HIDDEN → native-setter REPLACE + input/change (the React fill technique). Every call site
+  // inserts after a clear/select-all, where replace ≡ insert; the caller's read-back poll gates it.
+  if (await cdpSynthInput()) {
+    try {
+      const r = await cdpEval(cdpSynthSetValue, String(text), false);
+      if (r && r.ok) { inputLog("insertText(synth)", JSON.stringify(String(text))); return; }
+    } catch (e) { /* fall through to trusted */ }
+  }
   inputLog("insertText", JSON.stringify(String(text)));
   if (inputLockActive) await actingDelta(+1);
   try { return await cdpSend("Input.insertText", { text: String(text) }); }
@@ -497,6 +712,16 @@ async function cdpInsertText(text) {
 // route through here, so gating cdpKeyTap covers the bot's entire key path (counter-based,
 // so the nested cdpTypeChars→cdpKeyTap stays "acting" throughout — no per-char gap).
 async function cdpKeyTap(def) {
+  // HIDDEN → synthetic keydown+keyup on the focused element (Tab additionally blurs; Space
+  // additionally activates — the two default actions the fill relies on). Enter/Escape are
+  // page-handled (Workday listens for the key events themselves), so the dispatch suffices.
+  if (await cdpSynthInput()) {
+    try {
+      await cdpEval(cdpSynthKeyTap, def.key, def.code, def.vk, def.modifiers || 0);
+      inputLog("key(synth)", JSON.stringify(def.key) + (def.modifiers ? " +mod" + def.modifiers : ""));
+      return;
+    } catch (e) { /* fall through to trusted */ }
+  }
   inputLog("key", JSON.stringify(def.key) + (def.modifiers ? " +mod" + def.modifiers : ""));
   if (inputLockActive) await actingDelta(+1);
   try {
@@ -507,12 +732,16 @@ async function cdpKeyTap(def) {
       modifiers: def.modifiers || 0
     };
     if (def.text) { down.text = def.text; down.unmodifiedText = def.text; }
-    await cdpSend("Input.dispatchKeyEvent", down);
-    await cdpSend("Input.dispatchKeyEvent", {
-      type: "keyUp", key: def.key, code: def.code,
-      windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
-      modifiers: def.modifiers || 0
-    });
+    // BATCHED SEND (2026-07-25): down+up issued back-to-back, awaited together — one hidden-tab
+    // input-pipeline drain per tap instead of two (see cdpClickAt). Text insertion rides the keyDown.
+    await Promise.all([
+      cdpSend("Input.dispatchKeyEvent", down),
+      cdpSend("Input.dispatchKeyEvent", {
+        type: "keyUp", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
+        modifiers: def.modifiers || 0
+      })
+    ]);
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -532,6 +761,17 @@ const CDP_KEYS = {
 // Probe/profile strings are plain text; vk is best-effort for non-alphanumerics
 // (the `text` field is what produces the character).
 async function cdpTypeChars(text, perCharDelayMs = 40) {
+  // HIDDEN → ONE native-setter REPLACE with a last-char keystroke wrap (cdpSynthSetValue) instead of
+  // per-char key events — synthetic key events insert no text (no default actions), and this is also
+  // the big hidden win (a 35-char typeahead candidate = 70 frame-gated Input commands ≈ 40s → 1 eval).
+  // REPLACE is correct at every call site: typing always follows a clear (typeInSearch) or a
+  // select-all (dates — where replace ≡ what select+type achieved); the read-back/chip gates verify.
+  if (await cdpSynthInput()) {
+    try {
+      const r = await cdpEval(cdpSynthSetValue, String(text), true);
+      if (r && r.ok) { inputLog("typeChars(synth)", JSON.stringify(String(text))); return; }
+    } catch (e) { /* fall through to trusted per-char */ }
+  }
   // Per-char gap is ADAPTIVE (Stage B): fast (fg / worker-fast) → scale by FAST_FACTOR but keep the
   // typing-specific TYPE_FAST_FLOOR_MS (> FAST_FLOOR_MS) so keystroke-driven listeners still arm the
   // typeahead's first-option highlight (cdpTypeChars is the KEYSTROKE path chosen over insertText for
@@ -552,7 +792,15 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
 
 // Clear the FOCUSED text input: Select-All (Ctrl+A — Windows/Linux modifier 2)
 // then Delete. Trusted key path so React sees a real edit, unlike a "" setter.
+// HIDDEN → native-setter "" + input/change (the page engine's proven "clear before typing"
+// pattern) — synthetic Ctrl+A/Delete run no default actions, so the key path can't clear there.
 async function cdpSelectAllDelete() {
+  if (await cdpSynthInput()) {
+    try {
+      const r = await cdpEval(cdpSynthSetValue, "", false);
+      if (r && r.ok) { inputLog("selectAllDelete(synth)", '""'); return; }
+    } catch (e) { /* fall through to trusted */ }
+  }
   await cdpKeyTap({ key: "a", code: "KeyA", vk: 65, modifiers: 2 });
   await cdpAdaptiveDelay(60); // adaptive (Stage B): fast fg/worker-fast, full on the slow path; a stale-text race is caught by the caller's post-clear read-back
   await cdpKeyTap(CDP_KEYS.delete);

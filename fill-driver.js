@@ -700,13 +700,16 @@ const optionForPolarity = (optionLabels, polarity) => {
 // ── Per-widget fill paths (actuation via `act`, decisions per M22) ──────────
 
 // Poll until an input's checked state is `want`. Generous wall-clock — the
-// page's React update runs on the throttled loop.
+// page's React update runs on the throttled loop. READ-FIRST (2026-07-25): native
+// label-activation flips `checked` synchronously in the click's own event turn, so the
+// first read usually succeeds immediately — the old delay-then-read paid one full
+// commitIntervalMs per radio/checkbox for nothing. A not-yet-flipped read just polls.
 const pollCheckedIs = async (act, id, want, budgets) => {
   const deadline = Date.now() + budgets.commitCeilingMs;
-  while (Date.now() < deadline) {
-    await act.delay(budgets.commitIntervalMs);
+  do {
     if ((await act.readChecked(id)) === want) return true;
-  }
+    await act.delay(budgets.commitIntervalMs);
+  } while (Date.now() < deadline);
   return false;
 };
 
@@ -795,11 +798,11 @@ const openAndReadDropdown = async (act, loc, budgets) => {
     if (attempt > 1) { await act.pressEscape(); await act.delay(budgets.reopenSettleMs); }
     if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
     const expandDeadline = Date.now() + budgets.openExpandWindowMs;
-    while (Date.now() < expandDeadline) {
-      await act.delay(budgets.settleIntervalMs);
+    do { // READ-FIRST (2026-07-25): the trusted click's React handler runs synchronously, so the trigger usually reads expanded immediately — a premature read just re-polls
       state = await act.readDropdownState(loc);
       if (state && state.ariaExpanded === "true") { expanded = true; break; }
-    }
+      await act.delay(budgets.settleIntervalMs);
+    } while (Date.now() < expandDeadline);
   }
   if (expanded) { // GATE 2: settle to the COMPLETE list (2 equal non-zero reads); interval adaptive under the measured-fast gate (delayRender)
     let prevCount = -1, stable = 0;
@@ -1243,17 +1246,26 @@ const parseRemediation = (text) => {
 // the options linger a beat while they unmount and STAY CLICKABLE — returning on aria alone raced the
 // close at fast (M39) pacing (this branch's dropdowns-don't-close-instantly report; matches the
 // closeAndVerifyBlank listbox-gone gate). We poll readDropdownState until the options are gone,
-// re-Escaping each round (real-time delayFull — the listbox closes at the page's pace), bounded by
-// iterations so a stuck list can't spin. Returns true iff confirmed gone. Used by the successful
-// COMMIT path, the commit-failed path, the tier-aware KEEP path, and the genuine-no-match path — every
-// path that opened the list must confirm it's gone before the next field.
+// re-Escaping each round, bounded by a WALL-CLOCK deadline so a stuck list can't spin. Returns true
+// iff confirmed gone. Used by the successful COMMIT path, the commit-failed path, the tier-aware KEEP
+// path, and the genuine-no-match path — every path that opened the list must confirm it's gone before
+// the next field.
+// PACING (2026-07-25 speed round): the poll interval is delayRender (adaptive under the measured-fast
+// gate — the unmount is exactly the kind of render the fast regime completes fast), and the BOUND is a
+// real wall-clock deadline (openRetries × reopenSettleMs — the same total window closeAndVerifyBlank
+// uses) instead of an iteration count. The old shape (delayFull(commitIntervalMs) × 4 iterations) paid
+// a fixed ~300ms per committed dropdown even when the options unmounted on the first beat; the gate is
+// interval-length-INDEPENDENT (options-gone re-read), so a shorter beat only re-polls sooner — the
+// total close window is unchanged, and a genuinely slow close still gets the full ~1.2s before we
+// return false. The iteration cap is a spin-guard for no-op-delay fakes only.
 async function closeDropdownConfirmed(act, loc, budgets) {
   const stillOpen = (s) => !!(s && s.listboxPresent && s.optionCount > 0); // clickable options still mounted
-  const maxTries = (budgets.openRetries || 3) + 1;
+  const dr = act.delayRender || act.delayFull; // adaptive close-settle (fallback for older fakes)
+  const deadline = Date.now() + (budgets.openRetries || 3) * (budgets.reopenSettleMs || 400);
   let st = await act.readDropdownState(loc);
-  for (let i = 0; i < maxTries && stillOpen(st); i++) {
+  for (let i = 0; i < 40 && stillOpen(st) && Date.now() <= deadline; i++) {
     await act.pressEscape();
-    await act.delayFull(budgets.commitIntervalMs);
+    await dr(budgets.commitIntervalMs);
     st = await act.readDropdownState(loc);
   }
   return !stillOpen(st);
@@ -1332,12 +1344,15 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
     if (!(await act.openDropdown(loc))) continue; // trigger rect dead — re-open
     // GATE 1 (cheap): poll aria-expanded for a SHORT window. A real open expands
     // promptly; a raced no-op never does. Don't burn the option ceiling on a race.
+    // READ-FIRST (2026-07-25): the trusted click's React handler runs synchronously,
+    // so the first read usually already sees aria-expanded="true" — the old
+    // delay-then-read paid one settleIntervalMs per dropdown for nothing.
     const expandDeadline = Date.now() + budgets.openExpandWindowMs;
-    while (Date.now() < expandDeadline) {
-      await act.delay(budgets.settleIntervalMs);
+    do {
       state = await act.readDropdownState(loc);
       if (state && state.ariaExpanded === "true") { expanded = true; openedAt = Date.now(); break; }
-    }
+      await act.delay(budgets.settleIntervalMs);
+    } while (Date.now() < expandDeadline);
   }
   // GATE 2: the trigger IS expanded — NEVER re-click it. Poll optionCount to the FULL
   // ceiling (a cold lazy list renders after the expand). Settle = 2 equal non-zero reads.
@@ -1448,8 +1463,7 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
     }
     let after = null;
     const deadline = Date.now() + (ceilingMs || budgets.commitCeilingMs); // ceilingMs: SHORT deadline for the fast overwrite attempt (fail quick → slow refill); full ceiling otherwise
-    while (Date.now() < deadline) {
-      await delayRender(budgets.commitIntervalMs); // the page commits the pick at its own pace — adaptive under the measured-fast gate (STAGE 2)
+    do { // READ-FIRST (2026-07-25): the option click's selection usually lands in the click's own event turn — the old delay-then-read paid one commitIntervalMs per commit for nothing; a not-yet-committed read just re-polls. The PERSISTENCE beat below stays delay-first (it must be a real beat).
       const cs = await act.readDropdownState(loc);
       after = cs ? cs.triggerText : after;
       if (committedText(after)) {
@@ -1466,7 +1480,8 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
         if (committedText(after2)) return { ok: true, after: after2 };
         after = after2; // reverted — not committed; keep polling until the deadline
       }
-    }
+      await delayRender(budgets.commitIntervalMs); // the page commits the pick at its own pace — adaptive under the measured-fast gate (STAGE 2)
+    } while (Date.now() < deadline);
     return { ok: false, after };
   };
 
@@ -2631,9 +2646,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // employer list. (2026-07-25.)
   const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
+  // [CDP-TIME] phase accounting (2026-07-25): where a page's wall-clock actually goes — logged by the
+  // SW per page so pacing is retuned on EVIDENCE, not guesses. Zero behavior change; log-only.
+  const timings = {};
+  const markPhase = (k, t0) => { timings[k] = (timings[k] || 0) + (Date.now() - t0); };
+  let _phaseT0 = Date.now();
 
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
     if (only && !only.has(f.fieldName)) continue; // AI-4: re-fill only the targeted field(s)
+    const _fieldT0 = Date.now();
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
     const rawValue = mappedPath ? getByPath(profile, mappedPath) : undefined;
@@ -3017,12 +3038,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
 
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
+    record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
     results.push(record);
 
     // Let one field's transient UI settle before the next opens (also the
     // natural blur of the prior field — the sequential-cleanup rule).
     await act.delay(budgets.interFieldMs);
   }
+  markPhase("flat", _phaseT0); _phaseT0 = Date.now();
 
   // M38 FOLD — after the flat fields, drive each repeating section PRESENT on this page
   // (so ONE drivePageFill = a full page fill). One repeatingScan determines presence: a
@@ -3058,6 +3081,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (out && Array.isArray(out.results)) results.push(...out.results);
     }
   }
+  markPhase("sections", _phaseT0); _phaseT0 = Date.now();
 
   // m3a: surface UNKNOWN repeating sections (present on the form but NOT in PAGE_SECTIONS) as review
   // STUBS carrying the backend identifier (container_prefix + heading + the detected field shape when
@@ -3199,6 +3223,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       });
     }
   }
+  markPhase("stubs", _phaseT0); _phaseT0 = Date.now();
 
   // (Nested repeating sub-sections — cert ▸ Specialties + Attachments — are emitted per SURVIVING
   // parent entry INSIDE driveRepeatingSectionCdp from the HARDCODED section.nested config, DURING the
@@ -3237,6 +3262,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } catch (e) { /* a revealed-field fill threw → don't abort the whole page; next round / honest miss */ }
     }
   }
+  markPhase("cascade", _phaseT0); _phaseT0 = Date.now();
 
   // ── CASCADE-REMOVED reconciliation ── a field present in the UP-FRONT scan but now GONE
   // from the DOM (DELETED by an earlier field's value — e.g. Country=Afghanistan removes the
@@ -3287,8 +3313,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Summary editability: scrape the full option list for choice fields that lack one (tagged FoS
   // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
-  if (!targeted) await captureChoiceOptions(act, results, budgets);
+  // opts.optionCache: the SW-loaded cross-run option store (see captureChoiceOptions) — cosmetic only.
+  _phaseT0 = Date.now();
+  if (!targeted) await captureChoiceOptions(act, results, budgets, opts && opts.optionCache);
+  markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
+  markPhase("audit", _phaseT0); _phaseT0 = Date.now();
 
   // ── ALREADY-FILLED sweep — the LAST pass before the bundle (source-of-truth ordering) ── the
   // review must inventory EVERYTHING the page holds at the moment Save & Continue is clicked: a
@@ -3302,6 +3332,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // so nothing here is ever re-actuated: the fluent-checkbox lesson). Skipped in BOTH targeted
   // modes (onlyFieldNames / onlySections) — a remediation re-fill never re-inventories the page.
   if (!targeted) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
+  markPhase("sweep", _phaseT0);
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
@@ -3314,7 +3345,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const sessionWarning = (srcRec && srcRec.status === "needs_review" && srcRec.optionsLoaded === false)
     ? "Likely session expired — the \"How did you hear about us?\" options never loaded (server fetch failed). Refresh, log in, and reopen the form, then retry."
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes };
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings };
 }
 
 // ============================================================================
@@ -3641,6 +3672,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     }
   } catch (e) { /* no scan → config order */ }
   for (const f of orderedMap) {
+    const _fieldT0 = Date.now(); // [CDP-TIME] per-field wall-clock (stamped on every rec pushed below)
     const recName = f.name || f.field;
     const findFd = (entry) => entry ? (f.labelRegex
       ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
@@ -3811,6 +3843,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
         const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
       } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI required-empty typeahead error: " + String((e && e.message) || e); }
     }
+    rec.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME]
     recs.push(rec);
     await act.delay(budgets.interFieldMs);
   }
@@ -5187,13 +5220,29 @@ async function captureDropdownOptions(act, loc, budgets) {
 // dropdown in review, same as page-2 does). Dispatch by widget; cache per option-set key so
 // same-vocabulary fields (FoS across education entries; language/proficiency dropdowns across entries)
 // re-open ONCE, not N times. Non-fatal throughout.
-async function captureChoiceOptions(act, results, budgets) {
+// optionCache (2026-07-25 speed round, OPTIONAL): a CROSS-RUN store the SW loads from
+// chrome.storage and persists back after the page (engine computes / SW does I/O — the driver
+// only reads/mutates the plain object handed in). key → { options, at }. It serves ONLY this
+// cosmetic surface (the review editor's <select>/combobox lists) — the fill/match ladder always
+// reads LIVE options, so a stale list can never cause a wrong fill (a stale pick at review just
+// no-matches on replay → needs_review). Fed for FREE from records that already carry options
+// (committed dropdowns / start-scraped typeaheads), so a re-run at the same tenant — where run 1's
+// committed value is now a tier-0 prefilled-keep — skips the cold re-open (~5.6s server lists)
+// entirely. TTL'd on read; entries the cache served are NOT re-stamped (so staleness still expires).
+const OPTION_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
+async function captureChoiceOptions(act, results, budgets, optionCache) {
   if (!act) return;
-  const cache = new Map(); // key → options[] | null (already attempted)
+  const cache = new Map(); // key → options[] | null (already attempted THIS page)
+  const oc = (optionCache && typeof optionCache === "object") ? optionCache : null;
+  const ocGet = (key) => {
+    const e = oc && oc[key];
+    return (e && Array.isArray(e.options) && e.options.length && (Date.now() - (e.at || 0)) < OPTION_CACHE_TTL_MS) ? e.options : null;
+  };
+  const ocPut = (key, options) => { if (oc && Array.isArray(options) && options.length) oc[key] = { options: options.slice(), at: Date.now() }; };
+  let cacheHits = 0;
   for (const rec of results || []) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
-    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown / start-scraped typeahead already has them
     let key, scrape;
     if (rec.widgetType === "typeahead" && act.scrapeTaOptions) {
       // Repeating-section FoS typeaheads AND flat page-1 typeaheads kept without actuation
@@ -5209,10 +5258,16 @@ async function captureChoiceOptions(act, results, budgets) {
       key = "dd:" + String(rec.fieldName).split(".").pop(); // recName stem (degree/language/readingProficiency) — same stem ⇒ same option vocabulary
       scrape = () => captureDropdownOptions(act, { wrapperSel: rec.auditLoc }, budgets);
     } else continue;
-    if (!cache.has(key)) cache.set(key, await scrape());
+    if (Array.isArray(rec.options) && rec.options.length) { ocPut(key, rec.options); continue; } // committed dropdown / start-scraped typeahead already has them → FEED the store (free)
+    if (!cache.has(key)) {
+      const stored = ocGet(key);
+      if (stored) { cache.set(key, stored.slice()); cacheHits++; } // cross-run hit → ZERO actuation (no cold re-open); not re-stamped
+      else { const scraped = await scrape(); cache.set(key, scraped); ocPut(key, scraped); }
+    }
     const opts = cache.get(key);
     if (opts && opts.length) rec.options = opts.slice();
   }
+  if (cacheHits) console.log(`[ApplyPilot][CDP-TIME] option-capture: ${cacheHits} field(s) served from the cross-run option cache (no cold re-open).`);
 }
 
 // ============================================================================
