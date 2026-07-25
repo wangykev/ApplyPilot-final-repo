@@ -16,6 +16,9 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
     "Tiered fields (degree, field_of_study, country, country_phone_code, certification) are arrays, most-specific first.",
     "work_experience[].role_description is ONE paragraph (a few sentences) describing the role — how it would fill a single Workday text box, NOT a bulleted list.",
     "work_experience[].currently_work_here is a boolean: true when the role has no end date or says Present/Current, else false.",
+    "education[].graduation_date is \"YYYY-MM\" when the resume shows an (expected) graduation month/year; education[].coursework is the 'Relevant Coursework' course list, one string per course.",
+    "projects[] mirror the resume's Projects section: bullets VERBATIM (one string per bullet), tech_stack from the project's tech line.",
+    "skill_groups mirror the resume's labeled skill-category lines (e.g. Languages / Tools) EXACTLY as grouped; skills is the FLAT union of every skill.",
   ].join(" ");
 
   const template = {
@@ -34,9 +37,24 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
       { job_title: "", company: "", location: "", currently_work_here: false, from: "YYYY-MM", to: "YYYY-MM", role_description: "", tech_stack: [] },
     ],
     education: [
-      { school_or_university: "", degree: [], field_of_study: [], gpa: "", from_year: "YYYY", to_year: "YYYY" },
+      {
+        school_or_university: "",
+        location: "",
+        degree: [],
+        field_of_study: [],
+        gpa: "",
+        gpa_scale: "",
+        from_year: "YYYY",
+        to_year: "YYYY",
+        graduation_date: "YYYY-MM",
+        coursework: [],
+      },
+    ],
+    projects: [
+      { name: "", from: "YYYY-MM", to: "YYYY-MM", summary: "", bullets: [], tech_stack: [], link: "", github: "" },
     ],
     skills: [],
+    skill_groups: [{ name: "", skills: [] }],
     languages: [{ language: "", reading: "", speaking: "", writing: "" }],
     certifications: [{ certification: [], certification_number: "", issued_date: "", expiration_date: "" }],
   };
