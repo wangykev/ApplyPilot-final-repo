@@ -10,6 +10,9 @@ import { tailorResume, type JdApplication } from "./actions";
 import type { TailorMode, TailoredResume } from "@/lib/tailor";
 import { dateRange } from "@/lib/resume-doc";
 
+/** The untailored resume (from the profile) + its exportable documents. */
+export type OriginalResume = { resume: TailoredResume; printHtml: string; tex: string };
+
 const MODES: { id: TailorMode; name: string; blurb: string; guard: string }[] = [
   {
     id: "select",
@@ -31,11 +34,12 @@ const MODES: { id: TailorMode; name: string; blurb: string; guard: string }[] = 
   },
 ];
 
-export function TailorPanel({ apps }: { apps: JdApplication[] }) {
+export function TailorPanel({ apps, original }: { apps: JdApplication[]; original: OriginalResume | null }) {
   const [jd, setJd] = useState("");
   const [appId, setAppId] = useState("");
   const [mode, setMode] = useState<TailorMode>("select");
   const [out, setOut] = useState<{ result: TailoredResume; tex: string; printHtml: string } | null>(null);
+  const [view, setView] = useState<"tailored" | "original">("tailored");
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<{ text: string; aiLink?: boolean } | null>(null);
 
@@ -49,36 +53,44 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
     startTransition(async () => {
       setErr(null);
       const res = await tailorResume({ jobDescription: jd, mode });
-      if (res.ok) setOut({ result: res.result, tex: res.tex, printHtml: res.printHtml });
-      else {
+      if (res.ok) {
+        setOut({ result: res.result, tex: res.tex, printHtml: res.printHtml });
+        setView("tailored");
+      } else {
         setOut(null);
         setErr({ text: res.error, aiLink: res.error.toLowerCase().includes("api key") });
       }
     });
 
+  // Which resume the preview card shows + which documents the export buttons emit.
+  const showingOriginal = (view === "original" && !!original) || (!out && !!original);
+  const active = showingOriginal
+    ? original && { r: original.resume, printHtml: original.printHtml, tex: original.tex, name: "resume-original" }
+    : out && { r: out.result, printHtml: out.printHtml, tex: out.tex, name: "resume-tailored" };
+
   const savePdf = () => {
-    if (!out) return;
+    if (!active) return;
     const w = window.open("", "_blank");
     if (!w) return;
-    w.document.write(out.printHtml);
+    w.document.write(active.printHtml);
     w.document.close();
     w.focus();
     setTimeout(() => w.print(), 250); // let fonts/layout settle before the dialog
   };
 
   const downloadTex = () => {
-    if (!out) return;
-    const blob = new Blob([out.tex], { type: "application/x-tex" });
+    if (!active) return;
+    const blob = new Blob([active.tex], { type: "application/x-tex" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "resume-tailored.tex";
+    a.download = active.name + ".tex";
     a.click();
     URL.revokeObjectURL(a.href);
   };
 
   const r = out?.result ?? null;
   const review = useMemo(() => {
-    if (!r) return { edited: 0, reverted: r ? 0 : 0, risks: 0 };
+    if (!r) return { edited: 0, reverted: 0, risks: 0 };
     let edited = 0,
       risks = 0;
     for (const e of r.experiences)
@@ -88,6 +100,8 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
       }
     return { edited, reverted: r.reverted_count, risks };
   }, [r]);
+
+  const preview = active?.r ?? null;
 
   return (
     <div className="space-y-6">
@@ -123,7 +137,7 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
       >
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           {MODES.map((m) => {
-            const active = mode === m.id;
+            const activeMode = mode === m.id;
             return (
               <button
                 key={m.id}
@@ -131,11 +145,11 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
                 onClick={() => setMode(m.id)}
                 className={clsx(
                   "rounded-xl border p-4 text-left transition-colors",
-                  active ? "border-amber bg-panel-raised" : "border-hairline hover:border-ink-faint"
+                  activeMode ? "border-amber bg-panel-raised" : "border-hairline hover:border-ink-faint"
                 )}
               >
                 <div className="flex items-center gap-2">
-                  <span className={clsx("h-2 w-2 rounded-full", active ? "bg-amber" : "bg-ink-faint")} />
+                  <span className={clsx("h-2 w-2 rounded-full", activeMode ? "bg-amber" : "bg-ink-faint")} />
                   <span className="font-display text-sm font-medium">{m.name}</span>
                 </div>
                 <p className="mt-2 text-xs leading-relaxed text-ink-dim">{m.blurb}</p>
@@ -170,13 +184,38 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
         </div>
       </SectionCard>
 
-      {r && (
+      {preview && (
         <>
           <SectionCard
-            title="Tailored resume"
-            subtitle="Save as PDF opens the print dialog (choose “Save as PDF”). The .tex compiles in Overleaf with your exact template."
+            title={showingOriginal ? "Your resume — original" : "Tailored resume"}
+            subtitle={
+              showingOriginal
+                ? out
+                  ? "Straight from your profile, untailored. Flip back to Tailored to compare."
+                  : "Straight from your profile. Paste a job description above and tailor to see the difference."
+                : "Save as PDF opens the print dialog (choose “Save as PDF”). The .tex compiles in Overleaf with your exact template."
+            }
             actions={
-              <div className="flex gap-2">
+              <div className="flex items-center gap-2">
+                {out && original && (
+                  <div className="mr-1 flex overflow-hidden rounded-lg border border-hairline">
+                    {(["tailored", "original"] as const).map((v, idx) => (
+                      <button
+                        key={v}
+                        onClick={() => setView(v)}
+                        className={clsx(
+                          "px-3 py-1.5 text-xs capitalize transition-colors",
+                          idx === 0 && "border-r border-hairline",
+                          view === v
+                            ? "bg-amber font-semibold text-cockpit"
+                            : "text-ink-dim hover:bg-panel-raised/60 hover:text-ink"
+                        )}
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <button onClick={savePdf} className="btn-ghost px-3 py-1.5 text-xs">
                   <Printer className="h-3.5 w-3.5" /> Save as PDF
                 </button>
@@ -186,32 +225,34 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
               </div>
             }
           >
-            {/* review strip */}
-            <div className="mb-4 flex flex-wrap gap-2 font-mono text-[11px]">
-              <span className="rounded-md border border-hairline px-2 py-1 text-ink-dim">mode: {r.mode}</span>
-              {review.edited > 0 && (
-                <span className="rounded-md border border-amber/40 px-2 py-1 text-amber">{review.edited} AI-reworded</span>
-              )}
-              {review.reverted > 0 && (
-                <span className="rounded-md border border-verified/40 px-2 py-1 text-verified">
-                  {review.reverted} rewrite{review.reverted === 1 ? "" : "s"} reverted by the fact-check
-                </span>
-              )}
-              {review.risks > 0 && (
-                <span className="rounded-md border border-signal/40 px-2 py-1 text-signal">
-                  {review.risks} fabrication risk{review.risks === 1 ? "" : "s"} — verify below
-                </span>
-              )}
-            </div>
+            {/* review strip — tailored view only */}
+            {!showingOriginal && r && (
+              <div className="mb-4 flex flex-wrap gap-2 font-mono text-[11px]">
+                <span className="rounded-md border border-hairline px-2 py-1 text-ink-dim">mode: {r.mode}</span>
+                {review.edited > 0 && (
+                  <span className="rounded-md border border-amber/40 px-2 py-1 text-amber">{review.edited} AI-reworded</span>
+                )}
+                {review.reverted > 0 && (
+                  <span className="rounded-md border border-verified/40 px-2 py-1 text-verified">
+                    {review.reverted} rewrite{review.reverted === 1 ? "" : "s"} reverted by the fact-check
+                  </span>
+                )}
+                {review.risks > 0 && (
+                  <span className="rounded-md border border-signal/40 px-2 py-1 text-signal">
+                    {review.risks} fabrication risk{review.risks === 1 ? "" : "s"} — verify below
+                  </span>
+                )}
+              </div>
+            )}
 
             {/* document preview — a light “paper” card inside the dark cockpit */}
             <div className="rounded-lg bg-white p-8 text-[13px] leading-relaxed text-neutral-900 shadow-inner">
-              {r.summary && (
+              {preview.summary && (
                 <p className="mb-3 border-l-2 border-amber pl-2 italic">
-                  {r.summary} <span className="not-italic text-[10px] text-amber">✦ AI summary — review</span>
+                  {preview.summary} <span className="not-italic text-[10px] text-amber">✦ AI summary — review</span>
                 </p>
               )}
-              {r.experiences
+              {preview.experiences
                 .filter((e) => e.include && e.bullets.length)
                 .map((e, i) => (
                   <div key={i} className="mb-3">
@@ -230,15 +271,15 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
                     </ul>
                   </div>
                 ))}
-              {r.skills.length > 0 && (
+              {preview.skills.length > 0 && (
                 <p className="mt-2 text-xs">
-                  <span className="font-semibold">Skills:</span> {r.skills.join(", ")}
+                  <span className="font-semibold">Skills:</span> {preview.skills.join(", ")}
                 </p>
               )}
             </div>
           </SectionCard>
 
-          {(review.edited > 0 || review.risks > 0 || r.reverted_count > 0) && (
+          {!showingOriginal && r && (review.edited > 0 || review.risks > 0 || r.reverted_count > 0) && (
             <SectionCard title="What the AI changed" subtitle="Original vs tailored, per bullet. Reverted rewrites failed the deterministic fact-check.">
               <ul className="space-y-3">
                 {r.experiences.flatMap((e, i) =>
@@ -276,7 +317,7 @@ export function TailorPanel({ apps }: { apps: JdApplication[] }) {
             </SectionCard>
           )}
 
-          {(r.gaps.length > 0 || r.skills_omitted.length > 0 || r.rationale) && (
+          {!showingOriginal && r && (r.gaps.length > 0 || r.skills_omitted.length > 0 || r.rationale) && (
             <SectionCard title="Honest read" subtitle="What this job asks for that your background can't claim — surfaced, never papered over.">
               {r.gaps.length > 0 && (
                 <ul className="space-y-1.5 text-sm text-ink">
