@@ -200,9 +200,7 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
             title={showingOriginal ? "Your resume — original" : "Tailored resume"}
             subtitle={
               showingOriginal
-                ? out
-                  ? "Straight from your profile, untailored. Flip back to Tailored to compare."
-                  : "Straight from your profile. Paste a job description above and tailor to see the difference."
+                ? "Generated from your PROFILE data — not your uploaded PDF (that file attaches as-is; preview it on the Resume page). Formatting differs from your LaTeX; if content is missing here, your profile is missing it — parse your resume or edit the profile."
                 : "Save as PDF opens the print dialog (choose “Save as PDF”). The .tex compiles in Overleaf with your exact template."
             }
             actions={
