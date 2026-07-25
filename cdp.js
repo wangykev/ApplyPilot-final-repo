@@ -1723,8 +1723,21 @@ function cdpDropdownOptionRectByText(wrapperSel, text) {
   if (!el) return null;
   if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "instant" });
   const r = el.getBoundingClientRect();
-  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
-           cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
+  // READ-ONLY diagnostic (no behavior change — the caller still clicks (cx,cy) exactly as before): is the
+  // target option ACTUALLY at the click point? `hitTarget` false / `atPointText` != text ⇒ a still-settling
+  // /virtualizing list shifted the row or an overlay occludes it (a coordinate MIS-CLICK). `hitTarget` true
+  // but no commit ⇒ the click lands right but the list isn't INTERACTIVE yet (the 2026-07-06 root cause).
+  // `collisions` > 1 ⇒ the aria-controls id is shared by multiple elements (getElementById picked the wrong one).
+  let hitTarget = null, atPointText = null, collisions = null;
+  try {
+    const hit = document.elementFromPoint(cx, cy);
+    const ho = hit && hit.closest ? (hit.closest('[role="option"]') || hit) : hit;
+    hitTarget = !!(hit && (hit === el || el.contains(hit) || ho === el));
+    atPointText = ho ? (ho.textContent || "").trim().slice(0, 40) : null;
+    collisions = id ? document.querySelectorAll("#" + ((window.CSS && CSS.escape) ? CSS.escape(id) : id)).length : null;
+  } catch (e) {}
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), cx, cy, hitTarget, atPointText, collisions };
 }
 
 function cdpReadRadioState(wrapperSel) {
@@ -2758,6 +2771,11 @@ function makeCdpActuation(llmConfig) {
     clickDropdownOptionByText: async (loc, text) => {
       const rect = await cdpEval(cdpDropdownOptionRectByText, loc.wrapperSel, text);
       if (!rect || rect.w <= 0) return false;
+      // READ-ONLY diagnostic for the intermittent dropdown first-commit stray: capture whether the click
+      // point actually holds the target option AT CLICK TIME. Compare across the first commit + the fallback
+      // re-commit to tell a MIS-CLICK (hitTarget=false / atPoint≠text) from an interactive-readiness no-commit
+      // (hitTarget=true, click lands right but the value doesn't take). collisions>1 = aria-controls id shared.
+      try { console.log(`[ApplyPilot][CDP-DD-COMMIT] "${text}" hitTarget=${rect.hitTarget} atPoint=${JSON.stringify(rect.atPointText)} collisions=${rect.collisions} rect=${rect.cx},${rect.cy}${rect.hitTarget === false ? " ⚠ OFF-TARGET" : ""}`); } catch (e) {}
       await cdpClickAt(rect.cx, rect.cy);
       return true;
     },
