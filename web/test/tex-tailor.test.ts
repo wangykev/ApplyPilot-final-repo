@@ -1,6 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractTexUnits, applyTexTailor, detex, vocabFromTex, buildTexTailorPrompt, shimForXetex } from "@/lib/tex-tailor";
+import {
+  extractTexUnits,
+  applyTexTailor,
+  detex,
+  vocabFromTex,
+  buildTexTailorPrompt,
+  shimForXetex,
+  decideTexEdits,
+  fitTexToPages,
+} from "@/lib/tex-tailor";
 
 // A miniature sb2nov-style document: macro DEFINITION decoy before \begin{document}
 // (must not become a unit), two experiences + a project, nested braces, an Awards
@@ -106,6 +115,45 @@ test("unparseable reply → original document verbatim + error", () => {
   assert.equal(r.error, "parse-failed");
   assert.equal(r.tex, TEX);
   assert.ok(r.records.every((x) => x.action === "kept"));
+});
+
+test("fitTexToPages: MEASURED page fit — reverts the largest-growth rewrite first, converges, notes why", async () => {
+  const units = extractTexUnits(TEX);
+  const vocab = vocabFromTex(TEX);
+  // full mode: both replacements accepted (vocab-clean words)
+  const { decisions } = decideTexEdits(
+    units,
+    [
+      { id: "T0", action: "replace", text: "Built 4 ROS 2 nodes with C++ for control " + "and robotic systems control ".repeat(8) }, // huge growth
+      { id: "T2", action: "replace", text: "Automated data pipelines in Python daily" }, // tiny growth
+    ],
+    "rewrite-full",
+    vocab
+  );
+  // fake compiler: a "page" holds the original doc + 100 chars — the huge rewrite
+  // (+~250 chars) overflows to page 2; the tiny one (+7 chars) fits
+  const compilePages = async (t: string) => Math.max(1, Math.ceil(t.length / (TEX.length + 100)));
+  const basePages = await compilePages(TEX);
+  const fit = await fitTexToPages(TEX, decisions, basePages, compilePages);
+  assert.equal(fit.fitted, true);
+  assert.equal(fit.pages, basePages);
+  assert.equal(fit.length_reverts, 1, "only the worst offender reverted");
+  const t0 = decisions.find((d) => d.unit.id === "T0")!;
+  assert.equal(t0.action, "kept");
+  assert.match(t0.violation ?? "", /page count/);
+  assert.equal(decisions.find((d) => d.unit.id === "T2")!.action, "replaced", "small rewrite survives");
+  assert.ok(fit.tex.includes("Automated data pipelines in Python daily"));
+});
+
+test("fitTexToPages: already fitting → zero reverts; compiler unavailable → returns unfitted, no loop", async () => {
+  const units = extractTexUnits(TEX);
+  const { decisions } = decideTexEdits(units, [{ id: "T2", action: "replace", text: "Automated Python pipelines" }], "rewrite-full", vocabFromTex(TEX));
+  const ok = await fitTexToPages(TEX, decisions, 1, async () => 1);
+  assert.equal(ok.length_reverts, 0);
+  assert.equal(ok.fitted, true);
+  const dead = await fitTexToPages(TEX, decisions, 1, async () => null);
+  assert.equal(dead.fitted, false, "no engine → honestly unfitted");
+  assert.equal(dead.length_reverts, 0);
 });
 
 test("shimForXetex: guards RAW pdfTeX primitives; idempotent on already-guarded lines", () => {

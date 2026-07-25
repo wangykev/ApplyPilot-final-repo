@@ -146,15 +146,16 @@ const MODE_RULES: Record<TailorMode, string> = {
     'MODE: SURFACE REWRITE. Per bullet: "keep", "drop", or "replace" with reworded text that',
     "front-loads the JD's language. HARD RULES for replacements: keep every fact, metric, number,",
     "technology and scope EXACTLY as stated — rephrase and tighten only. NEVER add a number,",
-    "technology, or claim that is not in the original bullet. Keep each replacement NO LONGER than",
-    "the original (the resume must not grow past its page).",
+    "technology, or claim that is not in the original bullet. Aim for a similar length to the",
+    "original (page fit is verified by compiling — oversize rewrites get reverted).",
   ].join("\n"),
   "rewrite-full": [
     'MODE: FULL REWRITE. Per bullet: "keep", "drop", or "replace" with new text that presents the',
     "SAME underlying work in the JD's language — recombine and re-emphasize aggressively, but do NOT",
     "invent employers, titles, dates, metrics, or technologies the candidate never used.",
-    "Keep each replacement NO LONGER than the original bullet (the resume must not grow past its page).",
-    "Every replacement is shown to the candidate flagged as AI-written for review.",
+    "Aim for a similar length to the original bullet (page fit is verified by compiling —",
+    "oversize rewrites get reverted). Every replacement is shown to the candidate flagged as",
+    "AI-written for review.",
   ].join("\n"),
 };
 
@@ -227,31 +228,21 @@ export function vocabFromTex(tex: string): Set<string> {
   return vocab;
 }
 
-/**
- * Parse the LLM reply and splice the edits into the .tex. NEVER throws; an
- * unparseable reply returns the ORIGINAL document with every unit "kept".
- */
-export function applyTexTailor(tex: string, jdReply: string, mode: TailorMode): TexTailorResult {
-  const units = extractTexUnits(tex);
-  const identity: TexTailorResult = {
-    tex,
-    records: units.map((u) => ({ id: u.id, context: u.context, action: "kept", was: u.plain, now: u.plain })),
-    gaps: [],
-    rationale: "",
-    reverted_count: 0,
-  };
-  const obj = extractJsonObject(jdReply);
-  if (!obj) return { ...identity, error: "parse-failed", raw: String(jdReply).slice(0, 400) };
+export type TexDecision = {
+  unit: TexUnit;
+  action: "kept" | "dropped" | "replaced";
+  now: string;
+  violation?: string;
+  risk?: string;
+};
 
-  const vocab = vocabFromTex(tex);
+/** Stage 1: turn the LLM's edits into per-unit decisions under the mode's guardrails. */
+export function decideTexEdits(units: TexUnit[], edits: TexEdit[], mode: TailorMode, vocab: Set<string>): { decisions: TexDecision[]; reverted: number } {
   const byId = new Map<string, TexEdit>();
-  for (const e of Array.isArray(obj.edits) ? (obj.edits as TexEdit[]) : []) {
-    if (e && typeof e.id === "string") byId.set(e.id, e);
-  }
+  for (const e of edits) if (e && typeof e.id === "string") byId.set(e.id, e);
 
   let reverted = 0;
-  type Decision = { unit: TexUnit; action: "kept" | "dropped" | "replaced"; now: string; violation?: string; risk?: string };
-  const decisions: Decision[] = units.map((u) => {
+  const decisions: TexDecision[] = units.map((u) => {
     const e = byId.get(u.id);
     const action = String(e?.action ?? "keep").toLowerCase();
     if (action === "drop") return { unit: u, action: "dropped", now: "" };
@@ -275,7 +266,7 @@ export function applyTexTailor(tex: string, jdReply: string, mode: TailorMode): 
 
   // never empty a section's bullet list (LaTeX errors on an empty itemize, and an
   // empty section is never the right resume) — a fully-dropped group keeps all
-  const byContext = new Map<string, Decision[]>();
+  const byContext = new Map<string, TexDecision[]>();
   for (const d of decisions) {
     const k = d.unit.context;
     if (!byContext.has(k)) byContext.set(k, []);
@@ -289,8 +280,11 @@ export function applyTexTailor(tex: string, jdReply: string, mode: TailorMode): 
       }
     }
   }
+  return { decisions, reverted };
+}
 
-  // splice from the END so earlier ranges stay valid
+/** Stage 2: splice decisions into the ORIGINAL tex (from the end, so ranges stay valid). */
+export function spliceTexEdits(tex: string, decisions: TexDecision[]): string {
   let outTex = tex;
   for (const d of [...decisions].sort((a, b) => b.unit.start - a.unit.start)) {
     if (d.action === "dropped") {
@@ -303,20 +297,92 @@ export function applyTexTailor(tex: string, jdReply: string, mode: TailorMode): 
       outTex = outTex.slice(0, d.unit.start) + `\\resumeItem{${escapeLatex(d.now)}}` + outTex.slice(d.unit.end);
     }
   }
+  return outTex;
+}
 
+export function decisionsToRecords(decisions: TexDecision[]): TexEditRecord[] {
+  return decisions.map((d) => ({
+    id: d.unit.id,
+    context: d.unit.context,
+    action: d.action,
+    was: d.unit.plain,
+    now: d.action === "dropped" ? "" : d.now,
+    ...(d.violation ? { violation: d.violation } : {}),
+    ...(d.risk ? { fabrication_risk: d.risk } : {}),
+  }));
+}
+
+/** Pull the edits/gaps/reasoning out of a reply for the staged pipeline. */
+export function parseTexReply(jdReply: string): { edits: TexEdit[]; gaps: string[]; rationale: string } | null {
+  const obj = extractJsonObject(jdReply);
+  if (!obj) return null;
   return {
-    tex: outTex,
-    records: decisions.map((d) => ({
-      id: d.unit.id,
-      context: d.unit.context,
-      action: d.action,
-      was: d.unit.plain,
-      now: d.action === "dropped" ? "" : d.now,
-      ...(d.violation ? { violation: d.violation } : {}),
-      ...(d.risk ? { fabrication_risk: d.risk } : {}),
-    })),
+    edits: Array.isArray(obj.edits) ? (obj.edits as TexEdit[]) : [],
     gaps: (Array.isArray(obj.gaps) ? obj.gaps : []).map((g) => String(g ?? "").trim()).filter(Boolean),
     rationale: String(obj.reasoning ?? "").trim(),
+  };
+}
+
+/**
+ * PAGE-FIT enforcement — MEASURED, not prompt-trusted. Using the injected
+ * compiler (`compilePages`: tex → page count, null on failure), while the
+ * document exceeds the ORIGINAL's page count, revert the replacement with the
+ * largest text growth back to its source and recompile. Reverting to original
+ * text is always safe, and with every replacement reverted the document cannot
+ * exceed the original (drops only shrink) — the loop converges by construction.
+ * Mutates + returns the decisions (length-reverts carry a violation note the
+ * review UI already renders).
+ */
+export async function fitTexToPages(
+  tex: string,
+  decisions: TexDecision[],
+  basePages: number,
+  compilePages: (tex: string) => Promise<number | null>
+): Promise<{ tex: string; pages: number | null; length_reverts: number; fitted: boolean }> {
+  let current = spliceTexEdits(tex, decisions);
+  let pages = await compilePages(current);
+  let lengthReverts = 0;
+
+  while (pages != null && basePages > 0 && pages > basePages) {
+    const candidates = decisions
+      .filter((d) => d.action === "replaced")
+      .sort((a, b) => (b.now.length - b.unit.plain.length) - (a.now.length - a.unit.plain.length));
+    const worst = candidates[0];
+    if (!worst) break; // nothing revertible left; drops alone can't overflow
+    worst.action = "kept";
+    worst.now = worst.unit.plain;
+    worst.violation = "reverted to keep the resume at its original page count";
+    lengthReverts++;
+    current = spliceTexEdits(tex, decisions);
+    pages = await compilePages(current);
+  }
+
+  return { tex: current, pages, length_reverts: lengthReverts, fitted: pages == null ? false : basePages <= 0 || pages <= basePages };
+}
+
+/**
+ * Parse the LLM reply and splice the edits into the .tex. NEVER throws; an
+ * unparseable reply returns the ORIGINAL document with every unit "kept".
+ * (Composition of the stages above — the page-fit loop uses them directly.)
+ */
+export function applyTexTailor(tex: string, jdReply: string, mode: TailorMode): TexTailorResult {
+  const units = extractTexUnits(tex);
+  const identity: TexTailorResult = {
+    tex,
+    records: units.map((u) => ({ id: u.id, context: u.context, action: "kept", was: u.plain, now: u.plain })),
+    gaps: [],
+    rationale: "",
+    reverted_count: 0,
+  };
+  const parsed = parseTexReply(jdReply);
+  if (!parsed) return { ...identity, error: "parse-failed", raw: String(jdReply).slice(0, 400) };
+
+  const { decisions, reverted } = decideTexEdits(units, parsed.edits, mode, vocabFromTex(tex));
+  return {
+    tex: spliceTexEdits(tex, decisions),
+    records: decisionsToRecords(decisions),
+    gaps: parsed.gaps,
+    rationale: parsed.rationale,
     reverted_count: reverted,
   };
 }
