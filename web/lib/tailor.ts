@@ -47,10 +47,21 @@ export type TailoredExperience = {
   bullets: TailoredBullet[];
 };
 
+export type TailoredProject = {
+  include: boolean;
+  name: string;
+  role: string;
+  from: string;
+  to: string;
+  tech: string; // tech_stack joined for display — code-copied, never LLM-authored
+  bullets: TailoredBullet[];
+};
+
 export type TailoredResume = {
   mode: TailorMode;
   summary: string; // one tailored summary line — ALWAYS AI-written, always review
   experiences: TailoredExperience[]; // profile order preserved; include=false = dropped
+  projects: TailoredProject[]; // same rules as experiences
   skills: string[]; // chosen + ordered, values from the profile list only
   skills_omitted: string[];
   gaps: string[]; // JD requirements with nothing to claim
@@ -94,6 +105,34 @@ export function workUnits(profile: Profile): WorkUnit[] {
   }));
 }
 
+export type ProjectUnit = {
+  id: string; // "P0"
+  name: string;
+  role: string;
+  from: string;
+  to: string;
+  tech: string;
+  bullets: { id: string; text: string }[]; // "P0.B0" …
+};
+
+export function projectUnits(profile: Profile): ProjectUnit[] {
+  return (profile.projects ?? []).map((p, i) => {
+    // Kevin's profile often duplicates summary as bullet 0 — bullets are the render
+    // truth; a bullet-less project falls back to its summary as the single bullet.
+    const texts = (p.bullets ?? []).map((b) => String(b || "").trim()).filter(Boolean);
+    const effective = texts.length ? texts : p.summary && p.summary.trim() ? [p.summary.trim()] : [];
+    return {
+      id: `P${i}`,
+      name: p.name || "",
+      role: p.role || "",
+      from: p.from || "",
+      to: p.to || "",
+      tech: (p.tech_stack ?? []).filter(Boolean).join(", "),
+      bullets: effective.map((text, j) => ({ id: `P${i}.B${j}`, text })),
+    };
+  });
+}
+
 export function skillUnits(profile: Profile): { id: string; text: string }[] {
   return (profile.skills ?? [])
     .filter((s) => s && String(s).trim())
@@ -130,12 +169,20 @@ export function buildTailorPrompt(
   mode: TailorMode
 ): { system: string; user: string } {
   const work = workUnits(profile);
+  const projects = projectUnits(profile);
   const skills = skillUnits(profile);
 
   const workBlock = work
     .map((w) => {
       const head = `[${w.id}] ${w.job_title || "Role"} @ ${w.company || "?"} (${[w.from, w.to || (w.currently_work_here ? "present" : "")].filter(Boolean).join(" – ")})`;
       const bullets = w.bullets.map((b) => `  [${b.id}] ${b.text}`).join("\n");
+      return bullets ? `${head}\n${bullets}` : head;
+    })
+    .join("\n");
+  const projectBlock = projects
+    .map((p) => {
+      const head = `[${p.id}] ${p.name || "Project"}${p.tech ? ` | tech: ${p.tech}` : ""} (${[p.from, p.to].filter(Boolean).join(" – ")})`;
+      const bullets = p.bullets.map((b) => `  [${b.id}] ${b.text}`).join("\n");
       return bullets ? `${head}\n${bullets}` : head;
     })
     .join("\n");
@@ -152,16 +199,21 @@ export function buildTailorPrompt(
     '- "skills": the skill ids to keep, ordered most-JD-relevant first. Omit irrelevant ones.',
     '- "experiences": one entry per experience id, {"id", "include" (boolean), "bullets" (ordered)}.',
     "  Keep every experience unless it is truly irrelevant; keep at least one experience.",
+    '- "projects": one entry per project id, {"id", "include", "bullets"} — the SAME bullet rules',
+    "  as experiences. Keep the projects most relevant to the JD.",
     '- "gaps": JD requirements the background CANNOT support — name them honestly, never paper over.',
     '- "reasoning": 2-3 sentences on your choices.',
     "",
     "Respond with ONLY a JSON object — no prose, no markdown fence:",
-    '{ "summary": "...", "experiences": [...], "skills": ["S1","S0"], "gaps": ["..."], "reasoning": "..." }',
+    '{ "summary": "...", "experiences": [...], "projects": [...], "skills": ["S1","S0"], "gaps": ["..."], "reasoning": "..." }',
   ].join("\n");
 
   const user = [
     "CANDIDATE BACKGROUND UNITS:",
     workBlock || "(no work experience)",
+    "",
+    "PROJECTS:",
+    projectBlock || "(none)",
     "",
     "SKILLS:",
     skillsBlock || "(none)",
@@ -213,6 +265,12 @@ export function buildProfileVocab(profile: Profile): Set<string> {
     splitRoleDescription(w.role_description).forEach(add);
     add(w.job_title);
     add(w.company);
+  }
+  for (const p of profile.projects ?? []) {
+    (p.tech_stack ?? []).forEach(add);
+    (p.bullets ?? []).forEach(add);
+    add(p.summary);
+    add(p.name);
   }
   (profile.skills ?? []).forEach(add);
   for (const e of profile.education ?? []) {
@@ -293,7 +351,14 @@ type ReplyExperience = { id?: string; include?: boolean; bullets?: ReplyBullet[]
  */
 export function identityResume(profile: Profile, mode: TailorMode = "select"): TailoredResume {
   const work = workUnits(profile);
+  const projects = projectUnits(profile);
   const skills = skillUnits(profile);
+  const verbatim = (b: { id: string; text: string }): TailoredBullet => ({
+    text: b.text,
+    source_text: b.text,
+    source_ids: [b.id],
+    edited: false,
+  });
   return {
     mode,
     summary: "",
@@ -305,12 +370,16 @@ export function identityResume(profile: Profile, mode: TailorMode = "select"): T
       from: w.from,
       to: w.to,
       currently_work_here: w.currently_work_here,
-      bullets: w.bullets.map((b) => ({
-        text: b.text,
-        source_text: b.text,
-        source_ids: [b.id],
-        edited: false,
-      })),
+      bullets: w.bullets.map(verbatim),
+    })),
+    projects: projects.map((p) => ({
+      include: true,
+      name: p.name,
+      role: p.role,
+      from: p.from,
+      to: p.to,
+      tech: p.tech,
+      bullets: p.bullets.map(verbatim),
     })),
     skills: skills.map((s) => s.text),
     skills_omitted: [],
@@ -327,6 +396,7 @@ export function identityResume(profile: Profile, mode: TailorMode = "select"): T
  */
 export function parseTailorReply(text: string, profile: Profile, mode: TailorMode): TailoredResume {
   const work = workUnits(profile);
+  const projects = projectUnits(profile);
   const skills = skillUnits(profile);
   const vocab = buildProfileVocab(profile);
 
@@ -335,33 +405,23 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
   const obj = extractJsonObject(text);
   if (!obj) return { ...identity, error: "parse-failed", raw: String(text).slice(0, 400) };
 
-  const bulletById = new Map<string, { text: string; expIdx: number }>();
-  work.forEach((w, wi) => w.bullets.forEach((b) => bulletById.set(b.id, { text: b.text, expIdx: wi })));
+  // ONE bullet map across sections; `owner` (the section id, "W0"/"P1") scopes
+  // select/surface picks to the section's own bullets.
+  const bulletById = new Map<string, { text: string; owner: string }>();
+  work.forEach((w) => w.bullets.forEach((b) => bulletById.set(b.id, { text: b.text, owner: w.id })));
+  projects.forEach((p) => p.bullets.forEach((b) => bulletById.set(b.id, { text: b.text, owner: p.id })));
   const skillById = new Map(skills.map((s) => [s.id, s.text]));
 
   let reverted = 0;
 
-  // experiences: reply order is ignored for the SECTION (profile = reverse-chron
-  // stays); reply order applies WITHIN an experience's bullets.
-  const replyExps = Array.isArray(obj.experiences) ? (obj.experiences as ReplyExperience[]) : [];
-  const byExpId = new Map<string, ReplyExperience>();
-  for (const re of replyExps) if (re && typeof re.id === "string") byExpId.set(re.id, re);
-
-  const experiences: TailoredExperience[] = work.map((w, wi) => {
-    const re = byExpId.get(w.id);
-    const base = identity.experiences[wi];
-    if (!re) return base; // unmentioned → keep verbatim (fail-safe)
-
-    const include = re.include !== false;
-    const replyBullets = Array.isArray(re.bullets) ? re.bullets : null;
-    if (!replyBullets) return { ...base, include };
-
+  // Per-mode bullet processing, shared by experiences and projects.
+  const processBullets = (replyBullets: ReplyBullet[], ownerId: string): TailoredBullet[] => {
     const bullets: TailoredBullet[] = [];
     for (const rb of replyBullets) {
       if (typeof rb === "string") {
         // id string → verbatim source bullet (the select-mode shape)
         const src = bulletById.get(rb);
-        if (src && src.expIdx === wi) {
+        if (src && src.owner === ownerId) {
           bullets.push({ text: src.text, source_text: src.text, source_ids: [rb], edited: false });
         }
         continue;
@@ -371,7 +431,7 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
       if (mode === "select") {
         // select mode may ONLY reference ids — a {text} here is ignored in favor of the source
         const src = rb.id ? bulletById.get(rb.id) : undefined;
-        if (src && src.expIdx === wi) {
+        if (src && src.owner === ownerId) {
           bullets.push({ text: src.text, source_text: src.text, source_ids: [rb.id!], edited: false });
         }
         continue;
@@ -379,7 +439,7 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
 
       if (mode === "rewrite-surface") {
         const src = rb.id ? bulletById.get(rb.id) : undefined;
-        if (!src || src.expIdx !== wi) continue;
+        if (!src || src.owner !== ownerId) continue;
         const newText = String(rb.text ?? "").trim();
         if (!newText || newText === src.text) {
           bullets.push({ text: src.text, source_text: src.text, source_ids: [rb.id!], edited: false });
@@ -395,7 +455,7 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
         continue;
       }
 
-      // rewrite-full: free text grounded in sources
+      // rewrite-full: free text grounded in sources (from ANY section)
       const newText = String(rb.text ?? "").trim();
       if (!newText) continue;
       const srcIds = (Array.isArray(rb.sources) ? rb.sources : [])
@@ -411,15 +471,50 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
         ...(risk ? { fabrication_risk: risk } : {}),
       });
     }
+    return bullets;
+  };
 
-    // an included experience must keep at least one bullet — else fall back to all
+  const indexReply = (arr: unknown): Map<string, ReplyExperience> => {
+    const byId = new Map<string, ReplyExperience>();
+    if (Array.isArray(arr)) {
+      for (const re of arr as ReplyExperience[]) if (re && typeof re.id === "string") byId.set(re.id, re);
+    }
+    return byId;
+  };
+
+  // Reply order is ignored for the SECTIONS (profile order stays); reply order
+  // applies WITHIN a section's bullets. Unmentioned sections keep verbatim.
+  const byExpId = indexReply(obj.experiences);
+  const experiences: TailoredExperience[] = work.map((w, wi) => {
+    const re = byExpId.get(w.id);
+    const base = identity.experiences[wi];
+    if (!re) return base;
+    const include = re.include !== false;
+    const replyBullets = Array.isArray(re.bullets) ? re.bullets : null;
+    if (!replyBullets) return { ...base, include };
+    const bullets = processBullets(replyBullets, w.id);
+    // an included section must keep at least one bullet — else fall back to all
     if (include && bullets.length === 0) return { ...base, include };
     return { ...base, include, bullets };
   });
 
-  // every experience dropped → fail-safe to all included
-  const anyIncluded = experiences.some((e) => e.include);
+  const byProjId = indexReply(obj.projects);
+  const projectsOut: TailoredProject[] = projects.map((p, pi) => {
+    const rp = byProjId.get(p.id);
+    const base = identity.projects[pi];
+    if (!rp) return base;
+    const include = rp.include !== false;
+    const replyBullets = Array.isArray(rp.bullets) ? rp.bullets : null;
+    if (!replyBullets) return { ...base, include };
+    const bullets = processBullets(replyBullets, p.id);
+    if (include && bullets.length === 0) return { ...base, include };
+    return { ...base, include, bullets };
+  });
+
+  // EVERYTHING dropped → fail-safe to the untouched original (never an empty resume)
+  const anyIncluded = experiences.some((e) => e.include) || projectsOut.some((p) => p.include);
   const safeExperiences = anyIncluded ? experiences : identity.experiences;
+  const safeProjects = anyIncluded ? projectsOut : identity.projects;
 
   // skills: ids only — the LLM cannot invent a skill
   const replySkills = Array.isArray(obj.skills) ? (obj.skills as unknown[]) : null;
@@ -441,6 +536,7 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
     mode,
     summary: String(obj.summary ?? "").trim(),
     experiences: safeExperiences,
+    projects: safeProjects,
     skills: chosenSkills,
     skills_omitted: omitted,
     gaps: (Array.isArray(obj.gaps) ? obj.gaps : []).map((g) => String(g ?? "").trim()).filter(Boolean),

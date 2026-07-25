@@ -132,6 +132,12 @@ const TEX_PREAMBLE = String.raw`%-------------------------
       \textit{\small#3} & \textit{\small #4} \\
     \end{tabular*}\vspace{-7pt}
 }
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & #2 \\
+    \end{tabular*}\vspace{-7pt}
+}
 \renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
 \newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
 \newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
@@ -163,7 +169,8 @@ export function tailoredToTex(profile: Profile, tailored: TailoredResume): strin
     out.push("%-----------SUMMARY-----------", `\\small{${escapeLatex(tailored.summary)}}`, "\\vspace{2pt}", "");
   }
 
-  // education — always verbatim from the profile (facts, never tailored)
+  // education — always verbatim from the profile (facts, never tailored);
+  // coursework + GPA render as items under the school, mirroring the sb2nov layout
   const edu = profile.education ?? [];
   if (edu.length) {
     out.push("%-----------EDUCATION-----------", "\\section{Education}", "  \\resumeSubHeadingListStart");
@@ -177,8 +184,16 @@ export function tailoredToTex(profile: Profile, tailored: TailoredResume): strin
       out.push(
         "    \\resumeSubheading",
         `      {${escapeLatex(e.school_or_university)}}{}`,
-        `      {${escapeLatex(degreeLine)}${e.gpa ? escapeLatex(` — GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`) : ""}}{\\normalfont ${escapeLatex(gradText)}}`
+        `      {${escapeLatex(degreeLine)}}{\\normalfont ${escapeLatex(gradText)}}`
       );
+      const items: string[] = [];
+      if ((e.coursework ?? []).length) items.push(`Relevant Coursework: ${e.coursework.join(", ")}`);
+      if (e.gpa) items.push(`Cumulative GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`);
+      if (items.length) {
+        out.push("        \\resumeItemListStart");
+        for (const it of items) out.push(`            \\resumeItem{${escapeLatex(it)}}`);
+        out.push("        \\resumeItemListEnd");
+      }
     }
     out.push("  \\resumeSubHeadingListEnd", "");
   }
@@ -198,6 +213,23 @@ export function tailoredToTex(profile: Profile, tailored: TailoredResume): strin
       out.push("      \\resumeItemListEnd", "");
     }
     out.push("  \\resumeSubHeadingListEnd", "");
+  }
+
+  // projects — the tailored selection
+  const projIncluded = (tailored.projects ?? []).filter((p) => p.include && p.bullets.length);
+  if (projIncluded.length) {
+    out.push("%-----------PROJECTS-----------", "\\section{Projects}", "    \\resumeSubHeadingListStart");
+    for (const p of projIncluded) {
+      const title = `\\textbf{${escapeLatex(p.name)}}${p.tech ? ` $|$ \\emph{${escapeLatex(p.tech)}}` : ""}`;
+      out.push(
+        "        \\resumeProjectHeading",
+        `          {${title}}{${escapeLatex(dateRange(p.from, p.to, false))}}`,
+        "          \\resumeItemListStart"
+      );
+      for (const b of p.bullets) out.push(`            \\resumeItem{${escapeLatex(b.text)}}`);
+      out.push("          \\resumeItemListEnd", "");
+    }
+    out.push("    \\resumeSubHeadingListEnd", "");
   }
 
   if (tailored.skills.length) {
@@ -242,11 +274,25 @@ export function tailoredToPrintHtml(profile: Profile, tailored: TailoredResume):
       const gradText = e.graduation_date && e.graduation_date !== "YYYY-MM"
         ? `Expected ${displayDate(e.graduation_date)}`
         : [e.from_year, e.to_year].filter(Boolean).join(" – ");
+      const items: string[] = [];
+      if ((e.coursework ?? []).length) items.push(`Relevant Coursework: ${e.coursework.join(", ")}`);
+      if (e.gpa) items.push(`Cumulative GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`);
       return `<div class="entry">
   <div class="row"><span class="org">${escapeHtml(e.school_or_university)}</span><span class="dates">${escapeHtml(gradText)}</span></div>
-  <div class="row"><span class="role">${escapeHtml(degreeLine)}${e.gpa ? escapeHtml(` — GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`) : ""}</span></div>
+  <div class="row"><span class="role">${escapeHtml(degreeLine)}</span></div>
+  ${items.length ? `<ul>${items.map((it) => `<li>${escapeHtml(it)}</li>`).join("")}</ul>` : ""}
 </div>`;
     })
+    .join("\n");
+
+  const projHtml = (tailored.projects ?? [])
+    .filter((p) => p.include && p.bullets.length)
+    .map(
+      (p) => `<div class="entry">
+  <div class="row"><span class="org">${escapeHtml(p.name)}${p.tech ? ` <span class="tech">| ${escapeHtml(p.tech)}</span>` : ""}</span><span class="dates">${escapeHtml(dateRange(p.from, p.to, false))}</span></div>
+  <ul>${p.bullets.map((b) => `<li>${escapeHtml(b.text)}</li>`).join("")}</ul>
+</div>`
+    )
     .join("\n");
 
   const expHtml = tailored.experiences
@@ -278,6 +324,7 @@ export function tailoredToPrintHtml(profile: Profile, tailored: TailoredResume):
   .org { font-weight: 700; }
   .role { font-style: italic; font-size: 10pt; }
   .dates { font-size: 9.5pt; font-style: italic; }
+  .tech { font-style: italic; font-weight: 400; font-size: 9.5pt; }
   ul { margin: 2px 0 0 16px; }
   li { margin-bottom: 1.5px; font-size: 10pt; }
   .skills { font-size: 10pt; }
@@ -289,6 +336,7 @@ export function tailoredToPrintHtml(profile: Profile, tailored: TailoredResume):
   ${tailored.summary ? `<p class="summary">${escapeHtml(tailored.summary)}</p>` : ""}
   ${eduHtml ? `<h2>Education</h2>\n${eduHtml}` : ""}
   ${expHtml ? `<h2>Professional Experience</h2>\n${expHtml}` : ""}
+  ${projHtml ? `<h2>Projects</h2>\n${projHtml}` : ""}
   ${tailored.skills.length ? `<h2>Technical Skills</h2>\n<p class="skills">${escapeHtml(tailored.skills.join(", "))}</p>` : ""}
 </body>
 </html>`;

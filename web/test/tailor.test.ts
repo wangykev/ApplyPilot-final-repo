@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   splitRoleDescription,
   workUnits,
+  projectUnits,
   skillUnits,
   buildTailorPrompt,
   parseTailorReply,
@@ -24,7 +25,18 @@ const PROFILE = coerceProfile({
       gpa: "3.95",
       gpa_scale: "4.00",
       graduation_date: "2028-05",
+      coursework: ["Intro to Computer Systems", "Digital Design"],
     },
+  ],
+  projects: [
+    {
+      name: "FPGA Motor Control",
+      from: "2026-01",
+      summary: "real-time motor control on an FPGA",
+      bullets: ["Built a real-time motor-control peripheral on an FPGA", "Implemented a fixed-point PID speed loop"],
+      tech_stack: ["SystemVerilog", "FPGA"],
+    },
+    { name: "Summary-only project", summary: "a project with only a summary", bullets: [] },
   ],
   work_experience: [
     {
@@ -124,7 +136,8 @@ test("select: include:false drops an experience; ALL dropped falls back to all i
     "select"
   );
   assert.equal(one.experiences[1].include, false);
-  const all = parseTailorReply(
+  // all experiences dropped but projects remain → allowed (the resume isn't empty)
+  const expOnly = parseTailorReply(
     JSON.stringify({
       experiences: [
         { id: "W0", include: false },
@@ -134,7 +147,25 @@ test("select: include:false drops an experience; ALL dropped falls back to all i
     PROFILE,
     "select"
   );
+  assert.ok(expOnly.experiences.every((e) => !e.include));
+  assert.ok(expOnly.projects.every((p) => p.include));
+  // EVERYTHING dropped → fail-safe restores the whole original (never an empty resume)
+  const all = parseTailorReply(
+    JSON.stringify({
+      experiences: [
+        { id: "W0", include: false },
+        { id: "W1", include: false },
+      ],
+      projects: [
+        { id: "P0", include: false },
+        { id: "P1", include: false },
+      ],
+    }),
+    PROFILE,
+    "select"
+  );
   assert.ok(all.experiences.every((e) => e.include), "never emit an empty resume");
+  assert.ok(all.projects.every((p) => p.include));
 });
 
 // ── surface mode: facts locked by a deterministic check ──────────────────────
@@ -194,6 +225,49 @@ test("full: free text carries sources; out-of-profile tech flagged as fabricatio
   assert.match(risky.fabrication_risk ?? "", /kubernetes/i);
 });
 
+// ── projects as first-class units ─────────────────────────────────────────────
+test("projectUnits: stable ids; bullets from bullets[]; summary is the fallback bullet", () => {
+  const p = projectUnits(PROFILE);
+  assert.equal(p[0].id, "P0");
+  assert.equal(p[0].bullets[1].id, "P0.B1");
+  assert.equal(p[0].tech, "SystemVerilog, FPGA");
+  assert.deepEqual(p[1].bullets.map((b) => b.text), ["a project with only a summary"]);
+});
+test("buildTailorPrompt: projects block + reply contract include projects", () => {
+  const { system, user } = buildTailorPrompt(PROFILE, "jd text", "select");
+  assert.match(user, /\[P0\] FPGA Motor Control \| tech: SystemVerilog, FPGA/);
+  assert.match(user, /\[P0\.B0\] Built a real-time motor-control peripheral/);
+  assert.match(system, /"projects": one entry per project id/);
+});
+test("select: project bullets pick verbatim by id; a cross-section id is skipped", () => {
+  const r = parseTailorReply(
+    JSON.stringify({ projects: [{ id: "P0", include: true, bullets: ["P0.B1", "W0.B0"] }] }),
+    PROFILE,
+    "select"
+  );
+  assert.deepEqual(r.projects[0].bullets.map((b) => b.text), ["Implemented a fixed-point PID speed loop"]);
+  // unmentioned project kept verbatim
+  assert.equal(r.projects[1].include, true);
+});
+test("surface: a project rewrite that invents a number is reverted", () => {
+  const r = parseTailorReply(
+    JSON.stringify({ projects: [{ id: "P0", bullets: [{ id: "P0.B0", text: "Built 12 FPGA peripherals" }] }] }),
+    PROFILE,
+    "rewrite-surface"
+  );
+  assert.equal(r.projects[0].bullets[0].text, "Built a real-time motor-control peripheral on an FPGA");
+  assert.match(r.projects[0].bullets[0].violation ?? "", /invented number "12"/);
+});
+test("projects: include:false drops one; experiences survive independently", () => {
+  const r = parseTailorReply(
+    JSON.stringify({ projects: [{ id: "P1", include: false }] }),
+    PROFILE,
+    "select"
+  );
+  assert.equal(r.projects[1].include, false);
+  assert.ok(r.experiences.every((e) => e.include));
+});
+
 // ── identityResume (the "Original" view + the fail-safe baseline) ─────────────
 test("identityResume: every experience included, every bullet verbatim, all skills, no summary", () => {
   const r = identityResume(PROFILE);
@@ -248,6 +322,30 @@ test("displayDate/dateRange: YYYY-MM → Mon YYYY; current → Present", () => {
   assert.equal(displayDate("2025-05"), "May 2025");
   assert.equal(dateRange("2024-09", "", true), "Sep. 2024 – Present");
 });
+test("coerceProfile: projects survive; extension coursework bridges into education[0]", () => {
+  const p = coerceProfile({
+    education: [{ school_or_university: "CMU" }],
+    projects: [{ name: "Vinyl Player", bullets: ["Designed a turntable"], tech_stack: ["Altium"] }],
+    application_questions: { role_specific: { coursework_relevant: ["Imperative Computation"] } },
+  });
+  assert.equal(p.projects.length, 1);
+  assert.equal(p.projects[0].name, "Vinyl Player");
+  assert.deepEqual(p.education[0].coursework, ["Imperative Computation"]);
+});
+
+test("documents: Projects + coursework/GPA render in BOTH tex and print HTML", () => {
+  const original = identityResume(PROFILE);
+  const tex = tailoredToTex(PROFILE, original);
+  assert.match(tex, /\\section\{Projects\}/);
+  assert.match(tex, /FPGA Motor Control/);
+  assert.match(tex, /Relevant Coursework: Intro to Computer Systems, Digital Design/);
+  assert.match(tex, /Cumulative GPA: 3.95\/4.00/);
+  const html = tailoredToPrintHtml(PROFILE, original);
+  assert.match(html, /<h2>Projects<\/h2>/);
+  assert.match(html, /Built a real-time motor-control peripheral/);
+  assert.match(html, /Relevant Coursework: Intro to Computer Systems/);
+});
+
 test("tailoredToTex: sb2nov skeleton + escaped content + only included experiences", () => {
   const tailored = parseTailorReply(
     JSON.stringify({
