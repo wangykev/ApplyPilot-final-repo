@@ -5,6 +5,7 @@ import { isSupabaseConfigured } from "@/lib/env";
 import { callLLM } from "@/lib/llm";
 import { loadUserData } from "@/lib/user-data";
 import { buildTailorPrompt, parseTailorReply, type TailorMode, type TailoredResume } from "@/lib/tailor";
+import { extractTexUnits, buildTexTailorPrompt, applyTexTailor, shimForXetex, type TexTailorResult } from "@/lib/tex-tailor";
 import { tailoredToTex, tailoredToPrintHtml } from "@/lib/resume-doc";
 
 export type TailorActionResult =
@@ -62,6 +63,60 @@ export async function tailorResume({
   };
 }
 
+// ── RESUME-FIRST tailoring: edit the user's ACTUAL .tex (bullets only) ────────
+
+export type TexTailorActionResult = { ok: true; result: TexTailorResult } | { ok: false; error: string };
+
+/**
+ * Tailor the user's real resume source: the LLM proposes keep/drop/replace per
+ * \resumeItem bullet; everything else in the document passes through untouched
+ * (fidelity by construction — the operator's resume-first correction of the
+ * profile-first design). Same mode guardrails as the profile path.
+ */
+export async function tailorResumeTex({
+  jobDescription,
+  mode,
+  tex,
+}: {
+  jobDescription: string;
+  mode: TailorMode;
+  tex: string;
+}): Promise<TexTailorActionResult> {
+  const jd = (jobDescription || "").trim();
+  if (jd.length < MIN_JD_CHARS) {
+    return { ok: false, error: "Paste a job description first — a bit more text is needed to tailor." };
+  }
+  if (!["select", "rewrite-surface", "rewrite-full"].includes(mode)) {
+    return { ok: false, error: "Unknown tailoring mode." };
+  }
+  const units = extractTexUnits(tex || "");
+  if (!units.length) {
+    return { ok: false, error: "No \\resumeItem{…} bullets found in that .tex — is it your sb2nov-style resume source?" };
+  }
+
+  const loaded = await loadUserData();
+  if (!loaded.ok) return { ok: false, error: loaded.error };
+  const { ai } = loaded.data;
+  if (!ai.apiKey) return { ok: false, error: "Add an API key on the AI page first." };
+
+  const { system, user: prompt } = buildTexTailorPrompt(units, jd, mode);
+  const res = await callLLM({
+    provider: ai.provider,
+    model: ai.model,
+    apiKey: ai.apiKey,
+    system,
+    user: prompt,
+    maxTokens: 8000, // reply carries every bullet decision + thinking headroom
+  });
+  if (!res.ok) return { ok: false, error: "AI request failed: " + res.error };
+
+  const result = applyTexTailor(tex, res.text, mode);
+  if (result.error) {
+    return { ok: false, error: "Couldn't read the AI reply (" + result.error + ") — try again." };
+  }
+  return { ok: true, result };
+}
+
 // ── LaTeX → PDF compile (LOCAL engine; the exact sb2nov template) ─────────────
 
 export type CompileResult = { ok: true; pdfBase64: string } | { ok: false; error: string };
@@ -88,7 +143,9 @@ export async function compileLatexPdf({ tex }: { tex: string }): Promise<Compile
   let dir = "";
   try {
     dir = await mkdtemp(join(tmpdir(), "ap-tex-"));
-    await writeFile(join(dir, "resume.tex"), tex, "utf-8");
+    // XeTeX shim: guard pdfTeX-only primitives so a user's RAW resume.tex compiles
+    // under tectonic (the downloaded .tex is untouched — this is compile-time only).
+    await writeFile(join(dir, "resume.tex"), shimForXetex(tex), "utf-8");
     const run = new Promise<{ code: number; err: string }>((resolve) => {
       execFile(
         engine,
