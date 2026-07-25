@@ -2619,16 +2619,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // confirms the company is NAMED in the question; the answer comes from your employer list. Display keeps
   // jobContext.company untouched. Used at every employment site below (candidateIsPreviousWorker + the
   // recognizer post-pass + the checkbox contradiction flag) instead of reading jobContext.company directly.
-  const empCompany = (jobContext && jobContext.company) || apMatch.tenantCompanyFromUrl(scan.url) || null;
-  // Recognition tries EACH anchor candidate (scraped company AND the URL tenant), using whichever is
-  // actually NAMED in the question — so a WRONG/absent scrape (a division, a location, empty) doesn't block
-  // the good URL-tenant anchor (2026-07-25). Deduped, empties dropped. decideEmploymentStatus gets the
-  // anchor that matched.
-  const empAnchors = [...new Set([(jobContext && jobContext.company), apMatch.tenantCompanyFromUrl(scan.url)].filter(Boolean))];
-  const recognizeEmp = (label) => {
-    for (const a of empAnchors) { const r = recognizeEmploymentQuestion(label, a); if (r) return { tense: r.tense, company: a }; }
-    return null;
-  };
+  // Employment-question anchor (the company you're applying to): the page URL's tenant subdomain/path is
+  // the company brand on every Workday tenant and is ALWAYS present, so PREFER it; the scraped
+  // jobContext.company is only a fallback for a non-Workday URL. A wrong/empty scrape no longer blocks the
+  // recognizer. The recognizer confirms the company is NAMED in the question; the answer comes from your
+  // employer list. (2026-07-25.)
+  const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
 
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
@@ -2724,8 +2720,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // contradicts — keep the check, FLAG it for review. Agreement / unevaluable → silent, as before.
           if (!mappedPath && record.status === "filled") {
             try {
-              const emp = recognizeEmp(f.label); // tries each anchor (scrape + URL tenant)
-              const d = emp ? decideEmploymentStatus(emp.tense, emp.company, profile, f.label) : null;
+              const emp = recognizeEmploymentQuestion(f.label, empCompany);
+              const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
               if (d && d.fill === "No") {
                 record.status = "filled_review"; record.flag = "employer-match";
                 record.detail = (record.detail ? record.detail + "; " : "")
@@ -2821,10 +2817,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
-        const emp = recognizeEmp(f.label); // tries each anchor (scrape + URL tenant), uses the one NAMED in the question
-        // Diagnostic: reveal the anchors + recognition for any employment-shaped question (why it did/didn't fire).
-        try { if (emp || /\bemploy|\bwork(?:ed|ing|s)?\b/i.test(String(f.label || ""))) console.log(`[ApplyPilot][EMP-RECOG] anchors=${JSON.stringify(empAnchors)} → ${emp ? emp.tense + "/" + JSON.stringify(emp.company) : "NOT recognized"} | "${String(f.label || "").replace(/\s+/g, " ").slice(0, 70)}"`); } catch (e) {}
-        const decision = emp ? decideEmploymentStatus(emp.tense, emp.company, profile, f.label) : null;
+        const emp = recognizeEmploymentQuestion(f.label, empCompany);
+        const decision = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
         if (decision && decision.fill) {
           const norm = apMatch.normalize;
           if (f.widgetType === "radio") {
@@ -2852,9 +2846,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
             // DROPDOWN: open + read the live options (the proven reader), map the polarity to the exact
             // option, commit via the AI path's proven text-keyed click + persistence re-read (an EMPTY
             // fill never races → single commit; a prefilled-equal value keeps with ZERO value actuation).
-            const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
-            const enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+            let { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+            let enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+            // RENDER-RACE retry: a first open can settle before the options mount (the recognizer opens
+            // right after the prior field's re-render). Re-open ONCE for the full list before giving up —
+            // else a recognized employment question falls to the AI just because its options were late.
+            if (!enabledTexts.length) {
+              await closeAndVerifyBlank(act, loc, before, budgets);
+              const re = await openAndReadDropdown(act, loc, budgets);
+              before = re.before; state = re.state; expanded = re.expanded;
+              enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+            }
             const target = enabledTexts.length ? optionForPolarity(enabledTexts, decision.fill) : null;
+            try { console.log(`[ApplyPilot][EMP-DD] decision=${decision.fill} expanded=${expanded} enabled=${enabledTexts.length} target=${JSON.stringify(target)} opts=${JSON.stringify(enabledTexts.slice(0, 8))}`); } catch (e) {}
             if (!target) {
               await closeAndVerifyBlank(act, loc, before, budgets); // options unreadable/ambiguous → close clean, AI fallback below
             } else if (hasLiveValue(before) && norm(before) === norm(target)) {
