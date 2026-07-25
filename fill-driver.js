@@ -30,7 +30,8 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio, normalizeLabel: normalizeLabel,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
-      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders };
+      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
+      tenantCompanyFromUrl: tenantCompanyFromUrl };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -2611,6 +2612,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
   const bucketIndex = buildBucketIndex(opts && opts.buckets); // Profile v2: wording → answer buckets (consulted before AI)
   const scan = await act.scanPage();
+  // Employment-question anchor (the company you're applying to): prefer the scraped jobContext.company,
+  // else the tenant subdomain from THIS page's URL (always present — magna.wd…myworkday{jobs,site}.com →
+  // "Magna"). So the employer-match / employment-status logic anchors RELIABLY off the URL instead of a
+  // scrape/hand-off that may not have populated a company (Option 1, 2026-07-25). The recognizer still
+  // confirms the company is NAMED in the question; the answer comes from your employer list. Display keeps
+  // jobContext.company untouched. Used at every employment site below (candidateIsPreviousWorker + the
+  // recognizer post-pass + the checkbox contradiction flag) instead of reading jobContext.company directly.
+  const empCompany = (jobContext && jobContext.company) || apMatch.tenantCompanyFromUrl(scan.url) || null;
   const results = [];
 
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
@@ -2669,7 +2678,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
         // "Yes" carries a review flag; unevaluable stays blank + review.
-        const company = jobContext && jobContext.company;
+        const company = empCompany; // scrape OR the URL tenant — reliable anchor (Option 1)
         const employers = profile.employment_history_companies;
         record.mappedPath = "(employer-match)";
         record.rawValue = company || null;
@@ -2706,8 +2715,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // contradicts — keep the check, FLAG it for review. Agreement / unevaluable → silent, as before.
           if (!mappedPath && record.status === "filled") {
             try {
-              const empCompany = jobContext && jobContext.company;
-              const emp = recognizeEmploymentQuestion(f.label, empCompany);
+              const emp = recognizeEmploymentQuestion(f.label, empCompany); // empCompany = scrape OR URL tenant (Option 1)
               const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
               if (d && d.fill === "No") {
                 record.status = "filled_review"; record.flag = "employer-match";
@@ -2804,8 +2812,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
-        const empCompany = jobContext && jobContext.company;
-        const emp = recognizeEmploymentQuestion(f.label, empCompany);
+        const emp = recognizeEmploymentQuestion(f.label, empCompany); // empCompany = scrape OR URL tenant (Option 1)
         const decision = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
         if (decision && decision.fill) {
           const norm = apMatch.normalize;

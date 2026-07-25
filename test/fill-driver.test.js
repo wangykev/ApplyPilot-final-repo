@@ -97,7 +97,7 @@ function makeFakeAct(fields, opts) {
     delay: async () => {},
     delayFull: async () => {}, // non-adaptive (real-time) wait — instant in tests
     scanPage: async () => ({
-      url: "fake://page",
+      url: o.scanUrl || "fake://page", // o.scanUrl lets a test model a real tenant URL (the employment anchor's tenant fallback)
       repeatingFieldCount: 0,
       fields: fields.map((f) => ({
         wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType,
@@ -695,9 +695,37 @@ test("employment question — 'Yes' (company in history) → filled_review + emp
   assert.strictEqual(e.needs_review_reason, "employer_match_uncertain", "renders as an employer match, NOT AI-inferred");
   assert.strictEqual(e.confidence_source, "employer_match");
 });
-test("employment question — no company anchor → NOT recognized → not silently filled (falls to blank/AI)", async () => {
+test("employment question — no company anchor AND a non-tenant URL → NOT recognized → not silently filled (falls to blank/AI)", async () => {
+  // run() uses the default fake scan url ("fake://page" → no tenant), so with jobContext.company empty
+  // there's NO anchor at all → the recognizer can't fire. (Contrast the URL-tenant test just below.)
   const [rec] = await run([empField("Are you a former MAGNA employee?")], { employment_history_companies: ["Google"] }, {});
-  assert.notStrictEqual(rec.status, "filled", "no company → not recognized → never a silent deterministic fill");
+  assert.notStrictEqual(rec.status, "filled", "no anchor (no company + non-tenant url) → not recognized → never a silent deterministic fill");
+});
+
+// ── Option 1 (2026-07-25): the employment anchor falls back to the page URL's tenant subdomain ──
+// so the recognizer + employer-match logic anchor RELIABLY off the URL (always present) instead of a
+// scraped jobContext.company that may be empty. The decision still comes from the profile employer list.
+const { tenantCompanyFromUrl } = require("../lib.js");
+test("tenantCompanyFromUrl: extracts the company brand from a Workday tenant URL", () => {
+  assert.strictEqual(tenantCompanyFromUrl("https://magna.wd3.myworkdayjobs.com/en-US/x"), "Magna");
+  assert.strictEqual(tenantCompanyFromUrl("https://magna.wd3.myworkdaysite.com/y"), "Magna", "the logged-in form host too");
+  assert.strictEqual(tenantCompanyFromUrl("https://comcast.wd5.myworkdayjobs.com/z"), "Comcast");
+  assert.strictEqual(tenantCompanyFromUrl("https://acme-corp.wd1.myworkdayjobs.com/a"), "Acme Corp");
+  assert.strictEqual(tenantCompanyFromUrl("https://careers.google.com/j"), null, "non-Workday → null");
+  assert.strictEqual(tenantCompanyFromUrl(""), null);
+  assert.strictEqual(tenantCompanyFromUrl(null), null);
+});
+test("employment anchor via URL tenant: a custom 'former «co» employee?' with EMPTY jobContext.company is recognized + filled 'No' deterministically (no AI)", async () => {
+  // jobContext.company is empty ({}), but the page URL is a Magna tenant → the anchor falls back to
+  // "Magna" (from the URL), so the recognizer fires and fills a deterministic clean-miss "No" from the
+  // employer list — instead of the AI safety-reversal (LEGALLY-LOADED review). The LLM is never called.
+  const act = makeFakeAct([empField("Are you a former MAGNA employee?")],
+    { scanUrl: "https://magna.wd3.myworkdaysite.com/en-US/apply", aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled", "recognized via the URL tenant → deterministic No, no review");
+  assert.ok(!rec.flag, "no ai / LEGALLY-LOADED flag");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "LLM NOT called — the URL tenant anchor made it deterministic");
 });
 
 // ── ADVERSARIAL WORDINGS (2026-07-24) — each of these WOULD have produced a silent WRONG deterministic

@@ -842,8 +842,23 @@ function looksLikeSso(state) {
   return false;
 }
 
+// The company brand from a Workday tenant URL — magna.wd3.myworkdayjobs.com → "Magna" (also the
+// logged-in myworkdaysite.com form host). The tenant subdomain IS the company brand on virtually every
+// Workday tenant AND is always present in the page URL, so it's a reliable employment-question anchor when
+// the scraped jobContext.company is missing (Option 1, 2026-07-25 — anchor on the URL tenant, still
+// confirmed-in-question by the recognizer; the answer comes from the profile employer list). Returns null
+// on a non-Workday / unparseable URL. Mirrors scrapeJobDescription's subdomain+titleCase fallback.
+function tenantCompanyFromUrl(url) {
+  let host = "";
+  try { host = new URL(String(url == null ? "" : url)).hostname; } catch (e) { host = ""; }
+  const m = host.match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
+  if (!m) return null;
+  return m[1].replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim()
+    .split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ") || null;
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isAlreadyApplied };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, tenantCompanyFromUrl };
 }
