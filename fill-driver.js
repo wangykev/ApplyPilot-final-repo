@@ -2846,19 +2846,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
             // DROPDOWN: open + read the live options (the proven reader), map the polarity to the exact
             // option, commit via the AI path's proven text-keyed click + persistence re-read (an EMPTY
             // fill never races → single commit; a prefilled-equal value keeps with ZERO value actuation).
-            let { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
-            let enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
-            // RENDER-RACE retry: a first open can settle before the options mount (the recognizer opens
-            // right after the prior field's re-render). Re-open ONCE for the full list before giving up —
-            // else a recognized employment question falls to the AI just because its options were late.
-            if (!enabledTexts.length) {
-              await closeAndVerifyBlank(act, loc, before, budgets);
-              const re = await openAndReadDropdown(act, loc, budgets);
-              before = re.before; state = re.state; expanded = re.expanded;
-              enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
-            }
+            const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+            const enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
             const target = enabledTexts.length ? optionForPolarity(enabledTexts, decision.fill) : null;
-            try { console.log(`[ApplyPilot][EMP-DD] decision=${decision.fill} expanded=${expanded} enabled=${enabledTexts.length} target=${JSON.stringify(target)} opts=${JSON.stringify(enabledTexts.slice(0, 8))}`); } catch (e) {}
             if (!target) {
               await closeAndVerifyBlank(act, loc, before, budgets); // options unreadable/ambiguous → close clean, AI fallback below
             } else if (hasLiveValue(before) && norm(before) === norm(target)) {
