@@ -183,20 +183,37 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // Gmail auto-verify defaults ON for a website run (an email-verify tenant would otherwise
         // halt); the message may override, and the stored toggle wins if explicitly OFF.
         const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
-        // Background fill (the website "Run in background" button): open the job tab UNFOCUSED
-        // (active:false) so the operator stays on the Run page while the pipeline works. The whole
-        // CDP substrate is already hidden-safe (worker-timers override + adaptive pacing + cdpWakePage),
-        // so nothing downstream changes — a genuinely-unrenderable step still halts self-explaining
-        // (e.g. hidden-render-stalled) rather than guessing.
+        // Background fill (the website "Run in background" button) — a VISIBLE-but-UNFOCUSED MINI
+        // WINDOW, not a background tab (2026-07-25). The [CDP-TIME] evidence showed a hidden tab's
+        // INPUT PIPELINE stalls ~1.2–1.5s per trusted Input.dispatch* event (no compositor frames —
+        // per-field cost scaled with the input-event count, IDENTICAL across pacing regimes), which
+        // no delay tuning can fix. A visible-unfocused popup window keeps compositor frames flowing:
+        // trusted input lands in ms, the page paints (the dropdown overwrite debounce takes the tiny
+        // VISIBLE beats), and act.visible/cdpFast run the fast ladders — while the operator's own
+        // window keeps focus. Positioned at the bottom-right of the operator's current window. If the
+        // operator covers/minimizes it, OS occlusion throttles it back to hidden-tab behavior — the
+        // worker-timers override + adaptive pacing + cdpWakePage remain as the belt (never WORSE than
+        // the old background tab; a genuinely-unrenderable step still halts self-explaining).
         const background = message.background === true;
 
         runInFlight = true;
-        emitRunProgress("Opening the job posting", background ? "in a background tab" : "");
-        // Open the job link in a new tab and wait for the first load to settle.
-        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+        emitRunProgress("Opening the job posting", background ? "in a mini window (visible + unfocused — fast input path)" : "");
+        // Open the job link and wait for the first load to settle.
+        let tab = null;
+        if (background) {
+          let bounds = null;
+          try { bounds = await new Promise((res) => chrome.windows.getLastFocused((w) => res(w))); } catch (e) { bounds = null; }
+          const W = 480, H = 640;
+          const left = Math.max(0, (bounds && bounds.left != null && bounds.width != null) ? bounds.left + bounds.width - W - 16 : 60);
+          const top = Math.max(0, (bounds && bounds.top != null && bounds.height != null) ? bounds.top + bounds.height - H - 88 : 60);
+          const win = await new Promise((res) => chrome.windows.create({ url: startUrl, focused: false, type: "popup", width: W, height: H, left, top }, res));
+          tab = win && Array.isArray(win.tabs) ? win.tabs[0] : null;
+        } else {
+          tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: true }, res));
+        }
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
         const tabId = tab.id;
-        console.log(`[ApplyPilot][RUN] opened job tab ${tabId} (${background ? "BACKGROUND — unfocused, hidden-safe pacing" : "foreground"})`);
+        console.log(`[ApplyPilot][RUN] opened job tab ${tabId} (${background ? "MINI WINDOW — visible + unfocused (fast trusted-input path; cover/minimize it and the run degrades to hidden-safe pacing)" : "foreground"})`);
         await waitTabComplete(tabId, 20000);
         await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
 

@@ -504,14 +504,22 @@ function inputLog(...a) { if (inputTraceEnabled) console.log("[ApplyPilot][INPUT
 
 // Full mouse click at viewport CSS-pixel coords: move → press → release — the
 // closest CDP analog to a real click; the resulting page events are isTrusted.
+// BATCHED SEND (2026-07-25 — the hidden input-pipeline stall): on a HIDDEN tab each awaited
+// Input.dispatch* ack stalls ~1.2–1.5s (input processing rides compositor-frame scheduling, and a
+// hidden tab produces no frames — the [CDP-TIME] evidence: per-field cost scaled with the input-event
+// count across BOTH pacing regimes). chrome.debugger.sendCommand delivers in order per target, so we
+// ISSUE the sequence back-to-back and await the acks together — the renderer's input queue drains the
+// whole burst in one beat instead of paying one stall per event. Event order/semantics unchanged.
 async function cdpClickAt(x, y) {
   inputLog("click", "(" + Math.round(x) + "," + Math.round(y) + ")");
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 });
-    await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 });
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
+    await Promise.all([
+      cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 }),
+      cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 }),
+      cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 })
+    ]);
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -523,11 +531,15 @@ async function cdpTripleClickAt(x, y) {
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), button: "left", pointerType: "mouse" };
-    await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" });
+    // BATCHED SEND (2026-07-25): issue the whole move + 3×(press/release) sequence back-to-back and
+    // await together — in-order delivery holds, and a hidden tab pays ONE input-pipeline drain for
+    // the burst instead of seven (see cdpClickAt).
+    const sends = [cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", x: base.x, y: base.y, button: "none", buttons: 0, pointerType: "mouse" })];
     for (let i = 1; i <= 3; i++) {
-      await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i });
-      await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i });
+      sends.push(cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: i }));
+      sends.push(cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 0, clickCount: i }));
     }
+    await Promise.all(sends);
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -556,12 +568,16 @@ async function cdpKeyTap(def) {
       modifiers: def.modifiers || 0
     };
     if (def.text) { down.text = def.text; down.unmodifiedText = def.text; }
-    await cdpSend("Input.dispatchKeyEvent", down);
-    await cdpSend("Input.dispatchKeyEvent", {
-      type: "keyUp", key: def.key, code: def.code,
-      windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
-      modifiers: def.modifiers || 0
-    });
+    // BATCHED SEND (2026-07-25): down+up issued back-to-back, awaited together — one hidden-tab
+    // input-pipeline drain per tap instead of two (see cdpClickAt). Text insertion rides the keyDown.
+    await Promise.all([
+      cdpSend("Input.dispatchKeyEvent", down),
+      cdpSend("Input.dispatchKeyEvent", {
+        type: "keyUp", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk,
+        modifiers: def.modifiers || 0
+      })
+    ]);
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
