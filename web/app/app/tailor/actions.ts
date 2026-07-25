@@ -5,7 +5,18 @@ import { isSupabaseConfigured } from "@/lib/env";
 import { callLLM } from "@/lib/llm";
 import { loadUserData } from "@/lib/user-data";
 import { buildTailorPrompt, parseTailorReply, type TailorMode, type TailoredResume } from "@/lib/tailor";
-import { extractTexUnits, buildTexTailorPrompt, applyTexTailor, shimForXetex, type TexTailorResult } from "@/lib/tex-tailor";
+import {
+  extractTexUnits,
+  buildTexTailorPrompt,
+  parseTexReply,
+  decideTexEdits,
+  decisionsToRecords,
+  spliceTexEdits,
+  fitTexToPages,
+  vocabFromTex,
+  shimForXetex,
+  type TexTailorResult,
+} from "@/lib/tex-tailor";
 import { tailoredToTex, tailoredToPrintHtml } from "@/lib/resume-doc";
 
 export type TailorActionResult =
@@ -65,7 +76,36 @@ export async function tailorResume({
 
 // ── RESUME-FIRST tailoring: edit the user's ACTUAL .tex (bullets only) ────────
 
-export type TexTailorActionResult = { ok: true; result: TexTailorResult } | { ok: false; error: string };
+export type TexTailorActionResult =
+  | {
+      ok: true;
+      result: TexTailorResult;
+      /** Compiled PDF of the FITTED document (absent when no local engine). */
+      pdfBase64?: string;
+      pages?: number | null;
+      basePages?: number | null;
+      length_reverts?: number;
+    }
+  | { ok: false; error: string };
+
+/** tex → PDF bytes with the local engine; null when unavailable/failed. */
+async function tryCompile(tex: string): Promise<Buffer | null> {
+  const r = await runTectonic(tex);
+  return r.ok ? r.pdf : null;
+}
+
+/** tex → page count via the local engine + unpdf; null when unavailable/failed. */
+async function compilePages(tex: string): Promise<number | null> {
+  const pdf = await tryCompile(tex);
+  if (!pdf) return null;
+  try {
+    const { getDocumentProxy } = await import("unpdf");
+    const doc = await getDocumentProxy(new Uint8Array(pdf));
+    return doc.numPages;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Tailor the user's real resume source: the LLM proposes keep/drop/replace per
@@ -110,11 +150,41 @@ export async function tailorResumeTex({
   });
   if (!res.ok) return { ok: false, error: "AI request failed: " + res.error };
 
-  const result = applyTexTailor(tex, res.text, mode);
-  if (result.error) {
-    return { ok: false, error: "Couldn't read the AI reply (" + result.error + ") — try again." };
+  const parsed = parseTexReply(res.text);
+  if (!parsed) return { ok: false, error: "Couldn't read the AI reply (parse-failed) — try again." };
+  const { decisions, reverted } = decideTexEdits(units, parsed.edits, mode, vocabFromTex(tex));
+
+  // PAGE-FIT: measure the ORIGINAL's page count, then compile-and-revert the
+  // largest-growth rewrites until the tailored document fits it. Engine absent →
+  // skip (the client's compile fallback surfaces the set-TECTONIC_PATH hint).
+  const basePages = await compilePages(tex);
+  let fittedTex: string | null = null;
+  let pages: number | null = null;
+  let lengthReverts = 0;
+  if (basePages != null) {
+    const fit = await fitTexToPages(tex, decisions, basePages, compilePages);
+    fittedTex = fit.tex;
+    pages = fit.pages;
+    lengthReverts = fit.length_reverts;
   }
-  return { ok: true, result };
+
+  const result: TexTailorResult = {
+    tex: fittedTex ?? spliceTexEdits(tex, decisions),
+    records: decisionsToRecords(decisions),
+    gaps: parsed.gaps,
+    rationale: parsed.rationale,
+    reverted_count: reverted,
+  };
+
+  const finalPdf = fittedTex != null ? await tryCompile(fittedTex) : null;
+  return {
+    ok: true,
+    result,
+    ...(finalPdf ? { pdfBase64: finalPdf.toString("base64") } : {}),
+    pages,
+    basePages,
+    length_reverts: lengthReverts,
+  };
 }
 
 // ── LaTeX → PDF compile (LOCAL engine; the exact sb2nov template) ─────────────
@@ -128,12 +198,8 @@ export type CompileResult = { ok: true; pdfBase64: string } | { ok: false; error
  * deploy would need a compile container instead (documented in WEBSITE.md).
  * Auth-gated like every user action (signed-in or DEV_PREVIEW). Never throws.
  */
-export async function compileLatexPdf({ tex }: { tex: string }): Promise<CompileResult> {
-  const gate = await loadUserData();
-  if (!gate.ok) return { ok: false, error: gate.error };
-  if (!tex || tex.length < 100 || !tex.includes("\\begin{document}")) {
-    return { ok: false, error: "Nothing to compile — tailor first." };
-  }
+/** Shared engine runner: shim + temp dir + tectonic + read the PDF. Never throws. */
+async function runTectonic(tex: string): Promise<{ ok: true; pdf: Buffer } | { ok: false; error: string }> {
   const { mkdtemp, writeFile, readFile, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -162,12 +228,22 @@ export async function compileLatexPdf({ tex }: { tex: string }): Promise<Compile
       return { ok: false, error: "LaTeX compile failed: " + err.slice(-400) };
     }
     const pdf = await readFile(join(dir, "resume.pdf"));
-    return { ok: true, pdfBase64: pdf.toString("base64") };
+    return { ok: true, pdf };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "compile crashed" };
   } finally {
     if (dir) rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+export async function compileLatexPdf({ tex }: { tex: string }): Promise<CompileResult> {
+  const gate = await loadUserData();
+  if (!gate.ok) return { ok: false, error: gate.error };
+  if (!tex || tex.length < 100 || !tex.includes("\\begin{document}")) {
+    return { ok: false, error: "Nothing to compile — tailor first." };
+  }
+  const r = await runTectonic(tex);
+  return r.ok ? { ok: true, pdfBase64: r.pdf.toString("base64") } : r;
 }
 
 // ── JD sources: tracked applications that carry a scraped job description ────

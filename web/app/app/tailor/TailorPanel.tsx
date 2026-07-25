@@ -54,6 +54,8 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
   const [texSrc, setTexSrc] = useState<string | null>(null);
   const [texName, setTexName] = useState<string>("");
   const [texOut, setTexOut] = useState<TexTailorResult | null>(null);
+  // Measured page fit (compile-and-revert loop): pages vs the original's count.
+  const [fitInfo, setFitInfo] = useState<{ pages: number | null; basePages: number | null; lengthReverts: number } | null>(null);
 
   useEffect(() => {
     try {
@@ -132,9 +134,21 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
         const res = await tailorResumeTex({ jobDescription: jd, mode, tex: texSrc });
         if (res.ok) {
           setTexOut(res.result);
-          void compileFrom(res.result.tex); // the preview IS the compiled document
+          setFitInfo({ pages: res.pages ?? null, basePages: res.basePages ?? null, lengthReverts: res.length_reverts ?? 0 });
+          if (res.pdfBase64) {
+            // server already compiled the page-fitted document — show it directly
+            const bytes = Uint8Array.from(atob(res.pdfBase64), (c) => c.charCodeAt(0));
+            const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+            setLatexPdf((prev) => {
+              if (prev) URL.revokeObjectURL(prev);
+              return url;
+            });
+          } else {
+            void compileFrom(res.result.tex); // no engine on the server path — fallback surfaces the hint
+          }
         } else {
           setTexOut(null);
+          setFitInfo(null);
           setErr({ text: res.error, aiLink: res.error.toLowerCase().includes("api key") });
         }
         return;
@@ -364,6 +378,21 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
                     {texOut.reverted_count > 0 && (
                       <span className="rounded-md border border-verified/40 px-2 py-1 text-verified">
                         {texOut.reverted_count} rewrite{texOut.reverted_count === 1 ? "" : "s"} reverted by the fact-check
+                      </span>
+                    )}
+                    {fitInfo?.pages != null && fitInfo.basePages != null && (
+                      <span
+                        className={clsx(
+                          "rounded-md border px-2 py-1",
+                          fitInfo.pages <= fitInfo.basePages ? "border-verified/40 text-verified" : "border-signal/40 text-signal"
+                        )}
+                      >
+                        {fitInfo.pages} page{fitInfo.pages === 1 ? "" : "s"} — {fitInfo.pages <= fitInfo.basePages ? "fits your original" : `original is ${fitInfo.basePages}`}
+                      </span>
+                    )}
+                    {(fitInfo?.lengthReverts ?? 0) > 0 && (
+                      <span className="rounded-md border border-amber/40 px-2 py-1 text-amber">
+                        {fitInfo!.lengthReverts} reverted to fit the page
                       </span>
                     )}
                     {risks > 0 && (
