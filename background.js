@@ -2697,6 +2697,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
       return { ok: false, error: "attach-failed:" + attached.error };
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so a hidden single-page fill behaves like the walk
+    cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); auth/onboarding/recon stay trusted
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
@@ -2843,6 +2844,8 @@ async function runCdpReplayWalk(tabId, opts) {
       else LOG("⚠ REFILL: no profile in storage — a page not in the bundle can't be fresh-filled and will HALT. Click 'Load default profile' first to enable fresh-fill of never-reached pages.");
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
+    // NOTE: synthetic input stays OFF for the REPLAY walk (default) — the submit-adjacent path keeps
+    // the battle-tested trusted primitives until the fill walk's synthetic mode is live-verified.
     LOG(authorize
       ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
       : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
@@ -3301,6 +3304,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so page-to-page advancement runs while backgrounded
+    cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); onboarding/auth ran trusted on its own attach
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
@@ -3995,6 +3999,10 @@ async function runCdpOnboard(tabId, opts) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides();
+    // NOTE: synthetic input stays OFF for ONBOARDING (default) — the auth screens are the one surface
+    // the synthetic repertoire failed live (2026-07-25: fields read back OK but the Sign In submit
+    // never fired — the auth app doesn't register native-setter values / untrusted clicks the way the
+    // application form does). Trusted input costs only ~15-25s here (a few fields + clicks).
     await cdpSetFocusEmulation(true); // best-effort: keep a hidden/backgrounded tab repainting (SPA sub-view transitions defer on rAF, paused when hidden)
     LOG("attached. Onboarding: JD → Apply → Apply Manually → sign-in/create-account → verify → land on the form. Keep the tab VISIBLE to watch. Never submits.");
 

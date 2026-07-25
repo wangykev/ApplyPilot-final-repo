@@ -85,11 +85,12 @@ function cdpAttach(tabId) {
         await cdpSend("Page.enable", {}); // required for Page.addScriptToEvaluateOnNewDocument (cdpInstallPageOverrides)
         // Refresh the debug input-trace toggle per run (popup checkbox → chrome.storage.local).
         try { const { debugInputTrace } = await new Promise((r) => chrome.storage.local.get("debugInputTrace", r)); setInputTrace(!!debugInputTrace); } catch (e) { /* default stays OFF */ }
-        // Synthetic-input kill-switch (2026-07-25): forceTrustedInput=true reverts HIDDEN runs to the
+        // Synthetic-input kill-switch (2026-07-25): forceTrustedInput=true reverts HIDDEN fills to the
         // trusted Input.* path (slow-but-battle-tested) — the escape hatch if a tenant's widgets
         // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
         try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
-        console.log(`[ApplyPilot][CDP] input mode: ${_forceTrustedInput ? "TRUSTED always (forceTrustedInput)" : "synthetic when hidden / trusted when visible"}`);
+        _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
+        console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
         resolve({ ok: true });
       } catch (e) {
         resolve({ ok: false, error: String((e && e.message) || e) });
@@ -519,8 +520,20 @@ async function actingDelta(d) { try { await cdpEval((dd) => { window.__apActing 
 //   • elementFromPoint descends OPEN shadow roots (the Simplify-dismiss X lives in one) and steps
 //     past Workday's own click_filter overlay to the control beneath it.
 let _forceTrustedInput = false; // storage kill-switch, read at cdpAttach
+// SCOPED opt-in (2026-07-25, after the live sign-in stall): synthetic input is enabled ONLY by the
+// FILL entry points (runCdpWalk / runCdpFillPage) — the surface the synthetic repertoire was proven
+// on (application FORM pages). The ONBOARDING/AUTH screens stay on the trusted path: the live run
+// showed the auth form's Sign In submit never fired under synthetic input (fields read back OK but
+// no outcome — the auth app likely doesn't register native-setter values in its own state, leaving
+// the submit inert), and auth is a tiny fraction of run time (~4 fields + a few clicks), so trusted
+// is the right trade there. Reset to false at every cdpAttach; recon/replay/onboarding never enable it.
+let _synthInputEnabled = false;
+function cdpSetSyntheticInput(on) {
+  _synthInputEnabled = !!on;
+  if (on) console.log("[ApplyPilot][CDP] synthetic input ENABLED for this run's fill — hidden-tab actuation dispatches page-side (trusted when visible; forceTrustedInput overrides).");
+}
 async function cdpSynthInput() {
-  if (_forceTrustedInput) return false;
+  if (!_synthInputEnabled || _forceTrustedInput) return false;
   return !(await cdpVisible()); // hidden ⇒ synthetic page-side dispatch (fast); visible ⇒ trusted Input.* (proven)
 }
 
