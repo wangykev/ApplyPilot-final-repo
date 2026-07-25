@@ -14,6 +14,30 @@ importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js
 // so the fill engine reads them unchanged. The engine is agnostic to how they
 // got there. NOTHING here fills or submits — it only persists the handoff.
 // ============================================================================
+
+// ── Live run progress → the website Run page, over a long-lived external Port. ──
+// The website opens a `chrome.runtime.connect(extId, { name: "ap-run-progress" })` port; the
+// AP_RUN_APPLICATION pipeline (this handler → runCdpOnboard → runCdpWalk, all in THIS file) calls the
+// module-level emitRunProgress() at each phase — NO parameter threading, since they're all module-scope.
+// No port connected (a popup-triggered run) ⇒ emitRunProgress just logs to the SW console. The port
+// also counts as activity, keeping the MV3 SW warm for the duration of the run (a free bonus).
+let runProgressPort = null;
+let lastRunProgress = null;
+let runInFlight = false;
+chrome.runtime.onConnectExternal.addListener((port) => {
+  if (!port || port.name !== "ap-run-progress") return;
+  runProgressPort = port;
+  // Replay the latest phase so a port that connects a beat after the run started isn't blank
+  // (gated on an active run so a fresh port never sees a stale prior-run phase).
+  if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
+  port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
+});
+function emitRunProgress(phase, detail) {
+  lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
+  try { console.log(`[ApplyPilot][RUN] » ${phase}${detail ? " — " + detail : ""}`); } catch (e) { /* ignore */ }
+  try { if (runProgressPort) runProgressPort.postMessage(lastRunProgress); } catch (e) { /* port closed */ }
+}
+
 chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
   const type = message && message.type;
 
@@ -159,17 +183,27 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // Gmail auto-verify defaults ON for a website run (an email-verify tenant would otherwise
         // halt); the message may override, and the stored toggle wins if explicitly OFF.
         const gmailEnabled = message.gmailEnabled !== undefined ? !!message.gmailEnabled : (cfg.gmailEnabled !== false);
+        // Background fill (the website "Run in background" button): open the job tab UNFOCUSED
+        // (active:false) so the operator stays on the Run page while the pipeline works. The whole
+        // CDP substrate is already hidden-safe (worker-timers override + adaptive pacing + cdpWakePage),
+        // so nothing downstream changes — a genuinely-unrenderable step still halts self-explaining
+        // (e.g. hidden-render-stalled) rather than guessing.
+        const background = message.background === true;
 
+        runInFlight = true;
+        emitRunProgress("Opening the job posting", background ? "in a background tab" : "");
         // Open the job link in a new tab and wait for the first load to settle.
-        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: true }, res));
+        const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
         const tabId = tab.id;
+        console.log(`[ApplyPilot][RUN] opened job tab ${tabId} (${background ? "BACKGROUND — unfocused, hidden-safe pacing" : "foreground"})`);
         await waitTabComplete(tabId, 20000);
         await new Promise((r) => setTimeout(r, 1500)); // brief hydration beat — the JD is an SPA render
 
         // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
         // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
         let jd = null;
+        emitRunProgress("Reading the job description");
         try {
           const results = await chrome.scripting.executeScript({ target: { tabId }, func: scrapeJobDescription });
           jd = (results && results[0] && results[0].result) || null;
@@ -195,6 +229,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         }
 
         console.log("[ApplyPilot][RUN] reached the form — filling the application through to the review page (never submits).");
+        emitRunProgress("Filling the application", "working through the form to the review page");
         const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, jobContext);
         // reportApplication (in the walk's finally) upserts the tracker row keyed by the BUNDLE url —
         // the form page, which differs from the pasted startUrl once Apply/login navigates. Return that
@@ -204,6 +239,8 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         sendResponse({ ...onb, walked: true, walk, jd, tabId, startUrl, reportedUrl });
       } catch (e) {
         sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      } finally {
+        runInFlight = false; // stop replaying stale progress to a port that connects after this run
       }
     })();
     return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
@@ -3248,11 +3285,13 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       if (nav && nav.applyFlowReviewPresent) {
         reachedReview = true;
         LOG(`✓✓ reached the REVIEW page after ${pagesFilled.length} page(s) — the whole application is filled. NOT submitting (terminal). "View last summary" for the accumulated bundle.`);
+        emitRunProgress("Reached the review page", "the application is filled — nothing submitted");
         return { ok: true, stopped: "reached-review", reached_review: true, pages_filled: pagesFilled.length, pages: pagesFilled };
       }
 
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
+      emitRunProgress(`Filling page ${page}`);
       const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
@@ -3667,6 +3706,7 @@ async function runCdpOnboard(tabId, opts) {
   // navigate the tab to it. Returns { ok } or a needs_operator halt object.
   const doVerify = async (st) => {
     if (!gmailEnabled) return { ok: false, reached_form: false, needs_operator: true, stopped: "verification-required-gmail-off", detail: "Workday requires email verification but Gmail auto-verify is OFF. Enable it (and Connect Gmail) in the popup, or click the link in the email yourself and re-run." };
+    emitRunProgress("Verifying your email", "checking Gmail for the verification link");
     const host = st.host || "";
     // Account-exists-but-UNVERIFIED (a prior run created it, verification never completed): Workday's
     // sign-in page shows a "Resend Account Verification" button, and the ORIGINAL email may be stale
@@ -3721,6 +3761,7 @@ async function runCdpOnboard(tabId, opts) {
   // re-check outcome (past-auth / verify / already-exists→sign-in).
   const doCreateAccount = async (st) => {
     LOG(`creating a Workday account as ${creds.email}…`);
+    emitRunProgress("Creating your account");
     if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await pace(900); st = await scan() || st; }
     await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
     await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
@@ -3753,6 +3794,7 @@ async function runCdpOnboard(tabId, opts) {
     // re-sign-in) consumes an iteration, and a stray SECOND verify cycle doubles that — PANW hit
     // exactly 8 with a double-cycle (2026-07-09), i.e. no margin. 12 comfortably survives a
     // chooser→create→verify→(re-verify)→re-sign-in chain while still backstopping a genuinely stuck page.
+    emitRunProgress("Signing in");
     const maxAttempts = 12;
     let revealStalls = 0; // consecutive "Sign in with email" reveals where the form never rendered (hidden-tab repaint stall)
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -3837,16 +3879,36 @@ async function runCdpOnboard(tabId, opts) {
           label: "Sign In submit",
           done: (s) => classifyAuthOutcome(s) !== "unknown",
           formStillUp: (s) => !!s.markers.signInSubmit,
-          timeouts: [500, 20000] // fast re-click at 500ms if the first click no-op'd; then the full 20s for a genuinely slow sign-in
+          timeouts: [500, 6000] // fast re-click at 500ms, then a SHORT ceiling so we regain control in ~6s to check for Chrome's data-breach dialog (below) — instead of burning the full timeout with that dialog just sitting there blocking the form
         });
         if (r.notFound) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: r.blockedBy || "no Sign In button" };
         st = r.scan || st;
-        const out = classifyAuthOutcome(st);
+        let out = classifyAuthOutcome(st);
+        // ── Chrome's "password found in a data breach" dialog (detect-then-Enter, NEVER blind). ──
+        // That native browser dialog overlays the sign-in form after submit and blocks completion. It's
+        // browser chrome, invisible to the DOM — but THIS is its signature: we submitted Sign In, ~6s
+        // passed (the short ceiling above), and the sign-in form is STILL present (signInSubmit) with no
+        // recognized outcome. Enter is that dialog's default dismiss (operator-confirmed). SAFE + not
+        // blind: signInSubmit still present ⇒ we're on the SIGN-IN form (never the application form), so a
+        // stray Enter can at most re-submit sign-in (submitAndWait already re-clicks it every attempt) —
+        // never advance a page or submit an application. Fire ONCE the moment the stall is detected (~6s,
+        // not the old ~20s), THEN wait the full time for the real outcome; the routing below handles it.
+        if (out === "unknown" && st.markers.signInSubmit) {
+          LOG("sign-in stalled ~6s with the form present and no outcome — likely Chrome's 'password found in a data breach' dialog blocking it; pressing Enter to dismiss (safe: still on the sign-in form).");
+          emitRunProgress("Dismissing Chrome's data-breach password warning");
+          try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
+          const wb = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-breach-dismiss outcome");
+          st = wb.scan || st;
+          out = classifyAuthOutcome(st);
+        }
         LOG(`sign-in outcome: ${out}.`);
         if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
         if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
         if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
         if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
+        // Sign-in never resolved and the form is STILL up → a block (most likely the breach dialog) is up
+        // and Enter didn't clear it. Halt SPECIFICALLY (not a vague auth-unknown) so the operator can act.
+        if (st.markers.signInSubmit) return { ok: true, reached_form: false, needs_operator: true, stopped: "password-breach-dialog", detail: "Sign-in didn't complete — the likely cause is Chrome's \"the password you just used was found in a data breach\" warning blocking it. Dismiss that warning in the tab (or use a unique Workday password / turn off Chrome's breach warning), then re-run." };
         return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unknown", detail: `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}` };
       }
 
@@ -3891,6 +3953,7 @@ async function runCdpOnboard(tabId, opts) {
     const target = pickApplyTarget(applyChain);
     if (target) {
       LOG(`Stage 1 — clicking "${target.label}".`);
+      emitRunProgress("Starting the application", `clicking "${target.label}"`);
       const c = await clickTarget([target.sel], target.label);
       if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-click-blocked", detail: c.blockedBy || "Apply button not clickable" };
       const w = await waitFor((s) => s.markers.applyManually || s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply");
@@ -4820,12 +4883,14 @@ async function fillEngine(profile, defaults, jobContext) {
     if (overlapHits.length) {
       return { fill: "No", review: true, detail: `company "${co}" partially overlaps known employer(s): ${overlapHits.join(", ")} → filled "No"; REVIEW (could be the same employer)` };
     }
-    // Company was set but nothing matched it or appeared in the question → confident "No".
-    if (tightC) {
-      return { fill: "No", review: false, detail: `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))` };
-    }
-    // No company AND nothing of ours named in the question → cannot responsibly evaluate.
-    return { fill: null, review: true, detail: "no company set for this application and no known employer named in the question — left blank" };
+    // Clean miss → confident "No". A COMPLETE (non-empty) employer list makes non-membership safe (operator
+    // 2026-07-24: "trust your list"), so the "No" no longer REQUIRES the application company — the anchor
+    // only corroborates the "Yes"/overlap paths above. Without it we STILL fill "No" (your complete list
+    // names no company the question asks about); the missing corroboration is noted, not a review flag. (An
+    // EMPTY/unconfigured list already returned null above → stays blank+review. LOCKSTEP with fill-driver.js.)
+    return { fill: "No", review: false, detail: tightC
+      ? `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))`
+      : `no known employer appears in the question → No (clean miss vs ${employers.length} known employer(s); no application company set to corroborate)` };
   };
 
   // ── Repeating sections (Work Experience M17/M18 · Education M19) ────────────

@@ -30,7 +30,8 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio, normalizeLabel: normalizeLabel,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
-      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders };
+      sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
+      tenantCompanyFromUrl: tenantCompanyFromUrl };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -67,7 +68,12 @@ function commitOutcome(overwrite, commitKind, matchTier) {
     // that matches no candidate is an overwrite-stray (destructive — see CLAUDE/
     // dom-patterns; accepted).
     if (tier === "none") return { status: "needs_review", confidence: "none", flag: "overwrite-stray" };
-    return { status: "filled_review", confidence: tier === "exact" ? "high" : "low", flag: "overwrite-success" };
+    // An EXACT overwrite is a deterministic profile match — trust it like an exact EMPTY-field fill
+    // (filled, no review). Only a NON-exact overwrite (containment/fuzzy) is a GUESS that replaced a real
+    // value → keep that flagged. (Operator: a deterministic fill shouldn't nag for approval just because
+    // the field held a prior value — e.g. re-running over a leftover "Others" and committing exact "Other".)
+    if (tier === "exact") return { status: "filled", confidence: "high", flag: "overwrite-success" };
+    return { status: "filled_review", confidence: "low", flag: "overwrite-success" };
   }
   if (commitKind === "auto") {
     if (tier === "exact") return { status: "filled", confidence: "high", flag: "autocommit-exact" };
@@ -463,7 +469,12 @@ const companyTight = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 const companyTokens = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/)
     .filter((t) => t.length >= 2 && !COMPANY_STOP.has(t));
-const GENERIC_SINGLE = new Set(["bank","tech","global","systems","solutions","services","capital","financial","national","health","media","digital","consulting","ventures","labs","online","store","center"]);
+// Words that are as often a common ENGLISH word as a company brand — a company whose FIRST token is one of
+// these ("General Motors", "American Express", "United Airlines", "Federal ...") must be NAMED IN FULL in
+// the question; the lone token can't brand-anchor, so a role/status question ("are you a GENERAL employee
+// or a manager?", "are you a FEDERAL employee?") is never misread as a company-membership question. (2026-07-25.)
+const GENERIC_SINGLE = new Set(["bank","tech","global","systems","solutions","services","capital","financial","national","health","media","digital","consulting","ventures","labs","online","store","center",
+  "general","federal","american","united","international","standard","central","premier","continental","associated","allied","republic","mutual","liberty","eastern","western","northern","southern","pacific","atlantic","industries","enterprises","worldwide","universal"]);
 const containsSeq = (hay, needle) => {
   if (!needle.length) return false;
   for (let i = 0; i + needle.length <= hay.length; i++) {
@@ -514,10 +525,14 @@ const decidePreviousWorker = (company, questionText, employers) => {
   if (overlapHits.length) {
     return { fill: "No", review: true, detail: `company "${co}" partially overlaps known employer(s): ${overlapHits.join(", ")} → filled "No"; REVIEW (could be the same employer)` };
   }
-  if (tightC) {
-    return { fill: "No", review: false, detail: `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))` };
-  }
-  return { fill: null, review: true, detail: "no company set for this application and no known employer named in the question — left blank" };
+  // Clean miss → confident "No". A COMPLETE (non-empty) employer list is what makes non-membership safe
+  // (operator 2026-07-24: "trust your list"), so the "No" no longer REQUIRES jobContext.company — the
+  // company anchor only corroborates the "Yes"/overlap paths above. Without it we STILL fill "No" (your
+  // complete list names no company the question asks about); the missing corroboration is noted in the
+  // detail, NOT a review flag. (An EMPTY/unconfigured list already returned null above → stays blank+review.)
+  return { fill: "No", review: false, detail: tightC
+    ? `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))`
+    : `no known employer appears in the question → No (clean miss vs ${employers.length} known employer(s); no application company set to corroborate)` };
 };
 
 // ── Employment-status-at-the-application-company recognizer (DETERMINISTIC, no AI) ──────────────
@@ -595,9 +610,21 @@ const recognizeEmploymentQuestion = (label, company) => {
   let hit = false;
   for (const s of text.split(/[.?!;]+/)) {
     const sTokens = companyTokens(s);
-    const coStart = seqStart(sTokens, coTokens);
+    // Anchor where the sentence NAMES the company. Prefer the full token sequence (most
+    // precise). But the JD scrape can yield a fuller corporate name than the question asks
+    // — "Magna International" / "Magna Powertrain" scraped vs a bare "MAGNA" in the question
+    // — so if the full sequence isn't present, fall back to the company's distinctive BRAND
+    // token (coTokens[0], when it's ≥5 chars and not a generic descriptor — the SAME brand
+    // token the "worked for «co»" phrase keys on). A generic head ("Bank of America" → "bank")
+    // still requires the full sequence, so this can't false-anchor on a common word.
+    let coStart = seqStart(sTokens, coTokens);
+    let coSpan = coTokens.length;
+    if (coStart === -1 && coTokens[0].length >= 5 && !GENERIC_SINGLE.has(coTokens[0])) {
+      coStart = sTokens.indexOf(coTokens[0]);
+      coSpan = 1;
+    }
     if (coStart === -1) continue; // this sentence doesn't name the company
-    const coEnd = coStart + coTokens.length - 1;
+    const coEnd = coStart + coSpan - 1;
     let empNear = false;
     for (let i = Math.max(0, coStart - WINDOW); i <= Math.min(sTokens.length - 1, coEnd + WINDOW); i++) {
       if (EMPLOY_TERM_RE.test(sTokens[i])) { empNear = true; break; }
@@ -1346,10 +1373,30 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
     return { status: "needs_review", detail: "options did not render (skipped_no_option_match)", after: before };
   }
 
-  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  let enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
   // DROPDOWN = select from a full list → NO containment (a substring match is a guess: "PA" must not
   // silently become "Armed Forces Pacific"). Exact → fuzzy(typo) → escalate to review. (2026-07-16)
-  const m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
+  let m = apMatch.matchCandidates(overwriteCandidates, enabledTexts, { containment: false });
+  if (m.targetIndex === -1) {
+    // RENDER-RACE re-match (bounded): GATE-2 settles on 2 stable reads, which can PRECEDE a chunked list
+    // finishing its render — so a real option (e.g. "Male") may mount just AFTER GATE-2 exited, and a
+    // STATED value would then wrongly fall to the AI canonicalize ("the dropdown didn't wait to render").
+    // Keep polling the OPEN list; the instant it grows to include a candidate, re-match and commit
+    // deterministically. Bounded by openCeilingMs, and breaks early once the list goes stable again with
+    // still no match (genuinely not offered) — so a true no-match costs only a few extra reads.
+    let seenCount = enabledTexts.length, stableAtNoMatch = 0;
+    const raceDeadline = Date.now() + budgets.openCeilingMs;
+    while (m.targetIndex === -1 && Date.now() < raceDeadline) {
+      await delayRender(budgets.settleIntervalMs);
+      const s2 = await act.readDropdownState(loc);
+      if (!s2 || s2.ariaExpanded !== "true" || !s2.optionCount) break; // list closed/emptied → genuine handling below
+      const et2 = s2.options.filter((o) => !o.disabled).map((o) => o.text);
+      if (et2.length !== seenCount) { seenCount = et2.length; stableAtNoMatch = 0; } else { stableAtNoMatch++; }
+      const m2 = apMatch.matchCandidates(overwriteCandidates, et2, { containment: false });
+      if (m2.targetIndex !== -1) { state = s2; enabledTexts = et2; m = m2; break; } // late option mounted → deterministic match
+      if (stableAtNoMatch >= budgets.stableReads) break; // list settled and still no candidate → genuinely not offered
+    }
+  }
   if (m.targetIndex === -1) {
     // CLOSE-CONFIRMED before returning: the open list OVERLAPS the next field, so a lingering
     // list strays the next field's open-click (the live degree→"Associates" — the Field-of-Study
@@ -2570,6 +2617,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
   const bucketIndex = buildBucketIndex(opts && opts.buckets); // Profile v2: wording → answer buckets (consulted before AI)
   const scan = await act.scanPage();
+  // Employment-question anchor (the company you're applying to): prefer the scraped jobContext.company,
+  // else the tenant subdomain from THIS page's URL (always present — magna.wd…myworkday{jobs,site}.com →
+  // "Magna"). So the employer-match / employment-status logic anchors RELIABLY off the URL instead of a
+  // scrape/hand-off that may not have populated a company (Option 1, 2026-07-25). The recognizer still
+  // confirms the company is NAMED in the question; the answer comes from your employer list. Display keeps
+  // jobContext.company untouched. Used at every employment site below (candidateIsPreviousWorker + the
+  // recognizer post-pass + the checkbox contradiction flag) instead of reading jobContext.company directly.
+  // Employment-question anchor (the company you're applying to): the page URL's tenant subdomain/path is
+  // the company brand on every Workday tenant and is ALWAYS present, so PREFER it; the scraped
+  // jobContext.company is only a fallback for a non-Workday URL. A wrong/empty scrape no longer blocks the
+  // recognizer. The recognizer confirms the company is NAMED in the question; the answer comes from your
+  // employer list. (2026-07-25.)
+  const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
 
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
@@ -2628,7 +2688,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } else if (f.fieldName === "candidateIsPreviousWorker") {
         // Fill + review-queue model (decidePreviousWorker, verbatim). Every
         // "Yes" carries a review flag; unevaluable stays blank + review.
-        const company = jobContext && jobContext.company;
+        const company = empCompany; // scrape OR the URL tenant — reliable anchor (Option 1)
         const employers = profile.employment_history_companies;
         record.mappedPath = "(employer-match)";
         record.rawValue = company || null;
@@ -2665,7 +2725,6 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // contradicts — keep the check, FLAG it for review. Agreement / unevaluable → silent, as before.
           if (!mappedPath && record.status === "filled") {
             try {
-              const empCompany = jobContext && jobContext.company;
               const emp = recognizeEmploymentQuestion(f.label, empCompany);
               const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
               if (d && d.fill === "No") {
@@ -2763,7 +2822,6 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
-        const empCompany = jobContext && jobContext.company;
         const emp = recognizeEmploymentQuestion(f.label, empCompany);
         const decision = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
         if (decision && decision.fill) {

@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Rocket, Loader2, Check, AlertTriangle, X, Cable, ChevronDown, ExternalLink } from "lucide-react";
+import { Rocket, Loader2, Check, AlertTriangle, X, Cable, ChevronDown, ExternalLink, EyeOff } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
-import { sendToExtension, extensionMessagingAvailable, type ExtResponse } from "@/lib/extension";
+import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type ExtResponse, type RunProgress } from "@/lib/extension";
 import { linkedExtensionId } from "@/lib/extension-sync";
 import { saveRunJob } from "./actions";
 import { clsx } from "@/lib/clsx";
@@ -12,7 +12,7 @@ import { clsx } from "@/lib/clsx";
 type Jd = { title?: string; company?: string; text?: string; url?: string };
 type Phase =
   | { s: "idle" }
-  | { s: "running" }
+  | { s: "running"; background: boolean }
   | { s: "done"; resp: ExtResponse; jd: Jd | null; appId: string | null };
 
 type Outcome = { tone: "ok" | "warn" | "err"; headline: string; detail?: string };
@@ -25,6 +25,7 @@ const ONBOARD_STOP: Record<string, string> = {
   "verification-email-not-found": "Couldn't find the verification email. Check the inbox, click the link, then run again.",
   "verify-link-invalid": "The verification link was rejected — open it manually in this browser, then run again.",
   "hidden-render-stalled": "The sign-in form didn't render while the tab was in the background. Bring the tab to the front and run again.",
+  "password-breach-dialog": "Chrome is blocking sign-in with a “password found in a data breach” warning. Dismiss it in the tab — or use a unique Workday password (the Credentials page enforces a strong one), or turn off Chrome’s breach warning — then run again.",
   "workday-maintenance": "Workday is in planned maintenance. Try again after the maintenance window.",
   "unknown-page": "Couldn't find an Apply / sign-in / form on that page. Make sure the link is the job posting.",
   "already-applied": "You've already applied to this job — Workday won't reopen the application, so there's nothing to fill.",
@@ -101,15 +102,20 @@ export function RunPanel() {
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [connected, setConnected] = useState<boolean | null>(null);
   const [showJd, setShowJd] = useState(false);
+  const [progress, setProgress] = useState<RunProgress | null>(null);
+  const portRef = useRef<{ disconnect: () => void } | null>(null);
 
   useEffect(() => {
     setConnected(linkedExtensionId() !== null && extensionMessagingAvailable());
   }, []);
 
+  // Tear down a live-progress port if the panel unmounts mid-run (client-side nav).
+  useEffect(() => () => portRef.current?.disconnect(), []);
+
   const running = phase.s === "running";
   const validUrl = /^https?:\/\/\S+$/i.test(url.trim());
 
-  async function run() {
+  async function run(background: boolean) {
     const startUrl = url.trim();
     if (!validUrl || running) return;
     const extId = linkedExtensionId();
@@ -117,9 +123,21 @@ export function RunPanel() {
       setConnected(false);
       return;
     }
-    setPhase({ s: "running" });
+    setPhase({ s: "running", background });
+    setProgress({ phase: background ? "Starting in the background…" : "Starting…", detail: "", at: 0 });
 
-    const resp = await sendToExtension(extId, { type: "AP_RUN_APPLICATION", startUrl });
+    // Open a live-progress port BEFORE kicking off the run so we catch the earliest phases. The
+    // extension streams { phase, detail } over it as onboard/fill progresses; it's UI sugar only —
+    // the authoritative outcome still arrives on the sendToExtension response below.
+    portRef.current = openRunProgressPort(extId, (p) => setProgress(p));
+
+    // background:true → the extension opens the job tab UNFOCUSED and the whole pipeline runs
+    // hidden (the CDP substrate is throttle-immune) — you stay right here on the Run page.
+    const resp = await sendToExtension(extId, { type: "AP_RUN_APPLICATION", startUrl, background });
+
+    portRef.current?.disconnect();
+    portRef.current = null;
+    setProgress(null);
 
     // Save whatever the extension scraped to the tracker row for this posting.
     const jd = (resp.jd as Jd | null) ?? null;
@@ -162,35 +180,58 @@ export function RunPanel() {
 
       <SectionCard
         title="Job link"
-        subtitle="A Workday posting URL (myworkdayjobs.com). Run opens it in a new tab — keep that tab visible to watch it work."
+        subtitle="A Workday posting URL (myworkdayjobs.com). Run opens it in a new tab and works through it — foreground to watch, or in the background while you stay here."
       >
         <div className="flex flex-col gap-3 sm:flex-row">
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") run();
+              if (e.key === "Enter") run(false);
             }}
             disabled={running}
             placeholder="https://company.wd5.myworkdayjobs.com/…/job/…/apply"
             className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber disabled:opacity-60"
           />
           <button
-            onClick={run}
+            onClick={() => run(false)}
             disabled={!validUrl || running || connected === false}
             className="btn-primary shrink-0"
           >
             {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
             {running ? "Running…" : "Run"}
           </button>
+          <button
+            onClick={() => run(true)}
+            disabled={!validUrl || running || connected === false}
+            className="btn-ghost shrink-0"
+            title="Fills in an unfocused tab — you stay on this page while it works."
+          >
+            {phase.s === "running" && phase.background ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <EyeOff className="h-4 w-4" />
+            )}
+            {phase.s === "running" && phase.background ? "Filling in background…" : "Background fill"}
+          </button>
         </div>
 
         {running && (
-          <p className="mt-4 text-xs leading-relaxed text-ink-dim">
-            Working through Apply → sign-in → email verification → fill. This takes a minute or two — the
-            tab shows Chrome&apos;s &ldquo;started debugging&rdquo; bar while the extension drives it. It will
-            stop at the review page and never submit.
-          </p>
+          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-hairline bg-cockpit px-3.5 py-3">
+            <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-ink">
+                {progress?.phase ||
+                  (phase.s === "running" && phase.background ? "Starting in the background…" : "Starting…")}
+              </p>
+              {progress?.detail && <p className="mt-0.5 text-xs text-ink-dim">{progress.detail}</p>}
+              <p className="mt-1.5 text-xs leading-relaxed text-ink-faint">
+                {phase.s === "running" && phase.background
+                  ? "Running in an unfocused tab — stay here; the result lands here and in your Tracker. Stops at the review page, never submits."
+                  : "Watch the tab (Chrome shows a “started debugging” bar). Stops at the review page, never submits."}
+              </p>
+            </div>
+          </div>
         )}
       </SectionCard>
 

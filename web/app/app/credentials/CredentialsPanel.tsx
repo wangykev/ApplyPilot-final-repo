@@ -19,7 +19,7 @@ import { FieldLabel } from "@/components/form/fields";
 import { sendToExtension, extensionMessagingAvailable, type ExtResponse } from "@/lib/extension";
 import { linkedExtensionId, liveSync } from "@/lib/extension-sync";
 import { saveCredentials, saveOnboardConfig } from "./actions";
-import type { Credentials, OnboardConfig } from "@/lib/credentials";
+import { passwordRequirements, type Credentials, type OnboardConfig } from "@/lib/credentials";
 import { clsx } from "@/lib/clsx";
 
 type Msg = { kind: "ok" | "err"; text: string } | null;
@@ -52,6 +52,9 @@ function CredentialsSection({ initial }: { initial: Credentials }) {
   const [msg, setMsg] = useState<Msg>(null);
 
   const dirty = creds.email !== saved.email || creds.password !== saved.password;
+  const reqs = passwordRequirements(creds.password);
+  // An empty password is allowed (clears credentials); a present one must meet Workday's policy.
+  const pwValid = creds.password === "" || reqs.every((r) => r.met);
 
   const edit = (patch: Partial<Credentials>) => {
     setCreds((c) => ({ ...c, ...patch }));
@@ -110,6 +113,28 @@ function CredentialsSection({ initial }: { initial: Credentials }) {
               {showPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
             </button>
           </div>
+          {/* Workday's account-creation password policy — live checklist so first-run
+              create-account never fails on the password rules. */}
+          {creds.password !== "" && (
+            <ul className="mt-2.5 grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-2">
+              {reqs.map((r) => (
+                <li
+                  key={r.id}
+                  className={clsx(
+                    "flex items-center gap-1.5 text-xs transition-colors",
+                    r.met ? "text-verified" : "text-ink-faint"
+                  )}
+                >
+                  {r.met ? (
+                    <Check className="h-3.5 w-3.5 shrink-0" />
+                  ) : (
+                    <span className="h-3 w-3 shrink-0 rounded-full border border-current" />
+                  )}
+                  {r.label}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <div className="flex items-start gap-2.5 rounded-lg border border-hairline bg-panel-raised/40 px-3.5 py-3 text-xs leading-relaxed text-ink-dim">
@@ -123,9 +148,9 @@ function CredentialsSection({ initial }: { initial: Credentials }) {
         <div className="flex flex-wrap items-center gap-3 pt-1">
           <button
             onClick={save}
-            disabled={saving || !dirty}
+            disabled={saving || !dirty || !pwValid}
             className="btn-primary"
-            title={!dirty ? "No changes to save" : undefined}
+            title={!dirty ? "No changes to save" : !pwValid ? "Password doesn't meet Workday's requirements yet" : undefined}
           >
             <Save className="h-4 w-4" />
             {saving ? "Saving…" : "Save credentials"}
