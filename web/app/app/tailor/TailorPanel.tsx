@@ -9,8 +9,9 @@ import { clsx } from "@/lib/clsx";
 import { tailorResume, type JdApplication } from "./actions";
 import type { TailorMode, TailoredResume } from "@/lib/tailor";
 
-/** The untailored resume (from the profile) + its exportable documents. */
-export type OriginalResume = { resume: TailoredResume; printHtml: string; tex: string };
+/** The "Original" view: the uploaded PDF when one is stored (`uploadedUrl` — the
+ *  REAL original), plus the profile-generated rendition + exports as fallback. */
+export type OriginalResume = { resume: TailoredResume; printHtml: string; tex: string; uploadedUrl?: string | null };
 
 const MODES: { id: TailorMode; name: string; blurb: string; guard: string }[] = [
   {
@@ -200,7 +201,9 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
             title={showingOriginal ? "Your resume — original" : "Tailored resume"}
             subtitle={
               showingOriginal
-                ? "Generated from your PROFILE data — not your uploaded PDF (that file attaches as-is; preview it on the Resume page). Formatting differs from your LaTeX; if content is missing here, your profile is missing it — parse your resume or edit the profile."
+                ? original?.uploadedUrl
+                  ? "Your uploaded PDF — exactly what gets attached to applications. Tailoring rebuilds the document from your PROFILE data, so the tailored version's layout will differ from this file."
+                  : "Generated from your PROFILE data — no uploaded PDF stored (upload one on the Resume page to see the real file here). If content is missing, your profile is missing it — parse your resume or edit the profile."
                 : "Save as PDF opens the print dialog (choose “Save as PDF”). The .tex compiles in Overleaf with your exact template."
             }
             actions={
@@ -224,12 +227,18 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
                     ))}
                   </div>
                 )}
-                <button onClick={savePdf} className="btn-ghost px-3 py-1.5 text-xs">
-                  <Printer className="h-3.5 w-3.5" /> Save as PDF
-                </button>
-                <button onClick={downloadTex} className="btn-ghost px-3 py-1.5 text-xs">
-                  <FileDown className="h-3.5 w-3.5" /> Download .tex
-                </button>
+                {/* export buttons only for the GENERATED documents — the uploaded PDF
+                    is already a file (the browser's PDF viewer has its own download) */}
+                {!(showingOriginal && original?.uploadedUrl) && (
+                  <>
+                    <button onClick={savePdf} className="btn-ghost px-3 py-1.5 text-xs">
+                      <Printer className="h-3.5 w-3.5" /> Save as PDF
+                    </button>
+                    <button onClick={downloadTex} className="btn-ghost px-3 py-1.5 text-xs">
+                      <FileDown className="h-3.5 w-3.5" /> Download .tex
+                    </button>
+                  </>
+                )}
               </div>
             }
           >
@@ -253,14 +262,23 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
               </div>
             )}
 
-            {/* document preview — the EXACT print document (what Save-as-PDF emits),
-                full page: header, education, experience, projects, skills */}
-            <iframe
-              title={showingOriginal ? "Original resume" : "Tailored resume"}
-              srcDoc={active.printHtml}
-              sandbox=""
-              className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner"
-            />
+            {/* Original + PDF stored → the ACTUAL uploaded file; otherwise the EXACT
+                print document (what Save-as-PDF emits), full page. The PDF iframe is
+                unsandboxed — the browser's PDF viewer needs its own scripts. */}
+            {showingOriginal && original?.uploadedUrl ? (
+              <iframe
+                title="Uploaded resume PDF"
+                src={original.uploadedUrl}
+                className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner"
+              />
+            ) : (
+              <iframe
+                title={showingOriginal ? "Original resume" : "Tailored resume"}
+                srcDoc={active.printHtml}
+                sandbox=""
+                className="h-[780px] w-full rounded-lg border border-hairline bg-white shadow-inner"
+              />
+            )}
             {!showingOriginal && (review.edited > 0 || review.risks > 0) && (
               <p className="mt-2 font-mono text-[11px] tracking-label text-ink-faint">
                 the preview is the exact PDF — AI-changed bullets are itemized below

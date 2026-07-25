@@ -277,9 +277,10 @@ export function tailoredToPrintHtml(profile: Profile, tailored: TailoredResume):
       const items: string[] = [];
       if ((e.coursework ?? []).length) items.push(`Relevant Coursework: ${e.coursework.join(", ")}`);
       if (e.gpa) items.push(`Cumulative GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`);
+      // grad date on the DEGREE row (sb2nov layout: school top, degree + date below)
       return `<div class="entry">
-  <div class="row"><span class="org">${escapeHtml(e.school_or_university)}</span><span class="dates">${escapeHtml(gradText)}</span></div>
-  <div class="row"><span class="role">${escapeHtml(degreeLine)}</span></div>
+  <div class="row"><span class="org">${escapeHtml(e.school_or_university)}</span></div>
+  <div class="row"><span class="role">${escapeHtml(degreeLine)}</span><span class="dates">${escapeHtml(gradText)}</span></div>
   ${items.length ? `<ul>${items.map((it) => `<li>${escapeHtml(it)}</li>`).join("")}</ul>` : ""}
 </div>`;
     })
