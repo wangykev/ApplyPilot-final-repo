@@ -210,11 +210,12 @@ async function cdpSetFocusEmulation(enabled) {
 // path can be exercised on demand (Workday's real CSP is an empirical unknown).
 let _workerTimersActive = false; // did the worker-timers polyfill install on the CURRENT doc? (set by cdpInstallPageOverrides readback; reset at attach)
 
-function buildOverrideSrc(opts) {
-  const forceNoWorker = !!(opts && opts.forceNoWorker);
-  const workerBlock = forceNoWorker
-    ? `window.__apWorkerTimers = false; /* forceWorkerTimersOff — simulate a CSP-blocked tenant (slow-path test) */`
-    : `try {
+// The worker-timers block, extracted (2026-07-25) so the CSP-bypass RETRY (cdpInstallPageOverrides)
+// can re-run JUST this block on a doc whose first attempt was CSP-blocked — without re-running the
+// full override (guarded by __apOverridesInstalled) or duplicating the source. Sets
+// window.__apWorkerTimers true/false itself; rAF picks up the replaced window.setTimeout dynamically
+// (it resolves window.setTimeout at call time, not install time).
+const WORKER_TIMERS_SRC = `try {
       var __wsrc = "var m={};onmessage=function(e){var d=e.data;" +
         "if(d.c==='s'){m[d.i]=setTimeout(function(){delete m[d.i];postMessage(d.i);},d.ms);}" +
         "else if(d.c==='v'){m[d.i]=setInterval(function(){postMessage(d.i);},d.ms);}" +
@@ -229,6 +230,23 @@ function buildOverrideSrc(opts) {
       window.clearInterval = function (i) { delete __cbs[i]; __w.postMessage({ c: "x", i: i }); };
       window.__apWorkerTimers = true;
     } catch (e) { window.__apWorkerTimers = false; }`;
+
+// Re-run ONLY the worker-timers block on a doc where the full override already installed but the
+// worker did NOT take (window.__apWorkerTimers !== true) — used after Page.setBypassCSP flips CSP
+// enforcement off so the blob: worker that was blocked on the first attempt can now install.
+// Idempotent: no-ops when the override never installed or the worker is already live.
+function buildWorkerRetrySrc() {
+  return `(function () { try {
+    if (!window.__apOverridesInstalled || window.__apWorkerTimers === true) return;
+    ${WORKER_TIMERS_SRC}
+  } catch (e) { /* best-effort */ } })();`;
+}
+
+function buildOverrideSrc(opts) {
+  const forceNoWorker = !!(opts && opts.forceNoWorker);
+  const workerBlock = forceNoWorker
+    ? `window.__apWorkerTimers = false; /* forceWorkerTimersOff — simulate a CSP-blocked tenant (slow-path test) */`
+    : WORKER_TIMERS_SRC;
   return `(function () {
   try {
     if (window.__apOverridesInstalled) return;
@@ -259,6 +277,18 @@ function buildOverrideSrc(opts) {
 async function cdpInstallPageOverrides() {
   let forceNoWorker = false;
   try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
+  // CSP BYPASS (2026-07-25 — the wd3.myworkdaysite.com slow-run diagnosis): a tenant whose CSP blocks
+  // blob: workers silently killed the WHOLE fast hidden path — the worker-timers install threw, the
+  // readback stayed false, and every page-side debounce/render quantized to the ~1Hz throttle (the
+  // live run's uniform ~11s/field). We are ALREADY attached via chrome.debugger, so ask the browser
+  // to bypass CSP enforcement for this page (the standard Puppeteer page.setBypassCSP technique) —
+  // then the blob: worker installs and the measured-fast gate does the rest. BEST-EFFORT + logged:
+  // an old Chrome / restricted command just leaves CSP on → the readback stays false → the safe
+  // slow path, byte-identical to before. Scoped to the debugger attach (detach restores enforcement).
+  let cspBypassed = false;
+  if (!forceNoWorker) {
+    try { await cdpSend("Page.setBypassCSP", { enabled: true }); cspBypassed = true; } catch (e) { /* stay CSP-bound */ }
+  }
   try {
     const src = buildOverrideSrc({ forceNoWorker });
     await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: src }); // future loads / re-auth
@@ -266,8 +296,17 @@ async function cdpInstallPageOverrides() {
     // Read back whether the worker-timers polyfill actually installed on the CURRENT
     // doc (CSP could block blob: workers → false → we stay on the safe slow path).
     try { _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers)); } catch (e) { _workerTimersActive = false; }
-    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : "OFF (CSP?)");
-    console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
+    // RETRY once (worker-only): the doc may carry __apOverridesInstalled from an EARLIER attach that
+    // ran without the bypass (SPA — no reload between runs), so the full override no-ops and the
+    // worker stays dead. buildWorkerRetrySrc re-runs JUST the worker block when the worker isn't live.
+    if (!_workerTimersActive && !forceNoWorker && cspBypassed) {
+      try {
+        await cdpSend("Runtime.evaluate", { expression: buildWorkerRetrySrc() });
+        _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers));
+      } catch (e) { /* stays slow/safe */ }
+    }
+    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)"));
+    console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; CSP bypass ${cspBypassed ? "ON" : "unavailable"}; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
   } catch (e) {
     _workerTimersActive = false;
     console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
@@ -391,6 +430,16 @@ async function cdpAdaptiveDelay(ms) {
 // (cdpVisible), never document.visibilityState, so a "[tab hidden]" log stays
 // TRUTHFUL even after the page's visibilityState is spoofed. Cheap (TTL-cached).
 async function cdpVisibilityLabel() { return (await cdpVisible()) ? "visible" : "hidden"; }
+
+// The PACING REGIME label for the per-page [CDP-TIME] log (2026-07-25) — makes every timing line
+// self-diagnosing: a slow page with "hidden-SLOW (no worker timers)" means the tenant's CSP (or the
+// forced flag) killed the worker install and EVERY page-side debounce is riding the ~1Hz throttle —
+// the whole-run bottleneck class, not something the adaptive budgets can fix. Cheap (TTL-cached reads).
+async function cdpPacingLabel() {
+  if (await cdpVisible()) return "visible-fast";
+  if (!_workerTimersActive) return "hidden-SLOW (no worker timers)";
+  return (await cdpTimersFast()) ? "hidden-fast (worker timers)" : "hidden-SLOW (worker throttled)";
+}
 
 // ── Operator input-lock (recon 2026-06-22) ──────────────────────────────────
 // While the bot actuates a VISIBLE tab the operator could accidentally click/type and
