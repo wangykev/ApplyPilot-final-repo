@@ -469,7 +469,12 @@ const companyTight = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 const companyTokens = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/)
     .filter((t) => t.length >= 2 && !COMPANY_STOP.has(t));
-const GENERIC_SINGLE = new Set(["bank","tech","global","systems","solutions","services","capital","financial","national","health","media","digital","consulting","ventures","labs","online","store","center"]);
+// Words that are as often a common ENGLISH word as a company brand — a company whose FIRST token is one of
+// these ("General Motors", "American Express", "United Airlines", "Federal ...") must be NAMED IN FULL in
+// the question; the lone token can't brand-anchor, so a role/status question ("are you a GENERAL employee
+// or a manager?", "are you a FEDERAL employee?") is never misread as a company-membership question. (2026-07-25.)
+const GENERIC_SINGLE = new Set(["bank","tech","global","systems","solutions","services","capital","financial","national","health","media","digital","consulting","ventures","labs","online","store","center",
+  "general","federal","american","united","international","standard","central","premier","continental","associated","allied","republic","mutual","liberty","eastern","western","northern","southern","pacific","atlantic","industries","enterprises","worldwide","universal"]);
 const containsSeq = (hay, needle) => {
   if (!needle.length) return false;
   for (let i = 0; i + needle.length <= hay.length; i++) {

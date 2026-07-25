@@ -619,7 +619,7 @@ test("radio: no candidate matches the labels → needs_review with the options",
 // "currently employed with Magna?") fills from the profile's employment history: a clean "No" SILENTLY
 // (no LEGALLY-LOADED flag, no review — the whole point), a "Yes"/uncertain review-flagged, NEVER auto-
 // "Yes". Recognized by TEXT, anchored on jobContext.company; unrecognized/unevaluable → the AI/blank fallback.
-const { recognizeEmploymentQuestion, decideCurrentlyEmployed, optionForPolarity } = require("../fill-driver.js");
+const { recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity } = require("../fill-driver.js");
 const empField = (label, options) => ({
   wrapperSel: "[w-emp]", fieldName: "customScreeningQuestion", widgetType: "radio", isRequired: true, label,
   options: options || [{ id: "y", labelText: "Yes", checked: false }, { id: "n", labelText: "No", checked: false }]
@@ -777,6 +777,46 @@ test("employment recognizer: 'current or former' → tense 'ever' (a former empl
 test("employment recognizer: the REAL Magna Q2 (verbose parenthetical) still fires as 'current'", () => {
   const q2 = 'Are you currently employed with Magna? (If you are a current Magna employee, please use the "Jobs Hub" in Workday to apply for this role. If you are a current contingent/supplemental/contract worker, please select "No".)';
   assert.deepStrictEqual(recognizeEmploymentQuestion(q2, "Magna"), { tense: "current", company: "Magna" });
+});
+
+// ── ADVERSARIAL SAFETY SWEEP (2026-07-25) — a deterministic "No"/"Yes" must NEVER be silently WRONG;
+// surfacing for review is always the safe outcome. These pin the trickiest company + question wordings.
+test("employment recognizer: common-descriptor company brands need the FULL name (never a lone descriptor)", () => {
+  // A company whose FIRST token is a common English word ("General Motors", "Federal Signal", "American
+  // Express") must be NAMED IN FULL — else a role/status question ("a GENERAL employee or a manager?",
+  // "a FEDERAL employee?") would be misread as company membership → a WRONG silent "No".
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a general employee or a manager?", "General Motors"), null, "lone 'General' is a role word");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former General employee?", "General Motors"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a federal employee?", "Federal Signal"), null, "'federal employee' is a status, not this company");
+  assert.strictEqual(recognizeEmploymentQuestion("Are you an American worker?", "American Express"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Are you generally employed elsewhere?", "General Motors"), null, "'generally' must not match the brand token 'general'");
+  // …but the FULL company name still anchors and fires:
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former General Motors employee?", "General Motors"), { tense: "former", company: "General Motors" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former Federal Signal employee?", "Federal Signal"), { tense: "former", company: "Federal Signal" });
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you a former American Express employee?", "American Express"), { tense: "former", company: "American Express" });
+});
+test("employment recognizer: 'payroll' counts as an employment word", () => {
+  assert.deepStrictEqual(recognizeEmploymentQuestion("Are you currently on Magna's payroll?", "Magna"), { tense: "current", company: "Magna" });
+});
+test("employment recognizer: contractor/consultant/services broadening → NOT recognized (employment word >3 tokens from the company)", () => {
+  // The formal-employer list can't answer a contractor/consultant relationship, so these must surface for
+  // review, never a silent "No". Sentence scoping handles it: "employee" ends up far from "«co»".
+  assert.strictEqual(recognizeEmploymentQuestion("Are you a former employee, contractor, or consultant of Magna?", "Magna"), null);
+  assert.strictEqual(recognizeEmploymentQuestion("Have you ever provided contract or consulting services to Magna?", "Magna"), null, "'services' is not an employment word");
+});
+test("employment recognizer BAILS: more different-fact wordings (rehire eligibility / dismissal)", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Are you eligible to be rehired by Magna?", "Magna"), null, "rehire ELIGIBILITY, not membership");
+  assert.strictEqual(recognizeEmploymentQuestion("Were you dismissed for cause from Magna?", "Magna"), null);
+});
+test("employment recognizer: bare 'work' (not worked/working for/at/with) is not membership", () => {
+  assert.strictEqual(recognizeEmploymentQuestion("Do you currently work for a company that competes with Magna?", "Magna"), null, "bare 'work' + competitor scope");
+});
+test("employment decision: subsidiaries broadening → clean-miss 'No' (operator #3: trust your list, no ownership DB)", () => {
+  const p = { employment_history_companies: ["Rivian"], work_experience: [{ company: "Rivian", currently_work_here: true }] };
+  const q = "Have you been employed by Magna or any of its subsidiaries?";
+  const emp = recognizeEmploymentQuestion(q, "Magna");
+  assert.deepStrictEqual(emp, { tense: "ever", company: "Magna" });
+  assert.deepStrictEqual(pickFR(decideEmploymentStatus(emp.tense, "Magna", p, q)), { fill: "No", review: false });
 });
 
 // ── DROPDOWN parity (2026-07-24) — the same question rendered as a yes/no dropdown fills the same way.
