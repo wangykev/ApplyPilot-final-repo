@@ -2620,6 +2620,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // jobContext.company untouched. Used at every employment site below (candidateIsPreviousWorker + the
   // recognizer post-pass + the checkbox contradiction flag) instead of reading jobContext.company directly.
   const empCompany = (jobContext && jobContext.company) || apMatch.tenantCompanyFromUrl(scan.url) || null;
+  // Recognition tries EACH anchor candidate (scraped company AND the URL tenant), using whichever is
+  // actually NAMED in the question — so a WRONG/absent scrape (a division, a location, empty) doesn't block
+  // the good URL-tenant anchor (2026-07-25). Deduped, empties dropped. decideEmploymentStatus gets the
+  // anchor that matched.
+  const empAnchors = [...new Set([(jobContext && jobContext.company), apMatch.tenantCompanyFromUrl(scan.url)].filter(Boolean))];
+  const recognizeEmp = (label) => {
+    for (const a of empAnchors) { const r = recognizeEmploymentQuestion(label, a); if (r) return { tense: r.tense, company: a }; }
+    return null;
+  };
   const results = [];
 
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
@@ -2715,8 +2724,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // contradicts — keep the check, FLAG it for review. Agreement / unevaluable → silent, as before.
           if (!mappedPath && record.status === "filled") {
             try {
-              const emp = recognizeEmploymentQuestion(f.label, empCompany); // empCompany = scrape OR URL tenant (Option 1)
-              const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+              const emp = recognizeEmp(f.label); // tries each anchor (scrape + URL tenant)
+              const d = emp ? decideEmploymentStatus(emp.tense, emp.company, profile, f.label) : null;
               if (d && d.fill === "No") {
                 record.status = "filled_review"; record.flag = "employer-match";
                 record.detail = (record.detail ? record.detail + "; " : "")
@@ -2812,8 +2821,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
-        const emp = recognizeEmploymentQuestion(f.label, empCompany); // empCompany = scrape OR URL tenant (Option 1)
-        const decision = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+        const emp = recognizeEmp(f.label); // tries each anchor (scrape + URL tenant), uses the one NAMED in the question
+        // Diagnostic: reveal the anchors + recognition for any employment-shaped question (why it did/didn't fire).
+        try { if (emp || /\bemploy|\bwork(?:ed|ing|s)?\b/i.test(String(f.label || ""))) console.log(`[ApplyPilot][EMP-RECOG] anchors=${JSON.stringify(empAnchors)} → ${emp ? emp.tense + "/" + JSON.stringify(emp.company) : "NOT recognized"} | "${String(f.label || "").replace(/\s+/g, " ").slice(0, 70)}"`); } catch (e) {}
+        const decision = emp ? decideEmploymentStatus(emp.tense, emp.company, profile, f.label) : null;
         if (decision && decision.fill) {
           const norm = apMatch.normalize;
           if (f.widgetType === "radio") {
