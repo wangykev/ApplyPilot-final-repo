@@ -11,8 +11,9 @@ import {
   buildProfileVocab,
   identityResume,
 } from "@/lib/tailor";
-import { escapeLatex, tailoredToTex, tailoredToPrintHtml, displayDate, dateRange } from "@/lib/resume-doc";
-import { coerceProfile } from "@/lib/profile-schema";
+import { escapeLatex, tailoredToTex, tailoredToPrintHtml, displayDate, dateRange, gpaText, skillLines } from "@/lib/resume-doc";
+import { coerceProfile, mergeProfile } from "@/lib/profile-schema";
+import { buildResumePrompt } from "@/lib/resume-prompt";
 
 const PROFILE = coerceProfile({
   personal_info: { first_name: "Kevin", last_name: "Wang", email: "k@x.com", phone_number: "850-666-0266" },
@@ -344,6 +345,70 @@ test("documents: Projects + coursework/GPA render in BOTH tex and print HTML", (
   assert.match(html, /<h2>Projects<\/h2>/);
   assert.match(html, /Built a real-time motor-control peripheral/);
   assert.match(html, /Relevant Coursework: Intro to Computer Systems/);
+});
+
+// ── resume-data completeness (the "beginning and end got removed" fixes) ──────
+test("gpaText: appends scale once; a gpa already carrying its scale passes through", () => {
+  assert.equal(gpaText("3.95", "4.00"), "3.95/4.00");
+  assert.equal(gpaText("4.00/4.00", "4.0"), "4.00/4.00", "never 4.00/4.00/4.0");
+  assert.equal(gpaText("", "4.0"), "");
+});
+
+test("skillLines: groups filter to the chosen subset; leftovers → Other; no groups → flat", () => {
+  const p = coerceProfile({
+    skills: ["C", "C++", "Git", "Docker"],
+    skill_groups: [
+      { name: "Languages", skills: ["C", "C++"] },
+      { name: "Hardware", skills: ["Altium Designer"] }, // nothing chosen → dropped
+    ],
+  });
+  const lines = skillLines(p, ["C++", "Git"]);
+  assert.deepEqual(lines, [
+    { name: "Languages", items: ["C++"] },
+    { name: "Other", items: ["Git"] },
+  ]);
+  assert.deepEqual(skillLines(coerceProfile({ skills: ["C"] }), ["C"]), [{ name: "", items: ["C"] }]);
+});
+
+test("documents: grouped skills render as labeled lines; education location on the school row", () => {
+  const p = coerceProfile({
+    education: [{ school_or_university: "CMU", location: "Pittsburgh, PA", gpa: "3.95", gpa_scale: "4.00" }],
+    work_experience: [{ job_title: "Intern", company: "X", role_description: "- did things" }],
+    skills: ["C", "Git"],
+    skill_groups: [{ name: "Languages", skills: ["C"] }, { name: "Tools", skills: ["Git"] }],
+  });
+  const tex = tailoredToTex(p, identityResume(p));
+  assert.match(tex, /\\textbf\{Languages\}\{: C\}/);
+  assert.match(tex, /\\textbf\{Tools\}\{: Git\}/);
+  assert.match(tex, /\{CMU\}\{Pittsburgh, PA\}/);
+  const html = tailoredToPrintHtml(p, identityResume(p));
+  assert.match(html, /<b>Languages:<\/b> C/);
+  assert.match(html, /Pittsburgh, PA/);
+});
+
+test("mergeProfile: an EXISTING education entry gains parsed coursework/location/grad date (empty fields only)", () => {
+  const base = coerceProfile({ education: [{ school_or_university: "CMU", gpa: "3.95" }] });
+  const incoming = coerceProfile({
+    education: [
+      { school_or_university: "Carnegie Mellon University", location: "Pittsburgh, PA", gpa: "9.99", graduation_date: "2027-05", coursework: ["Systems"] },
+    ],
+  });
+  const merged = mergeProfile(base, incoming);
+  assert.equal(merged.education[0].school_or_university, "CMU", "populated value never overwritten");
+  assert.equal(merged.education[0].gpa, "3.95", "populated value never overwritten");
+  assert.equal(merged.education[0].location, "Pittsburgh, PA");
+  assert.equal(merged.education[0].graduation_date, "2027-05");
+  assert.deepEqual(merged.education[0].coursework, ["Systems"]);
+});
+
+test("resume parse prompt: extracts projects, coursework, skill_groups, graduation_date", () => {
+  const { system, user } = buildResumePrompt("resume text");
+  assert.match(user, /"projects"/);
+  assert.match(user, /"skill_groups"/);
+  assert.match(user, /"coursework"/);
+  assert.match(user, /"graduation_date"/);
+  assert.match(system, /bullets VERBATIM/);
+  assert.match(system, /skill_groups mirror the resume's labeled skill-category lines/);
 });
 
 test("tailoredToTex: pdfTeX-only lines are \\ifdefined-guarded (same .tex compiles under tectonic/XeTeX)", () => {

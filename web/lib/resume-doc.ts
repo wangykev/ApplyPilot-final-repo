@@ -56,6 +56,38 @@ export function dateRange(from: string, to: string, current: boolean): string {
   return [a, b].filter(Boolean).join(" – ");
 }
 
+/** "3.95" + "4.00" → "3.95/4.00"; a gpa that ALREADY carries its scale
+ *  ("4.00/4.00") is passed through — never "4.00/4.00/4.0". */
+export function gpaText(gpa: string, scale: string): string {
+  const g = String(gpa || "").trim();
+  if (!g) return "";
+  const s = String(scale || "").trim();
+  return s && !g.includes("/") ? `${g}/${s}` : g;
+}
+
+/**
+ * The Technical Skills lines. With `skill_groups` present (the resume's labeled
+ * category lines), each group is filtered to the CHOSEN skills (tailoring may
+ * subset) and empty groups drop; chosen skills in no group land on an "Other"
+ * line. Without groups: one flat unlabeled line.
+ */
+export function skillLines(profile: Profile, chosen: string[]): { name: string; items: string[] }[] {
+  const groups = (profile.skill_groups ?? []).filter((g) => g && (g.skills ?? []).length);
+  if (!groups.length) return chosen.length ? [{ name: "", items: chosen }] : [];
+  const norm = (s: string) => s.trim().toLowerCase();
+  const chosenSet = new Set(chosen.map(norm));
+  const grouped = new Set<string>();
+  const lines: { name: string; items: string[] }[] = [];
+  for (const g of groups) {
+    const items = (g.skills ?? []).filter((s) => chosenSet.has(norm(s)));
+    items.forEach((s) => grouped.add(norm(s)));
+    if (items.length) lines.push({ name: g.name || "", items });
+  }
+  const leftovers = chosen.filter((s) => !grouped.has(norm(s)));
+  if (leftovers.length) lines.push({ name: lines.length ? "Other" : "", items: leftovers });
+  return lines;
+}
+
 // ── LaTeX ────────────────────────────────────────────────────────────────────
 
 /** Escape LaTeX specials in ONE pass — replacements are never rescanned, so the
@@ -185,12 +217,12 @@ export function tailoredToTex(profile: Profile, tailored: TailoredResume): strin
         : [e.from_year, e.to_year].filter(Boolean).join(" – ");
       out.push(
         "    \\resumeSubheading",
-        `      {${escapeLatex(e.school_or_university)}}{}`,
+        `      {${escapeLatex(e.school_or_university)}}{${escapeLatex(e.location || "")}}`,
         `      {${escapeLatex(degreeLine)}}{\\normalfont ${escapeLatex(gradText)}}`
       );
       const items: string[] = [];
       if ((e.coursework ?? []).length) items.push(`Relevant Coursework: ${e.coursework.join(", ")}`);
-      if (e.gpa) items.push(`Cumulative GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`);
+      if (e.gpa) items.push(`Cumulative GPA: ${gpaText(e.gpa, e.gpa_scale)}`);
       if (items.length) {
         out.push("        \\resumeItemListStart");
         for (const it of items) out.push(`            \\resumeItem{${escapeLatex(it)}}`);
@@ -234,12 +266,18 @@ export function tailoredToTex(profile: Profile, tailored: TailoredResume): strin
     out.push("    \\resumeSubHeadingListEnd", "");
   }
 
-  if (tailored.skills.length) {
+  const lines = skillLines(profile, tailored.skills);
+  if (lines.length) {
+    const body = lines
+      .map((l) => (l.name ? `     \\textbf{${escapeLatex(l.name)}}{: ${escapeLatex(l.items.join(", "))}}` : `     ${escapeLatex(l.items.join(", "))}`))
+      .join(" \\\\\n");
     out.push(
       "%-----------SKILLS-----------",
       "\\section{Technical Skills}",
       " \\begin{itemize}[leftmargin=0.15in, label={}]",
-      `    \\small{\\item{${escapeLatex(tailored.skills.join(", "))}}}`,
+      "    \\small{\\item{",
+      body,
+      "    }}",
       " \\end{itemize}",
       ""
     );
@@ -278,10 +316,10 @@ export function tailoredToPrintHtml(profile: Profile, tailored: TailoredResume):
         : [e.from_year, e.to_year].filter(Boolean).join(" – ");
       const items: string[] = [];
       if ((e.coursework ?? []).length) items.push(`Relevant Coursework: ${e.coursework.join(", ")}`);
-      if (e.gpa) items.push(`Cumulative GPA: ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}`);
-      // grad date on the DEGREE row (sb2nov layout: school top, degree + date below)
+      if (e.gpa) items.push(`Cumulative GPA: ${gpaText(e.gpa, e.gpa_scale)}`);
+      // grad date on the DEGREE row (sb2nov layout: school + location top, degree + date below)
       return `<div class="entry">
-  <div class="row"><span class="org">${escapeHtml(e.school_or_university)}</span></div>
+  <div class="row"><span class="org">${escapeHtml(e.school_or_university)}</span><span class="dates">${escapeHtml(e.location || "")}</span></div>
   <div class="row"><span class="role">${escapeHtml(degreeLine)}</span><span class="dates">${escapeHtml(gradText)}</span></div>
   ${items.length ? `<ul>${items.map((it) => `<li>${escapeHtml(it)}</li>`).join("")}</ul>` : ""}
 </div>`;
@@ -340,7 +378,14 @@ export function tailoredToPrintHtml(profile: Profile, tailored: TailoredResume):
   ${eduHtml ? `<h2>Education</h2>\n${eduHtml}` : ""}
   ${expHtml ? `<h2>Professional Experience</h2>\n${expHtml}` : ""}
   ${projHtml ? `<h2>Projects</h2>\n${projHtml}` : ""}
-  ${tailored.skills.length ? `<h2>Technical Skills</h2>\n<p class="skills">${escapeHtml(tailored.skills.join(", "))}</p>` : ""}
+  ${(() => {
+    const lines = skillLines(profile, tailored.skills);
+    if (!lines.length) return "";
+    const body = lines
+      .map((l) => (l.name ? `<b>${escapeHtml(l.name)}:</b> ${escapeHtml(l.items.join(", "))}` : escapeHtml(l.items.join(", "))))
+      .join("<br>");
+    return `<h2>Technical Skills</h2>\n<p class="skills">${body}</p>`;
+  })()}
 </body>
 </html>`;
 }
