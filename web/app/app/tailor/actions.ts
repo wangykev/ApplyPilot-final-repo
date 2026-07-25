@@ -62,6 +62,57 @@ export async function tailorResume({
   };
 }
 
+// ── LaTeX → PDF compile (LOCAL engine; the exact sb2nov template) ─────────────
+
+export type CompileResult = { ok: true; pdfBase64: string } | { ok: false; error: string };
+
+/**
+ * Compile a generated .tex to PDF with a LOCAL TeX engine (tectonic — a single
+ * user-scope binary; path via TECTONIC_PATH, falls back to "tectonic" on PATH).
+ * Runs on the machine hosting the site: works for local dev today; a Vercel
+ * deploy would need a compile container instead (documented in WEBSITE.md).
+ * Auth-gated like every user action (signed-in or DEV_PREVIEW). Never throws.
+ */
+export async function compileLatexPdf({ tex }: { tex: string }): Promise<CompileResult> {
+  const gate = await loadUserData();
+  if (!gate.ok) return { ok: false, error: gate.error };
+  if (!tex || tex.length < 100 || !tex.includes("\\begin{document}")) {
+    return { ok: false, error: "Nothing to compile — tailor first." };
+  }
+  const { mkdtemp, writeFile, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+
+  const engine = process.env.TECTONIC_PATH || "tectonic";
+  let dir = "";
+  try {
+    dir = await mkdtemp(join(tmpdir(), "ap-tex-"));
+    await writeFile(join(dir, "resume.tex"), tex, "utf-8");
+    const run = new Promise<{ code: number; err: string }>((resolve) => {
+      execFile(
+        engine,
+        [join(dir, "resume.tex"), "--outdir", dir, "--chatter", "minimal"],
+        { timeout: 180000, windowsHide: true },
+        (error, _stdout, stderr) => resolve({ code: error ? 1 : 0, err: String(stderr || (error && error.message) || "") })
+      );
+    });
+    const { code, err } = await run;
+    if (code !== 0) {
+      if (/ENOENT/.test(err)) {
+        return { ok: false, error: "LaTeX engine not found — set TECTONIC_PATH in web/.env.local (see .env.example)." };
+      }
+      return { ok: false, error: "LaTeX compile failed: " + err.slice(-400) };
+    }
+    const pdf = await readFile(join(dir, "resume.pdf"));
+    return { ok: true, pdfBase64: pdf.toString("base64") };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "compile crashed" };
+  } finally {
+    if (dir) rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // ── JD sources: tracked applications that carry a scraped job description ────
 
 export type JdApplication = {
