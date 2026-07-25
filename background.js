@@ -3879,39 +3879,36 @@ async function runCdpOnboard(tabId, opts) {
           label: "Sign In submit",
           done: (s) => classifyAuthOutcome(s) !== "unknown",
           formStillUp: (s) => !!s.markers.signInSubmit,
-          timeouts: [500, 20000] // fast re-click at 500ms if the first click no-op'd; then the full 20s for a genuinely slow sign-in
+          timeouts: [500, 6000] // fast re-click at 500ms, then a SHORT ceiling so we regain control in ~6s to check for Chrome's data-breach dialog (below) — instead of burning the full timeout with that dialog just sitting there blocking the form
         });
         if (r.notFound) return { ok: true, reached_form: false, needs_operator: true, stopped: "signin-submit-not-found", detail: r.blockedBy || "no Sign In button" };
         st = r.scan || st;
-        const out = classifyAuthOutcome(st);
+        let out = classifyAuthOutcome(st);
+        // ── Chrome's "password found in a data breach" dialog (detect-then-Enter, NEVER blind). ──
+        // That native browser dialog overlays the sign-in form after submit and blocks completion. It's
+        // browser chrome, invisible to the DOM — but THIS is its signature: we submitted Sign In, ~6s
+        // passed (the short ceiling above), and the sign-in form is STILL present (signInSubmit) with no
+        // recognized outcome. Enter is that dialog's default dismiss (operator-confirmed). SAFE + not
+        // blind: signInSubmit still present ⇒ we're on the SIGN-IN form (never the application form), so a
+        // stray Enter can at most re-submit sign-in (submitAndWait already re-clicks it every attempt) —
+        // never advance a page or submit an application. Fire ONCE the moment the stall is detected (~6s,
+        // not the old ~20s), THEN wait the full time for the real outcome; the routing below handles it.
+        if (out === "unknown" && st.markers.signInSubmit) {
+          LOG("sign-in stalled ~6s with the form present and no outcome — likely Chrome's 'password found in a data breach' dialog blocking it; pressing Enter to dismiss (safe: still on the sign-in form).");
+          emitRunProgress("Dismissing Chrome's data-breach password warning");
+          try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
+          const wb = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-breach-dismiss outcome");
+          st = wb.scan || st;
+          out = classifyAuthOutcome(st);
+        }
         LOG(`sign-in outcome: ${out}.`);
         if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
         if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
         if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
         if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
-        // ── Chrome's "password found in a data breach" dialog (detect-then-Enter, NEVER blind). ──
-        // That native browser dialog overlays the sign-in form after submit and blocks completion. It's
-        // browser chrome, invisible to the DOM — but THIS exact state is its signature: we submitted Sign
-        // In, waited the full timeout, and the sign-in form is STILL present (signInSubmit) with no
-        // recognized outcome and no error. Enter is that dialog's default dismiss (operator-confirmed).
-        // SAFE because signInSubmit is still present → we're on the SIGN-IN form, never the application
-        // form, so a stray Enter can at most re-submit sign-in — it can never advance a page or submit an
-        // application. Pressed ONCE, gated on this detection; if it doesn't clear, we halt SPECIFICALLY
-        // (not a vague auth-unknown) so the operator knows to dismiss it / use a unique password.
-        if (st.markers.signInSubmit) {
-          LOG("sign-in submitted but the form is still present with no outcome/error — likely Chrome's 'password found in a data breach' dialog blocking it; pressing Enter to dismiss (safe: still on the sign-in form).");
-          emitRunProgress("Dismissing Chrome's data-breach password warning");
-          try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
-          const wb = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-breach-dismiss outcome");
-          st = wb.scan || st;
-          const out2 = classifyAuthOutcome(st);
-          LOG(`post-dismiss sign-in outcome: ${out2}.`);
-          if (out2 === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
-          if (out2 === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
-          if (out2 === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
-          if (isAlreadyApplied(st)) return alreadyAppliedResult();
-          if (st.markers.signInSubmit) return { ok: true, reached_form: false, needs_operator: true, stopped: "password-breach-dialog", detail: "Sign-in didn't complete — the likely cause is Chrome's \"the password you just used was found in a data breach\" warning blocking it. Dismiss that warning in the tab (or use a unique Workday password / turn off Chrome's breach warning), then re-run." };
-        }
+        // Sign-in never resolved and the form is STILL up → a block (most likely the breach dialog) is up
+        // and Enter didn't clear it. Halt SPECIFICALLY (not a vague auth-unknown) so the operator can act.
+        if (st.markers.signInSubmit) return { ok: true, reached_form: false, needs_operator: true, stopped: "password-breach-dialog", detail: "Sign-in didn't complete — the likely cause is Chrome's \"the password you just used was found in a data breach\" warning blocking it. Dismiss that warning in the tab (or use a unique Workday password / turn off Chrome's breach warning), then re-run." };
         return { ok: true, reached_form: false, needs_operator: true, stopped: "auth-unknown", detail: `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}` };
       }
 
