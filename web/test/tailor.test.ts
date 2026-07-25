@@ -8,6 +8,7 @@ import {
   parseTailorReply,
   verifyFactsPreserved,
   buildProfileVocab,
+  identityResume,
 } from "@/lib/tailor";
 import { escapeLatex, tailoredToTex, tailoredToPrintHtml, displayDate, dateRange } from "@/lib/resume-doc";
 import { coerceProfile } from "@/lib/profile-schema";
@@ -191,6 +192,23 @@ test("full: free text carries sources; out-of-profile tech flagged as fabricatio
   assert.equal(clean.fabrication_risk, undefined);
   assert.deepEqual(clean.source_ids, ["W0.B0", "W0.B1"]);
   assert.match(risky.fabrication_risk ?? "", /kubernetes/i);
+});
+
+// ── identityResume (the "Original" view + the fail-safe baseline) ─────────────
+test("identityResume: every experience included, every bullet verbatim, all skills, no summary", () => {
+  const r = identityResume(PROFILE);
+  assert.ok(r.experiences.every((e) => e.include));
+  assert.equal(r.experiences[0].bullets[0].text, "Developed ROS 2 nodes for robotic systems");
+  assert.ok(r.experiences.every((e) => e.bullets.every((b) => !b.edited && b.text === b.source_text)));
+  assert.deepEqual(r.skills, ["C", "C++", "Python", "SystemVerilog"]);
+  assert.equal(r.summary, "");
+  assert.deepEqual(r.gaps, []);
+});
+test("identityResume: IS the parse fail-safe (a broken reply degrades to exactly the original)", () => {
+  const failsafe = parseTailorReply("garbage", PROFILE, "select");
+  delete (failsafe as { error?: string }).error;
+  delete (failsafe as { raw?: string }).raw;
+  assert.deepEqual(failsafe, identityResume(PROFILE, "select"));
 });
 
 // ── fail-safety ───────────────────────────────────────────────────────────────

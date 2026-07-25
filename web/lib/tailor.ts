@@ -287,16 +287,14 @@ type ReplyBullet = string | { id?: string; text?: string; sources?: string[] };
 type ReplyExperience = { id?: string; include?: boolean; bullets?: ReplyBullet[] };
 
 /**
- * Turn the LLM reply into a TailoredResume, enforcing each mode's guardrail.
- * NEVER throws. Fail-safe direction: anything unparseable keeps the ORIGINAL
- * profile content (a broken reply can only cost tailoring, never correctness).
+ * The UNTAILORED resume, straight from the profile: every experience, every
+ * bullet verbatim, every skill, no summary. Doubles as (a) the "Original" view
+ * on the tailor page and (b) parseTailorReply's fail-safe baseline.
  */
-export function parseTailorReply(text: string, profile: Profile, mode: TailorMode): TailoredResume {
+export function identityResume(profile: Profile, mode: TailorMode = "select"): TailoredResume {
   const work = workUnits(profile);
   const skills = skillUnits(profile);
-  const vocab = buildProfileVocab(profile);
-
-  const identity: TailoredResume = {
+  return {
     mode,
     summary: "",
     experiences: work.map((w) => ({
@@ -320,6 +318,19 @@ export function parseTailorReply(text: string, profile: Profile, mode: TailorMod
     rationale: "",
     reverted_count: 0,
   };
+}
+
+/**
+ * Turn the LLM reply into a TailoredResume, enforcing each mode's guardrail.
+ * NEVER throws. Fail-safe direction: anything unparseable keeps the ORIGINAL
+ * profile content (a broken reply can only cost tailoring, never correctness).
+ */
+export function parseTailorReply(text: string, profile: Profile, mode: TailorMode): TailoredResume {
+  const work = workUnits(profile);
+  const skills = skillUnits(profile);
+  const vocab = buildProfileVocab(profile);
+
+  const identity: TailoredResume = identityResume(profile, mode);
 
   const obj = extractJsonObject(text);
   if (!obj) return { ...identity, error: "parse-failed", raw: String(text).slice(0, 400) };
