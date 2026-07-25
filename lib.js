@@ -849,12 +849,23 @@ function looksLikeSso(state) {
 // confirmed-in-question by the recognizer; the answer comes from the profile employer list). Returns null
 // on a non-Workday / unparseable URL. Mirrors scrapeJobDescription's subdomain+titleCase fallback.
 function tenantCompanyFromUrl(url) {
-  let host = "";
-  try { host = new URL(String(url == null ? "" : url)).hostname; } catch (e) { host = ""; }
-  const m = host.match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
-  if (!m) return null;
-  return m[1].replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim()
-    .split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ") || null;
+  let host = "", path = "";
+  try { const u = new URL(String(url == null ? "" : url)); host = u.hostname; path = u.pathname || ""; } catch (e) {}
+  if (!/\.myworkday(?:jobs|site)\.com$/i.test(host)) return null; // trust ONLY Workday hosts
+  const titleCase = (s) => (String(s || "").replace(/[-_+]+/g, " ").replace(/\s+/g, " ").trim()
+    .split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ") || null);
+  const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+  // The brand lives in the SUBDOMAIN on the careers/JD host (magna.wd3.myworkdayjobs.com), but in the PATH
+  // on the LOGGED-IN FORM host — wd3.myworkdaysite.com/en-US/recruiting/<tenant>/<Tenant>/job/… (no company
+  // subdomain there). The fill runs on the form host, so the path fallback is the load-bearing one. Mirrors
+  // scrapeJobDescription's subdomain → path fallbacks.
+  const sub = host.match(/^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i);
+  if (sub) return titleCase(sub[1]);
+  const rec = path.match(/\/recruiting\/([^/]+)/i);      // /recruiting/<tenant>/… — the clean tenant slug (preferred)
+  if (rec) return titleCase(dec(rec[1]));
+  const job = path.match(/\/([^/]+)\/job\//i);           // fallback: the segment right before "/job/"
+  if (job) return titleCase(dec(job[1]));
+  return null;
 }
 
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the

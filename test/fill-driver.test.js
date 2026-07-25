@@ -706,11 +706,16 @@ test("employment question — no company anchor AND a non-tenant URL → NOT rec
 // so the recognizer + employer-match logic anchor RELIABLY off the URL (always present) instead of a
 // scraped jobContext.company that may be empty. The decision still comes from the profile employer list.
 const { tenantCompanyFromUrl } = require("../lib.js");
-test("tenantCompanyFromUrl: extracts the company brand from a Workday tenant URL", () => {
+test("tenantCompanyFromUrl: extracts the company brand from a Workday tenant URL (subdomain AND path)", () => {
+  // JD / careers host → the brand is the SUBDOMAIN
   assert.strictEqual(tenantCompanyFromUrl("https://magna.wd3.myworkdayjobs.com/en-US/x"), "Magna");
-  assert.strictEqual(tenantCompanyFromUrl("https://magna.wd3.myworkdaysite.com/y"), "Magna", "the logged-in form host too");
   assert.strictEqual(tenantCompanyFromUrl("https://comcast.wd5.myworkdayjobs.com/z"), "Comcast");
   assert.strictEqual(tenantCompanyFromUrl("https://acme-corp.wd1.myworkdayjobs.com/a"), "Acme Corp");
+  // LOGGED-IN FORM host → NO subdomain; the brand is in the PATH (/recruiting/<tenant>/…). This is the
+  // load-bearing case — the fill actually runs here (the live Magna URL that made the anchor go missing).
+  assert.strictEqual(tenantCompanyFromUrl("https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton/Junior_R00244793/apply"), "Magna");
+  assert.strictEqual(tenantCompanyFromUrl("https://wd5.myworkdaysite.com/en-US/recruiting/comcast/Comcast_Careers/job/x"), "Comcast");
+  // non-Workday / junk
   assert.strictEqual(tenantCompanyFromUrl("https://careers.google.com/j"), null, "non-Workday → null");
   assert.strictEqual(tenantCompanyFromUrl(""), null);
   assert.strictEqual(tenantCompanyFromUrl(null), null);
@@ -720,7 +725,7 @@ test("employment anchor via URL tenant: a custom 'former «co» employee?' with 
   // "Magna" (from the URL), so the recognizer fires and fills a deterministic clean-miss "No" from the
   // employer list — instead of the AI safety-reversal (LEGALLY-LOADED review). The LLM is never called.
   const act = makeFakeAct([empField("Are you a former MAGNA employee?")],
-    { scanUrl: "https://magna.wd3.myworkdaysite.com/en-US/apply", aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+    { scanUrl: "https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Milton/Junior_R00244793/apply", aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
   const rec = (await drivePageFill(act, { employment_history_companies: ["Google"] }, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(rec.after, "No");
   assert.strictEqual(rec.status, "filled", "recognized via the URL tenant → deterministic No, no review");
