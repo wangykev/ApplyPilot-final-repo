@@ -565,6 +565,9 @@ test('previous-worker radio is NEVER left "Yes" without a needs_review flag', as
     { name: "employer named in the question text", company: null, employers: ["US Bancorp Investments"], expect: { after: "Yes", status: "filled_review" } },
     { name: "partial overlap → No + review", company: "Magna", employers: ["Magna Steyr"], expect: { after: "No", status: "filled_review" } },
     { name: "clean miss → confident No, no review", company: "Magna", employers: ["Google"], expect: { after: "No", status: "filled" } },
+    // 2026-07-24 (operator "trust your list"): a clean miss with NO company anchor STILL fills a confident
+    // "No" from the complete (non-empty) list — the anchor only corroborates the Yes/overlap paths.
+    { name: "clean miss, NO company anchor → still confident No (trust the complete list)", company: null, employers: ["Google"], expect: { after: "No", status: "filled" } },
     { name: '["none"] sentinel → confident No', company: "Magna", employers: ["none"], expect: { after: "No", status: "filled" } },
     { name: "[] unfilled → blank + review", company: "Magna", employers: [], expect: { after: null, status: "needs_review" } },
     { name: "unconfigured → blank + review", company: "Magna", employers: undefined, expect: { after: null, status: "needs_review" } },
@@ -910,10 +913,12 @@ test("employment OPTIONAL radio — the deterministic tier runs for optional fie
 const aiPwField = (flags) => pwField(Object.assign({ isRequired: true }, flags || {}));
 
 test("AI radio (prev-worker unevaluable): infers No → filled_review + ai-choice-sensitive (LOUD), committed, confidence carried", async () => {
-  // no company set + Magna not in employment history → decidePreviousWorker is UNEVALUABLE (blank);
-  // the required-radio AI fallback then infers "No" from the ABSENCE of Magna in the profile.
+  // employment_history_companies:[] (unfilled) → decidePreviousWorker is UNEVALUABLE (blank — an empty
+  // list can't confirm non-membership); the required-radio AI fallback then infers "No" from the absence.
+  // (A NON-empty list is now a deterministic clean-miss "No" even without a company — so [] is the genuine
+  // unevaluable input that still exercises the AI path.)
   const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"No","justification":"Magna not in employment history","confidence":"High"}' });
-  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(rec.status, "filled_review", "an AI guess is never silently filled");
   assert.strictEqual(rec.after, "No");
   assert.strictEqual(rec.flag, "ai-choice-sensitive", "prev-worker sits next to a truthfulness cert → always LOUD");
@@ -928,7 +933,7 @@ test("AI radio (prev-worker unevaluable): infers No → filled_review + ai-choic
 
 test('AI radio: an inferred "Yes" is STILL filled_review, never plain filled (the truthfulness-cert invariant holds under AI)', async () => {
   const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"Yes","justification":"prior tenure suggested","confidence":"Low"}' });
-  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0]; // [] = genuinely unevaluable → AI path
   assert.strictEqual(rec.after, "Yes");
   assert.notStrictEqual(rec.status, "filled", "a Yes is never silently filled");
   assert.strictEqual(rec.status, "filled_review");
@@ -966,7 +971,7 @@ test("AI radio: a demographic (EEO) required radio → re-tagged ai-eeo-guess (D
 
 test("AI radio: the AI's pick is not one of the labels → needs_review (ai-nomatch), no commit", async () => {
   const act = makeFakeAct([aiPwField()], { aiEnabled: true, ai: '{"choice":"Maybe","justification":"unsure","confidence":"Low"}' });
-  const rec = (await drivePageFill(act, pwProfile(["Google"]), {}, {}, T_BUDGETS)).results[0];
+  const rec = (await drivePageFill(act, pwProfile([]), {}, {}, T_BUDGETS)).results[0]; // [] = unevaluable → AI path (a non-empty list now fills a deterministic "No")
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.flag, "ai-nomatch");
   assert.strictEqual(rec.after, null);

@@ -519,10 +519,14 @@ const decidePreviousWorker = (company, questionText, employers) => {
   if (overlapHits.length) {
     return { fill: "No", review: true, detail: `company "${co}" partially overlaps known employer(s): ${overlapHits.join(", ")} → filled "No"; REVIEW (could be the same employer)` };
   }
-  if (tightC) {
-    return { fill: "No", review: false, detail: `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))` };
-  }
-  return { fill: null, review: true, detail: "no company set for this application and no known employer named in the question — left blank" };
+  // Clean miss → confident "No". A COMPLETE (non-empty) employer list is what makes non-membership safe
+  // (operator 2026-07-24: "trust your list"), so the "No" no longer REQUIRES jobContext.company — the
+  // company anchor only corroborates the "Yes"/overlap paths above. Without it we STILL fill "No" (your
+  // complete list names no company the question asks about); the missing corroboration is noted in the
+  // detail, NOT a review flag. (An EMPTY/unconfigured list already returned null above → stays blank+review.)
+  return { fill: "No", review: false, detail: tightC
+    ? `no known employer matches the company "${co}" or appears in the question → No (clean miss vs ${employers.length} known employer(s))`
+    : `no known employer appears in the question → No (clean miss vs ${employers.length} known employer(s); no application company set to corroborate)` };
 };
 
 // ── Employment-status-at-the-application-company recognizer (DETERMINISTIC, no AI) ──────────────
