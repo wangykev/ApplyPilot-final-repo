@@ -6035,6 +6035,70 @@ test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cac
   assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // cached by stem "readingProficiency"
 });
 
+// ── choice-capture CROSS-RUN option cache (2026-07-25 speed round) ──────────────────────────
+// The SW loads/persists the store (chrome.storage `optionListCache`, tenant-scoped); the driver
+// only reads/mutates the plain object handed in. COSMETIC surface only (the review editor's
+// choice lists) — the fill/match ladder always reads LIVE options, so a stale list can never
+// cause a wrong fill.
+test("choice-capture cache: a fresh cache entry serves a prefilled-kept dropdown with ZERO re-opens", async () => {
+  const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }];
+  const cache = { "dd:country": { options: ["United States of America", "Canada"], at: Date.now() } };
+  const { act, calls } = makeDropdownAct();
+  await captureChoiceOptions(act, recs, T_BUDGETS, cache);
+  assert.deepStrictEqual(recs[0].options, ["United States of America", "Canada"]);
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0, "cache hit → no cold re-open (the ~5.6s server-list cost skipped)");
+});
+
+test("choice-capture cache: a committed record's options FEED the store (free); a live scrape is written back", async () => {
+  const recs = [
+    { fieldName: "language[0].language", widgetType: "dropdown", status: "filled", auditLoc: "[w-lang]", options: ["English", "Chinese"] }, // committed → feeds the store
+    { fieldName: "education[0].degree", widgetType: "dropdown", status: "filled", auditLoc: "[w-degree]" }                                  // optionless → scraped → written back
+  ];
+  const cache = {};
+  const { act } = makeDropdownAct();
+  await captureChoiceOptions(act, recs, T_BUDGETS, cache);
+  assert.deepStrictEqual(cache["dd:language"].options, ["English", "Chinese"], "committed options feed the store so a re-run's tier-0 keep hits the cache");
+  assert.deepStrictEqual(cache["dd:degree"].options, ["Bachelors", "Masters", "Doctorate"], "scraped options written back");
+  assert.ok(cache["dd:language"].at > 0 && cache["dd:degree"].at > 0, "entries are stamped for the TTL");
+});
+
+test("choice-capture cache: a STALE (TTL-expired) entry is ignored → live scrape, fresh write-back", async () => {
+  const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }];
+  const cache = { "dd:country": { options: ["Stale Land"], at: Date.now() - 8 * 24 * 3600 * 1000 } }; // > 7d TTL
+  const { act, calls } = makeDropdownAct();
+  await captureChoiceOptions(act, recs, T_BUDGETS, cache);
+  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"], "stale entry NOT served");
+  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1, "re-scraped live");
+  assert.deepStrictEqual(cache["dd:country"].options, ["Bachelors", "Masters", "Doctorate"], "fresh scrape replaces the stale entry");
+});
+
+test("choice-capture cache: typeahead records hit the cache by captureKey (no re-open)", async () => {
+  const recs = [taggedRec({ auditLoc: "[w-fos-0]" })];
+  const cache = { "ta:fieldOfStudy": { options: ["Cached Studies"], at: Date.now() } };
+  const { act, calls } = makeCaptureAct();
+  await captureChoiceOptions(act, recs, CAP_BUDGETS, cache);
+  assert.deepStrictEqual(recs[0].options, ["Cached Studies"]);
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0, "no re-open on a cache hit");
+  assert.strictEqual(calls.filter((c) => c[0] === "openHier").length, 0, "the field is never even opened");
+});
+
+test("closeDropdownConfirmed: polls on delayRender (adaptive) with a wall-clock bound — options-gone gate unchanged", async () => {
+  // The 2026-07-25 pacing change: the close-settle beat is delayRender (adaptive under the measured-
+  // fast gate), bounded by a REAL wall-clock deadline (openRetries × reopenSettleMs — the same total
+  // window closeAndVerifyBlank uses) instead of the old delayFull(commitIntervalMs) × 4 iterations.
+  const calls = [];
+  let lingering = 1;
+  const act = {
+    delayRender: async () => { calls.push("delayRender"); },
+    delayFull: async () => { calls.push("delayFull"); },
+    pressEscape: async () => {},
+    readDropdownState: async () => { const open = lingering > 0; if (lingering > 0) lingering--; return { listboxPresent: open, optionCount: open ? 3 : 0 }; }
+  };
+  const gone = await closeDropdownConfirmed(act, { wrapperSel: "[w]" }, { openRetries: 3, commitIntervalMs: 300, reopenSettleMs: 400 });
+  assert.strictEqual(gone, true, "still gates on options-gone");
+  assert.ok(calls.includes("delayRender") && !calls.includes("delayFull"), "the close-settle beat is adaptive (delayRender), not a fixed full-clock wait");
+});
+
 // ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
 // A genuine-no-match flat typeahead → the LLM picks from the captured option list → commit through the
 // proven filler, ALWAYS filled_review. Tree pickers (cert/source) EXCLUDED. Headline: Field of Study.
