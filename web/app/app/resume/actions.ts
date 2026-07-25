@@ -39,6 +39,28 @@ export async function applyParsedProfile(parsedRaw: unknown): Promise<ActionResu
   }
 }
 
+export type PreviewUrlResult = { ok: true; url: string } | { ok: false; error: string };
+
+/** A short-lived signed URL for the stored resume PDF, so the browser can render
+ *  the ACTUAL uploaded file (the private bucket blocks direct links). */
+export async function getResumePreviewUrl(): Promise<PreviewUrlResult> {
+  if (!isSupabaseConfigured()) return { ok: false, error: "Backend not connected." };
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "You're not signed in." };
+    const { data, error } = await supabase.storage
+      .from("resumes")
+      .createSignedUrl(`${user.id}/default-resume.pdf`, 600);
+    if (error || !data?.signedUrl) return { ok: false, error: error?.message ?? "No stored resume found." };
+    return { ok: true, url: data.signedUrl };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
 /** Remove the stored default resume (Storage object + row). */
 export async function removeResume(): Promise<ActionResult> {
   if (!isSupabaseConfigured()) return { ok: false, error: "Backend not connected." };

@@ -1,10 +1,10 @@
 "use client";
 
-import { useRef, useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import Link from "next/link";
-import { UploadCloud, FileText, Sparkles, Check, Trash2, ArrowRight } from "lucide-react";
+import { UploadCloud, FileText, Sparkles, Check, Trash2, ArrowRight, Eye, X } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
-import { applyParsedProfile, removeResume } from "./actions";
+import { applyParsedProfile, removeResume, getResumePreviewUrl } from "./actions";
 import { liveSync } from "@/lib/extension-sync";
 import type { Profile } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
@@ -38,7 +38,28 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
   const [parsing, setParsing] = useState(false);
   const [applying, startApply] = useTransition();
   const [dragging, setDragging] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Esc closes the PDF preview popup (backdrop click closes it too).
+  useEffect(() => {
+    if (!previewUrl) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPreviewUrl(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [previewUrl]);
+
+  async function openPreview() {
+    setPreviewLoading(true);
+    setMsg(null);
+    const res = await getResumePreviewUrl();
+    setPreviewLoading(false);
+    if (res.ok) setPreviewUrl(res.url);
+    else setMsg({ kind: "err", text: "Preview failed: " + res.error });
+  }
 
   async function onFile(f: File) {
     if (!f.type.includes("pdf")) {
@@ -149,9 +170,49 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
               <div className="truncate text-sm text-ink">{stored.filename}</div>
               <div className="font-mono text-[11px] text-ink-faint">{kb(stored.size)} · stored</div>
             </div>
+            <button
+              onClick={openPreview}
+              disabled={previewLoading}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-hairline px-2.5 py-1.5 text-xs text-ink-dim transition-colors hover:border-amber hover:text-ink"
+              title="View the uploaded PDF exactly as it will be attached"
+            >
+              <Eye className="h-3.5 w-3.5" />
+              {previewLoading ? "Opening…" : "Preview"}
+            </button>
             <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-verified">
               <Check className="h-3.5 w-3.5" /> Ready
             </span>
+          </div>
+        )}
+
+        {previewUrl && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+            onClick={() => setPreviewUrl(null)}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Resume preview"
+          >
+            <div
+              className="bezel relative flex h-[90vh] w-full max-w-3xl flex-col p-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between border-b border-hairline pb-3">
+                <h2 className="font-display text-lg font-medium">
+                  {stored?.filename ?? "Resume"}{" "}
+                  <span className="font-mono text-[11px] font-normal text-ink-faint">— the uploaded PDF, as attached to applications</span>
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setPreviewUrl(null)}
+                  className="text-ink-dim transition-colors hover:text-ink"
+                  aria-label="Close"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <iframe title="Resume PDF" src={previewUrl} className="mt-3 w-full flex-1 rounded-lg bg-white" />
+            </div>
           </div>
         )}
 
