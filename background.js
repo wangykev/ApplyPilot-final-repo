@@ -3751,7 +3751,12 @@ async function runCdpOnboard(tabId, opts) {
     return false;
   };
 
-  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null }) => {
+  // `beforeRetry` (2026-07-25, Caterpillar): an optional best-effort hook run before each RE-click.
+  // Create Account passes checkConsent — a missed/unchecked consent box makes the submit no-op with
+  // the form still up ("Error: Please check the box to continue"), so re-checking it before the
+  // retry self-heals a tenant the consent detector missed (checkConsent is idempotent — an
+  // already-checked box is a no-op read, never an uncheck).
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null, beforeRetry = null }) => {
     // Clear Chrome's password-manager autofill dropdown (it can cover the submit button and swallow the
     // coordinate click) and CONFIRM it's gone before clicking. Both onboarding submits follow credential
     // fields, so this is a no-op cost when nothing is focused.
@@ -3769,7 +3774,11 @@ async function runCdpOnboard(tabId, opts) {
       if (st && done(st)) return { scan: st };
       // Timed out. Re-click ONLY if still on this submit form; else the page advanced (done just
       // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
-      if (t < n && st && formStillUp(st)) { LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
+      if (t < n && st && formStillUp(st)) {
+        LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`);
+        if (beforeRetry) { try { await beforeRetry(st); } catch (e) { /* best-effort — the re-click proceeds regardless */ } }
+        continue;
+      }
       return { scan: st };
     }
     return { scan: st };
@@ -3850,7 +3859,8 @@ async function runCdpOnboard(tabId, opts) {
       selectors: ['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'],
       label: "Create Account submit",
       done: (s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || s.signInWithEmail || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""),
-      formStillUp: (s) => !!s.markers.createAccountSubmit
+      formStillUp: (s) => !!s.markers.createAccountSubmit,
+      beforeRetry: () => checkConsent() // a no-op submit with the form still up can mean a missed consent box ("Please check the box to continue" — Caterpillar) — re-detect + check it before re-clicking (idempotent)
     });
     if (r.notFound) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: r.blockedBy || "no Create Account button" };
     let post = r.scan || st;

@@ -2290,3 +2290,29 @@ Observed driving the website Run end-to-end on Magna wd3. Two facts that shaped 
 - **The "Something went wrong / please refresh" soft-error can appear right after login**, mid-Run — the fill
   walk now detects it (`cdpReadSessionState.softErrorPresent`) and reloads + restarts from page 1 (a refresh
   restarts the Workday application), same as onboarding's `maybeRefresh`. See progress-log 2026-07-22.
+
+## 2026-07-25 — Caterpillar: create-account consent is "I accept" (not matched by the agreementCheckbox id or the consent word-list)
+
+First live-verified-speed-era new-tenant probe (background Run, Caterpillar). Onboarding reached the
+create-account form, filled email/password/verify-password cleanly, but logged "no consent checkbox
+detected — proceeding" and the submit then no-op'd with the form still up, Workday rendering
+**"Error: Please check the box to continue"** under its "Caterpillar Global Data Privacy Statement"
+block. Observations (from the rendered page + the detector's misses — full DOM ids not yet captured):
+
+- The consent checkbox is NOT `[data-automation-id="agreementCheckbox"]` (the Magna shape) — that
+  selector found nothing.
+- Its accompanying text is **"I accept"** — which the old label word-list
+  (`/consent|terms|agree|privacy|acknowledge/`) does NOT match ("accept" ≠ "agree"), and/or the text
+  is not in an associated `<label>` at all (the label-for / wrapping-label routes both came up empty).
+- The auth screen also opens on the **Create Account view** with an `h3#authViewTitle` ("Create
+  Account") that the cover-check reported OVER the Sign In tab target — the sign-in-first attempt was
+  refused as a blind click, fell through to wrong_credentials, and the loop correctly converged on
+  create-account (no fix needed; noted for the pattern).
+
+**Fixes (same day):** `cdpConsentRect` adds `accept` to the word-list, also reads `aria-label`, and —
+only when label/aria give nothing — the nearest SMALL ancestor's own text (≤250 chars, so a page-wide
+container can never match); a CSS-clipped labelless input falls back to clicking its wrapper. And
+`submitAndWait` gained a `beforeRetry` hook: Create Account re-runs `checkConsent` before every
+re-click, so even a tenant the detector misses self-heals on retry 1 (checkConsent is idempotent —
+an already-checked box is never unchecked). Capture the real automation-id of Caterpillar's consent
+wrapper on the next probe to pin the selector.

@@ -1744,19 +1744,40 @@ function cdpConsentRect() {
   const bare = document.querySelector('[data-automation-id="agreementCheckbox"]');
   if (!checkbox && bare && bare.tagName === "INPUT") checkbox = bare;
   if (!checkbox) {
-    checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((b) => {
+    // Word-list fallback. WIDENED 2026-07-25 (Caterpillar): its create-account consent is labeled
+    // "I accept" — "accept" wasn't in the list, and the text may not live in an associated <label>
+    // at all, so also read aria-label and (only when label/aria give nothing) the nearest SMALL
+    // ancestor's own text (≤250 chars — a big container's text is too broad to trust; the word
+    // list on SHORT nearby text keeps an unrelated checkbox, e.g. a job-alerts opt-in, unmatched).
+    const CONSENT_RE = /consent|terms|agree|accept|privacy|acknowledge/;
+    const textFor = (b) => {
       const lab = b.id ? document.querySelector('label[for="' + b.id + '"]') : null;
       const wrapLab = b.closest && b.closest("label");
-      const txt = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || "").toLowerCase();
-      return /consent|terms|agree|privacy|acknowledge/.test(txt);
-    }) || null;
+      let t = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || b.getAttribute("aria-label") || "").trim();
+      if (!t) {
+        let el = b.parentElement;
+        for (let i = 0; i < 3 && el; i++) {
+          const s = (el.textContent || "").trim();
+          if (s) { if (s.length <= 250) t = s; break; } // first non-empty ancestor text only — never a page-wide container
+          el = el.parentElement;
+        }
+      }
+      return t.toLowerCase();
+    };
+    checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((b) => CONSENT_RE.test(textFor(b))) || null;
   }
   if (!checkbox) return null;
   const inputId = checkbox.id || null;
   const lab = inputId ? document.querySelector('label[for="' + inputId + '"]') : (checkbox.closest && checkbox.closest("label"));
-  const target = lab || checkbox;
+  let target = lab || checkbox;
   if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
-  const r = target.getBoundingClientRect();
+  let r = target.getBoundingClientRect();
+  if ((r.width <= 0 || r.height <= 0) && checkbox.parentElement) {
+    // CSS-clipped input with no label association (the styled box is a sibling/wrapper) — click the wrapper.
+    target = checkbox.parentElement;
+    if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
+    r = target.getBoundingClientRect();
+  }
   if (r.width <= 0 || r.height <= 0) return null;
   return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), checked: !!checkbox.checked, inputId };
 }
