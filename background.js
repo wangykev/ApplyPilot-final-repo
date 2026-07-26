@@ -3699,6 +3699,37 @@ async function runCdpOnboard(tabId, opts) {
     return { ok: true };
   };
 
+  // ── AUTH VIEW (2026-07-25, Caterpillar) ── Sign In and Create Account are two views of the SAME
+  // widget and BOTH carry email+password inputs, so "an email field is present" does NOT mean we are on
+  // the sign-in form. Live failure: the tenant opened on Create Account, the "Sign In" link click was
+  // refused (covered by the widget's own h3#authViewTitle), the flow filled the CREATE-ACCOUNT fields,
+  // and the generic `button[type="submit"]` fallback then clicked CREATE ACCOUNT while logging "Sign In
+  // submit". These predicates key on the SUBMIT markers — the only view-distinguishing signal.
+  const onSignInView = (s) => !!(s && s.markers && s.markers.signInSubmit);
+  const onCreateView = (s) => !!(s && s.markers && s.markers.createAccountSubmit && !s.markers.signInSubmit);
+
+  // Switch the auth widget to `want` ("signin" | "create") and VERIFY the switch actually happened
+  // (never assume a click landed). Ladder: the trusted coordinate click on the canonical link →, if that
+  // is refused/not-found, a page-side element click (cdpClickAuthSwitch — safe: a view-switch link is
+  // not a submit and not a consent control; submit buttons are excluded there) → then POLL for the
+  // target view's submit marker. Returns { ok, scan }. ok:false ⇒ the caller must NOT fill this view.
+  const switchAuthView = async (want, st) => {
+    const there = want === "signin" ? onSignInView : onCreateView;
+    if (there(st)) return { ok: true, scan: st };
+    const sel = want === "signin" ? '[data-automation-id="signInLink"]' : '[data-automation-id="createAccountLink"]';
+    const label = want === "signin" ? "Sign In tab" : "Create Account tab";
+    const r = await clickTarget([sel], label);
+    if (!r.clicked) {
+      const d = await cdpEval(cdpClickAuthSwitch, want === "signin" ? "signin" : "createaccount");
+      LOG(`"${label}" coordinate click ${r.blockedBy ? `refused (covered by ${r.blockedBy})` : "not found"} — ${d && d.ok ? `clicked it directly in-page (${JSON.stringify(d.text)}, via ${d.how})` : "no view-switch control found"}.`);
+      if (!d || !d.ok) return { ok: false, scan: st };
+    }
+    const w = await waitFor(there, 8000, `${want === "signin" ? "sign-in" : "create-account"} view`);
+    const scan2 = w.scan || st;
+    if (!w.matched) LOG(`the auth widget did not switch to the ${want === "signin" ? "SIGN IN" : "CREATE ACCOUNT"} view.`);
+    return { ok: !!w.matched, scan: scan2 };
+  };
+
   const checkConsent = async () => {
     let c = await cdpEval(cdpConsentRect);
     if (!c) { LOG("no consent checkbox detected — proceeding (some tenants have none)."); return; }
@@ -3844,7 +3875,9 @@ async function runCdpOnboard(tabId, opts) {
   const doCreateAccount = async (st) => {
     LOG(`creating a Workday account as ${creds.email}…`);
     emitRunProgress("Creating your account");
-    if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await pace(900); st = await scan() || st; }
+    // Switch to the CREATE ACCOUNT view + verify (same discipline as the sign-in switch: never fill a
+    // form we haven't confirmed we're on). Already there ⇒ no-op.
+    if (!onCreateView(st)) { const sw = await switchAuthView("create", st); st = sw.scan || st; }
     await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
     await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
     await fillVerifyPassword(creds.password);
@@ -3936,10 +3969,16 @@ async function runCdpOnboard(tabId, opts) {
       if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
       if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/credentials.json) in the popup, or sign in manually then re-run." };
 
-      // Prefer the sign-in path (switch to its tab if a link is showing).
-      if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await pace(800); st = await scan() || st; }
+      // Prefer the sign-in path — but SWITCH to the sign-in view and VERIFY the switch before touching
+      // any field. Both views carry email+password, so the old "a field is present ⇒ we're signing in"
+      // assumption typed the sign-in credentials into the CREATE-ACCOUNT form and pressed CREATE ACCOUNT
+      // while logging "Sign In submit" (Caterpillar, live) — it only recovered by accident afterwards.
+      // If the sign-in view can't be reached we fall through to the create-account branch DELIBERATELY,
+      // never by mislabelling one form as the other.
+      if (st.markers.signInLink || onCreateView(st)) { const sw = await switchAuthView("signin", st); st = sw.scan || st; }
+      if (onCreateView(st)) LOG("auth widget is on the CREATE ACCOUNT view and would not switch to Sign In — going to account creation (not filling sign-in credentials into this form).");
 
-      if (st.passwordInput || st.emailInput) {
+      if ((st.passwordInput || st.emailInput) && !onCreateView(st)) {
         LOG(`sign-in attempt ${attempt} as ${creds.email}.`);
         // data-automation-id FIRST (Workday-canonical + present on observed tenants); the generic
         // input[type=email] is the fallback. Ordering matters only for speed — a missing first

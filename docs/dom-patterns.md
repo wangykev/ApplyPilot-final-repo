@@ -2347,3 +2347,33 @@ both directions; date/year/checkbox never swap (classify() can't see a date comp
 on the record (`widgetAdapted`) and the record reports the LIVE widget so review renders the right editor.
 Unit-pinned (5 tests). **Still to capture on the next probe:** the actual `data-automation-id` of this
 tenant's school field, so it can be pinned as an alt instead of relying on the label fallback.
+
+## 2026-07-25 — Caterpillar: the auth widget can OPEN on the Create Account view (both views carry email+password)
+
+Follow-on to the consent-checkbox entry. Right after "Apply Manually" this tenant sometimes lands on the
+**Create Account** view of Workday's auth widget, with sign-in behind an "Already have an account? **Sign
+In**" link. Two facts make this dangerous, and together they produced a silent mis-fill:
+
+- **Both views render `email` + `password` inputs**, so the onboarding test `st.passwordInput ||
+  st.emailInput` ("a credential field exists ⇒ we're on the sign-in form") is NOT a view discriminator.
+  The only reliable signal is the SUBMIT marker: `signInSubmit` vs `createAccountSubmit`.
+- **The Sign In link's coordinate click was REFUSED by the cover-check**: `"Sign In tab" is covered by
+  h3#authViewTitle.css-ll0fik "Create Account" — refusing a blind click`. The widget's own heading
+  overlaps the link's click point, so `elementFromPoint` reports the h3, not the link. The refusal is
+  correct in general (it's what stops blind clicks under popups) but here it's a false positive.
+
+**Observed consequence (live):** the view never switched, the flow filled the CREATE-ACCOUNT email +
+password, then `submitAndWait`'s generic `button[type="submit"]` fallback clicked **Create Account** while
+logging `clicked "Sign In submit"` (the two canonical sign-in selectors had already `gave up` in
+rectReady). Workday answered with a validation error, `classifyAuthOutcome` read `wrong_credentials`, and
+the run "recovered" into the create-account flow BY ACCIDENT. Operator: don't do that.
+
+**Fixes (same day, background.js + cdp.js):** `onSignInView`/`onCreateView` predicates keyed on the SUBMIT
+markers; `switchAuthView(want)` clicks the canonical link, falls back to a page-side element click
+(`cdpClickAuthSwitch` — text/automation-id matched, **submit buttons explicitly excluded** so a bare
+"Create Account" text match can never press the submit, federated/chooser buttons excluded too), then
+POLLS for the target view's submit marker and reports whether the switch actually happened. The auth loop
+now switches + verifies BEFORE filling, and if the sign-in view can't be reached it goes to account
+creation DELIBERATELY (logged) instead of mislabelling one form as the other. doCreateAccount switches +
+verifies the same way. Sign-in failure → wrong_credentials → create-account is the unchanged existing path
+(the operator's "try sign in, if it doesn't work go back to create account").

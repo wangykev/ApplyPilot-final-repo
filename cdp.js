@@ -1782,6 +1782,45 @@ function cdpConsentRect() {
   return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), checked: !!checkbox.checked, inputId };
 }
 
+// AUTH VIEW SWITCH (2026-07-25, Caterpillar): Workday's auth screen renders Sign In and Create Account
+// as two views of the SAME widget, and some tenants OPEN on Create Account — sign-in is behind an
+// "Already have an account? Sign In" link. The coordinate click on that link can be REFUSED by the
+// cover-check because the widget's own heading (`h3#authViewTitle`) overlaps its click point (live:
+// "Sign In tab is covered by h3#authViewTitle 'Create Account' — refusing a blind click"), and the run
+// then filled the CREATE-ACCOUNT fields believing it was signing in. A view-switch LINK is neither a
+// submit nor a consent control, so a page-side element click is safe here — and it's the only way past
+// a false-positive cover. SUBMIT buttons are explicitly excluded (a bare "Create Account" text match
+// would otherwise hit the submit and create an account). Returns { ok, text, how }.
+function cdpClickAuthSwitch(want) {
+  const wantSignIn = want === "signin";
+  const isSubmit = (el) => {
+    const aid = (el.getAttribute && el.getAttribute("data-automation-id")) || "";
+    return /SubmitButton$/i.test(aid) || (el.getAttribute && (el.getAttribute("type") || "").toLowerCase() === "submit");
+  };
+  const cands = [];
+  const byId = document.querySelector(wantSignIn ? '[data-automation-id="signInLink"]' : '[data-automation-id="createAccountLink"]');
+  if (byId && !isSubmit(byId)) cands.push(byId);
+  const matches = (t) => wantSignIn
+    ? (/^sign in$/i.test(t) || /already have an account/i.test(t))
+    : (/^create account$/i.test(t) || /(don'?t|do not) have an account/i.test(t));
+  for (const el of Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'))) {
+    if (isSubmit(el)) continue;                                    // never the submit control
+    const t = (el.textContent || "").trim();
+    if (!t || t.length > 60) continue;
+    if (/with (google|apple|linkedin|email|sso)/i.test(t)) continue; // never a federated / chooser button
+    if (matches(t)) cands.push(el);
+  }
+  for (const el of cands) {
+    const r = el.getBoundingClientRect && el.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) continue;
+    try { el.scrollIntoView({ block: "center", behavior: "instant" }); } catch (e) {}
+    window.__apActing = (window.__apActing || 0) + 1;              // input-lock passthrough
+    try { el.click(); } catch (e) { continue; } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+    return { ok: true, text: (el.textContent || "").trim().slice(0, 60), how: el === byId ? "automation-id" : "text" };
+  }
+  return { ok: false };
+}
+
 // "Resend Account Verification" button — shown on Workday's sign-in page when the account EXISTS
 // but is UNVERIFIED (e.g. a prior run created it and never completed verification). Clicking it
 // dispatches a FRESH verification email; the original may be stale/expired. Matched by TEXT
