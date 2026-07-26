@@ -11,6 +11,7 @@ import {
   parseTexReply,
   decideTexEdits,
   decisionsToRecords,
+  enforceNoEmptyLists,
   spliceTexEdits,
   fitTexToPages,
   vocabFromTex,
@@ -153,6 +154,7 @@ export async function tailorResumeTex({
   const parsed = parseTexReply(res.text);
   if (!parsed) return { ok: false, error: "Couldn't read the AI reply (parse-failed) — try again." };
   const { decisions, reverted } = decideTexEdits(units, parsed.edits, mode, vocabFromTex(tex));
+  enforceNoEmptyLists(tex, decisions);
 
   // PAGE-FIT: measure the ORIGINAL's page count, then compile-and-revert the
   // largest-growth rewrites until the tailored document fits it. Engine absent →
