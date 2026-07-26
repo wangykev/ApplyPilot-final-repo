@@ -24,9 +24,34 @@ const bool = z
 /** ordered candidate list, most-specific first */
 const tiered = z.array(z.string()).default([]);
 
+/**
+ * A website URL is stored as a FULL absolute URL (operator, 2026-07-26): a bare "linkedin.com/in/you"
+ * is not what a form's URL field wants, and Workday's own validation rejects it. Prepends "https://"
+ * when the value carries no scheme; an explicit http:// or https:// is left alone. LOCKSTEP with the
+ * extension's ensureHttps (lib.js), which normalizes the same way at fill time — doing it here too
+ * means the value the operator SEES, the value synced to the extension, and the value filled all match.
+ */
+export function ensureHttpsUrl(url: unknown): string {
+  const t = String(url ?? "").trim();
+  if (!t) return "";
+  return /^https?:\/\//i.test(t) ? t : "https://" + t;
+}
+
+/** Does this look like a usable absolute URL? (post-normalization — for the editor's inline hint) */
+export function looksLikeUrl(url: unknown): boolean {
+  const t = ensureHttpsUrl(url);
+  if (!t) return true; // empty is not an ERROR, just unset
+  try {
+    const u = new URL(t);
+    return !!u.hostname && u.hostname.includes(".") && !/\s/.test(t);
+  } catch {
+    return false;
+  }
+}
+
 export const websiteSchema = z.object({
   type: str, // linkedin | github | portfolio | other
-  url: str,
+  url: str.transform(ensureHttpsUrl), // always stored as a full https:// URL
 });
 
 export const educationSchema = z.object({

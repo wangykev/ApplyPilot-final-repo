@@ -29,6 +29,7 @@ import {
   type TeachSource,
 } from "@/lib/teach";
 import { ensureStarterBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
+import { ensureHttpsUrl, looksLikeUrl, profileSchema } from "@/lib/profile-schema";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 const bucket = (over: Partial<Bucket>): Bucket => ({
@@ -592,4 +593,25 @@ test("default wordings: a website with no type is skipped; an operator's own wor
   const out = ensureDefaultFieldWordings(mine, profile);
   assert.equal(out.find((b) => b.profile_path === "websites.0.url"), undefined, "no type → nothing to seed");
   assert.deepEqual(out.find((b) => b.profile_path === "websites.1.url")?.questions, ["Portfolio link", "Portfolio"]);
+});
+
+// ── WEBSITE URLs are stored as FULL https:// URLs (operator, 2026-07-26) ──────────────────────
+test("website URL: bare host gains https://, an explicit scheme is left alone, empty stays empty", () => {
+  assert.equal(ensureHttpsUrl("linkedin.com/in/kevin"), "https://linkedin.com/in/kevin");
+  assert.equal(ensureHttpsUrl("  github.com/x  "), "https://github.com/x");
+  assert.equal(ensureHttpsUrl("https://x.dev"), "https://x.dev", "already full → untouched");
+  assert.equal(ensureHttpsUrl("http://x.dev"), "http://x.dev", "an explicit scheme is the operator's choice");
+  assert.equal(ensureHttpsUrl(""), "");
+  assert.equal(ensureHttpsUrl(null), "");
+});
+
+test("website URL: the profile SCHEMA normalizes on parse, so what's stored/synced/filled is the full URL", () => {
+  const p = profileSchema.parse({ websites: [{ type: "LinkedIn", url: "linkedin.com/in/kevin" }, { type: "GitHub", url: "" }] });
+  assert.equal(p.websites[0].url, "https://linkedin.com/in/kevin");
+  assert.equal(p.websites[1].url, "", "an unset URL is not invented");
+});
+
+test("website URL: looksLikeUrl flags what can't be a real URL (the editor's inline error)", () => {
+  for (const ok of ["", "linkedin.com/in/x", "https://x.dev", "sub.domain.co.uk/path?q=1"]) assert.equal(looksLikeUrl(ok), true, ok);
+  for (const bad of ["not a url", "localhost", "https://", "foo bar.com"]) assert.equal(looksLikeUrl(bad), false, bad);
 });

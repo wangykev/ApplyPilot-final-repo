@@ -48,6 +48,8 @@ import {
   certificationSchema,
   specialtySchema,
   additionalFileSchema,
+  ensureHttpsUrl,
+  looksLikeUrl,
 } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
 
@@ -243,7 +245,17 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               >
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   <TextField label="Type" value={w.type} disabled={locked} placeholder="Portfolio, Twitter…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
-                  <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
+                  <TextField
+                    label={w.type ? `${w.type} URL` : "URL"}
+                    bucketPath={`websites.${i}.url`}
+                    value={w.url}
+                    placeholder="https://…"
+                    hint="Full URL"
+                    onChange={(v) => update((p) => { p.websites[i].url = v; })}
+                    // Normalize on BLUR (not per keystroke): "linkedin.com/in/you" → "https://linkedin.com/in/you".
+                    onBlur={() => update((p) => { p.websites[i].url = ensureHttpsUrl(p.websites[i].url); })}
+                    error={looksLikeUrl(w.url) ? null : "Enter a full URL, e.g. https://linkedin.com/in/you"}
+                  />
                 </div>
               </EntryCard>
             );
