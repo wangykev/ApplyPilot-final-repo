@@ -1806,7 +1806,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   if (preTierIndex === 0) {
     return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled chip is already the top candidate — kept (no actuation)" };
   }
-  const overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
+  let overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
   const isOverwrite = priorChips.length > 0;          // a pre-fill we're trying to replace/upgrade (tier-0 KEEP already returned)
   const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
   const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
@@ -1870,6 +1870,35 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     await act.openHier(loc);
     await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
     capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
+    // PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25). The start-scrape already enumerated the widget's
+    // WHOLE option list, so typing a candidate just to learn it isn't offered is pure waste — live, FoS
+    // burned ~540ms proving "Electrical and Computer Engineering" was absent before typing the one that
+    // was there. Match the candidates against the scraped list ONCE:
+    //   • a candidate matches → start the loop AT that candidate (the known-absent ones are skipped)
+    //   • none match (and this is a normal fill, not a tier-upgrade) → skip the type/Enter walk entirely;
+    //     an empty candidate list flows to the SAME genuine-no-match end the walk would reach, so the
+    //     inline AI rescue (which picks from this very list) runs exactly as before.
+    // GATED on a COMPLETE scrape (reached the bottom, not capped): a partial list can't prove absence.
+    // Matching uses the directed-pick ladder ({containment:false}) — a containment-only "match" is NOT
+    // treated as present, so Workday's own autocommit recognition (the one containment we trust) still
+    // gets its chance by typing. CAVEAT: a server-search typeahead whose on-open list is only a subset
+    // would report "complete" for that subset; the cost there is an AI rescue (flagged for review)
+    // instead of a deterministic fill — never a wrong value.
+    if (capturedFull && capturedFull.scrapeComplete && overwriteCandidates.length) {
+      const pm = apMatch.matchCandidates(overwriteCandidates, capturedFull, { containment: false });
+      if (pm.targetIndex !== -1 && pm.matchedCandidate != null) {
+        const at = overwriteCandidates.findIndex((c) => String(c) === String(pm.matchedCandidate));
+        if (at > 0) {
+          trace.push({ candidate: "(pre-scrape match)", outcome: "short-circuit",
+            note: `skipped ${at} candidate(s) absent from the scraped ${capturedFull.length}-option list` });
+          overwriteCandidates = overwriteCandidates.slice(at);
+        }
+      } else if (preTierIndex === -1) { // normal fill only — a tier-UPGRADE walk keeps its keep-the-prefill semantics
+        trace.push({ candidate: "(pre-scrape match)", outcome: "short-circuit",
+          note: `no candidate appears in the scraped ${capturedFull.length}-option list (complete) — skipped the type/Enter walk` });
+        overwriteCandidates = [];
+      }
+    }
   }
   for (const [ci, cand] of overwriteCandidates.entries()) {
     const step = { candidate: cand };
@@ -2590,7 +2619,14 @@ function makeStartCapture(act, loc) {
     if (cats && cats.length) return null; // TREE → no start-scrape (the drill self-scrapes only on a no-match)
     try {
       const sc = act.scrapeTaOptions ? await act.scrapeTaOptions(loc) : null;
-      if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { reviewOpts = sc.options.slice(); return reviewOpts; }
+      if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) {
+        reviewOpts = sc.options.slice();
+        // Mark whether the scrape enumerated the WHOLE list (reached the bottom, not capped out). Only a
+        // COMPLETE list can support a NEGATIVE conclusion ("this candidate isn't offered") without typing.
+        // Non-enumerable so the array still deep-equals a plain option list for callers/tests.
+        try { Object.defineProperty(reviewOpts, "scrapeComplete", { value: !!sc.atBottom && !sc.cappedOut, enumerable: false }); } catch (e) { /* ignore */ }
+        return reviewOpts;
+      }
     } catch (e) { /* best-effort — the flat AI falls back to the last filtered set */ }
     return null;
   };
@@ -3101,6 +3137,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     if (f.widgetType === "checkbox_group" && !(Array.isArray(record.options) && record.options.length)
         && Array.isArray(f.groupOptions) && f.groupOptions.length) {
       record.options = f.groupOptions.map((o) => o.labelText).filter(Boolean);
+    }
+    // A FLAT date composite carries the form's own segment ORDER + granularity (MM/DD/YYYY vs MM/YYYY
+    // vs YYYY) so the review renders segmented inputs that match the form — section dates already did
+    // this via fillEntryCdp; flat ones classified as "unknown" until 2026-07-25 (Caterpillar self-ID).
+    if (f.widgetType === "date" && Array.isArray(f.dateSegments) && f.dateSegments.length) {
+      const ord = dateOrderOf(f.dateSegments);
+      if (ord.length) record.date_order = ord;
     }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
     results.push(record);
@@ -4405,6 +4448,35 @@ async function sweepAlreadyFilled(act, results) {
       }
     }
   }
+  // ORPHAN CHECKBOXES (2026-07-25) — a consent checkbox rendered OUTSIDE any `formField-*` wrapper is
+  // invisible to the page scan, so it never reached the records at all (live: Caterpillar's page-1
+  // SMS/marketing consent, revealed by the phone number; the create-account consent needed its own
+  // finder for the same reason). Inventory them READ-ONLY at the end of the page so the review shows
+  // everything the form holds. The bot does NOT tick them: an optional consent — especially a marketing
+  // one — is the operator's call, and it's recorded UNCHECKED with its full text.
+  if (act.scanOrphanCheckboxes) {
+    let orphans = null;
+    try { orphans = await act.scanOrphanCheckboxes(); } catch (e) { orphans = null; }
+    for (const o of (orphans || [])) {
+      if (!o || !o.label) continue;
+      const fieldName = "consent." + o.key;
+      if (results.some((r) => r.fieldName === fieldName)) continue;
+      results.push({
+        fieldName, label: o.label, widgetType: "checkbox", isRequired: !!o.required,
+        mappedPath: null, rawValue: null, resolved: null,
+        // Unchecked + optional = the correct resting state, but the operator should SEE it → review it.
+        // Already checked (tenant default) → surfaced as-is, also for review.
+        status: o.checked ? "filled_review" : "needs_review",
+        matchTier: null, confidence: null, flag: "consent-checkbox", verified: null,
+        after: String(!!o.checked),
+        detail: o.checked
+          ? "consent checkbox OUTSIDE the form's field set — already checked on the page; verify you want it"
+          : "consent checkbox OUTSIDE the form's field set — left UNCHECKED by ApplyPilot (an optional consent is yours to give); tick it in review if you want it",
+        auditLoc: o.selector || null
+      });
+    }
+  }
+
   // NESTED records (cert ▸ specialties) — the scans above can't join them by ordinal (Workday's
   // internal counters), but every nested record carries its PROBED auditLoc: re-read any STILL-
   // skipped one at end-of-page so a value typed/committed after the section filled is never missed.

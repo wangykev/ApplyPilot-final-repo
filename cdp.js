@@ -858,6 +858,12 @@ function cdpPageScan() {
     // the operator had to UNCHECK the current one to change it). Previously fell through to "unknown",
     // which the review editor renders as a bare TEXTBOX. Radio-like, so it gets radio-like handling.
     if (wrapper.querySelectorAll('input[type="checkbox"]').length > 1) return "checkbox_group";
+    // DATE composite (2026-07-25): Workday renders a date as 2–3 `dateSection*-input` spinbuttons in a
+    // `dateInputWrapper`. Those inputs have NO type attribute, so they counted as "text-like" — three of
+    // them meant textLike.length !== 1 and the field fell through to "unknown", i.e. a bare TEXTBOX in
+    // review with no idea whether the form wants MM/YYYY or MM/DD/YYYY (live: Caterpillar's self-ID
+    // "Date"). The segment ids also give the ORDER + granularity, carried as dateSegments below.
+    if (wrapper.querySelector('[data-automation-id^="dateSection"][data-automation-id$="-input"]')) return "date";
     const textLike = Array.from(wrapper.querySelectorAll("input")).filter((el) => {
       const t = (el.getAttribute("type") || "").toLowerCase();
       return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
@@ -959,6 +965,13 @@ function cdpPageScan() {
         value: valueOf(w, wt),
         domIndex: domPos.get(w)
       };
+      // Date segment ids in DOM order ("dateSectionMonth-input", "dateSectionDay-input", …) → the
+      // review renders the form's OWN granularity/order (MM/DD/YYYY vs MM/YYYY vs YYYY), not a locale
+      // date picker. Same shape cdpRepeatingScan already returns for section dates.
+      if (wt === "date") {
+        d.dateSegments = Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]'))
+          .map((n) => n.getAttribute("data-automation-id")).filter(Boolean);
+      }
       // A checkbox GROUP carries its option labels straight from the DOM — READ-ONLY, no open/actuation
       // needed (unlike a dropdown), so the review editor can render a real picker even when the field is
       // left BLANK (an optional EEO/self-ID question the bot must never answer — the operator picks).
@@ -2126,6 +2139,46 @@ function cdpReadRadioState(wrapperSel) {
     const lab = input.id ? document.querySelector('label[for="' + input.id + '"]') : null;
     return { id: input.id, labelText: lab ? lab.textContent.trim() : "", checked: input.checked };
   });
+}
+
+// ORPHAN CHECKBOXES (2026-07-25) — checkboxes that live OUTSIDE any `formField-*` wrapper, so the page
+// scan (which only walks formField wrappers) cannot see them at all. Caterpillar's page-1 SMS/marketing
+// consent is one: revealed by the phone number, never in the records. The create-account consent needed
+// its own finder (cdpConsentRect) for exactly this reason. READ-ONLY inventory for the review summary —
+// the bot never checks these (an optional consent is the operator's call; this only makes it VISIBLE).
+// Each gets a stable-ish key from its id/name/aria-label so re-runs merge instead of duplicating.
+function cdpScanOrphanCheckboxes() {
+  const out = [];
+  const seen = new Set();
+  for (const cb of Array.from(document.querySelectorAll('input[type="checkbox"]'))) {
+    if (cb.closest('[data-automation-id^="formField-"]')) continue;      // the normal scan owns these
+    if (cb.closest("[data-fkit-id]")) {
+      const f = cb.closest("[data-fkit-id]").getAttribute("data-fkit-id") || "";
+      if (/-\d+--/.test(f)) continue;                                    // inside a repeating entry — its section owns it
+    }
+    const r = cb.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) continue;                   // not rendered → not on the page for the operator either
+    const lab = cb.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id) + '"]') : null;
+    const wrapLab = cb.closest("label");
+    let text = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || cb.getAttribute("aria-label") || "").trim();
+    if (!text) { // fall back to the nearest SMALL ancestor's own text (a long consent paragraph is fine — it IS the label)
+      let el = cb.parentElement;
+      for (let i = 0; i < 4 && el; i++) { const t = (el.textContent || "").trim(); if (t) { text = t; break; } el = el.parentElement; }
+    }
+    if (!text) continue;                                                 // unlabeled → nothing meaningful to show in review
+    const key = cb.id || cb.getAttribute("name") || ("orphanCheckbox_" + out.length);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // A selector that re-resolves: prefer the id, else the automation-id, else an indexed fallback.
+    const sel = cb.id ? ('input[type="checkbox"]#' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id))
+      : (cb.getAttribute("data-automation-id") ? 'input[data-automation-id="' + cb.getAttribute("data-automation-id") + '"]' : null);
+    out.push({
+      key, inputId: cb.id || null, selector: sel, checked: !!cb.checked,
+      required: cb.getAttribute("aria-required") === "true" || cb.required === true,
+      label: text.replace(/\s+/g, " ").slice(0, 400)
+    });
+  }
+  return out;
 }
 
 // CHECKBOX GROUP (2026-07-25) — the same shape cdpReadRadioState returns, over `input[type=checkbox]`
@@ -3352,6 +3405,7 @@ function makeCdpActuation(llmConfig) {
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
     readCheckboxGroup: (loc) => cdpEval(cdpReadCheckboxGroupState, loc.wrapperSel), // pick-one checkbox set (self-ID); clickRadioLabel commits by label id
+    scanOrphanCheckboxes: () => cdpEval(cdpScanOrphanCheckboxes), // consents rendered OUTSIDE any formField wrapper (read-only inventory for review)
     // Blur whatever the fill last focused (2026-07-25, operator): some tenants only COMMIT a text field —
     // and fire the cascade it triggers — on BLUR, and the fill leaves focus INSIDE the last field it typed
     // (Caterpillar's SMS-consent checkbox is revealed by the phone number and never appeared while the

@@ -2440,3 +2440,28 @@ section-by-section, so a flat field sitting BETWEEN two repeating sections rende
 bundle's entry array is the render order in both viewers, so `orderResultsByDom` now sorts records by
 the wrapper's document position (a section takes the position of its FIRST field; unpositioned records
 inherit their neighbour's key; stable, so fill order within a section is untouched).
+
+## 2026-07-25 (b) — Caterpillar DOM captures: school typeahead, self-ID date, and the orphan SMS consent
+
+Operator-supplied DOM for three fields on the cat.wd5/solarturbines flow:
+
+- **Education school = `formField-school` + `data-fkit-id="education-484--school"`, a MULTISELECT
+  typeahead** (`data-uxi-widget-type="multiselect"`, chips in `selectedItemList`). Confirms both halves
+  of the earlier fix: the automation-id is `school` (now an explicit `altFields` entry, so the label
+  fallback isn't even needed) and the widget is a typeahead where Magna renders a text box (the
+  widget-adaptive fill handles it). Its committed chip is a `promptOption` inside a `selectedItem` `li`.
+- **The self-ID date is `data-automation-id="dateInputWrapper"` with three `dateSection{Month,Day,Year}`
+  spinbuttons** (`-display` shows the MM / DD / YYYY placeholders; `-input` holds the value). The FLAT
+  `classify` had NO date branch at all — those inputs carry no `type` attribute, so three of them made
+  `textLike.length !== 1` and the field fell through to **`unknown`** → a bare textbox in review with no
+  granularity. Now classified `date`, and the scan carries `dateSegments` so the review renders the
+  form's OWN order/granularity (MM/DD/YYYY here, MM/YYYY or YYYY elsewhere) — the same `date_order`
+  section dates already had. Unmapped flat dates stay unfilled (the operator fills in review; the date
+  replay path fills them at submit).
+- **The page-1 SMS/marketing consent checkbox is NOT inside any `formField-*` wrapper** — which is why
+  it never appeared in the records regardless of cascade timing or the blur fix (the page scan only
+  walks formField wrappers; the create-account consent needed its own finder for the same reason). New
+  READ-ONLY `cdpScanOrphanCheckboxes` inventories rendered checkboxes outside the field set (skipping
+  anything inside a repeating entry), and they surface as `consent.<key>` records flagged
+  `consent-checkbox`, **left UNCHECKED** — an optional consent, especially a marketing one, is the
+  operator's to give; the record just makes it visible with its full text.

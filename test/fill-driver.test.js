@@ -412,7 +412,7 @@ function makeFakeAct(fields, opts) {
       if (f && f.dropsFocusOnScrape) f._focusedSb = false;
       if (!f || f.scrapeFails) return { ok: false, error: "no wrapper" };
       const options = (f.scrapeOptions || []).slice();
-      return { ok: true, options, count: options.length, atBottom: true };
+      return { ok: true, options, count: options.length, atBottom: !f.scrapeNotAtBottom, cappedOut: !!f.scrapeCappedOut };
     },
     // Trusted-click commit fallback. Default: commits the named option (trusted
     // clicks work); flags: clickCommitFails (dispatched, page ignores it),
@@ -2792,6 +2792,77 @@ test("review order: no scan positions ⇒ order is left exactly as produced (nev
   const results = [{ fieldName: "a" }, { fieldName: "b" }, { fieldName: "c" }];
   orderResultsByDom(results, [], {});
   assert.deepStrictEqual(results.map((r) => r.fieldName), ["a", "b", "c"]);
+});
+
+// ── PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25) ────────────────────────────────────────────
+// The start-scrape already has the widget's whole option list, so a candidate that provably isn't in
+// it must NOT be typed just to discover that. Gated on a COMPLETE scrape (atBottom, not capped).
+test("typeahead short-circuit: candidates ABSENT from the complete scraped list are never typed", async () => {
+  const act = makeFakeAct([taField({
+    scrapeOptions: ["Accounting", "Biology", "Electrical Engineering"],
+    filterMap: { "Electrical Engineering": { autoCommit: "Electrical Engineering" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Electrical Engineering"]), {}, {}, T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["Electrical Engineering"], "only the candidate that IS in the list was typed");
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Electrical Engineering");
+});
+
+test("typeahead short-circuit: NO candidate in the complete list → zero typing, straight to the AI rescue", async () => {
+  const act = makeFakeAct([taField({
+    isRequired: true,
+    scrapeOptions: ["Accounting", "Biology"],
+    filterMap: { "Biology": { autoCommit: "Biology" } }
+  })], { aiEnabled: true, ai: '{"choice":"Biology","represented":true,"confidence":"High"}' });
+  const out = await drivePageFill(act, taProfile(["Underwater Basket Weaving"]), {}, {}, T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
+  assert.ok(!typed.includes("Underwater Basket Weaving"), "the absent candidate was never typed");
+  assert.ok(act.log.some(([m]) => m === "llm"), "went straight to the AI rescue");
+  assert.strictEqual(out.results[0].status, "filled_review");
+  assert.strictEqual(out.results[0].after, "Biology");
+});
+
+test("typeahead short-circuit: an INCOMPLETE scrape (never reached the bottom) still walks the FULL ladder", async () => {
+  // A partial list cannot prove absence — the candidate must still be typed (the server may filter to it).
+  const act = makeFakeAct([taField({
+    scrapeNotAtBottom: true,
+    scrapeOptions: ["Accounting", "Biology"],
+    filterMap: { "Zoology": { autoCommit: "Zoology" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Zoology"]), {}, {}, T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["Zoology"], "typed despite being absent from the PARTIAL scrape");
+  assert.strictEqual(out.results[0].status, "filled", "and it committed — no regression on server-filtered lists");
+});
+
+// ── ORPHAN CONSENT CHECKBOX (outside any formField wrapper) — Caterpillar's page-1 SMS consent ──
+test("orphan consent checkbox: inventoried for review, left UNCHECKED, zero actuation", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  const SMS = "I consent to receive periodic automated text messages … I understand that my consent is not required.";
+  act.scanOrphanCheckboxes = async () => [{ key: "smsConsent", inputId: "smsConsent", selector: "input#smsConsent", checked: false, required: false, label: SMS }];
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "consent.smsConsent");
+  assert.ok(rec, "the orphan consent checkbox reaches the review records");
+  assert.strictEqual(rec.flag, "consent-checkbox");
+  assert.strictEqual(rec.after, "false", "left UNCHECKED — an optional consent is the operator's to give");
+  assert.strictEqual(rec.label, SMS);
+  assert.ok(!act.log.some(([m]) => m === "clickCheckboxLabel"), "never actuated");
+});
+
+test("orphan consent checkbox: one ALREADY checked by the tenant is surfaced for verification, not silently kept", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  act.scanOrphanCheckboxes = async () => [{ key: "marketing", checked: true, required: false, label: "Send me marketing emails" }];
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "consent.marketing");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.after, "true");
+});
+
+test("orphan consent checkbox: absent substrate / none on the page ⇒ no records (inert)", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.flag === "consent-checkbox"));
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {

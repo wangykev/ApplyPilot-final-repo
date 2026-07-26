@@ -4439,6 +4439,9 @@ async function fillEngine(profile, defaults, jobContext) {
     // for it (the CDP path does), so it records as an unhandled type — same as today's "unknown",
     // but honestly typed so the review editor renders a picker instead of a textbox.
     if (wrapper.querySelectorAll('input[type="checkbox"]').length > 1) return "checkbox_group";
+    // 5c. DATE composite — `dateSection*-input` spinbuttons (no type attr, so they'd count as
+    // text-like and fall to "unknown"). LOCKSTEP with cdp.js cdpPageScan.classify.
+    if (wrapper.querySelector('[data-automation-id^="dateSection"][data-automation-id$="-input"]')) return "date";
     // 6. Text — exactly one text-like input.
     const textLike = Array.from(wrapper.querySelectorAll("input")).filter((el) => {
       const t = (el.getAttribute("type") || "").toLowerCase();
