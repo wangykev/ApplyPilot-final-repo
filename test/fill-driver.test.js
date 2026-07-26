@@ -6739,6 +6739,31 @@ test("M1 cascade: a field REVEALED after a value commits is filled + tagged casc
   assert.strictEqual(out.results.filter((r) => r.fieldName === "city").length, 1, "filled exactly once (only-NEW-keys, no re-trigger)");
 });
 
+test("M1 cascade LATE reveal: a field that mounts only AFTER the audit is still caught (the post-audit pass)", async () => {
+  // Live (Solar Turbines): the LAST field filled has nothing running after it, so its reveal — an
+  // SMS-consent checkbox revealed by the phone number — was still rendering when the first cascade pass
+  // ran, and it never entered the records. The post-capture/post-audit pass catches it for the price of
+  // one read-only scanPage. Here the reveal is gated on the AUDIT having run (readAuditRaw / the audit's
+  // re-read), i.e. strictly later than the first cascade pass.
+  const fields = [{ wrapperSel: "[w-phone]", fieldName: "phoneNumber", widgetType: "text", value: "" }];
+  const late = { wrapperSel: "[w-sms]", fieldName: "city", widgetType: "text", value: "", isRequired: true };
+  const act = makeFakeAct(fields);
+  const baseScan = act.scanPage;
+  let auditRan = false;
+  const baseRead = act.readTextValue;
+  act.readTextValue = async (loc, tag) => { if (fields[0].value) auditRan = true; return baseRead(loc, tag); }; // the audit re-reads the filled field
+  act.scanPage = async () => {
+    if (auditRan && !fields.some((f) => f.fieldName === "city")) fields.push(late); // mounts only after the audit's re-read
+    return baseScan();
+  };
+  const out = await drivePageFill(act, { personal_info: { phone_number: "850-666-0266", city: "London" } }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 3 });
+  const rec = out.results.find((r) => r.fieldName === "city");
+  assert.ok(rec, "the LATE-revealed field is recorded (would have been missed by the single pre-audit pass)");
+  assert.strictEqual(rec.cascadeRevealed, true);
+  assert.strictEqual(rec.after, "London");
+  assert.strictEqual(out.results.filter((r) => r.fieldName === "city").length, 1, "filled exactly once across both passes");
+});
+
 test("M1 cascade: a page that reveals a NEW field on every scan TERMINATES (round cap) and never re-fills a field", async () => {
   const fields = [{ wrapperSel: "[w0]", fieldName: "legalName--firstName", widgetType: "text", value: "" }];
   const act = makeFakeAct(fields);

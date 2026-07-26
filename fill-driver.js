@@ -3252,15 +3252,25 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // field, so by here the reveal is usually already mounted; the loop re-scans after each
   // fill round to catch a chained reveal, bounded by maxCascadeRounds. SKIPPED under `only`
   // (a targeted re-fill never needs to cascade — same gate as the fold/audit above).
-  if (!targeted) {
-    const seen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+  // SECOND CHECK, FREE (2026-07-25, Solar Turbines): the LAST field filled has nothing running after it,
+  // so its reveal is still MID-RENDER when this pass fires — live, an SMS-consent checkbox revealed by
+  // the phone number never entered the records at all (it mounted moments later, and it REFLOWED the
+  // footer, which is what the stale-rect cover-check then misread). Rather than add a fixed wait to
+  // EVERY page (the thing the speed round removed), `cascadePass` is called TWICE: here, and again AFTER
+  // the option capture + the M40 audit — which together already spend ~1s of real wall-clock settle. The
+  // second call costs ONE read-only scanPage when nothing appeared (tens of ms) and only pays a fill if
+  // something did. A tenant that reveals even later still surfaces the honest way: the field blocks Save
+  // & Continue → nav-timeout diagnostics + AI-4 remediation.
+  const cascadeSeen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+  const cascadePass = async () => {
+    if (targeted) return;
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
       let reFields;
       try { reFields = (await act.scanPage()).fields || []; } catch (e) { break; } // re-scan blip → stop (non-fatal)
-      const revealed = reFields.filter((f) => !seen.has(f.fieldName));
+      const revealed = reFields.filter((f) => !cascadeSeen.has(f.fieldName));
       if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
-      revealed.forEach((f) => seen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
+      revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
       try {
         const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames });
         for (const r of (sub && sub.results) || []) {
@@ -3270,7 +3280,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         }
       } catch (e) { /* a revealed-field fill threw → don't abort the whole page; next round / honest miss */ }
     }
-  }
+  };
+  await cascadePass();
   markPhase("cascade", _phaseT0); _phaseT0 = Date.now();
 
   // ── CASCADE-REMOVED reconciliation ── a field present in the UP-FRONT scan but now GONE
@@ -3328,6 +3339,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
   markPhase("audit", _phaseT0); _phaseT0 = Date.now();
+  // LATE-REVEAL catch (see cascadePass): the capture + audit above just spent ~1s of REAL settle, so a
+  // field that was still rendering when the first pass ran (the last-filled field's reveal — live: an
+  // SMS-consent checkbox after the phone number) is mounted by now. Costs one read-only scanPage when
+  // nothing appeared. A field filled here is NOT in the audit snapshot (that already ran) — it keeps its
+  // own per-widget read-back verification, and the sweep below still inventories it.
+  await cascadePass();
+  markPhase("cascade-late", _phaseT0); _phaseT0 = Date.now();
 
   // ── ALREADY-FILLED sweep — the LAST pass before the bundle (source-of-truth ordering) ── the
   // review must inventory EVERYTHING the page holds at the moment Save & Continue is clicked: a

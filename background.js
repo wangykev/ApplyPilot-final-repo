@@ -2248,7 +2248,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${s(r.elapsedMs)}`).join(", ");
     let pacing = "?"; try { pacing = await cdpPacingLabel(); } catch (e) { /* label only */ }
-    LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
+    LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)}+${s(ph["cascade-late"])} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
   }
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
