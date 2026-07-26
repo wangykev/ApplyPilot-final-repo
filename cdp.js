@@ -1711,16 +1711,21 @@ function cdpOnboardScan() {
 // clickPageNext's inline check): is the top element at (cx,cy) the target button (or
 // in its subtree)? If not, a coordinate click would be SWALLOWED by an overlay — return
 // what's covering it so the caller can auto-dismiss (cdpFindDismissControl) or halt.
+// STACK WALK (2026-07-25): walk the whole elementsFromPoint stack top-down and refuse only on an
+// element that would REALLY swallow the click. Transparent-to-clicks, in order of how they bit us:
+//   • Workday's own `click_filter` — a transparent overlay it puts on buttons to CAPTURE clicks; it IS
+//     the intended click surface (PANW Sign In, 2026-07-09).
+//   • `pointer-events: none` — paints but never receives the click.
+//   • A shadow HOST whose shadow tree paints NOTHING at this point: elementFromPoint returns the HOST
+//     for any point inside its box, so a full-width/!!invisible host (an extension's container) looked
+//     like a cover everywhere. Descend via shadowRoot.elementFromPoint; nothing there ⇒ not blocking.
+//   • The target itself, its ancestors, or its descendants.
+// Reaching the target with only transparent things above ⇒ clear. Nothing opaque AND the target never
+// appears (a stale rect after a reflow) ⇒ also clear: refusing there halted on a phantom (see
+// clickPageNext's re-measure), and a click into empty space is harmless — the nav-wait gates it.
 function cdpCoverCheck(selector, cx, cy) {
   const btn = document.querySelector(selector);
-  const top = document.elementFromPoint(cx, cy);
-  if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
-  // Workday's own `click_filter` is a TRANSPARENT overlay it renders on top of buttons to CAPTURE
-  // clicks — it IS the intended click surface, not an obstruction (a coordinate click on it activates
-  // the button underneath). elementFromPoint returns it instead of the button, which looked like a
-  // "cover" and made the click refuse (live: PANW Sign In submit, 2026-07-09). Treat it as clear.
-  const aid = top.getAttribute && top.getAttribute("data-automation-id");
-  if (aid === "click_filter" || (top.closest && top.closest('[data-automation-id="click_filter"]'))) return { blocked: false };
+  if (!btn) return { blocked: false };
   const desc = (el) => {
     const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
     if (el.id) p.push("#" + el.id);
@@ -1731,7 +1736,28 @@ function cdpCoverCheck(selector, cx, cy) {
     const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
     return p.join("") + (txt ? ' "' + txt + '"' : "");
   };
-  return { blocked: true, by: desc(top) };
+  const isTarget = (el) => el === btn || btn.contains(el) || el.contains(btn);
+  const seeThrough = (el) => {
+    const aid = el.getAttribute && el.getAttribute("data-automation-id");
+    if (aid === "click_filter" || (el.closest && el.closest('[data-automation-id="click_filter"]'))) return true;
+    let cs = null; try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
+    if (cs && cs.pointerEvents === "none") return true;
+    if (el.shadowRoot && el.shadowRoot.elementFromPoint) {
+      const inner = el.shadowRoot.elementFromPoint(cx, cy);
+      if (!inner) return true;                                  // the shadow tree paints nothing here
+      let ics = null; try { ics = window.getComputedStyle(inner); } catch (e) { ics = null; }
+      if (ics && ics.pointerEvents === "none") return true;
+    }
+    return false;
+  };
+  const stack = document.elementsFromPoint
+    ? Array.from(document.elementsFromPoint(cx, cy))
+    : [document.elementFromPoint(cx, cy)].filter(Boolean);
+  for (const el of stack) {
+    if (isTarget(el)) return { blocked: false };                // reached the target — only transparent things above it
+    if (!seeThrough(el)) return { blocked: true, by: desc(el) };
+  }
+  return { blocked: false };                                    // nothing opaque anywhere in the stack
 }
 
 // Create-account CONSENT control (workday.py two strategies): the explicit
@@ -3289,31 +3315,32 @@ function makeCdpActuation(llmConfig) {
     // Guarded Save & Continue. REFUSE on the review page (the footer button is
     // Submit there — the double-guard). cdpRectReady (M29) absorbs a transient 0-rect.
     clickPageNext: async () => {
+      const SEL = '[data-automation-id="pageFooterNextButton"]';
       const reviewPresent = await cdpEval(() => !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'));
       if (reviewPresent) return { clicked: false, refused: "review-page" };
-      const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
+      // A popup/overlay (the Simplify extension's dialog, a cookie banner, a modal) can sit OVER Save &
+      // Continue: a coordinate click would land on the popup and be SWALLOWED — the page never advances
+      // and it surfaces as a bare nav-timeout. So cover-check the button's center first and refuse with a
+      // diagnostic that NAMES the blocker rather than clicking blindly.
+      // MEASURE + CHECK TOGETHER, RE-MEASURING each round (2026-07-25, Solar Turbines): the rect and the
+      // cover test must describe the SAME layout. A field revealed by an earlier fill — Caterpillar mounts
+      // an SMS-consent checkbox after the phone number — REFLOWS the footer DOWNWARD, so a rect taken a
+      // moment earlier is stale and elementFromPoint reports whatever now sits at the old point (live: a
+      // floating extension widget). The old code never re-measured, so it halted blaming an overlay that
+      // was never on the button. Re-probing also lets a genuinely-animating overlay settle.
+      const probe = async () => {
+        const r = await cdpRectReady(SEL, true);
+        if (!r) return { rect: null, cover: null };
+        return { rect: r, cover: await cdpEval(cdpCoverCheck, SEL, r.cx, r.cy) };
+      };
+      let { rect, cover } = await probe();
       if (!rect) return { clicked: false, refused: "no-button" };
-      // A popup/overlay (e.g. the Simplify extension's dialog, a cookie banner, a modal) can sit OVER the
-      // Save & Continue button. A coordinate click would land on the popup and be SWALLOWED — the page never
-      // advances and it surfaces as a bare nav-timeout. So elementFromPoint the button's center first: the
-      // top node there must BE the button (or in its subtree). If something else covers it, refuse with a
-      // diagnostic that NAMES the blocker instead of clicking blindly.
-      const cover = await cdpEval((cx, cy) => {
-        const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]');
-        const top = document.elementFromPoint(cx, cy);
-        if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
-        const desc = (el) => {
-          const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
-          if (el.id) p.push("#" + el.id);
-          const aid = el.getAttribute && el.getAttribute("data-automation-id");
-          if (aid) p.push('[data-automation-id="' + aid + '"]');
-          const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
-          if (cls) p.push("." + cls);
-          const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
-          return p.join("") + (txt ? ' "' + txt + '"' : "");
-        };
-        return { blocked: true, by: desc(top) };
-      }, rect.cx, rect.cy);
+      for (let i = 0; i < 3 && cover && cover.blocked; i++) { // reflow/animation settle before believing it
+        await cdpDelay(250);
+        const p = await probe();
+        if (!p.rect) break;
+        rect = p.rect; cover = p.cover;
+      }
       if (cover && cover.blocked) {
         // Best-effort auto-dismiss (operator opted in 2026-07-06): try ONCE to click a clearly-dismissive
         // control (X/Close/No-thanks — never Accept/OK) inside the popup, incl. Simplify's shadow-DOM overlay,
@@ -3322,13 +3349,14 @@ function makeCdpActuation(llmConfig) {
         if (d && d.found) {
           console.log("[ApplyPilot][CDP] Save & Continue covered by", cover.by, "— clicking its dismiss control:", JSON.stringify(d.label));
           await cdpClickAt(d.cx, d.cy);
-          const coverGone = async () => cdpEval((cx, cy) => {
-            const b = document.querySelector('[data-automation-id="pageFooterNextButton"]');
-            const t = document.elementFromPoint(cx, cy);
-            return !b || !t || t === b || b.contains(t) || t.contains(b);
-          }, rect.cx, rect.cy);
           let clear = false;
-          for (let i = 0; i < 5 && !clear; i++) { await cdpDelay(300); clear = await coverGone(); } // let it animate out
+          for (let i = 0; i < 5 && !clear; i++) { // let it animate out — RE-MEASURING each poll (the button may also have moved)
+            await cdpDelay(300);
+            const p = await probe();
+            if (!p.rect) continue;
+            rect = p.rect;
+            clear = !(p.cover && p.cover.blocked);
+          }
           if (clear) {
             console.log("[ApplyPilot][CDP] popup dismissed — Save & Continue is now clickable.");
             await cdpClickAt(rect.cx, rect.cy);

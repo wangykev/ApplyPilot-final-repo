@@ -2377,3 +2377,36 @@ now switches + verifies BEFORE filling, and if the sign-in view can't be reached
 creation DELIBERATELY (logged) instead of mislabelling one form as the other. doCreateAccount switches +
 verifies the same way. Sign-in failure → wrong_credentials → create-account is the unchanged existing path
 (the operator's "try sign in, if it doesn't work go back to create account").
+
+## 2026-07-25 — Solar Turbines: a phone-triggered SMS-consent checkbox REFLOWS the footer (and the stale-rect cover-check blamed an extension overlay)
+
+Page 1 filled clean (13/14, audits matched) and then HALTED: `Save & Continue covered by
+div.simplify-jobs-shadow-root — clicking its dismiss control: "Minimize"` → `auto-dismiss clicked
+"Minimize" but the button is STILL covered — halting`. The overlay was NOT on the button. What actually
+happened:
+
+- **A consent checkbox mounts AFTER the phone number is filled** — a long SMS/marketing consent ("I
+  consent to receive periodic automated text messages … I understand that my consent is not required.
+  Reply STOP …" + a Terms and Conditions link). It is **cascade-revealed by the phone field** and it
+  **pushes Save & Continue DOWNWARD**.
+- **`clickPageNext` measured the footer rect once, then re-checked the cover at those SAME stale
+  coordinates** (the post-dismiss `coverGone()` closure captured `rect.cx/cy`). After the reflow, that
+  point no longer sat on the button — it sat on the floating extension widget — so the re-check could
+  never clear and the walk halted naming the wrong culprit.
+- Secondary: `document.elementFromPoint` returns the shadow **HOST** for any point inside its box, so an
+  extension container that paints nothing at that point still reads as a cover.
+
+**Fixes (same day, cdp.js):** (1) `clickPageNext` now RE-MEASURES the button (scroll + rect) on every
+cover round — an initial-settle loop (3 × 250ms) before believing any cover, and a fresh probe inside the
+post-dismiss poll — so the rect and the cover test always describe the same layout; (2) `cdpCoverCheck`
+walks the whole `elementsFromPoint` stack and treats as see-through: Workday's `click_filter`,
+`pointer-events:none` elements, and a shadow HOST whose `shadowRoot.elementFromPoint` finds nothing at
+that point; reaching the target with only see-through things above ⇒ clear, and a stack with nothing
+opaque ⇒ clear (a stale rect must not halt the walk).
+
+**Open (needs a devtools capture on the next probe):** the SMS-consent checkbox did NOT appear in the
+page-1 records at all — so it is either mounted after the cascade re-scan rounds or is not inside a
+`formField-*` wrapper. It is OPTIONAL ("consent is not required"), and the optional-unmapped-checkbox rule
+correctly leaves it UNCHECKED (never auto-consent to marketing SMS) — but it should still be inventoried
+in the review bundle. Capture its wrapper/automation-id to decide whether the cascade scan needs a longer
+reveal window or the field lives outside the scanned shape.
