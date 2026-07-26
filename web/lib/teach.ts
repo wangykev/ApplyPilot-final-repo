@@ -1,4 +1,5 @@
 import { normalizeQuestion, type Bucket } from "@/lib/buckets";
+import { profileFieldMeta } from "@/lib/profile-fields";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 /**
@@ -410,6 +411,54 @@ export function decideTeachPlan(
   // variant ladder, and when the wording is new too, BOTH are taught in one merged popup.
   if (!wantsVariant(profile, path)) return { route: "answer", needsWording, needsAnswer };
   return { route: needsWording ? "both" : "variant", needsWording, needsAnswer };
+}
+
+/** Field NAMES that are too generic to be a safe default question wording on their own — a form asking
+ *  "Type" or "Name" is not necessarily asking for the website type or a person's name, and a bucket
+ *  wording is an EXACT (normalized) match that would then fill from the wrong field. Everything else
+ *  ("First Name", "Postal Code", "Willing To Relocate") is specific enough to stand alone. */
+const GENERIC_FIELD_LABELS = new Set(["type", "name", "value", "other", "notes", "description", "url", "id", "status", "title"]);
+
+/** Only the PRIMARY entry of a repeating section gets a default wording — a flat tenant asks "School"
+ *  once, and a bucket binds to ONE path (the education.0.* starter convention). "education.1.gpa" etc.
+ *  are skipped. A non-indexed path always passes. */
+function isPrimaryEntryPath(path: string): boolean {
+  const m = /\.(\d+)\./.exec(path);
+  return !m || m[1] === "0";
+}
+
+/**
+ * DEFAULT QUESTION WORDINGS (operator, 2026-07-26): every profile field's question bucket starts with
+ * the field's OWN NAME as a wording — the "First Name" bucket contains "First Name" — so a form that
+ * literally labels its question the way the profile labels the field fills deterministically even when
+ * the tenant's automation-id isn't in FIELD_MAP. Matching is normalized (lower-cased, whitespace
+ * collapsed), so "First Name" also covers "first name".
+ *
+ * Non-destructive + idempotent, exactly like ensureStarterBuckets: existing wordings/values are never
+ * touched, the default is added only when that wording isn't already present (deduped by
+ * normalizeQuestion), and a bucket is created for a path only if the profile actually has the field.
+ * Applied on LOAD alongside ensureStarterBuckets, so it self-heals as the profile schema grows.
+ */
+export function ensureDefaultFieldWordings(buckets: Bucket[], profile: unknown): Bucket[] {
+  const rows = flattenProfileFields(profile);
+  let next = buckets;
+  for (const r of rows) {
+    const label = String(r.label || "").trim();
+    if (!label || GENERIC_FIELD_LABELS.has(label.toLowerCase())) continue;
+    if (!isPrimaryEntryPath(r.path)) continue;
+    const path = r.path.trim();
+    if (!path) continue;
+    const existing = next.find((b) => String(b.profile_path || "").trim() === path);
+    if (existing) {
+      const k = normalizeQuestion(label);
+      if ((existing.questions || []).some((q) => normalizeQuestion(q) === k)) continue; // already has it
+      next = next.map((b) => (b === existing ? { ...b, questions: [...(b.questions || []), label] } : b));
+      continue;
+    }
+    const seeded = ensureModeABucket(next, path, profileFieldMeta(path, undefined).bucketWidget);
+    next = addWordingToBucket(seeded.buckets, seeded.bucketId, label);
+  }
+  return next;
 }
 
 /** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */

@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
 import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
+import { ensureDefaultFieldWordings } from "@/lib/teach";
 import { coerceAiConfig } from "@/lib/ai-config";
 import { coerceCredentials, coerceOnboardConfig, type Credentials, type OnboardConfig } from "@/lib/credentials";
 import { generateApiKey, hashApiKey } from "@/lib/api-key";
@@ -47,7 +48,13 @@ function shapeProfileSlice(row: ProfileRow): ProfileSlice {
   // before the first profile-page visit still ships them). Extension merges/stores.
   // Ship any newly-added starter bindings (education/work-experience flat fields) to the extension too,
   // even for existing users whose buckets_json predates them (dedup by profile_path; non-destructive).
-  const buckets = ensureStarterBuckets(row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS);
+  // …plus each profile field's OWN NAME as a default wording ("First Name" in the first-name bucket),
+  // so a form that labels its question the way the profile labels the field fills deterministically even
+  // when the tenant's automation-id isn't in FIELD_MAP (operator, 2026-07-26). Non-destructive.
+  const buckets = ensureDefaultFieldWordings(
+    ensureStarterBuckets(row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS),
+    profile,
+  );
   const jc = row?.job_context_json as { company?: string } | null;
   const jobContext = jc?.company !== undefined ? { company: jc.company as string } : { company: "" };
   return { profile, defaults, buckets, jobContext };

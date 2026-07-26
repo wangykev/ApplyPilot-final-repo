@@ -22,6 +22,7 @@ import {
   fieldHoldsAnswer,
   decideTeachRoute,
   decideTeachPlan,
+  ensureDefaultFieldWordings,
   bucketHasWording,
   fieldIsEmpty,
   wasManuallyEdited,
@@ -524,4 +525,43 @@ test("bucketHasWording / fieldIsEmpty: the two axes, normalized", () => {
   assert.equal(fieldIsEmpty({ self_identification: { race: "" } }, RACE), true);
   assert.equal(fieldIsEmpty({ self_identification: { race: "Asian" } }, RACE), false);
   assert.equal(fieldIsEmpty({ self_identification: { race: [] } }, RACE), true);
+});
+
+// ── DEFAULT FIELD WORDINGS (operator, 2026-07-26) ─────────────────────────────────────────────
+// Every profile field's bucket starts with the field's OWN NAME as a wording, so a form that labels
+// its question the way the profile labels the field fills deterministically even when the tenant's
+// automation-id isn't in FIELD_MAP. Non-destructive + idempotent, like ensureStarterBuckets.
+test("default wordings: every profile field gets a bucket seeded with its own name", () => {
+  const profile = { personal_info: { first_name: "Kevin", last_name: "Wang", postal_code: "32312" } };
+  const out = ensureDefaultFieldWordings([], profile);
+  const fn = out.find((b) => b.profile_path === "personal_info.first_name");
+  assert.ok(fn, "a bucket exists for first_name");
+  assert.deepEqual(fn!.questions, ["First Name"]);
+  assert.ok(out.find((b) => b.profile_path === "personal_info.postal_code")?.questions.includes("Postal Code"));
+});
+
+test("default wordings: EXISTING buckets keep their wordings and just gain the field name (deduped)", () => {
+  const profile = { personal_info: { first_name: "Kevin" } };
+  const mine: Bucket[] = [{
+    id: "field_personal_info_first_name", profile_path: "personal_info.first_name", value: [],
+    category: "", widget_hint: "text", questions: ["Given name"], selectors: {},
+  }];
+  const out = ensureDefaultFieldWordings(mine, profile);
+  assert.deepEqual(out[0].questions, ["Given name", "First Name"], "operator wording kept, default appended");
+  // idempotent + case/spacing-insensitive (normalizeQuestion)
+  assert.deepEqual(ensureDefaultFieldWordings(out, profile)[0].questions, ["Given name", "First Name"]);
+  const cased: Bucket[] = [{ ...mine[0], questions: ["  first   NAME "] }];
+  assert.equal(ensureDefaultFieldWordings(cased, profile)[0].questions.length, 1, "already present under a different casing");
+});
+
+test("default wordings: generic labels are skipped, and only the PRIMARY repeating entry is seeded", () => {
+  const profile = {
+    websites: [{ type: "LinkedIn", url: "https://x" }],
+    education: [{ school_or_university: "CMU", gpa: "4.0" }, { school_or_university: "FSU", gpa: "3.9" }],
+  };
+  const out = ensureDefaultFieldWordings([], profile);
+  assert.equal(out.find((b) => b.profile_path === "websites.0.type"), undefined, "'Type' is too generic to stand alone");
+  assert.equal(out.find((b) => b.profile_path === "websites.0.url"), undefined, "'URL' is too generic to stand alone");
+  assert.ok(out.find((b) => b.profile_path === "education.0.gpa"), "primary entry seeded");
+  assert.equal(out.find((b) => b.profile_path === "education.1.gpa"), undefined, "entry 1 is NOT seeded (a bucket binds one path)");
 });
