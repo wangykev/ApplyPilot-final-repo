@@ -267,20 +267,28 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
             </button>
           </div>
         ) : (
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-4 py-3 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
-            <FileUp className="h-4 w-4" />
-            Upload your resume .tex
-            <input
-              type="file"
-              accept=".tex,text/x-tex,application/x-tex"
-              className="sr-only"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                e.target.value = "";
-                if (f) onTexFile(f);
-              }}
-            />
-          </label>
+          <>
+            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-4 py-3 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
+              <FileUp className="h-4 w-4" />
+              Upload your resume .tex
+              <input
+                type="file"
+                accept=".tex,text/x-tex,application/x-tex"
+                className="sr-only"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) onTexFile(f);
+                }}
+              />
+            </label>
+            <p className="mt-3 flex items-start gap-2 text-sm text-amber">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              No .tex uploaded — tailoring will REBUILD a resume from your profile data, and it will NOT look
+              like your real resume (sections your profile doesn&apos;t model are lost). Upload the .tex to
+              tailor your actual document.
+            </p>
+          </>
         )}
       </SectionCard>
 

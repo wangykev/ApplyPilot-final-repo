@@ -143,11 +143,13 @@ const MODE_RULES: Record<TailorMode, string> = {
     "— a \"replace\" action will be ignored. Drop only bullets that hurt the fit; keep is the default.",
   ].join("\n"),
   "rewrite-surface": [
-    'MODE: SURFACE REWRITE. Per bullet: "keep", "drop", or "replace" with reworded text that',
-    "front-loads the JD's language. HARD RULES for replacements: keep every fact, metric, number,",
-    "technology and scope EXACTLY as stated — rephrase and tighten only. NEVER add a number,",
-    "technology, or claim that is not in the original bullet. Aim for a similar length to the",
-    "original (page fit is verified by compiling — oversize rewrites get reverted).",
+    'MODE: SURFACE REWRITE — reword ONLY, never remove. Per bullet: "keep" or "replace" with',
+    'reworded text that front-loads the JD\'s language ("drop" is NOT allowed and will be ignored:',
+    "the tailored resume must be the same resume with a few words changed). HARD RULES for",
+    "replacements: keep every fact, metric, number, technology and scope EXACTLY as stated —",
+    "rephrase and tighten only. NEVER add a number, technology, or claim that is not in the",
+    "original bullet. Aim for a similar length to the original (page fit is verified by",
+    "compiling — oversize rewrites get reverted).",
   ].join("\n"),
   "rewrite-full": [
     'MODE: FULL REWRITE. Per bullet: "keep", "drop", or "replace" with new text that presents the',
@@ -245,7 +247,9 @@ export function decideTexEdits(units: TexUnit[], edits: TexEdit[], mode: TailorM
   const decisions: TexDecision[] = units.map((u) => {
     const e = byId.get(u.id);
     const action = String(e?.action ?? "keep").toLowerCase();
-    if (action === "drop") return { unit: u, action: "dropped", now: "" };
+    // surface = reword-ONLY: the result must be the same resume with a few words
+    // changed, so a model-proposed drop is ignored (operator expectation).
+    if (action === "drop" && mode !== "rewrite-surface") return { unit: u, action: "dropped", now: "" };
     if (action === "replace" && mode !== "select") {
       const newText = String(e?.text ?? "").trim();
       if (newText && newText !== u.plain) {
@@ -264,15 +268,34 @@ export function decideTexEdits(units: TexUnit[], edits: TexEdit[], mode: TailorM
     return { unit: u, action: "kept", now: u.plain };
   });
 
-  // never empty a section's bullet list (LaTeX errors on an empty itemize, and an
-  // empty section is never the right resume) — a fully-dropped group keeps all
-  const byContext = new Map<string, TexDecision[]>();
-  for (const d of decisions) {
-    const k = d.unit.context;
-    if (!byContext.has(k)) byContext.set(k, []);
-    byContext.get(k)!.push(d);
+  return { decisions, reverted };
+}
+
+/**
+ * STRUCTURAL never-empty-a-list guard: group decisions by the bullet's ENCLOSING
+ * \resumeItemListStart block (by position — collision-proof, unlike heading
+ * labels) and un-drop a group that would end up empty. An emptied itemize is a
+ * LaTeX error AND a vanished resume section — never the right outcome.
+ */
+export function enforceNoEmptyLists(tex: string, decisions: TexDecision[]): void {
+  const starts: number[] = [];
+  let at = tex.indexOf("\\resumeItemListStart");
+  while (at !== -1) {
+    starts.push(at);
+    at = tex.indexOf("\\resumeItemListStart", at + 1);
   }
-  for (const group of byContext.values()) {
+  const listIndexOf = (pos: number) => {
+    let idx = -1;
+    for (let i = 0; i < starts.length; i++) if (starts[i] < pos) idx = i;
+    return idx;
+  };
+  const byList = new Map<number, TexDecision[]>();
+  for (const d of decisions) {
+    const k = listIndexOf(d.unit.start);
+    if (!byList.has(k)) byList.set(k, []);
+    byList.get(k)!.push(d);
+  }
+  for (const group of byList.values()) {
     if (group.every((d) => d.action === "dropped")) {
       for (const d of group) {
         d.action = "kept";
@@ -280,7 +303,6 @@ export function decideTexEdits(units: TexUnit[], edits: TexEdit[], mode: TailorM
       }
     }
   }
-  return { decisions, reverted };
 }
 
 /** Stage 2: splice decisions into the ORIGINAL tex (from the end, so ranges stay valid). */
@@ -378,6 +400,7 @@ export function applyTexTailor(tex: string, jdReply: string, mode: TailorMode): 
   if (!parsed) return { ...identity, error: "parse-failed", raw: String(jdReply).slice(0, 400) };
 
   const { decisions, reverted } = decideTexEdits(units, parsed.edits, mode, vocabFromTex(tex));
+  enforceNoEmptyLists(tex, decisions);
   return {
     tex: spliceTexEdits(tex, decisions),
     records: decisionsToRecords(decisions),

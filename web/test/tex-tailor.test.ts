@@ -89,6 +89,16 @@ test("surface: clean reword replaces (escaped); invented number reverts + counts
   assert.ok(r.tex.includes(String.raw`(50\% faster)`), "original bullet restored verbatim");
 });
 
+test("surface is reword-ONLY: a model-proposed drop is IGNORED (same resume, few words changed)", () => {
+  const r = applyTexTailor(
+    TEX,
+    JSON.stringify({ edits: [{ id: "T1", action: "drop" }, { id: "T3", action: "drop" }] }),
+    "rewrite-surface"
+  );
+  assert.ok(r.records.every((x) => x.action === "kept"), "no drops in surface mode");
+  assert.equal(r.tex, TEX, "document unchanged when the model only proposed drops");
+});
+
 test("full: replacement kept with fabrication risk flagged for out-of-resume tech", () => {
   const r = applyTexTailor(
     TEX,
