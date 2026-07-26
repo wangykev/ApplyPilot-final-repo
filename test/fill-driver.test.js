@@ -102,7 +102,8 @@ function makeFakeAct(fields, opts) {
       fields: fields.map((f) => ({
         wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType,
         label: f.label || f.fieldName, isRequired: !!f.isRequired,
-        value: f.liveValue !== undefined ? f.liveValue : null // already-filled sweep: the field's CURRENT live value
+        value: f.liveValue !== undefined ? f.liveValue : null, // already-filled sweep: the field's CURRENT live value
+        groupOptions: f.groupOptions // checkbox_group: option labels read straight from the DOM (no actuation)
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
@@ -507,11 +508,24 @@ function makeFakeAct(fields, opts) {
 
     // radio / checkbox
     readRadioState: async (loc) => byLoc(loc).options.map((o) => ({ ...o })),
+    // checkbox GROUP (pick-one checkbox set — the OFCCP self-ID). Same shape as readRadioState.
+    readCheckboxGroup: async (loc) => { const f = byLoc(loc); return f.options ? f.options.map((o) => ({ ...o })) : null; },
     clickRadioLabel: async (loc, id) => {
       log.push(["clickRadioLabel", id]);
       const f = byLoc(loc);
       if (f.radioClickRectDead) return false;
-      if (!f.radioClickNoCommit) f.options.forEach((o) => { o.checked = o.id === id; });
+      if (f.radioClickNoCommit) return true;
+      if (f.widgetType === "checkbox_group") {
+        // Model the LIVE tenant quirk: a checkbox TOGGLES, and while another option is checked the
+        // tenant REFUSES a second check (the operator had to uncheck the current one first).
+        const me = f.options.find((o) => o.id === id);
+        if (!me) return true;
+        if (me.checked) { me.checked = false; return true; }          // toggle OFF
+        if (f.options.some((o) => o.checked)) return true;            // refuses while another is checked
+        me.checked = true;
+        return true;
+      }
+      f.options.forEach((o) => { o.checked = o.id === id; });
       return true;
     },
     focusInput: async (id) => { log.push(["focusInput", id]); focusedInputId = id; return true; },
@@ -2660,6 +2674,80 @@ test("repeating bucket: no buckets configured ⇒ the tier is inert (byte-identi
     items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: [], deleteOnNoMatch: false
   }, T_BUDGETS);
   assert.ok(!out.results.some((r) => r.flag === "bucket"), "no bucket index → no bucket fills");
+});
+
+// ── CHECKBOX GROUP (pick-one checkbox set — Caterpillar's OFCCP disability self-ID, 2026-07-25) ──
+// Several checkboxes in ONE wrapper acting like radios; the tenant refuses a second check while one
+// is set, so the filler must UNCHECK the current option first. Options are read from the DOM by the
+// SCAN (no actuation), so even a field left BLANK carries them → the review renders a real picker.
+const SELFID_OPTS = [
+  "Yes, I have a disability, or have had one in the past",
+  "No, I do not have a disability and have not had one in the past",
+  "I do not want to answer"
+];
+const selfIdField = (over = {}) => Object.assign({
+  wrapperSel: "[w-selfid]", fieldName: "disabilityStatus", widgetType: "checkbox_group",
+  label: "Please check one of the boxes below:",
+  options: SELFID_OPTS.map((t, i) => ({ id: "cb" + i, labelText: t, checked: false })),
+  groupOptions: SELFID_OPTS.map((t, i) => ({ id: "cb" + i, labelText: t, checked: false }))
+}, over);
+
+test("checkbox group: an UNMAPPED (voluntary self-ID) group is left BLANK but still carries its OPTIONS for review", async () => {
+  const act = makeFakeAct([selfIdField()]);
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "skipped", "a voluntary self-ID question is the OPERATOR's to answer — never auto-answered");
+  assert.deepStrictEqual(rec.options, SELFID_OPTS, "options ride the record so review renders a picker, not a textbox");
+  assert.ok(!act.log.some(([m]) => m === "clickRadioLabel"), "ZERO actuation on the blank group");
+});
+
+test("checkbox group: a MAPPED value checks the matching option (label-exact) and verifies exactly one is set", async () => {
+  const field = selfIdField({ fieldName: "gender" }); // any mapped field name; FIELD_MAP.gender → self_identification.gender
+  field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: false }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Male");
+  assert.strictEqual(rec.matchTier, "label-exact");
+  assert.strictEqual(field.options.filter((o) => o.checked).length, 1, "exactly ONE option ends checked");
+});
+
+test("checkbox group: replacing a checked option UNCHECKS the current one first (the tenant refuses a second check)", async () => {
+  const field = selfIdField({ fieldName: "gender" });
+  field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: true }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "committed despite the tenant's uncheck-first rule");
+  assert.strictEqual(rec.after, "Male");
+  assert.deepStrictEqual(field.options.map((o) => o.checked), [true, false], "the prior option was unchecked, the target checked");
+  const clicks = act.log.filter(([m]) => m === "clickRadioLabel").map(([, id]) => id);
+  assert.deepStrictEqual(clicks, ["f", "m"], "uncheck the current option BEFORE checking the target");
+});
+
+test("checkbox group: no candidate matches the labels → needs_review, ZERO actuation (never a guessed self-ID answer)", async () => {
+  const field = selfIdField({ fieldName: "gender" });
+  field.options = [{ id: "a", labelText: "Male", checked: false }, { id: "b", labelText: "Female", checked: false }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Nonbinary" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.ok(!field.options.some((o) => o.checked), "nothing was checked");
+});
+
+test("checkbox group: replayField (SUBMIT) sets the approved option through the same pick-one handler", async () => {
+  const field = selfIdField({ wrapperSel: '[data-automation-id="formField-disabilityStatus"]' }); // replayField derives the selector from field_id
+  field.options = [{ id: "y", labelText: SELFID_OPTS[0], checked: false }, { id: "n", labelText: SELFID_OPTS[1], checked: true }];
+  const act = makeFakeAct([field]);
+  const entry = { widget_type: "checkbox_group", current_value: SELFID_OPTS[0], field_id: "p::formField-disabilityStatus", canonical_field: "disabilityStatus" };
+  const r = await replayField(act, entry, T_BUDGETS);
+  assert.strictEqual(r.status, "filled", "the approved self-ID answer replays");
+  assert.strictEqual(r.after, SELFID_OPTS[0]);
+  assert.deepStrictEqual(field.options.map((o) => o.checked), [true, false]);
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {

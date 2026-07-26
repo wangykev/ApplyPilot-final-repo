@@ -4434,6 +4434,11 @@ async function fillEngine(profile, defaults, jobContext) {
     if (wrapper.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     // 5. Checkbox — a single checkbox input.
     if (wrapper.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    // 5b. Checkbox GROUP — several checkboxes in ONE wrapper acting as a pick-one (the OFCCP
+    // disability self-ID). LOCKSTEP with cdp.js cdpPageScan.classify. The page engine has no filler
+    // for it (the CDP path does), so it records as an unhandled type — same as today's "unknown",
+    // but honestly typed so the review editor renders a picker instead of a textbox.
+    if (wrapper.querySelectorAll('input[type="checkbox"]').length > 1) return "checkbox_group";
     // 6. Text — exactly one text-like input.
     const textLike = Array.from(wrapper.querySelectorAll("input")).filter((el) => {
       const t = (el.getAttribute("type") || "").toLowerCase();

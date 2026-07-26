@@ -413,7 +413,10 @@ const resolve = (raw, widgetType) => {
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
-  if (widgetType === "radio") {
+  if (widgetType === "radio" || widgetType === "checkbox_group") {
+    // checkbox_group (a pick-one checkbox set — the OFCCP self-ID) resolves EXACTLY like a radio: it is
+    // matched label-exact against the live options, so it needs the same candidate-list coercion. Without
+    // this it returned `unsupported widget type` → skipped, and a MAPPED value never filled.
     // A tiered candidate list (e.g. a degree/field_of_study rendered as radio on some tenant) must pass
     // through as the ladder — same as dropdown/typeahead. Without this, String(array) → "a,b" never
     // matches an option → the field falls to the AI (the triBool-dropdown bug's radio twin).
@@ -1565,6 +1568,52 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
   }
   await closeDropdownConfirmed(act, loc, budgets); // confirm the list is gone (not just aria) before the next field, even on a failed commit
   return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")`, after: res.after, options: enabledTexts, matchTier: m.matchTier };
+};
+
+// CHECKBOX GROUP — a pick-one set of checkboxes in ONE wrapper (Caterpillar's OFCCP disability
+// self-ID: "Yes, I have a disability…" / "No…" / "I do not want to answer"). Radio-like, with one
+// tenant quirk the operator observed: the current option must be UNCHECKED before another can be
+// set. So: match the candidate to a label exactly (radio's rule — no containment guessing on a
+// legally-loaded question), UNCHECK any other checked option first, then check the target, and
+// verify the END STATE (target checked AND nothing else) — a half-applied group is needs_review,
+// never a silent wrong answer. Zero actuation when the target is already the only one checked.
+const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
+  if (!act.readCheckboxGroup) return { status: "needs_review", detail: "substrate cannot read a checkbox group" };
+  const opts = await act.readCheckboxGroup(loc);
+  if (!opts || !opts.length) return { status: "error", detail: "no checkboxes in wrapper" };
+  const optionLabels = opts.map((o) => o.labelText);
+  const checkedNow = () => opts.filter((o) => o.checked);
+  const before = (checkedNow()[0] || {}).labelText || null;
+
+  let target = null;
+  for (const cand of candidates || []) {
+    const found = opts.find((o) => o.labelText.toLowerCase() === String(cand).toLowerCase());
+    if (found) { target = found; break; }
+  }
+  if (!target) return { status: "needs_review", detail: "no candidate matched the checkbox-group labels", after: before, options: optionLabels };
+
+  const readBack = async () => (await act.readCheckboxGroup(loc)) || [];
+  // 1. clear any OTHER checked option (this tenant refuses a second check while one is set)
+  for (const o of opts) {
+    if (!o.checked || o.id === target.id) continue;
+    await act.clickRadioLabel(loc, o.id); // label-click — same primitive as radio (native label activation)
+    await pollCheckedIs(act, o.id, false, budgets);
+  }
+  // 2. check the target (skip when it already is)
+  let now = await readBack();
+  const isOn = (id) => !!(now.find((o) => o.id === id) || {}).checked;
+  if (!isOn(target.id)) {
+    await act.clickRadioLabel(loc, target.id);
+    await pollCheckedIs(act, target.id, true, budgets);
+    now = await readBack();
+  }
+  const on = now.filter((o) => o.checked);
+  const after = (on[0] || {}).labelText || null;
+  if (!isOn(target.id)) return { status: "needs_review", detail: `checkbox-group selection did not commit for "${target.labelText}"`, after, options: optionLabels };
+  if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
+    detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
+  return { status: "filled", after, verified: true, matchTier: "label-exact", options: optionLabels,
+    detail: before && before !== after ? `label-click (replaced "${before}")` : "label-click" };
 };
 
 // Radio: label-text exact match (case-insensitive, candidates in order — M22
@@ -2788,7 +2837,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // yes/no boolean → its Yes/No(+True/False) ladder; any other (scalar) value → the field's
           // variants (e.g. gpa "3.5+", gender "Man"). A checkbox uses the boolean (its own branch above);
           // a text box types the value (not a choice widget → skipped).
-          if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead") {
+          if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead" || f.widgetType === "checkbox_group") {
             arg = typeof rawValue === "boolean"
               ? boolLadderCandidates(profile, mappedPath, rawValue)
               : appendFieldVariants(profile, mappedPath, arg);
@@ -2798,6 +2847,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
           else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "checkbox_group") Object.assign(record, await fillCheckboxGroupCdp(act, loc, arg, budgets)); // pick-one checkbox set (self-ID)
           else if (f.widgetType === "typeahead") {
             // Fix 2: start-scrape the options (FLAT → review + AI; TREE → no start-scrape). Inline AI on no-match.
             const cap = makeStartCapture(act, loc);
@@ -3044,6 +3094,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
 
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
+    // A checkbox GROUP always carries its option labels into the bundle — even when the field is left
+    // BLANK. The scan reads them straight from the DOM (no open/actuation), and without them the review
+    // editor renders a bare TEXTBOX for a pick-one question (live: Caterpillar's OFCCP disability
+    // self-ID — voluntary, so the bot correctly leaves it unanswered and the OPERATOR must pick).
+    if (f.widgetType === "checkbox_group" && !(Array.isArray(record.options) && record.options.length)
+        && Array.isArray(f.groupOptions) && f.groupOptions.length) {
+      record.options = f.groupOptions.map((o) => o.labelText).filter(Boolean);
+    }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
     results.push(record);
 
@@ -3281,6 +3339,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } catch (e) { /* a revealed-field fill threw → don't abort the whole page; next round / honest miss */ }
     }
   };
+  // BLUR the last-touched field FIRST (operator, 2026-07-25): a tenant can defer a field's commit — and
+  // the reveal that commit triggers — until BLUR, and the fill leaves focus sitting inside the last field
+  // it typed. Live: Caterpillar's SMS-consent checkbox is revealed by the phone number (the last flat
+  // field) and never appeared in the records at all, through BOTH cascade passes, because focus never
+  // left the phone box. One eval, best-effort, no focus moved into another widget.
+  if (!targeted && act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort */ } }
   await cascadePass();
   markPhase("cascade", _phaseT0); _phaseT0 = Date.now();
 
@@ -4860,7 +4924,7 @@ function auditActualFromRaw(widgetType, raw) {
     case "text": case "textarea": return { actual: raw ? raw.value : null, readable: !!raw };
     case "dropdown": return { actual: raw ? raw.triggerText : null, readable: !!raw };
     case "checkbox": return { actual: raw ? String(raw.checked) : null, readable: !!(raw && raw.inputId != null) };
-    case "radio": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
+    case "radio": case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; } // checkbox_group is radio-shaped: the CHECKED option's label
     case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
     case "date": {
       if (!Array.isArray(raw)) return { actual: null, readable: false };
@@ -4886,6 +4950,7 @@ async function auditReReadActual(act, e) {
       case "dropdown": raw = await act.readDropdownState(loc); break;
       case "checkbox": raw = await act.readCheckboxState(loc); break;
       case "radio": raw = await act.readRadioState(loc); break;
+      case "checkbox_group": raw = act.readCheckboxGroup ? await act.readCheckboxGroup(loc) : null; break;
       case "typeahead": raw = await act.readHier(loc); break;
       case "hierarchical": raw = await act.readSource(loc); break;
       case "date": {
@@ -4914,6 +4979,7 @@ async function auditRefillEntry(act, e, b) {
     case "typeahead": return await fillTypeaheadCdp(act, loc, [exp], b);
     case "hierarchical": return await fillTypeaheadCdp(act, loc, [exp], b); // merged: source uses the unified filler
     case "radio": return await fillRadioCdp(act, loc, [exp], b);
+    case "checkbox_group": return await fillCheckboxGroupCdp(act, loc, [exp], b);
     case "checkbox": return await fillCheckboxCdp(act, loc, String(exp) === "true", b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(exp)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
     default: throw new Error("audit re-fill: unsupported widget " + e.widgetType);
@@ -5015,6 +5081,7 @@ async function replayField(act, entry, budgets) {
     case "dropdown": return await fillDropdownCdp(act, loc, [value], b);
     case "typeahead": case "hierarchical": return await fillTypeaheadCdp(act, loc, [value], b);
     case "radio": return await fillRadioCdp(act, loc, [value], b);
+    case "checkbox_group": return await fillCheckboxGroupCdp(act, loc, [value], b); // pick-one checkbox set: unchecks the current option, then checks the approved one
     case "checkbox": return await fillCheckboxCdp(act, loc, value === true || /^(true|yes)$/i.test(String(value)), b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(value)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
     default: return { status: "needs_review", detail: "replay: unsupported widget " + widget };

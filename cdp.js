@@ -853,6 +853,11 @@ function cdpPageScan() {
     if (wrapper.querySelector('input[type="radio"]')) return "radio";
     if (wrapper.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     if (wrapper.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    // CHECKBOX GROUP (2026-07-25, Caterpillar's OFCCP disability self-ID): several checkboxes in ONE
+    // wrapper acting as a pick-one ("Yes, I have a disability…" / "No…" / "I do not want to answer" —
+    // the operator had to UNCHECK the current one to change it). Previously fell through to "unknown",
+    // which the review editor renders as a bare TEXTBOX. Radio-like, so it gets radio-like handling.
+    if (wrapper.querySelectorAll('input[type="checkbox"]').length > 1) return "checkbox_group";
     const textLike = Array.from(wrapper.querySelectorAll("input")).filter((el) => {
       const t = (el.getAttribute("type") || "").toLowerCase();
       return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
@@ -903,6 +908,11 @@ function cdpPageScan() {
       if (wt === "typeahead" || wt === "hierarchical") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
       if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
       if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
+      if (wt === "checkbox_group") { // the CHECKED option's label (radio-like) — the review's "current value"
+        const c = wr.querySelector('input[type="checkbox"]:checked'); if (!c) return null;
+        const lab = c.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(c.id) : c.id) + '"]') : null;
+        return lab ? (lab.textContent || "").trim() : "selected";
+      }
       const segs = Array.from(wr.querySelectorAll('[data-automation-id^="dateSection"][data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t));
       if (segs.length) return segs.join("/");
       const inp = wr.querySelector("input, textarea"); return inp ? (inp.value || null) : null;
@@ -916,7 +926,7 @@ function cdpPageScan() {
     fields: wrappers.map((w) => {
       const id = w.getAttribute("data-automation-id");
       const wt = classify(w);
-      return {
+      const d = {
         wrapperSel: '[data-automation-id="' + id + '"]',
         fieldName: id.slice("formField-".length),
         widgetType: wt,
@@ -924,6 +934,16 @@ function cdpPageScan() {
         isRequired: requiredOf(w),
         value: valueOf(w, wt)
       };
+      // A checkbox GROUP carries its option labels straight from the DOM — READ-ONLY, no open/actuation
+      // needed (unlike a dropdown), so the review editor can render a real picker even when the field is
+      // left BLANK (an optional EEO/self-ID question the bot must never answer — the operator picks).
+      if (wt === "checkbox_group") {
+        d.groupOptions = Array.from(w.querySelectorAll('input[type="checkbox"]')).map((cb) => {
+          const lab = cb.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id) + '"]') : null;
+          return { id: cb.id || null, labelText: lab ? (lab.textContent || "").trim() : (cb.getAttribute("aria-label") || "").trim(), checked: !!cb.checked };
+        }).filter((o) => o.labelText);
+      }
+      return d;
     })
   };
 }
@@ -2083,6 +2103,19 @@ function cdpReadRadioState(wrapperSel) {
   });
 }
 
+// CHECKBOX GROUP (2026-07-25) — the same shape cdpReadRadioState returns, over `input[type=checkbox]`
+// inside ONE wrapper (the OFCCP disability self-ID pick-one). Radio-shaped on purpose: the driver's
+// label-exact match + the label-click commit are reused verbatim. The caller is responsible for the
+// pick-one semantics (this tenant requires UNCHECKING the current option before another can be set).
+function cdpReadCheckboxGroupState(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  return Array.from(w.querySelectorAll('input[type="checkbox"]')).map((input) => {
+    const lab = input.id ? document.querySelector('label[for="' + input.id + '"]') : null;
+    return { id: input.id, labelText: lab ? lab.textContent.trim() : (input.getAttribute("aria-label") || "").trim(), checked: input.checked };
+  });
+}
+
 // Best-effort: find a clearly-DISMISSIVE control (X / Close / No thanks — NEVER Accept/Agree/OK/Got it)
 // inside the popup covering (cx,cy), so the walk can close it and proceed. Handles SHADOW-DOM overlays
 // (Simplify renders into div.simplify-jobs-shadow-root → the X lives in host.shadowRoot, invisible to a
@@ -2987,7 +3020,7 @@ function cdpSourceCategoryRect(label) {
 // (auditActualFromRaw — Node-testable); reconcileAudit falls back to the per-field path when this
 // method is absent (older fakes / a minimal audit act).
 const AUDIT_RAW_READERS = [cdpReadTextState, cdpReadInputBySel, cdpReadDropdownState,
-  cdpReadCheckboxState, cdpReadRadioState, cdpReadHierState, cdpReadSourcePick];
+  cdpReadCheckboxState, cdpReadRadioState, cdpReadCheckboxGroupState, cdpReadHierState, cdpReadSourcePick];
 // Page-side dispatcher — receives [{widgetType, wrapperSel, tag, dateSegs}] and returns the raw read
 // per spec. Self-contained: references ONLY the AUDIT_RAW_READERS (injected as sibling declarations
 // by cdpReadAuditRaw) + page globals. Keep the widget→reader map in LOCKSTEP with fill-driver's
@@ -3000,6 +3033,7 @@ function cdpAuditRawDispatch(specs) {
         case "dropdown": return cdpReadDropdownState(s.wrapperSel);
         case "checkbox": return cdpReadCheckboxState(s.wrapperSel);
         case "radio": return cdpReadRadioState(s.wrapperSel);
+        case "checkbox_group": return cdpReadCheckboxGroupState(s.wrapperSel);
         case "typeahead": return cdpReadHierState(s.wrapperSel);
         case "hierarchical": return cdpReadSourcePick(s.wrapperSel);
         case "date": return (s.dateSegs || []).map(function (seg) {
@@ -3292,6 +3326,18 @@ function makeCdpActuation(llmConfig) {
 
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
+    readCheckboxGroup: (loc) => cdpEval(cdpReadCheckboxGroupState, loc.wrapperSel), // pick-one checkbox set (self-ID); clickRadioLabel commits by label id
+    // Blur whatever the fill last focused (2026-07-25, operator): some tenants only COMMIT a text field —
+    // and fire the cascade it triggers — on BLUR, and the fill leaves focus INSIDE the last field it typed
+    // (Caterpillar's SMS-consent checkbox is revealed by the phone number and never appeared while the
+    // phone box still had focus). A direct activeElement.blur() rather than Tab: it fires blur/focusout
+    // without moving focus INTO the next widget (no risk of arming a typeahead / opening a picker).
+    blurActive: () => cdpEval(() => {
+      const a = document.activeElement;
+      if (!a || a === document.body || typeof a.blur !== "function") return false;
+      a.blur();
+      return true;
+    }),
     clickRadioLabel: async (loc, id) => {
       const rect = await cdpRectReady('label[for="' + id + '"]', true); // M29: retry the label rect
       if (!rect) return false;
