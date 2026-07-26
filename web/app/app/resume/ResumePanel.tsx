@@ -251,75 +251,90 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
           </div>
         }
       >
-        {tab === "tex" ? (
-          <>
-            <div className="mb-3 flex flex-wrap items-center gap-3">
-              <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-3 py-2 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
-                <FileUp className="h-4 w-4" />
-                {texName ? `Replace ${texName}` : "Upload .tex"}
-                <input
-                  type="file"
-                  accept=".tex,text/x-tex,application/x-tex"
-                  className="sr-only"
+        {/* SIDE-BY-SIDE: source (editor / docx controls) LEFT · live PDF RIGHT */}
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div>
+            {tab === "tex" ? (
+              <>
+                <div className="mb-3 flex flex-wrap items-center gap-3">
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-3 py-2 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
+                    <FileUp className="h-4 w-4" />
+                    {texName ? `Replace ${texName}` : "Upload .tex (optional)"}
+                    <input
+                      type="file"
+                      accept=".tex,text/x-tex,application/x-tex"
+                      className="sr-only"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        e.target.value = "";
+                        if (f) onSourceFile(f);
+                      }}
+                    />
+                  </label>
+                  <span className="font-mono text-[11px] text-ink-faint">
+                    {texName || "or just paste below"}
+                    {texText ? (sourceSaved ? " · stored" : " · unsaved edits") : ""}
+                  </span>
+                </div>
+                <textarea
+                  value={texText}
                   onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    e.target.value = "";
-                    if (f) onSourceFile(f);
+                    setTexText(e.target.value);
+                    setSourceSaved(false);
+                    if (!texName) setTexName("resume.tex");
                   }}
+                  spellCheck={false}
+                  placeholder={"Paste your resume's .tex here — it compiles live on the right as you type."}
+                  className="h-[620px] w-full resize-y rounded-lg border border-hairline bg-cockpit p-3 font-mono text-xs leading-relaxed text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
                 />
-              </label>
-              {texName && (
-                <span className="font-mono text-[11px] text-ink-faint">
-                  {texName}
-                  {sourceSaved ? " · stored" : " · unsaved edits"}
-                </span>
-              )}
-            </div>
-            {texText ? (
-              <textarea
-                value={texText}
-                onChange={(e) => {
-                  setTexText(e.target.value);
-                  setSourceSaved(false);
-                }}
-                spellCheck={false}
-                rows={22}
-                className="w-full resize-y rounded-lg border border-hairline bg-cockpit p-3 font-mono text-xs leading-relaxed text-ink outline-none transition-colors focus:border-amber"
-              />
+              </>
             ) : (
-              <p className="text-sm text-ink-dim">Upload your resume&apos;s .tex to edit it here — every edit recompiles the PDF below.</p>
-            )}
-          </>
-        ) : (
-          <div className="space-y-3">
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-3 py-2 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
-              <FileUp className="h-4 w-4" />
-              {docxName ? `Replace ${docxName}` : "Upload .docx"}
-              <input
-                type="file"
-                accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                className="sr-only"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  e.target.value = "";
-                  if (f) onSourceFile(f);
-                }}
-              />
-            </label>
-            {docxName && (
-              <div className="flex items-center gap-3">
-                <span className="font-mono text-[11px] text-ink-faint">{docxName} · stored</span>
-                <button onClick={convertDocx} disabled={compiling} className="btn-ghost px-3 py-1.5 text-xs">
-                  <RefreshCw className="h-3.5 w-3.5" /> {compiling ? "Converting…" : "Convert to PDF"}
-                </button>
+              <div className="space-y-3">
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-3 py-2 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
+                  <FileUp className="h-4 w-4" />
+                  {docxName ? `Replace ${docxName}` : "Upload .docx"}
+                  <input
+                    type="file"
+                    accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    className="sr-only"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      e.target.value = "";
+                      if (f) onSourceFile(f);
+                    }}
+                  />
+                </label>
+                {docxName && (
+                  <div className="flex items-center gap-3">
+                    <span className="font-mono text-[11px] text-ink-faint">{docxName} · stored</span>
+                    <button onClick={convertDocx} disabled={compiling} className="btn-ghost px-3 py-1.5 text-xs">
+                      <RefreshCw className="h-3.5 w-3.5" /> {compiling ? "Converting…" : "Convert to PDF"}
+                    </button>
+                  </div>
+                )}
+                <p className="text-xs text-ink-faint">
+                  .docx can&apos;t be live-edited here; conversion to PDF uses a local LibreOffice (set SOFFICE_PATH). For
+                  full live editing, use the .tex tab.
+                </p>
               </div>
             )}
-            <p className="text-xs text-ink-faint">
-              .docx can&apos;t be live-edited here; conversion to PDF uses a local LibreOffice (set SOFFICE_PATH). For full
-              live editing, use the .tex tab.
-            </p>
           </div>
-        )}
+
+          <div>
+            <div className="mb-2 flex items-center gap-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">
+              Live PDF preview
+              {compiling && <span className="text-amber">compiling…</span>}
+            </div>
+            {compileErr && <p className="mb-2 text-sm text-signal">{compileErr}</p>}
+            {compiled ? (
+              <iframe title="Compiled resume PDF" src={compiled.url} className="h-[620px] w-full rounded-lg border border-hairline bg-white shadow-inner" />
+            ) : (
+              <div className="flex h-[620px] items-center justify-center rounded-lg border border-dashed border-hairline px-6 text-center text-sm text-ink-faint">
+                {tab === "tex" ? "The compiled PDF appears here as you type" : "Convert the .docx to see the PDF here"}
+              </div>
+            )}
+          </div>
+        </div>
 
         {/* generated-PDF name + save */}
         <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-hairline pt-4">
@@ -336,22 +351,6 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
             <FileCheck2 className="h-4 w-4" />
             {applying ? "Saving…" : "Save as my resume"}
           </button>
-        </div>
-
-        {/* live PDF preview */}
-        <div className="mt-4">
-          <div className="mb-2 flex items-center gap-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">
-            Live PDF preview
-            {compiling && <span className="text-amber">compiling…</span>}
-          </div>
-          {compileErr && <p className="mb-2 text-sm text-signal">{compileErr}</p>}
-          {compiled ? (
-            <iframe title="Compiled resume PDF" src={compiled.url} className="h-[640px] w-full rounded-lg border border-hairline bg-white shadow-inner" />
-          ) : (
-            <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-hairline text-sm text-ink-faint">
-              {tab === "tex" ? "The compiled PDF appears here as you edit" : "Convert the .docx to see the PDF here"}
-            </div>
-          )}
         </div>
 
         {msg && (
