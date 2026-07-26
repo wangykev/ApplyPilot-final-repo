@@ -38,7 +38,16 @@ const MODES: { id: TailorMode; name: string; blurb: string; guard: string }[] = 
   },
 ];
 
-export function TailorPanel({ apps, original }: { apps: JdApplication[]; original: OriginalResume | null }) {
+export function TailorPanel({
+  apps,
+  original,
+  serverTex,
+}: {
+  apps: JdApplication[];
+  original: OriginalResume | null;
+  /** The .tex source stored on the Resume page — the preferred, cross-device source. */
+  serverTex: { tex: string; name: string } | null;
+}) {
   const [jd, setJd] = useState("");
   const [appId, setAppId] = useState("");
   const [mode, setMode] = useState<TailorMode>("select");
@@ -58,6 +67,13 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
   const [fitInfo, setFitInfo] = useState<{ pages: number | null; basePages: number | null; lengthReverts: number } | null>(null);
 
   useEffect(() => {
+    // the Resume page's stored source is the preferred base (works across devices);
+    // the local upload below remains as an override / signed-out fallback
+    if (serverTex) {
+      setTexSrc(serverTex.tex);
+      setTexName(serverTex.name);
+      return;
+    }
     try {
       const t = localStorage.getItem(TEX_LS_KEY);
       if (t) {
@@ -67,6 +83,7 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
     } catch {
       /* private mode etc. */
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function onTexFile(f: File) {
@@ -255,7 +272,9 @@ export function TailorPanel({ apps, original }: { apps: JdApplication[]; origina
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm text-ink">{texName}</div>
               <div className="font-mono text-[11px] text-ink-faint">
-                your .tex is the base — only bullet lines can change (kept on this device)
+                {serverTex && texSrc === serverTex.tex
+                  ? "synced from your Resume page — only bullet lines can change"
+                  : "your .tex is the base — only bullet lines can change (kept on this device)"}
               </div>
             </div>
             <button

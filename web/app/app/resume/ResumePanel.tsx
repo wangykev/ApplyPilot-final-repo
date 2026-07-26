@@ -2,9 +2,18 @@
 
 import { useEffect, useRef, useState, useTransition } from "react";
 import Link from "next/link";
-import { UploadCloud, FileText, Sparkles, Check, Trash2, ArrowRight, Eye, X } from "lucide-react";
+import { FileText, Sparkles, Check, Trash2, ArrowRight, Eye, X, FileUp, FileCheck2, RefreshCw } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
-import { applyParsedProfile, removeResume, getResumePreviewUrl } from "./actions";
+import {
+  applyParsedProfile,
+  removeResume,
+  getResumePreviewUrl,
+  saveResumeSourceTex,
+  saveCompiledResume,
+  convertDocxToPdf,
+  type ResumeSource,
+} from "./actions";
+import { compileLatexPdf } from "@/app/app/tailor/actions";
 import { liveSync } from "@/lib/extension-sync";
 import type { Profile } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
@@ -13,14 +22,13 @@ type Stored = { filename: string; size: number } | null;
 type Msg = { kind: "ok" | "err" | "info"; text: string; aiLink?: boolean } | null;
 
 function kb(bytes: number) {
-  return bytes < 1024 * 1024
-    ? `${Math.round(bytes / 1024)} KB`
-    : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function summarize(p: Profile): { label: string; n: number }[] {
   return [
     { label: "Roles", n: p.work_experience.length },
+    { label: "Projects", n: p.projects.length },
     { label: "Schools", n: p.education.length },
     { label: "Skills", n: p.skills.length },
     { label: "Links", n: p.websites.length },
@@ -29,20 +37,56 @@ function summarize(p: Profile): { label: string; n: number }[] {
   ].filter((x) => x.n > 0);
 }
 
-export function ResumePanel({ initialStored }: { initialStored: Stored }) {
+export function ResumePanel({ initialStored, initialSource }: { initialStored: Stored; initialSource: ResumeSource | null }) {
   const [stored, setStored] = useState<Stored>(initialStored);
-  const [file, setFile] = useState<File | null>(null);
-  const [parsed, setParsed] = useState<Profile | null>(null);
   const [msg, setMsg] = useState<Msg>(null);
-  const [uploading, setUploading] = useState(false);
+  const [parsed, setParsed] = useState<Profile | null>(null);
   const [parsing, setParsing] = useState(false);
   const [applying, startApply] = useTransition();
-  const [dragging, setDragging] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
 
-  // Esc closes the PDF preview popup (backdrop click closes it too).
+  // ── source (the document the PDF is generated from) ───────────────────────
+  const [tab, setTab] = useState<"tex" | "docx">(initialSource?.kind === "docx" ? "docx" : "tex");
+  const [texText, setTexText] = useState<string>(initialSource?.kind === "tex" ? initialSource.tex ?? "" : "");
+  const [texName, setTexName] = useState<string>(initialSource?.kind === "tex" ? initialSource.filename : "");
+  const [docxName, setDocxName] = useState<string>(initialSource?.kind === "docx" ? initialSource.filename : "");
+  const [pdfName, setPdfName] = useState<string>(initialStored?.filename ?? "resume.pdf");
+  const [sourceSaved, setSourceSaved] = useState(true); // editor text == stored source?
+
+  // live compile (debounced) — the bottom preview is the ACTUAL PDF
+  const [compiled, setCompiled] = useState<{ url: string; base64: string } | null>(null);
+  const [compiling, setCompiling] = useState(false);
+  const [compileErr, setCompileErr] = useState<string | null>(null);
+  const compileSeq = useRef(0);
+
+  async function compileNow(tex: string) {
+    const seq = ++compileSeq.current;
+    setCompiling(true);
+    setCompileErr(null);
+    const res = await compileLatexPdf({ tex });
+    if (seq !== compileSeq.current) return; // superseded by a newer edit
+    setCompiling(false);
+    if (!res.ok) {
+      setCompileErr(res.error);
+      return;
+    }
+    const bytes = Uint8Array.from(atob(res.pdfBase64), (c) => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    setCompiled((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return { url, base64: res.pdfBase64 };
+    });
+  }
+
+  // debounce: recompile ~1.2s after the user stops typing
+  useEffect(() => {
+    if (tab !== "tex" || !texText.trim()) return;
+    const t = setTimeout(() => void compileNow(texText), 1200);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [texText, tab]);
+
   useEffect(() => {
     if (!previewUrl) return;
     const onKey = (e: KeyboardEvent) => {
@@ -51,6 +95,74 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [previewUrl]);
+
+  async function onSourceFile(f: File) {
+    const lower = f.name.toLowerCase();
+    if (tab === "tex" && !lower.endsWith(".tex")) return setMsg({ kind: "err", text: "Please choose a .tex file." });
+    if (tab === "docx" && !lower.endsWith(".docx")) return setMsg({ kind: "err", text: "Please choose a .docx file." });
+    setMsg(null);
+
+    if (tab === "tex") {
+      // open in the editor immediately; storage is best-effort (sign-in optional for editing)
+      const text = await f.text();
+      setTexText(text);
+      setTexName(f.name);
+      setSourceSaved(false);
+    } else {
+      setDocxName(f.name);
+    }
+
+    try {
+      const fd = new FormData();
+      fd.append("file", f);
+      const r = await fetch("/api/resume/source", { method: "POST", body: fd });
+      const j = await r.json();
+      if (j.ok) {
+        setSourceSaved(true);
+        setMsg({ kind: "ok", text: `${f.name} stored as your resume source.` });
+      } else {
+        setMsg({ kind: "info", text: `Editing locally — source not stored (${j.error ?? "upload failed"}).` });
+      }
+    } catch {
+      setMsg({ kind: "info", text: "Editing locally — source not stored (backend unreachable)." });
+    }
+  }
+
+  async function convertDocx() {
+    setCompiling(true);
+    setCompileErr(null);
+    const res = await convertDocxToPdf();
+    setCompiling(false);
+    if (!res.ok) {
+      setCompileErr(res.error);
+      return;
+    }
+    const bytes = Uint8Array.from(atob(res.pdfBase64), (c) => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    setCompiled((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return { url, base64: res.pdfBase64 };
+    });
+  }
+
+  function save() {
+    if (!compiled) return;
+    startApply(async () => {
+      if (tab === "tex" && texText.trim()) {
+        const s = await saveResumeSourceTex({ filename: texName || "resume.tex", tex: texText });
+        if (s.ok) setSourceSaved(true);
+      }
+      const res = await saveCompiledResume({ pdfBase64: compiled.base64, pdfName });
+      if (res.ok) {
+        setStored({ filename: res.filename, size: res.size });
+        setPdfName(res.filename);
+        setMsg({ kind: "ok", text: `Saved ${res.filename} — this is what gets attached to applications.` });
+        liveSync("resume");
+      } else {
+        setMsg({ kind: "err", text: res.error });
+      }
+    });
+  }
 
   async function openPreview() {
     setPreviewLoading(true);
@@ -61,43 +173,15 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
     else setMsg({ kind: "err", text: "Preview failed: " + res.error });
   }
 
-  async function onFile(f: File) {
-    if (!f.type.includes("pdf")) {
-      setMsg({ kind: "err", text: "Please choose a PDF." });
-      return;
-    }
-    setFile(f);
-    setParsed(null);
-    setMsg(null);
-    // store it for the extension straight away
-    setUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append("file", f);
-      const r = await fetch("/api/resume/upload", { method: "POST", body: fd });
-      const j = await r.json();
-      if (j.ok) {
-        setStored({ filename: f.name, size: f.size });
-        setMsg({ kind: "ok", text: "Stored — ready to attach during applications." });
-        liveSync("resume"); // push the new resume bytes to a connected extension
-      } else {
-        setMsg({ kind: "err", text: j.error ?? "Upload failed." });
-      }
-    } catch {
-      setMsg({ kind: "err", text: "Upload failed — is the backend reachable?" });
-    } finally {
-      setUploading(false);
-    }
-  }
-
   async function parse() {
-    if (!file) return;
+    if (!compiled) return;
     setParsing(true);
     setMsg(null);
     setParsed(null);
     try {
+      const bytes = Uint8Array.from(atob(compiled.base64), (c) => c.charCodeAt(0));
       const fd = new FormData();
-      fd.append("file", file);
+      fd.append("file", new File([bytes], pdfName || "resume.pdf", { type: "application/pdf" }));
       const r = await fetch("/api/parse-resume", { method: "POST", body: fd });
       const j = await r.json();
       if (j.ok) {
@@ -121,7 +205,7 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
     if (!parsed) return;
     startApply(async () => {
       const res = await applyParsedProfile(parsed);
-      if (res.ok) liveSync("profile"); // the merged profile changed — push it to a connected extension
+      if (res.ok) liveSync("profile");
       setMsg(
         res.ok
           ? { kind: "ok", text: "Applied to your profile (filled blanks). Review it on the Profile page." }
@@ -135,10 +219,9 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
       const res = await removeResume();
       if (res.ok) {
         setStored(null);
-        setFile(null);
         setParsed(null);
         setMsg({ kind: "info", text: "Removed." });
-        liveSync("resume-clear"); // clear the resume in a connected extension too
+        liveSync("resume-clear");
       } else {
         setMsg({ kind: "err", text: res.error });
       }
@@ -148,118 +231,131 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
   return (
     <div className="space-y-6">
       <SectionCard
-        title="Your resume"
-        subtitle="One PDF. We store it so the extension can attach it to every application — no file picker per job."
+        title="Resume source"
+        subtitle="Upload the document your resume is WRITTEN in — .tex live-edits and recompiles below; the generated PDF (named on the right) is what the extension attaches. This source also feeds the Tailor page."
         actions={
-          stored ? (
-            <button
-              onClick={clear}
-              disabled={applying}
-              className="inline-flex items-center gap-1.5 text-xs text-ink-faint transition-colors hover:text-signal"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              Remove
-            </button>
-          ) : null
+          <div className="flex overflow-hidden rounded-lg border border-hairline">
+            {(["tex", "docx"] as const).map((t, idx) => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={clsx(
+                  "px-3 py-1.5 text-xs transition-colors",
+                  idx === 0 && "border-r border-hairline",
+                  tab === t ? "bg-amber font-semibold text-cockpit" : "text-ink-dim hover:bg-panel-raised/60 hover:text-ink"
+                )}
+              >
+                {t === "tex" ? "LaTeX (.tex)" : "Word (.docx)"}
+              </button>
+            ))}
+          </div>
         }
       >
-        {stored && (
-          <div className="mb-5 flex items-center gap-3 rounded-lg border border-hairline bg-panel-raised/50 p-3">
-            <FileText className="h-5 w-5 text-verified" />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm text-ink">{stored.filename}</div>
-              <div className="font-mono text-[11px] text-ink-faint">{kb(stored.size)} · stored</div>
+        {tab === "tex" ? (
+          <>
+            <div className="mb-3 flex flex-wrap items-center gap-3">
+              <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-3 py-2 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
+                <FileUp className="h-4 w-4" />
+                {texName ? `Replace ${texName}` : "Upload .tex"}
+                <input
+                  type="file"
+                  accept=".tex,text/x-tex,application/x-tex"
+                  className="sr-only"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    e.target.value = "";
+                    if (f) onSourceFile(f);
+                  }}
+                />
+              </label>
+              {texName && (
+                <span className="font-mono text-[11px] text-ink-faint">
+                  {texName}
+                  {sourceSaved ? " · stored" : " · unsaved edits"}
+                </span>
+              )}
             </div>
-            <button
-              onClick={openPreview}
-              disabled={previewLoading}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-hairline px-2.5 py-1.5 text-xs text-ink-dim transition-colors hover:border-amber hover:text-ink"
-              title="View the uploaded PDF exactly as it will be attached"
-            >
-              <Eye className="h-3.5 w-3.5" />
-              {previewLoading ? "Opening…" : "Preview"}
-            </button>
-            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-verified">
-              <Check className="h-3.5 w-3.5" /> Ready
-            </span>
-          </div>
-        )}
-
-        {previewUrl && (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-            onClick={() => setPreviewUrl(null)}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Resume preview"
-          >
-            <div
-              className="bezel relative flex h-[90vh] w-full max-w-3xl flex-col p-4"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between border-b border-hairline pb-3">
-                <h2 className="font-display text-lg font-medium">
-                  {stored?.filename ?? "Resume"}{" "}
-                  <span className="font-mono text-[11px] font-normal text-ink-faint">— the uploaded PDF, as attached to applications</span>
-                </h2>
-                <button
-                  type="button"
-                  onClick={() => setPreviewUrl(null)}
-                  className="text-ink-dim transition-colors hover:text-ink"
-                  aria-label="Close"
-                >
-                  <X className="h-5 w-5" />
+            {texText ? (
+              <textarea
+                value={texText}
+                onChange={(e) => {
+                  setTexText(e.target.value);
+                  setSourceSaved(false);
+                }}
+                spellCheck={false}
+                rows={22}
+                className="w-full resize-y rounded-lg border border-hairline bg-cockpit p-3 font-mono text-xs leading-relaxed text-ink outline-none transition-colors focus:border-amber"
+              />
+            ) : (
+              <p className="text-sm text-ink-dim">Upload your resume&apos;s .tex to edit it here — every edit recompiles the PDF below.</p>
+            )}
+          </>
+        ) : (
+          <div className="space-y-3">
+            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-hairline px-3 py-2 text-sm text-ink-dim transition-colors hover:border-amber hover:text-ink">
+              <FileUp className="h-4 w-4" />
+              {docxName ? `Replace ${docxName}` : "Upload .docx"}
+              <input
+                type="file"
+                accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                className="sr-only"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) onSourceFile(f);
+                }}
+              />
+            </label>
+            {docxName && (
+              <div className="flex items-center gap-3">
+                <span className="font-mono text-[11px] text-ink-faint">{docxName} · stored</span>
+                <button onClick={convertDocx} disabled={compiling} className="btn-ghost px-3 py-1.5 text-xs">
+                  <RefreshCw className="h-3.5 w-3.5" /> {compiling ? "Converting…" : "Convert to PDF"}
                 </button>
               </div>
-              <iframe title="Resume PDF" src={previewUrl} className="mt-3 w-full flex-1 rounded-lg bg-white" />
-            </div>
+            )}
+            <p className="text-xs text-ink-faint">
+              .docx can&apos;t be live-edited here; conversion to PDF uses a local LibreOffice (set SOFFICE_PATH). For full
+              live editing, use the .tex tab.
+            </p>
           </div>
         )}
 
-        <label
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDragging(false);
-            const f = e.dataTransfer.files?.[0];
-            if (f) onFile(f);
-          }}
-          className={clsx(
-            "flex cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border border-dashed px-6 py-12 text-center transition-colors",
-            dragging ? "border-amber bg-amber/[0.06]" : "border-hairline hover:border-ink-dim"
-          )}
-        >
-          <UploadCloud className={clsx("h-7 w-7", dragging ? "text-amber" : "text-ink-dim")} />
-          <div className="text-sm text-ink">
-            {uploading ? "Uploading…" : stored ? "Replace your resume" : "Drop your resume PDF here"}
+        {/* generated-PDF name + save */}
+        <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-hairline pt-4">
+          <label className="block min-w-56 flex-1">
+            <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">Generated PDF filename (what recruiters see)</span>
+            <input
+              value={pdfName}
+              onChange={(e) => setPdfName(e.target.value)}
+              placeholder="Kevin-Wang-Resume.pdf"
+              className="mt-1.5 w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
+            />
+          </label>
+          <button onClick={save} disabled={!compiled || applying || compiling} className="btn-primary">
+            <FileCheck2 className="h-4 w-4" />
+            {applying ? "Saving…" : "Save as my resume"}
+          </button>
+        </div>
+
+        {/* live PDF preview */}
+        <div className="mt-4">
+          <div className="mb-2 flex items-center gap-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">
+            Live PDF preview
+            {compiling && <span className="text-amber">compiling…</span>}
           </div>
-          <div className="font-mono text-[11px] text-ink-faint">PDF · up to 10 MB · click to browse</div>
-          <input
-            ref={inputRef}
-            type="file"
-            accept="application/pdf,.pdf"
-            className="sr-only"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) onFile(f);
-              e.target.value = "";
-            }}
-          />
-        </label>
+          {compileErr && <p className="mb-2 text-sm text-signal">{compileErr}</p>}
+          {compiled ? (
+            <iframe title="Compiled resume PDF" src={compiled.url} className="h-[640px] w-full rounded-lg border border-hairline bg-white shadow-inner" />
+          ) : (
+            <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-hairline text-sm text-ink-faint">
+              {tab === "tex" ? "The compiled PDF appears here as you edit" : "Convert the .docx to see the PDF here"}
+            </div>
+          )}
+        </div>
 
         {msg && (
-          <p
-            className={clsx(
-              "mt-4 text-sm",
-              msg.kind === "ok" && "text-verified",
-              msg.kind === "err" && "text-signal",
-              msg.kind === "info" && "text-ink-dim"
-            )}
-          >
+          <p className={clsx("mt-4 text-sm", msg.kind === "ok" && "text-verified", msg.kind === "err" && "text-signal", msg.kind === "info" && "text-ink-dim")}>
             {msg.text}
             {msg.aiLink && (
               <>
@@ -274,41 +370,79 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
       </SectionCard>
 
       <SectionCard
-        title="Parse with AI"
-        subtitle="Pull your work history, education, and skills out of the PDF into your profile. Review before it's applied — nothing is committed silently."
+        title="Stored resume (attached to applications)"
+        subtitle="The saved PDF the extension uploads on every application."
+        actions={
+          stored ? (
+            <button onClick={clear} disabled={applying} className="inline-flex items-center gap-1.5 text-xs text-ink-faint transition-colors hover:text-signal">
+              <Trash2 className="h-3.5 w-3.5" />
+              Remove
+            </button>
+          ) : null
+        }
       >
-        <button
-          onClick={parse}
-          disabled={!file || parsing}
-          className="btn-primary"
-          title={!file ? "Choose a PDF above first" : undefined}
-        >
+        {stored ? (
+          <div className="flex items-center gap-3 rounded-lg border border-hairline bg-panel-raised/50 p-3">
+            <FileText className="h-5 w-5 text-verified" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm text-ink">{stored.filename}</div>
+              <div className="font-mono text-[11px] text-ink-faint">{kb(stored.size)} · stored</div>
+            </div>
+            <button
+              onClick={openPreview}
+              disabled={previewLoading}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-hairline px-2.5 py-1.5 text-xs text-ink-dim transition-colors hover:border-amber hover:text-ink"
+              title="View the stored PDF exactly as it will be attached"
+            >
+              <Eye className="h-3.5 w-3.5" />
+              {previewLoading ? "Opening…" : "Preview"}
+            </button>
+            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-verified">
+              <Check className="h-3.5 w-3.5" /> Ready
+            </span>
+          </div>
+        ) : (
+          <p className="text-sm text-ink-dim">Nothing stored yet — compile above and “Save as my resume”.</p>
+        )}
+
+        {previewUrl && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => setPreviewUrl(null)} role="dialog" aria-modal="true" aria-label="Resume preview">
+            <div className="bezel relative flex h-[90vh] w-full max-w-3xl flex-col p-4" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between border-b border-hairline pb-3">
+                <h2 className="font-display text-lg font-medium">
+                  {stored?.filename ?? "Resume"}{" "}
+                  <span className="font-mono text-[11px] font-normal text-ink-faint">— the stored PDF, as attached to applications</span>
+                </h2>
+                <button type="button" onClick={() => setPreviewUrl(null)} className="text-ink-dim transition-colors hover:text-ink" aria-label="Close">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <iframe title="Resume PDF" src={previewUrl} className="mt-3 w-full flex-1 rounded-lg bg-white" />
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="Parse with AI"
+        subtitle="Pull your work history, education, projects, and skills out of the compiled PDF into your profile. Review before it's applied — nothing is committed silently."
+      >
+        <button onClick={parse} disabled={!compiled || parsing} className="btn-primary" title={!compiled ? "Compile a PDF above first" : undefined}>
           <Sparkles className="h-4 w-4" />
           {parsing ? "Reading your resume…" : "Parse with AI"}
         </button>
-        {!file && (
-          <p className="mt-3 text-xs text-ink-faint">
-            Select a PDF above, then parse. Parsing uses your configured AI provider.
-          </p>
-        )}
+        {!compiled && <p className="mt-3 text-xs text-ink-faint">Compile a PDF above, then parse. Parsing uses your configured AI provider.</p>}
 
         {parsed && (
           <div className="mt-6 rounded-lg border border-hairline bg-panel-raised/40 p-5">
             <div className="flex items-center gap-2">
               <span className="h-2 w-2 rounded-full bg-verified" />
-              <span className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
-                Found in your resume
-              </span>
+              <span className="font-mono text-[11px] uppercase tracking-label text-ink-dim">Found in your resume</span>
             </div>
             <div className="mt-4 flex flex-wrap gap-2">
-              {summarize(parsed).length === 0 && (
-                <span className="text-sm text-ink-faint">No structured sections detected.</span>
-              )}
+              {summarize(parsed).length === 0 && <span className="text-sm text-ink-faint">No structured sections detected.</span>}
               {summarize(parsed).map((s) => (
-                <span
-                  key={s.label}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-hairline bg-panel px-2.5 py-1 text-sm"
-                >
+                <span key={s.label} className="inline-flex items-center gap-1.5 rounded-md border border-hairline bg-panel px-2.5 py-1 text-sm">
                   <span className="font-mono text-amber">{s.n}</span>
                   <span className="text-ink-dim">{s.label}</span>
                 </span>

@@ -166,6 +166,15 @@ test("fitTexToPages: already fitting → zero reverts; compiler unavailable → 
   assert.equal(dead.length_reverts, 0);
 });
 
+test("sanitizePdfName: always ends .pdf once, strips unsafe chars, never empty", async () => {
+  const { sanitizePdfName } = await import("@/lib/filenames");
+  assert.equal(sanitizePdfName("Kevin Wang Resume"), "Kevin Wang Resume.pdf");
+  assert.equal(sanitizePdfName("resume.pdf"), "resume.pdf");
+  assert.equal(sanitizePdfName("RESUME.PDF"), "RESUME.pdf");
+  assert.equal(sanitizePdfName('we<ird:na*me?.pdf'), "we-ird-na-me.pdf");
+  assert.equal(sanitizePdfName("   "), "resume.pdf");
+});
+
 test("shimForXetex: guards RAW pdfTeX primitives; idempotent on already-guarded lines", () => {
   const raw = "\\usepackage{tabularx}\n\\input{glyphtounicode}\nx\n\\pdfgentounicode=1\n";
   const shimmed = shimForXetex(raw);

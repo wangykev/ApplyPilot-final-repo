@@ -57,7 +57,7 @@ create trigger on_auth_user_created
 create table if not exists public.resumes (
   id            uuid primary key default gen_random_uuid(),
   user_id       uuid not null references auth.users (id) on delete cascade,
-  kind          text not null default 'default' check (kind in ('default','variant')),
+  kind          text not null default 'default' check (kind in ('default','variant','source')),
   job_id        uuid,
   filename      text not null,
   mime          text not null default 'application/pdf',
