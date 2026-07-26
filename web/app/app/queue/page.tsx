@@ -22,7 +22,7 @@ async function loadQueue(): Promise<QueueItem[]> {
     if (!user) return DEV_PREVIEW ? SAMPLE : [];
     const { data } = await supabase
       .from("queue_items")
-      .select("id, url, status, position")
+      .select("id, url, status, position, company, role, source, location, posted_at, job_description")
       .eq("user_id", user.id)
       .order("position", { ascending: true });
     if ((!data || data.length === 0) && DEV_PREVIEW) return SAMPLE;
@@ -39,7 +39,7 @@ export default async function QueuePage() {
       <PageHeader
         eyebrow="Apply in batches"
         title="Job queue"
-        description="Line up Workday applications and let the extension work through them, one fill → review at a time."
+        description="Line up Workday applications and let the extension work through them, one fill → review at a time. Paste links here, or let Discover on the Run page fill this from LinkedIn, Handshake and the Simplify board."
       />
       <QueuePanel items={items} />
     </div>

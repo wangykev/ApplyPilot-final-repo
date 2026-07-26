@@ -2,7 +2,7 @@
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first)
+importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
 
 // ============================================================================
 // EXTERNAL messages from ApplyPilot Web (the website → extension handoff).
@@ -24,6 +24,11 @@ importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js
 let runProgressPort = null;
 let lastRunProgress = null;
 let runInFlight = false;
+// A discovery sweep is in flight (the website's Discover button). MUTUALLY EXCLUSIVE with a
+// fill run — NOT for politeness: cdp.js tracks its attachment in a module-level `cdpTabId`, so a
+// discovery CDP read (the JD scrape on an arbitrary ATS host) would CLOBBER the walk's tracked tab
+// and detach it mid-fill. The two handlers refuse each other while either is set.
+let discoverInFlight = false;
 chrome.runtime.onConnectExternal.addListener((port) => {
   if (!port || port.name !== "ap-run-progress") return;
   runProgressPort = port;
@@ -172,6 +177,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           sendResponse({ ok: false, error: "bad-url", detail: "Pass a full https:// job link." });
           return;
         }
+        // A discovery sweep may be holding the CDP attachment (see discoverInFlight) — refuse
+        // rather than let the two fight over cdp.js's single tracked tab mid-fill.
+        if (discoverInFlight) {
+          sendResponse({ ok: false, error: "discover-in-flight", detail: "A job-discovery sweep is running. Wait for it to finish, then run again." });
+          return;
+        }
         const store = await new Promise((r) =>
           chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r)
         );
@@ -247,6 +258,78 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       }
     })();
     return true; // async sendResponse — the full run keeps the port open (the debugger session keeps the SW alive)
+  }
+
+  // JOB DISCOVERY (the website "Discover" button on /app/run). Sweeps the operator's
+  // signed-in LinkedIn + Handshake job searches and the SimplifyJobs 2026 internship board
+  // for recently-posted jobs they have NOT already applied to / queued, opens each posting
+  // just long enough to scrape its description, closes it, and RETURNS the list. The website
+  // persists the result into `queue_items` — discovery itself writes NOTHING (same
+  // "engine computes / the caller does I/O" split the fill engine follows) and NEVER applies.
+  //
+  // The website passes `knownKeys` (discoveryJobKey of every application + queued job it
+  // already has) so the sweep can skip them BEFORE spending a tab open on their JD; the
+  // website de-dupes again on insert, which is the authoritative pass.
+  if (type === "AP_DISCOVER_JOBS") {
+    (async () => {
+      // discoverInFlight FIRST: this handler sets runInFlight too (to keep the progress port
+      // replaying), so checking runInFlight first would mislabel a second sweep as "a run".
+      if (discoverInFlight) {
+        sendResponse({ ok: false, error: "discover-in-flight", detail: "A discovery sweep is already running." });
+        return;
+      }
+      if (runInFlight) {
+        sendResponse({ ok: false, error: "run-in-flight", detail: "An application run is in progress. Wait for it to finish, then discover again." });
+        return;
+      }
+      discoverInFlight = true;
+      runInFlight = true; // keeps the progress port replaying this sweep's phases (see onConnectExternal)
+      try {
+        const out = await runJobDiscovery({
+          sources: message.sources || undefined,
+          knownKeys: Array.isArray(message.knownKeys) ? message.knownKeys : [],
+          query: typeof message.query === "string" ? message.query : undefined,
+          sinceDays: message.sinceDays,
+          maxPerSource: message.maxPerSource,
+          maxTotal: message.maxTotal,
+          maxJdOpens: message.maxJdOpens,
+          termPattern: message.termPattern,
+          background: message.background !== false, // sweep tabs open UNFOCUSED by default
+        });
+        sendResponse(out);
+      } catch (e) {
+        // runJobDiscovery is never-throws by contract; this is the belt for a load-order /
+        // programming error, so the website gets a real message instead of a dead port.
+        sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      } finally {
+        discoverInFlight = false;
+        runInFlight = false;
+      }
+    })();
+    return true; // async sendResponse — a sweep takes as long as its tab opens
+  }
+
+  // DISCOVERY RECON (read-only). Opens each board's search page in the operator's real
+  // signed-in session and dumps what the DOM actually looks like — selector hit-counts plus
+  // one representative card's markup — so the list scrapers' selector ladders can be
+  // tightened from OBSERVATION instead of the structure-first guesses they ship with.
+  // Same role the CDP recon harnesses play for a new Workday tenant. Queues nothing.
+  if (type === "AP_DISCOVER_RECON") {
+    (async () => {
+      if (runInFlight || discoverInFlight) {
+        sendResponse({ ok: false, error: "busy", detail: "A run or sweep is in progress." });
+        return;
+      }
+      discoverInFlight = true;
+      try {
+        sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query, background: message.background !== false }));
+      } catch (e) {
+        sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      } finally {
+        discoverInFlight = false;
+      }
+    })();
+    return true;
   }
 
   // Account sign-in credentials (email + password) → chrome.storage.local.credentials, the
@@ -392,6 +475,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // creating the OAuth client) before trusting auto-verify. [GMAIL-TEST] in the SW console.
   if (message.type === "RUN_GMAIL_TEST") {
     (async () => { const out = await runGmailSmokeTest(true); sendResponse(out); })();
+    return true; // async sendResponse
+  }
+
+  // JOB DISCOVERY from the POPUP — the same sweep the website's Discover button runs, minus
+  // the backend. Without the website there are no knownKeys, so nothing is filtered as
+  // already-applied and NOTHING is queued: this is the dry-run / debugging entry point.
+  // Results land in the SW console. Use the website's Discover button for the real flow.
+  if (message.type === "RUN_DISCOVER") {
+    (async () => {
+      if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
+      discoverInFlight = true;
+      try {
+        const out = await runJobDiscovery({
+          sources: message.sources || undefined,
+          query: message.query,
+          sinceDays: message.sinceDays,
+          maxJdOpens: message.maxJdOpens,
+          knownKeys: [],
+        });
+        console.log("[ApplyPilot][DISCOVER] popup sweep result (nothing was queued — no website connected):", JSON.stringify(out.stats), out.notes);
+        for (const j of out.jobs) console.log(`  · [${j.source}] ${j.company || "?"} — ${j.title || "?"} (${j.description ? j.description.length + " char JD" : "no JD"}) ${j.url}`);
+        sendResponse(out);
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      } finally { discoverInFlight = false; }
+    })();
+    return true; // async sendResponse
+  }
+
+  // DISCOVERY RECON from the popup — read-only DOM dump of the LinkedIn/Handshake search
+  // pages in the operator's signed-in session. Run this FIRST on a fresh install (or after a
+  // board redesign) and paste the [DISCOVER-RECON] output back, so the list scrapers'
+  // selectors come from observation. Trace before trusting — the standing working principle.
+  if (message.type === "RUN_DISCOVER_RECON") {
+    (async () => {
+      if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
+      discoverInFlight = true;
+      try { sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query })); }
+      catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+      finally { discoverInFlight = false; }
+    })();
     return true; // async sendResponse
   }
 

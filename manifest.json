@@ -11,6 +11,9 @@
   "host_permissions": [
     "*://*.myworkdayjobs.com/*",
     "*://*.myworkdaysite.com/*",
+    "https://www.linkedin.com/*",
+    "https://app.joinhandshake.com/*",
+    "https://raw.githubusercontent.com/*",
     "https://gmail.googleapis.com/*",
     "https://api.anthropic.com/*",
     "https://generativelanguage.googleapis.com/*",

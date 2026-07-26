@@ -493,6 +493,43 @@ document.getElementById("gmail-connect").addEventListener("click", () => {
   });
 });
 
+// ── Job discovery (popup DRY RUN) ───────────────────────────────────────────
+// The same sweep the website's Discover button drives, minus the backend: with no website
+// there are no known job keys to filter against and nowhere to store the result, so this
+// only LOGS. It's the debugging / first-look path — the real flow is /app/run → Discover.
+const discoverSources = () => ({
+  simplify: document.getElementById("discover-simplify").checked,
+  linkedin: document.getElementById("discover-linkedin").checked,
+  handshake: document.getElementById("discover-handshake").checked,
+});
+
+document.getElementById("discover-run").addEventListener("click", () => {
+  const query = document.getElementById("discover-query").value.trim();
+  const sinceDays = Number(document.getElementById("discover-days").value) || 7;
+  setStatus("Discovering jobs (opens board tabs + one tab per posting for its description, then closes them)… see [DISCOVER] in the service worker console.");
+  chrome.runtime.sendMessage({ type: "RUN_DISCOVER", sources: discoverSources(), query, sinceDays }, (resp) => {
+    if (chrome.runtime.lastError || !resp) { setStatus("Discovery: no response — see the service worker console."); return; }
+    if (resp.ok === false) { setStatus("Discovery failed: " + (resp.error || "unknown")); return; }
+    const s = resp.stats || {};
+    const per = Object.entries(s.bySource || {}).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
+    setStatus(
+      `✓ ${s.newJobs} new job(s) — ${per}. Scanned ${s.found}, skipped ${s.skippedKnown} known + ${s.skippedDupe} dupes; ` +
+      `read ${s.jdOpened - s.jdFailed}/${s.jdOpened} descriptions. NOTHING was queued (popup dry run).` +
+      (resp.notes && resp.notes.length ? " ⚠ " + resp.notes.join(" ") : "")
+    );
+  });
+});
+
+document.getElementById("discover-recon").addEventListener("click", () => {
+  setStatus("Discovery recon: opening the board search pages read-only… see [DISCOVER-RECON] in the service worker console for the DOM dump.");
+  chrome.runtime.sendMessage({ type: "RUN_DISCOVER_RECON", sources: discoverSources(), query: document.getElementById("discover-query").value.trim() }, (resp) => {
+    if (chrome.runtime.lastError || !resp) { setStatus("Recon: no response — see the service worker console."); return; }
+    if (resp.ok === false) { setStatus("Recon failed: " + (resp.error || "unknown")); return; }
+    const names = Object.keys(resp.recon || {});
+    setStatus(`✓ Recon dumped for: ${names.join(", ") || "nothing"}. Open the service worker console and copy the [DISCOVER-RECON] JSON.`);
+  });
+});
+
 document.getElementById("cdp-onboard").addEventListener("click", () => {
   setStatus("Onboarding: apply → apply manually → login → verify → form. Keep the tab VISIBLE. See [ONBOARD] in the service worker console.");
   chrome.runtime.sendMessage({ type: "RUN_CDP_ONBOARD" }, (resp) => {

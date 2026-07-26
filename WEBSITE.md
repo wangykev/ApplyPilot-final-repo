@@ -81,6 +81,8 @@ handoff contract).
 | `AP_SET_SESSION` | reporting + review-pull credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey, reviewUrl }` |
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
 | `AP_CLEAR_RESUME` | remove the stored resume (inverse of `AP_SYNC_RESUME`) | IndexedDB `deleteResume()` — idempotent |
+| `AP_DISCOVER_JOBS` | **sweep the job boards** (the `/app/run` Discover button) — reads only, writes NOTHING | returns `{ ok, jobs[], stats, notes[] }`; the WEBSITE persists them via `saveDiscovered` |
+| `AP_DISCOVER_RECON` | read-only DOM dump of the LinkedIn/Handshake search pages, for tightening the list scrapers | returns `{ ok, recon }` — queues nothing |
 
 - **Live sync (M13).** Connecting once is enough: after the extension id is saved on the device
   (`localStorage["applypilot.extensionId"]`, the Connect page), every profile / bucket / AI-config /
@@ -266,7 +268,7 @@ per-entry `is_approved`/`current_value`/`edit_kind`/`is_deleted`.
 - `resumes` — `id, user_id, kind('default'|'variant'), job_id?, filename, mime, size, storage_path, created_at`.
 - **Storage buckets:** `resumes` (0001) + `attachments` (0003) — both private, objects path-namespaced under `<uid>/`.
 - `applications` — `id, user_id, company, role, url, status('queued'|'filling'|'needs_review'|'submitted'|'interviewing'|'offer'|'rejected'), needs_review_count, review_bundle_json?, applied_at, …`.
-- `queue_items` — `id, user_id, url, status, position, created_at`.
+- `queue_items` — `id, user_id, url, status, position, created_at` + the discovery columns (migration `0010`): `job_key, company, role, source, location, posted_at, job_description`. A PASTED row leaves those null and renders exactly as before; a DISCOVERED row carries its board, freshness and scraped JD. Partial unique index on `(user_id, job_key) where job_key is not null` = one row per job per user, and the race backstop for two concurrent sweeps.
 - `reminders` — `id, application_id, due_at, note`.
 - `api_keys` — `id, user_id, key_hash, label, last_used_at` (the extension ingest credential).
 
@@ -287,7 +289,7 @@ per-entry `is_approved`/`current_value`/`edit_kind`/`is_deleted`.
 > the resume record, the `AP_*` handoff — is UNCHANGED by main. Extension suite 578/578 green; web
 > production build green.
 - **P5 (cover letters done; resume variants pending)** — `/app/cover-letter`: generate a tailored cover letter from the profile + a pasted posting via the user's LLM (`lib/cover-letter.ts` prompt + `generateCoverLetter` action), editable, copy-to-clipboard, grounded-only-in-profile. AI-tailored resume *variants* (resume `variant` rows) are the remaining P5 piece.
-- **P6** — Auto-discover jobs (board integrations) + production hardening (pinned extension ID via manifest `key`, encrypted keys, deploy).
+- **P6 (auto-discover built, live-verify pending)** — **Job discovery** (M16 below): the Discover button on `/app/run` fills `queue_items` from the Simplify 2026 board + the operator's signed-in LinkedIn/Handshake sessions. Remaining P6: production hardening (pinned extension ID via manifest `key` — now done, encrypted keys, deploy) and more boards.
 
 ---
 
@@ -332,6 +334,13 @@ extension's discipline.
   **Tracker dedup** — a stable `job_key = "<datacenter>:r<reqid>"` (`web/lib/job-key.ts`, lockstep with the extension's `canonicalJobUrl`; migration `0008` + index) so re-runs of a job update ONE row (the raw application url changes every run). Both writers upsert by (user_id, job_key); the tracker/detail render company + title, host only as a fallback.
   **Profile polish** — Save is dirty-gated; "How did you hear" seeds "Other" as the last list entry (the separate last-resort field retired); `web/supabase/schema.sql` is a consolidated one-paste snapshot of all migrations.
 - **M15 — Teach-flow correctness** *(done; web typecheck + build green, `test/teach.test.ts` extended)*: the teach page now surfaces exactly what the operator must act on. `isTeachable` UNCHANGED (AI-filled + approved, or a manual edit). A **"Skipped (N)"** section reveals + restores skipped cards. **`coveredKeys(buckets, profile)`** treats a bucket as "covering" a question only when it can actually answer it (Mode-A bound field non-empty / Mode-B value non-empty) — an empty/unanswered bucket (or a profile field the operator removed) resurfaces the question with the "add it back" warning. **#4:** an AI-filled entry is not hidden by `covered` even when a bucket nominally covers it (proof the saved value didn't match this tenant). The card recommends the matching Mode-A bucket's bound field (`bucket_path`) over the AI's `maps_to` hint; `profileValueAt` no longer renders "[object Object]" for object paths. Fixed the "Remember wording" popup flash (persist-then-apply in `commit()`).
+
+- **M16 — Job discovery: a Discover button that fills the queue** *(built 2026-07-26; extension 718/718, web 56/56, typecheck + build green; **live-verify pending**)*: the site can now FIND work, not just run it.
+  **`/app/run` → Discover (`DiscoverPanel.tsx`)** — pick sources (Simplify 2026 internships / LinkedIn / Handshake), an optional keyword, a "posted within N days" window and a "read up to N descriptions" cap, then one button. It sends **`AP_DISCOVER_JOBS`** to the extension with `knownKeys` (every `applications` row INCLUDING soft-deleted, plus every `queue_items` row — each contributing both its stored `job_key` and a freshly-derived one, so a legacy row can't re-surface), streams live phases over the existing run-progress port, then **auto-saves the result to the queue** (`saveDiscovered`) and lists what landed. Nothing is applied to.
+  **Where the jobs come from.** The **Simplify** board publishes structured JSON (`.github/scripts/listings.json`), so it's a plain fetch with a real `date_posted` — only `active && is_visible` rows survive. **LinkedIn + Handshake** are read out of real, unfocused tabs using **the operator's own cookies** (their explicit choice — no API keys, no credential handling, and discovery never attempts a login); a source that isn't signed in says so and is skipped rather than returning a misleading zero.
+  **Dedup (`lib/discover.ts`).** `discoveryJobKey` extends `canonicalJobUrl` with board ids (`linkedin:`/`handshake:`/`greenhouse:`/`lever:`/`ashby:`), Workday FIRST so a Simplify-board job keys identically to the `applications.job_key` written after applying — the invariant that makes "jobs I have not yet applied to" hold across the two tables. **LOCKSTEP with the extension's `discover.js`, and TEST-ENFORCED:** `test/discover.test.ts` cross-loads the real `discover.js` and fails if the two copies disagree. `saveDiscovered` re-derives every key **server-side** (a client-supplied key is ignored), dedupes against both tables, and leans on the partial unique index for races.
+  **Storage + UI.** Migration `0010_queue_discovery.sql` adds `job_key/company/role/source/location/posted_at/job_description` to `queue_items`; `/app/queue` rows now lead with company · role, a source badge, location, freshness and a JD toggle (a pasted row is unchanged). `GET /api/extension/queue` returns the metadata too, minus the JD (up to 20k chars/row, and nothing consuming the queue needs it).
+  **Known gap, stated plainly:** the LinkedIn/Handshake **list scrapers were written structure-first, NOT DOM-traced** (both need an authenticated session the build environment doesn't have). They anchor on posting-id links and degrade through selector ladders, and a **"Discover recon"** entry point (popup + `AP_DISCOVER_RECON`) dumps the real card markup so they can be tightened from observation — do that before trusting the counts.
 
 ## Design directions (under review)
 

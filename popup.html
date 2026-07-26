@@ -49,6 +49,26 @@
          [ONBOARD] in the service-worker console. -->
     <button id="cdp-onboard">Start application (apply → login → verify → form)</button>
     <hr>
+    <div class="section-title">Job discovery (LinkedIn · Handshake · Simplify board)</div>
+    <!-- DRY RUN of the sweep the website's Discover button drives. LinkedIn + Handshake are read
+         from YOUR signed-in session (cookies — no API key, no login attempt); the Simplify 2026
+         internship board is a plain fetch of its published listings.json. Each posting is opened
+         just long enough to scrape its description, then closed. Nothing is applied to, and from
+         the POPUP nothing is queued either (there's no website here to store it) — results land in
+         the service-worker console as [DISCOVER]. Use the website's Discover button for real. -->
+    <label for="discover-query">Keyword filter (blank = everything recent):</label>
+    <input id="discover-query" type="text" placeholder="software engineer intern">
+    <label for="discover-days">Posted within (days):</label>
+    <input id="discover-days" type="number" min="1" max="60" value="7">
+    <label><input id="discover-simplify" type="checkbox" checked> Simplify 2026 internships (GitHub board)</label>
+    <label><input id="discover-linkedin" type="checkbox" checked> LinkedIn (your signed-in session)</label>
+    <label><input id="discover-handshake" type="checkbox" checked> Handshake (your signed-in session)</label>
+    <button id="discover-run">Discover jobs (dry run — logs, queues nothing)</button>
+    <!-- RECON FIRST on a fresh install / after a board redesign: dumps what the LinkedIn and
+         Handshake search pages ACTUALLY look like in your session (selector hit-counts + one real
+         card's markup) so the list scrapers stop guessing. [DISCOVER-RECON] in the SW console. -->
+    <button id="discover-recon">Discover recon (dump the board DOM — read-only)</button>
+    <hr>
     <div class="section-title">CDP fill</div>
     <!-- CDP fill FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
          flat fields AND every repeating section present. On page 1 == simple-widgets; on page 2

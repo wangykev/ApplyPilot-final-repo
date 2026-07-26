@@ -1117,3 +1117,73 @@ fields (it's a deterministic tier like buckets — the AI fallbacks stay require
   contradiction flag + agreement-silent + consent-unchanged, optional-checkbox No/Yes/pre-ticked, text
   silent-No/Yes-review/detail-request-bail/overwrite, textarea, optional-radio tier). Live-confirmation on
   Magna pending.
+
+## 2026-07-26 — Job DISCOVERY: a Discover button that fills the queue from LinkedIn + Handshake + the Simplify board (branch `discover-jobs`)
+
+Operator ask: *"on the run page … make a discover button. that opens a linkedin, handshake, and github of the
+simplify 2026 internships page. Finds recently posted jobs that I have not yet applied to and adds them to a
+queue stored on the website. If the job description is not on the page, physically open the link, scrape the
+jd, and close it."* Follow-up: *"The linkedin and handshake pages will use my account since I will be logged
+in with cookies."* — so the boards are read out of the operator's OWN signed-in tabs; no API keys, no
+credential handling, and discovery never attempts a login.
+
+The stage BEFORE the queue. New `discover.js` (SW, importScripts after lib.js) + `AP_DISCOVER_JOBS` /
+`AP_DISCOVER_RECON` external handlers + a `DiscoverPanel` on `/app/run`. **Reads only — never applies,
+never submits, and writes nothing itself:** the sweep RETURNS jobs and the WEBSITE persists them
+(`saveDiscovered` → `queue_items`), extending "engine computes / the caller does I/O" one level out.
+
+- **Three sources, cheapest substrate that works.**
+  - **simplify** — the SimplifyJobs/Summer2026-Internships board publishes STRUCTURED JSON
+    (`.github/scripts/listings.json`: `company_name, title, url, locations, terms, category, active,
+    is_visible, date_posted` unix-s — schema verified against the live file), so it's a plain `fetch`: no
+    tab, no scraping, and a REAL posted date to filter on. Scraping the rendered README would be strictly
+    worse. Only `active && is_visible` rows survive — an inactive row is a CLOSED posting, and queueing one
+    would waste a whole run.
+  - **linkedin / handshake** — the operator's logged-in job search, read from a real unfocused tab through
+    their cookies. LinkedIn's `f_TPR=r<seconds>` + `sortBy=DD` make the SOURCE do the recency filtering
+    (far cheaper than scraping a year of postings and dropping them here).
+- **⚠ Selector confidence, stated honestly.** The Simplify feed is a verified published contract. The
+  LinkedIn/Handshake list scrapers could NOT be traced from the build environment (both need an
+  authenticated session), so against the standing "trace the real DOM — don't guess" principle they are
+  written **structure-first**: anchor on the one thing that has survived every redesign (an `<a href>`
+  carrying the posting id — `/jobs/view/<id>`, `/jobs/<id>`), walk UP to the enclosing card, then read
+  title/company/location/date through a selector LADDER with a text-line fallback. They report
+  `signedIn` + a per-source note rather than silently returning nothing. **`runDiscoverRecon`
+  (`AP_DISCOVER_RECON` / popup "Discover recon") dumps the real card markup + selector hit-counts from the
+  operator's session** — run it once per board and tighten the ladders from observation.
+- **The JD pass — "physically open the link, scrape the jd, and close it."** `fillMissingDescriptions`
+  opens each posting ONE tab at a time (never a fan-out), scrapes via the generic `scrapeJobPosting`
+  ladder (Workday/Greenhouse/Lever/Ashby/Oracle + a largest-text-block fallback), and closes it in a
+  `finally` — a thrown scraper can't leak a tab. A failed scrape is NON-FATAL: the job still queues with
+  an empty description, because a missing JD is a nice-to-have, not a reason to lose a posting.
+- **Reading arbitrary ATS hosts without an `<all_urls>` grab.** `discoverReadPage` tries
+  `chrome.scripting` first (for the hosts we DO take: linkedin, handshake, raw.githubusercontent) and
+  falls back to **CDP** for arbitrary employer pages — `chrome.debugger` is not host-gated, the same
+  invariant the Workday walk already relies on. Cost: Chrome's "started debugging" infobar for the moment
+  the tab is open. **`discoverInFlight` ⟷ `runInFlight` are now MUTUALLY EXCLUSIVE** — not politeness:
+  cdp.js tracks its attachment in a module-level `cdpTabId`, so a discovery CDP read would clobber a
+  running walk's tracked tab and detach it mid-fill.
+- **Dedup — the load-bearing bit.** `discoveryJobKey` extends the tracker's `canonicalJobUrl` with board
+  ids (`linkedin:<id>`, `handshake:<id>`, `greenhouse:<co>:<id>`, lever, ashby). Ordering matters: a
+  Workday posting keys through `canonicalJobUrl` FIRST, so a job found on the Simplify board (whose url IS
+  the employer's Workday link) produces the SAME key `applications.job_key` holds after it's applied to —
+  that is what makes "jobs I have not yet applied to" actually hold across the two tables. The website
+  sends `knownKeys` (applications INCLUDING soft-deleted + every queue row, each contributing both its
+  stored key and a freshly-derived one so legacy rows don't re-surface) so the sweep skips them BEFORE
+  spending a tab open; `saveDiscovered` re-derives every key SERVER-SIDE (a client-supplied key is
+  ignored) and dedupes authoritatively, with the partial unique index on `(user_id, job_key)` as the
+  race backstop.
+- **Bounded by construction + NO SILENT CAPS.** `maxPerSource` 25 / `maxTotal` 60 / `maxJdOpens` 10, and
+  whatever a cap drops is reported as a note ("N more matched but were left out by the cap") — "found 60"
+  must not read as "that's all there is". An UNKNOWN posted date counts as FRESH (unit-pinned): every
+  source is already time-bounded upstream, so an unparseable date is far more likely a parse gap than a
+  stale job, and dropping it would hide real postings invisibly.
+- **Storage:** migration `0010_queue_discovery.sql` adds `job_key/company/role/source/location/posted_at/
+  job_description` to `queue_items` + the partial unique index. A PASTED row leaves them null and renders
+  exactly as before; a DISCOVERED row leads with company · role · source · freshness · a JD toggle.
+- Verified: extension suite **718 pass, 0 fail** (+29 discover tests); web suite **56 pass, 0 fail**
+  (+11, including a **LOCKSTEP test that cross-loads the extension's real `discover.js`** and asserts both
+  `discoveryJobKey` copies agree — drift is now a test failure, not a production surprise); web typecheck
+  + production build green. **Live-verify PENDING** (needs the operator's signed-in Chrome): run
+  **Discover recon first** per board, tighten the LinkedIn/Handshake ladders from the dump, then a real
+  sweep.
