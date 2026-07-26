@@ -4461,17 +4461,24 @@ async function sweepAlreadyFilled(act, results) {
       if (!o || !o.label) continue;
       const fieldName = "consent." + o.key;
       if (results.some((r) => r.fieldName === fieldName)) continue;
+      // Status semantics (operator 2026-07-25):
+      //   • CHECKED on the page → a live value ApplyPilot did NOT set → the already-filled convention
+      //     (filled_review / already_on_form): worth one look, e.g. a pre-ticked marketing consent.
+      //   • UNCHECKED + OPTIONAL → the correct resting state and the operator's own choice → plain
+      //     `skipped`: it still SHOWS in ALL FIELDS and is tickable, but it is NOT a review item.
+      //   • UNCHECKED + REQUIRED → it will block Save & Continue → needs_review, loudly.
+      const checked = !!o.checked;
       results.push({
         fieldName, label: o.label, widgetType: "checkbox", isRequired: !!o.required,
         mappedPath: null, rawValue: null, resolved: null,
-        // Unchecked + optional = the correct resting state, but the operator should SEE it → review it.
-        // Already checked (tenant default) → surfaced as-is, also for review.
-        status: o.checked ? "filled_review" : "needs_review",
-        matchTier: null, confidence: null, flag: "consent-checkbox", verified: null,
-        after: String(!!o.checked),
-        detail: o.checked
+        status: checked ? "filled_review" : (o.required ? "needs_review" : "skipped"),
+        matchTier: null, confidence: null, flag: checked ? "already-filled" : "consent-checkbox", verified: null,
+        after: checked ? "true" : null,
+        detail: checked
           ? "consent checkbox OUTSIDE the form's field set — already checked on the page; verify you want it"
-          : "consent checkbox OUTSIDE the form's field set — left UNCHECKED by ApplyPilot (an optional consent is yours to give); tick it in review if you want it",
+          : (o.required
+            ? "REQUIRED consent checkbox OUTSIDE the form's field set — unchecked; it will block Save & Continue until you tick it"
+            : "optional consent checkbox — left unchecked (yours to give); tick it here if you want it"),
         auditLoc: o.selector || null
       });
     }
@@ -5990,6 +5997,15 @@ function buildReviewBundle(results, meta) {
       return { needs_review: true, needs_review_reason: "already_on_form" }; // has a value (verify) OR required + empty (needs a value)
     }
     if (rec.flag === "already-filled-match") return { needs_review: false, needs_review_reason: null }; // already on the form AND equals the profile value → correct, no flag
+    // CONSENT CHECKBOX outside the form's field set (the orphan sweep). An OPTIONAL one left UNCHECKED
+    // is the CORRECT resting state and the operator's own choice — it SHOWS in ALL FIELDS (tickable if
+    // they want it) but must NOT nag (operator 2026-07-25: "that checkbox is optional, no need for
+    // review"). Mirrors the KNOWN-empty-section rule. A REQUIRED one left unchecked WILL block Save &
+    // Continue, so that one stays a review item (its record is pushed as needs_review).
+    if (rec.flag === "consent-checkbox") {
+      if (rec.status === "needs_review") return { needs_review: true, needs_review_reason: "already_on_form" };
+      return { needs_review: false, needs_review_reason: null };
+    }
     if (rec.flag === "nested-unfilled") return { needs_review: true, needs_review_reason: "nested_section" }; // a nested repeating field (cert → specialty) — operator fills/verifies
     if (rec.flag === "nested-section-stub") return { needs_review: true, needs_review_reason: "nested_section" }; // an EMPTY nested sub-section (reveal-by-add) — operator adds/verifies entries
     if (rec.flag === "nested-attachment") return { needs_review: true, needs_review_reason: "nested_attachment" }; // a per-entry attachment — upload on the form

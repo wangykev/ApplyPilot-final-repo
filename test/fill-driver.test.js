@@ -2845,9 +2845,13 @@ test("orphan consent checkbox: inventoried for review, left UNCHECKED, zero actu
   const rec = out.results.find((r) => r.fieldName === "consent.smsConsent");
   assert.ok(rec, "the orphan consent checkbox reaches the review records");
   assert.strictEqual(rec.flag, "consent-checkbox");
-  assert.strictEqual(rec.after, "false", "left UNCHECKED — an optional consent is the operator's to give");
+  assert.strictEqual(rec.status, "skipped", "OPTIONAL + unchecked is the correct resting state — visible, but NOT a review item");
   assert.strictEqual(rec.label, SMS);
   assert.ok(!act.log.some(([m]) => m === "clickCheckboxLabel"), "never actuated");
+  const bundle = buildReviewBundle(out.results, { page: "p1", url: "u", tenant: "t", capturedAt: "now" });
+  const be = bundle.entries.find((e) => String(e.field_id).includes("consent.smsConsent"));
+  assert.ok(be, "reaches the bundle (ALL FIELDS)");
+  assert.strictEqual(be.needs_review, false, "does NOT nag in NEEDS REVIEW (operator: it's optional)");
 });
 
 test("orphan consent checkbox: one ALREADY checked by the tenant is surfaced for verification, not silently kept", async () => {
@@ -2857,6 +2861,18 @@ test("orphan consent checkbox: one ALREADY checked by the tenant is surfaced for
   const rec = out.results.find((r) => r.fieldName === "consent.marketing");
   assert.strictEqual(rec.status, "filled_review");
   assert.strictEqual(rec.after, "true");
+});
+
+test("orphan consent checkbox: a REQUIRED one left unchecked IS a review item (it blocks Save & Continue)", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  act.scanOrphanCheckboxes = async () => [{ key: "mustAgree", checked: false, required: true, label: "I agree to the terms" }];
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "consent.mustAgree");
+  assert.strictEqual(rec.status, "needs_review");
+  const bundle = buildReviewBundle(out.results, { page: "p1", url: "u", tenant: "t", capturedAt: "now" });
+  const be = bundle.entries.find((e) => String(e.field_id).includes("consent.mustAgree"));
+  assert.ok(be, "the required consent reaches the bundle");
+  assert.strictEqual(be.needs_review, true, "a REQUIRED unchecked consent must surface — it blocks the page");
 });
 
 test("orphan consent checkbox: absent substrate / none on the page ⇒ no records (inert)", async () => {
