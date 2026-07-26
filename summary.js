@@ -540,6 +540,12 @@ function buildEditor(entry) {
   if (wt === "dropdown" && entry.options && entry.options.length) return selectFrom(entry.options);
   if (wt === "radio" && entry.options && entry.options.length) return selectFrom(entry.options);
   if (wt === "radio") return Object.assign(textInput("input"), { partial: true }); // options not captured → free text + the partial note (don't silently degrade to a bare box)
+  // CHECKBOX GROUP (2026-07-25) — a pick-one set of checkboxes in one wrapper (the OFCCP disability
+  // self-ID). Radio-like → the SAME <select> editor. Its options come from the page scan (read
+  // straight from the DOM, no actuation), so a field the bot deliberately left BLANK — a voluntary
+  // EEO/self-ID question is the operator's to answer — still renders a real picker, not a textbox.
+  if (wt === "checkbox_group" && entry.options && entry.options.length) return selectFrom(entry.options);
+  if (wt === "checkbox_group") return Object.assign(textInput("input"), { partial: true });
   if (wt === "checkbox") {
     const cb = el("input", { class: "editor-check", type: "checkbox" });
     cb.checked = checkedOf(entry.current_value);

@@ -853,6 +853,17 @@ function cdpPageScan() {
     if (wrapper.querySelector('input[type="radio"]')) return "radio";
     if (wrapper.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     if (wrapper.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    // CHECKBOX GROUP (2026-07-25, Caterpillar's OFCCP disability self-ID): several checkboxes in ONE
+    // wrapper acting as a pick-one ("Yes, I have a disability…" / "No…" / "I do not want to answer" —
+    // the operator had to UNCHECK the current one to change it). Previously fell through to "unknown",
+    // which the review editor renders as a bare TEXTBOX. Radio-like, so it gets radio-like handling.
+    if (wrapper.querySelectorAll('input[type="checkbox"]').length > 1) return "checkbox_group";
+    // DATE composite (2026-07-25): Workday renders a date as 2–3 `dateSection*-input` spinbuttons in a
+    // `dateInputWrapper`. Those inputs have NO type attribute, so they counted as "text-like" — three of
+    // them meant textLike.length !== 1 and the field fell through to "unknown", i.e. a bare TEXTBOX in
+    // review with no idea whether the form wants MM/YYYY or MM/DD/YYYY (live: Caterpillar's self-ID
+    // "Date"). The segment ids also give the ORDER + granularity, carried as dateSegments below.
+    if (wrapper.querySelector('[data-automation-id^="dateSection"][data-automation-id$="-input"]')) return "date";
     const textLike = Array.from(wrapper.querySelectorAll("input")).filter((el) => {
       const t = (el.getAttribute("type") || "").toLowerCase();
       return t === "" || ["text", "email", "tel", "number", "url"].includes(t);
@@ -894,6 +905,19 @@ function cdpPageScan() {
     }
     return false;
   };
+  // REVIEW ORDER (2026-07-25, operator): which repeating SECTION does a repeating wrapper belong to?
+  // (the fkit base of the nearest indexed ancestor, e.g. "workExperience-2--null" → "workExperience").
+  // Paired with the document-order index below it lets the review list flat fields and repeating
+  // sections INTERLEAVED exactly as the form lays them out, instead of all-flat-then-all-sections.
+  const sectionBaseOf = (w) => {
+    let el = w.closest("[data-fkit-id]");
+    while (el) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)-\d+--/.exec(el.getAttribute("data-fkit-id") || "");
+      if (m) return m[1];
+      el = el.parentElement ? el.parentElement.closest("[data-fkit-id]") : null;
+    }
+    return null;
+  };
   // The field's CURRENT live value (the already-filled sweep: the review must inventory everything
   // the page holds, not just what the bot filled). LOCKSTEP with cdpRepeatingScan's valueOf. Empty
   // date segments render their "MM"/"DD"/"YYYY" placeholder text → filtered (never counts as filled).
@@ -903,27 +927,61 @@ function cdpPageScan() {
       if (wt === "typeahead" || wt === "hierarchical") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
       if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
       if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
+      if (wt === "checkbox_group") { // the CHECKED option's label (radio-like) — the review's "current value"
+        const c = wr.querySelector('input[type="checkbox"]:checked'); if (!c) return null;
+        const lab = c.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(c.id) : c.id) + '"]') : null;
+        return lab ? (lab.textContent || "").trim() : "selected";
+      }
       const segs = Array.from(wr.querySelectorAll('[data-automation-id^="dateSection"][data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t));
       if (segs.length) return segs.join("/");
       const inp = wr.querySelector("input, textarea"); return inp ? (inp.value || null) : null;
     } catch (e) { return null; }
   };
   const all = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
+  // Document-order position of EVERY formField wrapper (flat + repeating) — the ordering key the
+  // review uses. A repeating SECTION's position is the position of its FIRST field, so a flat field
+  // that sits between two sections on the form stays between them in the review.
+  const domPos = new Map();
+  const sectionOrder = {};
+  all.forEach((w, i) => {
+    domPos.set(w, i);
+    const b = isRepeating(w) ? sectionBaseOf(w) : null;
+    if (b && sectionOrder[b] === undefined) sectionOrder[b] = i;
+  });
   const wrappers = all.filter((w) => !isRepeating(w));
   return {
     url: location.href,
     repeatingFieldCount: all.length - wrappers.length,
+    sectionOrder,
     fields: wrappers.map((w) => {
       const id = w.getAttribute("data-automation-id");
       const wt = classify(w);
-      return {
+      const d = {
         wrapperSel: '[data-automation-id="' + id + '"]',
         fieldName: id.slice("formField-".length),
         widgetType: wt,
         label: labelOf(w),
         isRequired: requiredOf(w),
-        value: valueOf(w, wt)
+        value: valueOf(w, wt),
+        domIndex: domPos.get(w)
       };
+      // Date segment ids in DOM order ("dateSectionMonth-input", "dateSectionDay-input", …) → the
+      // review renders the form's OWN granularity/order (MM/DD/YYYY vs MM/YYYY vs YYYY), not a locale
+      // date picker. Same shape cdpRepeatingScan already returns for section dates.
+      if (wt === "date") {
+        d.dateSegments = Array.from(w.querySelectorAll('[data-automation-id^="dateSection"]'))
+          .map((n) => n.getAttribute("data-automation-id")).filter(Boolean);
+      }
+      // A checkbox GROUP carries its option labels straight from the DOM — READ-ONLY, no open/actuation
+      // needed (unlike a dropdown), so the review editor can render a real picker even when the field is
+      // left BLANK (an optional EEO/self-ID question the bot must never answer — the operator picks).
+      if (wt === "checkbox_group") {
+        d.groupOptions = Array.from(w.querySelectorAll('input[type="checkbox"]')).map((cb) => {
+          const lab = cb.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id) + '"]') : null;
+          return { id: cb.id || null, labelText: lab ? (lab.textContent || "").trim() : (cb.getAttribute("aria-label") || "").trim(), checked: !!cb.checked };
+        }).filter((o) => o.labelText);
+      }
+      return d;
     })
   };
 }
@@ -1711,16 +1769,21 @@ function cdpOnboardScan() {
 // clickPageNext's inline check): is the top element at (cx,cy) the target button (or
 // in its subtree)? If not, a coordinate click would be SWALLOWED by an overlay — return
 // what's covering it so the caller can auto-dismiss (cdpFindDismissControl) or halt.
+// STACK WALK (2026-07-25): walk the whole elementsFromPoint stack top-down and refuse only on an
+// element that would REALLY swallow the click. Transparent-to-clicks, in order of how they bit us:
+//   • Workday's own `click_filter` — a transparent overlay it puts on buttons to CAPTURE clicks; it IS
+//     the intended click surface (PANW Sign In, 2026-07-09).
+//   • `pointer-events: none` — paints but never receives the click.
+//   • A shadow HOST whose shadow tree paints NOTHING at this point: elementFromPoint returns the HOST
+//     for any point inside its box, so a full-width/!!invisible host (an extension's container) looked
+//     like a cover everywhere. Descend via shadowRoot.elementFromPoint; nothing there ⇒ not blocking.
+//   • The target itself, its ancestors, or its descendants.
+// Reaching the target with only transparent things above ⇒ clear. Nothing opaque AND the target never
+// appears (a stale rect after a reflow) ⇒ also clear: refusing there halted on a phantom (see
+// clickPageNext's re-measure), and a click into empty space is harmless — the nav-wait gates it.
 function cdpCoverCheck(selector, cx, cy) {
   const btn = document.querySelector(selector);
-  const top = document.elementFromPoint(cx, cy);
-  if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
-  // Workday's own `click_filter` is a TRANSPARENT overlay it renders on top of buttons to CAPTURE
-  // clicks — it IS the intended click surface, not an obstruction (a coordinate click on it activates
-  // the button underneath). elementFromPoint returns it instead of the button, which looked like a
-  // "cover" and made the click refuse (live: PANW Sign In submit, 2026-07-09). Treat it as clear.
-  const aid = top.getAttribute && top.getAttribute("data-automation-id");
-  if (aid === "click_filter" || (top.closest && top.closest('[data-automation-id="click_filter"]'))) return { blocked: false };
+  if (!btn) return { blocked: false };
   const desc = (el) => {
     const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
     if (el.id) p.push("#" + el.id);
@@ -1731,7 +1794,28 @@ function cdpCoverCheck(selector, cx, cy) {
     const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
     return p.join("") + (txt ? ' "' + txt + '"' : "");
   };
-  return { blocked: true, by: desc(top) };
+  const isTarget = (el) => el === btn || btn.contains(el) || el.contains(btn);
+  const seeThrough = (el) => {
+    const aid = el.getAttribute && el.getAttribute("data-automation-id");
+    if (aid === "click_filter" || (el.closest && el.closest('[data-automation-id="click_filter"]'))) return true;
+    let cs = null; try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
+    if (cs && cs.pointerEvents === "none") return true;
+    if (el.shadowRoot && el.shadowRoot.elementFromPoint) {
+      const inner = el.shadowRoot.elementFromPoint(cx, cy);
+      if (!inner) return true;                                  // the shadow tree paints nothing here
+      let ics = null; try { ics = window.getComputedStyle(inner); } catch (e) { ics = null; }
+      if (ics && ics.pointerEvents === "none") return true;
+    }
+    return false;
+  };
+  const stack = document.elementsFromPoint
+    ? Array.from(document.elementsFromPoint(cx, cy))
+    : [document.elementFromPoint(cx, cy)].filter(Boolean);
+  for (const el of stack) {
+    if (isTarget(el)) return { blocked: false };                // reached the target — only transparent things above it
+    if (!seeThrough(el)) return { blocked: true, by: desc(el) };
+  }
+  return { blocked: false };                                    // nothing opaque anywhere in the stack
 }
 
 // Create-account CONSENT control (workday.py two strategies): the explicit
@@ -1744,21 +1828,81 @@ function cdpConsentRect() {
   const bare = document.querySelector('[data-automation-id="agreementCheckbox"]');
   if (!checkbox && bare && bare.tagName === "INPUT") checkbox = bare;
   if (!checkbox) {
-    checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((b) => {
+    // Word-list fallback. WIDENED 2026-07-25 (Caterpillar): its create-account consent is labeled
+    // "I accept" — "accept" wasn't in the list, and the text may not live in an associated <label>
+    // at all, so also read aria-label and (only when label/aria give nothing) the nearest SMALL
+    // ancestor's own text (≤250 chars — a big container's text is too broad to trust; the word
+    // list on SHORT nearby text keeps an unrelated checkbox, e.g. a job-alerts opt-in, unmatched).
+    const CONSENT_RE = /consent|terms|agree|accept|privacy|acknowledge/;
+    const textFor = (b) => {
       const lab = b.id ? document.querySelector('label[for="' + b.id + '"]') : null;
       const wrapLab = b.closest && b.closest("label");
-      const txt = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || "").toLowerCase();
-      return /consent|terms|agree|privacy|acknowledge/.test(txt);
-    }) || null;
+      let t = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || b.getAttribute("aria-label") || "").trim();
+      if (!t) {
+        let el = b.parentElement;
+        for (let i = 0; i < 3 && el; i++) {
+          const s = (el.textContent || "").trim();
+          if (s) { if (s.length <= 250) t = s; break; } // first non-empty ancestor text only — never a page-wide container
+          el = el.parentElement;
+        }
+      }
+      return t.toLowerCase();
+    };
+    checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((b) => CONSENT_RE.test(textFor(b))) || null;
   }
   if (!checkbox) return null;
   const inputId = checkbox.id || null;
   const lab = inputId ? document.querySelector('label[for="' + inputId + '"]') : (checkbox.closest && checkbox.closest("label"));
-  const target = lab || checkbox;
+  let target = lab || checkbox;
   if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
-  const r = target.getBoundingClientRect();
+  let r = target.getBoundingClientRect();
+  if ((r.width <= 0 || r.height <= 0) && checkbox.parentElement) {
+    // CSS-clipped input with no label association (the styled box is a sibling/wrapper) — click the wrapper.
+    target = checkbox.parentElement;
+    if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
+    r = target.getBoundingClientRect();
+  }
   if (r.width <= 0 || r.height <= 0) return null;
   return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), checked: !!checkbox.checked, inputId };
+}
+
+// AUTH VIEW SWITCH (2026-07-25, Caterpillar): Workday's auth screen renders Sign In and Create Account
+// as two views of the SAME widget, and some tenants OPEN on Create Account — sign-in is behind an
+// "Already have an account? Sign In" link. The coordinate click on that link can be REFUSED by the
+// cover-check because the widget's own heading (`h3#authViewTitle`) overlaps its click point (live:
+// "Sign In tab is covered by h3#authViewTitle 'Create Account' — refusing a blind click"), and the run
+// then filled the CREATE-ACCOUNT fields believing it was signing in. A view-switch LINK is neither a
+// submit nor a consent control, so a page-side element click is safe here — and it's the only way past
+// a false-positive cover. SUBMIT buttons are explicitly excluded (a bare "Create Account" text match
+// would otherwise hit the submit and create an account). Returns { ok, text, how }.
+function cdpClickAuthSwitch(want) {
+  const wantSignIn = want === "signin";
+  const isSubmit = (el) => {
+    const aid = (el.getAttribute && el.getAttribute("data-automation-id")) || "";
+    return /SubmitButton$/i.test(aid) || (el.getAttribute && (el.getAttribute("type") || "").toLowerCase() === "submit");
+  };
+  const cands = [];
+  const byId = document.querySelector(wantSignIn ? '[data-automation-id="signInLink"]' : '[data-automation-id="createAccountLink"]');
+  if (byId && !isSubmit(byId)) cands.push(byId);
+  const matches = (t) => wantSignIn
+    ? (/^sign in$/i.test(t) || /already have an account/i.test(t))
+    : (/^create account$/i.test(t) || /(don'?t|do not) have an account/i.test(t));
+  for (const el of Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'))) {
+    if (isSubmit(el)) continue;                                    // never the submit control
+    const t = (el.textContent || "").trim();
+    if (!t || t.length > 60) continue;
+    if (/with (google|apple|linkedin|email|sso)/i.test(t)) continue; // never a federated / chooser button
+    if (matches(t)) cands.push(el);
+  }
+  for (const el of cands) {
+    const r = el.getBoundingClientRect && el.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) continue;
+    try { el.scrollIntoView({ block: "center", behavior: "instant" }); } catch (e) {}
+    window.__apActing = (window.__apActing || 0) + 1;              // input-lock passthrough
+    try { el.click(); } catch (e) { continue; } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+    return { ok: true, text: (el.textContent || "").trim().slice(0, 60), how: el === byId ? "automation-id" : "text" };
+  }
+  return { ok: false };
 }
 
 // "Resend Account Verification" button — shown on Workday's sign-in page when the account EXISTS
@@ -1994,6 +2138,59 @@ function cdpReadRadioState(wrapperSel) {
   return Array.from(w.querySelectorAll('input[type="radio"]')).map((input) => {
     const lab = input.id ? document.querySelector('label[for="' + input.id + '"]') : null;
     return { id: input.id, labelText: lab ? lab.textContent.trim() : "", checked: input.checked };
+  });
+}
+
+// ORPHAN CHECKBOXES (2026-07-25) — checkboxes that live OUTSIDE any `formField-*` wrapper, so the page
+// scan (which only walks formField wrappers) cannot see them at all. Caterpillar's page-1 SMS/marketing
+// consent is one: revealed by the phone number, never in the records. The create-account consent needed
+// its own finder (cdpConsentRect) for exactly this reason. READ-ONLY inventory for the review summary —
+// the bot never checks these (an optional consent is the operator's call; this only makes it VISIBLE).
+// Each gets a stable-ish key from its id/name/aria-label so re-runs merge instead of duplicating.
+function cdpScanOrphanCheckboxes() {
+  const out = [];
+  const seen = new Set();
+  for (const cb of Array.from(document.querySelectorAll('input[type="checkbox"]'))) {
+    if (cb.closest('[data-automation-id^="formField-"]')) continue;      // the normal scan owns these
+    if (cb.closest("[data-fkit-id]")) {
+      const f = cb.closest("[data-fkit-id]").getAttribute("data-fkit-id") || "";
+      if (/-\d+--/.test(f)) continue;                                    // inside a repeating entry — its section owns it
+    }
+    const r = cb.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) continue;                   // not rendered → not on the page for the operator either
+    const lab = cb.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id) + '"]') : null;
+    const wrapLab = cb.closest("label");
+    let text = ((lab && lab.textContent) || (wrapLab && wrapLab.textContent) || cb.getAttribute("aria-label") || "").trim();
+    if (!text) { // fall back to the nearest SMALL ancestor's own text (a long consent paragraph is fine — it IS the label)
+      let el = cb.parentElement;
+      for (let i = 0; i < 4 && el; i++) { const t = (el.textContent || "").trim(); if (t) { text = t; break; } el = el.parentElement; }
+    }
+    if (!text) continue;                                                 // unlabeled → nothing meaningful to show in review
+    const key = cb.id || cb.getAttribute("name") || ("orphanCheckbox_" + out.length);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // A selector that re-resolves: prefer the id, else the automation-id, else an indexed fallback.
+    const sel = cb.id ? ('input[type="checkbox"]#' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id))
+      : (cb.getAttribute("data-automation-id") ? 'input[data-automation-id="' + cb.getAttribute("data-automation-id") + '"]' : null);
+    out.push({
+      key, inputId: cb.id || null, selector: sel, checked: !!cb.checked,
+      required: cb.getAttribute("aria-required") === "true" || cb.required === true,
+      label: text.replace(/\s+/g, " ").slice(0, 400)
+    });
+  }
+  return out;
+}
+
+// CHECKBOX GROUP (2026-07-25) — the same shape cdpReadRadioState returns, over `input[type=checkbox]`
+// inside ONE wrapper (the OFCCP disability self-ID pick-one). Radio-shaped on purpose: the driver's
+// label-exact match + the label-click commit are reused verbatim. The caller is responsible for the
+// pick-one semantics (this tenant requires UNCHECKING the current option before another can be set).
+function cdpReadCheckboxGroupState(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  return Array.from(w.querySelectorAll('input[type="checkbox"]')).map((input) => {
+    const lab = input.id ? document.querySelector('label[for="' + input.id + '"]') : null;
+    return { id: input.id, labelText: lab ? lab.textContent.trim() : (input.getAttribute("aria-label") || "").trim(), checked: input.checked };
   });
 }
 
@@ -2901,7 +3098,7 @@ function cdpSourceCategoryRect(label) {
 // (auditActualFromRaw — Node-testable); reconcileAudit falls back to the per-field path when this
 // method is absent (older fakes / a minimal audit act).
 const AUDIT_RAW_READERS = [cdpReadTextState, cdpReadInputBySel, cdpReadDropdownState,
-  cdpReadCheckboxState, cdpReadRadioState, cdpReadHierState, cdpReadSourcePick];
+  cdpReadCheckboxState, cdpReadRadioState, cdpReadCheckboxGroupState, cdpReadHierState, cdpReadSourcePick];
 // Page-side dispatcher — receives [{widgetType, wrapperSel, tag, dateSegs}] and returns the raw read
 // per spec. Self-contained: references ONLY the AUDIT_RAW_READERS (injected as sibling declarations
 // by cdpReadAuditRaw) + page globals. Keep the widget→reader map in LOCKSTEP with fill-driver's
@@ -2914,6 +3111,7 @@ function cdpAuditRawDispatch(specs) {
         case "dropdown": return cdpReadDropdownState(s.wrapperSel);
         case "checkbox": return cdpReadCheckboxState(s.wrapperSel);
         case "radio": return cdpReadRadioState(s.wrapperSel);
+        case "checkbox_group": return cdpReadCheckboxGroupState(s.wrapperSel);
         case "typeahead": return cdpReadHierState(s.wrapperSel);
         case "hierarchical": return cdpReadSourcePick(s.wrapperSel);
         case "date": return (s.dateSegs || []).map(function (seg) {
@@ -3206,6 +3404,19 @@ function makeCdpActuation(llmConfig) {
 
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
+    readCheckboxGroup: (loc) => cdpEval(cdpReadCheckboxGroupState, loc.wrapperSel), // pick-one checkbox set (self-ID); clickRadioLabel commits by label id
+    scanOrphanCheckboxes: () => cdpEval(cdpScanOrphanCheckboxes), // consents rendered OUTSIDE any formField wrapper (read-only inventory for review)
+    // Blur whatever the fill last focused (2026-07-25, operator): some tenants only COMMIT a text field —
+    // and fire the cascade it triggers — on BLUR, and the fill leaves focus INSIDE the last field it typed
+    // (Caterpillar's SMS-consent checkbox is revealed by the phone number and never appeared while the
+    // phone box still had focus). A direct activeElement.blur() rather than Tab: it fires blur/focusout
+    // without moving focus INTO the next widget (no risk of arming a typeahead / opening a picker).
+    blurActive: () => cdpEval(() => {
+      const a = document.activeElement;
+      if (!a || a === document.body || typeof a.blur !== "function") return false;
+      a.blur();
+      return true;
+    }),
     clickRadioLabel: async (loc, id) => {
       const rect = await cdpRectReady('label[for="' + id + '"]', true); // M29: retry the label rect
       if (!rect) return false;
@@ -3229,31 +3440,32 @@ function makeCdpActuation(llmConfig) {
     // Guarded Save & Continue. REFUSE on the review page (the footer button is
     // Submit there — the double-guard). cdpRectReady (M29) absorbs a transient 0-rect.
     clickPageNext: async () => {
+      const SEL = '[data-automation-id="pageFooterNextButton"]';
       const reviewPresent = await cdpEval(() => !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'));
       if (reviewPresent) return { clicked: false, refused: "review-page" };
-      const rect = await cdpRectReady('[data-automation-id="pageFooterNextButton"]', true);
+      // A popup/overlay (the Simplify extension's dialog, a cookie banner, a modal) can sit OVER Save &
+      // Continue: a coordinate click would land on the popup and be SWALLOWED — the page never advances
+      // and it surfaces as a bare nav-timeout. So cover-check the button's center first and refuse with a
+      // diagnostic that NAMES the blocker rather than clicking blindly.
+      // MEASURE + CHECK TOGETHER, RE-MEASURING each round (2026-07-25, Solar Turbines): the rect and the
+      // cover test must describe the SAME layout. A field revealed by an earlier fill — Caterpillar mounts
+      // an SMS-consent checkbox after the phone number — REFLOWS the footer DOWNWARD, so a rect taken a
+      // moment earlier is stale and elementFromPoint reports whatever now sits at the old point (live: a
+      // floating extension widget). The old code never re-measured, so it halted blaming an overlay that
+      // was never on the button. Re-probing also lets a genuinely-animating overlay settle.
+      const probe = async () => {
+        const r = await cdpRectReady(SEL, true);
+        if (!r) return { rect: null, cover: null };
+        return { rect: r, cover: await cdpEval(cdpCoverCheck, SEL, r.cx, r.cy) };
+      };
+      let { rect, cover } = await probe();
       if (!rect) return { clicked: false, refused: "no-button" };
-      // A popup/overlay (e.g. the Simplify extension's dialog, a cookie banner, a modal) can sit OVER the
-      // Save & Continue button. A coordinate click would land on the popup and be SWALLOWED — the page never
-      // advances and it surfaces as a bare nav-timeout. So elementFromPoint the button's center first: the
-      // top node there must BE the button (or in its subtree). If something else covers it, refuse with a
-      // diagnostic that NAMES the blocker instead of clicking blindly.
-      const cover = await cdpEval((cx, cy) => {
-        const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]');
-        const top = document.elementFromPoint(cx, cy);
-        if (!btn || !top || top === btn || btn.contains(top) || top.contains(btn)) return { blocked: false };
-        const desc = (el) => {
-          const p = [el.tagName ? el.tagName.toLowerCase() : "?"];
-          if (el.id) p.push("#" + el.id);
-          const aid = el.getAttribute && el.getAttribute("data-automation-id");
-          if (aid) p.push('[data-automation-id="' + aid + '"]');
-          const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
-          if (cls) p.push("." + cls);
-          const txt = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
-          return p.join("") + (txt ? ' "' + txt + '"' : "");
-        };
-        return { blocked: true, by: desc(top) };
-      }, rect.cx, rect.cy);
+      for (let i = 0; i < 3 && cover && cover.blocked; i++) { // reflow/animation settle before believing it
+        await cdpDelay(250);
+        const p = await probe();
+        if (!p.rect) break;
+        rect = p.rect; cover = p.cover;
+      }
       if (cover && cover.blocked) {
         // Best-effort auto-dismiss (operator opted in 2026-07-06): try ONCE to click a clearly-dismissive
         // control (X/Close/No-thanks — never Accept/OK) inside the popup, incl. Simplify's shadow-DOM overlay,
@@ -3262,13 +3474,14 @@ function makeCdpActuation(llmConfig) {
         if (d && d.found) {
           console.log("[ApplyPilot][CDP] Save & Continue covered by", cover.by, "— clicking its dismiss control:", JSON.stringify(d.label));
           await cdpClickAt(d.cx, d.cy);
-          const coverGone = async () => cdpEval((cx, cy) => {
-            const b = document.querySelector('[data-automation-id="pageFooterNextButton"]');
-            const t = document.elementFromPoint(cx, cy);
-            return !b || !t || t === b || b.contains(t) || t.contains(b);
-          }, rect.cx, rect.cy);
           let clear = false;
-          for (let i = 0; i < 5 && !clear; i++) { await cdpDelay(300); clear = await coverGone(); } // let it animate out
+          for (let i = 0; i < 5 && !clear; i++) { // let it animate out — RE-MEASURING each poll (the button may also have moved)
+            await cdpDelay(300);
+            const p = await probe();
+            if (!p.rect) continue;
+            rect = p.rect;
+            clear = !(p.cover && p.cover.blocked);
+          }
           if (clear) {
             console.log("[ApplyPilot][CDP] popup dismissed — Save & Continue is now clickable.");
             await cdpClickAt(rect.cx, rect.cy);

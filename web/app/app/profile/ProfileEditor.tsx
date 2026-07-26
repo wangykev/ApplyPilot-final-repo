@@ -48,6 +48,8 @@ import {
   certificationSchema,
   specialtySchema,
   additionalFileSchema,
+  ensureHttpsUrl,
+  looksLikeUrl,
 } from "@/lib/profile-schema";
 import { clsx } from "@/lib/clsx";
 
@@ -243,7 +245,17 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               >
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   <TextField label="Type" value={w.type} disabled={locked} placeholder="Portfolio, Twitter…" onChange={(v) => update((p) => { p.websites[i].type = v; })} />
-                  <TextField label={w.type ? `${w.type} URL` : "URL"} bucketPath={`websites.${i}.url`} value={w.url} placeholder="https://…" onChange={(v) => update((p) => { p.websites[i].url = v; })} />
+                  <TextField
+                    label={w.type ? `${w.type} URL` : "URL"}
+                    bucketPath={`websites.${i}.url`}
+                    value={w.url}
+                    placeholder="https://…"
+                    hint="Full URL"
+                    onChange={(v) => update((p) => { p.websites[i].url = v; })}
+                    // Normalize on BLUR (not per keystroke): "linkedin.com/in/you" → "https://linkedin.com/in/you".
+                    onBlur={() => update((p) => { p.websites[i].url = ensureHttpsUrl(p.websites[i].url); })}
+                    error={looksLikeUrl(w.url) ? null : "Enter a full URL, e.g. https://linkedin.com/in/you"}
+                  />
                 </div>
               </EntryCard>
             );
@@ -504,6 +516,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TriBoolField label="Willing to do a drug test" bucketPath="screening.willing_drug_test" value={profile.screening.willing_drug_test} onChange={(v) => update((p) => { p.screening.willing_drug_test = v; })} ladder={profile.answer_ladders?.["screening.willing_drug_test"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.willing_drug_test"] = n; })} />
           <TriBoolField label="Valid driver's license" bucketPath="screening.has_valid_drivers_license" value={profile.screening.has_valid_drivers_license} onChange={(v) => update((p) => { p.screening.has_valid_drivers_license = v; })} ladder={profile.answer_ladders?.["screening.has_valid_drivers_license"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.has_valid_drivers_license"] = n; })} />
           <TriBoolField label="Willing to relocate" bucketPath="screening.willing_to_relocate" value={profile.screening.willing_to_relocate} onChange={(v) => update((p) => { p.screening.willing_to_relocate = v; })} ladder={profile.answer_ladders?.["screening.willing_to_relocate"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.willing_to_relocate"] = n; })} />
+          <TriBoolField label="Willing to relocate at your own cost" bucketPath="screening.willing_to_relocate_at_own_cost" value={profile.screening.willing_to_relocate_at_own_cost} onChange={(v) => update((p) => { p.screening.willing_to_relocate_at_own_cost = v; })} ladder={profile.answer_ladders?.["screening.willing_to_relocate_at_own_cost"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.willing_to_relocate_at_own_cost"] = n; })} />
           <TriBoolField label="Open to remote" bucketPath="screening.remote_ok" value={profile.screening.remote_ok} onChange={(v) => update((p) => { p.screening.remote_ok = v; })} ladder={profile.answer_ladders?.["screening.remote_ok"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["screening.remote_ok"] = n; })} />
           <DateField label="Earliest start date" granularity="month-day-year" bucketPath="screening.earliest_start_date" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
           <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />

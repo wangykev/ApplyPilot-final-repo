@@ -3,7 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile, emptyProfile } from "@/lib/profile-schema";
 import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
-import { teachableCards, type TeachSource } from "@/lib/teach";
+import { teachableCards, ensureDefaultFieldWordings, type TeachSource } from "@/lib/teach";
 import type { ReviewBundle } from "@/lib/review-summary";
 
 export const dynamic = "force-dynamic";
@@ -41,7 +41,12 @@ export async function GET() {
     const profile = profRes.data?.profile_json ? coerceProfile(profRes.data.profile_json) : emptyProfile();
     // Mirror loadBuckets: NULL buckets_json → the starter set; otherwise the user's buckets + any newly
     // shipped starter bindings they don't have yet (dedup by profile_path, non-destructive).
-    const buckets = ensureStarterBuckets(profRes.data?.buckets_json != null ? coerceBuckets(profRes.data.buckets_json) : STARTER_BUCKETS);
+    // …plus every profile field's own name as a default wording, so a card whose question IS the field
+    // label counts as already covered instead of asking to be taught (operator, 2026-07-26).
+    const buckets = ensureDefaultFieldWordings(
+      ensureStarterBuckets(profRes.data?.buckets_json != null ? coerceBuckets(profRes.data.buckets_json) : STARTER_BUCKETS),
+      profile,
+    );
     const dismissed = Array.isArray(profRes.data?.teach_dismissed_json) ? (profRes.data!.teach_dismissed_json as string[]) : [];
     const cards = teachableCards(apps, buckets, profile, dismissed);
     return NextResponse.json({ ok: true, cards });

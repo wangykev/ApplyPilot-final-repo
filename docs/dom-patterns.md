@@ -2290,3 +2290,178 @@ Observed driving the website Run end-to-end on Magna wd3. Two facts that shaped 
 - **The "Something went wrong / please refresh" soft-error can appear right after login**, mid-Run — the fill
   walk now detects it (`cdpReadSessionState.softErrorPresent`) and reloads + restarts from page 1 (a refresh
   restarts the Workday application), same as onboarding's `maybeRefresh`. See progress-log 2026-07-22.
+
+## 2026-07-25 — Caterpillar: create-account consent is "I accept" (not matched by the agreementCheckbox id or the consent word-list)
+
+First live-verified-speed-era new-tenant probe (background Run, Caterpillar). Onboarding reached the
+create-account form, filled email/password/verify-password cleanly, but logged "no consent checkbox
+detected — proceeding" and the submit then no-op'd with the form still up, Workday rendering
+**"Error: Please check the box to continue"** under its "Caterpillar Global Data Privacy Statement"
+block. Observations (from the rendered page + the detector's misses — full DOM ids not yet captured):
+
+- The consent checkbox is NOT `[data-automation-id="agreementCheckbox"]` (the Magna shape) — that
+  selector found nothing.
+- Its accompanying text is **"I accept"** — which the old label word-list
+  (`/consent|terms|agree|privacy|acknowledge/`) does NOT match ("accept" ≠ "agree"), and/or the text
+  is not in an associated `<label>` at all (the label-for / wrapping-label routes both came up empty).
+- The auth screen also opens on the **Create Account view** with an `h3#authViewTitle` ("Create
+  Account") that the cover-check reported OVER the Sign In tab target — the sign-in-first attempt was
+  refused as a blind click, fell through to wrong_credentials, and the loop correctly converged on
+  create-account (no fix needed; noted for the pattern).
+
+**Fixes (same day):** `cdpConsentRect` adds `accept` to the word-list, also reads `aria-label`, and —
+only when label/aria give nothing — the nearest SMALL ancestor's own text (≤250 chars, so a page-wide
+container can never match); a CSS-clipped labelless input falls back to clicking its wrapper. And
+`submitAndWait` gained a `beforeRetry` hook: Create Account re-runs `checkConsent` before every
+re-click, so even a tenant the detector misses self-heals on retry 1 (checkConsent is idempotent —
+an already-checked box is never unchecked). Capture the real automation-id of Caterpillar's consent
+wrapper on the next probe to pin the selector.
+
+## 2026-07-25 — Solar Turbines (cat.wd5): a section field's automation-id AND its WIDGET are both tenant-variable
+
+Second Caterpillar-family probe (`cat.wd5.myworkdayjobs.com/en-US/solarturbines`, background Run). Page 2
+filled 28/35 cleanly but `education[0].schoolName` came back **`error: field wrapper not found in entry`**,
+and Save & Continue was then blocked by *"Error-School or University — The field School or University is
+required and must have a value."* Two independent tenant differences, both first observed here:
+
+- **The id differs.** `EDUCATION_MAP` resolved school by the single automation-id `schoolName` (Magna's).
+  Solar Turbines uses something else, so `findFd` returned null and **no fill path ever ran** — this is why
+  "none of the fallbacks worked": every fallback (AI canonicalize, required-empty AI, deleteOnNoMatch) lives
+  *downstream* of a resolved wrapper. AI-4 remediation then guessed the field name `school`, which also
+  wasn't on the page, and correctly declined to act.
+- **The widget differs.** The page renders School or University as a **multiselect TYPEAHEAD** — the UI shows
+  `0 items selected` (the chip counter), not an empty text box. Magna renders the same logical field as plain
+  text. So even a resolved wrapper would have been filled by the wrong handler.
+
+Also seen on this tenant (no fix needed): `skills` (typeahead) and `linkedInAccount` (text) are unmapped →
+`skipped: no mapping`; `degree` offers "Bachelor of Science (BS)" so the stated "Bachelor of Science /
+Bachelors" needed the AI canonicalize (→ `filled_review`, correct); FoS scraped **404 options**.
+
+**Fixes (same day, fill-driver.js):** (1) a field-resolution LADDER — `labelRegex` | `field` | `altFields[]` |
+`labelFallback` (a last-resort label regex), applied TWO-PASS at every call site (ids across the whole map
+first) so a fallback can never steal a field another entry names exactly; (2) **widget-adaptive fill** — when
+the live scan's `widgetType` disagrees with the map's, the LIVE type wins and the value is re-resolved for it
+(a plain string becomes a single-candidate list for a choice widget, then goes through that widget's normal
+match ladder + commit verification — never a blind commit). Restricted to text/textarea/dropdown/typeahead in
+both directions; date/year/checkbox never swap (classify() can't see a date composite). The swap is recorded
+on the record (`widgetAdapted`) and the record reports the LIVE widget so review renders the right editor.
+Unit-pinned (5 tests). **Still to capture on the next probe:** the actual `data-automation-id` of this
+tenant's school field, so it can be pinned as an alt instead of relying on the label fallback.
+
+## 2026-07-25 — Caterpillar: the auth widget can OPEN on the Create Account view (both views carry email+password)
+
+Follow-on to the consent-checkbox entry. Right after "Apply Manually" this tenant sometimes lands on the
+**Create Account** view of Workday's auth widget, with sign-in behind an "Already have an account? **Sign
+In**" link. Two facts make this dangerous, and together they produced a silent mis-fill:
+
+- **Both views render `email` + `password` inputs**, so the onboarding test `st.passwordInput ||
+  st.emailInput` ("a credential field exists ⇒ we're on the sign-in form") is NOT a view discriminator.
+  The only reliable signal is the SUBMIT marker: `signInSubmit` vs `createAccountSubmit`.
+- **The Sign In link's coordinate click was REFUSED by the cover-check**: `"Sign In tab" is covered by
+  h3#authViewTitle.css-ll0fik "Create Account" — refusing a blind click`. The widget's own heading
+  overlaps the link's click point, so `elementFromPoint` reports the h3, not the link. The refusal is
+  correct in general (it's what stops blind clicks under popups) but here it's a false positive.
+
+**Observed consequence (live):** the view never switched, the flow filled the CREATE-ACCOUNT email +
+password, then `submitAndWait`'s generic `button[type="submit"]` fallback clicked **Create Account** while
+logging `clicked "Sign In submit"` (the two canonical sign-in selectors had already `gave up` in
+rectReady). Workday answered with a validation error, `classifyAuthOutcome` read `wrong_credentials`, and
+the run "recovered" into the create-account flow BY ACCIDENT. Operator: don't do that.
+
+**Fixes (same day, background.js + cdp.js):** `onSignInView`/`onCreateView` predicates keyed on the SUBMIT
+markers; `switchAuthView(want)` clicks the canonical link, falls back to a page-side element click
+(`cdpClickAuthSwitch` — text/automation-id matched, **submit buttons explicitly excluded** so a bare
+"Create Account" text match can never press the submit, federated/chooser buttons excluded too), then
+POLLS for the target view's submit marker and reports whether the switch actually happened. The auth loop
+now switches + verifies BEFORE filling, and if the sign-in view can't be reached it goes to account
+creation DELIBERATELY (logged) instead of mislabelling one form as the other. doCreateAccount switches +
+verifies the same way. Sign-in failure → wrong_credentials → create-account is the unchanged existing path
+(the operator's "try sign in, if it doesn't work go back to create account").
+
+## 2026-07-25 — Solar Turbines: a phone-triggered SMS-consent checkbox REFLOWS the footer (and the stale-rect cover-check blamed an extension overlay)
+
+Page 1 filled clean (13/14, audits matched) and then HALTED: `Save & Continue covered by
+div.simplify-jobs-shadow-root — clicking its dismiss control: "Minimize"` → `auto-dismiss clicked
+"Minimize" but the button is STILL covered — halting`. The overlay was NOT on the button. What actually
+happened:
+
+- **A consent checkbox mounts AFTER the phone number is filled** — a long SMS/marketing consent ("I
+  consent to receive periodic automated text messages … I understand that my consent is not required.
+  Reply STOP …" + a Terms and Conditions link). It is **cascade-revealed by the phone field** and it
+  **pushes Save & Continue DOWNWARD**.
+- **`clickPageNext` measured the footer rect once, then re-checked the cover at those SAME stale
+  coordinates** (the post-dismiss `coverGone()` closure captured `rect.cx/cy`). After the reflow, that
+  point no longer sat on the button — it sat on the floating extension widget — so the re-check could
+  never clear and the walk halted naming the wrong culprit.
+- Secondary: `document.elementFromPoint` returns the shadow **HOST** for any point inside its box, so an
+  extension container that paints nothing at that point still reads as a cover.
+
+**Fixes (same day, cdp.js):** (1) `clickPageNext` now RE-MEASURES the button (scroll + rect) on every
+cover round — an initial-settle loop (3 × 250ms) before believing any cover, and a fresh probe inside the
+post-dismiss poll — so the rect and the cover test always describe the same layout; (2) `cdpCoverCheck`
+walks the whole `elementsFromPoint` stack and treats as see-through: Workday's `click_filter`,
+`pointer-events:none` elements, and a shadow HOST whose `shadowRoot.elementFromPoint` finds nothing at
+that point; reaching the target with only see-through things above ⇒ clear, and a stack with nothing
+opaque ⇒ clear (a stale rect must not halt the walk).
+
+**Open (needs a devtools capture on the next probe):** the SMS-consent checkbox did NOT appear in the
+page-1 records at all — so it is either mounted after the cascade re-scan rounds or is not inside a
+`formField-*` wrapper. It is OPTIONAL ("consent is not required"), and the optional-unmapped-checkbox rule
+correctly leaves it UNCHECKED (never auto-consent to marketing SMS) — but it should still be inventoried
+in the review bundle. Capture its wrapper/automation-id to decide whether the cascade scan needs a longer
+reveal window or the field lives outside the scanned shape.
+
+## 2026-07-25 — Caterpillar/Solar Turbines: the OFCCP disability self-ID is a CHECKBOX GROUP, and the SMS consent is blur-gated
+
+Last page of the Caterpillar flow (the voluntary self-identification of disability form: Name /
+Employee ID / Date / "Please check one of the boxes below"). Three observations:
+
+- **The three answers are CHECKBOXES in ONE wrapper, behaving as pick-one** — "Yes, I have a
+  disability, or have had one in the past" / "No, I do not have a disability and have not had one in
+  the past" / "I do not want to answer". The operator confirmed the tenant **refuses a second check
+  while one is set** (you must UNCHECK the current option first). `classify` only matched a *single*
+  checkbox, so the wrapper fell through to `unknown` → the review editor rendered a bare TEXTBOX for a
+  pick-one legal question. New widget type **`checkbox_group`**: option labels come from the SCAN (read
+  from the DOM, no actuation), so even a BLANK field (voluntary ⇒ the bot must not answer it) reaches
+  review as a real picker; the filler is label-EXACT, unchecks-then-checks, and verifies the end state
+  (exactly one checked). Wired through the M40 audit and `replayField` (the submit-stage fill).
+- **The Date field is a `MM/DD/YYYY` composite** (the signature date). Left to the operator in review;
+  the date replay path already fills it from the approved value.
+- **The SMS/marketing consent checkbox on PAGE 1 is BLUR-GATED.** It is revealed by the phone number,
+  but only once the phone field BLURS — the fill leaves focus inside the box it just typed, so the
+  checkbox never mounted while we were looking (it was missing from the records through BOTH cascade
+  passes). Fix: `act.blurActive()` — a direct `activeElement.blur()` (not Tab, which would move focus
+  INTO the next widget and could arm a typeahead) — runs once after the fold, before the reveal passes.
+  The checkbox itself is OPTIONAL ("my consent is not required") → the optional-unmapped-checkbox rule
+  leaves it UNCHECKED, which is the correct answer; it just needs to be INVENTORIED in review.
+
+**Also fixed from this page (review UX):** records were produced flat-fields-first then
+section-by-section, so a flat field sitting BETWEEN two repeating sections rendered above both. The
+bundle's entry array is the render order in both viewers, so `orderResultsByDom` now sorts records by
+the wrapper's document position (a section takes the position of its FIRST field; unpositioned records
+inherit their neighbour's key; stable, so fill order within a section is untouched).
+
+## 2026-07-25 (b) — Caterpillar DOM captures: school typeahead, self-ID date, and the orphan SMS consent
+
+Operator-supplied DOM for three fields on the cat.wd5/solarturbines flow:
+
+- **Education school = `formField-school` + `data-fkit-id="education-484--school"`, a MULTISELECT
+  typeahead** (`data-uxi-widget-type="multiselect"`, chips in `selectedItemList`). Confirms both halves
+  of the earlier fix: the automation-id is `school` (now an explicit `altFields` entry, so the label
+  fallback isn't even needed) and the widget is a typeahead where Magna renders a text box (the
+  widget-adaptive fill handles it). Its committed chip is a `promptOption` inside a `selectedItem` `li`.
+- **The self-ID date is `data-automation-id="dateInputWrapper"` with three `dateSection{Month,Day,Year}`
+  spinbuttons** (`-display` shows the MM / DD / YYYY placeholders; `-input` holds the value). The FLAT
+  `classify` had NO date branch at all — those inputs carry no `type` attribute, so three of them made
+  `textLike.length !== 1` and the field fell through to **`unknown`** → a bare textbox in review with no
+  granularity. Now classified `date`, and the scan carries `dateSegments` so the review renders the
+  form's OWN order/granularity (MM/DD/YYYY here, MM/YYYY or YYYY elsewhere) — the same `date_order`
+  section dates already had. Unmapped flat dates stay unfilled (the operator fills in review; the date
+  replay path fills them at submit).
+- **The page-1 SMS/marketing consent checkbox is NOT inside any `formField-*` wrapper** — which is why
+  it never appeared in the records regardless of cascade timing or the blur fix (the page scan only
+  walks formField wrappers; the create-account consent needed its own finder for the same reason). New
+  READ-ONLY `cdpScanOrphanCheckboxes` inventories rendered checkboxes outside the field set (skipping
+  anything inside a repeating entry), and they surface as `consent.<key>` records flagged
+  `consent-checkbox`, **left UNCHECKED** — an optional consent, especially a marketing one, is the
+  operator's to give; the record just makes it visible with its full text.

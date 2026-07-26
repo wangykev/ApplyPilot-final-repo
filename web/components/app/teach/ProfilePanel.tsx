@@ -22,6 +22,9 @@ export function ProfilePanel({
   onOpenAnswer,
   note,
   disabled,
+  selectMode,
+  onSelectPath,
+  onCancelSelect,
 }: {
   profile: unknown;
   highlightPath: string;
@@ -29,6 +32,13 @@ export function ProfilePanel({
   onOpenAnswer: (path: string, label?: string) => void;
   note?: string | null;
   disabled?: boolean;
+  /** RETARGET MODE (2026-07-25, operator): "Wrong field?" no longer opens a search popup over the
+   *  profile — the profile is ALREADY on screen, so the whole row becomes one click target and the
+   *  operator points at the right field directly. Rows stop opening the bucket/answer editors while
+   *  this is on. */
+  selectMode?: boolean;
+  onSelectPath?: (path: string, label: string) => void;
+  onCancelSelect?: () => void;
 }) {
   const rows = flattenProfileFields(profile);
   const sections: { key: string; label: string; rows: ProfileFieldRow[] }[] = [];
@@ -53,12 +63,19 @@ export function ProfilePanel({
   const skills = strList(p.skills).join(", ");
   const employers = strList(p.employment_history_companies).join(", ");
 
-  const common = { onOpenBucket, onOpenAnswer, disabled, highlightPath };
+  const common = { onOpenBucket, onOpenAnswer, disabled, highlightPath, selectMode: !!selectMode, onSelectPath };
   const anyContent = sections.length > 0 || websiteRows.length > 0 || skills || employers;
 
   // Auto-scroll the recommended (highlighted) row into view within this panel, so the teach card on
   // the left and its target field on the right are on the same screen.
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Escape leaves retarget mode (the same affordance the popup had).
+  useEffect(() => {
+    if (!selectMode || !onCancelSelect) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onCancelSelect(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectMode, onCancelSelect]);
   useEffect(() => {
     if (!highlightPath) return;
     const el = scrollRef.current?.querySelector<HTMLElement>('[data-hot="1"]');
@@ -76,10 +93,23 @@ export function ProfilePanel({
         <p className="eyebrow">Your profile</p>
         {note && <span className="font-mono text-[10px] tracking-label text-verified">{note}</span>}
       </div>
-      <p className="mt-1 text-xs text-ink-faint">
-        Click a field&apos;s <span className="text-ink-dim">name</span> for its question wordings, or its{" "}
-        <span className="text-ink-dim">answer</span> to edit it and its answer variants.
-      </p>
+      {selectMode ? (
+        <div className="mt-2 flex items-center justify-between gap-3 rounded-lg border border-amber/40 bg-amber/10 px-3 py-2">
+          <p className="text-xs text-ink">
+            Pick the field this answer belongs to — <span className="text-ink-dim">click any field below</span>.
+          </p>
+          {onCancelSelect && (
+            <button type="button" onClick={onCancelSelect} className="btn-ghost px-2 py-1 text-xs">
+              Cancel
+            </button>
+          )}
+        </div>
+      ) : (
+        <p className="mt-1 text-xs text-ink-faint">
+          Click a field&apos;s <span className="text-ink-dim">name</span> for its question wordings, or its{" "}
+          <span className="text-ink-dim">answer</span> to edit it and its answer variants.
+        </p>
+      )}
       <div className="mt-4 space-y-5">
         {sections.map((s) => (
           <FieldBox key={s.key} label={s.label} rows={s.rows.map((r) => ({ path: r.path, label: r.label, value: r.value }))} {...common} />
@@ -104,6 +134,8 @@ function FieldBox({
   onOpenBucket,
   onOpenAnswer,
   disabled,
+  selectMode,
+  onSelectPath,
 }: {
   label: string;
   rows: FieldRowData[];
@@ -111,6 +143,8 @@ function FieldBox({
   onOpenBucket: (path: string, label: string, bucketWidget: string) => void;
   onOpenAnswer: (path: string, label?: string) => void;
   disabled?: boolean;
+  selectMode?: boolean;
+  onSelectPath?: (path: string, label: string) => void;
 }) {
   return (
     <div>
@@ -120,6 +154,27 @@ function FieldBox({
         {rows.map((r) => {
           const hot = !!highlightPath && r.path === highlightPath;
           const meta = profileFieldMeta(r.path, undefined);
+          if (selectMode) {
+            // RETARGET: the whole row is ONE target — no name/answer split, no editors.
+            return (
+              <button
+                key={r.path}
+                type="button"
+                data-hot={hot ? "1" : undefined}
+                disabled={disabled}
+                onClick={() => onSelectPath && onSelectPath(r.path, r.label)}
+                title={`Use ${r.label} for this answer`}
+                className={clsx(
+                  "flex w-full items-baseline justify-between gap-3 px-3 py-1.5 text-left transition-colors",
+                  "hover:bg-amber/15 focus:bg-amber/15 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60",
+                  hot && "scroll-mt-20 bg-amber/10",
+                )}
+              >
+                <span className={clsx("truncate text-sm", hot ? "font-medium text-amber" : "text-ink-dim")}>{r.label}</span>
+                <span className="block max-w-[55%] truncate font-mono text-xs text-ink-faint">{r.value || "—"}</span>
+              </button>
+            );
+          }
           return (
             <div
               key={r.path}
