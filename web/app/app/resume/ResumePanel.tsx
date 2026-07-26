@@ -21,6 +21,39 @@ import { clsx } from "@/lib/clsx";
 type Stored = { filename: string; size: number } | null;
 type Msg = { kind: "ok" | "err" | "info"; text: string; aiLink?: boolean } | null;
 
+// Draft persistence: the editor survives navigating away and coming back, even
+// signed-out / before "Save as my resume". Also mirrored to the tailor page's
+// fallback keys so the source ports over without a backend.
+const LS_TEX = "applypilot.resume.tex";
+const LS_TEX_NAME = "applypilot.resume.texName";
+const LS_PDF_NAME = "applypilot.resume.pdfName";
+const LS_TAILOR_TEX = "applypilot.tailor.tex";
+const LS_TAILOR_NAME = "applypilot.tailor.texName";
+const LS_VERSIONS = "applypilot.resume.versions";
+
+/** Named snapshots of the .tex — different versions of the same resume the user
+ *  can switch between. Kept on this device; the EDITOR's content is always the
+ *  live/active one (it's what compiles, saves, and feeds the Tailor page). */
+type TexVersion = { id: string; name: string; tex: string; savedAt: number };
+
+function loadVersions(): TexVersion[] {
+  try {
+    const raw = localStorage.getItem(LS_VERSIONS);
+    const v = raw ? (JSON.parse(raw) as TexVersion[]) : [];
+    return Array.isArray(v) ? v.filter((x) => x && typeof x.tex === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeVersions(v: TexVersion[]) {
+  try {
+    localStorage.setItem(LS_VERSIONS, JSON.stringify(v));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
 function kb(bytes: number) {
   return bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
@@ -54,6 +87,11 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
   const [pdfName, setPdfName] = useState<string>(initialStored?.filename ?? "resume.pdf");
   const [sourceSaved, setSourceSaved] = useState(true); // editor text == stored source?
 
+  // named versions of the .tex (device-local)
+  const [versions, setVersions] = useState<TexVersion[]>([]);
+  const [versionName, setVersionName] = useState("");
+  const [activeVersion, setActiveVersion] = useState<string>("");
+
   // live compile (debounced) — the bottom preview is the ACTUAL PDF
   const [compiled, setCompiled] = useState<{ url: string; base64: string } | null>(null);
   const [compiling, setCompiling] = useState(false);
@@ -78,6 +116,82 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
       return { url, base64: res.pdfBase64 };
     });
   }
+
+  // restore the local draft on mount — it's the latest editing session, so it wins
+  // over the server copy (which it may extend with unsaved edits)
+  useEffect(() => {
+    try {
+      const draft = localStorage.getItem(LS_TEX);
+      if (draft) {
+        setTexText(draft);
+        setTexName(localStorage.getItem(LS_TEX_NAME) || "resume.tex");
+        setTab("tex");
+        setSourceSaved(initialSource?.kind === "tex" && initialSource.tex === draft);
+      }
+      const pn = localStorage.getItem(LS_PDF_NAME);
+      if (pn) setPdfName(pn);
+      setVersions(loadVersions());
+    } catch {
+      /* private mode etc. */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function snapshotVersion() {
+    if (!texText.trim()) return;
+    const name = versionName.trim() || `Version ${versions.length + 1}`;
+    const next: TexVersion[] = [
+      ...versions.filter((v) => v.name !== name), // same name = overwrite
+      { id: `${Date.now()}`, name, tex: texText, savedAt: Date.now() },
+    ];
+    setVersions(next);
+    storeVersions(next);
+    setActiveVersion(name);
+    setVersionName("");
+    setMsg({ kind: "ok", text: `Snapshotted “${name}” (${next.length} version${next.length === 1 ? "" : "s"} on this device).` });
+  }
+
+  function switchVersion(name: string) {
+    setActiveVersion(name);
+    const v = versions.find((x) => x.name === name);
+    if (!v) return;
+    setTexText(v.tex);
+    setSourceSaved(false);
+    setMsg({ kind: "info", text: `Loaded “${v.name}” into the editor.` });
+  }
+
+  function deleteVersion() {
+    if (!activeVersion) return;
+    const next = versions.filter((x) => x.name !== activeVersion);
+    setVersions(next);
+    storeVersions(next);
+    setActiveVersion("");
+    setMsg({ kind: "info", text: "Version deleted (editor content untouched)." });
+  }
+
+  // persist the draft (debounced) + mirror to the tailor page's fallback keys
+  useEffect(() => {
+    if (!texText.trim()) return;
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(LS_TEX, texText);
+        localStorage.setItem(LS_TEX_NAME, texName || "resume.tex");
+        localStorage.setItem(LS_TAILOR_TEX, texText);
+        localStorage.setItem(LS_TAILOR_NAME, texName || "resume.tex");
+      } catch {
+        /* quota / private mode — session-only then */
+      }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [texText, texName]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_PDF_NAME, pdfName);
+    } catch {
+      /* noop */
+    }
+  }, [pdfName]);
 
   // debounce: recompile ~1.2s after the user stops typing
   useEffect(() => {
@@ -275,6 +389,35 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                     {texName || "or just paste below"}
                     {texText ? (sourceSaved ? " · stored" : " · unsaved edits") : ""}
                   </span>
+                </div>
+                {/* versions of the same resume (kept on this device) */}
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <select
+                    value={activeVersion}
+                    onChange={(e) => switchVersion(e.target.value)}
+                    className="min-w-40 appearance-none rounded-lg border border-hairline bg-cockpit px-3 py-1.5 text-xs text-ink outline-none transition-colors focus:border-amber"
+                  >
+                    <option value="">{versions.length ? "Load a version…" : "No saved versions yet"}</option>
+                    {versions.map((v) => (
+                      <option key={v.id} value={v.name} className="bg-panel">
+                        {v.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    value={versionName}
+                    onChange={(e) => setVersionName(e.target.value)}
+                    placeholder={`name it (e.g. "hardware focus")`}
+                    className="w-44 rounded-lg border border-hairline bg-cockpit px-3 py-1.5 text-xs text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
+                  />
+                  <button onClick={snapshotVersion} disabled={!texText.trim()} className="btn-ghost px-3 py-1.5 text-xs" title="Snapshot the current editor content as a named version">
+                    <FileCheck2 className="h-3.5 w-3.5" /> Save version
+                  </button>
+                  {activeVersion && (
+                    <button onClick={deleteVersion} className="inline-flex items-center gap-1 text-xs text-ink-faint transition-colors hover:text-signal" title={`Delete “${activeVersion}”`}>
+                      <Trash2 className="h-3.5 w-3.5" /> Delete
+                    </button>
+                  )}
                 </div>
                 <textarea
                   value={texText}
