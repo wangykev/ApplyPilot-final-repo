@@ -4238,6 +4238,14 @@ async function sweepAlreadyFilled(act, results) {
   // (field automation-id OR labelRegex, the fillEntryCdp findFd logic mirrored).
   let rscan = null; try { rscan = await act.repeatingScan(); } catch (e) { rscan = null; }
   const sections = (rscan && rscan.sections) || {};
+  // Wrappers some record ALREADY vouches for (2026-07-25). Identity is the DOM WRAPPER, not the record
+  // NAME: a tenant-renamed field keeps the fieldMap's canonical recName (`education[0].schoolName`) while
+  // the live automation-id is different (`school`), and a per-entry bucket fill records the live name —
+  // either way a name-keyed lookup misses and the sweep pushed a DUPLICATE "already on the form
+  // (unmapped section field) — NOT filled by ApplyPilot" row for a field this run had just filled
+  // correctly (live: Solar Turbines' school, filled + autocommit-exact, then re-surfaced as needs_review).
+  // Guards only the PUSH-a-new-record branches; the flip-an-existing-skipped-record path is untouched.
+  const claimedLocs = new Set(results.map((r) => r && r.auditLoc).filter(Boolean));
   for (const sec of PAGE_SECTIONS) {
     const s = sections[sec.containerPrefix];
     if (!s || !Array.isArray(s.entries)) continue;
@@ -4246,12 +4254,17 @@ async function sweepAlreadyFilled(act, results) {
       for (const fd of ((s.entries[i] && s.entries[i].fields) || [])) {
         // "" fieldName = the Attachments wrapper ("formField-" empty suffix) — never a sweep row
         if (!fd.fieldName || fd.widgetType === "file_upload" || nestedFields.has(fd.fieldName)) continue;
-        const fm = (sec.fieldMap || []).find((m) => m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName);
+        // SAME resolution ladder as the fill (fmMatchesFd): id → altFields → labelFallback, the fallback
+        // only when no other map entry names this field by id. Without it a tenant-renamed field looks
+        // "unmapped" here and gets a duplicate row (the Solar Turbines school bug).
+        const fm = (sec.fieldMap || []).find((m) => fmMatchesFd(m, fd, false))
+          || (sec.fieldMap || []).find((m) => m.labelFallback && m.labelFallback.test(fd.label || "")
+                && !(sec.fieldMap || []).some((o) => o !== m && fmMatchesFd(o, fd, false)));
         if (fm) {
           const key = sec.name + "[" + i + "]." + (fm.name || fm.field);
           const rec = results.find((r) => r.fieldName === key && r.status !== "removed");
           if (rec && rec.status === "skipped" && !rec.flag && hasLiveValue(fd.value)) flip(rec, fd.value, fd.wrapperSel);
-          else if (!rec && hasLiveValue(fd.value)) {
+          else if (!rec && hasLiveValue(fd.value) && !claimedLocs.has(fd.wrapperSel)) {
             // a LIVE value no record vouches for — a surviving row whose records were dropped
             // (index shift after a remediation delete) or an operator-added extra entry. The
             // summary is the page's source of truth → surface it as already-filled.
@@ -4264,8 +4277,9 @@ async function sweepAlreadyFilled(act, results) {
               auditLoc: fd.wrapperSel || null
             });
           }
-        } else if (hasLiveValue(fd.value)) {
+        } else if (hasLiveValue(fd.value) && !claimedLocs.has(fd.wrapperSel)) {
           // an UNMAPPED field inside a KNOWN section holding a value — the "not mapped" edge case
+          // (claimedLocs: never for a wrapper this run already filled, e.g. via the per-entry bucket tier)
           results.push({
             fieldName: sec.name + "[" + i + "]." + fd.fieldName, label: fd.label || fd.fieldName,
             widgetType: fd.widgetType, isRequired: !!fd.isRequired,

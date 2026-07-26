@@ -2631,6 +2631,27 @@ test("repeating bucket: NEVER double-fills a field the fieldMap already filled",
   assert.notStrictEqual(hits[0].flag, "bucket", "the mapped fill is NOT re-flagged as a bucket fill");
 });
 
+test("sweep: a TENANT-RENAMED section field this run FILLED is not re-surfaced as 'already on the form' (no duplicate row)", async () => {
+  // Live (Solar Turbines): education[0].schoolName filled correctly (autocommit-exact) and the sweep then
+  // pushed a SECOND record education[0].school — filled_review "already on the form (unmapped section
+  // field) — NOT filled by ApplyPilot" — because its join keyed on the map's id, which this tenant renamed.
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "school", widgetType: "text", isRequired: true, label: "School or University", value: "" }] });
+  const state = { prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  // the section fill happens inside driveRepeatingSectionCdp; run the page-level sweep over its records
+  const results = out.results.slice();
+  await sweepAlreadyFilled(act, results);
+  const schoolRecs = results.filter((r) => /^education\[0\]\.(school|schoolName)$/.test(r.fieldName));
+  assert.strictEqual(schoolRecs.length, 1, "exactly ONE record for the school field — no duplicate sweep row");
+  assert.strictEqual(schoolRecs[0].fieldName, "education[0].schoolName");
+  assert.notStrictEqual(schoolRecs[0].flag, "already-filled", "the field this run filled is not re-flagged as someone else's value");
+  assert.notStrictEqual(schoolRecs[0].status, "filled_review");
+});
+
 test("repeating bucket: no buckets configured ⇒ the tier is inert (byte-identical to the pre-bucket fill)", async () => {
   const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
     newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null")] });
