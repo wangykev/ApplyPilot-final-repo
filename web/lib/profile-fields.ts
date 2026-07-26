@@ -102,6 +102,7 @@ const META: Record<string, ProfileFieldMeta> = {
   "screening.willing_drug_test": { widget: "tribool", bucketWidget: "radio" },
   "screening.has_valid_drivers_license": { widget: "tribool", bucketWidget: "radio" },
   "screening.willing_to_relocate": { widget: "tribool", bucketWidget: "radio" },
+  "screening.willing_to_relocate_at_own_cost": { widget: "tribool", bucketWidget: "radio" },
   "screening.remote_ok": { widget: "tribool", bucketWidget: "radio" },
   "screening.earliest_start_date": { widget: "date", granularity: "month-day-year", bucketWidget: "date" },
 };

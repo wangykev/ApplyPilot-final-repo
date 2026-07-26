@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { X, Check } from "lucide-react";
+import { clsx } from "@/lib/clsx";
 import { CheckboxField, TagListField, TieredField } from "@/components/form/fields";
 import { ProfileFieldEditor, arrv } from "@/components/app/teach/AnswerEditPopup";
 import {
@@ -9,7 +10,9 @@ import {
   addWordingToBucket,
   ensureModeABucket,
   bucketLabel,
-  decideTeachRoute,
+  decideTeachPlan,
+  setFieldVariants,
+  profileValueAt,
   boolAnswerCandidates,
   isBoolAnswer,
   seedLadderDraft,
@@ -77,8 +80,13 @@ export function TeachAddPopup({
   const isField = target.kind === "field";
   const path = isField ? target.path : "";
   const fieldLabel = isField ? target.label : "";
-  // For a field: does it already hold this answer (→ wording) or not (→ answer)?
-  const route = isField ? decideTeachRoute(profile, path, card.answer) : "answer";
+  // TWO AXES (operator, 2026-07-25): the question WORDING (bucket) and the ANSWER (value / variant
+  // ladder) can EACH be missing. "both" → the merged side-by-side popup; "variant" → the answer is a
+  // new phrasing of a value the field already holds (file it in the ladder, NEVER overwrite the value).
+  const plan = isField
+    ? decideTeachPlan(profile, path, { question: card.question, answer: card.answer }, buckets)
+    : { route: "answer" as const, needsWording: true, needsAnswer: true };
+  const route = plan.route;
   const meta = isField ? profileFieldMeta(path, getAtPath(profile, path)) : null;
   // A NON-STANDARD yes/no label (e.g. "Affirmative") a tenant used — the default Yes/No+True/False ladder
   // can't match it, so remember it in this field's ladder (answer_ladders) for the chosen polarity, so it
@@ -99,6 +107,14 @@ export function TeachAddPopup({
 
   // ── existing (Mode-B) answer: optionally add the card's answer to its candidate ladder ──
   const [alsoLadder, setAlsoLadder] = useState(false);
+
+  // ── the field's ANSWER-VARIANT ladder (routes "variant" / "both"): the tenant's phrasing of a value
+  // the profile already holds — e.g. race "Asian" + the form's "Asian (not hispanic or latino)". Stored
+  // in answer_ladders[path].values, which the extension appends as extra match candidates. ──
+  const existingVariants = isField
+    ? ((profile as { answer_ladders?: Record<string, { values?: string[] }> })?.answer_ladders?.[path]?.values ?? [])
+    : [];
+  const [variants, setVariants] = useState<string[]>(() => dedupWordings([...existingVariants, card.answer]));
 
   // ── non-standard yes/no label: the editable fill-ladder draft (same reorderable editor as the profile
   // page), seeded with the polarity's defaults + the card's label; re-seeded when the Yes/No toggle flips. ──
@@ -129,6 +145,18 @@ export function TeachAddPopup({
         buckets: addWordingToBucket(withB, bucketId, card.question),
         toast: nonStandardBool ? `Remembered “${card.answer}” for your ${fieldLabel} ✓` : `Added to your ${fieldLabel} ✓`,
       });
+    } else if (isField && (route === "variant" || route === "both")) {
+      // The field HOLDS a different value → the card's answer is another PHRASING of it, so it goes in
+      // the answer-variant ladder; the stored value is left ALONE (overwriting "Asian" with the form's
+      // "Asian (not hispanic or latino)" would corrupt the profile). "both" files the wording too.
+      const withVariants = setFieldVariants(profile, path, variants) as Profile;
+      const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
+      const next = withB.map((b) => (b.id === bucketId ? { ...b, questions: dedupWordings(wordings) } : b));
+      onConfirm({
+        profile: withVariants,
+        buckets: next,
+        toast: route === "both" ? `Taught — wording + answer for ${fieldLabel} ✓` : `Answer variant added to ${fieldLabel} ✓`,
+      });
     } else if (isField) {
       // wording route — the value's already there, only the phrasing is new
       const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
@@ -149,18 +177,28 @@ export function TeachAddPopup({
 
   // A non-standard yes/no label needs a definite polarity (Yes or No) before we can file it in a ladder.
   const canConfirm =
-    isField && route === "answer" ? (nonStandardBool ? typeof fieldValue === "boolean" : true) : wordings.length > 0;
+    isField && route === "answer"
+      ? (nonStandardBool ? typeof fieldValue === "boolean" : true)
+      : isField && route === "variant"
+        ? variants.length > 0
+        : isField && route === "both"
+          ? variants.length > 0 && wordings.length > 0
+          : wordings.length > 0;
 
   const title =
     isField && route === "answer"
       ? `Add to your ${fieldLabel}`
-      : isField
-        ? `Remember wording — ${fieldLabel}`
-        : `Add to ${existing ? bucketLabel(existing) : "answer"}`;
+      : isField && route === "both"
+        ? `Teach both — ${fieldLabel}`
+        : isField && route === "variant"
+          ? `Answer variant — ${fieldLabel}`
+          : isField
+            ? `Remember wording — ${fieldLabel}`
+            : `Add to ${existing ? bucketLabel(existing) : "answer"}`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
-      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div className={clsx("w-full rounded-xl border border-hairline bg-panel p-5 shadow-2xl", route === "both" ? "max-w-3xl" : "max-w-md")} onClick={(e) => e.stopPropagation()}>
         <div className="mb-3 flex items-center justify-between">
           <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{title}</h3>
           <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
@@ -212,6 +250,57 @@ export function TeachAddPopup({
               ) : (
                 <p className="text-xs text-signal">Pick Yes or No above so we know which &ldquo;{card.answer}&rdquo; means.</p>
               ))}
+          </div>
+        )}
+
+        {/* BOTH missing → the question bucket and the answer ladder, side by side, both being added. */}
+        {isField && route === "both" && (
+          <div className="space-y-3">
+            <p className="text-xs text-ink-dim">
+              This is a new <span className="text-ink">wording</span> AND a new <span className="text-ink">answer phrasing</span> for your{" "}
+              <span className="text-ink">{fieldLabel}</span> — both get taught. Your stored value stays as it is.
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
+                <p className="mb-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">Question bucket</p>
+                <TagListField
+                  label="Question wordings"
+                  value={wordings}
+                  onChange={setWordings}
+                  highlight={card.question}
+                  placeholder="Add another wording, press Enter"
+                />
+              </div>
+              <div className="rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
+                <p className="mb-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">Answer ladder</p>
+                <p className="mb-2 text-xs text-ink-faint">
+                  Your {fieldLabel}: <span className="font-medium text-ink">{profileValueAt(profile, path) || "—"}</span>
+                </p>
+                <TieredField
+                  label="Answer variants it tries (most-specific first)"
+                  value={variants}
+                  onChange={setVariants}
+                  highlight={card.answer}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* the wording is already known → only the answer phrasing is new */}
+        {isField && route === "variant" && (
+          <div className="space-y-2">
+            <p className="text-xs text-ink-dim">
+              This phrasing is already filed under <span className="text-ink">{fieldLabel}</span>, but the form worded the
+              ANSWER differently. Adding it to the answer ladder — your stored value{" "}
+              <span className="text-ink">{profileValueAt(profile, path) || "—"}</span> stays as it is.
+            </p>
+            <TieredField
+              label="Answer variants it tries (most-specific first)"
+              value={variants}
+              onChange={setVariants}
+              highlight={card.answer}
+            />
           </div>
         )}
 

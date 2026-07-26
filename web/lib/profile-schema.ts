@@ -156,6 +156,7 @@ export const screeningSchema = z
     willing_drug_test: triBool,
     has_valid_drivers_license: triBool,
     willing_to_relocate: triBool,
+    willing_to_relocate_at_own_cost: triBool, // the common follow-up: relocation offered, but WHO PAYS
     remote_ok: triBool,
     earliest_start_date: str, // "YYYY-MM-DD"
     years_of_experience_total: str,

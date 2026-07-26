@@ -326,6 +326,11 @@ function rawAt(profile: unknown, path: string): unknown {
  *  answer the profile already covers does NOT resurface in teach after being taught. */
 export function fieldHoldsAnswer(profile: unknown, path: string, answer: string): boolean {
   const raw = rawAt(profile, path);
+  // The field's ANSWER-VARIANT ladder counts as HELD: answer_ladders[path].values is exactly what the
+  // extension appends as extra match candidates (appendFieldVariants), so a phrasing already taught
+  // there fills deterministically and must NOT resurface as a teach card (2026-07-25).
+  const variants = (profile as { answer_ladders?: Record<string, { values?: string[] }> } | null)?.answer_ladders?.[path]?.values;
+  if (Array.isArray(variants) && variants.some((v) => sameAnswer(String(v), answer))) return true;
   if (Array.isArray(raw)) return raw.some((v) => typeof v === "string" && sameAnswer(v, answer));
   if (typeof raw === "boolean") {
     const ladders = (profile as { answer_ladders?: Record<string, { yes?: string[]; no?: string[] }> } | null)?.answer_ladders;
@@ -336,15 +341,75 @@ export function fieldHoldsAnswer(profile: unknown, path: string, answer: string)
   return raw != null && sameAnswer(String(raw), answer);
 }
 
-/** Which route the teach confirm popup takes when a card is added to a chosen profile field:
- *  - "wording": the field already holds the card's answer → only the phrasing is missing, so add the
- *    wording (the value stays untouched);
- *  - "answer":  the field is empty OR holds a different value → set / append the answer (and file the
- *    wording too, so the card is fully taught).
- *  Splitting these is what makes the popup show exactly "the question OR the answer" that's missing. */
-export type TeachRoute = "answer" | "wording";
+/** Does this field's question bucket ALREADY contain this wording? (normalized, the fill's own key) */
+export function bucketHasWording(buckets: Bucket[], path: string, question: string): boolean {
+  const p = String(path || "").trim();
+  const k = normalizeQuestion(question);
+  if (!p || !k) return false;
+  return (buckets || []).some(
+    (b) => String(b.profile_path || "").trim() === p && (b.questions || []).some((q) => normalizeQuestion(q) === k),
+  );
+}
+
+/** Is the field EMPTY (no stored value at all)? An empty field wants its VALUE set; a field that already
+ *  holds a different value wants the tenant's phrasing filed as an answer VARIANT, never an overwrite. */
+export function fieldIsEmpty(profile: unknown, path: string): boolean {
+  const raw = rawAt(profile, path);
+  if (raw == null) return true;
+  if (Array.isArray(raw)) return raw.filter((v) => String(v ?? "").trim() !== "").length === 0;
+  if (typeof raw === "boolean") return false;
+  return String(raw).trim() === "";
+}
+
+/** Which route the teach confirm popup takes when a card is added to a chosen profile field. TWO
+ *  INDEPENDENT axes (operator, 2026-07-25) — the question WORDING (the bucket) and the ANSWER (the
+ *  field's value / its answer-variant ladder) can each be missing, so the old binary route mishandled
+ *  the case where BOTH are:
+ *  - "wording": the field already answers this → only the phrasing is new → add it to the bucket;
+ *  - "answer":  the field is EMPTY → set its value (and file the wording too);
+ *  - "variant": the field holds a DIFFERENT value and the wording is already known → the tenant's
+ *    phrasing of the answer belongs in this field's answer-variant ladder — NEVER overwrite the value
+ *    (the live case: race = "Asian", the form wanted "Asian (not hispanic or latino)");
+ *  - "both":    the field holds a different value AND the wording is new → BOTH must be taught, so the
+ *    popup shows the question bucket and the answer ladder side by side. Checked FIRST.
+ */
+export type TeachRoute = "answer" | "wording" | "variant" | "both";
 export function decideTeachRoute(profile: unknown, path: string, answer: string): TeachRoute {
-  return fieldHoldsAnswer(profile, path, answer) ? "wording" : "answer";
+  if (fieldHoldsAnswer(profile, path, answer)) return "wording"; // the answer is covered; only the phrasing can be new
+  if (fieldIsEmpty(profile, path)) return "answer";              // nothing stored yet → set the value
+  return wantsVariant(profile, path) ? "variant" : "answer";     // scalar → the answer is another PHRASING; bool/list → a real value change
+}
+
+/** Is a DIFFERENT answer on this field a new PHRASING (→ the variant ladder) or a real VALUE change?
+ *  - boolean (triBool): a different answer flips POLARITY → a value change (its per-polarity label
+ *    ladder is handled by the popup's non-standard-label editor);
+ *  - array (tiered/list): a different answer is another accepted option → appended to the field's OWN
+ *    list by the value editor;
+ *  - scalar: the profile holds one canonical value ("Asian") and the form worded it differently
+ *    ("Asian (not hispanic or latino)") → the ANSWER-VARIANT ladder, never an overwrite. */
+function wantsVariant(profile: unknown, path: string): boolean {
+  const raw = rawAt(profile, path);
+  return typeof raw !== "boolean" && !Array.isArray(raw);
+}
+
+/** The FULL decision, both axes at once — what the popup renders and what confirm must save. */
+export function decideTeachPlan(
+  profile: unknown,
+  path: string,
+  card: { question: string; answer: string },
+  buckets: Bucket[],
+): { route: TeachRoute; needsWording: boolean; needsAnswer: boolean } {
+  const answerHeld = fieldHoldsAnswer(profile, path, card.answer);
+  const wordingKnown = bucketHasWording(buckets, path, card.question);
+  const needsWording = !wordingKnown;
+  const needsAnswer = !answerHeld;
+  if (!needsAnswer) return { route: "wording", needsWording, needsAnswer };   // only the phrasing can be missing
+  if (fieldIsEmpty(profile, path)) return { route: "answer", needsWording, needsAnswer }; // empty field → set the value
+  // Holds a DIFFERENT value. A bool polarity flip / a list append is a real VALUE change (the value
+  // editor owns it, and it files the wording too); a SCALAR difference is another phrasing → the
+  // variant ladder, and when the wording is new too, BOTH are taught in one merged popup.
+  if (!wantsVariant(profile, path)) return { route: "answer", needsWording, needsAnswer };
+  return { route: needsWording ? "both" : "variant", needsWording, needsAnswer };
 }
 
 /** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */

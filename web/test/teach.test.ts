@@ -21,6 +21,9 @@ import {
   dottedPath,
   fieldHoldsAnswer,
   decideTeachRoute,
+  decideTeachPlan,
+  bucketHasWording,
+  fieldIsEmpty,
   wasManuallyEdited,
   type TeachSource,
 } from "@/lib/teach";
@@ -369,7 +372,7 @@ test("fieldHoldsAnswer: scalar / boolean(Yes-No) / tiered-array-any-candidate; e
 test("decideTeachRoute: value already present → 'wording'; missing/different → 'answer'", () => {
   const p = { self_identification: { gender: "Male" }, personal_info: { city: "" } };
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Male"), "wording"); // already holds it
-  assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
+  assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "variant"); // holds a DIFFERENT value → the answer is a VARIANT, never an overwrite
   assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
 });
 
@@ -466,4 +469,59 @@ test("yes/no teach correctness: boolean fields cover Yes/True AND No/False + cus
 
   // flattenProfileFields ignores the answer_ladders metadata (no junk rows / phantom section)
   assert.equal(flattenProfileFields(pc).some((r) => r.section === "answer_ladders" || r.path.startsWith("answer_ladders")), false);
+});
+
+// ── TWO-AXIS teach plan (operator, 2026-07-25) ────────────────────────────────────────────────
+// The question WORDING (bucket) and the ANSWER (value / variant ladder) are independent; the case
+// where BOTH are missing was unhandled and is checked FIRST. Live example: race = "Asian" in the
+// profile, the form asked "Please select the ethnicity which most accurately describes how you
+// identify yourself" and the approved answer was "Asian (not hispanic or latino)".
+const RACE = "self_identification.race";
+const ethnicityQ = "Please select the ethnicity which most accurately describes how you identify yourself";
+const raceProfile = () => ({ self_identification: { race: "Asian" } });
+const bucketFor = (path: string, questions: string[]): Bucket => ({
+  id: "field_" + path.replace(/[^\w]+/g, "_"), profile_path: path, value: [], category: "", widget_hint: "dropdown", questions, selectors: {},
+});
+
+test("teach plan: NEW wording + NEW answer phrasing → 'both' (the merged popup), the value untouched", () => {
+  const plan = decideTeachPlan(raceProfile(), RACE, { question: ethnicityQ, answer: "Asian (not hispanic or latino)" }, []);
+  assert.equal(plan.route, "both");
+  assert.equal(plan.needsWording, true);
+  assert.equal(plan.needsAnswer, true);
+});
+
+test("teach plan: KNOWN wording + new answer phrasing → 'variant' (answer ladder only)", () => {
+  const buckets = [bucketFor(RACE, [ethnicityQ])];
+  const plan = decideTeachPlan(raceProfile(), RACE, { question: ethnicityQ, answer: "Asian (not hispanic or latino)" }, buckets);
+  assert.equal(plan.route, "variant");
+  assert.equal(plan.needsWording, false);
+  assert.equal(plan.needsAnswer, true);
+});
+
+test("teach plan: new wording + answer ALREADY held → 'wording' (question bucket only)", () => {
+  const plan = decideTeachPlan(raceProfile(), RACE, { question: ethnicityQ, answer: "Asian" }, []);
+  assert.equal(plan.route, "wording");
+  assert.equal(plan.needsAnswer, false);
+});
+
+test("teach plan: an EMPTY field sets its VALUE (not a variant)", () => {
+  const plan = decideTeachPlan({ self_identification: {} }, RACE, { question: ethnicityQ, answer: "Asian" }, []);
+  assert.equal(plan.route, "answer");
+});
+
+test("teach plan: an answer already in the field's VARIANT ladder does not resurface as an answer change", () => {
+  const p = { self_identification: { race: "Asian" }, answer_ladders: { [RACE]: { values: ["Asian (not hispanic or latino)"] } } };
+  // the variant is stored → setFieldVariants covered it; only the wording can still be new
+  const plan = decideTeachPlan(p, RACE, { question: ethnicityQ, answer: "Asian (not hispanic or latino)" }, []);
+  assert.equal(plan.needsAnswer, false, "the ladder already carries this phrasing");
+  assert.equal(plan.route, "wording");
+});
+
+test("bucketHasWording / fieldIsEmpty: the two axes, normalized", () => {
+  const buckets = [bucketFor(RACE, ["  PLEASE select the Ethnicity which most accurately describes how you identify yourself  "])];
+  assert.equal(bucketHasWording(buckets, RACE, ethnicityQ), true, "normalized wording match");
+  assert.equal(bucketHasWording(buckets, "self_identification.gender", ethnicityQ), false, "bound to a different field");
+  assert.equal(fieldIsEmpty({ self_identification: { race: "" } }, RACE), true);
+  assert.equal(fieldIsEmpty({ self_identification: { race: "Asian" } }, RACE), false);
+  assert.equal(fieldIsEmpty({ self_identification: { race: [] } }, RACE), true);
 });

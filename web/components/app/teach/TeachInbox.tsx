@@ -57,6 +57,10 @@ export function TeachInbox({
   // the shared new-answer popup (identical to the profile page's "Add remembered answer").
   const [confirm, setConfirm] = useState<{ target: ConfirmTarget } | null>(null);
   const [picker, setPicker] = useState(false);
+  // RETARGET (2026-07-25, operator): "Wrong field?" points at the profile ALREADY shown on the right
+  // instead of opening a search popup over it. The picker stays reachable for the things a row-click
+  // can't express (a brand-new answer, or an existing bucket).
+  const [retarget, setRetarget] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
   // teach-time AI fallback: recommendation per card.key for cards with no stamped maps_to hint
   const [recCache, setRecCache] = useState<Record<string, FieldRecommendation>>({});
@@ -288,6 +292,7 @@ export function TeachInbox({
 
   const pickTarget = (t: PickedTarget) => {
     setPicker(false);
+    setRetarget(false);
     if (t.kind === "new") setNewOpen(true);
     else if (t.kind === "field") setConfirm({ target: { kind: "field", path: t.path, label: humanize(t.path) } });
     else setConfirm({ target: { kind: "existing", id: t.id } });
@@ -369,9 +374,14 @@ export function TeachInbox({
                     <Check className="h-4 w-4" />
                     Add to your {humanize(recPath)}
                   </button>
-                  <button onClick={() => setPicker(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                    Wrong field?
+                  <button onClick={() => setRetarget(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving || retarget}>
+                    {retarget ? "Pick a field on the right →" : "Wrong field?"}
                   </button>
+                  {retarget && (
+                    <button onClick={() => { setRetarget(false); setPicker(true); }} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+                      Search all fields…
+                    </button>
+                  )}
                 </div>
               </div>
             ) : (
@@ -402,6 +412,9 @@ export function TeachInbox({
         note={panelNote}
         onOpenBucket={(path, label, widget) => setBucketPopup({ path, label, widget })}
         onOpenAnswer={(path, label) => setAnswerPopup({ path, label })}
+        selectMode={retarget}
+        onCancelSelect={() => setRetarget(false)}
+        onSelectPath={(path) => { setRetarget(false); setConfirm({ target: { kind: "field", path, label: humanize(path) } }); }}
       />
 
       {/* question bucket — the question wordings that map to a field's answer (the ANSWER LADDER is a
