@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -2748,6 +2748,50 @@ test("checkbox group: replayField (SUBMIT) sets the approved option through the 
   assert.strictEqual(r.status, "filled", "the approved self-ID answer replays");
   assert.strictEqual(r.after, SELFID_OPTS[0]);
   assert.deepStrictEqual(field.options.map((o) => o.checked), [true, false]);
+});
+
+// ── REVIEW ORDER: form order, sections interleaved with flat fields (operator, 2026-07-25) ──
+test("review order: a flat field BETWEEN two repeating sections stays between them (not hoisted above both)", () => {
+  // Production order: all flat records first, then section-by-section. Page layout: phone (0),
+  // workExperience (1..), "howDidYouHear" (10), education (11..), websites (20..).
+  const scanFields = [{ fieldName: "phoneNumber", domIndex: 0 }, { fieldName: "howDidYouHear", domIndex: 10 }];
+  const sectionOrder = { workExperience: 1, education: 11, webAddress: 20 };
+  const results = [
+    { fieldName: "phoneNumber" }, { fieldName: "howDidYouHear" },          // flat (produced first)
+    { fieldName: "workExperience.add" }, { fieldName: "workExperience[0].jobTitle" }, { fieldName: "workExperience[1].jobTitle" },
+    { fieldName: "education.add" }, { fieldName: "education[0].degree" },
+    { fieldName: "website.add" }, { fieldName: "website[0].url" }          // section name "website" ≠ fkit base "webAddress"
+  ];
+  orderResultsByDom(results, scanFields, sectionOrder);
+  assert.deepStrictEqual(results.map((r) => r.fieldName), [
+    "phoneNumber",
+    "workExperience.add", "workExperience[0].jobTitle", "workExperience[1].jobTitle",
+    "howDidYouHear",                                                        // BETWEEN the sections, as on the form
+    "education.add", "education[0].degree",
+    "website.add", "website[0].url"
+  ]);
+});
+
+test("review order: a section's own records keep their fill order (stable), and unpositioned records stay with their group", () => {
+  const scanFields = [{ fieldName: "firstName", domIndex: 0 }];
+  const sectionOrder = { education: 5 };
+  const results = [
+    { fieldName: "firstName" },
+    { fieldName: "education.add" },
+    { fieldName: "education[0].schoolName" },
+    { fieldName: "education[0].degree" },
+    { fieldName: "education[0].__note" },        // no position → inherits the previous key
+    { fieldName: "education[1].schoolName" }
+  ];
+  const before = results.map((r) => r.fieldName);
+  orderResultsByDom(results, scanFields, sectionOrder);
+  assert.deepStrictEqual(results.map((r) => r.fieldName), before, "already in form order → unchanged (stable)");
+});
+
+test("review order: no scan positions ⇒ order is left exactly as produced (never scrambles)", () => {
+  const results = [{ fieldName: "a" }, { fieldName: "b" }, { fieldName: "c" }];
+  orderResultsByDom(results, [], {});
+  assert.deepStrictEqual(results.map((r) => r.fieldName), ["a", "b", "c"]);
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {

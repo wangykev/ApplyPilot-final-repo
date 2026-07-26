@@ -899,6 +899,19 @@ function cdpPageScan() {
     }
     return false;
   };
+  // REVIEW ORDER (2026-07-25, operator): which repeating SECTION does a repeating wrapper belong to?
+  // (the fkit base of the nearest indexed ancestor, e.g. "workExperience-2--null" → "workExperience").
+  // Paired with the document-order index below it lets the review list flat fields and repeating
+  // sections INTERLEAVED exactly as the form lays them out, instead of all-flat-then-all-sections.
+  const sectionBaseOf = (w) => {
+    let el = w.closest("[data-fkit-id]");
+    while (el) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)-\d+--/.exec(el.getAttribute("data-fkit-id") || "");
+      if (m) return m[1];
+      el = el.parentElement ? el.parentElement.closest("[data-fkit-id]") : null;
+    }
+    return null;
+  };
   // The field's CURRENT live value (the already-filled sweep: the review must inventory everything
   // the page holds, not just what the bot filled). LOCKSTEP with cdpRepeatingScan's valueOf. Empty
   // date segments render their "MM"/"DD"/"YYYY" placeholder text → filtered (never counts as filled).
@@ -919,10 +932,21 @@ function cdpPageScan() {
     } catch (e) { return null; }
   };
   const all = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
+  // Document-order position of EVERY formField wrapper (flat + repeating) — the ordering key the
+  // review uses. A repeating SECTION's position is the position of its FIRST field, so a flat field
+  // that sits between two sections on the form stays between them in the review.
+  const domPos = new Map();
+  const sectionOrder = {};
+  all.forEach((w, i) => {
+    domPos.set(w, i);
+    const b = isRepeating(w) ? sectionBaseOf(w) : null;
+    if (b && sectionOrder[b] === undefined) sectionOrder[b] = i;
+  });
   const wrappers = all.filter((w) => !isRepeating(w));
   return {
     url: location.href,
     repeatingFieldCount: all.length - wrappers.length,
+    sectionOrder,
     fields: wrappers.map((w) => {
       const id = w.getAttribute("data-automation-id");
       const wt = classify(w);
@@ -932,7 +956,8 @@ function cdpPageScan() {
         widgetType: wt,
         label: labelOf(w),
         isRequired: requiredOf(w),
-        value: valueOf(w, wt)
+        value: valueOf(w, wt),
+        domIndex: domPos.get(w)
       };
       // A checkbox GROUP carries its option labels straight from the DOM — READ-ONLY, no open/actuation
       // needed (unlike a dropdown), so the review editor can render a real picker even when the field is

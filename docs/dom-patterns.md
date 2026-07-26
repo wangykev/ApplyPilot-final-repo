@@ -2410,3 +2410,33 @@ page-1 records at all — so it is either mounted after the cascade re-scan roun
 correctly leaves it UNCHECKED (never auto-consent to marketing SMS) — but it should still be inventoried
 in the review bundle. Capture its wrapper/automation-id to decide whether the cascade scan needs a longer
 reveal window or the field lives outside the scanned shape.
+
+## 2026-07-25 — Caterpillar/Solar Turbines: the OFCCP disability self-ID is a CHECKBOX GROUP, and the SMS consent is blur-gated
+
+Last page of the Caterpillar flow (the voluntary self-identification of disability form: Name /
+Employee ID / Date / "Please check one of the boxes below"). Three observations:
+
+- **The three answers are CHECKBOXES in ONE wrapper, behaving as pick-one** — "Yes, I have a
+  disability, or have had one in the past" / "No, I do not have a disability and have not had one in
+  the past" / "I do not want to answer". The operator confirmed the tenant **refuses a second check
+  while one is set** (you must UNCHECK the current option first). `classify` only matched a *single*
+  checkbox, so the wrapper fell through to `unknown` → the review editor rendered a bare TEXTBOX for a
+  pick-one legal question. New widget type **`checkbox_group`**: option labels come from the SCAN (read
+  from the DOM, no actuation), so even a BLANK field (voluntary ⇒ the bot must not answer it) reaches
+  review as a real picker; the filler is label-EXACT, unchecks-then-checks, and verifies the end state
+  (exactly one checked). Wired through the M40 audit and `replayField` (the submit-stage fill).
+- **The Date field is a `MM/DD/YYYY` composite** (the signature date). Left to the operator in review;
+  the date replay path already fills it from the approved value.
+- **The SMS/marketing consent checkbox on PAGE 1 is BLUR-GATED.** It is revealed by the phone number,
+  but only once the phone field BLURS — the fill leaves focus inside the box it just typed, so the
+  checkbox never mounted while we were looking (it was missing from the records through BOTH cascade
+  passes). Fix: `act.blurActive()` — a direct `activeElement.blur()` (not Tab, which would move focus
+  INTO the next widget and could arm a typeahead) — runs once after the fold, before the reveal passes.
+  The checkbox itself is OPTIONAL ("my consent is not required") → the optional-unmapped-checkbox rule
+  leaves it UNCHECKED, which is the correct answer; it just needs to be INVENTORIED in review.
+
+**Also fixed from this page (review UX):** records were produced flat-fields-first then
+section-by-section, so a flat field sitting BETWEEN two repeating sections rendered above both. The
+bundle's entry array is the render order in both viewers, so `orderResultsByDom` now sorts records by
+the wrapper's document position (a section takes the position of its FIRST field; unpositioned records
+inherit their neighbour's key; stable, so fill order within a section is untouched).

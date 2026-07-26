@@ -19,7 +19,7 @@ A Manifest V3 Chrome extension that automates Workday job applications from a st
 
 See `docs/dom-patterns.md` for the full, dated rulebook (every observed tenant + refutations). Short version:
 - Every form field sits in a `<div data-automation-id="formField-*">` wrapper.
-- `classifyField` derives the widget type from wrapper descendants, first match wins: **hierarchical `source` → typeahead (`data-uxi-widget-type="multiselect"`) → radio (`input[type=radio]`) → dropdown (`button[aria-haspopup="listbox"]`) → checkbox → text → unknown**.
+- `classifyField` derives the widget type from wrapper descendants, first match wins: **hierarchical `source` → typeahead (`data-uxi-widget-type="multiselect"`) → radio (`input[type=radio]`) → dropdown (`button[aria-haspopup="listbox"]`) → checkbox (ONE) → checkbox_group (2+ checkboxes in one wrapper = a pick-one set, e.g. the OFCCP disability self-ID; radio-like fill, options read from the DOM by the scan) → text → unknown**.
 - **Rules come from observed DOM, not the Python spec.** Patterns the spec assumed do NOT hold on observed pages (e.g. `role="combobox"`, `role="radiogroup"` don't fire on Comcast). When code and doc disagree, fix one — don't let them drift.
 
 ## React fill technique

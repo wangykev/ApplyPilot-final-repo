@@ -3425,6 +3425,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   if (!targeted) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
   markPhase("sweep", _phaseT0);
 
+  // REVIEW ORDER (operator, 2026-07-25): sort the records into the FORM's own top-to-bottom order, so
+  // a flat field between two repeating sections renders between them instead of above both. Uses a
+  // FRESH scan so fields revealed during this page (cascade) carry a real position too; a scan failure
+  // leaves the order exactly as before (non-fatal). Last step — nothing downstream depends on order
+  // (the audit/sweep join by name), and the bundle's entry array IS the viewers' render order.
+  if (!targeted) {
+    try {
+      const fin = await act.scanPage();
+      orderResultsByDom(results, (fin && fin.fields) || scan.fields, (fin && fin.sectionOrder) || scan.sectionOrder);
+    } catch (e) { /* keep the production order */ }
+  }
+
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
   // M30 session-expiry EARLY-WARNING (heuristic, SOURCE-ONLY): if this page has the
@@ -4266,6 +4278,42 @@ async function readLiveValueByWidget(act, widget, loc) {
     const t = act.readTextValue ? await act.readTextValue(loc) : null;
     return t ? t.value : null;
   } catch (e) { return null; }
+}
+
+// ── REVIEW ORDER (operator, 2026-07-25) ── the review must list fields in the order the FORM lays
+// them out. Records are PRODUCED flat-loop-first then section-by-section, so a flat field sitting
+// BETWEEN two repeating sections used to render above both of them ("other fields first, then the
+// repeating sections"). The bundle's entry array IS the render order in both viewers, so ordering
+// here fixes both. Key = the wrapper's document position from the scan (`domIndex`); a repeating
+// section's records all take the position of its FIRST field (`sectionOrder[base]`), which keeps a
+// section's own entries/fields contiguous and in fill order. Records with no position (section ops,
+// stubs, cascade-revealed fields the scan didn't have) INHERIT the previous record's key, so they
+// stay attached to the group they belong to. STABLE (ties keep their original relative order), so
+// within a section the entry/field sequence is untouched. PURE + Node-testable.
+function orderResultsByDom(results, scanFields, sectionOrder) {
+  const secBase = {};
+  for (const s of PAGE_SECTIONS) secBase[s.name] = String(s.containerPrefix || "").replace(/-$/, "");
+  const flatIdx = {};
+  for (const f of (scanFields || [])) if (f && typeof f.domIndex === "number") flatIdx[f.fieldName] = f.domIndex;
+  const order = sectionOrder || {};
+  const keyOf = (r) => {
+    const name = String((r && r.fieldName) || "");
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*[[.]/.exec(name);       // "education[0].degree" / "website.add"
+    if (m) { const b = secBase[m[1]] || m[1]; if (order[b] != null) return order[b]; }
+    if (order[name] != null) return order[name];                    // a section STUB (bare base name)
+    if (flatIdx[name] != null) return flatIdx[name];                // a flat field
+    return null;
+  };
+  let last = -1;
+  const keyed = results.map((r, i) => {
+    const k = keyOf(r);
+    if (k != null) last = k;
+    return { r, k: k != null ? k : last, i };
+  });
+  keyed.sort((a, b) => (a.k - b.k) || (a.i - b.i));
+  results.length = 0;
+  for (const x of keyed) results.push(x.r);
+  return results;
 }
 
 async function sweepAlreadyFilled(act, results) {
@@ -6031,5 +6079,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
