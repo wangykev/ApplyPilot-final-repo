@@ -2,7 +2,7 @@ import { PageHeader } from "@/components/app/PageHeader";
 import { loadUserData } from "@/lib/user-data";
 import { identityResume } from "@/lib/tailor";
 import { tailoredToPrintHtml, tailoredToTex } from "@/lib/resume-doc";
-import { getResumePreviewUrl } from "@/app/app/resume/actions";
+import { getResumePreviewUrl, getResumeSource } from "@/app/app/resume/actions";
 import { listJdApplications } from "./actions";
 import { TailorPanel, type OriginalResume } from "./TailorPanel";
 
@@ -27,7 +27,9 @@ async function loadOriginal(): Promise<OriginalResume | null> {
 }
 
 export default async function TailorPage() {
-  const [apps, original] = await Promise.all([listJdApplications(), loadOriginal()]);
+  const [apps, original, sourceRes] = await Promise.all([listJdApplications(), loadOriginal(), getResumeSource()]);
+  const source = sourceRes.ok ? sourceRes.source : null;
+  const serverTex = source?.kind === "tex" && source.tex ? { tex: source.tex, name: source.filename } : null;
   return (
     <div className="space-y-8">
       <PageHeader
@@ -35,7 +37,7 @@ export default async function TailorPage() {
         title="Tailor resume"
         description="Reshape your resume for a specific posting — from safe bullet selection to an aggressive rewrite. Your employers, dates, education and skills list never change; every AI edit is flagged for review."
       />
-      <TailorPanel apps={apps} original={original} />
+      <TailorPanel apps={apps} original={original} serverTex={serverTex} />
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import { PageHeader } from "@/components/app/PageHeader";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
+import { getResumeSource } from "./actions";
 import { ResumePanel } from "./ResumePanel";
 
 export const dynamic = "force-dynamic";
@@ -27,15 +28,15 @@ async function loadResume(): Promise<{ filename: string; size: number } | null> 
 }
 
 export default async function ResumePage() {
-  const stored = await loadResume();
+  const [stored, sourceRes] = await Promise.all([loadResume(), getResumeSource()]);
   return (
     <div className="space-y-8">
       <PageHeader
         eyebrow="Documents"
         title="Resume"
-        description="Upload one PDF. ApplyPilot stores it for the extension to attach, and can parse it into your profile."
+        description="Upload your resume's SOURCE (.tex or .docx), live-edit it, and generate the PDF that gets attached to every application — under the filename you choose."
       />
-      <ResumePanel initialStored={stored} />
+      <ResumePanel initialStored={stored} initialSource={sourceRes.ok ? sourceRes.source : null} />
     </div>
   );
 }
