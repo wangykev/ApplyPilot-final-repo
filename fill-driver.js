@@ -2582,10 +2582,16 @@ function buildBucketIndex(buckets) {
 // returns the result flagged `bucket` (provenance — a "remembered" style badge, NOT an ai-* flag)
 // ONLY on a real commit; a no-match/failure returns null so the caller falls through to the AI pass
 // / blank. textarea (essays) + file_upload + unknown are never bucket-filled.
-const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
+// `opts.rawValue` (2026-07-25, repeating-section buckets): fill from THIS value instead of
+// getByPath(profile, bucket.profile_path) — the caller already resolved the per-ENTRY value (entry i's
+// own item), so a bucket bound to `education.0.school_or_university` fills entry 1 from entry 1's data.
+// The answer-LADDER lookups deliberately keep using the bucket's VERBATIM path (that's how the operator's
+// variants are keyed — `education.0.gpa`), so ladders stay shared across a section's entries.
+const fillFromBucket = async (act, loc, f, bucket, profile, budgets, opts) => {
+  const hasRawOverride = !!(opts && Object.prototype.hasOwnProperty.call(opts, "rawValue"));
   let arg;
   if (bucket.profile_path) {
-    const rawVal = getByPath(profile, bucket.profile_path);
+    const rawVal = hasRawOverride ? opts.rawValue : getByPath(profile, bucket.profile_path);
     const r = resolve(rawVal, f.widgetType);
     if (!r || r.skip) return null;
     arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
@@ -3073,6 +3079,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
         items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
         aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
+        // Per-entry answer buckets: an entry field the fieldMap doesn't name fills from its WORDING +
+        // this entry's own data (see fillEntryCdp's bucket tier). itemsKey scopes which buckets may fire.
+        buckets: bucketIndex, itemsKey: sec.itemsKey,
         nested: sec.nested || null,          // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
         // AI-4 Tier-1.6 remediation re-fill: NEVER reconcile-DOWN (deleting entries beyond profile-N
         // would wipe rows the operator added by hand — the 2026-07-02 complaint). Main fill: false.
@@ -3676,7 +3685,31 @@ function fmMatchesFd(m, fd, allowLabel) {
 // swap there would be a misread, not an observation.
 const ADAPTIVE_WIDGETS = new Set(["text", "textarea", "dropdown", "typeahead"]);
 
-async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx) {
+// The per-entry answer-bucket tier (2026-07-25, operator's design): inside a repeating section EVERY
+// entry shows the SAME question wording, so a bucket's wording identifies WHICH FIELD this is, while the
+// ENTRY ORDINAL picks WHICH VALUE — entry 0 gets education[0]'s school, entry 1 gets education[1]'s. That
+// makes a label-keyed bucket safe in a repeating section, where a naive bucket (one wording → one answer)
+// would have filled all three work experiences with the same employer.
+// Mechanics: the bucket's `profile_path` is entry-0-shaped (`education.0.school_or_university`, the
+// starter-bucket convention). We verify its ROOT names THIS section (itemsKey/sectionName — so a
+// `personal_info.city` bucket can never fire inside an education entry), strip the `<root>.<digits>.`
+// prefix, and read the REST from the ENTRY'S OWN item object — which is inherently index-correct, no
+// remapping. Returns { tail, rawValue } or null.
+// Mode B (a fixed `value`, no profile_path) is deliberately NOT applied per-entry: it has no indexed data,
+// so filling every entry with the same answer is a guess, not a lookup.
+function entryBucketValue(bucket, item, itemsKey, sectionName) {
+  if (!bucket || !bucket.profile_path) return null;
+  const m = /^([A-Za-z_][A-Za-z0-9_]*)\.(\d+)\.(.+)$/.exec(String(bucket.profile_path));
+  if (!m) return null;                                   // not an entry-shaped path → not a repeating binding
+  const root = m[1], tail = m[3];
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (norm(root) !== norm(itemsKey) && norm(root) !== norm(sectionName)) return null; // a different section's bucket — never cross-apply
+  const rawValue = getByPath(item, tail);
+  if (rawValue === undefined || rawValue === null || rawValue === "") return null;
+  return { tail, rawValue };
+}
+
+async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx, bucketCtx) {
   const recs = [];
   const base = sectionName + "[" + idx + "].";
   // FILL IN DOM ORDER (operator rule 2026-07-02): iterate the ENTRY'S scanned fields top-to-bottom
@@ -3909,6 +3942,58 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     rec.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME]
     recs.push(rec);
     await act.delay(budgets.interFieldMs);
+  }
+
+  // ── PER-ENTRY ANSWER-BUCKET tier (2026-07-25) ── the fieldMap models the fields we KNOW; a tenant can
+  // render extra/renamed ones the map never names (Solar Turbines' education school under a foreign id;
+  // a `skills` field we don't model). Those stay EMPTY and, if required, block Save & Continue. Here any
+  // entry field the map did NOT claim gets the bucket treatment: match its WORDING to a bucket (the same
+  // label index the flat loop uses), then take the value from THIS ENTRY'S item (entryBucketValue) — the
+  // wording says which field, the ordinal says which value. DETERMINISTIC (a candidate through the same
+  // match ladder, never a blind commit) and it runs BEFORE nothing — the AI tiers above already ran for
+  // MAPPED fields only, so this is purely additive. Skipped entirely when no buckets are configured.
+  const bkIndex = bucketCtx && bucketCtx.index;
+  if (bkIndex && bkIndex.size) {
+    let entry = null;
+    try {
+      const scan = await act.repeatingScan();
+      const sec = scan && scan.sections ? scan.sections[prefix] : null;
+      entry = sec && sec.entries ? sec.entries[idx] : null;
+    } catch (e) { entry = null; }
+    // A field is HANDLED if some fieldMap entry claims it (id or label) or a record already covers its
+    // wrapper — so the bucket tier can never double-fill what the mapped loop just filled.
+    const filledLocs = new Set(recs.map((r) => r.auditLoc).filter(Boolean));
+    // rec-by-profile-path: when a bucket fills a field the map DID name but could not resolve
+    // ("field wrapper not found in entry"), update THAT record instead of emitting a duplicate.
+    const recByPath = new Map();
+    for (const r of recs) { const p = String(r.mappedPath || ""); if (p.startsWith(base)) recByPath.set(p.slice(base.length), r); }
+    for (const fd of ((entry && entry.fields) || [])) {
+      if (!fd || !fd.label || !fd.wrapperSel) continue;
+      if (filledLocs.has(fd.wrapperSel)) continue;                                  // already actuated by the mapped loop
+      if (fieldMap.some((m) => fmMatchesFd(m, fd, true))) continue;                 // the map claims it (it just had no value / failed on its own terms)
+      const bucket = bkIndex.get(apMatch.normalizeLabel(fd.label));
+      if (!bucket) continue;
+      const bv = entryBucketValue(bucket, item, bucketCtx.itemsKey, sectionName);
+      if (!bv) continue;                                                            // Mode B / another section's bucket / no value for THIS entry
+      const f2 = { fieldName: fd.fieldName, label: fd.label, isRequired: !!fd.isRequired, widgetType: fd.widgetType, wrapperSel: fd.wrapperSel };
+      let bkRes = null;
+      try { bkRes = await fillFromBucket(act, { wrapperSel: fd.wrapperSel }, f2, bucket, (aiCtx && aiCtx.profile) || {}, budgets, { rawValue: bv.rawValue }); }
+      catch (e) { bkRes = null; }                                                   // a failed bucket fill leaves the field as it was (blank → surfaces/halts as before)
+      if (!bkRes) continue;
+      const existing = recByPath.get(bv.tail);
+      if (existing && existing.status !== "filled" && existing.status !== "filled_review") {
+        Object.assign(existing, bkRes, { auditLoc: fd.wrapperSel, label: fd.label, widgetType: fd.widgetType, resolved: bv.rawValue });
+        existing.detail = (bkRes.detail || "") + " · resolved by question wording (the map's id did not match this tenant)";
+      } else {
+        recs.push(Object.assign({
+          fieldName: base + fd.fieldName, label: fd.label, widgetType: fd.widgetType, isRequired: !!fd.isRequired,
+          mappedPath: base + bv.tail, rawValue: bv.rawValue, resolved: bv.rawValue,
+          status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+          auditLoc: fd.wrapperSel
+        }, bkRes));
+      }
+      await act.delay(budgets.interFieldMs);
+    }
   }
   return recs;
 }
@@ -4470,7 +4555,10 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const fillCount = Math.min(N, await act.entryCount(containerPrefix));
   const perEntry = [];
   for (let i = 0; i < fillCount; i++) {
-    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets, section.aiContext);
+    // bucketCtx: the per-entry answer-bucket tier (wording → which field; ordinal → which value). Absent
+    // (recon/replay/tests without buckets) ⇒ the tier no-ops and the fill is byte-identical to before.
+    const bucketCtx = section.buckets ? { index: section.buckets, itemsKey: section.itemsKey || name } : null;
+    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets, section.aiContext, bucketCtx);
     // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.

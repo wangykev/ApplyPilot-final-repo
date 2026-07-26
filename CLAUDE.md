@@ -114,6 +114,16 @@ for any UNMAPPED field the deterministic pass left empty, **before** the AI post
   clicking the answer. Fill: `appendFieldVariants`/`boolLadderCandidates` (fill-driver.js) append the
   ladder's variants as extra match-ladder candidates for choice widgets, keyed by the bucket's
   `profile_path` VERBATIM (dotted, incl. numeric `education.0.gpa`).
+- **Buckets fill REPEATING-section entries too (2026-07-25, operator's design).** Inside a repeating
+  section every entry shows the SAME wording, so the bucket identifies **which FIELD** and the entry
+  **ORDINAL** picks **which VALUE**: a bucket bound to `education.0.school_or_university` fills entry 0
+  from `education[0]` and entry 1 from `education[1]` (the value is read from the ENTRY'S OWN item — no
+  index remapping). Runs in `fillEntryCdp` AFTER the fieldMap loop, ONLY for entry fields the map did not
+  claim (id or label), so it can never double-fill; the bucket's path ROOT must name the section
+  (`itemsKey`) or it can't fire; and when a bucket fills a field the map named but couldn't RESOLVE, it
+  updates that record instead of duplicating it. **Mode B (a fixed `value`) does NOT fire per-entry** —
+  with no indexed data, filling every entry identically is a guess. Same safety as the flat tier: a
+  CANDIDATE through the match ladder, flagged `bucket`, never a blind commit. Unit-pinned.
 - **Education (& other repeating sections) fill BOTH shapes (2026-07-23).** A section like Education renders
   as a repeat-add block OR as flat single questions. Flat fill goes through Mode-A **starter buckets** bound
   to entry-0 paths (`education.0.{school_or_university,gpa,degree,field_of_study}`,

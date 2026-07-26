@@ -2569,6 +2569,78 @@ test("section field: a labelFallback NEVER steals a field another map entry name
   assert.strictEqual(out.results.find((r) => r.fieldName === "education[0].fieldOfStudy").after, "Electrical Engineering");
 });
 
+// ── PER-ENTRY answer buckets in a repeating section (2026-07-25, operator's design) ────────────
+// The same wording appears in EVERY entry, so the bucket identifies WHICH FIELD and the entry ORDINAL
+// picks WHICH VALUE: entry 0 → education[0]'s school, entry 1 → education[1]'s. Only fires for entry
+// fields the fieldMap does NOT claim.
+const SCHOOL_BUCKET = { questions: ["School or University"], profile_path: "education.0.school_or_university" };
+const eduBucketEntry = (fkit, fieldName) => ({ fkit, fields: [{ fieldName: fieldName || "someForeignId", widgetType: "text", isRequired: true, label: "School or University" }] });
+
+test("repeating bucket: an UNMAPPED entry field fills from its WORDING + that ENTRY's own value (ordinal picks the value)", async () => {
+  const state = { prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null"), eduBucketEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }, { school_or_university: "Florida State University" }],
+    fieldMap: [{ field: "degree", widget: "dropdown", key: "degree", path: "degree" }], // school NOT in the map
+    deleteOnNoMatch: false, buckets: buildBucketIndex([SCHOOL_BUCKET])
+  }, T_BUDGETS);
+  const e0 = out.results.find((r) => r.fieldName === "education[0].someForeignId");
+  const e1 = out.results.find((r) => r.fieldName === "education[1].someForeignId");
+  assert.strictEqual(e0.after, "Carnegie Mellon University", "entry 0 got entry 0's value");
+  assert.strictEqual(e1.after, "Florida State University", "entry 1 got ENTRY 1's value — not a repeat of entry 0");
+  assert.strictEqual(e0.flag, "bucket");
+  assert.strictEqual(e0.mappedPath, "education[0].school_or_university");
+});
+
+test("repeating bucket: a bucket from ANOTHER section never fires inside this one", async () => {
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null")] });
+  const foreign = { questions: ["School or University"], profile_path: "work_experience.0.company" }; // wrong root
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University", company: "SHOULD NOT FILL" }],
+    fieldMap: [], deleteOnNoMatch: false, buckets: buildBucketIndex([foreign])
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.after === "SHOULD NOT FILL"), "a work_experience-bound bucket must never fill an education entry");
+});
+
+test("repeating bucket: Mode B (fixed value, no profile_path) does NOT fire per-entry (no indexed data = a guess)", async () => {
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null"), eduBucketEntry("education-1--null")] });
+  const modeB = { questions: ["School or University"], value: ["Some Fixed School"] };
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{}, {}], fieldMap: [], deleteOnNoMatch: false, buckets: buildBucketIndex([modeB])
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.after === "Some Fixed School"), "Mode B would fill every entry identically → not applied per-entry");
+});
+
+test("repeating bucket: NEVER double-fills a field the fieldMap already filled", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "schoolName", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }],
+    fieldMap: [{ field: "schoolName", widget: "text", key: "school_or_university", path: "school_or_university" }],
+    deleteOnNoMatch: false, buckets: buildBucketIndex([SCHOOL_BUCKET])
+  }, T_BUDGETS);
+  const hits = out.results.filter((r) => r.after === "Carnegie Mellon University");
+  assert.strictEqual(hits.length, 1, "exactly one record — the mapped fill; the bucket tier skipped the claimed field");
+  assert.notStrictEqual(hits[0].flag, "bucket", "the mapped fill is NOT re-flagged as a bucket fill");
+});
+
+test("repeating bucket: no buckets configured ⇒ the tier is inert (byte-identical to the pre-bucket fill)", async () => {
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: [], deleteOnNoMatch: false
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.flag === "bucket"), "no bucket index → no bucket fills");
+});
+
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
   // Total commit failure: the Enter no-ops AND the click fallback is ignored.
   const act = makeFakeAct([taField({
