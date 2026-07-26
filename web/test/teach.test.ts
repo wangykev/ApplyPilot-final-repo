@@ -561,7 +561,35 @@ test("default wordings: generic labels are skipped, and only the PRIMARY repeati
   };
   const out = ensureDefaultFieldWordings([], profile);
   assert.equal(out.find((b) => b.profile_path === "websites.0.type"), undefined, "'Type' is too generic to stand alone");
-  assert.equal(out.find((b) => b.profile_path === "websites.0.url"), undefined, "'URL' is too generic to stand alone");
   assert.ok(out.find((b) => b.profile_path === "education.0.gpa"), "primary entry seeded");
   assert.equal(out.find((b) => b.profile_path === "education.1.gpa"), undefined, "entry 1 is NOT seeded (a bucket binds one path)");
+});
+
+test("default wordings: each WEBSITE is seeded from its TYPE (LinkedIn / GitHub / Personal Website), not 'URL'", () => {
+  const profile = {
+    websites: [
+      { type: "LinkedIn", url: "https://linkedin.com/in/x" },
+      { type: "GitHub", url: "https://github.com/x" },
+      { type: "Personal Website", url: "https://x.dev" },
+    ],
+  };
+  const out = ensureDefaultFieldWordings([], profile);
+  // EVERY entry gets its own bucket (unlike the other repeating sections) — each is a distinct question.
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.0.url")?.questions, ["LinkedIn"]);
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.1.url")?.questions, ["GitHub"]);
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.2.url")?.questions, ["Personal Website"]);
+  // no "URL"/"Type" wording anywhere, and idempotent
+  assert.ok(!out.some((b) => (b.questions || []).some((q) => /^url$/i.test(q))));
+  assert.deepEqual(ensureDefaultFieldWordings(out, profile).find((b) => b.profile_path === "websites.1.url")?.questions, ["GitHub"]);
+});
+
+test("default wordings: a website with no type is skipped; an operator's own wording is kept", () => {
+  const profile = { websites: [{ type: "", url: "https://x" }, { type: "Portfolio", url: "https://y" }] };
+  const mine: Bucket[] = [{
+    id: "field_websites_1_url", profile_path: "websites.1.url", value: [],
+    category: "", widget_hint: "text", questions: ["Portfolio link"], selectors: {},
+  }];
+  const out = ensureDefaultFieldWordings(mine, profile);
+  assert.equal(out.find((b) => b.profile_path === "websites.0.url"), undefined, "no type → nothing to seed");
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.1.url")?.questions, ["Portfolio link", "Portfolio"]);
 });

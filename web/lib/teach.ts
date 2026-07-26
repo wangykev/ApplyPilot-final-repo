@@ -442,6 +442,30 @@ function isPrimaryEntryPath(path: string): boolean {
 export function ensureDefaultFieldWordings(buckets: Bucket[], profile: unknown): Bucket[] {
   const rows = flattenProfileFields(profile);
   let next = buckets;
+  // WEBSITES are the exception to both rules below: each entry is a DIFFERENT question (LinkedIn is not
+  // GitHub), so every entry — not just the primary — gets its own bucket, and the wording comes from the
+  // entry's TYPE rather than the field name ("Url"/"Type" are far too generic). Operator, 2026-07-26:
+  // "for linkedin, github, and personal website also make it default, no need for URL" — the wording is
+  // the type verbatim ("LinkedIn", "GitHub", "Personal Website"), matching a form that labels its field
+  // exactly that. The three built-in types are type-locked in the profile editor; a custom one the
+  // operator names works the same way.
+  const sites = (profile as { websites?: { type?: string; url?: string }[] } | null)?.websites;
+  if (Array.isArray(sites)) {
+    sites.forEach((w, i) => {
+      const type = String(w?.type || "").trim();
+      if (!type) return;
+      const path = "websites." + i + ".url";
+      const existing = next.find((b) => String(b.profile_path || "").trim() === path);
+      if (existing) {
+        const k = normalizeQuestion(type);
+        if ((existing.questions || []).some((q) => normalizeQuestion(q) === k)) return;
+        next = next.map((b) => (b === existing ? { ...b, questions: [...(b.questions || []), type] } : b));
+        return;
+      }
+      const seeded = ensureModeABucket(next, path, "text");
+      next = addWordingToBucket(seeded.buckets, seeded.bucketId, type);
+    });
+  }
   for (const r of rows) {
     const label = String(r.label || "").trim();
     if (!label || GENERIC_FIELD_LABELS.has(label.toLowerCase())) continue;
