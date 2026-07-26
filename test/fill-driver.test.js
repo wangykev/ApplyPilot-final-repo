@@ -2502,6 +2502,73 @@ test("required-empty typeahead (section / FoS): AI ON → infers + forces a pick
   assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "a confident AI fill KEEPS the entry (not delete-with-memory)");
 });
 
+// ── Tenant-variable section fields: id alternates + WIDGET-ADAPTIVE fill (2026-07-25) ──────────
+// Live break (cat.wd5/solarturbines): education "School or University" is neither `schoolName` NOR a
+// text box — it's a multiselect TYPEAHEAD under a different id, so the single hardcoded id resolved
+// nothing ("field wrapper not found in entry"), no fill ran, and the required field blocked Save &
+// Continue. Two mechanisms fix it: altFields/labelFallback resolution, and the live DOM's widget winning.
+const SCHOOL_FM = [{ field: "schoolName", altFields: ["school"], labelFallback: /school|university/i,
+  widget: "text", key: "school_or_university", path: "school_or_university" }];
+
+test("section field: an ALT automation-id resolves the wrapper (tenant renamed schoolName → school)", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "school", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled", "resolved via altFields — NOT 'field wrapper not found in entry'");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+});
+
+test("section field: LABEL fallback resolves a wrapper whose id matches no alternate", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "e7f3a91c0000", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled", "hashed/unknown id resolved by the label fallback");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+});
+
+test("section field: the LIVE widget WINS — a text-mapped field the tenant renders as a TYPEAHEAD fills through the typeahead ladder", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "school", widgetType: "typeahead", isRequired: true, label: "School or University",
+    chips: [], scrapeOptions: ["Carnegie Mellon University", "MIT"], filterMap: { "Carnegie Mellon University": { autoCommit: "Carnegie Mellon University" } } }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled", "filled as a typeahead even though the map says text");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+  assert.strictEqual(rec.widgetType, "typeahead", "the record reports the LIVE widget (review renders the right editor)");
+  assert.deepStrictEqual(rec.widgetAdapted, { configured: "text", live: "typeahead" }, "the swap is recorded");
+});
+
+test("section field: a matching map widget is NEVER swapped (no adaptation when config and live agree)", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "schoolName", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.widgetType, "text");
+  assert.strictEqual(rec.widgetAdapted, undefined, "no swap recorded when the live DOM agrees with the map");
+});
+
+test("section field: a labelFallback NEVER steals a field another map entry names by id", async () => {
+  // "Field of Study" must go to the fieldOfStudy entry, not to school's /school|university/i fallback —
+  // and school's own field still resolves. Guards the two-pass (ids first) resolution.
+  const entry = (fkit) => ({ fkit, fields: [
+    { fieldName: "fieldOfStudy", widgetType: "text", isRequired: false, label: "Field of Study" },
+    { fieldName: "someHashedId", widgetType: "text", isRequired: true, label: "School or University" }
+  ] });
+  const fm = [SCHOOL_FM[0], { field: "fieldOfStudy", widget: "text", key: "fos", path: "field_of_study" }];
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University", fos: "Electrical Engineering" }], fieldMap: fm, deleteOnNoMatch: false }, T_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "education[0].schoolName").after, "Carnegie Mellon University");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "education[0].fieldOfStudy").after, "Electrical Engineering");
+});
+
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
   // Total commit failure: the Enter no-ops AND the click fallback is ignored.
   const act = makeFakeAct([taField({

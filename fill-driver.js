@@ -3396,7 +3396,13 @@ const LANGUAGE_MAP = [
 // (fromYearParsed/toYearParsed = parseYear; issuedDateParsed/expirationDateParsed = parseYearMonthDay)
 // and filled by the now-un-deferred date branch via fillDateCompositeCdp.
 const EDUCATION_MAP = [
-  { field: "schoolName", widget: "text", key: "school_or_university", path: "school_or_university" },
+  // school: the automation-id is TENANT-VARIABLE and so is the WIDGET — Magna renders a text box
+  // (`schoolName`), cat.wd5/solarturbines a multiselect TYPEAHEAD under a different id (live 2026-07-25:
+  // the lone `schoolName` lookup found nothing → "field wrapper not found in entry" → the required field
+  // blocked Save & Continue). altFields + labelFallback resolve the wrapper; the widget-adaptive dispatch
+  // (see fillEntryCdp) then fills whatever the live DOM actually is.
+  { field: "schoolName", altFields: ["school", "schoolItem", "university", "institution"], labelFallback: /school|university|institution|college/i,
+    widget: "text", key: "school_or_university", path: "school_or_university" },
   { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
   { field: "fieldOfStudy", widget: "typeahead", key: "field_of_study", path: "field_of_study", captureOptions: true }, // FoS Round 3: scrape the full option list into the bundle → summary searchable editor
   { field: "gradeAverage", widget: "text", key: "gpa", path: "gpa" },
@@ -3646,6 +3652,30 @@ function todayYMD() {
 // core warning). Resolves the field by automation-id (`f.field`) OR by label
 // (`f.labelRegex`, for hashed ids — Languages). Records use the SAME shape as
 // drivePageFill so the report/table code is shared.
+// Does field-descriptor `fd` belong to fieldMap entry `m`? RESOLUTION LADDER (2026-07-25, the Solar
+// Turbines "School or University" miss): a section field's `formField-*` automation-id is TENANT-
+// VARIABLE — Magna calls the education school field `schoolName`, cat.wd5/solarturbines does not, so the
+// single hardcoded id resolved NOTHING and the record died `field wrapper not found in entry` (no fill
+// path ever ran, and the required field then blocked Save & Continue). Ladder, first hit wins:
+//   1. `labelRegex`  — the by-label entries (hashed ids, e.g. Languages proficiencies) keep matching ONLY by label
+//   2. `field`       — the canonical automation-id
+//   3. `altFields[]` — observed aliases on other tenants
+//   4. `labelFallback` — a LAST-RESORT label regex, used only when no id matched anywhere (pass allowLabel)
+// The label fallback is deliberately two-pass at every call site (ids across the WHOLE map first), so it can
+// never steal a field another map entry names exactly.
+function fmMatchesFd(m, fd, allowLabel) {
+  if (!m || !fd) return false;
+  if (m.labelRegex) return m.labelRegex.test(fd.label || "");
+  if (m.field && fd.fieldName === m.field) return true;
+  if (Array.isArray(m.altFields) && m.altFields.indexOf(fd.fieldName) !== -1) return true;
+  if (allowLabel && m.labelFallback) return m.labelFallback.test(fd.label || "");
+  return false;
+}
+// Widgets whose fill path may be swapped to whatever the LIVE DOM shows (below). Dates/years/checkboxes
+// are EXCLUDED: the scan's classify() has no "date" type (a date composite classifies "unknown"), so a
+// swap there would be a misread, not an observation.
+const ADAPTIVE_WIDGETS = new Set(["text", "textarea", "dropdown", "typeahead"]);
+
 async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx) {
   const recs = [];
   const base = sectionName + "[" + idx + "].";
@@ -3664,8 +3694,16 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     const ent0 = scan0 && scan0.sections && scan0.sections[prefix] && Array.isArray(scan0.sections[prefix].entries) ? scan0.sections[prefix].entries[idx] : null;
     if (ent0 && Array.isArray(ent0.fields) && ent0.fields.length) {
       const used = new Set(); const inDom = [];
+      // TWO-PASS (see fmMatchesFd): every field gets an ID-based match first; only fields still
+      // unclaimed after that fall back to a map entry's labelFallback — so a fallback regex can never
+      // steal a field some other entry names by id.
       for (const fd of ent0.fields) {
-        const fm = fieldMap.find((m) => !used.has(m) && (m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName));
+        const fm = fieldMap.find((m) => !used.has(m) && fmMatchesFd(m, fd, false));
+        if (fm) { used.add(fm); inDom.push(fm); }
+      }
+      for (const fd of ent0.fields) {
+        if (fieldMap.some((m) => used.has(m) && fmMatchesFd(m, fd, false))) continue; // already claimed by id
+        const fm = fieldMap.find((m) => !used.has(m) && fmMatchesFd(m, fd, true));
         if (fm) { used.add(fm); inDom.push(fm); }
       }
       if (inDom.length) orderedMap = inDom.concat(fieldMap.filter((m) => !used.has(m)));
@@ -3674,9 +3712,17 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
   for (const f of orderedMap) {
     const _fieldT0 = Date.now(); // [CDP-TIME] per-field wall-clock (stamped on every rec pushed below)
     const recName = f.name || f.field;
-    const findFd = (entry) => entry ? (f.labelRegex
-      ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
-      : entry.fields.find((x) => x.fieldName === f.field)) : null;
+    // Resolution ladder (fmMatchesFd): labelRegex | id | altFields, then — only if NO map entry claims
+    // the field by id — labelFallback. Tenant-variable automation-ids (Solar Turbines' school field)
+    // resolve here instead of dying "field wrapper not found in entry".
+    const findFd = (entry) => {
+      if (!entry || !Array.isArray(entry.fields)) return null;
+      const byId = entry.fields.find((x) => fmMatchesFd(f, x, false));
+      if (byId) return byId;
+      if (!f.labelFallback) return null;
+      return entry.fields.find((x) => f.labelFallback.test(x.label || "")
+        && !fieldMap.some((m) => m !== f && fmMatchesFd(m, x, false))) || null; // never steal a field another entry names exactly
+    };
     const scanFd = async () => {
       const scan = await act.repeatingScan();
       const sec = scan && scan.sections ? scan.sections[prefix] : null;
@@ -3739,8 +3785,23 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       recs.push(rec); await act.delay(budgets.interFieldMs); continue;
     }
     const loc = { wrapperSel: fd.wrapperSel };
+    // WIDGET-ADAPTIVE FILL (2026-07-25, the Solar Turbines school field): the SAME logical field renders
+    // as different WIDGETS across tenants — Magna's education "School or University" is a text box,
+    // cat.wd5/solarturbines renders it as a multiselect TYPEAHEAD ("0 items selected"). The observed DOM is
+    // the rulebook, so when the live scan's widgetType disagrees with the map's, the LIVE type wins and the
+    // value is re-resolved for it (a plain string → a single-candidate list for a choice widget, and the
+    // choice widget's own match ladder + commit verification then apply as usual — never a blind commit).
+    // Restricted to ADAPTIVE_WIDGETS in BOTH directions (date/year/checkbox never swap — classify() can't
+    // see a date composite). Recorded on the rec so review shows what actually filled.
+    let effWidget = f.widget;
+    if (ADAPTIVE_WIDGETS.has(f.widget) && ADAPTIVE_WIDGETS.has(fd.widgetType) && fd.widgetType !== f.widget) {
+      effWidget = fd.widgetType;
+      rec.widgetType = effWidget;
+      rec.widgetAdapted = { configured: f.widget, live: effWidget };
+      console.log(`[ApplyPilot][CDP] ${base + recName}: tenant renders this as a ${effWidget} (map says ${f.widget}) — filling as ${effWidget} (live DOM wins).`);
+    }
     rec.auditLoc = fd.wrapperSel; // M40: retain the entry-scoped locator for the post-fill audit re-read
-    rec.auditTag = f.widget === "textarea" ? "textarea" : undefined;
+    rec.auditTag = effWidget === "textarea" ? "textarea" : undefined;
     if (f.widget === "year" || f.widget === "date") { const ord = dateOrderOf(fd.dateSegments); if (ord.length) rec.date_order = ord; } // m3c: form's segment order → the summary's segmented date editor (all date fields, not just revealed ones)
     // FoS Round 3: tag so the END-OF-PAGE option-capture pass can find this record (captureKey groups
     // same-vocabulary fields across entries → one scrape). Captured at end-of-page, NOT inline — an
@@ -3759,20 +3820,22 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
         Object.assign(rec, await fillCheckboxCdp(act, loc, item[f.key] === true, budgets));
       } else {
         // textarea (WE roleDescription) resolves like text — a plain string (bulletsText).
-        const r = resolve(item[f.key], f.widget === "textarea" ? "text" : f.widget);
+        // effWidget (not f.widget): the LIVE widget wins, so a text-mapped field the tenant renders as a
+        // typeahead/dropdown resolves into a CANDIDATE list and fills through that widget's own ladder.
+        const r = resolve(item[f.key], effWidget === "textarea" ? "text" : effWidget);
         if (r.skip) {
           rec.status = "skipped";
           rec.detail = r.reason || ("empty value at " + base + f.path);
         } else {
           const arg = r.value !== undefined ? r.value : r.candidates;
           rec.resolved = arg;
-          if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
-          else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
+          if (effWidget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
+          else if (effWidget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
           // keepOpenForCanonicalize: when AI is on, a genuine no-match here is IMMEDIATELY followed by the
           // canonicalize block below — so fillDropdownCdp leaves the list OPEN and aiCanonicalizeField reuses
           // it (no redundant close→reopen; the canonicalize closes it). Off when AI can't canonicalize.
-          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets, { keepOpenForCanonicalize: !!(aiCtx && act.aiEnabled) }));
-          else if (f.widget === "typeahead") {
+          else if (effWidget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets, { keepOpenForCanonicalize: !!(aiCtx && act.aiEnabled) }));
+          else if (effWidget === "typeahead") {
             // Fix 2: start-of-fill option capture for EVERY section typeahead (was FoS-only). makeStartCapture
             // scrapes the full leaf list at the START for a FLAT field (FoS → rec.options for the summary
             // searchable picker + the flat AI), and returns null for a TREE (cert) — no wasted scroll on a
@@ -3789,8 +3852,8 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
             Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture: cap.onCapture, ai: aiForField }));
             const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
           }
-          else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
-          else { rec.status = "skipped"; rec.detail = "no handler for widget " + f.widget; }
+          else if (effWidget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
+          else { rec.status = "skipped"; rec.detail = "no handler for widget " + effWidget; }
         }
       }
     } catch (e) {
@@ -3803,7 +3866,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     // so ONLY this field surfaces for review while the row's deterministic fields stay clean. Mirrors the
     // flat loop's canonicalize + the repeating typeahead's inline AI (dropdowns had NONE before). AI OFF →
     // untouched. (Required-empty INFER + the keep/delete-with-memory decision are Phase 2.)
-    if (aiCtx && act.aiEnabled && f.widget === "dropdown" && rec.resolved != null && rec.genuineNoMatch === true) {
+    if (aiCtx && act.aiEnabled && effWidget === "dropdown" && rec.resolved != null && rec.genuineNoMatch === true) {
       const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired, widgetType: "dropdown", wrapperSel: fd.wrapperSel };
       try {
         const aiRes = await aiCanonicalizeField(act, loc, f2, rec.resolved, budgets);
@@ -3834,7 +3897,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     // Save & Continue. When AI is on, run the unified filler with NO candidates → the inline AI infers from the
     // profile (no stated answer) + FORCES a pick + flags. AI OFF → stays skipped. (NOT the deleteOnNoMatch cert
     // case — that path deletes an unfillable entry; this only fires for status `skipped`, i.e. no value to try.)
-    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && f.widget === "typeahead") {
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && effWidget === "typeahead") {
       try {
         const loc2 = { wrapperSel: rec.auditLoc };
         const cap = makeStartCapture(act, loc2);

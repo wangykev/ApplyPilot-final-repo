@@ -2316,3 +2316,34 @@ container can never match); a CSS-clipped labelless input falls back to clicking
 re-click, so even a tenant the detector misses self-heals on retry 1 (checkConsent is idempotent —
 an already-checked box is never unchecked). Capture the real automation-id of Caterpillar's consent
 wrapper on the next probe to pin the selector.
+
+## 2026-07-25 — Solar Turbines (cat.wd5): a section field's automation-id AND its WIDGET are both tenant-variable
+
+Second Caterpillar-family probe (`cat.wd5.myworkdayjobs.com/en-US/solarturbines`, background Run). Page 2
+filled 28/35 cleanly but `education[0].schoolName` came back **`error: field wrapper not found in entry`**,
+and Save & Continue was then blocked by *"Error-School or University — The field School or University is
+required and must have a value."* Two independent tenant differences, both first observed here:
+
+- **The id differs.** `EDUCATION_MAP` resolved school by the single automation-id `schoolName` (Magna's).
+  Solar Turbines uses something else, so `findFd` returned null and **no fill path ever ran** — this is why
+  "none of the fallbacks worked": every fallback (AI canonicalize, required-empty AI, deleteOnNoMatch) lives
+  *downstream* of a resolved wrapper. AI-4 remediation then guessed the field name `school`, which also
+  wasn't on the page, and correctly declined to act.
+- **The widget differs.** The page renders School or University as a **multiselect TYPEAHEAD** — the UI shows
+  `0 items selected` (the chip counter), not an empty text box. Magna renders the same logical field as plain
+  text. So even a resolved wrapper would have been filled by the wrong handler.
+
+Also seen on this tenant (no fix needed): `skills` (typeahead) and `linkedInAccount` (text) are unmapped →
+`skipped: no mapping`; `degree` offers "Bachelor of Science (BS)" so the stated "Bachelor of Science /
+Bachelors" needed the AI canonicalize (→ `filled_review`, correct); FoS scraped **404 options**.
+
+**Fixes (same day, fill-driver.js):** (1) a field-resolution LADDER — `labelRegex` | `field` | `altFields[]` |
+`labelFallback` (a last-resort label regex), applied TWO-PASS at every call site (ids across the whole map
+first) so a fallback can never steal a field another entry names exactly; (2) **widget-adaptive fill** — when
+the live scan's `widgetType` disagrees with the map's, the LIVE type wins and the value is re-resolved for it
+(a plain string becomes a single-candidate list for a choice widget, then goes through that widget's normal
+match ladder + commit verification — never a blind commit). Restricted to text/textarea/dropdown/typeahead in
+both directions; date/year/checkbox never swap (classify() can't see a date composite). The swap is recorded
+on the record (`widgetAdapted`) and the record reports the LIVE widget so review renders the right editor.
+Unit-pinned (5 tests). **Still to capture on the next probe:** the actual `data-automation-id` of this
+tenant's school field, so it can be pinned as an alt instead of relying on the label fallback.
