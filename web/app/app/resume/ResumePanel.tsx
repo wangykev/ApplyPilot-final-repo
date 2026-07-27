@@ -91,6 +91,39 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
   const [versions, setVersions] = useState<TexVersion[]>([]);
   const [versionName, setVersionName] = useState("");
   const [activeVersion, setActiveVersion] = useState<string>("");
+  // stored-card tabs: "attached" (what the extension uploads) or a version preview
+  const [storedTab, setStoredTab] = useState<string>("attached");
+  const versionPdfCache = useRef(new Map<string, { tex: string; url: string }>());
+  const [versionPdf, setVersionPdf] = useState<string | null>(null);
+  const [versionCompiling, setVersionCompiling] = useState(false);
+  const [versionErr, setVersionErr] = useState<string | null>(null);
+
+  async function openStoredTab(name: string) {
+    setStoredTab(name);
+    setVersionErr(null);
+    if (name === "attached") return;
+    const v = versions.find((x) => x.name === name);
+    if (!v) return;
+    const cached = versionPdfCache.current.get(name);
+    if (cached && cached.tex === v.tex) {
+      setVersionPdf(cached.url);
+      return;
+    }
+    setVersionPdf(null);
+    setVersionCompiling(true);
+    const res = await compileLatexPdf({ tex: v.tex });
+    setVersionCompiling(false);
+    if (!res.ok) {
+      setVersionErr(res.error);
+      return;
+    }
+    const bytes = Uint8Array.from(atob(res.pdfBase64), (c) => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    const old = versionPdfCache.current.get(name);
+    if (old) URL.revokeObjectURL(old.url);
+    versionPdfCache.current.set(name, { tex: v.tex, url });
+    setVersionPdf(url);
+  }
 
   // live compile (debounced) — the bottom preview is the ACTUAL PDF
   const [compiled, setCompiled] = useState<{ url: string; base64: string } | null>(null);
@@ -526,9 +559,9 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
 
       <SectionCard
         title="Stored resume (attached to applications)"
-        subtitle="The saved PDF the extension uploads on every application."
+        subtitle="The saved PDF the extension uploads on every application — plus your saved versions."
         actions={
-          stored ? (
+          stored && storedTab === "attached" ? (
             <button onClick={clear} disabled={applying} className="inline-flex items-center gap-1.5 text-xs text-ink-faint transition-colors hover:text-signal">
               <Trash2 className="h-3.5 w-3.5" />
               Remove
@@ -536,28 +569,76 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
           ) : null
         }
       >
-        {stored ? (
-          <div className="flex items-center gap-3 rounded-lg border border-hairline bg-panel-raised/50 p-3">
-            <FileText className="h-5 w-5 text-verified" />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm text-ink">{stored.filename}</div>
-              <div className="font-mono text-[11px] text-ink-faint">{kb(stored.size)} · stored</div>
-            </div>
-            <button
-              onClick={openPreview}
-              disabled={previewLoading}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-hairline px-2.5 py-1.5 text-xs text-ink-dim transition-colors hover:border-amber hover:text-ink"
-              title="View the stored PDF exactly as it will be attached"
-            >
-              <Eye className="h-3.5 w-3.5" />
-              {previewLoading ? "Opening…" : "Preview"}
-            </button>
-            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-verified">
-              <Check className="h-3.5 w-3.5" /> Ready
-            </span>
+        {/* tabs: the attached PDF + one per saved version */}
+        {versions.length > 0 && (
+          <div className="mb-4 flex flex-wrap gap-1 rounded-lg border border-hairline p-1">
+            {["attached", ...versions.map((v) => v.name)].map((name) => (
+              <button
+                key={name}
+                onClick={() => void openStoredTab(name)}
+                className={clsx(
+                  "rounded-md px-3 py-1.5 text-xs transition-colors",
+                  storedTab === name ? "bg-amber font-semibold text-cockpit" : "text-ink-dim hover:bg-panel-raised/60 hover:text-ink"
+                )}
+              >
+                {name === "attached" ? "Attached" : name}
+              </button>
+            ))}
           </div>
+        )}
+
+        {storedTab === "attached" ? (
+          stored ? (
+            <div className="flex items-center gap-3 rounded-lg border border-hairline bg-panel-raised/50 p-3">
+              <FileText className="h-5 w-5 text-verified" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm text-ink">{stored.filename}</div>
+                <div className="font-mono text-[11px] text-ink-faint">{kb(stored.size)} · stored</div>
+              </div>
+              <button
+                onClick={openPreview}
+                disabled={previewLoading}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-hairline px-2.5 py-1.5 text-xs text-ink-dim transition-colors hover:border-amber hover:text-ink"
+                title="View the stored PDF exactly as it will be attached"
+              >
+                <Eye className="h-3.5 w-3.5" />
+                {previewLoading ? "Opening…" : "Preview"}
+              </button>
+              <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-verified">
+                <Check className="h-3.5 w-3.5" /> Ready
+              </span>
+            </div>
+          ) : (
+            <p className="text-sm text-ink-dim">Nothing stored yet — paste or upload your source above; it auto-saves once it compiles.</p>
+          )
         ) : (
-          <p className="text-sm text-ink-dim">Nothing stored yet — paste or upload your source above; it auto-saves once it compiles.</p>
+          <div>
+            <div className="mb-3 flex flex-wrap items-center gap-3">
+              <span className="font-mono text-[11px] text-ink-faint">
+                version “{storedTab}” — saved on this device
+                {versionCompiling && <span className="text-amber"> · compiling…</span>}
+              </span>
+              <button
+                onClick={() => {
+                  switchVersion(storedTab);
+                  setStoredTab("attached");
+                  window.scrollTo({ top: 0, behavior: "smooth" });
+                }}
+                className="btn-ghost px-3 py-1.5 text-xs"
+                title="Load this version into the editor — it auto-compiles and becomes the attached resume"
+              >
+                <FileCheck2 className="h-3.5 w-3.5" /> Load into editor (makes it the attached one)
+              </button>
+            </div>
+            {versionErr && <p className="mb-2 text-sm text-signal">{versionErr}</p>}
+            {versionPdf ? (
+              <iframe title={`Version ${storedTab}`} src={versionPdf} className="h-[560px] w-full rounded-lg border border-hairline bg-white shadow-inner" />
+            ) : (
+              <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-hairline text-sm text-ink-faint">
+                {versionCompiling ? "Compiling this version…" : "Preview appears here"}
+              </div>
+            )}
+          </div>
         )}
 
         {previewUrl && (
