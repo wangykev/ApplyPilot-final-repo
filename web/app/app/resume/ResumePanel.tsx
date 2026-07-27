@@ -259,24 +259,35 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
     });
   }
 
-  function save() {
+  // AUTO-SAVE (no save button): every SUCCESSFUL compile persists the source +
+  // the PDF (under the chosen name) and live-syncs the extension. A failed
+  // compile never reaches here, so a broken document can't replace the stored
+  // resume. Signed-out → quiet "local only" status (the local draft still holds).
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "local">("idle");
+  const saveSeq = useRef(0);
+
+  useEffect(() => {
     if (!compiled) return;
-    startApply(async () => {
+    const seq = ++saveSeq.current;
+    const t = setTimeout(async () => {
+      setSaveState("saving");
       if (tab === "tex" && texText.trim()) {
         const s = await saveResumeSourceTex({ filename: texName || "resume.tex", tex: texText });
-        if (s.ok) setSourceSaved(true);
+        if (s.ok && seq === saveSeq.current) setSourceSaved(true);
       }
       const res = await saveCompiledResume({ pdfBase64: compiled.base64, pdfName });
+      if (seq !== saveSeq.current) return; // superseded by a newer compile/name edit
       if (res.ok) {
         setStored({ filename: res.filename, size: res.size });
-        setPdfName(res.filename);
-        setMsg({ kind: "ok", text: `Saved ${res.filename} — this is what gets attached to applications.` });
+        setSaveState("saved");
         liveSync("resume");
       } else {
-        setMsg({ kind: "err", text: res.error });
+        setSaveState("local"); // typically "not signed in" / backend off — draft still safe locally
       }
-    });
-  }
+    }, 1500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compiled, pdfName]);
 
   async function openPreview() {
     setPreviewLoading(true);
@@ -479,7 +490,7 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
           </div>
         </div>
 
-        {/* generated-PDF name + save */}
+        {/* generated-PDF name — everything auto-saves; no save button */}
         <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-hairline pt-4">
           <label className="block min-w-56 flex-1">
             <span className="font-mono text-[10px] uppercase tracking-label text-ink-dim">Generated PDF filename (what recruiters see)</span>
@@ -490,10 +501,12 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
               className="mt-1.5 w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
             />
           </label>
-          <button onClick={save} disabled={!compiled || applying || compiling} className="btn-primary">
-            <FileCheck2 className="h-4 w-4" />
-            {applying ? "Saving…" : "Save as my resume"}
-          </button>
+          <span className="pb-2 font-mono text-[11px] tracking-label">
+            {saveState === "saving" && <span className="text-amber">auto-saving…</span>}
+            {saveState === "saved" && <span className="text-verified">✓ auto-saved &amp; synced — this PDF attaches to applications</span>}
+            {saveState === "local" && <span className="text-ink-faint">local only — sign in to store &amp; sync</span>}
+            {saveState === "idle" && <span className="text-ink-faint">auto-saves after each successful compile</span>}
+          </span>
         </div>
 
         {msg && (
@@ -544,7 +557,7 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
             </span>
           </div>
         ) : (
-          <p className="text-sm text-ink-dim">Nothing stored yet — compile above and “Save as my resume”.</p>
+          <p className="text-sm text-ink-dim">Nothing stored yet — paste or upload your source above; it auto-saves once it compiles.</p>
         )}
 
         {previewUrl && (
