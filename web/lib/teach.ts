@@ -16,6 +16,25 @@ export function isBucketEligibleWidget(w?: string | null): boolean {
   return BUCKET_ELIGIBLE.has(String(w || ""));
 }
 
+/**
+ * "What is today's date?" is NOT a reusable answer (operator 2026-07-28: "don't put any questions that
+ * are just date into teach"). A signature/acknowledgement date is per-APPLICATION: remembering it would
+ * teach a bucket to fill a STALE date on every future form — worse than not learning it at all.
+ *
+ * Deliberately NARROW — it excludes questions that are JUST a date ask, not everything containing the
+ * word. "Date of Birth" and "Graduation Date" ARE reusable answers and must keep teaching, so only a
+ * bare "Date" (however punctuated) and the explicit today/signature phrasings are dropped. The `date`
+ * and `year` WIDGETS are excluded too: a date composite can't be bucket-filled at all today, so a card
+ * for one is unanswerable — and this keeps it that way if `date` is ever added to BUCKET_ELIGIBLE.
+ */
+const DATE_ONLY_QUESTION =
+  /^(date|dates|todays? date|current date|date signed( on)?|signature date|date of signature|date completed|completion date)$/;
+export function isDateOnlyQuestion(label?: string | null, widget?: string | null): boolean {
+  const w = String(widget || "");
+  if (w === "date" || w === "year") return true;
+  return DATE_ONLY_QUESTION.test(normalizeQuestion(String(label || "")).replace(/[:.]+$/, "").replace(/'/g, ""));
+}
+
 /** Read a dotted profile path → a display string (a tiered array shows its first candidate). A path
  *  that lands on an OBJECT or an array-of-objects (e.g. a whole repeating section like `education`) has
  *  no scalar display → "" (guards against rendering "[object Object]"). */
@@ -105,6 +124,7 @@ function isTeachable(e: ReviewEntry): boolean {
     !e.is_deleted &&
     (edited || (!!e.is_approved && !!e.needs_review)) &&
     isBucketEligibleWidget(e.widget_type) &&
+    !isDateOnlyQuestion(e.question_label, e.widget_type) && // a per-application date is never a reusable answer
     !!e.question_label &&
     normalizeQuestion(e.question_label) !== "" &&
     e.current_value != null &&

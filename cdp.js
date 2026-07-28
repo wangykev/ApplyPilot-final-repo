@@ -1758,6 +1758,10 @@ function cdpOnboardScan() {
   const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
   return {
     url: location.href, host: location.host, title: document.title,
+    // Was the document still parsing when we read it? The auth widget can be MID-RENDER (auth chrome
+    // present, email/password not in the DOM yet) — indistinguishable from "this page has no fields"
+    // without this. A hidden tab makes it common; the waitFor timeout logs it (2026-07-27).
+    readyState: document.readyState,
     bodyText,
     formFieldCount: formFields.length,
     emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,

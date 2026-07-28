@@ -12,9 +12,16 @@ export const runtime = "nodejs";
  * extension's summary.html). Authenticated with the per-user ingest key (AP_SET_SESSION),
  * mirroring the queue-pull route. READ-ONLY.
  *
- * Match strategy: `?url=` (the posting URL the report upserts by) → the exact application
- * row; falls back to the most-recently-updated application that HAS a bundle when no url is
- * given. Returns `{ ok, bundle }` (bundle null when nothing matches — the SW then keeps its
+ * Match strategy, most precise first:
+ *   `?job_key=` — the STABLE per-job key (tenant + requisition id, see lib/job-key.ts). This is
+ *      what a SUBMIT run passes: it names ONE application unambiguously and survives the fact that
+ *      the raw form url changes every run. A job_key with no matching row returns bundle:null — the
+ *      caller must refuse rather than replay someone else's answers.
+ *   `?url=` — the raw url the report upserts by (the legacy/default key).
+ *   neither — the most-recently-updated application that HAS a bundle. Fine for "replay what I just
+ *      filled in this browser"; NOT safe for a submit run, which is why submit runs send job_key.
+ *
+ * Returns `{ ok, bundle, application_id }` (bundle null when nothing matches — the SW then keeps its
  * local bundle). The bundle is returned VERBATIM; the SW does not re-derive approval (the
  * save action already recomputed the envelope; submitPrecondition re-checks defensively).
  */
@@ -39,7 +46,9 @@ export async function GET(req: Request) {
     .maybeSingle();
   if (!keyRow) return j({ ok: false, error: "Invalid key." }, 401);
 
-  const url = new URL(req.url).searchParams.get("url");
+  const params = new URL(req.url).searchParams;
+  const url = params.get("url");
+  const jobKey = params.get("job_key");
 
   let q = admin
     .from("applications")
@@ -48,7 +57,10 @@ export async function GET(req: Request) {
     .not("review_bundle_json", "is", null)
     .order("updated_at", { ascending: false })
     .limit(1);
-  if (url && url.trim()) q = q.eq("url", url.trim());
+  // job_key is the precise key — when it's given we NEVER widen to the url/most-recent fallbacks, so a
+  // submit run either gets that exact application's approved bundle or nothing.
+  if (jobKey && jobKey.trim()) q = q.eq("job_key", jobKey.trim());
+  else if (url && url.trim()) q = q.eq("url", url.trim());
 
   const { data, error } = await q.maybeSingle();
   if (error) return j({ ok: false, error: error.message }, 500);

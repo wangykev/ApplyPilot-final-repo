@@ -107,6 +107,8 @@ export type ApprovalEnvelope = {
   approved_count: number;
   pending_count: number;
   unreplaced_placeholders: number;
+  /** REQUIRED fields still holding no value — Workday refuses the page, so submit_ready is false. */
+  required_blank?: number;
   all_approved: boolean;
   submit_ready: boolean;
 };

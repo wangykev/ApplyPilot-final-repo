@@ -131,13 +131,44 @@ function joinBullets(bullets) {
     : "";
 }
 
-// Ensure a website URL has a scheme: leave http(s):// URLs as-is, prepend "https://"
-// to a scheme-less one (e.g. "linkedin.com/in/x" → "https://linkedin.com/in/x"); ""→"".
-// Pure → unit-tested; the SW applies it when prepping websites so the form gets a full URL.
+// Canonicalize a website URL to the FULL link the operator wants stored and filled (2026-07-26):
+// a scheme, AND "www." on a bare apex host — "linkedin.com/in/x" → "https://www.linkedin.com/in/x".
+//
+// WHY www: a form's URL field (and the site itself) canonicalizes to the www host, so a stored bare
+// host doesn't match what the page ends up holding. That mismatch is not cosmetic — it fails EVERY
+// equality tier we have (exact, containment [www. is inserted mid-string, so neither side contains
+// the other], and fuzzy, which lands at 89 vs the 90 bar), which flags the M40 audit and makes
+// submitPrecondition BLOCK the submit on a review-page DISAGREE. Storing the canonical form is what
+// keeps all three copies — profile, page, bundle — byte-identical.
+//
+// www is added ONLY to a bare apex host, because it is WRONG anywhere else: "blog.example.com" has no
+// "www.blog.example.com", and neither does most personal-domain hosting. So a host that already
+// carries ANY subdomain (including "www.") is returned untouched, as are IP/userinfo hosts. An apex is
+// 2 labels ("linkedin.com"), or 3 whose last two are a public multi-part suffix ("example.co.uk").
+// Pure → unit-tested. LOCKSTEP with the website's ensureHttpsUrl (web/lib/profile-schema.ts): both
+// must produce the SAME string, or the synced profile and the filled value drift apart again.
+const APEX_MULTIPART_TLD = /^(co|com|net|org|edu|gov|ac|gob|mil)\.[a-z]{2}$/i;
 function ensureHttps(url) {
   const t = String(url == null ? "" : url).trim();
   if (!t) return "";
-  return /^https?:\/\//i.test(t) ? t : "https://" + t;
+  const withScheme = /^https?:\/\//i.test(t) ? t : "https://" + t;
+  try {
+    const u = new URL(withScheme);
+    if (u.username || u.password) return withScheme;                 // user:pass@host — the splice below can't be trusted
+    const host = u.hostname;
+    if (!host || /^[\d.]+$/.test(host) || host.indexOf(":") !== -1) return withScheme; // IPv4/IPv6 → never www
+    const labels = host.split(".");
+    const isApex =
+      labels.length === 2 ||
+      (labels.length === 3 && APEX_MULTIPART_TLD.test(labels.slice(-2).join(".")));
+    if (!isApex) return withScheme;                                  // already subdomained (incl. www.) → leave alone
+    // Splice "www." after the scheme rather than rebuilding via URL.toString(), which would also
+    // normalize the rest (e.g. appending a trailing "/" to a path-less URL) — we change the host only.
+    const m = /^(https?:\/\/)([\s\S]*)$/i.exec(withScheme);
+    return m ? m[1] + "www." + m[2] : withScheme;
+  } catch (e) {
+    return withScheme; // unparseable → still better than a scheme-less value; never throws
+  }
 }
 
 // Is a proficiency value "Fluent"? Accepts a string or a tiered array (fluent appearing
@@ -415,6 +446,75 @@ function languageDeletionPlan(entries) {
   const seen = new Set(), dupes = [];
   for (const e of list) {
     const v = String((e && e.language) || "").trim().toLowerCase();
+    if (!v) continue;
+    if (seen.has(v)) dupes.push(e.index); else seen.add(v);
+  }
+  const summary = list.map((e) => e.summary).join(", ");
+  if (dupes.length) return { mode: "real", deleteIndices: dupes.slice(), summary };
+  return { mode: "phantom", deleteIndices: list.map((e) => e.index), summary };
+}
+
+// ── GENERIC phantom-duplicate support: ANY repeating section (2026-07-27) ───────────────────────────
+// Workday's backend sometimes APPENDS a repeating section instead of REPLACING it, so its stored copy
+// holds duplicates the FORM does not show — the page is visibly clean and Save & Continue is still
+// rejected. First seen on websites + languages (which have their own tuned helpers above, kept because
+// they're live-verified and know their sections' value semantics); these three generalize the same
+// treatment to EVERY repeating section (work experience / education / certifications / …).
+
+// Which repeating SECTION does a "duplicate…" validation error name? Returns a PAGE_SECTIONS name, or
+// null when the text isn't a duplicate error / names nothing we model. Deliberately looser than the two
+// phrase-exact detectors above (Workday words these differently per section, and we only have two
+// observed samples) — safe because the ACTION it authorizes is bounded (delete that section's visible
+// rows) and independently verified afterwards (the rows must reappear on the review page).
+const DUPLICATE_SECTION_WORDS = [
+  { section: "website",        rx: /website|web\s?address|\burls?\b/i },
+  { section: "language",       rx: /language/i },
+  { section: "education",      rx: /education|school|degree|university/i },
+  { section: "workExperience", rx: /work\s?experience|employment|employer|job\s?title/i },
+  { section: "certification",  rx: /certificat|licen[cs]e/i },
+];
+function duplicateErrorSection(errorTexts) {
+  const texts = (Array.isArray(errorTexts) ? errorTexts : [errorTexts]).map((t) => String(t == null ? "" : t));
+  for (const t of texts) {
+    if (!/duplicate/i.test(t)) continue;
+    for (const d of DUPLICATE_SECTION_WORDS) if (d.rx.test(t)) return d.section;
+  }
+  return null;
+}
+
+// Entries of ANY repeating section, parsed out of a page's results (records keyed
+// `<section>[i].<field>`), each carrying a composite KEY — every filled value of that row, normalized
+// and order-independent — so "two identical rows" is decidable for a section whose identity isn't one
+// field (a work-experience row is title+company+dates, not a single URL).
+function sectionEntriesFromResults(results, section) {
+  const rx = new RegExp("^" + String(section || "").replace(/[^\w]/g, "") + "\\[(\\d+)\\]\\.(\\w+)");
+  const byIdx = {};
+  for (const r of (Array.isArray(results) ? results : [])) {
+    const m = rx.exec((r && r.fieldName) || "");
+    if (!m) continue;
+    const i = parseInt(m[1], 10);
+    const e = (byIdx[i] = byIdx[i] || { index: i, values: {} });
+    if (r.after != null && String(r.after).trim() !== "") e.values[m[2]] = String(r.after).trim();
+  }
+  return Object.keys(byIdx).map((k) => byIdx[k]).sort((a, b) => a.index - b.index).map((e) => {
+    const keys = Object.keys(e.values).sort();
+    return {
+      index: e.index,
+      key: keys.map((k) => k + "=" + e.values[k].toLowerCase().replace(/\/+$/, "")).join("|"),
+      summary: keys.map((k) => e.values[k]).join(" · ") || "?",
+    };
+  });
+}
+
+// Real-vs-phantom deletion plan for ANY repeating section — the generic of website/languageDeletionPlan,
+// keyed on the composite entry signature. Two rows with the SAME signature ⇒ a REAL duplicate → delete
+// only the later occurrence(s). All rows distinct ⇒ Workday is complaining about a duplicate that isn't
+// on the page (PHANTOM) → the whole visible section goes, which is what its backend accepts.
+function sectionDeletionPlan(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const seen = new Set(), dupes = [];
+  for (const e of list) {
+    const v = String((e && e.key) || "").trim();
     if (!v) continue;
     if (seen.has(v)) dupes.push(e.index); else seen.add(v);
   }
@@ -834,12 +934,246 @@ function looksLikeSso(state) {
   // A native "Sign in with email" button means Workday offers an email/password path (a
   // social-login CHOOSER, e.g. Palo Alto Networks) — NOT a forced SSO redirect. Reveal it, don't halt.
   if (s.signInWithEmail) return false;
-  const ssoUrl = /\bsso\b|[?&/](saml|idp|oidc|federation)\b|okta|pingidentity|pingone|onelogin|microsoftonline|\badfs\b|auth0|login\.gov/i.test(String(s.url || ""));
-  if (ssoUrl) return true;
+  const url = String(s.url || "");
+  const ssoUrl = /\bsso\b|[?&/](saml|idp|oidc|federation)\b|okta|pingidentity|pingone|onelogin|microsoftonline|\badfs\b|auth0|login\.gov/i.test(url);
+  if (ssoUrl) return true; // POSITIVE evidence: we were redirected to an identity provider.
+  // ── FIELD-ABSENCE IS NOT EVIDENCE OF SSO ON A WORKDAY-HOSTED PAGE (operator, 2026-07-27:
+  //    "Workday will never be SSO"). ────────────────────────────────────────────────────────────
+  // The check below infers SSO from a MISSING email/password field, which is absence-of-evidence: a
+  // Workday auth widget that is still RENDERING looks exactly like a bare "Sign in with <provider>"
+  // redirect — auth chrome present, fields not yet in the DOM. Live (Caterpillar wd5, hidden tab,
+  // 2026-07-27) that produced a flat-wrong "this tenant uses SSO" halt on an ordinary create-account
+  // page: the tab was backgrounded, the widget needed >20s to paint (the post-apply-manually wait
+  // timed out at 20s), the fields weren't there yet, and the "Already have an account? Sign In" link
+  // satisfied signInButtonPresent. A REAL SSO redirect leaves the Workday host, so the URL test above
+  // still catches it — while still ON a Workday host, a slow render is by far the likelier story, and
+  // the caller waits/halts honestly instead of blaming SSO.
+  if (isWorkdayHost(url)) return false;
   // A sign-in button with NO email/password field AND no email-chooser button = a bare
-  // "Sign in with <provider>" redirect → SSO.
+  // "Sign in with <provider>" redirect → SSO. (Non-Workday hosts only, per above.)
   if (s.signInButtonPresent && !s.passwordInput && !s.emailInput) return true;
   return false;
+}
+
+// ── Job-posting settle-poll: the ACCEPT RULE (pure, unit-pinned) ─────────────────────────────────
+// One step of "has the posting finished rendering?", folded over successive page reads. The SW does the
+// I/O (waitJobPageSettled in background.js); this owns the decision, so it can be tested without a page.
+//
+// `read` = { len, hasPosting } — body-text length + whether the posting's OWN content is in the DOM.
+// `state` = the previous step's return ({ prev, stable }); pass nothing to start.
+//
+// Rule: only TWO CONSECUTIVE EQUAL, non-empty reads count as settled (the same discipline as the fill's
+// settle-polls — never a fixed sleep). A stable count is only TRUSTWORTHY once the posting's content is
+// actually present; without it, insist on more repeats, because a page can PAUSE mid-hydration and hold
+// a partial byte count (live: a background run sat at 461 chars of a posting that renders 2913).
+function jobPageSettleStep(read, state) {
+  const prev = state && typeof state.prev === "number" ? state.prev : -1;
+  const prevStable = state && typeof state.stable === "number" ? state.stable : 0;
+  const len = read && typeof read.len === "number" ? read.len : 0;
+  const stable = len > 0 && len === prev ? prevStable + 1 : 0;
+  const accept = stable > 0 && (!!(read && read.hasPosting) || stable >= 3);
+  return { accept, prev: len, stable };
+}
+
+// ── The EMPTY Workday shell after a sign-in submit (operator 2026-07-27: "the solution is to just
+//    refresh the page") ────────────────────────────────────────────────────────────────────────────
+// Live on cat.wd5/solarturbines: sign-in submitted, and the page came back with `readyState=complete`
+// but NOTHING on it — no form fields, no auth chrome (no email/password/submit/links), no apply
+// controls, no already-applied marker; body text just the cookie boilerplate, while the title still
+// read "Create Account". There is nothing to act on and nothing to classify (classifyAuthOutcome says
+// "unknown"), so the flow used to halt `auth-unknown` — but a plain RELOAD reliably brings the real
+// page back, so this is recoverable, not operator-worthy.
+//
+// STRICT by design, because the action it authorizes is a page reload: it requires the document to be
+// FULLY LOADED (never fires mid-navigation, when everything is legitimately absent for a moment) and
+// EVERY actionable marker to be absent. A page with any field, any auth control, any apply button, or
+// real content is NOT blank. `readyState` is optional so an older scan (which didn't report it) simply
+// never matches — fail-closed.
+const BLANK_PAGE_BOILERPLATE_MAX = 700; // a genuinely empty shell is just the cookie/skip-link text
+function isBlankAuthPage(state) {
+  const s = state || {};
+  if (s.readyState !== "complete") return false;          // still loading ⇒ absence proves nothing
+  if ((s.formFieldCount || 0) > 0) return false;
+  if (s.hasAuthEl || s.emailInput || s.passwordInput || s.signInWithEmail) return false;
+  const m = s.markers || {};
+  // ANY actionable/known page shape disqualifies it — this must never fire on a page we can drive.
+  if (m.signInSubmit || m.createAccountSubmit || m.signInLink || m.createAccountLink || m.verifyPassword) return false;
+  if (m.adventureButton || m.continueButton || m.applyManually || m.useMyLastApplication) return false;
+  if (m.applyFlowReviewPage || m.alreadyAppliedPage || m.formField) return false;
+  const text = String(s.bodyText || "").replace(/\s+/g, " ").trim();
+  return text.length <= BLANK_PAGE_BOILERPLATE_MAX;        // real content ⇒ not an empty shell
+}
+
+
+// ── Locating a repeating section on the LIVE page (pure) ────────────────────────────────────────────
+// The fkit container prefix is TENANT-VARIABLE — website rows live under `webAddress-` on the observed
+// tenants while their records are keyed `website[i]`, and nothing guarantees that mapping holds
+// everywhere. Trusting a hardcoded prefix is exactly what made the first live phantom-duplicate fix
+// delete 0 of 2 rows (entryCount("webAddress-") → 0 → the loop bailed immediately). cdpRepeatingScan
+// DISCOVERS the prefixes actually present in the DOM; this picks ours out of them, most-certain first:
+// the canonical prefix → a prefix starting with the section NAME → the section's HEADING (the same
+// anchor findSectionAdd uses, and the most tenant-proof of the three). `sectionCfg` is the PAGE_SECTIONS
+// row ({containerPrefix, headingRegex}) passed in by the caller so this stays dependency-free.
+function findLiveSection(rscan, sectionName, sectionCfg) {
+  const sections = (rscan && rscan.sections) || {};
+  const keys = Object.keys(sections);
+  if (!keys.length) return null;
+  const sec = sectionCfg || null;
+  if (sec && sec.containerPrefix && sections[sec.containerPrefix]) return { prefix: sec.containerPrefix, live: sections[sec.containerPrefix] };
+  const byName = keys.find((k) => k.toLowerCase().indexOf(String(sectionName || "").toLowerCase()) === 0);
+  if (byName) return { prefix: byName, live: sections[byName] };
+  if (sec && sec.headingRegex) {
+    const re = new RegExp(sec.headingRegex, "i");
+    const byHeading = keys.find((k) => re.test(String(sections[k].heading || "")));
+    if (byHeading) return { prefix: byHeading, live: sections[byHeading] };
+  }
+  return null;
+}
+
+// Plan-shaped entries from the LIVE scan's rows — index, a dedupe KEY, a summary, and whether the row
+// even HAS a Delete control. Live rows beat results-derived ones: they include anything Workday added
+// behind our back, and they carry the values actually on screen. `keyField` is the section's identity
+// field when it has one (website→url, language→language — their duplicate errors are about that single
+// value); absent, or missing from the row, the whole row's values form the key.
+function liveDupEntries(liveEntries, keyField) {
+  const norm = (v) => String(v).trim().toLowerCase().replace(/\/+$/, "");
+  return (liveEntries || []).map((e, i) => {
+    const filled = ((e && e.fields) || []).filter((f) => f && f.value != null && String(f.value).trim() !== "");
+    const keyed = keyField ? filled.filter((f) => f.fieldName === keyField) : [];
+    const basis = keyed.length ? keyed : filled;
+    return {
+      index: i,
+      key: basis.map((f) => f.fieldName + "=" + norm(f.value)).sort().join("|"),
+      summary: filled.map((f) => String(f.value)).join(" · ") || "?",
+      deletePresent: !!(e && e.deletePresent),
+    };
+  });
+}
+
+// A date composite's SEGMENT ORDER for the review editor: the scan reports raw segment automation-ids
+// (["dateSectionMonth-display","dateSectionMonth-input","dateSectionYear-display",…]) and the viewer
+// needs the form's own order — ["month","day","year"] / ["month","year"] / ["year"] — to render a
+// segmented MM/DD/YYYY editor instead of a text box. Passing the RAW ids through instead printed them
+// as the field's content on the review page (live 2026-07-27, the cascade-added "Date" field).
+function dateOrderOf(segs) {
+  const order = [];
+  for (const seg of (Array.isArray(segs) ? segs : [])) {
+    const m = /dateSection(Month|Day|Year)/i.exec(String(seg));
+    if (m) { const p = m[1].toLowerCase(); if (!order.includes(p)) order.push(p); }
+  }
+  return order;
+}
+
+// ── CASCADE-REVEALED REQUIRED FIELDS (pure) ─────────────────────────────────────────────────────────
+// A field the form has since made REQUIRED, which the approved bundle cannot answer, is a question for
+// the HUMAN — not something to guess and not something to halt blind on. Live (solarturbines page 5,
+// 2026-07-27): filling an OPTIONAL name promoted "Date" and "Please check one of the boxes below" to
+// required. Nothing was wrong with the fill — both were optional AND blank when the page was reviewed,
+// so there was genuinely nothing to record; the replay then had nothing to put there and Workday refused
+// the page. These two turn that into a review item the operator can answer on the website.
+//
+// BOTH gap shapes count, and the second is the one that actually happened: an entry MISSING from the
+// bundle, and an entry PRESENT but BLANK. Neither helper ever invents a value — every entry produced is
+// empty and unapproved, so bundleSubmitBlockers (required-blank + unapproved-flagged) keeps refusing
+// until a human answers it.
+function newlyRequiredGaps(liveFields, bundleEntries, pageKey, errorTitles) {
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
+  };
+  const byName = new Map();
+  for (const e of bundleEntries || []) byName.set(nameOf(e), e);
+  const blank = (v) => v == null || String(v).trim() === "";
+  const titles = (errorTitles || []).map((t) => normalizeLabel(String(t || "")));
+  return (liveFields || [])
+    .filter((f) => f && f.isRequired === true && blank(f.value) && f.widgetType !== "file_upload")
+    .map((f) => {
+      const entry = byName.get(f.fieldName) || null;
+      const named = titles.length ? titles.includes(normalizeLabel(String(f.label || ""))) : false;
+      return { field: f, entry, reason: !entry ? "not-in-bundle" : "blank-in-bundle", namedByError: named };
+    })
+    // Only fields the bundle can't answer. A required field the bundle HAS a value for isn't a gap —
+    // if it's still blank on the page that's a replay failure, which the strict verify already reports.
+    .filter((g) => !g.entry || blank(g.entry.current_value));
+}
+
+// The mirror of newlyRequiredGaps: REQUIRED fields the page shows as BLANK that the approved bundle DOES
+// have a value for. That is a value which did not STICK — it was filled and verified, then something
+// cleared it before Save & Continue.
+//
+// Live (solarturbines page 5, 2026-07-28): the disability checkbox group was replayed and VERIFIED
+// checked (fillCheckboxGroupCdp re-reads and requires exactly one box on), the page then reported
+// "Please check one of the boxes below … is required and must have a value", and the operator watched it
+// happen — "the checkbox at the end first clicked, but then something happened and it got unclicked".
+// The fill walk catches this class with its post-settle M40 audit; the replay had no equivalent, so the
+// walk clicked Save & Continue on a page it believed was complete.
+//
+// Deliberately the same blank/carve-out rules as bundleSubmitBlockers so the three checks agree: a
+// checkbox stores "false" (never empty), file_upload has its own re-attach step.
+function requiredBlankOnPage(liveFields, bundleEntries) {
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
+  };
+  const blank = (v) => v == null || String(v).trim() === "";
+  const byName = new Map();
+  for (const e of bundleEntries || []) byName.set(nameOf(e), e);
+  const out = [];
+  for (const f of liveFields || []) {
+    if (!f || f.isRequired !== true || f.widgetType === "file_upload") continue;
+    if (!blank(f.value)) continue;                       // holds a value → fine
+    const entry = byName.get(f.fieldName);
+    if (!entry || blank(entry.current_value)) continue;   // nothing approved to put back → newlyRequiredGaps owns it
+    out.push({ field: f, entry, approved: String(entry.current_value) });
+  }
+  return out;
+}
+
+// Build a review entry for a newly-required field. Empty + unapproved BY DESIGN — this asks the human a
+// question, it never answers it.
+function cascadeEntryFor(gap, pageKey, pageNumber, index) {
+  const f = gap.field;
+  const options = Array.isArray(f.checkboxes) && f.checkboxes.length
+    ? f.checkboxes.map((c) => ({ text: c.labelText }))          // a checkbox group carries its labels in the DOM
+    : Array.isArray(f.options) ? f.options : [];
+  return {
+    field_id: (pageKey ? pageKey + "::" : "") + "formField-" + f.fieldName,
+    page: pageKey || null,
+    page_number: pageNumber || null,
+    field_index: index,
+    question_label: f.label || f.fieldName,
+    widget_type: f.widgetType,
+    canonical_field: null,
+    is_required: true,
+    current_value: null,
+    original_ai_value: null,
+    is_edited: false,
+    edit_kind: null,
+    is_approved: false,
+    confidence: "none",
+    confidence_source: "cascade_revealed",
+    needs_review: true,
+    needs_review_reason: "cascade_required",
+    fill_status: "not_filled",
+    cascade_revealed: true,
+    flag: "cascade-required",
+    options,
+    date_order: f.widgetType === "date" || f.widgetType === "year" ? dateOrderOf(f.dateSegments) : null,
+    detail: gap.reason === "not-in-bundle"
+      ? "became REQUIRED on the live form and was never captured when this application was reviewed — answer it here, then re-run"
+      : "was OPTIONAL and left blank when this application was reviewed, and the form has since made it REQUIRED — answer it here, then re-run",
+  };
+}
+
+
+// Is this URL on a Workday-owned host (the careers/JD host or the logged-in form host)? Used to reject
+// absence-based SSO inference (above) — while we're still on Workday's own domain, a missing field means
+// "not rendered yet", not "federated login". An unparseable/empty URL is NOT treated as Workday.
+function isWorkdayHost(url) {
+  try { return /\.myworkday(?:jobs|site)\.com$/i.test(new URL(String(url == null ? "" : url)).hostname); }
+  catch (e) { return false; }
 }
 
 // The company brand from a Workday tenant URL — magna.wd3.myworkdayjobs.com → "Magna" (also the
@@ -871,5 +1205,5 @@ function tenantCompanyFromUrl(url) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, tenantCompanyFromUrl };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl };
 }

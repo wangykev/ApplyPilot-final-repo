@@ -249,12 +249,14 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                     label={w.type ? `${w.type} URL` : "URL"}
                     bucketPath={`websites.${i}.url`}
                     value={w.url}
-                    placeholder="https://…"
-                    hint="Full URL"
+                    placeholder="https://www.linkedin.com/in/you"
+                    hint="Full URL, including www"
                     onChange={(v) => update((p) => { p.websites[i].url = v; })}
-                    // Normalize on BLUR (not per keystroke): "linkedin.com/in/you" → "https://linkedin.com/in/you".
+                    // Normalize on BLUR (not per keystroke): "linkedin.com/in/you" → the full canonical
+                    // link "https://www.linkedin.com/in/you". www is added only to a bare apex host, so a
+                    // URL that already has a subdomain ("blog.you.dev") keeps it — see ensureHttpsUrl.
                     onBlur={() => update((p) => { p.websites[i].url = ensureHttpsUrl(p.websites[i].url); })}
-                    error={looksLikeUrl(w.url) ? null : "Enter a full URL, e.g. https://linkedin.com/in/you"}
+                    error={looksLikeUrl(w.url) ? null : "Enter a full URL, e.g. https://www.linkedin.com/in/you"}
                   />
                 </div>
               </EntryCard>

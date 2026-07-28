@@ -4,7 +4,17 @@
 // classifier, the Workday soft-error (refresh) detector, and SSO detection.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied } = require("../lib.js");
+const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage } = require("../lib.js");
+
+// Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
+const settleAt = (reads) => {
+  let st = null;
+  for (let i = 0; i < reads.length; i++) {
+    st = jobPageSettleStep(reads[i], st);
+    if (st.accept) return i + 1;
+  }
+  return null;
+};
 
 const A = '[data-automation-id="adventureButton"]';
 const C = '[data-automation-id="continueButton"]';
@@ -59,9 +69,98 @@ test("looksLikeSso: a sign-in button with no email/password field → true (redi
   assert.strictEqual(looksLikeSso({ url: "https://x/login", signInButtonPresent: true, emailInput: false, passwordInput: false }), true);
   assert.strictEqual(looksLikeSso({ url: "https://x/login", signInButtonPresent: true, emailInput: true, passwordInput: true }), false);
 });
+// REGRESSION (live, Caterpillar wd5 in a BACKGROUND tab, 2026-07-27). The field-absence branch above is
+// absence-of-evidence, and on a Workday host it fired on an ordinary CREATE-ACCOUNT page whose widget
+// simply hadn't painted its inputs yet: auth chrome present, no email/password in the DOM, and the
+// "Already have an account? Sign In" link satisfying signInButtonPresent → a flat-wrong "this tenant uses
+// SSO" halt. Operator: "Workday will never be SSO." A REAL federated login leaves the Workday host, so the
+// URL test still catches it — see the isWorkdayHost guard.
+test("looksLikeSso: a still-RENDERING Workday auth page is NOT sso (field-absence proves nothing there)", () => {
+  const midRender = {
+    url: "https://cat.wd5.myworkdayjobs.com/en-US/CaterpillarCareers/login",
+    signInButtonPresent: true, emailInput: false, passwordInput: false, signInWithEmail: false,
+    hasAuthEl: true, markers: { signInLink: true, createAccountSubmit: true },
+  };
+  assert.strictEqual(looksLikeSso(midRender), false);
+  // …and the same page on the logged-in form host is equally not-SSO.
+  assert.strictEqual(looksLikeSso({ ...midRender, url: "https://wd5.myworkdaysite.com/recruiting/cat/x/login" }), false);
+});
+test("looksLikeSso: a Workday tenant that REDIRECTS to an identity provider is still caught (positive evidence)", () => {
+  assert.strictEqual(looksLikeSso({ url: "https://cat.okta.com/app/signin", signInButtonPresent: true, emailInput: false, passwordInput: false }), true);
+  assert.strictEqual(looksLikeSso({ url: "https://login.microsoftonline.com/cat", signInButtonPresent: true, emailInput: false, passwordInput: false }), true);
+  // A non-Workday host keeps the original field-absence inference (unchanged behavior).
+  assert.strictEqual(looksLikeSso({ url: "https://careers.acme.com/login", signInButtonPresent: true, emailInput: false, passwordInput: false }), true);
+});
+
 test("looksLikeSso: a social-login chooser with a 'Sign in with email' button → NOT sso", () => {
   // Palo Alto Networks variant: Apple/Google/LinkedIn buttons + SignInWithEmailButton, no form yet.
   assert.strictEqual(looksLikeSso({ url: "https://paloaltonetworks.wd5.myworkdayjobs.com/…/applyManually", signInButtonPresent: true, emailInput: false, passwordInput: false, signInWithEmail: true }), false);
+});
+
+// ── jobPageSettleStep — "has the posting finished rendering?" (replaces a flat 1500ms beat) ─────────
+// Live evidence it exists for (Caterpillar wd5, background run, 2026-07-27): a scrape read 461 chars of
+// a posting that healthy runs read as 2913, and the still-hydrating page then reflowed the Apply button
+// out from under the cover-check.
+test("jobPageSettleStep: a warm load settles as soon as an equal read lands WITH posting content", () => {
+  assert.strictEqual(settleAt([
+    { len: 800, hasPosting: false },
+    { len: 2913, hasPosting: true },
+    { len: 2913, hasPosting: true },
+  ]), 3, "two equal reads + the posting present = done (and sooner than the flat beat it replaces)");
+});
+
+test("jobPageSettleStep: a page PAUSED mid-hydration is NOT accepted on one repeat (the 461-char case)", () => {
+  assert.strictEqual(settleAt([
+    { len: 461, hasPosting: false },
+    { len: 461, hasPosting: false },
+  ]), null, "equal but no posting content → keep waiting, don't scrape a partial page");
+});
+
+test("jobPageSettleStep: …and it DOES settle once the real content arrives", () => {
+  assert.strictEqual(settleAt([
+    { len: 461, hasPosting: false },
+    { len: 461, hasPosting: false },
+    { len: 2913, hasPosting: true },
+    { len: 2913, hasPosting: true },
+  ]), 4);
+});
+
+test("jobPageSettleStep: a genuinely static page with no posting marker still settles (3 repeats)", () => {
+  assert.strictEqual(settleAt([
+    { len: 900, hasPosting: false }, { len: 900, hasPosting: false },
+    { len: 900, hasPosting: false }, { len: 900, hasPosting: false },
+  ]), 4, "never block forever on a tenant whose markers we don't recognize");
+});
+
+test("jobPageSettleStep: an empty/unreadable page never counts as settled", () => {
+  assert.strictEqual(settleAt([{ len: 0, hasPosting: false }, { len: 0, hasPosting: false }, { len: 0, hasPosting: false }]), null);
+  assert.strictEqual(settleAt([{}, {}, {}]), null);
+});
+
+// ── isBlankAuthPage — Workday's EMPTY shell after a sign-in submit (recover by reloading) ───────────
+// Captured live on cat.wd5/solarturbines: the submit returned a fully-loaded page with NOTHING on it,
+// while the title still said "Create Account". It used to halt `auth-unknown`; a reload fixes it.
+// The detector authorizes a page RELOAD, so every near-miss below must stay false.
+const BLANK_LIVE = {
+  readyState: "complete", formFieldCount: 0, hasAuthEl: false, emailInput: false, passwordInput: false,
+  signInWithEmail: false, markers: {},
+  bodyText: 'Skip to main content This site uses and sets "cookies" on your computer to help make this website better.',
+};
+test("isBlankAuthPage: the live empty-shell state → true", () => {
+  assert.strictEqual(isBlankAuthPage(BLANK_LIVE), true);
+});
+test("isBlankAuthPage: a page still LOADING is never blank (absence proves nothing mid-navigation)", () => {
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, readyState: "loading" }), false);
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, readyState: undefined }), false, "an older scan without readyState fails closed");
+});
+test("isBlankAuthPage: ANY actionable page is never blank (never reload something we can drive)", () => {
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, formFieldCount: 2 }), false, "the application form");
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, emailInput: true, hasAuthEl: true }), false, "a live sign-in form");
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, markers: { signInSubmit: true } }), false);
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, markers: { createAccountSubmit: true } }), false);
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, markers: { applyManually: true } }), false, "the apply chain");
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, markers: { alreadyAppliedPage: true } }), false, "already-applied is its own clean halt");
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, bodyText: "x".repeat(3000) }), false, "a page with real content");
 });
 
 test("isAlreadyApplied: the alreadyAppliedPage marker → true (Magna wd3 — title is a stale 'Create Account')", () => {

@@ -49,6 +49,10 @@ import {
   mustReplace,
   isPrePopulated,
   isCascadeRevealed,
+  isBecameRequired,
+  orderForReview,
+  normalizeDateOrder,
+  todayForDateOrder,
   explainFill,
   statusOf,
   cleanPageName,
@@ -124,9 +128,10 @@ export function ReviewEditor({
   );
 
   // commit a value edit (buildEditor's onCommit). Recompute edit_kind/is_edited; a VALUE edit
-  // RESETS approval (re-review). null = cleared.
+  // RESETS approval (re-review) — UNLESS the caller passes { approve: true }, which one-click buttons
+  // that write a single self-evident value use (see "Today"). null = cleared.
   const commit = useCallback(
-    (entry: ReviewEntry, val: string | null) => {
+    (entry: ReviewEntry, val: string | null, opts?: { approve?: boolean }) => {
       const value = val === "" || val == null ? null : val;
       const merged: ReviewEntry = { ...entry, current_value: value };
       const edit_kind = editKindOf(merged);
@@ -135,7 +140,16 @@ export function ReviewEditor({
         edit_kind,
         is_edited: edit_kind !== null,
       };
-      if (entry.is_approved) {
+      // APPROVE IN THE SAME PATCH (operator 2026-07-28: "if today is pressed, automatically approve").
+      // A value edit normally RESETS approval — a changed value deserves a fresh look. The exception is a
+      // one-click button that writes ONE unambiguous, self-evident value: clicking "Today" IS the human
+      // decision, so demanding a second click to confirm what you just chose is pure friction. Still
+      // gated by canApprove (a required field left empty can never be approved), and done in ONE patch so
+      // there's no intermediate state where the field reads edited-but-unapproved.
+      if (opts?.approve && canApprove(merged)) {
+        patch.is_approved = true;
+        patch.approved_at = nowIso();
+      } else if (entry.is_approved) {
         patch.is_approved = false;
         patch.approved_at = null;
       }
@@ -412,14 +426,9 @@ export function ReviewEditor({
   const approval = useMemo(() => approvalEnvelope(entries), [entries]);
   const blocked = useMemo(() => live.filter(needsAnswer), [live]);
 
-  const flagged = useMemo(() => {
-    const all = live.filter((e) => e.needs_review);
-    return [
-      ...all.filter(isSuperHard),
-      ...all.filter((e) => mustReplace(e) && !isSuperHard(e)),
-      ...all.filter((e) => !mustReplace(e)),
-    ];
-  }, [live]);
+  // NEW items first (questions a submit run sent back), then the pre-existing loudness ordering —
+  // see reviewPriority. Stable, so form order still decides within a tier.
+  const flagged = useMemo(() => orderForReview(live.filter((e) => e.needs_review)), [live]);
 
   const groupKeys = useMemo(() => {
     const seen = new Set<string>();
@@ -562,7 +571,7 @@ export function ReviewEditor({
 // ─────────────────────────────────────────────────────────────────────────────
 // Row context threaded through the tree (avoids prop-drilling the mutators everywhere).
 type RowCtx = {
-  commit: (e: ReviewEntry, v: string | null) => void;
+  commit: (e: ReviewEntry, v: string | null, opts?: { approve?: boolean }) => void;
   setApproved: (e: ReviewEntry, on: boolean) => void;
   setTiers: (e: ReviewEntry, tiers: string[]) => void;
   registerRow: (id: string, node: HTMLDivElement | null) => void;
@@ -1049,6 +1058,8 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   const wt = e.widget_type;
   const cur = e.current_value;
   const onCommit = (v: string | null) => ctx.commit(e, v);
+  // "Today" writes one self-evident value, so it also approves — see commit()'s approve option.
+  const onCommitApproved = (v: string | null) => ctx.commit(e, v, { approve: true });
 
   // file_upload: the résumé + top-level Documents are uploaded elsewhere (the profile /
   // attachments manager); per-entry attachments attach on the form. Display-only here.
@@ -1094,7 +1105,8 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
     return <TierEditor e={e} ctx={ctx} />;
   }
   if (wt === "hierarchical") return <TierEditor e={e} ctx={ctx} />;
-  if (wt === "date") return <DateSeg value={cur} order={e.date_order} onCommit={onCommit} />;
+  if (wt === "date")
+    return <DateSeg value={cur} order={e.date_order} onCommit={onCommit} onCommitToday={onCommitApproved} />;
   if (wt === "textarea") return <TextBox value={cur} onCommit={onCommit} textarea />;
   return <TextBox value={cur} onCommit={onCommit} />;
 }
@@ -1269,12 +1281,19 @@ function DateSeg({
   value,
   order,
   onCommit,
+  onCommitToday,
 }: {
   value: string | null | undefined;
   order: string[] | null | undefined;
   onCommit: (v: string | null) => void;
+  /** "Today" commits AND approves (the click is the decision). Falls back to onCommit if not given. */
+  onCommitToday?: (v: string | null) => void;
 }) {
-  const segs = Array.isArray(order) && order.length ? order : null;
+  // NORMALIZE, never trust: an unrecognized token used to render as the input's placeholder (live —
+  // raw `dateSectionMonth-display` ids printed as the field's content). normalizeDateOrder heals a raw
+  // or stale order, and anything it can't map degrades to a plain text box instead of showing junk.
+  const norm = normalizeDateOrder(order);
+  const segs = norm.length ? norm : null;
   const [parts, setParts] = useState<string[]>(() => String(value ?? "").split("/"));
   useEffect(() => setParts(String(value ?? "").split("/")), [value]);
   if (!segs) return <TextBox value={value} onCommit={onCommit} />;
@@ -1306,6 +1325,22 @@ function DateSeg({
           </span>
         );
       })}
+      {/* "Today" — the one date a form asks for that the profile can never hold is today's (a signature
+          or acknowledgement date), and it's the field most likely to come back as BECAME REQUIRED.
+          Commits the computed values DIRECTLY rather than going through `commit()`, which reads the
+          `parts` state that this same click is setting (a stale-state race). */}
+      <button
+        type="button"
+        className="btn-ghost ml-1 shrink-0 px-2 py-1 text-[11px]"
+        title="Fill in today's date and approve it"
+        onClick={() => {
+          const vals = todayForDateOrder(segs);
+          setParts(vals);
+          (onCommitToday || onCommit)(vals.join("/"));
+        }}
+      >
+        Today
+      </button>
     </div>
   );
 }
@@ -1377,7 +1412,20 @@ function ReviewBadges({ e }: { e: ReviewEntry }) {
         {e.flag === "ai-closest-forced" ? "AI FORCED" : "LOW-CONF AI"}
       </Badge>
     );
-  if (isCascadeRevealed(e))
+  // "BECAME REQUIRED" and "REVEALED" are both cascade_revealed, but they are different news for the
+  // human: one merely appeared, the other is a question the form is now DEMANDING an answer to. Checked
+  // first so exactly one of the two shows (operator 2026-07-27).
+  if (isBecameRequired(e))
+    badges.push(
+      <Badge
+        key="br"
+        tone="warn"
+        title="The form made this field required after you reviewed this application — it was optional (or absent) then, so there's no approved answer for it yet. Answer it here, then submit again."
+      >
+        ✱ BECAME REQUIRED
+      </Badge>
+    );
+  else if (isCascadeRevealed(e))
     badges.push(
       <Badge key="cr" tone="warn" title="This field appeared only after an earlier value committed — confirm it.">
         ⤴ REVEALED

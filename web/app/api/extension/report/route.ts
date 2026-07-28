@@ -65,6 +65,10 @@ export async function POST(req: Request) {
     needs_review_count: typeof body.needs_review_count === "number" ? body.needs_review_count : 0,
     review_bundle_json: body.review_bundle ?? null,
     applied_at: typeof body.captured_at === "string" ? body.captured_at : null,
+    // WHICH account this run signed in as (migration 0011). The extension only sends this when it
+    // matched the run to this job, so a present `login` is authoritative; an absent one leaves any
+    // previously-recorded login untouched (see loginFields).
+    ...loginFields(body.login),
   };
 
   // Dedupe by the stable job_key when present (a Workday application url changes every run — see
@@ -109,6 +113,27 @@ export async function POST(req: Request) {
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+
+/**
+ * The per-application login columns, from the extension's `login` payload (background.js
+ * recordRunLogin). Returns `{}` when there's no usable record — a report from a run that signed in by
+ * hand (no stored credentials), or an older extension build, must NOT blank out a login this
+ * application already has on file. An email is the minimum: without it there's nothing to track.
+ */
+function loginFields(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return {};
+  const l = raw as Record<string, unknown>;
+  const email = str(l.email);
+  if (!email) return {};
+  return {
+    login_email: email.slice(0, 320).toLowerCase(),
+    login_tenant: str(l.tenant)?.slice(0, 200) ?? null,
+    login_host: str(l.host)?.slice(0, 253) ?? null,
+    login_created: l.created === true,
+    login_verified: l.verified === true,
+    login_at: str(l.at) ?? new Date().toISOString(),
+  };
 }
 function j(obj: unknown, status: number) {
   return NextResponse.json(obj, { status });

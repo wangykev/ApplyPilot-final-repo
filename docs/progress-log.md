@@ -1118,3 +1118,997 @@ fields (it's a deterministic tier like buckets — the AI fallbacks stay require
   contradiction flag + agreement-silent + consent-unchanged, optional-checkbox No/Yes/pre-ticked, text
   silent-No/Yes-review/detail-request-bail/overwrite, textarea, optional-radio tier). Live-confirmation on
   Magna pending.
+
+## 2026-07-26 — Per-application LOGIN on the backend + a SUBMIT button on the Run page (branch `worktree-background-fill`)
+
+Two operator asks, plus a real safety bug the second one surfaced.
+
+### 1. Which account each application was filed with (`applications.login_*`, migration `0011`)
+
+Workday accounts are per-TENANT, so "what did I sign in as on this one?" is a real question weeks later when
+a recruiter replies — and after a create-account run the tracker row is the only record that the account
+exists at all. Until now the sign-in lived in exactly one place (`profiles.credentials_json`, one row for
+everything) and nothing tied an account to an application.
+
+**Migration `0011_application_login.sql`** — `applications` gains `login_email`, `login_tenant`, `login_host`,
+`login_created` (the account was CREATED on that run vs signed in to), `login_verified` (the email
+round-trip completed), `login_at`, plus a `(user_id, login_email)` index ("which applications went through
+this account?"). The PASSWORD is deliberately NOT copied per row — it lives once, on `credentials_json`;
+duplicating the same secret across rows buys nothing.
+
+**The extension is the source of truth** — it's the thing that actually signed in, so it records what it
+USED, not what the website separately has stored (the two can diverge if an edit never synced).
+`recordRunLogin({email,url,tenant,created,verified})` (background.js) writes `chrome.storage.local.lastRunLogin`
+the moment a run reaches the form, at BOTH onboarding call sites (the website `AP_RUN_APPLICATION` and the
+popup's `RUN_CDP_ONBOARD`, so a popup-driven fill is tracked too). `getRunLoginFor(bundleUrl)` then attaches
+it to `reportApplication`'s payload — **match-gated**: an exact `job_key` match, else a same-tenant match,
+else `null`. A stale record from a previous run against a different tenant must never be reported as this
+application's account: **no login beats a wrong login.** An empty email also yields `null` — that's a
+hand-signed-in run and there is nothing truthful to record.
+
+Both writers fill the same columns and agree: `POST /api/extension/report` maps `body.login` through
+`loginFields()`, and the website's `saveRunJob` takes the login straight out of the run response (the
+handlers now RETURN the recorded object) via `loginPatch()`. Both treat "no usable record" as `{}` — an
+older extension build or a hand-signed-in run never BLANKS a login already on file.
+
+**UI:** the tracker detail header renders `LoginLine` — "Signed in as `you+magna@…` on Magna" with
+`account created` / `email verified` badges and a link to the Sign-in page. Nothing renders when unknown,
+rather than implying an account we can't vouch for.
+
+### 2. A Submit button on `/app/run` (`AP_SUBMIT_APPLICATION`)
+
+The strict-replay SUBMIT pipeline has been live-verified in simulate since 2026-07-12, but it was reachable
+only from the popup's armed button on an already-open tab. Now the site drives the third stage the way it
+drives the first: paste the same job link → **Submit**.
+
+**`AP_SUBMIT_APPLICATION` (background.js)** — the SECOND external message that actuates, and the only one
+that can submit: pull the approved bundle for ONE job → pre-flight → open the posting in a fresh tab →
+`runCdpOnboard` (sign in, record the login) → `runCdpReplayWalk({authorize:true, simulateSubmit:!arm, jobKey})`
+→ strict per-field verify per page → review-page equality → `submitPrecondition` → submit ONCE.
+`arm:true` is the per-run token; WITHOUT it the run is a full DRY rehearsal — same code path end to end,
+logging "▶▶ WOULD CLICK SUBMIT ◀◀" instead of clicking. Always a FOREGROUND tab: the replay path uses
+trusted input (it has no synthetic-input fast path, unlike the fill), and an irreversible action should be
+watchable while it happens. `simulateSubmit:true` stays HARDCODED in the popup's `RUN_CDP_SUBMIT` — this
+handler adds a caller, it does not relax the existing gate.
+
+**`bundleSubmitBlockers(bundle)` (fill-driver.js, PURE)** — the BUNDLE-decidable half of the submit gate
+(a real bundle, an accepted schema, every flagged/revealed field approved, no unreplaced AI placeholder),
+EXTRACTED from `submitPrecondition` so there is ONE implementation and no lockstep dup. Two callers: the
+live gate folds it in (unchanged behavior, blocker order preserved), and the submit run uses it as a
+PRE-FLIGHT before opening a tab — so "3 fields still need approval" costs milliseconds instead of a full
+sign-in + replay. A named invariant test pins that every pre-flight blocker is ALSO reported by
+`submitPrecondition`: the pre-flight can never be laxer than the authority.
+
+**⚠ SAFETY BUG FIXED (found while wiring this).** `pullApprovedBundle` keyed the pull on the LOCAL bundle's
+url, and `GET /api/extension/review`'s no-match fallback is "the most-recently-updated application that HAS
+a bundle". A submit run for job B while storage held job A's fill would therefore have replayed **A's
+approved answers into B's form and submitted it** — the worst possible failure for this tool. Fixes, all
+three: `pullApprovedBundle(LOG, {jobKey})` targets by the run-stable `job_key`; the review route NEVER
+widens to the url/most-recent fallbacks when a `job_key` is given (no match ⇒ `bundle:null`); and the
+submit run REFUSES on no match instead of replaying whatever is in storage. `runCdpReplayWalk` takes
+`opts.jobKey` and threads it into its own re-pull, so the walk can't re-clobber the targeted bundle either.
+
+**Web (`RunPanel.tsx`)** — a "Submit this application" card beside the existing Run buttons: **Rehearse
+(no submit)** and **Submit** behind a two-step confirm ("Submit for real? This can't be undone." →
+Yes/Cancel), the pending confirmation dropped whenever the link is edited. `interpretSubmit` maps every
+outcome to plain language (`REPLAY_STOP` for the replay halts, which mostly mean "the form changed since
+you approved it — re-fill and re-approve"), and gate blockers render as a list instead of an opaque stop.
+`saveRunSubmit` (run/actions.ts) is the ONE place an application becomes `submitted` — the extension
+deliberately never reports that status ("the human submits"), and here the human authorized it on this page;
+a rehearsal writes no status at all, so it can never make an unsubmitted application look submitted.
+
+Verified: extension suite green (724 pass / 0 fail — +8: `bundleSubmitBlockers` approved/unapproved/
+cascade-revealed/empty/stale-schema/placeholder/soft-deleted + the never-laxer invariant); web
+`tsc --noEmit` clean, production build green, web tests 59/59. **Live-verification pending** (needs the
+operator's browser + Supabase: run migration `0011`, reload the extension, then Rehearse on an
+already-approved job before ever pressing Submit).
+
+## 2026-07-26 — Website URLs require `www` (the full canonical link) (branch `worktree-background-fill`)
+
+Fallout from a live LinkedIn card on `/app/teach`. The profile held `https://linkedin.com/in/wangykev`,
+the bucket filled it cleanly (`status:"filled"`, `flag:"bucket"`, `verified:true`) — and yet the field
+came back flagged on the review page with the `www.` form as its value. Nothing in the repo adds `www.`
+(the only match repo-wide is an SVG namespace), so the www came from the page/operator, and the two
+strings then fail EVERY equality tier we have:
+
+| check | result |
+|---|---|
+| `textValuesMatch` (M40 audit, fill-driver) | **false** — exact-match plus a PHONE-digit relief only, and `PHONE_SHAPE` excludes anything containing a letter, so URLs get nothing |
+| containment (`valuesAgree`, lib.js) | **no** — `www.` is inserted MID-string, so neither side contains the other |
+| fuzzy | **89** vs the 90 bar — missed by one point |
+| `reconcileReviewPage` | **DISAGREE** |
+| `submitPrecondition` | **BLOCKS** — `"1 review-page value(s) DISAGREE with the approved bundle"`, and the blocker doesn't even name the field |
+
+So a bare-host profile value doesn't just nag on review — it can refuse a submit outright. Operator's
+call: fix it at the SOURCE by storing the canonical link, rather than adding a URL relief to the
+comparators.
+
+**`ensureHttps` (lib.js) / `ensureHttpsUrl` (web/lib/profile-schema.ts) — LOCKSTEP.** Both now return
+scheme + `www.` on a bare apex host: `linkedin.com/in/x` → `https://www.linkedin.com/in/x`.
+
+**`www` goes on an APEX host ONLY** — this is the load-bearing restriction. `www.blog.example.com`
+generally does not resolve, and neither does `www.<personal-domain>` on much personal hosting, so
+blanket-prefixing would turn a WORKING profile link into a dead one — a worse failure than the mismatch
+being fixed. An apex is 2 labels (`linkedin.com`) or 3 whose last two match a public multi-part suffix
+(`/^(co|com|net|org|edu|gov|ac|gob|mil)\.[a-z]{2}$/` → `example.co.uk`). A host that already carries ANY
+subdomain (including `www.`), an IP host, or userinfo is returned UNTOUCHED. The output is spliced after
+the scheme rather than rebuilt via `URL.toString()`, which would also normalize the rest (appending a
+trailing `/` to a path-less URL); `URL` is used for the DECISION only, wrapped so it never throws.
+
+Idempotent by construction (an already-canonical URL returns byte-identical — no `www.www.`), which is
+what makes re-normalizing safe: it runs on schema PARSE and on editor blur, so a stored profile
+self-heals on its next save with no migration. Editor hint/placeholder/error updated to say "including
+www". CAVEAT recorded for the operator: `github.com` → `www.github.com` (redirects fine, but GitHub's
+canonical is bare), and a personal domain without a www record is the one case to eyeball.
+
+Verified: a cross-check script ran BOTH copies over 16 inputs (bare/scheme'd/already-www/subdomained/
+multi-part-TLD/IP/localhost/empty/whitespace) — byte-identical on every one. Extension suite **728/728**
+(+5 ensureHttps tests: canonicalization, idempotency, subdomain-never-www, multi-part suffix, IP +
+no-throw); web tests **62/62** (+3, existing website-URL expectations updated); typecheck + build green.
+Live-verification pending (re-save the profile, re-sync, confirm the LinkedIn field fills www and the
+audit stops flagging it).
+
+## 2026-07-27 — The false "SSO" halt: a hidden-tab render race, and waits that couldn't say why (branch `worktree-background-fill`)
+
+Operator report, Caterpillar wd5, BACKGROUND (hidden) run — intermittent, not reproducible on demand:
+
+```
+[ONBOARD] clicked "Apply Manually".
+[ONBOARD] waitFor(post-apply-manually) timed out after 20000ms
+[ONBOARD] Stage 3 — auth screen detected.
+[ONBOARD] waitFor(sign-in-form-render) timed out after 8000ms
+[CDP] detached from tab …
+```
+…and then, looking at the tab: the CREATE ACCOUNT page, fully rendered, "with everything". The run had
+reported **SSO** — "idk where that log even came from", and the operator's rule: *Workday will never be SSO.*
+
+**Root cause (reproduced in a unit harness, not inferred).** A chain of three:
+1. A hidden tab paints slowly. `waitFor(post-apply-manually)` burned its full 20s — then the very next
+   scan saw the auth screen. That timeout was itself the evidence the page needed >20s.
+2. Stage 3 fires on `hasAuthEl`, which is true via `createAccountSubmit`/`signInLink` — while
+   `emailInput`/`passwordInput` are still absent. So the flow entered the race-guard block, whose budget
+   is a flat **8s**. The widget hadn't painted its inputs in that window either.
+3. Fall-through to `looksLikeSso(st)` — whose second branch infers SSO from a MISSING email/password
+   field plus any "sign in"-texted clickable. Caterpillar's create-account view carries an "Already have
+   an account? **Sign In**" link → `signInButtonPresent` true → **SSO halt on an ordinary create-account
+   page.** Fed the real state into the pure function: `looksLikeSso(...) === true`. Confirmed.
+
+The operator sees a fully-rendered page afterwards because *looking at the tab foregrounds it* — the
+classic heisenbug shape for this class.
+
+**Fix 1 — field-absence is not SSO evidence on a Workday host.** `looksLikeSso` keeps the URL test
+(POSITIVE evidence: a real federated login LEAVES the Workday host for okta/ping/saml/…), and now returns
+false for the absence branch when `isWorkdayHost(url)` (new pure helper, exported). Unit-pinned both ways:
+a mid-render Workday page (careers host AND the logged-in `myworkdaysite` form host) is NOT sso; an
+Okta/Microsoft redirect still IS; a non-Workday host keeps the original inference unchanged.
+
+**Fix 2 — render budgets scale with visibility.** Both auth-render waits go through
+`renderBudget(visibleMs, hiddenMs)` (`cdpVisible`-gated): post-apply-manually 20s→**45s** hidden,
+sign-in-form-render 8s→**30s** hidden. VISIBLE keeps the tuned, live-verified values, so the foreground
+happy path is byte-identical. A genuinely fieldless auth screen (no create-account affordance either) now
+halts **`auth-form-not-rendered`** — "if you ran this in the background it's usually a slow repaint, run
+it in the foreground" — instead of blaming SSO. New `ONBOARD_STOP` copy on the Run page.
+
+**Fix 3 — the waits can now explain themselves** (the operator's actual ask: "put a log so if it happens
+again we can be sure"). Three different failures used to print one indistinguishable line:
+- `scan()` swallowed EVERY read error into `null` — a destroyed execution context mid-navigation, a
+  detach, a page exception and "not there yet" were the same thing. It now counts OK/failed reads and
+  keeps the last error text.
+- A `waitFor` timeout logs those read counts, the tab's REAL visibility (SW-side `cdpVisible`, not the
+  page's spoofed `visibilityState`), and `describeState(last)` — url · title · **readyState** (new field
+  on `cdpOnboardScan`: was the document still parsing?) · formFields · email/password/signInWithEmail/
+  signInButtonText/hasAuthEl · the list of present markers. It also returns the last SUCCESSFUL scan
+  rather than a possibly-null final attempt.
+- Every `needs_operator` halt in the auth stage now goes through `haltNeedsOperator`, which LOGS the
+  reason and that page state. They were silent returns, which is why the console just stopped at
+  "detached" with the reason visible only in the popup/website response.
+
+Had these existed, the original report would have read: *hidden tab, 16 reads OK / 0 failed, readyState
+complete, hasAuthEl true, email=false password=false, markers=[signInLink,createAccountSubmit]* — i.e.
+"the page is fine, the fields just aren't painted yet", not "SSO".
+
+Verified: extension **730/730** (+4 looksLikeSso regression tests); web typecheck + build green.
+⚠ **Unresolved flake:** one full-suite run in seven failed with a bare `ERR_ASSERTION (actual:false,
+expected:true)`; six consecutive re-runs were clean and the failing test name wasn't captured. Not
+introduced by this change (the only unit-tested surface touched is `looksLikeSso`, which is pure and
+deterministic) — recorded here so the next sighting can be tied to this one.
+Live-verification pending: re-run the Caterpillar job in the background and confirm it now signs in (or
+halts with a truthful reason + a state dump) instead of reporting SSO.
+
+## 2026-07-27 — Onboarding's cover-check re-measures (the phantom "covered by locations…" refusal)
+
+Second Caterpillar wd5 background-run report, same day, different symptom — and it worked on a re-run:
+
+```
+[ONBOARD] Stage 1 — clicking "Apply (job listing)".
+[ONBOARD] "Apply (job listing)" is covered by div.css-cygeeu "locationsSan Diego, California"
+          — refusing a blind click.
+[CDP] detached
+```
+
+**That "cover" is ordinary page content** — the job-details location block. It can't overlay the Apply
+button; it sits in the normal flow. So the coordinates were wrong, not the page.
+
+**Root cause: a STALE RECT after a reflow.** `clickTarget` (the onboarding click primitive — Apply /
+Apply Manually / the Sign In tab / the auth view-switch links) measured the button rect ONCE with
+`cdpRectReady`, then ran `cdpCoverCheck` at those coordinates, and re-checked at the SAME coordinates
+after any dismiss attempt. This is precisely the bug `clickPageNext` was fixed for on **2026-07-25**
+(a fill-revealed SMS-consent checkbox reflowed the footer downward → the old point hit a floating
+extension widget → halt blaming a phantom overlay). The fix was never ported to the onboarding path.
+
+The trigger here is hydration, not a fill: the run's own log shows the JD scrape returned **461 chars**
+(and a raw `XMLNAME …` title) where a healthy run on the same posting got **2913**. The page was still
+filling in; content above the Apply button grew; the button moved down; the measured point ended up
+inside the details panel. A hidden tab makes that window much wider — and re-running worked because the
+second load was warm.
+
+**Fix.** `clickTarget` now mirrors `clickPageNext`: a `probe()` that re-measures the rect AND re-runs the
+cover check together, looped up to **3 × 250ms** before any cover is believed (which also lets a real
+animating overlay settle), a FRESH probe after clicking a dismiss control (dismissing reflows the page
+too), and a refusal message that states the rect was re-measured — so a future refusal means a genuine
+overlay rather than a coordinate artifact. Standing rule added to CLAUDE.md: any new coordinate-click
+site must re-measure inside its cover loop.
+
+Verified: extension **730/730**, `node --check` clean. Live-verification pending (re-run the Caterpillar
+job in the background; Stage 1 should click through instead of refusing).
+
+**Noted, NOT fixed** (separate, non-blocking): the JD scrape can capture a partially-hydrated page (461 vs
+2913 chars), so the tracker's saved job description is occasionally truncated and the title keeps
+Workday's `XMLNAME` prefix. `AP_RUN_APPLICATION` waits `waitTabComplete` + a flat 1500ms hydration beat,
+which is not enough for a hidden tab. A settle-poll (wait for body-text length to stop growing, bounded)
+would fix both — deferred pending the operator's go-ahead since it adds latency to every run.
+
+## 2026-07-27 — Settle-poll the job posting before reading or clicking it (operator go-ahead)
+
+The deferred half of the previous entry, approved by the operator. The JD page is an SPA render: the tab
+reports "complete" when the DOCUMENT loads, but Workday keeps filling the posting in afterwards, and the
+old wait was a flat `setTimeout(1500)`. On a hidden tab that under-waits, with two observed costs:
+- the saved job description was TRUNCATED (**461 chars** of a posting that healthy runs read as **2913**),
+  and the role came out as Workday's raw slug `XMLNAME 2027 Gas Turbine …` because the real
+  `jobPostingHeader` hadn't rendered, so the URL-slug fallback won;
+- the still-growing page REFLOWED the Apply button out from under Stage 1's cover-check → the phantom
+  `covered by div.css-cygeeu "locationsSan Diego, California"` refusal.
+
+**`waitJobPageSettled(tabId, ceilingMs=12000, intervalMs=300)`** (background.js) polls the page via
+`chrome.scripting` (no debugger attach exists yet at this point in the run) for
+`{ len: body.innerText.length, hasPosting, readyState }`.
+
+**The accept rule is PURE and unit-pinned — `jobPageSettleStep(read, state)` (lib.js)**, folded over the
+reads, mirroring the fill's settle-poll discipline (two CONSECUTIVE EQUAL, non-empty reads — never a
+fixed sleep). The twist over a plain byte-count settle: a stable count is only TRUSTWORTHY once the
+posting's own content (`jobPostingDescription` / `jobPostingHeader`) is present. Without it the rule
+demands 3 repeats, because a page can PAUSE mid-hydration and hold a partial count — exactly the 461-char
+observation, which a naive "two equal reads" would have accepted immediately. 5 tests pin it: warm load
+(settles on read 3), the 461 stall (never accepted on one repeat), stall-then-render (settles once the
+real content lands), an unrecognized-marker page (still settles at 3 repeats — never block forever), and
+empty/unreadable reads (never settle).
+
+Properties worth keeping: it EXITS EARLY on a warm load (~2 polls ≈ 600ms), so the common case is now
+FASTER than the 1500ms beat it replaced; it is best-effort — a read failure or the ceiling proceeds
+anyway, since the scrape and the onboarding scan are each independently guarded, so a too-early return
+costs a retry and never a wrong action; and it logs what it decided (`SETTLED after Nms — C chars,
+posting content present`), so a future partial scrape is self-evident in the console.
+
+Wired into BOTH `AP_RUN_APPLICATION` and `AP_SUBMIT_APPLICATION` — the submit run doesn't scrape a JD, but
+it clicks the same Apply button through the same cover-check. Also: `scrapeJobDescription` strips the
+`XMLNAME` prefix Workday puts on a slug whose title starts with a digit, so that artifact can't reach the
+tracker as the role name even if the header fallback is ever used again.
+
+Verified: extension **735/735** (+5). Live-verification pending — re-run the Caterpillar job in the
+background and confirm the log reports a settled page with the full character count.
+
+## 2026-07-27 — The REPLAY adapts to Workday's phantom duplicate-entry error (deterministic, no AI)
+
+Live replay on solarturbines (Caterpillar family), page 2:
+
+```
+[CDP-REPLAY-WALK] page 2 replay: 31 field(s) — 8 changed, 21 already-correct, 0 FAILED.
+[CDP-REPLAY-WALK] page 2 Save & Continue: {"clicked":true}
+[CDP-REPLAY-WALK]   re-click fallback: error text present — NOT re-clicking (a real validation block…)
+[CDP-REPLAY-WALK] page errors (1):
+[CDP-REPLAY-WALK]     • Error-URLYou can't add duplicate website URLs.
+[CDP-REPLAY-WALK] ⚠ page 2 did NOT advance … HALT
+```
+
+**This is not our bug and not a real duplicate.** The replay filled correctly (0 FAILED) and the page
+shows three DISTINCT URLs. Operator's diagnosis: *"the workday backend is flaky … sometimes it will
+append instead of replace, making it seem like there are duplicates. On the actual page there is no
+duplicates, but workday gives us an error saying there are."* So the duplicate exists only in Workday's
+STORED copy, and the form is clean.
+
+**What Workday accepts is deleting the VISIBLE rows** — its retained copy then satisfies the section,
+which is why the values still show on the REVIEW page afterwards. Operator's requirement, both halves:
+delete the fake duplicates, **and** make sure the websites are still there at review as if we hadn't.
+
+**`clearPhantomDuplicates(act, results, errorSamples, LOG)`** (background.js), wired into the replay
+walk's nav-timeout branch as the ONE remediation a replay performs (it still runs NO AI-4). It reuses the
+existing PURE plan from the fill walk's Tier 0 rather than inventing a second rule:
+`isDuplicateWebsiteError` / `isDuplicateLanguageError` → `websiteDeletionPlan` / `languageDeletionPlan`,
+where a REAL duplicate (two rows sharing a value) deletes only the later occurrence(s) and all-distinct
+rows are the PHANTOM case. For PHANTOM it clears every **LIVE** row (driven by `act.entryCount`, not the
+results' indices, which can lag the DOM after a re-render). Then it re-clicks Save & Continue and the
+walk continues. **Bounded at 2 per RUN** — a duplicate error that survives the fix is a real problem, not
+something to retry.
+
+**The retention premise is CHECKED, not assumed.** The deleted values remain in the approved bundle, so
+`reconcileReviewPage` at the review page already compares them against what Workday displays, and a value
+that did NOT come back lands in `missing_on_review` — which `submitPrecondition` treats as a HARD blocker.
+Added on top: the walk records what it deleted (`phantomDeleted`) and ATTRIBUTES the outcome at review —
+either `✓ phantom-duplicate check: all N deleted website value(s) are present on the review page` or a
+loud `⛔ … did NOT come back … submitting would file this application WITHOUT them`. So the safety
+property is "we never submit an application whose websites Workday silently dropped", enforced by the
+existing gate rather than by trust.
+
+**Refactor (no behavior change):** the row-delete loop (highest-index-first, count-polled, stop on
+no-progress) was duplicated in both Tier-0 blocks; it is now `deleteEntriesByIndex(act, prefix, indices)`
+— ONE implementation shared by the fill walk's language + website tiers and the new replay path, so they
+can't drift. The Tier-0 blocks keep their own logging and record-merging, so the fill walk's observable
+behavior is byte-identical.
+
+Verified: extension **735/735** (the existing dup-plan tests cover the pure decision layer and still
+pass through the refactor); the live error string from the log was fed to `isDuplicateWebsiteError` →
+true, and the three distinct live rows → `{mode:"phantom", deleteIndices:[0,1,2]}`, i.e. clear the
+section. `clearPhantomDuplicates` / `deleteEntriesByIndex` live in background.js, which the node test
+runner can't require (SW `importScripts`), so they carry no direct unit test — the decision layer they
+call is pure and pinned, and the delete loop is the fill walk's live-verified one.
+Live-verification pending: re-run the replay and confirm page 2 advances after the fix, then that the
+review page shows the websites (the `✓ phantom-duplicate check` line).
+
+## 2026-07-27 — Phantom duplicate-entry fix generalized to ALL repeating sections, both walks
+
+Follow-on to the entry above, per the operator: *"make the duplicate fix for all repeating sections
+during the run and the review … during the fill, if you deleted the section, make it show as filled on
+the review page … for the review, if it is depleted, make sure it shows back on the workday review page."*
+
+Three changes.
+
+**1. EVERY repeating section, in BOTH walks.** The remediation was two hardcoded tiers (language-only,
+website-only) in the fill walk plus the replay hook added earlier. It is now ONE function,
+`clearPhantomDuplicates`, called by the fill walk as AI-4 **Tier 0** and by the replay walk as its only
+remediation. New PURE helpers in lib.js, unit-pinned:
+- `duplicateErrorSection(errorTexts)` — routes a "duplicate…" error to a section by wording
+  (website / language / education / workExperience / certification), and claims NOTHING for a
+  non-duplicate error or a duplicate naming no section we model (pinned both ways — a plain
+  "The field School is required" must never authorize deleting a section).
+- `sectionEntriesFromResults(results, section)` + `sectionDeletionPlan(entries)` — the generic of the
+  website/language pair, keying a row on the **composite signature of all its fields**, because most
+  sections aren't identified by one value (a work-experience row is title+company+dates). website and
+  language keep their bespoke, value-aware helpers (live-verified); everything else uses the generic.
+Real-vs-phantom is unchanged: identical rows ⇒ delete the later occurrence(s); all-distinct ⇒ PHANTOM,
+clear every LIVE row (`entryCount`-driven, since the results' indices can lag the DOM).
+
+**2. Deleted rows now stay FILLED in the review summary.** This was a real gap: Tier 0 deletes the rows,
+then the pre-advance `reconPageTruth` marks anything no longer on the page `status:"removed"` → "dropped
+from review" → `repersistPageBundle` writes a bundle with the whole section MISSING. So the operator's
+review page lost a section that is still on the submitted application. `markPhantomKept` now flags those
+records `phantomKept` (+ annotates the detail with why they're absent from the form), and
+`reconPageTruth` SKIPS flagged records in its removal sweep. Status stays `filled` deliberately — the
+operator asked for them to read "as if we did not delete it".
+
+**3. The retention premise is verified at Workday's review page.** Unchanged in mechanism from the
+previous entry, now covering any section: the values stay in the approved bundle, so
+`reconcileReviewPage` compares them against what Workday displays and a value that did not come back is
+`missing_on_review` → a HARD `submitPrecondition` blocker, with the replay walk attributing it in the log
+(`⛔ the … value(s) we deleted … did NOT come back`) so a blocked submit names its cause.
+
+Also folded in: the row-delete loop existed twice (both Tier-0 blocks) and now has a third caller, so it
+is `deleteEntriesByIndex(act, prefix, indices)` — one implementation, highest-index-first, count-polled,
+stops on no-progress.
+
+Verified: extension **740/740** (+5 pure tests: per-section error routing, the two negative cases,
+composite-signature entries, real-vs-phantom, empty-section). `clearPhantomDuplicates` /
+`markPhantomKept` / `deleteEntriesByIndex` live in background.js (not requireable by the node runner —
+SW `importScripts`), so they carry no direct unit test; the decision layer they call is pure and pinned.
+Live-verification pending: a replay that trips the duplicate error should log `⟳ Workday rejected Save &
+Continue with a duplicate-… error`, advance, keep the section visible+filled in the review summary, and
+finish with `✓ phantom-duplicate check: all N deleted … value(s) are present on the review page`.
+
+## 2026-07-27 — Workday's EMPTY page after a sign-in submit: reload instead of halting
+
+The new wait-diagnostics earned their keep on the first submit rehearsal. Full evidence, from one run:
+
+```
+[ONBOARD] clicked "Sign In submit".
+[ONBOARD] waitFor(Sign In submit outcome) timed out after 500ms — 8 read(s) OK / 0 failed; tab VISIBLE.
+[ONBOARD]   last page state: … title="Sign In" · readyState=complete · formFields=2 · email=true ·
+            password=true · hasAuthEl=true · markers=[applyFlowPage,createAccountLink,formField,signInSubmit]
+[ONBOARD] Sign In submit: no outcome after 500ms and the form is still up — re-clicking…
+[ONBOARD] clicked "Sign In submit (retry 1)".
+[ONBOARD] waitFor(Sign In submit outcome) timed out after 6000ms — 94 read(s) OK / 0 failed; tab VISIBLE.
+[ONBOARD]   last page state: … title="Create Account" · readyState=complete · formFields=0 · email=false ·
+            password=false · hasAuthEl=false · markers=[none]
+[ONBOARD] sign-in outcome: unknown.
+[ONBOARD] ⛔ HALT (needs operator) — auth-unknown: Create Account — Skip to main content This site uses…
+```
+
+Note what the state dumps establish, which the old one-line timeout could not: **94 reads succeeded, 0
+failed** — the extension was reading the page perfectly. The page itself was EMPTY: fully loaded, zero
+form fields, zero auth chrome, no markers at all, body text nothing but the cookie banner, under a stale
+"Create Account" title. Nothing to classify (`classifyAuthOutcome` → `unknown`), nothing to act on.
+Operator: *"the solution is to just refresh the page."*
+
+**`isBlankAuthPage(state)` (lib.js, PURE, unit-pinned)** detects exactly that shape, and `doAuth` now
+RELOADS + re-enters the auth loop instead of halting — bounded at 2 (`MAX_BLANK_RELOADS`), after which it
+halts `blank-page-after-signin` ("Workday kept returning an EMPTY page … refresh the tab and re-run"),
+with matching Run-page copy.
+
+**Strictness is the whole design**, because what this authorizes is a page reload: it requires
+`readyState === "complete"` (so it can never fire mid-navigation, where absence proves nothing) AND every
+actionable marker absent — any form field, any auth control (email/password/submit/links/verifyPassword),
+any apply-chain button, the already-applied marker, or more than ~700 chars of body text disqualifies it.
+A scan lacking `readyState` (an older build) fails closed. Pinned with the live state as the positive
+case plus seven near-misses, including the live sign-in form captured one step earlier in this very log.
+It sits BEFORE the breach-dialog branch (which requires `signInSubmit` present — mutually exclusive with
+a blank page) and before the `auth-unknown` halt, so no working path changes.
+
+**Correlation recorded, not acted on:** the blank page appeared after the **500ms fast re-click** of Sign
+In. The first click was almost certainly in flight rather than swallowed — at 500ms the form was still up,
+which is what `submitAndWait`'s `formStillUp` guard reads as "re-click". Double-submitting Workday's
+sign-in is a plausible way to reach a broken shell. The tuned 500ms tier is deliberate (2026-07-22: a flat
+500ms pre-click was too slow on the happy path), so it was left alone; if this recurs, lengthening that
+first Sign-In tier is the next lever, and the reload recovery makes it non-fatal meanwhile.
+
+Verified: extension **743/743** (+3), web typecheck clean. Live-verification pending — the next
+occurrence should log the reload and continue instead of halting.
+
+## 2026-07-27 — The REPLAY walk reloads on Workday's soft-error page (and stops blaming the bundle)
+
+Live, on a **Rehearse (no submit)** run:
+
+```
+[CDP-REPLAY-WALK] ⚠ ARMED REPLAY WALK (authorize=true) — replaying the 63 approved field(s)…
+[CDP-REPLAY-WALK] ──── REPLAY PAGE 1 ────
+[CDP-REPLAY-WALK] ⚠ page 1: NO matching page in the approved bundle (live flat fields: none;
+                  repeating: none). The bundle never captured this page — HALT.
+```
+
+The tab was on Workday's transient **"Something went wrong / please refresh"** page. The FILL walk has
+reloaded past that since 2026-07-22 (`softErrorPresent`, checked at the top of each page and again after
+the fill, → `reloadAndSettle` + restart from page 1). The REPLAY walk never got that guard.
+
+The resulting message was worse than a bare failure: the error page has no form, so `liveNames` and the
+repeating scan both came back empty, `selectPageBundleEntries` matched nothing, and the walk concluded
+**"The bundle never captured this page"** — pointing the operator at a 63-field approved bundle that was
+entirely fine, for a Workday hiccup a refresh clears.
+
+**Two fixes.**
+
+1. **Soft-error parity.** `runCdpReplayWalk` now checks `nav.softErrorPresent` at the TOP of each page
+   (before the no-form / no-match paths can misread it) and `navAfter.softErrorPresent` after each page's
+   replay — the same two spots, in the same order, as the fill walk. Each reloads via `reloadAndSettle`
+   and `continue restartWalk`; a reload returns Workday to page 1, so the whole replay restarts, and
+   skip-if-correct makes the already-correct pages cheap on the way back. Bounded by
+   `MAX_REPLAY_SOFT_RELOADS` (3/run, mirroring the fill walk's `MAX_SOFT_RELOADS`), after which it halts
+   `workday-soft-error` with a needs-operator message instead of looping.
+
+2. **An EMPTY page is never blamed on the bundle.** Before the "not in the approved bundle" halt, the
+   walk now asks whether the page has ANY flat fields or repeating sections at all. None of either means
+   there is nothing on screen to match — a hiccup, a page still rendering, an error shell — which is a
+   PAGE problem, not a coverage gap. It reloads + restarts on the same budget, then halts
+   **`replay-page-empty`**: *"The approved bundle is fine; the PAGE never rendered."* The
+   `replay-page-not-in-bundle` halt now only fires when the page genuinely HAS fields that the bundle
+   doesn't cover — which is what that message always claimed.
+
+Run-page copy added for both new stops (`workday-soft-error`, `replay-page-empty`).
+
+Verified: extension **743/743**, web typecheck clean. Live-verification pending — re-run the Rehearse; a
+soft-error page should now log the reload + restart rather than halting on page 1.
+
+## 2026-07-27 — Why the phantom-duplicate fix deleted 0/2, and the rebuild on the real walk's mechanism
+
+The fix fired correctly on a live Rehearse and then did nothing:
+
+```
+[CDP-REPLAY-WALK] ⟳ Workday rejected Save & Continue with a duplicate-website error, but the page shows
+                  no duplicates (phantom) … Deleting 2 visible row(s): [linkedin, github]
+[CDP-REPLAY-WALK]    deleted 0/2 website row(s).
+[CDP-REPLAY-WALK] ⚠ page 2 did NOT advance (nav-timeout, real error present) — HALT
+```
+
+**Root cause: a hardcoded fkit prefix.** The section registry pinned websites to `webAddress-`, so the
+loop opened with `act.entryCount("webAddress-")`, got 0, and broke on its first iteration. The plan had
+been computed from the RESULTS (2 rows), so the log promised 2 deletions and delivered none. Worse, the
+loop's three exits — no rows, no Delete button, count didn't drop — were indistinguishable from outside,
+so "deleted 0/2" carried no diagnosis at all. (My own instrumentation gap; the same one this session has
+now fixed twice elsewhere.)
+
+**Rebuilt on the live page + the real walk's mechanism** (operator: *"you can see how the real walk
+deletes. and use the same mechanism."*):
+- **`findLiveSection(rscan, name, cfg)` (lib.js, PURE)** — `cdpRepeatingScan` already DISCOVERS the
+  prefixes present in the DOM (it derives them from `<base>-<N>--null`), so the prefix is never assumed:
+  canonical `containerPrefix` → a prefix starting with the section NAME → the section's HEADING regex
+  (the anchor `findSectionAdd` uses, and the most tenant-proof). Returns null when the section genuinely
+  isn't there — a failed scan is not a licence to delete.
+- **`liveDupEntries(rows, keyField)` (lib.js, PURE)** — dedupe entries built from the LIVE rows rather
+  than from results, so anything Workday added behind our back is included; each carries the row's
+  `deletePresent`. `keyField` is the section's identity value where it has one (website→url,
+  language→language, matching their tuned semantics), else the whole row's signature; a row missing that
+  field falls back to the whole-row key rather than producing an empty one.
+- **`deleteRepeatingRows`** replaces the bespoke loop with the shapes the fill walk already proves:
+  **clear-to-N** is `driveRepeatingSectionCdp`'s reconcile-down — delete `count - 1`, RE-POLL the count,
+  repeat — which cannot be derailed by a stale index; **targeted** mirrors remediation's Tier-1.5
+  index delete (highest-first). Both poll via `pollEntryCount` on the section-reconcile budgets and stop
+  on no-progress, capped at 10.
+- **Honesty:** every exit logs its reason (`no-rows:<prefix>` / `no-delete-button@<i>` /
+  `count-did-not-drop@<i>`), and a 0-row delete returns `ran:false` — the fix never claims success it
+  didn't achieve, so the walk halts visibly rather than continuing on a false premise. It also logs how
+  many live rows lack a Delete control, which is the next thing to know if this recurs.
+
+Verified: extension **750/750** (+7 pure tests covering exactly the regression — canonical prefix,
+section-name fallback, heading fallback, absent-section null, live keying, missing-key-field fallback,
+and real-vs-phantom on live rows). Live-verification pending: the next duplicate error should log the
+resolved live prefix and a non-zero delete, or say precisely why not.
+
+## 2026-07-27 — Page-5 replay: the silently-dropped approved field, and the missing required-blank guard
+
+The phantom-duplicate fix worked live (pages 2–4 advanced: *"deleted 2/2 website row(s) … ✓ page 2 →
+advanced"*). Page 5 then exposed three separate things. Two are fixed here; the third is a design
+question answered in the response, not built.
+
+### 1. An approved field was replayed into thin air (FIXED)
+
+```
+page 5 → matched approved page … (4 flat-field overlap; 5 approved entries).
+page 5 replay: 4 field(s) — 1 changed, 1 already-correct, 0 FAILED.
+  • Error-Please check one of the boxes below:The field … is required and must have a value.
+```
+
+**5 approved entries, 4 replayed.** `replayFlatFields` had `if (!present.has(fname)) continue;` — an
+approved entry whose field name isn't in the live page scan was dropped **silently**: no record, no log,
+and `0 FAILED`. The operator had answered "Please check one of the boxes below" and the run neither
+filled it nor said it hadn't. (`checkbox_group` IS supported by `replayField`, so the widget wasn't the
+problem — the entry never reached it.)
+
+It now emits a real record: `status:"needs_review"`, `flag:"replay-field-absent"`, with the field name
+AND a sample of the live field names. Two consequences: the walk's strict per-field verify HALTS on it
+(instead of continuing toward a submit missing an approved answer), and the log immediately distinguishes
+"the field is genuinely absent" from "its automation-id differs from the one recorded at fill time" —
+which is the recon the operator asked for, delivered at the moment of failure rather than as a separate
+run. The pre-existing test asserting the silent-drop contract was updated; repeating + file_upload
+entries still skip silently (each has its own dedicated replay step).
+
+### 2. "Can I blank a mandatory field and still submit?" — you could. Now you can't. (FIXED)
+
+Checked rather than assumed, and the answer was **no guard existed**:
+- the extension viewer refuses to APPROVE a required-empty field (`canApprove` in summary.js) — but that
+  is UI-only, and the **website port dropped it**;
+- `approvalEnvelope.submit_ready` (both copies) only ever required *all flagged approved + no AI
+  placeholder*; a required-but-blank field satisfied it;
+- `bundleSubmitBlockers` / `submitPrecondition` never encoded it either.
+
+The only thing catching it was Workday's own validation — i.e. exactly the page-5 nav-timeout halt.
+Now it's a first-class blocker in `bundleSubmitBlockers` (so both the website submit run's PRE-FLIGHT and
+the live gate refuse, naming the offending fields), and `required_blank` joins the approval envelope in
+BOTH `web/lib/review-approval.ts` and `summary-lib.js` so `submit_ready` goes false and the site's Submit
+button disables. **Conservative by construction:** an unchecked checkbox stores `"false"` (not empty) so
+it's never mis-flagged, `file_upload` is excluded (own re-attach + `resume-not-attached` halt), stub rows
+are display-only, and preferred-name fields are `is_required:false` so a hidden one can't trip it.
+
+### 3. Cascade-revealed REQUIRED fields (not built — see the response)
+
+Filling an optional Name field promoted "Date" and the checkbox group to required. Those weren't in the
+approved bundle, so the replay had nothing to put there and Workday refused the page. The machinery for
+the answer already exists (`cascade_revealed`, the `refill` mode, the report-to-website path); the
+proposal is to capture newly-required-but-unapproved fields into the bundle, push them to the review
+page, and halt asking for approval — rather than halt blind.
+
+Verified: extension **753/753** (+4), web tests 62/62, typecheck + build green.
+
+## 2026-07-27 — Cascade-revealed required fields go back to REVIEW (and the two invisible replay outcomes)
+
+Built after re-deriving the page-5 diagnosis, which my previous entry got partly wrong.
+
+**The corrected reading.** From the live log — `page 5 replay: 4 field(s) — 1 changed, 1 already-correct,
+0 FAILED` against `5 approved entries` — the counters (`changed`=filled, `kept`=already-correct,
+`failed`=needs_review/error) leave **2 results unaccounted: status `skipped`**, and **1 entry that never
+produced a result at all**. So THREE approved entries went unfilled through TWO invisible mechanisms, and
+the previous entry only closed one of them:
+1. `!present.has(fname) → continue` — vanished before `replayField` (closed previously).
+2. `replayField`'s `cleared` branch — `value == null || value === ""` → `skipped`, counted by nothing.
+
+Mechanism 2 is almost certainly what happened to the operator's checkbox group, and it reframes the whole
+page-5 report: **the checkbox group and Date were both OPTIONAL and BLANK when the page was reviewed.**
+The fill was correct — there was nothing to record. Filling the optional Name at replay time promoted
+both to REQUIRED, and Workday refused a page whose approved bundle legitimately had blanks. The
+"cascade" issue and the "checkbox didn't fill" issue are one root cause.
+
+**1. Cascade-revealed required → a review question.** On a replay nav-timeout (after the phantom-dup
+attempt), a fresh scan feeds **`newlyRequiredGaps(liveFields, bundleEntries, pageKey, errorTitles)`**
+(lib.js, PURE): every live field that is `isRequired`, holds no value, and whose bundle entry is MISSING
+**or BLANK** is a gap. Each becomes a **`cascadeEntryFor`** entry — empty, unapproved, `needs_review`,
+`cascade_revealed`, with the live options attached (a checkbox group carries its labels in the DOM, so the
+review page renders a real picker instead of a bare text box) and a detail explaining *why* it is suddenly
+required. They're merged into the bundle (upgrading a blank entry in place rather than duplicating),
+persisted, pushed via `reportApplication`, and the walk halts **`replay-needs-approval`** listing the
+questions. The Run page renders them as the blocker list.
+
+It never invents an answer: every entry is empty and unapproved, so the new required-blank rule and the
+unapproved-flagged rule in `bundleSubmitBlockers` both keep refusing until a human answers. Excluded:
+`file_upload` (own re-attach + `resume-not-attached` halt), and a required field the page ALREADY holds a
+value for — that's a replay failure, owned by the strict per-field verify.
+
+**2. `skipped` is no longer invisible.** The per-page line gained a `not-actuated` count, and skipped
+entries are listed by name with their reason (`cleared`, `replay-deleted`, …). That single line would
+have made the page-5 diagnosis immediate.
+
+Verified: extension **759/759** (+6 pure tests: both gap shapes, page-already-has-a-value, optional-blank,
+bundle-has-an-answer, file_upload carve-out, and that `cascadeEntryFor` yields an empty unapproved entry
+with real checkbox options), web 62/62, typecheck + build green. Live-verification pending: re-run the
+Rehearse — page 5 should now stop with "A few new questions need your answer", listing Date and the
+checkbox group, with both answerable on the Tracker.
+
+## 2026-07-27 — Two false halts from my own changes: the mid-cascade replay, and halting on success
+
+Both surfaced immediately in live runs, and both are cases where the code stopped on a page that was
+actually fine. The new state-dump logging is what made each obvious in one read.
+
+### A. Replay halted mid-cascade (a regression from the absent-field record)
+
+```
+⚠ Workday soft-error at replay page 1 — reloading + restarting (soft-reload 1/3).   ← the new fix, working
+page 1 → matched approved page … (1 flat-field overlap; 15 approved entries)
+page 1 replay: 15 field(s) — 1 changed, 0 already-correct, 0 not-actuated, 14 FAILED.
+    • legalName--firstName … no field named "legalName--firstName" on this page (live: country)
+    …13 more
+```
+
+`live: country` — after the soft-error reload the page had rendered ONLY the Country field. Workday page 1
+mounts address / region / postal / phone **after Country commits** (the documented M1 cascade). The
+previous entry's `replay-field-absent` record then fired on all 14 and turned a mid-cascade page into a
+hard `replay-mismatch` halt. Before that record existed these were silently skipped, so this halt was
+introduced by that change.
+
+Two fixes: **(1) cascade re-replay** — after `replayFlatFields`, re-scan (bounded, 2 rounds) and replay
+whatever has since mounted, replacing the provisional absent verdicts with real ones; the fill walk has
+had this cascade re-scan for a long time, the replay side simply never did. **(2) severity split** — an
+absent field HALTS only when it is REQUIRED; an OPTIONAL one is `skipped` + logged (a phone extension, a
+cascade that never fired, is nothing to do and must not fail a submit).
+
+### B. Onboarding halted on the page it wanted
+
+```
+the page came back EMPTY after the sign-in submit … Reloading (1/2) and retrying   ← the new fix, working
+waitFor(sign-in-form-render) timed out after 8000ms — 123 read(s) OK / 0 failed; tab VISIBLE.
+    last page state: … readyState=complete · formFields=14 · hasAuthEl=false · markers=[applyFlowPage,formField]
+⛔ HALT — auth-form-not-rendered
+```
+
+`formFields=14 · hasAuthEl=false` **is the application form** — `isPastAuth` by definition. The sign-in
+had succeeded and the reload landed on the form; the flow halted anyway because
+`waitFor(sign-in-form-render)` polls only for `passwordInput || emailInput || signInWithEmail`. The form
+appeared INSIDE the 8s window, so the budget was never the problem (the operator's read — "it didn't let
+the page load before giving up" — was close, but the wait wasn't looking for the right thing).
+
+`isPastAuth(s)` is now part of that predicate, of the chooser-reveal predicate, and of a new
+`post-blank-reload` wait (the blank-page recovery previously took a single early scan, which reads an
+empty document a beat too soon and sends the loop hunting for sign-in fields that will never come). Each
+wait is followed by `isPastAuth ⇒ continue`, so the loop top returns `reached_form`, and the
+`auth-form-not-rendered` halt re-checks it before firing.
+
+Verified: extension **760/760** (+1: absent-required halts / absent-optional doesn't). Live-verification
+pending on both.
+
+## 2026-07-27 — Audit: every wait predicate in the onboarding flow
+
+Three bugs in one day shared one shape — *a wait polls for one specific thing and misses that the goal was
+already reached, or that it can never be reached* — so all 10 `waitFor` call sites in `runCdpOnboard` were
+audited against both halves.
+
+**(1) Does it accept the GOAL STATE?** A wait for sign-in fields must also accept "we're already past
+auth", because the sign-in can land mid-wait.
+
+| wait | verdict |
+|---|---|
+| `sign-in-form-render` | **was missing** → fixed (halted `auth-form-not-rendered` on a page showing the form) |
+| `email-sign-in-form` (chooser) | **was missing** → fixed |
+| `post-blank-reload` | added with the fix; also upgraded from a single early scan to a real wait |
+| `switchAuthView` view wait | **was missing** → fixed. A signed-in page can never "switch views", so it waited the full 8s and then logged "the auth widget did not switch" about a page we were past |
+| `Sign In submit outcome`, `post-breach-dismiss outcome` | OK — `classifyAuthOutcome` returns `success` on form-present + no-auth-chrome |
+| `post-activation sign-in page`, `post-apply`, `post-apply-manually`, `auth-or-form` | OK — each already accepts `formFieldCount > 0` |
+
+**(2) Does it bail on a TERMINAL state?** None of them did. Every predicate waits for a page to BECOME
+something; on an already-applied or maintenance page it never will, so each wait burned its full budget in
+turn — an already-applied posting cost **20s (post-apply) + 45s (post-apply-manually) + 12s
+(auth-or-form)** before the flow reached a state it detects instantly. Fixed once, centrally: `waitFor`
+now exits early on `isAlreadyApplied` / `isWorkdayMaintenance`, logging why and returning a `terminal`
+field. Callers then reach their proper clean halts immediately.
+
+**Bonus finding (a real wrong-halt).** `doAuth`'s loop top checks `classifyAuthOutcome` and `isPastAuth`
+but **never `isAlreadyApplied`** — it's checked at the initial scan, at the start of Stage 3, and after a
+successful sign-in, but not inside the loop. An already-applied page reached during the loop therefore
+fell through to the race-guard and halted `auth-form-not-rendered`, because its shape (no form, no auth
+chrome, no credential fields) is precisely what that halt tests for. Now it returns the clean
+`already-applied` result; the halt itself also re-checks before firing.
+
+**Left alone, deliberately:** `cdpWaitNextPage` (the walk's transition detector) already checks
+maintenance then session-death before anything else. It does NOT early-exit on a soft-error page — that
+costs one wasted timeout, after which the caller's own `softErrorPresent` check handles it. It is the most
+load-bearing wait in the system and the payoff didn't justify touching it. `settlePage` is a generic
+readyState settle with nothing to add, and the injected page-engine's `waitFor(selector)` is a different,
+DOM-level contract (out of scope).
+
+Verified: extension **760/760**, web typecheck clean.
+
+## 2026-07-27 — Cascade review polish: the date editor, and "BECAME REQUIRED" ≠ "REVEALED"
+
+The cascade handler worked end-to-end on the first live run — page 5 replayed, hit the duplicate-free
+`Error-Date The field Date is required`, captured the field, pushed it to the site
+(`application reported — 200 (needs_review, 3 need review)`) and halted `replay-needs-approval`. Two
+presentation defects in what the operator then saw.
+
+**1. The date field rendered as its own plumbing.** The review card showed
+`dateSectionMonth-display / dateSectionMonth-input / dateSectionDay-display / …` where the value editor
+should be. `cascadeEntryFor` passed the scan's RAW segment automation-ids through as `date_order`, but
+the viewer expects the form's segment ORDER — `["month","day","year"]` — to render a segmented MM/DD/YYYY
+editor. The fill path has always converted via `dateOrderOf`; the new cascade path didn't. `dateOrderOf`
+moved into lib.js (fill-driver keeps a one-line alias, so all its existing call sites are untouched) and
+`cascadeEntryFor` now uses it, only for `date`/`year` widgets. Pinned: full M/D/Y, a month-year composite,
+and a non-date field (null).
+
+**2. "⤴ REVEALED" was the wrong words.** Operator: *"It also says revealed. instead can you make a
+different flag like became required."* Correct — the two are different news. `⤴ REVEALED` describes a
+field that merely appeared after another value committed; this one is a question the form is now
+DEMANDING an answer to, and the operator needs to know which. New predicate **`isBecameRequired`**
+(`cascade_revealed && flag === "cascade-required"`) renders **`✱ BECAME REQUIRED`** with an explanatory
+tooltip, checked BEFORE the generic revealed badge so exactly one shows. Added in lockstep across all
+four copies that carry `isCascadeRevealed`: `review-model.ts` (what ReviewEditor imports),
+`review-approval.ts`, `summary-lib.js`, and `summary.js`'s badge row.
+
+Both entries stay `cascade_revealed`, so `requiresApproval` and the submit gate are unchanged — this is
+purely what the human is told.
+
+Verified: extension **761/761** (+1), web 62/62, typecheck + build green.
+
+## 2026-07-28 — New review items on top; date questions never teach
+
+Two operator asks once the cascade-back-to-review flow was working.
+
+**1. NEW review items sort to the TOP.** A question sent back by a submit run is the whole reason the
+operator reopened the review page, but the list was in form order, so it appeared among fields that were
+already approved once — the easiest place to miss it. `reviewPriority` + `orderForReview`
+(`web/lib/review-model.ts`, PURE) now tier the "Needs review" list: **0** became-required (a question the
+form now demands — nothing to verify, something to ANSWER) → **1** otherwise cascade-revealed → **2**
+super-hard (forced / low-confidence AI on a sensitive field) → **3** must-replace → **4** everything else.
+The sort is STABLE, so form order still decides inside a tier and two new items keep their relative order;
+the pre-existing loudness ordering is preserved beneath the new tiers rather than replaced.
+`ReviewEditor`'s three-way `flagged` filter collapses to one `orderForReview` call.
+
+**2. A date question is never a teach card.** Operator: *"don't put any questions that are just date into
+teach."* Right — a signature/acknowledgement date is per-APPLICATION, so remembering it would teach a
+bucket to fill a STALE date on every future form: actively worse than not learning it.
+`isDateOnlyQuestion(label, widget)` (`web/lib/teach.ts`) excludes the `date`/`year` WIDGETS — which can't
+be bucket-filled at all today, so such a card is unanswerable, and this keeps it excluded if `date` is
+ever added to `BUCKET_ELIGIBLE` — plus bare date asks by LABEL ("Date", "Date*", "Date:", "Today's Date",
+"Date Signed On", "Signature Date", "Date Completed", …). **Narrow on purpose:** "Date of Birth",
+"Graduation Date" and "Earliest date you can start" ARE reusable answers and must keep teaching, so only
+questions that are JUST a date ask are dropped. Wired into `isTeachable`.
+
+NOT touched: the extension's own `summary.js` viewer ordering — it's the fallback the operator has
+confirmed is being deleted, so polish there is waste. (`isBecameRequired` was still added to it in the
+previous entry, so its badge is correct.)
+
+Verified: web tests **69/69** (+7: three ordering cases incl. stability, four date cases incl. the
+must-keep-teaching ones), typecheck + build green; extension **761/761** unchanged.
+
+## 2026-07-28 — The date editor heals its own input; the replay re-verifies before Save
+
+**1. The date STILL rendered wrong — because the fix was on the wrong side.** Operator: *"instead of
+dd/mm/yyyy it is now date/date/date/date/date/date/date"*. `DateSeg` does
+`const m = DATE_META[s] || { ph: s, max: 4 }` — for any token it doesn't know it uses **the token itself
+as the input's placeholder**. So whatever `date_order` holds gets printed verbatim. Fixing
+`cascadeEntryFor` (yesterday) only fixed what NEW bundles contain; a review bundle is **durable**, so the
+already-stored bundle kept its raw ids, and an older extension build still installed would keep producing
+them.
+
+So the fix belongs in the VIEWER: **`normalizeDateOrder`** (review-model.ts, PURE) accepts either the
+clean form or the raw scan ids, matching `/(month|day|year)/` per token (so `dateSectionMonth-display`
+→ `month`), deduping and dropping anything unrecognized. `DateSeg` uses it and falls back to a plain text
+box when nothing usable survives — an unknown token can never again reach the UI as a placeholder. 6 raw
+ids → `["month","day","year"]`; junk → a text box. Pinned with raw ids, month-year, year-only, an
+already-clean order, and four junk shapes.
+
+**2. The checkbox that unchecked itself → pre-Save re-verify.** Operator: *"the checkbox at the end first
+clicked, but then something happened and it got unclicked."* Checked the evidence first: the group
+replayed and **verified** (`fillCheckboxGroupCdp` re-reads the group and requires exactly one box on, and
+the page reported `0 FAILED`), then Save & Continue returned "Please check one of the boxes below … is
+required and must have a value". So the fill was right and the value did not STICK.
+
+The fill walk catches exactly this with its post-settle M40 audit. The replay walk had no equivalent — it
+clicked Save on a page it believed was complete. Now it takes ONE fresh scan immediately before every Save
+& Continue and runs **`requiredBlankOnPage`** (lib.js, PURE) — the mirror of `newlyRequiredGaps`: fields
+that are required, blank on the page, and that the approved bundle DOES have a value for (a value that
+didn't stick). Only those are re-replayed, and the outcome is logged either way, so a validation error
+becomes a self-healing retry with a trail. It deliberately claims nothing it can't fix: a field with no
+approved answer belongs to `newlyRequiredGaps`, an unchecked checkbox stores `"false"` (never blank), and
+`file_upload` has its own re-attach step — the same carve-outs as `bundleSubmitBlockers`.
+
+Verified: extension **763/763** (+2), web **72/72** (+3), typecheck + build green. Live-verification
+pending: the date should render MM/DD/YYYY on the existing bundle with no re-fill needed, and a
+disappearing checkbox should now be re-filled before Save instead of failing it.
+
+## 2026-07-28 — A "Today" button on review-page date fields
+
+Operator: *"for date questions in the review page can you put a button next to it that fills with the
+current date."* Well targeted — the one date a form asks for that the profile can never hold is TODAY (a
+signature / acknowledgement date), and it is exactly the field that keeps coming back as BECAME REQUIRED,
+so typing it by hand is the friction worth removing.
+
+`todayForDateOrder(order, now?)` (`web/lib/review-model.ts`, PURE) returns one value per segment IN THE
+FORM'S OWN ORDER, so a month/year composite gets only month+year and a DD/MM tenant gets its own order
+rather than ours. Zero-padded to match the MM / DD placeholders. **LOCAL date, not UTC** — a click at
+23:30 would otherwise sign the form with tomorrow's date. `now` is injectable, so it's tested without
+freezing the clock.
+
+`DateSeg` renders a `btn-ghost` "Today" beside the segments. The click commits the COMPUTED values
+directly rather than calling `commit()`, which reads the `parts` state that the same click is setting (a
+stale-state race). Value format verified end-to-end against the replay: `auditDateSegments("07/05/2026")`
+→ Month/Day/Year in order, and `auditDateMatches` compares with `parseInt`, so zero-padding is irrelevant
+to the read-back — the button's output replays identically to a hand-typed date.
+
+Appears on EVERY segmented date field (including repeating-section dates), which is what was asked; it's
+inert unless clicked. NOT added to the extension's `summary.js` viewer — that's the fallback being
+retired.
+
+Verified: web **75/75** (+3: per-order shaping incl. DD/MM and year-only, the local-vs-UTC boundary, and
+an empty order), typecheck + build green; extension **763/763** unchanged.
+
+## 2026-07-28 — "Today" auto-approves; an absent approved field is never fatal
+
+**1. Pressing "Today" approves the field.** Operator: *"if today is pressed, automatically approve."* A
+value edit normally RESETS approval — a changed value deserves a fresh look — so the button needed an
+explicit opt-out, not a bypass of the rule. `commit(entry, val, { approve: true })` sets
+`is_approved`/`approved_at` **in the same patch** as the value, so there is no intermediate state where the
+row reads edited-but-unapproved and `patchEntry` recomputes the envelope once (header progress + the
+Submit button update on that single click). Still gated by `canApprove` — and deliberately evaluated
+against the MERGED entry, because the pre-click entry is required-and-empty (which can never be approved)
+while the post-click one holds a date. The rationale for the exception: clicking "Today" IS the human
+decision on a single unambiguous value; demanding a second click to confirm what you just chose is pure
+friction. Nothing else uses the option, so ordinary edits still reset approval.
+Pinned at the semantic level (`approvalEnvelope`): a cascade-required date blocks while blank (and is also
+caught as `required_blank`), value+approval together make it `submit_ready`, and a value WITHOUT the
+approval still blocks — i.e. the auto-approve is what actually does the work.
+
+**2. An absent approved field no longer halts the replay.** Live, pages 1–3 replayed clean and page 4
+stopped:
+
+```
+page 4 → matched approved page … (1 flat-field overlap; 5 approved entries)
+    • gender [dropdown] … no field named "gender" on this page (live: acceptTermsAndAgreements)
+    • ethnicity [dropdown] …
+    • veteranStatus [dropdown] …
+⚠ page 4: 3 field(s) did not replay cleanly — HALT
+```
+
+The live page SCANNED as one field (the terms checkbox); the bundle's page-4 group held the three EEO
+dropdowns too.
+
+**CORRECTION — the cause is NOT settled.** My first two readings were both wrong, and the operator said so:
+I guessed "Workday stopped asking because it already holds the answers", then "they're inside a repeating
+container that `cdpPageScan` filters out". The operator: *"all the values do exist on the page"* and *"this
+page is not a repeating section. this page has no repeating containers."* So the fields are visibly there
+and the scan reported one. Remaining candidates, none proven: the wrappers mount later than the re-scan
+looked, the page renders those answers as READ-ONLY text (no `formField-*` wrapper to fill), or the
+wrappers carry different automation-ids on this step. What IS established is that the scan's name list
+disagreed with the page.
+
+Halting there was wrong twice over: it fails a page that is fine, and it prevents ever reaching the check
+that can actually decide. **The authority is Workday's own review page.** The entry keeps its approved
+value, so `reconcileReviewPage` looks for it and `submitPrecondition` HARD-BLOCKS on `missing_on_review`
+— a value genuinely lost cannot be submitted — while a required field Workday still wants blocks Save &
+Continue anyway and routes to the cascade/nav-timeout path. Two backstops, neither needing a mid-walk
+guess. So an absent entry is now always `status:"skipped"` + `replay-field-absent`, with its own log line
+naming the fields and saying the review-page check will vouch for them.
+
+This supersedes yesterday's required-vs-optional severity split, which was a half-measure in the same
+direction.
+
+**3. The replay asks the DOM, not the scan's list.** `present` is built from `cdpPageScan.fields`, which
+filters out every field inside a repeating container — it is a convenience list for the flat driver, NOT an
+inventory of the page, so it can never be the authority on whether a field exists. `replayFlatFields` now
+probes `act.selExists('[data-automation-id="formField-<name>"]')` — the very selector the per-widget
+handlers address — before believing anything is missing. That covers a stale scan and the repeating filter
+regardless of which one bit us here.
+
+**4. And when a field IS still absent, the walk now dumps the evidence.** One eval, only on a page that
+already went wrong: the page's ACTUAL unfiltered `formField-*` id list (with a total count, `readyState`,
+and body length) plus a per-missing-wrapper DOM probe. The next occurrence settles the cause from the log
+instead of inviting a third guess — the same recon-at-the-moment-of-failure move that resolved the false
+SSO halt and the phantom-duplicate delete earlier in the week.
+
+Verified: extension **763/763**, web **77/77** (+2), typecheck + build green.
+
+## 2026-07-28 — Dead service worker: two files declaring one name (and the guard for it)
+
+```
+Service worker registration failed. Status code: 15
+Uncaught SyntaxError: Failed to execute 'importScripts' on 'WorkerGlobalScope':
+Identifier 'dateOrderOf' has already been declared.
+```
+
+The extension was completely dead — no fill, no walk, no popup handlers — and **every one of the 765 node
+tests was green.**
+
+**Cause, entirely self-inflicted.** Moving `dateOrderOf` into lib.js (so `cascadeEntryFor` could use it),
+I left a convenience alias behind in fill-driver.js — `const dateOrderOf = (segs) => apMatch.dateOrderOf(segs)`
+— specifically so its seven existing call sites wouldn't need editing. But `importScripts` evaluates every
+file into ONE shared global scope, unlike Node's per-module scope: `function dateOrderOf` in lib.js and
+`const dateOrderOf` in fill-driver.js are two declarations of the same global. That's a SyntaxError, and a
+SyntaxError while importing means the worker never registers.
+
+Node could never catch this — `require` gives each file its own scope — which is exactly why it survived a
+green suite and only appeared on loading the unpacked extension.
+
+**Fix:** the alias is gone and all seven call sites go through `apMatch.dateOrderOf` — the indirection
+fill-driver.js already uses for every other lib.js helper, and the reason the two files can coexist at all.
+
+**Guard: `test/sw-globals.test.js`.** It derives the file list from `background.js`'s actual
+`importScripts(...)` call (so it can't drift), scans for top-level declarations anchored at column 0, and
+fails listing any name owned by two files, with the SW-scope rule in the message. A second test asserts
+every importScripts'd file exists and parses. **Verified against the real bug:** re-appending the alias
+makes it fail, removing it makes it pass — so it catches this exact class rather than merely asserting
+today's state. Indented declarations (the stringified `fillEngine`'s deliberate lockstep copies of
+normalize/matchCandidates) are ignored, since they live inside functions and never touch the global scope.
+
+A standing rule went into CLAUDE.md's Working principles: never re-declare an imported name; reach it
+through `apMatch.*`.
+
+Verified: extension **767/767** (+2), and a scan of all seven SW files reports no other collision.
+
+## 2026-07-28 — The replay walk never settled the page (and a second Node-invisible SW break)
+
+Two failures in one run, the second one the root cause the operator had already identified.
+
+### A. `apMatch.dateOrderOf is not a function` — the same trap, one layer down
+
+Yesterday's collision fix routed fill-driver's seven `dateOrderOf` call sites through `apMatch`. But
+`apMatch` is TWO different objects:
+
+```js
+const apMatch = (typeof module !== "undefined" && module.exports)
+  ? require("./lib.js")              // Node: everything lib.js exports
+  : { normalize, matchCandidates, … } // SW: only what someone remembered to list
+```
+
+`dateOrderOf` was in lib.js's exports but NOT in the SW literal — so all 767 tests passed (Node takes the
+`require` branch) and the replay walk died mid-run in the browser. Same lesson as the global-scope
+collision: **Node cannot see SW-only wiring.** Fixed by listing it, and guarded by two new tests — every
+`apMatch.X` used in fill-driver.js must appear in the literal, and every literal key must be exported by
+lib.js (so the two branches can't drift apart). Both verified to FAIL when the wiring is broken:
+removing `dateOrderOf: dateOrderOf` makes the first one report exactly that name.
+
+### B. The replay walk scanned pages MID-RENDER
+
+The operator: *"each time we go to the next page, it doesn't poll for the page to completely settle. check
+the fill path to see how that logic works. the fill path works every time."* Correct, and the new
+diagnostic proved it beyond doubt:
+
+```
+page 1: 9 approved value(s) had no field to fill on this page (candidateIsPreviousWorker,
+        legalName--firstName, …, postalCode, consent.f01l8)
+    the page carries 6 formField wrapper(s) in total (readyState=complete, 1699 chars):
+        [source, country, phoneType, countryPhoneCode, phoneNumber, extension]
+    wrapper present in the DOM? addressLine1=no · city=no · legalName--firstName=no · …
+✓ page 1 → advanced
+page 2 → matched approved page … (14 flat-field overlap; 15 approved entries)
+    the page carries 14 formField wrapper(s) in total … [source, candidateIsPreviousWorker, country,
+        legalName--firstName, …, extension]
+```
+
+Six wrappers, then fourteen — **the same physical page, scanned twice.** And this is why it looked like an
+advance: `cdpWaitNextPage` keys on the page SIGNATURE (url ‖ pageId ‖ **field-id set**), so eight fields
+mounting changes the signature and reads as a page transition. So the replay half-filled page 1, saved,
+"advanced" onto the same page, and filled it properly the second time. (It also retires the page-4 EEO
+mystery from earlier: same shape — a scan taken before the fields existed. My two guesses, "Workday
+stopped asking" and "repeating containers", were both wrong; the operator's "all the values do exist on
+the page" was right, and this is why.)
+
+The fill walk has had the answer since 2026-07-25 — a WALL-CLOCK field-set settle — but it lived inside
+`fillAndPersistPage`, which the replay walk never calls. Extracted verbatim as
+**`awaitFieldSetSettled(act)`** and called by BOTH walks before the page scan: break only once a NON-ZERO
+field count has held UNCHANGED for ≥1.2s of real time, polled at 150ms on **`delayFull`** (never
+`delayRender` — adaptive, collapses to ~40ms on a visible tab, which would make a half-rendered page look
+stable and defeat the whole point), 12s ceiling, ~1s all-zero bail so a repeating-only page like My
+Experience doesn't wait. The replay logs the settle time and resulting field count per page.
+
+Verified: extension **769/769** (+2 apMatch guards), `node --check` clean on the changed files. RELOAD THE
+EXTENSION before the next run.
