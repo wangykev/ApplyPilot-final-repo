@@ -2112,3 +2112,44 @@ Experience doesn't wait. The replay logs the settle time and resulting field cou
 
 Verified: extension **769/769** (+2 apMatch guards), `node --check` clean on the changed files. RELOAD THE
 EXTENSION before the next run.
+
+## 2026-07-28 — Submit gate relaxed: only a CONTRADICTED value blocks, not a missing one
+
+First fully clean replay to the review page — and the gate still refused:
+
+```
+✓✓ reached the REVIEW page after replaying 5 page(s)
+review page vs approved: AGREE 53 · DISAGREE 0 · MISSING 1 · EXTRA 1 · AMBIGUOUS 0 (of 54)
+    ∅ approved "English" ("Language*") is NOT shown on the review page
+submit gate: 1 blocker(s) — NOT submitting:
+    ✗ 1 approved value(s) not shown on the review page
+```
+
+Operator: *"the language controls what language is shown on the page so does not matter for the review
+page. Maybe make it so it just checks if anything is filled wrong. if things are missing it is fine."*
+
+Right, and the distinction is epistemic. **DISAGREE is positive evidence** — the review page displays a
+value that CONTRADICTS what was approved, which is exactly the value-revert class this check was built to
+catch. **MISSING is absence of evidence**, and it conflates two very different things: a value that didn't
+stick, and a field Workday's summary simply never renders. `Language*` is the second kind — it selects the
+page's display language, so it has no business appearing in an application summary. On top of that, the
+matcher is heuristic by design (CLAUDE.md: VALUE-PRESENCE, not label-match; short values fall back to
+label-anchoring), so failing to LOCATE a value is not proof it was lost.
+
+So `submitPrecondition` no longer blocks on `reviewMissing`. It is still surfaced in the log, now with a
+line saying it is informational and why. DISAGREE still blocks. EXTRA was already non-blocking. A scrape
+FAILURE still blocks — without a successful read, DISAGREE can't be evaluated either, so "can't confirm"
+must not read as "confirmed fine".
+
+**The one exception, deliberately kept fatal.** The phantom-duplicate fix DELETES visible rows on the
+premise that Workday retained its own copy — and its verification was `reviewMissing` blocking. Dropping
+that blocker outright would have silently gutted it: a deleted website whose value never came back would
+sail through. So the walk now collects those specific values (`phantomLost`, the intersection of what we
+deleted with what the review page lacks) and passes them as their OWN blocker, naming the values. For
+anything we deleted ourselves, absence IS positive evidence. The log line that already said "The gate
+blocks below" is now telling the truth again.
+
+Verified: extension **772/772** (+3: missing-alone doesn't block, DISAGREE still does, phantom-lost still
+does, scrape-failure still does). Note this is a genuine relaxation of the submit gate — the remaining
+guards are DISAGREE, scrape-failure, phantom-lost, every flagged field approved, no unreplaced AI
+placeholder, no required field blank, on-review-page, session alive, and single-fire.

@@ -5808,7 +5808,22 @@ function submitPrecondition(bundle, liveState, findings, opts) {
   //     extra-on-page but does not block on it — review boilerplate is noisy.)
   if (f.reviewScrapeFailed) blockers.push("could not read the review page to confirm it matches the approved values");
   if (Array.isArray(f.reviewDisagree) && f.reviewDisagree.length) blockers.push(`${f.reviewDisagree.length} review-page value(s) DISAGREE with the approved bundle`);
-  if (Array.isArray(f.reviewMissing) && f.reviewMissing.length) blockers.push(`${f.reviewMissing.length} approved value(s) not shown on the review page`);
+  // MISSING alone does NOT block (operator 2026-07-28: "make it so it just checks if anything is filled
+  // wrong. if things are missing it is fine"). DISAGREE is positive evidence — the page shows a value that
+  // CONTRADICTS what was approved. MISSING is absence of evidence, and the review page legitimately does
+  // not render every field: live, `Language*` = "English" was reported missing because that field controls
+  // the page's display language and never appears in the summary, which blocked an otherwise-perfect run
+  // (AGREE 53 · DISAGREE 0). Value-presence matching is heuristic too (short values fall back to
+  // label-anchoring), so a locatable-value failure is not proof a value was lost. It is still SURFACED in
+  // the log for the operator.
+  //
+  // The ONE exception, kept blocking: a value WE deleted ourselves to clear Workday's phantom
+  // duplicate-entry error. There, absence is positive evidence — the whole premise of that fix is that
+  // Workday retained its own copy, so a deleted value that does not come back means the application would
+  // be filed WITHOUT it. See the phantom-duplicate verification in runCdpReplayWalk.
+  if (Array.isArray(f.phantomLost) && f.phantomLost.length) {
+    blockers.push(`${f.phantomLost.length} value(s) deleted to clear Workday's duplicate error did NOT come back on the review page (${f.phantomLost.slice(0, 3).join(", ")}${f.phantomLost.length > 3 ? ", …" : ""}) — submitting would file this application without them`);
+  }
   // 7. no cascade-revealed field the bundle never covered (surfaced during the replay walk).
   if (Array.isArray(f.cascadeRevealed) && f.cascadeRevealed.length) blockers.push(`${f.cascadeRevealed.length} cascade-revealed field(s) not in the approved bundle`);
   // 8. zero replay-verify mismatches / unverifiables across all pages (a clean walk never reaches here

@@ -3319,6 +3319,7 @@ async function runCdpReplayWalk(tabId, opts) {
             reviewDiff.missing = rec.missing_on_review || [];
             LOG(`review page vs approved: AGREE ${c.agree} · DISAGREE ${c.disagree} · MISSING ${c.missing_on_review} · EXTRA ${c.extra_on_review} · AMBIGUOUS ${c.ambiguous} (of ${c.claimed} value-bearing entries).`);
             rec.disagree.forEach((d) => LOG(`    ≠ "${d.label || d.canonical_field || d.field_id}": approved "${d.value_bundle}" but the page shows "${d.value_review}"`));
+            if ((rec.missing_on_review || []).length) LOG(`    (${rec.missing_on_review.length} approved value(s) are not SHOWN on the review page — informational, NOT blocking: Workday's summary doesn't render every field, and value-presence matching is heuristic. A value the page CONTRADICTS is what blocks.)`);
             rec.missing_on_review.forEach((m) => LOG(`    ∅ approved "${m.value_bundle}" ("${m.label || m.canonical_field || m.field_id}") is NOT shown on the review page`));
             if ((rec.extra_on_review || []).length) { LOG(`    (${rec.extra_on_review.length} extra value(s) on the page not in the bundle — logged, NOT blocking:)`); rec.extra_on_review.slice(0, 6).forEach((x) => LOG(`      + "${x.value_review}" (${x.label || "?"})`)); }
           } else {
@@ -3337,11 +3338,13 @@ async function runCdpReplayWalk(tabId, opts) {
         //    The values live in the approved bundle, so reconcileReviewPage above already compared them
         //    — a value that did not come back is in `missing`, which is a HARD gate blocker below. This
         //    block attributes it, so a blocked submit says WHY instead of citing an anonymous mismatch. ──
+        const phantomLost = [];
         if (phantomDeleted.length) {
           const missingText = (reviewDiff.missing || []).map((m) => String(m.value_bundle || "").toLowerCase());
           for (const fix of phantomDeleted) {
             const gone = (fix.values || []).filter((v) => missingText.some((mv) => mv === String(v).toLowerCase()));
             if (gone.length) {
+              phantomLost.push(...gone); // → a HARD gate blocker (a plain MISSING is not; see submitPrecondition)
               LOG(`⛔ the ${fix.kind} value(s) we deleted to clear Workday's phantom duplicate did NOT come back on the review page: ${gone.join(", ")}`);
               LOG(`   Workday did not retain its own copy, so submitting would file this application WITHOUT them. The gate blocks below — re-run the fill for this job, re-approve, and submit again.`);
             } else {
@@ -3356,7 +3359,7 @@ async function runCdpReplayWalk(tabId, opts) {
         try { livePlaceholder = await cdpEval(() => ((document.body && document.body.innerText) || "").indexOf("[NEEDS YOUR ANSWER") !== -1); } catch (e) { /* ignore — bundle check still applies */ }
         const gate = submitPrecondition(bundle, nav, {
           mismatches: findings.mismatches, cascadeRevealed: findings.cascadeRevealed, livePlaceholder,
-          reviewDisagree: reviewDiff.disagree, reviewMissing: reviewDiff.missing, reviewScrapeFailed: reviewDiff.scrapeFailed
+          reviewDisagree: reviewDiff.disagree, reviewMissing: reviewDiff.missing, phantomLost, reviewScrapeFailed: reviewDiff.scrapeFailed
         }, { authorize, alreadyFired: submitFired });
         if (!gate.ok) {
           LOG(`submit gate: ${gate.blockers.length} blocker(s) — NOT submitting:`);

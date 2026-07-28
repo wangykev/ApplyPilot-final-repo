@@ -7609,10 +7609,36 @@ test("submitPrecondition: a review-page value that DISAGREES with the approved b
   assert.ok(r.blockers.some((b) => /DISAGREE with the approved bundle/.test(b)));
 });
 
-test("submitPrecondition: an approved value MISSING from the review page blocks", () => {
-  const r = gate((i) => { i.findings.reviewMissing = [{ label: "Phone", value_bundle: "8506660266" }]; });
+// RELAXED 2026-07-28 (operator): "make it so it just checks if anything is filled wrong. if things are
+// missing it is fine." DISAGREE is positive evidence — the page shows a CONTRADICTING value. MISSING is
+// absence of evidence: Workday's summary doesn't render every field (live: `Language*` = "English"
+// controls the page's display language and never appears there, blocking a run that was otherwise
+// AGREE 53 · DISAGREE 0), and value-presence matching is heuristic on short values.
+test("submitPrecondition: an approved value MISSING from the review page does NOT block on its own", () => {
+  const r = gate((i) => { i.findings.reviewMissing = [{ label: "Language*", value_bundle: "English" }]; });
+  assert.strictEqual(r.ok, true, "a value the page simply doesn't display can't block a submit: " + r.blockers.join("; "));
+});
+
+test("submitPrecondition: a DISAGREE still blocks — a contradicted value is the thing we check for", () => {
+  const r = gate((i) => { i.findings.reviewDisagree = [{ label: "City", value_bundle: "Chicago", value_review: "Detroit" }]; });
   assert.strictEqual(r.ok, false);
-  assert.ok(r.blockers.some((b) => /not shown on the review page/.test(b)));
+  assert.ok(r.blockers.some((b) => /DISAGREE/.test(b)), r.blockers.join("; "));
+});
+
+// The ONE exception to the relaxation: a value WE deleted to clear Workday's phantom duplicate-entry
+// error. That fix's whole premise is that Workday retained its own copy, so absence there IS positive
+// evidence — the application would be filed without it.
+test("submitPrecondition: a value WE deleted that didn't come back on the review page still BLOCKS", () => {
+  const r = gate((i) => { i.findings.phantomLost = ["https://www.linkedin.com/in/wangykev"]; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /did NOT come back/.test(b)), r.blockers.join("; "));
+  assert.ok(r.blockers.some((b) => /linkedin/.test(b)), "names the value so the operator knows what would be lost");
+});
+
+test("submitPrecondition: a review-page scrape failure STILL blocks (can't check DISAGREE either)", () => {
+  const r = gate((i) => { i.findings.reviewScrapeFailed = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /could not read the review page/.test(b)));
 });
 
 test("submitPrecondition: a review-page scrape FAILURE blocks (can't confirm it matches → don't submit)", () => {
