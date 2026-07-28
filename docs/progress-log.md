@@ -2176,10 +2176,17 @@ generalizes the rule the login columns already followed ("an absent login must n
 file"): absence means *"I have nothing to say about this"*, never *"set it to nothing"*.
 
 **Second fix, a wrong-value hazard rather than a null one.** The cascade report passed
-`chrome.storage.local.jobContext`, a GLOBAL slot holding whatever the last Run scraped. On a submit run
-for job B it can still say job A's company — and writing that onto B's row is worse than writing nothing.
-It now passes `null`, so `company` falls back to `bundle.tenant`, captured from THIS application's own
-fill.
+`chrome.storage.local.jobContext`. Checked what that slot actually holds, and it is worse than "the last
+run's company": **nothing in background.js writes it back** — a Run builds its own local `jobContext` from
+the JD scrape and threads it down without persisting — so storage only ever holds what the WEBSITE synced
+from `profiles.job_context_json`. That is a per-USER value (its editor page was retired; it survives as a
+Cover-letter default), with no relationship to the job being submitted. Writing it onto the row would
+stamp an unrelated company on the application, and **a plausible WRONG value is worse than a blank one**: a
+gap is visible and the next fill repairs it, whereas a wrong company reads as fact — and `company` is not
+inert, it anchors the employment-status recognizer's "are you a former «company» employee?" decisions. Now
+passes `null`, so `company` falls back to `bundle.tenant`, captured from THIS application's own fill.
+LATENT, not observed: it needs the cascade path to fire on a submit run while the synced job context names
+a different company, which this session's same-job runs never did.
 
 Verified: web **85/85** (+8 pinning the no-clobber rule: absent company/role omitted, whitespace treated
 as absent, carried values written, the report's own payload always written, status validation, and the
