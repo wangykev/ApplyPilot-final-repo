@@ -327,6 +327,9 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         LOG(`approved bundle loaded for job_key "${jobKey}" (${pull.count} field(s)) — ${arm ? "⚠ ARMED: this run WILL submit if every gate passes." : "DRY rehearsal: runs the whole gate and stops at 'would submit'."}`);
 
         // ── 3. Open the posting + sign in (the form is per-session; a submit run always re-onboards). ──
+        // BACKGROUND is supported (2026-07-28): the replay enables synthetic input for its field
+        // actuation, so a hidden run isn't paying ~1.2-1.5s per input event. Sign-in still runs trusted
+        // on its own attach, and the final submit click is forced trusted — see runCdpReplayWalk.
         emitRunProgress("Opening the job posting", background ? "in a background tab" : "");
         const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
         if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
@@ -3245,11 +3248,25 @@ async function runCdpReplayWalk(tabId, opts) {
       else LOG("⚠ REFILL: no profile in storage — a page not in the bundle can't be fresh-filled and will HALT. Click 'Load default profile' first to enable fresh-fill of never-reached pages.");
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (same as the fill walk)
-    // NOTE: synthetic input stays OFF for the REPLAY walk (default) — the submit-adjacent path keeps
-    // the battle-tested trusted primitives until the fill walk's synthetic mode is live-verified.
+    // SYNTHETIC INPUT ON for the replay's field actuation (2026-07-28) — so a BACKGROUND submit run is
+    // not ~1.2-1.5s per input event. It was held off "until the fill walk's synthetic mode is
+    // live-verified", and that condition is now met by the background fills. The original objection was
+    // specific to the AUTH form (its Sign In submit never fired under synthetic — the auth app doesn't
+    // register native-setter values), and that surface is NOT here: runCdpOnboard signs in on its OWN
+    // attach, which stays trusted, and cdpAttach resets this flag, so enabling it here covers ONLY
+    // application FORM pages — exactly the surface the synthetic repertoire was proven on.
+    //
+    // Safe because nothing about VERIFICATION changes: synthetic only engages when the tab is HIDDEN
+    // (cdpSynthInput), every read-back / persistence re-read / M40 audit is untouched, and the replay
+    // adds strict per-field verify + review-page equality + the submit gate on top. A synthetic no-op
+    // therefore ends as needs_review and halts — it can never become a wrong value. `forceTrustedInput`
+    // in chrome.storage.local still overrides everything.
+    cdpSetSyntheticInput(true);
+    const _vis = await cdpVisible().catch(() => true);
+    const _mode = _vis ? "VISIBLE (trusted input)" : "HIDDEN (synthetic input for fields; the submit click stays trusted)";
     LOG(authorize
-      ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Eyes-on, DISPOSABLE application. Keep the tab VISIBLE.`
-      : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Keep the tab VISIBLE to watch. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
+      ? `⚠ ARMED REPLAY WALK (authorize=true) — replaying the ${bundle.entries.length} approved field(s) page-by-page; at the REVIEW page it runs the precondition gate and, if EVERY check passes, clicks SUBMIT ONCE. Tab is ${_mode}.${simulateSubmit ? " SIMULATE: it will stop at 'would submit'." : " This run CAN submit — disposable application."}`
+      : `DRY REPLAY WALK — replaying the ${bundle.entries.length} approved field(s) page-by-page to the REVIEW page. NEVER submits (not authorized). Tab is ${_mode}. A value the form no longer offers, or a required field left empty, HALTS — never a guess.`);
     const act = makeCdpActuation(await getLlmConfig()); // AI OFF for replay regardless (replayRepeatingSections passes aiContext:null; flat replayField never calls AI)
     let pagesReplayed = [];
     // Workday's PHANTOM duplicate-entry bug (see clearPhantomDuplicates): what we deleted to get past
@@ -3377,7 +3394,11 @@ async function runCdpReplayWalk(tabId, opts) {
           return { ok: true, stopped: "would-submit", would_submit: true, simulated: true, reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
         }
         // (real path — not reached while simulateSubmit is on) → the ONE irreversible click.
-        LOG(`✓ submit gate PASSED — clicking SUBMIT ONCE (authorized).`);
+        // FORCE TRUSTED for it, even hidden: this is the single action that cannot be undone, so it uses
+        // the most proven mechanism rather than the fast one. Costs ~1.5s on a hidden tab for ONE click —
+        // nothing, against the value of not wondering whether a synthetic click half-fired.
+        cdpSetSyntheticInput(false);
+        LOG(`✓ submit gate PASSED — clicking SUBMIT ONCE (authorized; trusted input, even if hidden).`);
         const subSig = cdpPageSig(await cdpEval(cdpPageScan));
         const sub = await act.clickSubmit(true);
         submitFired = true; // single-fire — never attempt a second submit this run

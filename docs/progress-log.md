@@ -2193,3 +2193,43 @@ as absent, carried values written, the report's own payload always written, stat
 login carve-outs), extension **772/772**, typecheck green. NOTE the production build failed ONCE with
 `Failed to collect page data for /_not-found` and passed on two clean re-runs — recorded as flaky, not
 diagnosed.
+
+## 2026-07-28 — Background submit runs: synthetic input for the replay, trusted for the one click
+
+Operator: *"it should be able to submit in the background too. for now I have been testing in the
+foreground and it works now. Time to test them in the background."*
+
+Foreground already worked because a visible tab uses trusted `Input.*` and acks in milliseconds. HIDDEN was
+the problem: trusted input to a hidden tab stalls ~1.2–1.5s **per event** (input processing rides
+compositor-frame scheduling, and a hidden tab produces no frames), and the replay walk had synthetic input
+switched OFF.
+
+**Why it was off, and why that reason no longer applies.** The comment said the submit-adjacent path keeps
+trusted primitives "until the fill walk's synthetic mode is live-verified" — a condition the background
+fills have since met. More importantly the original objection was never about form pages: synthetic failed
+on the **AUTH** form, whose Sign In submit never fired because the auth app doesn't register native-setter
+values. That surface isn't in the replay walk at all — `runCdpOnboard` signs in on its OWN attach, and
+`cdpAttach` resets the flag, so `cdpSetSyntheticInput(true)` inside `runCdpReplayWalk` covers ONLY
+application FORM pages: exactly where the synthetic repertoire is proven.
+
+**Why it's safe.** Nothing about verification changes. Synthetic engages only when the tab is HIDDEN
+(`cdpSynthInput`), every read-back / persistence re-read / M40 audit is untouched, and the replay stacks
+strict per-field verify + review-page equality + `submitPrecondition` on top. A synthetic no-op therefore
+surfaces as `needs_review` and HALTS the walk — it cannot become a wrong value.
+`chrome.storage.local.forceTrustedInput` still overrides everything.
+
+**The one exception, deliberately slow: `act.clickSubmit` is forced back to TRUSTED even when hidden**
+(`cdpSetSyntheticInput(false)` immediately before it). It is the single action in the whole system that
+cannot be undone, so it uses the most proven mechanism rather than the fastest one — ~1.5s for one click,
+against never having to wonder whether a synthetic click half-fired.
+
+**UI.** `/app/run`'s submit card gains a "Run in the background (unfocused tab)" checkbox, defaulted OFF,
+covering both Rehearse and Submit. Ticking it shows a plain warning that a background run can't be watched
+— fine for a rehearsal, but for a real submit you won't see the final click. The replay's opening banner
+now prints the tab's input mode (`VISIBLE (trusted)` / `HIDDEN (synthetic for fields; submit click stays
+trusted)`) so a slow run self-diagnoses, and it no longer tells the operator to "keep the tab VISIBLE"
+when they deliberately chose otherwise.
+
+Verified: extension **772/772**, web **85/85**, typecheck + build green. Live-verification pending — try
+Rehearse with the box ticked first; the banner should report HIDDEN/synthetic and it should finish in
+roughly foreground time.

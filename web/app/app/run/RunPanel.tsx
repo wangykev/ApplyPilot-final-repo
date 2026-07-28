@@ -221,6 +221,7 @@ export function RunPanel() {
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [submitPhase, setSubmitPhase] = useState<SubmitPhase>({ s: "idle" });
   const [confirming, setConfirming] = useState(false); // the armed-submit two-step
+  const [submitBg, setSubmitBg] = useState(false); // run the submit/rehearse in an unfocused tab
   const [connected, setConnected] = useState<boolean | null>(null);
   const [showJd, setShowJd] = useState(false);
   const [progress, setProgress] = useState<RunProgress | null>(null);
@@ -313,7 +314,7 @@ export function RunPanel() {
     setProgress({ phase: armed ? "Starting the submit run…" : "Starting the rehearsal…", detail: "", at: 0 });
     portRef.current = openRunProgressPort(extId, (p) => setProgress(p));
 
-    const resp = await sendToExtension(extId, { type: "AP_SUBMIT_APPLICATION", startUrl, arm: armed });
+    const resp = await sendToExtension(extId, { type: "AP_SUBMIT_APPLICATION", startUrl, arm: armed, background: submitBg });
 
     portRef.current?.disconnect();
     portRef.current = null;
@@ -461,10 +462,28 @@ export function RunPanel() {
           )}
         </div>
 
+        <label className="mt-3 flex w-fit cursor-pointer items-center gap-2 text-xs text-ink-dim">
+          <input
+            type="checkbox"
+            checked={submitBg}
+            onChange={(e) => setSubmitBg(e.target.checked)}
+            disabled={busy}
+            className="h-3.5 w-3.5 accent-amber"
+          />
+          Run in the background (unfocused tab — you stay on this page)
+        </label>
+        {submitBg && (
+          <p className="mt-1.5 text-xs leading-relaxed text-amber/90">
+            A background run can&apos;t be watched while it works. Fine for a rehearsal; for a real
+            submit you won&apos;t see the final click happen — the result still lands here and in your
+            Tracker.
+          </p>
+        )}
+
         <p className="mt-3 text-xs leading-relaxed text-ink-faint">
-          Both run in a visible tab so you can watch. Neither can submit an application whose review
-          isn&apos;t fully approved, or whose review page doesn&apos;t show exactly the values you
-          approved — it stops and tells you what&apos;s in the way. Not filled yet?{" "}
+          Neither can submit an application whose review isn&apos;t fully approved, or whose review page
+          contradicts the values you approved — it stops and tells you what&apos;s in the way. Not filled
+          yet?{" "}
           <Link href="/app/tracker" className="text-amber hover:underline">
             Fill and approve it first
           </Link>
@@ -478,9 +497,10 @@ export function RunPanel() {
               <p className="text-sm font-medium text-ink">{progress?.phase || "Starting…"}</p>
               {progress?.detail && <p className="mt-0.5 text-xs text-ink-dim">{progress.detail}</p>}
               <p className="mt-1.5 text-xs leading-relaxed text-ink-faint">
-                {submitPhase.s === "running" && submitPhase.armed
+                {(submitPhase.s === "running" && submitPhase.armed
                   ? "Signing in and replaying your approved answers. It submits only if every check passes."
-                  : "Signing in and replaying your approved answers. Nothing will be submitted."}
+                  : "Signing in and replaying your approved answers. Nothing will be submitted.") +
+                  (submitBg ? " Running in an unfocused tab — stay here." : " Watch the tab as it works.")}
               </p>
             </div>
           </div>
