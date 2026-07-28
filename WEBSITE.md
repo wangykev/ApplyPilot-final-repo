@@ -107,7 +107,7 @@ handoff contract).
 After a fill/walk, the SW POSTs to `{ingestUrl}` with `Bearer {ingestKey}`:
 `{ company, role, url, job_key, status, needs_review_count, captured_at, review_bundle, login }`. A Next.js
 route validates the per-user ingest key (an `api_keys` row) and upserts-by-`job_key` an `applications` row.
-`login` = `{ email, tenant, host, created, verified, at }`, the account that run actually signed in as →
+**A report never NULLS a column it wasn't given** (`lib/report-fields.ts`, PURE + unit-tested): `company` / `role` / `url` / `job_key` / `applied_at` are OMITTED from the write when absent, so an UPDATE can't erase them. `reportApplication` sends `role: null` on every report (the extension doesn't know the job title) and a null `company` when the run has no jobContext — which wiped the tracker row's company + role after a Rehearse run (the FILL path only survived because `saveRunJob` rewrites them afterwards from the scraped JD). The report's OWN payload — status / needs_review_count / review_bundle_json — is always written. `login` = `{ email, tenant, host, created, verified, at }`, the account that run actually signed in as →
 the `login_*` columns (migration `0011`). It is MATCH-GATED extension-side (see CLAUDE.md → Onboarding), and
 an absent/emailless `login` leaves any previously-recorded account untouched — never blanked.
 Per-user API key avoids extension-side OAuth token refresh. **Both** the single-page CDP fill

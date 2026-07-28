@@ -3678,8 +3678,11 @@ async function runCdpReplayWalk(tabId, opts) {
             bundle.needs_review_count = bundle.entries.filter((e) => e.needs_review && !e.is_deleted).length;
             if (bundle.approval) bundle.approval.submit_ready = false; // stale roll-up must not read ready
             await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle }, r));
-            const jc = await new Promise((r) => chrome.storage.local.get("jobContext", (s) => r((s && s.jobContext) || null)));
-            await reportApplication(bundle, jc); // → the website review page, so the operator can answer them
+            // jobContext is a GLOBAL slot holding whatever the last Run scraped — on a submit run for job B
+            // it may still say job A's company, and writing that onto B's row is worse than writing
+            // nothing. Pass null so reportApplication falls back to `bundle.tenant`, which was captured
+            // from THIS application's own fill.
+            await reportApplication(bundle, null); // → the website review page, so the operator can answer them
             LOG(`⚠ page ${page}: ${added.length} field(s) the form now REQUIRES have no approved answer — sent back to REVIEW (they are on the website now; answer them and re-run):`);
             added.forEach((e) => LOG(`    • "${e.question_label}" [${e.widget_type}]${e.options && e.options.length ? ` — options: ${e.options.map((o) => o.text).slice(0, 6).join(" | ")}` : ""} — ${e.detail}`));
             return {

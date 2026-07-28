@@ -2153,3 +2153,36 @@ Verified: extension **772/772** (+3: missing-alone doesn't block, DISAGREE still
 does, scrape-failure still does). Note this is a genuine relaxation of the submit gate — the remaining
 guards are DISAGREE, scrape-failure, phantom-lost, every flagged field approved, no unreplaced AI
 placeholder, no required field blank, on-review-page, session alive, and single-fire.
+
+## 2026-07-28 — A Rehearse run wiped the tracker row's company + role
+
+Operator: *"when I fill out the form, it accurately shows in the review page company/role. when I do the
+new rehearse run, it goes back to the tracker without the company/role, just the website."*
+
+**Cause.** `reportApplication` (background.js) sends **`role: null` on every report** — the extension has
+no idea what the job title is — and `company: (jobContext?.company) || bundle.tenant || null`, which is
+null when the run has no jobContext. `POST /api/extension/report` wrote those nulls straight into its
+UPDATE, erasing what the fill had recorded. The FILL path only ever survived this **by accident**:
+`saveRunJob` runs afterwards and rewrites company/role from the scraped JD. A submit run has no such
+follow-up, so the damage stuck. The trigger on a Rehearse is the cascade path added earlier this week,
+which reports the bundle when it sends newly-required fields back to review.
+
+**Fix — the rule, not the symptom: a report never NULLS a column it wasn't given.** Extracted to
+`web/lib/report-fields.ts` (PURE, so it's testable without a route or a DB): `reportColumns(body, userId)`
+OMITS `company` / `role` / `url` / `job_key` / `applied_at` when the payload doesn't carry them, rather
+than writing null. Safe for an INSERT too (an omitted column takes its default). The report's OWN payload —
+status, needs_review_count, review_bundle_json — is always written, since that IS the report. This
+generalizes the rule the login columns already followed ("an absent login must not blank the account on
+file"): absence means *"I have nothing to say about this"*, never *"set it to nothing"*.
+
+**Second fix, a wrong-value hazard rather than a null one.** The cascade report passed
+`chrome.storage.local.jobContext`, a GLOBAL slot holding whatever the last Run scraped. On a submit run
+for job B it can still say job A's company — and writing that onto B's row is worse than writing nothing.
+It now passes `null`, so `company` falls back to `bundle.tenant`, captured from THIS application's own
+fill.
+
+Verified: web **85/85** (+8 pinning the no-clobber rule: absent company/role omitted, whitespace treated
+as absent, carried values written, the report's own payload always written, status validation, and the
+login carve-outs), extension **772/772**, typecheck green. NOTE the production build failed ONCE with
+`Failed to collect page data for /_not-found` and passed on two clean re-runs — recorded as flaky, not
+diagnosed.
