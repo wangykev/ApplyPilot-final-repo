@@ -31,7 +31,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio, normalizeLabel: normalizeLabel,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
       sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
-      tenantCompanyFromUrl: tenantCompanyFromUrl };
+      tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -3142,7 +3142,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // vs YYYY) so the review renders segmented inputs that match the form — section dates already did
     // this via fillEntryCdp; flat ones classified as "unknown" until 2026-07-25 (Caterpillar self-ID).
     if (f.widgetType === "date" && Array.isArray(f.dateSegments) && f.dateSegments.length) {
-      const ord = dateOrderOf(f.dateSegments);
+      const ord = apMatch.dateOrderOf(f.dateSegments);
       if (ord.length) record.date_order = ord;
     }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
@@ -3218,7 +3218,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         try {
           if (f.widgetType === "dropdown") { const o = await captureDropdownOptions(act, loc, budgets); if (o && o.length) s.options = o; }
           else if (f.widgetType === "typeahead") { const cap = await captureTypeaheadOptions(act, loc, budgets); if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; } }
-          else if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; }
+          else if (f.widgetType === "date") { const ord = apMatch.dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; }
         } catch (e) { /* non-fatal — stays its base widget */ }
         shape.push(s);
       }
@@ -3972,7 +3972,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     }
     rec.auditLoc = fd.wrapperSel; // M40: retain the entry-scoped locator for the post-fill audit re-read
     rec.auditTag = effWidget === "textarea" ? "textarea" : undefined;
-    if (f.widget === "year" || f.widget === "date") { const ord = dateOrderOf(fd.dateSegments); if (ord.length) rec.date_order = ord; } // m3c: form's segment order → the summary's segmented date editor (all date fields, not just revealed ones)
+    if (f.widget === "year" || f.widget === "date") { const ord = apMatch.dateOrderOf(fd.dateSegments); if (ord.length) rec.date_order = ord; } // m3c: form's segment order → the summary's segmented date editor (all date fields, not just revealed ones)
     // FoS Round 3: tag so the END-OF-PAGE option-capture pass can find this record (captureKey groups
     // same-vocabulary fields across entries → one scrape). Captured at end-of-page, NOT inline — an
     // inline scrape races the field's post-commit settle (empty scrape) / corrupts the commit.
@@ -4534,6 +4534,12 @@ async function reconPageTruth(act, results) {
       if (!sec) continue; // unknown-section records (m3a) — not ours to reconcile
       const s = sections[sec.containerPrefix];
       const entries = (s && s.entries) || []; // an emptied section is legitimately absent from the scan
+      // PHANTOM-DUPLICATE SURVIVORS (2026-07-27): a row we deleted ONLY to clear Workday's stale
+      // server-side duplicate is deliberately absent from the page — but Workday KEPT its own copy, so
+      // the value is still on the application and MUST still show as filled on the review page
+      // ("make it show as filled … as if we did not delete it"). Without this guard the sweep below
+      // marks it removed and the operator's review loses a section that is actually submitted.
+      if (r.phantomKept) continue;
       const i = parseInt(m[2], 10);
       if (i >= entries.length) { markRemoved(r, "row no longer on the page at advance-time (deleted) — dropped from review"); continue; }
       // survivor row: the record must claim the LIVE value (a mid-list delete shifts later rows
@@ -4632,7 +4638,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
         const flat = fields.filter((f) => !nestedFieldNames.has(f.fieldName) && !(hasNestedAttach && f.widgetType === "file_upload"));
         if (flat.length) detectedShape = flat.map((f) => {
           const o = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType, label: f.label, is_required: !!f.isRequired };
-          if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; }
+          if (f.widgetType === "date") { const ord = apMatch.dateOrderOf(f.dateSegments); if (ord.length) o.date_order = ord; }
           return o;
         });
       }
@@ -5194,8 +5200,17 @@ async function replayField(act, entry, budgets) {
   // a correct field is wasted work and re-opens the stray/false-verify risk (the degree→Associates class).
   // (Choice widgets self-skip via their keep-guards too; this covers text/date/radio/checkbox uniformly
   // and avoids even opening a correct dropdown.) A failed live read → fall through and actuate normally.
+  //
+  // OVERRIDABLE (2026-07-28): `skipIfCorrect: false` FORCES actuation even when the box already reads
+  // correct. This block used to skip UNCONDITIONALLY — it never consulted the budget the rest of the
+  // replay path uses — so a caller asking for a forced re-write silently got a no-op ("already correct on
+  // the page — left unchanged"), which is exactly what happened to the phantom-required remedy's first
+  // attempt. `undefined` still skips, so every existing caller is unchanged; only an explicit `false`
+  // forces. Needed because a value that is correct IN THE DOM is not proof Workday's own form model has
+  // it (live: Workday demanding a Name/Date it was itself rendering).
+  const skipIfCorrect = b.skipIfCorrect !== false;
   try {
-    const live = await auditReReadActual(act, { widgetType: widget, auditLoc: sel, auditTag: widget === "textarea" ? "textarea" : undefined, expected: value });
+    const live = skipIfCorrect ? await auditReReadActual(act, { widgetType: widget, auditLoc: sel, auditTag: widget === "textarea" ? "textarea" : undefined, expected: value }) : null;
     if (live && live.readable && replayValueMatches(widget, live.actual, value)) {
       return { status: "filled", verified: true, after: live.actual, replay: "already-correct", flag: "replay-already-correct", detail: "already correct on the page — left unchanged (no actuation)" };
     }
@@ -5218,20 +5233,65 @@ async function replayField(act, entry, budgets) {
 // PRESENT, re-fillable bundle entry on the live page via replayField; skips repeating (deferred),
 // file_upload, deleted, and any field NOT present in `presentFieldNames` (so it scopes to the
 // current page). NO Next/Submit — the caller stays in control. Returns the per-field results.
+// The live field NAME a bundle entry targets (`<page>::formField-<name>` → `<name>`). Exported because
+// the replay walk's cascade re-scan needs the same mapping to decide which absent entries have mounted.
+function replayEntryFieldName(entry) {
+  const id = String((entry && entry.field_id) || "");
+  const auto = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+  return auto.indexOf("formField-") === 0 ? auto.slice("formField-".length) : auto;
+}
+
 async function replayFlatFields(act, entries, presentFieldNames, budgets) {
   const b = Object.assign({}, DEFAULT_BUDGETS, budgets || {});
   const present = presentFieldNames instanceof Set ? presentFieldNames : new Set(presentFieldNames || []);
-  const fieldNameOf = (entry) => {
-    const id = String((entry && entry.field_id) || "");
-    const auto = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
-    return auto.indexOf("formField-") === 0 ? auto.slice("formField-".length) : auto;
-  };
   const results = [];
   for (const entry of entries || []) {
     if (!entry || entry.widget_type === "section" || entry.widget_type === "file_upload") continue;
     if (entry.is_deleted || isRepeatingEntry(entry)) continue;       // deferred / dropped
-    const fname = fieldNameOf(entry);
-    if (!present.has(fname)) continue;                                // not on THIS live page
+    const fname = replayEntryFieldName(entry);
+    // ── ASK THE PAGE, don't trust the name list (2026-07-28). ──────────────────────────────────────
+    // `present` comes from cdpPageScan.fields, which FILTERS OUT every field inside a repeating
+    // container (`const wrappers = all.filter((w) => !isRepeating(w))`) — it is a convenience list for
+    // the flat driver, NOT an inventory of the page. Live: page 4's EEO dropdowns (gender / ethnicity /
+    // veteranStatus) were reported absent and halted the replay while the operator was looking straight
+    // at them — "all the values do exist on the page". A stale scan (a field that mounted since) has the
+    // same shape. So before believing a field is missing, probe the DOM for its wrapper directly; the
+    // per-widget handlers address it by that same selector, so if it exists they can fill it.
+    let onPage = present.has(fname);
+    if (!onPage && typeof act.selExists === "function") {
+      const sel0 = deriveFlatWrapperSel(entry);
+      try { onPage = !!(sel0 && (await act.selExists(sel0))); } catch (e) { /* probe failed → treat as absent */ }
+    }
+    if (!onPage) {
+      // NOT on this live page. This used to `continue` SILENTLY — no record, no log — so an approved
+      // value that never got replayed simply vanished (live 2026-07-27: page 5 selected 5 approved
+      // entries and replayed 4; the missing one was a checkbox_group the operator HAD answered, and
+      // nothing anywhere said so). Emit a real record instead: it names the field, and — because it is
+      // `needs_review` — the walk's strict per-field verify HALTS on it rather than carrying on toward a
+      // submit that would be missing an approved answer. `presentSample` makes the cause obvious: either
+      // the field is genuinely absent (a cascade that didn't fire) or its automation-id differs from the
+      // one recorded at fill time.
+      // NEVER FATAL — recorded, logged, and judged at the REVIEW PAGE (2026-07-28). An absent field is
+      // not evidence of a problem: Workday routinely stops asking a question whose answer it already
+      // holds (live: the EEO gender/ethnicity/veteranStatus dropdowns were on the FILL's page but gone on
+      // the replay, because the answers are saved server-side), and the caller's cascade re-scan handles
+      // the not-yet-mounted case. Halting here was wrong twice over — it fails a page that is fine, AND
+      // it prevents ever reaching the check that can actually decide.
+      //
+      // The authority is Workday's own review page: the entry keeps its approved value, so
+      // reconcileReviewPage looks for it there and submitPrecondition HARD-BLOCKS on
+      // `missing_on_review`. If the value really was lost it cannot be submitted; if it was merely
+      // already saved, the walk proceeds. And a required field that Workday still wants but we couldn't
+      // fill blocks Save & Continue anyway → the nav-timeout / cascade path. Two backstops, neither of
+      // which needs a guess here.
+      results.push({
+        field: fname, widgetType: entry.widget_type,
+        status: "skipped", flag: "replay-field-absent",
+        detail: `approved value was NOT replayed — no field named "${fname}" on this page (live: ${[...present].slice(0, 12).join(", ") || "none"}${present.size > 12 ? `, +${present.size - 12} more` : ""}); Workday may already hold this answer — the review-page check decides before any submit`,
+        after: null,
+      });
+      continue;
+    }
     const r = await replayField(act, entry, b);
     results.push(Object.assign({ field: fname, widgetType: entry.widget_type }, r));
     await act.delay(b.interFieldMs);
@@ -5677,6 +5737,55 @@ function isTransientRenderFailure(records) {
   return fails.every((r) => RENDER_FLAKE_RX.test(String((r && r.detail) || "") + " " + String((r && r.flag) || "")));
 }
 
+// bundleSubmitBlockers — the BUNDLE-ONLY half of the submit gate: everything decidable from the
+// approved reviewSummary alone, with NO live page (a real bundle, an accepted schema, every
+// flagged/revealed field approved, no unreplaced AI placeholder). PURE.
+//
+// ONE implementation, TWO callers (never a lockstep dup):
+//   • submitPrecondition (below) folds it into the full live gate at the review page — the authority.
+//   • the PRE-FLIGHT check a website-driven submit run does BEFORE opening a tab / signing in
+//     (background.js AP_SUBMIT_APPLICATION), so "3 fields still need approval" is answered in
+//     milliseconds instead of after a full onboard + replay walk.
+// It can only ever ADD blockers — the live gate still re-runs it, so a pre-flight pass is never a
+// licence to submit.
+function bundleSubmitBlockers(bundle) {
+  const blockers = [];
+  const entries = bundle && Array.isArray(bundle.entries) ? bundle.entries.filter((e) => !e.is_deleted) : [];
+  if (!entries.length) blockers.push("no approved bundle entries to replay");
+  if (bundle && bundle.schema_version && ACCEPTED_SCHEMA_VERSIONS.indexOf(bundle.schema_version) === -1) {
+    blockers.push(`bundle schema_version "${bundle.schema_version}" not in accepted ${JSON.stringify(ACCEPTED_SCHEMA_VERSIONS)}`);
+  }
+  // requiresApproval = (needs_review || cascade_revealed) && !deleted — mirrors summary-lib so the gate
+  // and the review editor agree. super-hard / legally-loaded / needs-answer / eeo-guess are ALL
+  // needs_review, so this single check covers the whole mustReplace class.
+  const unapproved = entries.filter((e) => (e.needs_review || e.cascade_revealed) && !e.is_approved);
+  if (unapproved.length) {
+    blockers.push(`${unapproved.length} flagged/revealed field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
+  }
+  const bundlePh = apMatch.unreplacedPlaceholders(entries) || [];
+  if (bundlePh.length) blockers.push(`${bundlePh.length} unreplaced AI placeholder(s) in the bundle`);
+  // A REQUIRED field with NO VALUE must never reach submit (operator 2026-07-27: "did you make sure I
+  // can't blank a mandatory field before approving and going to submit"). The answer was no: the
+  // extension's viewer refused to APPROVE a required-empty field (summary.js `canApprove`), but that
+  // check was UI-only — the website port dropped it, and neither approvalEnvelope's `submit_ready` nor
+  // this gate ever encoded it. The only thing catching it was Workday itself refusing to advance, which
+  // surfaces as a mid-replay nav-timeout halt (live: page 5, "The field Date is required"). Now it's a
+  // first-class blocker, stated up front. Conservative on purpose: a checkbox stores "false" (not empty)
+  // so an unchecked box is never mis-flagged, and file_upload is excluded (the résumé is re-attached by
+  // its own step and has its own resume-not-attached halt). Preferred-name fields are is_required:false,
+  // so a hidden one can't trip this either.
+  const requiredBlank = entries.filter((e) =>
+    e && e.is_required === true &&
+    e.widget_type !== "file_upload" && e.widget_type !== "section_stub" &&
+    e.widget_type !== "nested_section_stub" && e.widget_type !== "removed_entry" &&
+    (e.current_value == null || String(e.current_value).trim() === "")
+  );
+  if (requiredBlank.length) {
+    blockers.push(`${requiredBlank.length} REQUIRED field(s) have no value (${requiredBlank.slice(0, 3).map((e) => e.question_label || e.canonical_field || e.field_id).join(", ")}${requiredBlank.length > 3 ? ", …" : ""}) — Workday will refuse the page`);
+  }
+  return blockers;
+}
+
 // submitPrecondition (M4) — the ORDERED gate for the ONE irreversible click (act.clickSubmit). PURE:
 // every input is passed in; returns { ok, blockers[] } (blockers = human-readable reasons, logged for
 // the operator). ALL conditions must pass. This is the safety surface — clickSubmit fires ONLY when
@@ -5688,7 +5797,6 @@ function submitPrecondition(bundle, liveState, findings, opts) {
   const o = opts || {};
   const f = findings || {};
   const blockers = [];
-  const entries = (bundle && Array.isArray(bundle.entries)) ? bundle.entries.filter((e) => !e.is_deleted) : [];
   // 1. explicit per-run authorization (a token, never a standing setting).
   if (o.authorize !== true) blockers.push("not authorized (authorize !== true)");
   // 2. must be ON the review page — the ONLY page where the footer button IS Submit.
@@ -5696,29 +5804,35 @@ function submitPrecondition(bundle, liveState, findings, opts) {
   // 3. session alive / not planned-maintenance.
   if (liveState && apMatch.isWorkdayMaintenance(liveState)) blockers.push("Workday maintenance page");
   else if (liveState && apMatch.sessionLooksDead(liveState)) blockers.push("session dead / expired");
-  // 4. a real bundle + a schema this build can honor (never replay a stale-build bundle).
-  if (!entries.length) blockers.push("no approved bundle entries to replay");
-  if (bundle && bundle.schema_version && ACCEPTED_SCHEMA_VERSIONS.indexOf(bundle.schema_version) === -1) {
-    blockers.push(`bundle schema_version "${bundle.schema_version}" not in accepted ${JSON.stringify(ACCEPTED_SCHEMA_VERSIONS)}`);
-  }
-  // 5. every field that requires approval IS approved. requiresApproval = needs_review && !deleted
-  //    (mirrors summary-lib requiresApproval); super-hard / legally-loaded / needs-answer / eeo-guess
-  //    are ALL needs_review, so this single check covers the whole mustReplace class.
-  // needs_review OR cascade_revealed (M6: a revealed field forces a second review even if it filled
-  // cleanly) must be human-approved — mirrors summary-lib requiresApproval so the gate and the viewer agree.
-  const unapproved = entries.filter((e) => (e.needs_review || e.cascade_revealed) && !e.is_approved);
-  if (unapproved.length) blockers.push(`${unapproved.length} flagged/revealed field(s) not approved (${unapproved.slice(0, 3).map((e) => e.field_id || e.canonical_field).join(", ")}${unapproved.length > 3 ? ", …" : ""})`);
-  // 6. no unreplaced AI placeholder — in the BUNDLE, and (belt-and-suspenders) on the LIVE page.
-  const bundlePh = apMatch.unreplacedPlaceholders(entries) || [];
-  if (bundlePh.length) blockers.push(`${bundlePh.length} unreplaced AI placeholder(s) in the bundle`);
+  // 4/5/6. the BUNDLE-decidable half — a real bundle + an accepted schema (never replay a stale-build
+  //    bundle), every flagged/revealed field human-approved, no unreplaced AI placeholder. Shared with
+  //    the website submit run's pre-flight check (see bundleSubmitBlockers above) so there is exactly
+  //    ONE implementation of "is this bundle approved enough to submit".
+  blockers.push(...bundleSubmitBlockers(bundle));
+  // 6b. belt-and-suspenders: a placeholder VISIBLE on the LIVE page (the bundle check is above).
   if (f.livePlaceholder) blockers.push("an unreplaced AI placeholder is VISIBLE on the live review page");
-  // 6b. REVIEW-PAGE EQUALITY — the review page must DISPLAY exactly the approved values (operator
+  // 6c. REVIEW-PAGE EQUALITY — the review page must DISPLAY exactly the approved values (operator
   //     requirement). A scrape failure = can't confirm → block (strict). disagree = the page shows a
   //     CONTRADICTING value; missing = an approved value NOT shown on the page. (The caller logs
   //     extra-on-page but does not block on it — review boilerplate is noisy.)
   if (f.reviewScrapeFailed) blockers.push("could not read the review page to confirm it matches the approved values");
   if (Array.isArray(f.reviewDisagree) && f.reviewDisagree.length) blockers.push(`${f.reviewDisagree.length} review-page value(s) DISAGREE with the approved bundle`);
-  if (Array.isArray(f.reviewMissing) && f.reviewMissing.length) blockers.push(`${f.reviewMissing.length} approved value(s) not shown on the review page`);
+  // MISSING alone does NOT block (operator 2026-07-28: "make it so it just checks if anything is filled
+  // wrong. if things are missing it is fine"). DISAGREE is positive evidence — the page shows a value that
+  // CONTRADICTS what was approved. MISSING is absence of evidence, and the review page legitimately does
+  // not render every field: live, `Language*` = "English" was reported missing because that field controls
+  // the page's display language and never appears in the summary, which blocked an otherwise-perfect run
+  // (AGREE 53 · DISAGREE 0). Value-presence matching is heuristic too (short values fall back to
+  // label-anchoring), so a locatable-value failure is not proof a value was lost. It is still SURFACED in
+  // the log for the operator.
+  //
+  // The ONE exception, kept blocking: a value WE deleted ourselves to clear Workday's phantom
+  // duplicate-entry error. There, absence is positive evidence — the whole premise of that fix is that
+  // Workday retained its own copy, so a deleted value that does not come back means the application would
+  // be filed WITHOUT it. See the phantom-duplicate verification in runCdpReplayWalk.
+  if (Array.isArray(f.phantomLost) && f.phantomLost.length) {
+    blockers.push(`${f.phantomLost.length} value(s) deleted to clear Workday's duplicate error did NOT come back on the review page (${f.phantomLost.slice(0, 3).join(", ")}${f.phantomLost.length > 3 ? ", …" : ""}) — submitting would file this application without them`);
+  }
   // 7. no cascade-revealed field the bundle never covered (surfaced during the replay walk).
   if (Array.isArray(f.cascadeRevealed) && f.cascadeRevealed.length) blockers.push(`${f.cascadeRevealed.length} cascade-revealed field(s) not in the approved bundle`);
   // 8. zero replay-verify mismatches / unverifiables across all pages (a clean walk never reaches here
@@ -5796,14 +5910,9 @@ async function captureTypeaheadOptions(act, loc, budgets) {
 // input","dateSectionDay-input","dateSectionYear-input"] → ["month","day","year"]; M/Y → ["month",
 // "year"]; year-only → ["year"]). The summary renders segmented inputs in THIS order (matches the
 // form's mm/dd/yyyy — a browser <input type=date> would show the locale order instead).
-function dateOrderOf(segs) {
-  const order = [];
-  for (const seg of (Array.isArray(segs) ? segs : [])) {
-    const m = /dateSection(Month|Day|Year)/i.exec(String(seg));
-    if (m) { const p = m[1].toLowerCase(); if (!order.includes(p)) order.push(p); }
-  }
-  return order;
-}
+// dateOrderOf lives in lib.js (cascadeEntryFor needs it too). It is reached via apMatch, NOT re-declared
+// here: importScripts loads lib.js and this file into the SAME service-worker global scope, so a second
+// top-level declaration of the same name is a SyntaxError that kills the whole worker (2026-07-28).
 
 // m3b: REVEAL-BY-ADD — an EMPTY unknown section is present only via its Add button + heading (no
 // entry container to read), so mount ONE entry, detect its field shape + the now-known fkit prefix,
@@ -5885,7 +5994,7 @@ async function revealUnknownSection(act, heading, budgets) {
         const cap = await captureTypeaheadOptions(act, loc, budgets); // tree → categories (retag hierarchical); flat → all options
         if (cap) { s.widget_type = cap.widget_type; if (Array.isArray(cap.options) && cap.options.length) s.options = cap.options; }
       } else if (f.widgetType === "date") {
-        const ord = dateOrderOf(f.dateSegments); // the form's segment order → summary renders segmented inputs, not a locale date picker
+        const ord = apMatch.dateOrderOf(f.dateSegments); // the form's segment order → summary renders segmented inputs, not a locale date picker
         if (ord.length) s.date_order = ord;
       }
     } catch (e) { /* non-fatal — the field stays a text box in the summary */ }
@@ -5937,7 +6046,7 @@ function detectSectionShapes(scan) {
     shapes[name] = flat.map((f) => {
       const s = { recName: f.fieldName, path: f.fieldName, widget_type: f.widgetType,
         label: f.label != null ? f.label : f.fieldName, is_required: !!f.isRequired };
-      if (f.widgetType === "date") { const ord = dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; } // m3c: segment order for the summary date editor
+      if (f.widgetType === "date") { const ord = apMatch.dateOrderOf(f.dateSegments); if (ord.length) s.date_order = ord; } // m3c: segment order for the summary date editor
       return s;
     });
   }
@@ -6167,5 +6276,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

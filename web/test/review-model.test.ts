@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { explainFill } from "../lib/review-model";
+import { explainFill, orderForReview, reviewPriority, isBecameRequired, normalizeDateOrder, todayForDateOrder } from "../lib/review-model";
 import type { ReviewEntry } from "../lib/review-summary";
 
 // explainFill turns the engine's terse `detail` log line into intuitive, applicant-facing copy on the
@@ -87,4 +87,84 @@ test("a truly unrecognized needs_review flag falls back to an intuitive nudge, n
 
 test("not flagged, no detail → nothing to say", () => {
   assert.equal(explainFill(mk({ flag: null, detail: null, needs_review: false, fill_status: "filled" })), null);
+});
+
+
+// ── orderForReview — NEW review items at the TOP (operator 2026-07-28) ──────────────────────────────
+// When a submit run sends questions BACK to review, they are the reason the operator reopened the page.
+// In pure form order they landed among fields already approved once, which is where they get missed.
+test("orderForReview: BECAME REQUIRED sorts first, then other revealed, then the loud AI tiers", () => {
+  const plain = mk({ field_id: "a", question_label: "Plain" });
+  const superHard = mk({ field_id: "b", question_label: "Forced AI", flag: "ai-closest-forced", confidence: "low" });
+  const revealed = mk({ field_id: "c", question_label: "Revealed", cascade_revealed: true });
+  const became = mk({ field_id: "d", question_label: "Date", cascade_revealed: true, flag: "cascade-required" });
+  const order = orderForReview([plain, superHard, revealed, became]).map((e) => e.question_label);
+  assert.deepEqual(order, ["Date", "Revealed", "Forced AI", "Plain"]);
+  assert.equal(reviewPriority(became), 0);
+  assert.ok(isBecameRequired(became) && !isBecameRequired(revealed), "only the cascade-required flag is 'became required'");
+});
+
+test("orderForReview: STABLE — form order still decides inside a tier", () => {
+  const a = mk({ field_id: "1", question_label: "First" });
+  const b = mk({ field_id: "2", question_label: "Second" });
+  const c = mk({ field_id: "3", question_label: "Third" });
+  assert.deepEqual(orderForReview([a, b, c]).map((e) => e.question_label), ["First", "Second", "Third"]);
+});
+
+test("orderForReview: two new items keep their form order relative to each other", () => {
+  const d1 = mk({ field_id: "x", question_label: "Date", cascade_revealed: true, flag: "cascade-required" });
+  const d2 = mk({ field_id: "y", question_label: "Please check one of the boxes below", cascade_revealed: true, flag: "cascade-required" });
+  const plain = mk({ field_id: "z", question_label: "Plain" });
+  assert.deepEqual(orderForReview([plain, d1, d2]).map((e) => e.question_label),
+    ["Date", "Please check one of the boxes below", "Plain"]);
+});
+
+
+// ── normalizeDateOrder — the viewer heals its own input (live 2026-07-28, twice) ─────────────────────
+// DateSeg fell back to `{ ph: segment }` for unknown tokens, so a bundle whose date_order held RAW scan
+// ids printed them as the input placeholders. A bundle is DURABLE (and an older extension build may
+// still be installed), so the page must normalize rather than trust.
+test("normalizeDateOrder: RAW scan automation-ids heal to the form's segment order", () => {
+  assert.deepEqual(
+    normalizeDateOrder(["dateSectionMonth-display", "dateSectionMonth-input", "dateSectionDay-display", "dateSectionDay-input", "dateSectionYear-display", "dateSectionYear-input"]),
+    ["month", "day", "year"],
+    "6 raw ids → 3 deduped segments, in the form's own order"
+  );
+  assert.deepEqual(normalizeDateOrder(["dateSectionMonth-input", "dateSectionYear-input"]), ["month", "year"]);
+  assert.deepEqual(normalizeDateOrder(["dateSectionYear-display"]), ["year"], "year-only composites keep their shape");
+});
+
+test("normalizeDateOrder: an already-clean order passes through unchanged", () => {
+  assert.deepEqual(normalizeDateOrder(["month", "day", "year"]), ["month", "day", "year"]);
+  assert.deepEqual(normalizeDateOrder(["year"]), ["year"]);
+});
+
+test("normalizeDateOrder: junk yields [] so the editor degrades to a text box, never prints the token", () => {
+  assert.deepEqual(normalizeDateOrder(["date", "date", "date"]), [], "unrecognized tokens are dropped, not shown");
+  assert.deepEqual(normalizeDateOrder([]), []);
+  assert.deepEqual(normalizeDateOrder(null), []);
+  assert.deepEqual(normalizeDateOrder("month/day/year"), [], "a non-array is not an order");
+});
+
+
+// ── todayForDateOrder — the review page's "Today" button (operator 2026-07-28) ───────────────────────
+// The one date a form asks for that the profile can never hold is TODAY (a signature / acknowledgement
+// date), and it's the field most likely to come back as BECAME REQUIRED.
+test("todayForDateOrder: shaped to the form's OWN segment order, zero-padded", () => {
+  const d = new Date(2026, 6, 5); // 5 Jul 2026, LOCAL
+  assert.deepEqual(todayForDateOrder(["month", "day", "year"], d), ["07", "05", "2026"]);
+  assert.deepEqual(todayForDateOrder(["month", "year"], d), ["07", "2026"], "a month/year composite gets only what it asks for");
+  assert.deepEqual(todayForDateOrder(["year"], d), ["2026"]);
+  assert.deepEqual(todayForDateOrder(["day", "month", "year"], d), ["05", "07", "2026"], "a DD/MM tenant gets its own order, not ours");
+});
+
+test("todayForDateOrder: uses the LOCAL date, not UTC (never sign a form with the wrong day)", () => {
+  // 23:30 local on 5 Jul is already 6 Jul in UTC — a UTC read would fill tomorrow.
+  const lateLocal = new Date(2026, 6, 5, 23, 30);
+  assert.deepEqual(todayForDateOrder(["month", "day", "year"], lateLocal), ["07", "05", "2026"]);
+});
+
+test("todayForDateOrder: an empty/absent order yields nothing to fill", () => {
+  assert.deepEqual(todayForDateOrder([], new Date()), []);
+  assert.deepEqual(todayForDateOrder(null, new Date()), []);
 });

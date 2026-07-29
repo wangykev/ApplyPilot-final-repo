@@ -82,6 +82,13 @@ handoff contract).
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
 | `AP_CLEAR_RESUME` | remove the stored resume (inverse of `AP_SYNC_RESUME`) | IndexedDB `deleteResume()` — idempotent |
 
+> **The two ACTUATING messages** (everything else above only PERSISTS a handoff): **`AP_RUN_APPLICATION`**
+> (the Run button — fill to the review page, never submits) and **`AP_SUBMIT_APPLICATION`** (the Submit
+> button — replay the APPROVED bundle → review-page equality → the submit gate → submit once). The latter
+> takes `{ startUrl, arm }`: **without `arm:true` it is a full DRY rehearsal** (identical code path, logs
+> "would submit", never clicks), and the site only sends `arm:true` from the second click of a two-step
+> confirm. Both return the `login` they signed in as (below).
+
 - **Live sync (M13).** Connecting once is enough: after the extension id is saved on the device
   (`localStorage["applypilot.extensionId"]`, the Connect page), every profile / bucket / AI-config /
   resume edit is pushed to the extension automatically from the browser via `lib/extension-sync.ts`
@@ -98,8 +105,11 @@ handoff contract).
 ### 2. Extension → Backend (report application status) — P2 (credential plumbed in v1)
 
 After a fill/walk, the SW POSTs to `{ingestUrl}` with `Bearer {ingestKey}`:
-`{ company, role, url, status, needs_review_count, captured_at, review_bundle }`. A Next.js route
-validates the per-user ingest key (an `api_keys` row) and upserts-by-URL an `applications` row.
+`{ company, role, url, job_key, status, needs_review_count, captured_at, review_bundle, login }`. A Next.js
+route validates the per-user ingest key (an `api_keys` row) and upserts-by-`job_key` an `applications` row.
+**A report never NULLS a column it wasn't given** (`lib/report-fields.ts`, PURE + unit-tested): `company` / `role` / `url` / `job_key` / `applied_at` are OMITTED from the write when absent, so an UPDATE can't erase them. `reportApplication` sends `role: null` on every report (the extension doesn't know the job title) and a null `company` when the run has no jobContext — which wiped the tracker row's company + role after a Rehearse run (the FILL path only survived because `saveRunJob` rewrites them afterwards from the scraped JD). The report's OWN payload — status / needs_review_count / review_bundle_json — is always written. `login` = `{ email, tenant, host, created, verified, at }`, the account that run actually signed in as →
+the `login_*` columns (migration `0011`). It is MATCH-GATED extension-side (see CLAUDE.md → Onboarding), and
+an absent/emailless `login` leaves any previously-recorded account untouched — never blanked.
 Per-user API key avoids extension-side OAuth token refresh. **Both** the single-page CDP fill
 (`runCdpFillPage`) and the multi-page walk (`runCdpWalk`, on every exit) push the accumulated
 review bundle, so the website always has the latest to review.
@@ -108,8 +118,12 @@ review bundle, so the website always has the latest to review.
 
 The website is the **review surface** (edit + approve — see the review-editor section). Before a
 replay/submit, the SW **pulls** the human-approved bundle from `{reviewUrl}`
-(`GET /api/extension/review?url=…` with `Bearer {ingestKey}`) and writes it into
-`chrome.storage.local.reviewSummary` — the exact slot `runCdpReplayWalk` reads. `pullApprovedBundle`
+(`GET /api/extension/review?job_key=…` — or the legacy `?url=` — with `Bearer {ingestKey}`) and writes it
+into `chrome.storage.local.reviewSummary` — the exact slot `runCdpReplayWalk` reads. **`job_key` is
+mandatory for a SUBMIT run:** with only `?url=` (or neither) the route falls back to *the most-recently-
+updated application that has a bundle*, so a submit for job B could replay job A's approved answers into
+B's form and submit it. When `job_key` is given the route NEVER widens (no match ⇒ `bundle:null`) and the
+caller refuses. `pullApprovedBundle`
 NEVER throws: not-connected / no-remote-bundle / HTTP error all fall back to the local bundle, so
 replay is never blocked by the network. **When the site is connected and has a bundle, it is the
 source of truth** (it overwrites the local one — the point of hosting review on the site); the
@@ -125,7 +139,7 @@ The extension's `prepareProfile` (`background.js`) DERIVES `*Parsed` (dates), `b
 fields** — never the derived ones. Reference: `data/profile.example.json`.
 
 - `personal_info` — `first_name`, `last_name`, `has_preferred_name` + `preferred_first_name` + `preferred_last_name` (revealed by an "I have a preferred name" checkbox — the extension's `preferredCheck`/`preferredName--first/last` already map these), address, email, phone, `country`*, `country_phone_code`* (*=tiered array).
-- `websites[]` — `{type, url}` (url gets `https://` prepended; `label` was dropped — the extension only fills url). The editor pins **3 fixed rows** (LinkedIn / GitHub / Personal Website, **type locked**); added rows carry a custom type.
+- `websites[]` — `{type, url}` (`label` was dropped — the extension only fills url). The editor pins **3 fixed rows** (LinkedIn / GitHub / Personal Website, **type locked**); added rows carry a custom type. **`url` is stored as the FULL CANONICAL link — scheme AND `www.`** (`ensureHttpsUrl`, lockstep with the extension's `ensureHttps`): `linkedin.com/in/you` → `https://www.linkedin.com/in/you`. Required because the form canonicalizes to the www host, and a bare-host value then fails every equality tier (exact / containment / fuzzy-89-vs-90) → an M40 audit flag and a **blocked submit**. `www.` goes on a bare APEX host only (2 labels, or 3 ending in `co.uk`-style suffixes) — an existing subdomain, an IP, or userinfo is left untouched, since `www.blog.example.com` usually doesn't resolve. Idempotent; applied on parse + editor blur, so stored profiles self-heal on their next save.
 - `education[]` — `{school_or_university, degree*, field_of_study*, minor, gpa, gpa_scale, from_year("YYYY"), to_year("YYYY"), graduation_date("YYYY-MM"), currently_enrolled, …}`.
 - `work_experience[]` — `{job_title, company, location, currently_work_here, from("YYYY-MM"), to("YYYY-MM"), role_description, tech_stack[]}`. **`role_description` (one Workday-style textarea, dash-bulleted) REPLACED `bullets[]`** — `coerceProfile` migrates legacy bullets → `- ` lines; the extension's `prepareProfile` derives `bulletsText` from it (bullets fallback), so `WORK_EXPERIENCE_MAP` is unchanged.
 - `languages[]` `{language, reading, speaking, writing, fluent}` — `fluent` (tri-bool) is the human-set "I am fluent" box; `prepareProfile` uses it when set, else derives from reading∧speaking∧writing. `certifications[]` `{certification*, certification_number, issued_date("YYYY-MM-DD"), expiration_date, specialties[]}`; each specialty `{specialty, start_date("YYYY-MM-DD"), end_date, attachment}` — nested repeating, matches the extension's `CERT_NESTED`. `projects[]`.
@@ -265,7 +279,7 @@ per-entry `is_approved`/`current_value`/`edit_kind`/`is_deleted`.
 - `profiles` — one row/user: `profile_json`, `buckets_json` (answer buckets — migration `0002_buckets.sql`), `defaults_json`, `job_context_json`, `ai_config` (provider/model/key/enabled), `updated_at`.
 - `resumes` — `id, user_id, kind('default'|'variant'), job_id?, filename, mime, size, storage_path, created_at`.
 - **Storage buckets:** `resumes` (0001) + `attachments` (0003) — both private, objects path-namespaced under `<uid>/`.
-- `applications` — `id, user_id, company, role, url, status('queued'|'filling'|'needs_review'|'submitted'|'interviewing'|'offer'|'rejected'), needs_review_count, review_bundle_json?, applied_at, …`.
+- `applications` — `id, user_id, company, role, url, job_key, status('queued'|'filling'|'needs_review'|'submitted'|'interviewing'|'offer'|'rejected'), needs_review_count, review_bundle_json?, job_description?, applied_at, deleted_at?, …` **+ the LOGIN this application was filed with** (migration `0011`): `login_email, login_tenant, login_host, login_created` (the account was CREATED that run), `login_verified` (the email round-trip completed), `login_at`. Workday accounts are per-tenant, so this is what tells you how to sign back in when a recruiter replies — and after a create-account run it's the only record the account exists. The PASSWORD is deliberately NOT duplicated here; it lives once on `profiles.credentials_json`. `status:'submitted'` is written ONLY by the site's own `saveRunSubmit` (the extension never reports it — the human authorizes a submit).
 - `queue_items` — `id, user_id, url, status, position, created_at`.
 - `reminders` — `id, application_id, due_at, note`.
 - `api_keys` — `id, user_id, key_hash, label, last_used_at` (the extension ingest credential).
@@ -335,6 +349,21 @@ extension's discipline.
 
 - **M16 — Teach two-axis routing + default wordings + full URLs** *(done; web typecheck + build green, `test/teach.test.ts` 59 tests)*: the teach flow treats the question WORDING (bucket) and the ANSWER (value / variant ladder) as INDEPENDENT axes. `decideTeachPlan(profile, path, card, buckets)` replaces the binary route, checked in order: answer already held → **wording** (bucket only); field EMPTY → **answer** (set the value); a SCALAR holding a different value → **variant** (the tenant's phrasing goes to `answer_ladders[path].values` — the stored value is NEVER overwritten, the live race "Asian" vs the form's "Asian (not hispanic or latino)"), and when the wording is new too → **both**, a MERGED popup showing the question bucket and the answer ladder side by side. Boolean/list fields keep the value route (a polarity flip / list append is a real value change). `fieldHoldsAnswer` now counts the variants ladder, so a taught variant never resurfaces as a card. **"Wrong field?" picks on the PANEL** — the profile is already displayed on the right, so retarget mode turns each row into one click target (Escape/Cancel exits; "Search all fields…" still reaches the picker for a new answer / an existing bucket). **`ensureDefaultFieldWordings(buckets, profile)`** seeds every profile field's bucket with the field's own name as a wording (the first-name bucket contains "First Name"), applied on LOAD next to `ensureStarterBuckets` at the sync slice, the teach API and the profile bucket editor; non-destructive + idempotent, skipping labels too generic to be safe exact matches and every repeating entry past the primary one — **WEBSITES excepted both ways**: each entry is a distinct question, so every entry gets a bucket seeded with its TYPE ("LinkedIn" / "GitHub" / "Personal Website", never "URL"). **Website URLs are stored as FULL `https://` URLs** (`websiteSchema.url` transforms through `ensureHttpsUrl`, lockstep with the extension's `ensureHttps`; the editor normalizes on blur and flags a value that still can't be a URL). New profile field **"Willing to relocate at your own cost"** (triBool) next to Willing to relocate.
 
+- **M17 — Submit from the Run page + the login behind each application** *(built 2026-07-26; extension suite 724/724, web typecheck + build green, live-verify pending)*: two operator asks.
+  **`/app/run` Submit** — the site now drives the THIRD stage, not just the fill. A "Submit this application" card offers **Rehearse (no submit)** and **Submit** (a two-step "this can't be undone" confirm; the pending confirmation is dropped if the link is edited), both firing the new **`AP_SUBMIT_APPLICATION`**: pull the approved bundle for THIS job → pre-flight → fresh visible tab → sign in → replay every approved answer with strict per-field verify → review-page equality → the submit gate → submit once. Rehearse is the identical path with the click withheld, so a dry run proves the whole gate. `interpretSubmit` + `REPLAY_STOP` turn every halt into plain language (a replay halt usually means "the form changed since you approved it"), and gate blockers render as a list rather than an opaque stop. `saveRunSubmit` is the ONE writer of `status:'submitted'` (a rehearsal writes no status — it must never make an unsubmitted application look submitted).
+  **Per-application login** (migration `0011`) — `applications.login_*` records the Workday account each application was filed with, reported by the extension (the thing that actually signed in) and mirrored by `saveRunJob` from the run response; shown on `/app/tracker/[id]` as "Signed in as … on «tenant»" with *account created* / *email verified* badges, and nothing at all when unknown.
+  **⚠ Fixed en route:** `GET /api/extension/review` fell back to *the most-recently-updated bundle* when its `?url=` didn't match, so a submit run for one job could have replayed **another application's approved answers into it and submitted**. The route now honors an exact `?job_key=` with no widening, and the extension refuses instead of falling back.
+
+- **M18 — Website URLs require `www` (the full canonical link)** *(done 2026-07-26; extension 728/728, web tests 62/62, typecheck + build green)*: `ensureHttpsUrl` / `ensureHttps` (LOCKSTEP) now canonicalize a website URL to scheme **+ `www.` on a bare apex host**, not just a scheme. Triggered by a live LinkedIn mismatch: the profile held `https://linkedin.com/in/…` while the form ended up holding the `www.` form, and that pair fails **every** equality tier we have — exact, containment (`www.` is inserted mid-string, so neither contains the other), and fuzzy at **89** against the 90 bar — so the M40 audit flagged a perfectly good deterministic fill and `submitPrecondition` would BLOCK on a review-page DISAGREE. `www.` is added ONLY to an apex host (2 labels, or 3 ending in a `co.uk`-style multi-part suffix); a host with an existing subdomain, an IP, or userinfo is returned untouched, because inventing `www.blog.example.com` breaks a working link — a worse failure than the mismatch. Idempotent (never stacks), applied on schema parse and editor blur so existing profiles self-heal on their next save; the editor's hint/placeholder/error now say "including www". A cross-check script confirmed both copies return byte-identical output on 16 inputs.
+
+- **M19 — New review items on top; dates never teach** *(done 2026-07-28; web tests 69/69, typecheck + build green)*: two operator asks after the cascade flow went live.
+  **NEW items first.** When a submit run sends questions BACK to review (`cascade-required`), they are the reason the operator reopened the page — in pure form order they landed among fields already approved once, which is where they get missed. `reviewPriority` / `orderForReview` (`lib/review-model.ts`, PURE) sort the "Needs review" list: **0** became-required → **1** otherwise cascade-revealed → **2** super-hard AI → **3** must-replace → **4** the rest. STABLE, so form order still decides within a tier, and the existing loudness ordering is preserved underneath. `ReviewEditor`'s `flagged` memo is now one call.
+  **Dates never become teach cards.** A signature/acknowledgement date is per-APPLICATION: remembering it would teach a bucket to fill a STALE date on every future form — worse than not learning it. `isDateOnlyQuestion(label, widget)` (`lib/teach.ts`) excludes the `date`/`year` WIDGETS (which can't be bucket-filled anyway) and bare date asks by label ("Date", "Date*", "Today's Date", "Date Signed On", "Signature Date", …). Deliberately NARROW — "Date of Birth" and "Graduation Date" ARE reusable answers and keep teaching. Wired into `isTeachable`.
+
+- **M20 — Date fields: self-healing editor + a "Today" button** *(done 2026-07-28; web tests 75/75, typecheck + build green)*:
+  **The viewer normalizes its own input.** `DateSeg` fell back to `{ ph: segment }` for an unknown token, so a bundle whose `date_order` held RAW scan ids (`dateSectionMonth-display`, …) printed them as the input placeholders. Fixing the extension only fixed NEW bundles — a review bundle is DURABLE — so `normalizeDateOrder` (`lib/review-model.ts`, PURE) now heals whatever it's handed (raw ids or clean tokens → `["month","day","year"]`, deduped, unknowns dropped) and degrades to a plain text box when nothing survives. An unrecognized token can never reach the UI as a placeholder again.
+  **A "Today" button** sits beside every segmented date editor: the one date a form asks for that the profile can never hold is *today* (a signature / acknowledgement date), and it's the field most likely to come back as BECAME REQUIRED. `todayForDateOrder(order, now?)` (PURE, injectable clock) shapes today to the form's OWN order — a month/year or DD/MM composite gets only what it asks for — zero-padded to match the MM/DD placeholders, using the **LOCAL** date so a late-evening click can't sign the form with tomorrow's UTC day. The click commits the computed values directly rather than through the `parts` state it is setting (a stale-state race). Value format round-trips: the extension's `auditDateMatches` compares with `parseInt`, so padding is irrelevant.
+
 ## Design directions (under review)
 
 Operator chose the **flight-deck** direction (dark + amber instrument panel). The set is now four
@@ -369,7 +398,7 @@ copy its ID, paste it on `/app/connect`, then **Sync to extension**.
 
 ### Supabase setup (one-time)
 1. Create a Supabase project. Project Settings → API → copy the URL + anon key + service-role key into `web/.env.local`.
-2. Run the migrations in `web/supabase/migrations/` **in order**: `0001_init.sql` (tables + RLS + private `resumes` bucket), `0002_buckets.sql` (`profiles.buckets_json`), `0003_attachments.sql` (private `attachments` bucket + RLS).
+2. Run **every** migration in `web/supabase/migrations/` **in numeric order** (`0001_init.sql` tables + RLS + private `resumes` bucket → `0002_buckets.sql` → `0003_attachments.sql` → … → `0011_application_login.sql`). `web/supabase/schema.sql` is a consolidated one-paste snapshot of the same thing for a fresh project; on an EXISTING project run the new migrations only.
 3. Auth → Providers → enable **Email** and **Google** (set the Google OAuth client + the `…/auth/callback` redirect).
 4. Remove `NEXT_PUBLIC_DEV_PREVIEW` from `.env.local` to enforce real auth.
 

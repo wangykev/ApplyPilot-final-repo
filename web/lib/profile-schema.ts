@@ -25,16 +25,48 @@ const bool = z
 const tiered = z.array(z.string()).default([]);
 
 /**
- * A website URL is stored as a FULL absolute URL (operator, 2026-07-26): a bare "linkedin.com/in/you"
- * is not what a form's URL field wants, and Workday's own validation rejects it. Prepends "https://"
- * when the value carries no scheme; an explicit http:// or https:// is left alone. LOCKSTEP with the
- * extension's ensureHttps (lib.js), which normalizes the same way at fill time — doing it here too
- * means the value the operator SEES, the value synced to the extension, and the value filled all match.
+ * A website URL is stored as the FULL canonical link (operator, 2026-07-26): a scheme, AND "www." on a
+ * bare apex host — "linkedin.com/in/you" → "https://www.linkedin.com/in/you". A bare host is not what a
+ * form's URL field wants, and Workday's own validation rejects it.
+ *
+ * WHY www is REQUIRED, not cosmetic: the site (and the form) canonicalize to the www host, so a stored
+ * bare host stops matching what the page actually holds — and that mismatch fails EVERY equality tier
+ * in the pipeline (exact; containment, since "www." is inserted mid-string so neither side contains the
+ * other; and fuzzy, which lands at 89 against the 90 bar). The result is an M40 audit flag and a
+ * submitPrecondition BLOCK on a review-page DISAGREE. Storing the canonical form keeps the profile, the
+ * page and the approved bundle byte-identical.
+ *
+ * www is added ONLY to a bare apex host, because it is WRONG anywhere else: "blog.example.com" has no
+ * "www.blog.example.com", and neither does most personal-domain hosting. A host that already carries
+ * ANY subdomain (including "www.") is left untouched, as are IP/userinfo hosts. An apex is 2 labels
+ * ("linkedin.com"), or 3 whose last two are a public multi-part suffix ("example.co.uk").
+ *
+ * LOCKSTEP with the extension's ensureHttps (lib.js), which normalizes the same way at fill time — so
+ * the value the operator SEES, the value synced to the extension, and the value filled all match.
  */
+const APEX_MULTIPART_TLD = /^(co|com|net|org|edu|gov|ac|gob|mil)\.[a-z]{2}$/i;
+
 export function ensureHttpsUrl(url: unknown): string {
   const t = String(url ?? "").trim();
   if (!t) return "";
-  return /^https?:\/\//i.test(t) ? t : "https://" + t;
+  const withScheme = /^https?:\/\//i.test(t) ? t : "https://" + t;
+  try {
+    const u = new URL(withScheme);
+    if (u.username || u.password) return withScheme; // user:pass@host — the splice below can't be trusted
+    const host = u.hostname;
+    if (!host || /^[\d.]+$/.test(host) || host.includes(":")) return withScheme; // IPv4/IPv6 → never www
+    const labels = host.split(".");
+    const isApex =
+      labels.length === 2 ||
+      (labels.length === 3 && APEX_MULTIPART_TLD.test(labels.slice(-2).join(".")));
+    if (!isApex) return withScheme; // already subdomained (incl. www.) → leave alone
+    // Splice "www." after the scheme rather than rebuilding via URL.toString(), which would also
+    // normalize the rest (e.g. appending a trailing "/" to a path-less URL) — we change the host only.
+    const m = /^(https?:\/\/)([\s\S]*)$/i.exec(withScheme);
+    return m ? m[1] + "www." + m[2] : withScheme;
+  } catch {
+    return withScheme; // unparseable → still better than a scheme-less value; never throws
+  }
 }
 
 /** Does this look like a usable absolute URL? (post-normalization — for the editor's inline hint) */

@@ -532,6 +532,7 @@ function cdpSetSyntheticInput(on) {
   _synthInputEnabled = !!on;
   if (on) console.log("[ApplyPilot][CDP] synthetic input ENABLED for this run's fill — hidden-tab actuation dispatches page-side (trusted when visible; forceTrustedInput overrides).");
 }
+function cdpSyntheticInputEnabled() { return _synthInputEnabled; } // so a caller can SAVE/RESTORE around a deliberately-trusted step
 async function cdpSynthInput() {
   if (!_synthInputEnabled || _forceTrustedInput) return false;
   return !(await cdpVisible()); // hidden ⇒ synthetic page-side dispatch (fast); visible ⇒ trusted Input.* (proven)
@@ -616,6 +617,167 @@ function cdpSynthSetValue(text, withKeystroke) {
     if (keyInit) { try { el.dispatchEvent(new KeyboardEvent("keyup", keyInit)); } catch (e) {} }
     return { ok: true, value: el.value };
   } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+}
+
+// ── Committing a field before the page is saved (2026-07-28) ─────────────────
+// Workday validates a field on BLUR. Real typing ends with the user moving away, which fires
+// blur/focusout; `cdpSynthSetValue` fires keydown/input/change/keyup and NOTHING ELSE, and the only
+// thing that blurs a synthetic-filled field is the NEXT synthetic click calling el.focus() (which fires
+// the previous element's blur as a side effect). So the LAST field filled on a page is still focused
+// when Save & Continue is clicked, and its blur — hence Workday's validation commit — races the submit
+// in the same tick. Live on a HIDDEN solarturbines replay, page 5: every value physically correct and
+// verified, and Save came back "The field Name is required and must have a value" + the same for Date.
+// The operator's own workaround is the proof: *click into the field, then press Next, and the error goes
+// away* — that is a focus/blur cycle with time to land.
+//
+// Two primitives, used at two moments:
+//   • cdpCommitPendingEdits  — PREVENTIVE, run just before every Save & Continue: blur whatever is
+//     focused so the page has no uncommitted edit when it's submitted.
+//   • cdpNudgeFieldCommit    — CURATIVE, run only when Workday claims a field is empty that visibly
+//     holds a value: focus → change → blur each of that field's inputs, reproducing the manual fix.
+// Both use the REAL .focus()/.blur() methods, so the browser sequences genuine focus events; nothing
+// here touches a VALUE, so neither can turn a correct fill into a wrong one.
+function cdpCommitPendingEdits() {
+  const el = document.activeElement;
+  if (!el || el === document.body || typeof el.blur !== "function") return { blurred: false };
+  const editable = (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+  if (!editable) return { blurred: false, skipped: el.tagName };
+  const tag = (el.getAttribute && (el.getAttribute("data-automation-id") || el.getAttribute("aria-label"))) || el.tagName;
+  window.__apActing = (window.__apActing || 0) + 1;
+  try {
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) { /* handlers are best-effort */ }
+    el.blur();                       // REAL blur → the browser fires blur + focusout in the right order
+    return { blurred: true, tag: String(tag || "") };
+  } catch (e) {
+    return { blurred: false, error: String(e) };
+  } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+}
+
+// Focus→change→blur every value-bearing input inside each wrapper. For a DATE composite that walks the
+// month/day/year spinbuttons exactly as tabbing through them would. Checkboxes/radios are SKIPPED — their
+// commit is the click itself (already read-back verified), and they have no pending-edit state to flush.
+function cdpNudgeFieldCommit(wrapperSels) {
+  const out = [];
+  const sels = Array.isArray(wrapperSels) ? wrapperSels : [];
+  window.__apActing = (window.__apActing || 0) + 1;
+  try {
+    for (const sel of sels) {
+      let w = null;
+      try { w = document.querySelector(sel); } catch (e) { w = null; }
+      if (!w) { out.push({ sel, nudged: 0, reason: "wrapper not on the page" }); continue; }
+      const inputs = Array.prototype.slice.call(w.querySelectorAll('input, textarea, [contenteditable="true"]'))
+        .filter((el) => !el.disabled && el.type !== "hidden" && el.type !== "checkbox" && el.type !== "radio" && el.type !== "file");
+      let n = 0;
+      for (const el of inputs) {
+        try {
+          el.focus();
+          if (document.activeElement !== el) continue;   // couldn't focus it — a nudge that didn't happen
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.blur();
+          n++;
+        } catch (e) { /* per-input best effort; the caller re-checks the errors either way */ }
+      }
+      out.push({ sel, nudged: n, inputs: inputs.length });
+    }
+    return out;
+  } finally { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }
+}
+
+// ── Diagnosing a "required" error on a field that LOOKS filled (2026-07-28, round 2) ─────────────────
+// The blur-commit fix (cdpCommitPendingEdits / cdpNudgeFieldCommit) did NOT clear it, so the mechanism is
+// something else and a third guess is not worth making. This is READ-ONLY and dumps, at the moment of the
+// failure, the facts that separate the hypotheses that remain — the same "make the next occurrence answer
+// it" move that settled the auth-render halts:
+//
+//   • H1 the DOM holds the value and Workday's model disagrees anyway
+//        ⇒ domValue set, reactValue set
+//   • H2 the value REVERTED after we verified it (the "watched it uncheck itself" class on this very page)
+//        ⇒ domValue EMPTY
+//   • H3 React's internal state never took the value, so its next render will wipe it
+//        ⇒ domValue set, reactValue EMPTY/different  ← the native-setter didn't reach React
+//   • H4 the error is STALE — rendered before our fill, and the Save click was actually swallowed
+//        ⇒ errorsInsideWrapper false / the error node is a page-level banner only
+//   • H5 the DATE composite is the odd one out (spinbuttons carry aria-valuenow, not value)
+//        ⇒ per-segment value vs ariaValueNow disagree
+//
+// Reading React's internals is the load-bearing part: `value` in the DOM and React's `memoizedProps.value`
+// are exactly what diverge when a native-setter write doesn't notify React, and that divergence is
+// invisible to every check we already have (read-backs, the M40 audit and the page scan all read the DOM).
+function cdpDiagnoseFieldCommit(wrapperSels) {
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  // React attaches its fiber/props under keys like "__reactProps$hash" — the ONLY way to see the state
+  // the component will re-render from. Defensive throughout: an internals change must degrade to nulls,
+  // never throw inside a diagnostic.
+  const reactOf = (el) => {
+    const out = { propsValue: undefined, fiberValue: undefined, propsKeys: null };
+    try {
+      const keys = Object.keys(el);
+      const pk = keys.find((k) => k.indexOf("__reactProps$") === 0);
+      const fk = keys.find((k) => k.indexOf("__reactFiber$") === 0);
+      if (pk && el[pk]) { out.propsValue = el[pk].value; out.propsKeys = Object.keys(el[pk]).slice(0, 12).join(","); }
+      if (fk && el[fk]) {
+        let f = el[fk];
+        for (let i = 0; i < 4 && f; i++) {
+          if (f.memoizedProps && "value" in f.memoizedProps) { out.fiberValue = f.memoizedProps.value; break; }
+          f = f.return;
+        }
+      }
+    } catch (e) { out.error = String(e); }
+    return out;
+  };
+
+  const errorNodes = Array.prototype.slice.call(document.querySelectorAll('[data-automation-id*="rror" i], [role="alert"]'))
+    .map((n) => ({ automationId: n.getAttribute("data-automation-id") || null, role: n.getAttribute("role") || null, text: clean(n.textContent).slice(0, 200), node: n }));
+
+  const fields = (Array.isArray(wrapperSels) ? wrapperSels : []).map((sel) => {
+    let w = null;
+    try { w = document.querySelector(sel); } catch (e) { w = null; }
+    if (!w) return { sel, present: false };
+    const inputs = Array.prototype.slice.call(w.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="spinbutton"]'))
+      .map((el) => {
+        const r = reactOf(el);
+        return {
+          tag: el.tagName,
+          automationId: el.getAttribute("data-automation-id") || null,
+          type: el.getAttribute("type") || null,
+          role: el.getAttribute("role") || null,
+          domValue: "value" in el ? el.value : null,
+          defaultValue: "defaultValue" in el ? el.defaultValue : null,
+          textContent: el.isContentEditable ? clean(el.textContent).slice(0, 60) : null,
+          ariaValueNow: el.getAttribute("aria-valuenow"),      // date spinbuttons live here, not in .value
+          ariaInvalid: el.getAttribute("aria-invalid"),
+          ariaRequired: el.getAttribute("aria-required"),
+          checked: el.type === "checkbox" || el.type === "radio" ? !!el.checked : null,
+          disabled: !!el.disabled,
+          isActiveElement: el === document.activeElement,
+          reactPropsValue: r.propsValue === undefined ? "(none)" : r.propsValue,
+          reactFiberValue: r.fiberValue === undefined ? "(none)" : r.fiberValue,
+          reactPropsKeys: r.propsKeys,
+        };
+      });
+    // Is the error rendered INSIDE this field's wrapper (its own validation) or only in the page-level
+    // banner (possibly stale — H4)? The node scan alone got this WRONG live: it reported "NONE" while the
+    // wrapper's own text plainly read "Error: The field Name is required…", because Workday's inline error
+    // element carries neither an "error"-ish automation-id nor role="alert". So fall back to the wrapper's
+    // TEXT, which is the thing the operator actually sees.
+    const wrapperText = clean(w.textContent).slice(0, 240);
+    const inside = errorNodes.filter((e) => { try { return w.contains(e.node); } catch (x) { return false; } })
+      .map((e) => ({ automationId: e.automationId, text: e.text }));
+    const inlineErrorText = (clean(w.textContent).match(/Error:\s*[^]*?(?=$|Error:)/) || [null])[0];
+    return { sel, present: true, wrapperText, inputs, errorsInsideWrapper: inside,
+      inlineErrorInWrapperText: inlineErrorText ? String(inlineErrorText).slice(0, 160) : null };
+  });
+
+  return {
+    url: location.href,
+    activeElement: (function () {
+      const a = document.activeElement;
+      if (!a || a === document.body) return "(body/none)";
+      return (a.getAttribute && (a.getAttribute("data-automation-id") || a.getAttribute("aria-label"))) || a.tagName;
+    })(),
+    fields,
+    allErrorNodes: errorNodes.map((e) => ({ automationId: e.automationId, role: e.role, text: e.text })),
+  };
 }
 
 // ── Input primitives (trusted, off-loop) ────────────────────────────────────
@@ -1752,16 +1914,179 @@ function cdpOnboardScan() {
     // state, NOT an error (see isAlreadyApplied); the title can be a stale "Create Account", so the
     // automation-id is the reliable signal.
     alreadyAppliedPage: present('[data-automation-id="alreadyAppliedPage"]'),
+    // Candidate-home "My Applications" list — the page the already-applied recovery navigates to in
+    // order to read whether the application was REALLY submitted (2026-07-28). These automation-ids are
+    // UNCONFIRMED across tenants (no recon dump captured yet), so they're a bonus signal only:
+    // isMyApplicationsPage falls back to heading + status text, which is what the operator reads.
+    myApplicationsPage: present('[data-automation-id="applicationsSectionHeader"]')
+      || present('[data-automation-id="candidateHomePage"]')
+      || present('[data-automation-id="myApplicationsPage"]'),
     formField: formFields.length > 0
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
   const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
   return {
     url: location.href, host: location.host, title: document.title,
+    // Was the document still parsing when we read it? The auth widget can be MID-RENDER (auth chrome
+    // present, email/password not in the DOM yet) — indistinguishable from "this page has no fields"
+    // without this. A hidden tab makes it common; the waitFor timeout logs it (2026-07-27).
+    readyState: document.readyState,
     bodyText,
     formFieldCount: formFields.length,
     emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,
     markers
+  };
+}
+
+// ── Already-applied recovery reads (2026-07-28) ──────────────────────────────
+// Workday sometimes shows "You've already applied for this job" for an application that was STARTED but
+// never SUBMITTED (operator-observed). The only authority on which it is, is the candidate's own
+// "My Applications" list. These three reads drive the recovery; every DECISION on their output is a pure
+// lib.js function (isMyApplicationsPage / applicationStatusOf / pickApplicationRow / classifyWorkdayPage).
+//
+// DELIBERATELY GENERIC. We have no confirmed DOM for this page on any tenant, so instead of guessing an
+// automation-id and silently reading nothing, this enumerates the page STRUCTURALLY (every job-ish link,
+// its enclosing row, that row's text) and returns enough raw material for the SW to both decide AND, on a
+// miss, PRINT what it actually saw. The first live run therefore either works or self-reports the exact
+// DOM needed to tighten it — no second recon round to learn the shape.
+function cdpReadApplicationsPage() {
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const STATUS_RX = /\bnot submitted\b|\bunsubmitted\b|\bsubmitted\b|\bin progress\b|\bincomplete\b|\bdraft\b|\bstarted\b|\bunder consideration\b/i;
+
+  // A row is the smallest ancestor of the link that carries a status word — that's what makes it "a row"
+  // rather than "the link" or "the whole page". Bounded climb; falls back to the nearest tr/li.
+  const rowFor = (a) => {
+    let el = a, best = null;
+    for (let i = 0; i < 8 && el && el !== document.body; i++) {
+      const tag = (el.tagName || "").toLowerCase();
+      if ((tag === "tr" || tag === "li") && !best) best = el;
+      if (STATUS_RX.test(clean(el.textContent))) return el;
+      el = el.parentElement;
+    }
+    return best || a.parentElement || a;
+  };
+
+  const links = Array.prototype.slice.call(document.querySelectorAll("a[href], [role='link'][href]"));
+  const seen = new Set();
+  const rows = [];
+  for (const a of links) {
+    const href = a.getAttribute("href") || "";
+    const title = clean(a.textContent);
+    if (!title) continue;
+    // Job-ish: a posting/application link, or a requisition id in the href/text. Skip nav chrome.
+    const jobish = /\/job\/|\/apply\b|applicationId|jobRequisition|_R\d|\bR\d{5,}\b/i.test(href + " " + title);
+    if (!jobish) continue;
+    const row = rowFor(a);
+    const rowText = clean(row.textContent).slice(0, 400);
+    const key = href + "|" + title;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let rect = null;
+    try { const r = a.getBoundingClientRect(); rect = { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height }; } catch (e) { /* off-screen */ }
+    const statusMatch = rowText.match(STATUS_RX);
+    rows.push({
+      index: rows.length,
+      title,
+      href: a.href || href,                  // absolute when the browser resolved it
+      text: rowText,
+      statusText: statusMatch ? statusMatch[0] : null,
+      rowAutomationId: (row.getAttribute && row.getAttribute("data-automation-id")) || null,
+      visible: !!(rect && rect.w > 0 && rect.h > 0)
+    });
+  }
+
+  // COLLAPSED sections — the operator's "sometimes the application dropdown is closed so you will have to
+  // open it". Anything that advertises itself as collapsed is a candidate to expand; the SW clicks them
+  // and re-reads until the row count stops growing (settle, never a fixed beat).
+  const collapsed = Array.prototype.slice.call(document.querySelectorAll('[aria-expanded="false"]'))
+    .map((el, i) => {
+      let rect = null;
+      try { const r = el.getBoundingClientRect(); rect = { w: r.width, h: r.height }; } catch (e) { /* ignore */ }
+      return {
+        index: i,
+        label: clean(el.getAttribute("aria-label") || el.textContent).slice(0, 80),
+        automationId: (el.getAttribute("data-automation-id")) || null,
+        visible: !!(rect && rect.w > 0 && rect.h > 0)
+      };
+    })
+    .filter((c) => c.visible);
+
+  return {
+    url: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    rows,
+    collapsed,
+    // Diagnostic material for a miss: what the page actually is, so a failed pick prints something useful.
+    headings: Array.prototype.slice.call(document.querySelectorAll("h1, h2, h3, h4")).map((h) => clean(h.textContent)).filter(Boolean).slice(0, 12),
+    bodyText: clean(document.body ? document.body.innerText : "").slice(0, 4000)
+  };
+}
+
+// Stamp `data-ap-click="<token>"` on the FIRST clickable whose visible text matches, so the caller can
+// click it through the PROVEN clickTarget path (re-measured cover-check, auto-dismiss, coordinate click)
+// instead of a second, weaker click primitive. Text-anchored clicks are unavoidable here — "View My
+// Applications" and an application ROW have no stable automation-id we've confirmed.
+// `rejectRx` is the safety rail: it can never tag something the caller named as off-limits.
+function cdpTagClickableByText(token, textRx, rejectRx, indexHint) {
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  let want, reject = null;
+  try { want = new RegExp(textRx, "i"); } catch (e) { return { tagged: false, error: "bad pattern" }; }
+  if (rejectRx) { try { reject = new RegExp(rejectRx, "i"); } catch (e) { reject = null; } }
+
+  // Clear any previous tag so a stale one can never be clicked.
+  Array.prototype.forEach.call(document.querySelectorAll("[data-ap-click]"), (el) => el.removeAttribute("data-ap-click"));
+
+  const cands = Array.prototype.slice.call(document.querySelectorAll('a[href], button, [role="button"], [role="link"]'));
+  const matches = [];
+  for (const el of cands) {
+    const txt = clean(el.textContent) || clean(el.getAttribute("aria-label"));
+    if (!txt || !want.test(txt)) continue;
+    if (reject && reject.test(txt)) continue;
+    let r = null;
+    try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+    if (!r || r.width <= 0 || r.height <= 0) continue;         // invisible ⇒ not clickable
+    matches.push({ el, text: txt.slice(0, 100), href: el.getAttribute("href") || null });
+  }
+  if (!matches.length) return { tagged: false, matchCount: 0 };
+  const pick = (typeof indexHint === "number" && indexHint >= 0 && indexHint < matches.length) ? matches[indexHint] : matches[0];
+  pick.el.setAttribute("data-ap-click", token);
+  try { pick.el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* best effort */ }
+  return { tagged: true, matchCount: matches.length, text: pick.text, href: pick.href };
+}
+
+// Same, but targets a specific application ROW by its href — used after pickApplicationRow chose one, so
+// the click lands on exactly the row the pure matcher approved (never "the first job-ish link").
+function cdpTagRowByHref(token, href) {
+  Array.prototype.forEach.call(document.querySelectorAll("[data-ap-click]"), (el) => el.removeAttribute("data-ap-click"));
+  const want = String(href || "");
+  if (!want) return { tagged: false };
+  const cands = Array.prototype.slice.call(document.querySelectorAll("a[href]"));
+  const hit = cands.find((a) => a.href === want) || cands.find((a) => (a.getAttribute("href") || "") === want);
+  if (!hit) return { tagged: false, tried: want.slice(0, 200) };
+  hit.setAttribute("data-ap-click", token);
+  try { hit.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* best effort */ }
+  return { tagged: true, text: String(hit.textContent || "").replace(/\s+/g, " ").trim().slice(0, 100) };
+}
+
+// Identity of the job-description page we landed on after clicking an application row — so the recovery
+// can PROVE it's the right posting before clicking Continue Application (the operator's "make sure it is
+// the correct application"). Reads the posting title, any requisition id on the page, and which apply/
+// continue affordances exist.
+function cdpReadJobIdentity() {
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const q = (sel) => document.querySelector(sel);
+  const titleEl = q('[data-automation-id="jobPostingHeader"]') || q("h1") || q("h2");
+  const body = clean(document.body ? document.body.innerText : "");
+  const reqEl = q('[data-automation-id="requisitionId"]');
+  return {
+    url: location.href,
+    title: document.title,
+    postingTitle: titleEl ? clean(titleEl.textContent).slice(0, 200) : null,
+    requisitionText: reqEl ? clean(reqEl.textContent).slice(0, 80) : null,
+    hasContinue: !!q('[data-automation-id="continueButton"]'),
+    hasApply: !!(q('[data-automation-id="adventureButton"]') || q('[data-automation-id="applyManually"]')),
+    bodyText: body.slice(0, 3000)
   };
 }
 
@@ -3443,6 +3768,15 @@ function makeCdpActuation(llmConfig) {
       const SEL = '[data-automation-id="pageFooterNextButton"]';
       const reviewPresent = await cdpEval(() => !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'));
       if (reviewPresent) return { clicked: false, refused: "review-page" };
+      // COMMIT THE LAST FIELD BEFORE SAVING (2026-07-28). Workday validates on blur, and in synthetic
+      // mode the last-filled field is still focused here — its blur would otherwise race this very click
+      // (see cdpCommitPendingEdits). Blur it and give the validator a beat. Cheap, and it applies to both
+      // walks because both advance through this one method. Never touches a value, so it cannot mis-fill;
+      // at Save time no widget should be mid-interaction, so there is nothing to disturb.
+      try {
+        const c = await cdpEval(cdpCommitPendingEdits);
+        if (c && c.blurred) { await cdpAdaptiveDelay(400); }
+      } catch (e) { /* best effort — the click and its error check still gate everything */ }
       // A popup/overlay (the Simplify extension's dialog, a cookie banner, a modal) can sit OVER Save &
       // Continue: a coordinate click would land on the popup and be SWALLOWED — the page never advances
       // and it surfaces as a bare nav-timeout. So cover-check the button's center first and refuse with a
