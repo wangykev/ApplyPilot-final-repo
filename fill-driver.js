@@ -413,7 +413,10 @@ const resolve = (raw, widgetType) => {
     if (isEmpty(raw)) return { skip: true };
     return { candidates: [String(raw)] };
   }
-  if (widgetType === "radio") {
+  if (widgetType === "radio" || widgetType === "checkbox_group") {
+    // checkbox_group (a pick-one checkbox set — the OFCCP self-ID) resolves EXACTLY like a radio: it is
+    // matched label-exact against the live options, so it needs the same candidate-list coercion. Without
+    // this it returned `unsupported widget type` → skipped, and a MAPPED value never filled.
     // A tiered candidate list (e.g. a degree/field_of_study rendered as radio on some tenant) must pass
     // through as the ladder — same as dropdown/typeahead. Without this, String(array) → "a,b" never
     // matches an option → the field falls to the AI (the triBool-dropdown bug's radio twin).
@@ -1567,6 +1570,52 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
   return { status: "needs_review", detail: `commit failed for "${target}" (trigger shows "${res.after}")`, after: res.after, options: enabledTexts, matchTier: m.matchTier };
 };
 
+// CHECKBOX GROUP — a pick-one set of checkboxes in ONE wrapper (Caterpillar's OFCCP disability
+// self-ID: "Yes, I have a disability…" / "No…" / "I do not want to answer"). Radio-like, with one
+// tenant quirk the operator observed: the current option must be UNCHECKED before another can be
+// set. So: match the candidate to a label exactly (radio's rule — no containment guessing on a
+// legally-loaded question), UNCHECK any other checked option first, then check the target, and
+// verify the END STATE (target checked AND nothing else) — a half-applied group is needs_review,
+// never a silent wrong answer. Zero actuation when the target is already the only one checked.
+const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
+  if (!act.readCheckboxGroup) return { status: "needs_review", detail: "substrate cannot read a checkbox group" };
+  const opts = await act.readCheckboxGroup(loc);
+  if (!opts || !opts.length) return { status: "error", detail: "no checkboxes in wrapper" };
+  const optionLabels = opts.map((o) => o.labelText);
+  const checkedNow = () => opts.filter((o) => o.checked);
+  const before = (checkedNow()[0] || {}).labelText || null;
+
+  let target = null;
+  for (const cand of candidates || []) {
+    const found = opts.find((o) => o.labelText.toLowerCase() === String(cand).toLowerCase());
+    if (found) { target = found; break; }
+  }
+  if (!target) return { status: "needs_review", detail: "no candidate matched the checkbox-group labels", after: before, options: optionLabels };
+
+  const readBack = async () => (await act.readCheckboxGroup(loc)) || [];
+  // 1. clear any OTHER checked option (this tenant refuses a second check while one is set)
+  for (const o of opts) {
+    if (!o.checked || o.id === target.id) continue;
+    await act.clickRadioLabel(loc, o.id); // label-click — same primitive as radio (native label activation)
+    await pollCheckedIs(act, o.id, false, budgets);
+  }
+  // 2. check the target (skip when it already is)
+  let now = await readBack();
+  const isOn = (id) => !!(now.find((o) => o.id === id) || {}).checked;
+  if (!isOn(target.id)) {
+    await act.clickRadioLabel(loc, target.id);
+    await pollCheckedIs(act, target.id, true, budgets);
+    now = await readBack();
+  }
+  const on = now.filter((o) => o.checked);
+  const after = (on[0] || {}).labelText || null;
+  if (!isOn(target.id)) return { status: "needs_review", detail: `checkbox-group selection did not commit for "${target.labelText}"`, after, options: optionLabels };
+  if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
+    detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
+  return { status: "filled", after, verified: true, matchTier: "label-exact", options: optionLabels,
+    detail: before && before !== after ? `label-click (replaced "${before}")` : "label-click" };
+};
+
 // Radio: label-text exact match (case-insensitive, candidates in order — M22
 // fillRadio), label-click primary, focus+Space fallback (both recon-proven),
 // committed state verified by the checked read-back.
@@ -1757,7 +1806,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   if (preTierIndex === 0) {
     return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled", flag: "prefilled-kept", confidence: "high", detail: "pre-filled chip is already the top candidate — kept (no actuation)" };
   }
-  const overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
+  let overwriteCandidates = preTierIndex > 0 ? candidates.slice(0, preTierIndex) : candidates;
   const isOverwrite = priorChips.length > 0;          // a pre-fill we're trying to replace/upgrade (tier-0 KEEP already returned)
   const chipSetIsNew = (chips) => chips.length > 0 && chipSetChanged(priorChips, chips);
   const withOverwrite = (ret, refilled) => { if (isOverwrite) ret.overwrite = { original: priorChips.join("; "), refilled: !!refilled }; return ret; };
@@ -1821,6 +1870,35 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     await act.openHier(loc);
     await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
     capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
+    // PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25). The start-scrape already enumerated the widget's
+    // WHOLE option list, so typing a candidate just to learn it isn't offered is pure waste — live, FoS
+    // burned ~540ms proving "Electrical and Computer Engineering" was absent before typing the one that
+    // was there. Match the candidates against the scraped list ONCE:
+    //   • a candidate matches → start the loop AT that candidate (the known-absent ones are skipped)
+    //   • none match (and this is a normal fill, not a tier-upgrade) → skip the type/Enter walk entirely;
+    //     an empty candidate list flows to the SAME genuine-no-match end the walk would reach, so the
+    //     inline AI rescue (which picks from this very list) runs exactly as before.
+    // GATED on a COMPLETE scrape (reached the bottom, not capped): a partial list can't prove absence.
+    // Matching uses the directed-pick ladder ({containment:false}) — a containment-only "match" is NOT
+    // treated as present, so Workday's own autocommit recognition (the one containment we trust) still
+    // gets its chance by typing. CAVEAT: a server-search typeahead whose on-open list is only a subset
+    // would report "complete" for that subset; the cost there is an AI rescue (flagged for review)
+    // instead of a deterministic fill — never a wrong value.
+    if (capturedFull && capturedFull.scrapeComplete && overwriteCandidates.length) {
+      const pm = apMatch.matchCandidates(overwriteCandidates, capturedFull, { containment: false });
+      if (pm.targetIndex !== -1 && pm.matchedCandidate != null) {
+        const at = overwriteCandidates.findIndex((c) => String(c) === String(pm.matchedCandidate));
+        if (at > 0) {
+          trace.push({ candidate: "(pre-scrape match)", outcome: "short-circuit",
+            note: `skipped ${at} candidate(s) absent from the scraped ${capturedFull.length}-option list` });
+          overwriteCandidates = overwriteCandidates.slice(at);
+        }
+      } else if (preTierIndex === -1) { // normal fill only — a tier-UPGRADE walk keeps its keep-the-prefill semantics
+        trace.push({ candidate: "(pre-scrape match)", outcome: "short-circuit",
+          note: `no candidate appears in the scraped ${capturedFull.length}-option list (complete) — skipped the type/Enter walk` });
+        overwriteCandidates = [];
+      }
+    }
   }
   for (const [ci, cand] of overwriteCandidates.entries()) {
     const step = { candidate: cand };
@@ -2541,7 +2619,14 @@ function makeStartCapture(act, loc) {
     if (cats && cats.length) return null; // TREE → no start-scrape (the drill self-scrapes only on a no-match)
     try {
       const sc = act.scrapeTaOptions ? await act.scrapeTaOptions(loc) : null;
-      if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) { reviewOpts = sc.options.slice(); return reviewOpts; }
+      if (sc && sc.ok && Array.isArray(sc.options) && sc.options.length) {
+        reviewOpts = sc.options.slice();
+        // Mark whether the scrape enumerated the WHOLE list (reached the bottom, not capped out). Only a
+        // COMPLETE list can support a NEGATIVE conclusion ("this candidate isn't offered") without typing.
+        // Non-enumerable so the array still deep-equals a plain option list for callers/tests.
+        try { Object.defineProperty(reviewOpts, "scrapeComplete", { value: !!sc.atBottom && !sc.cappedOut, enumerable: false }); } catch (e) { /* ignore */ }
+        return reviewOpts;
+      }
     } catch (e) { /* best-effort — the flat AI falls back to the last filtered set */ }
     return null;
   };
@@ -2582,10 +2667,16 @@ function buildBucketIndex(buckets) {
 // returns the result flagged `bucket` (provenance — a "remembered" style badge, NOT an ai-* flag)
 // ONLY on a real commit; a no-match/failure returns null so the caller falls through to the AI pass
 // / blank. textarea (essays) + file_upload + unknown are never bucket-filled.
-const fillFromBucket = async (act, loc, f, bucket, profile, budgets) => {
+// `opts.rawValue` (2026-07-25, repeating-section buckets): fill from THIS value instead of
+// getByPath(profile, bucket.profile_path) — the caller already resolved the per-ENTRY value (entry i's
+// own item), so a bucket bound to `education.0.school_or_university` fills entry 1 from entry 1's data.
+// The answer-LADDER lookups deliberately keep using the bucket's VERBATIM path (that's how the operator's
+// variants are keyed — `education.0.gpa`), so ladders stay shared across a section's entries.
+const fillFromBucket = async (act, loc, f, bucket, profile, budgets, opts) => {
+  const hasRawOverride = !!(opts && Object.prototype.hasOwnProperty.call(opts, "rawValue"));
   let arg;
   if (bucket.profile_path) {
-    const rawVal = getByPath(profile, bucket.profile_path);
+    const rawVal = hasRawOverride ? opts.rawValue : getByPath(profile, bucket.profile_path);
     const r = resolve(rawVal, f.widgetType);
     if (!r || r.skip) return null;
     arg = r.value !== undefined ? r.value : r.candidates; // same shape as the mapped-path dispatch
@@ -2782,7 +2873,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           // yes/no boolean → its Yes/No(+True/False) ladder; any other (scalar) value → the field's
           // variants (e.g. gpa "3.5+", gender "Man"). A checkbox uses the boolean (its own branch above);
           // a text box types the value (not a choice widget → skipped).
-          if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead") {
+          if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead" || f.widgetType === "checkbox_group") {
             arg = typeof rawValue === "boolean"
               ? boolLadderCandidates(profile, mappedPath, rawValue)
               : appendFieldVariants(profile, mappedPath, arg);
@@ -2792,6 +2883,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
           else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
           else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "checkbox_group") Object.assign(record, await fillCheckboxGroupCdp(act, loc, arg, budgets)); // pick-one checkbox set (self-ID)
           else if (f.widgetType === "typeahead") {
             // Fix 2: start-scrape the options (FLAT → review + AI; TREE → no start-scrape). Inline AI on no-match.
             const cap = makeStartCapture(act, loc);
@@ -3038,6 +3130,21 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     }
 
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
+    // A checkbox GROUP always carries its option labels into the bundle — even when the field is left
+    // BLANK. The scan reads them straight from the DOM (no open/actuation), and without them the review
+    // editor renders a bare TEXTBOX for a pick-one question (live: Caterpillar's OFCCP disability
+    // self-ID — voluntary, so the bot correctly leaves it unanswered and the OPERATOR must pick).
+    if (f.widgetType === "checkbox_group" && !(Array.isArray(record.options) && record.options.length)
+        && Array.isArray(f.groupOptions) && f.groupOptions.length) {
+      record.options = f.groupOptions.map((o) => o.labelText).filter(Boolean);
+    }
+    // A FLAT date composite carries the form's own segment ORDER + granularity (MM/DD/YYYY vs MM/YYYY
+    // vs YYYY) so the review renders segmented inputs that match the form — section dates already did
+    // this via fillEntryCdp; flat ones classified as "unknown" until 2026-07-25 (Caterpillar self-ID).
+    if (f.widgetType === "date" && Array.isArray(f.dateSegments) && f.dateSegments.length) {
+      const ord = dateOrderOf(f.dateSegments);
+      if (ord.length) record.date_order = ord;
+    }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
     results.push(record);
 
@@ -3073,6 +3180,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         name: sec.name, headingRegex: sec.headingRegex, containerPrefix: sec.containerPrefix,
         items, fieldMap: sec.fieldMap, deleteOnNoMatch: sec.deleteOnNoMatch,
         aiContext: { profile, jobContext }, // Option B: inline AI rescue context for the section's typeaheads (FoS)
+        // Per-entry answer buckets: an entry field the fieldMap doesn't name fills from its WORDING +
+        // this entry's own data (see fillEntryCdp's bucket tier). itemsKey scopes which buckets may fire.
+        buckets: bucketIndex, itemsKey: sec.itemsKey,
         nested: sec.nested || null,          // HARDCODED nested sub-sections (cert ▸ Specialties + Attachments); null elsewhere
         // AI-4 Tier-1.6 remediation re-fill: NEVER reconcile-DOWN (deleting entries beyond profile-N
         // would wipe rows the operator added by hand — the 2026-07-02 complaint). Main fill: false.
@@ -3243,15 +3353,25 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // field, so by here the reveal is usually already mounted; the loop re-scans after each
   // fill round to catch a chained reveal, bounded by maxCascadeRounds. SKIPPED under `only`
   // (a targeted re-fill never needs to cascade — same gate as the fold/audit above).
-  if (!targeted) {
-    const seen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+  // SECOND CHECK, FREE (2026-07-25, Solar Turbines): the LAST field filled has nothing running after it,
+  // so its reveal is still MID-RENDER when this pass fires — live, an SMS-consent checkbox revealed by
+  // the phone number never entered the records at all (it mounted moments later, and it REFLOWED the
+  // footer, which is what the stale-rect cover-check then misread). Rather than add a fixed wait to
+  // EVERY page (the thing the speed round removed), `cascadePass` is called TWICE: here, and again AFTER
+  // the option capture + the M40 audit — which together already spend ~1s of real wall-clock settle. The
+  // second call costs ONE read-only scanPage when nothing appeared (tens of ms) and only pays a fill if
+  // something did. A tenant that reveals even later still surfaces the honest way: the field blocks Save
+  // & Continue → nav-timeout diagnostics + AI-4 remediation.
+  const cascadeSeen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+  const cascadePass = async () => {
+    if (targeted) return;
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
       let reFields;
       try { reFields = (await act.scanPage()).fields || []; } catch (e) { break; } // re-scan blip → stop (non-fatal)
-      const revealed = reFields.filter((f) => !seen.has(f.fieldName));
+      const revealed = reFields.filter((f) => !cascadeSeen.has(f.fieldName));
       if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
-      revealed.forEach((f) => seen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
+      revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
       try {
         const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames });
         for (const r of (sub && sub.results) || []) {
@@ -3261,7 +3381,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         }
       } catch (e) { /* a revealed-field fill threw → don't abort the whole page; next round / honest miss */ }
     }
-  }
+  };
+  // BLUR the last-touched field FIRST (operator, 2026-07-25): a tenant can defer a field's commit — and
+  // the reveal that commit triggers — until BLUR, and the fill leaves focus sitting inside the last field
+  // it typed. Live: Caterpillar's SMS-consent checkbox is revealed by the phone number (the last flat
+  // field) and never appeared in the records at all, through BOTH cascade passes, because focus never
+  // left the phone box. One eval, best-effort, no focus moved into another widget.
+  if (!targeted && act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort */ } }
+  await cascadePass();
   markPhase("cascade", _phaseT0); _phaseT0 = Date.now();
 
   // ── CASCADE-REMOVED reconciliation ── a field present in the UP-FRONT scan but now GONE
@@ -3319,6 +3446,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
   markPhase("audit", _phaseT0); _phaseT0 = Date.now();
+  // LATE-REVEAL catch (see cascadePass): the capture + audit above just spent ~1s of REAL settle, so a
+  // field that was still rendering when the first pass ran (the last-filled field's reveal — live: an
+  // SMS-consent checkbox after the phone number) is mounted by now. Costs one read-only scanPage when
+  // nothing appeared. A field filled here is NOT in the audit snapshot (that already ran) — it keeps its
+  // own per-widget read-back verification, and the sweep below still inventories it.
+  await cascadePass();
+  markPhase("cascade-late", _phaseT0); _phaseT0 = Date.now();
 
   // ── ALREADY-FILLED sweep — the LAST pass before the bundle (source-of-truth ordering) ── the
   // review must inventory EVERYTHING the page holds at the moment Save & Continue is clicked: a
@@ -3333,6 +3467,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // modes (onlyFieldNames / onlySections) — a remediation re-fill never re-inventories the page.
   if (!targeted) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
   markPhase("sweep", _phaseT0);
+
+  // REVIEW ORDER (operator, 2026-07-25): sort the records into the FORM's own top-to-bottom order, so
+  // a flat field between two repeating sections renders between them instead of above both. Uses a
+  // FRESH scan so fields revealed during this page (cascade) carry a real position too; a scan failure
+  // leaves the order exactly as before (non-fatal). Last step — nothing downstream depends on order
+  // (the audit/sweep join by name), and the bundle's entry array IS the viewers' render order.
+  if (!targeted) {
+    try {
+      const fin = await act.scanPage();
+      orderResultsByDom(results, (fin && fin.fields) || scan.fields, (fin && fin.sectionOrder) || scan.sectionOrder);
+    } catch (e) { /* keep the production order */ }
+  }
 
   const counts = results.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
   const needsReview = results.filter((r) => r.status === "needs_review" || r.status === "filled_review");
@@ -3396,7 +3542,13 @@ const LANGUAGE_MAP = [
 // (fromYearParsed/toYearParsed = parseYear; issuedDateParsed/expirationDateParsed = parseYearMonthDay)
 // and filled by the now-un-deferred date branch via fillDateCompositeCdp.
 const EDUCATION_MAP = [
-  { field: "schoolName", widget: "text", key: "school_or_university", path: "school_or_university" },
+  // school: the automation-id is TENANT-VARIABLE and so is the WIDGET — Magna renders a text box
+  // (`schoolName`), cat.wd5/solarturbines a multiselect TYPEAHEAD under a different id (live 2026-07-25:
+  // the lone `schoolName` lookup found nothing → "field wrapper not found in entry" → the required field
+  // blocked Save & Continue). altFields + labelFallback resolve the wrapper; the widget-adaptive dispatch
+  // (see fillEntryCdp) then fills whatever the live DOM actually is.
+  { field: "schoolName", altFields: ["school", "schoolItem", "university", "institution"], labelFallback: /school|university|institution|college/i,
+    widget: "text", key: "school_or_university", path: "school_or_university" },
   { field: "degree", widget: "dropdown", key: "degree", path: "degree" },
   { field: "fieldOfStudy", widget: "typeahead", key: "field_of_study", path: "field_of_study", captureOptions: true }, // FoS Round 3: scrape the full option list into the bundle → summary searchable editor
   { field: "gradeAverage", widget: "text", key: "gpa", path: "gpa" },
@@ -3646,7 +3798,55 @@ function todayYMD() {
 // core warning). Resolves the field by automation-id (`f.field`) OR by label
 // (`f.labelRegex`, for hashed ids — Languages). Records use the SAME shape as
 // drivePageFill so the report/table code is shared.
-async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx) {
+// Does field-descriptor `fd` belong to fieldMap entry `m`? RESOLUTION LADDER (2026-07-25, the Solar
+// Turbines "School or University" miss): a section field's `formField-*` automation-id is TENANT-
+// VARIABLE — Magna calls the education school field `schoolName`, cat.wd5/solarturbines does not, so the
+// single hardcoded id resolved NOTHING and the record died `field wrapper not found in entry` (no fill
+// path ever ran, and the required field then blocked Save & Continue). Ladder, first hit wins:
+//   1. `labelRegex`  — the by-label entries (hashed ids, e.g. Languages proficiencies) keep matching ONLY by label
+//   2. `field`       — the canonical automation-id
+//   3. `altFields[]` — observed aliases on other tenants
+//   4. `labelFallback` — a LAST-RESORT label regex, used only when no id matched anywhere (pass allowLabel)
+// The label fallback is deliberately two-pass at every call site (ids across the WHOLE map first), so it can
+// never steal a field another map entry names exactly.
+function fmMatchesFd(m, fd, allowLabel) {
+  if (!m || !fd) return false;
+  if (m.labelRegex) return m.labelRegex.test(fd.label || "");
+  if (m.field && fd.fieldName === m.field) return true;
+  if (Array.isArray(m.altFields) && m.altFields.indexOf(fd.fieldName) !== -1) return true;
+  if (allowLabel && m.labelFallback) return m.labelFallback.test(fd.label || "");
+  return false;
+}
+// Widgets whose fill path may be swapped to whatever the LIVE DOM shows (below). Dates/years/checkboxes
+// are EXCLUDED: the scan's classify() has no "date" type (a date composite classifies "unknown"), so a
+// swap there would be a misread, not an observation.
+const ADAPTIVE_WIDGETS = new Set(["text", "textarea", "dropdown", "typeahead"]);
+
+// The per-entry answer-bucket tier (2026-07-25, operator's design): inside a repeating section EVERY
+// entry shows the SAME question wording, so a bucket's wording identifies WHICH FIELD this is, while the
+// ENTRY ORDINAL picks WHICH VALUE — entry 0 gets education[0]'s school, entry 1 gets education[1]'s. That
+// makes a label-keyed bucket safe in a repeating section, where a naive bucket (one wording → one answer)
+// would have filled all three work experiences with the same employer.
+// Mechanics: the bucket's `profile_path` is entry-0-shaped (`education.0.school_or_university`, the
+// starter-bucket convention). We verify its ROOT names THIS section (itemsKey/sectionName — so a
+// `personal_info.city` bucket can never fire inside an education entry), strip the `<root>.<digits>.`
+// prefix, and read the REST from the ENTRY'S OWN item object — which is inherently index-correct, no
+// remapping. Returns { tail, rawValue } or null.
+// Mode B (a fixed `value`, no profile_path) is deliberately NOT applied per-entry: it has no indexed data,
+// so filling every entry with the same answer is a guess, not a lookup.
+function entryBucketValue(bucket, item, itemsKey, sectionName) {
+  if (!bucket || !bucket.profile_path) return null;
+  const m = /^([A-Za-z_][A-Za-z0-9_]*)\.(\d+)\.(.+)$/.exec(String(bucket.profile_path));
+  if (!m) return null;                                   // not an entry-shaped path → not a repeating binding
+  const root = m[1], tail = m[3];
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (norm(root) !== norm(itemsKey) && norm(root) !== norm(sectionName)) return null; // a different section's bucket — never cross-apply
+  const rawValue = getByPath(item, tail);
+  if (rawValue === undefined || rawValue === null || rawValue === "") return null;
+  return { tail, rawValue };
+}
+
+async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budgets, aiCtx, bucketCtx) {
   const recs = [];
   const base = sectionName + "[" + idx + "].";
   // FILL IN DOM ORDER (operator rule 2026-07-02): iterate the ENTRY'S scanned fields top-to-bottom
@@ -3664,8 +3864,16 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     const ent0 = scan0 && scan0.sections && scan0.sections[prefix] && Array.isArray(scan0.sections[prefix].entries) ? scan0.sections[prefix].entries[idx] : null;
     if (ent0 && Array.isArray(ent0.fields) && ent0.fields.length) {
       const used = new Set(); const inDom = [];
+      // TWO-PASS (see fmMatchesFd): every field gets an ID-based match first; only fields still
+      // unclaimed after that fall back to a map entry's labelFallback — so a fallback regex can never
+      // steal a field some other entry names by id.
       for (const fd of ent0.fields) {
-        const fm = fieldMap.find((m) => !used.has(m) && (m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName));
+        const fm = fieldMap.find((m) => !used.has(m) && fmMatchesFd(m, fd, false));
+        if (fm) { used.add(fm); inDom.push(fm); }
+      }
+      for (const fd of ent0.fields) {
+        if (fieldMap.some((m) => used.has(m) && fmMatchesFd(m, fd, false))) continue; // already claimed by id
+        const fm = fieldMap.find((m) => !used.has(m) && fmMatchesFd(m, fd, true));
         if (fm) { used.add(fm); inDom.push(fm); }
       }
       if (inDom.length) orderedMap = inDom.concat(fieldMap.filter((m) => !used.has(m)));
@@ -3674,9 +3882,17 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
   for (const f of orderedMap) {
     const _fieldT0 = Date.now(); // [CDP-TIME] per-field wall-clock (stamped on every rec pushed below)
     const recName = f.name || f.field;
-    const findFd = (entry) => entry ? (f.labelRegex
-      ? entry.fields.find((x) => f.labelRegex.test(x.label || ""))
-      : entry.fields.find((x) => x.fieldName === f.field)) : null;
+    // Resolution ladder (fmMatchesFd): labelRegex | id | altFields, then — only if NO map entry claims
+    // the field by id — labelFallback. Tenant-variable automation-ids (Solar Turbines' school field)
+    // resolve here instead of dying "field wrapper not found in entry".
+    const findFd = (entry) => {
+      if (!entry || !Array.isArray(entry.fields)) return null;
+      const byId = entry.fields.find((x) => fmMatchesFd(f, x, false));
+      if (byId) return byId;
+      if (!f.labelFallback) return null;
+      return entry.fields.find((x) => f.labelFallback.test(x.label || "")
+        && !fieldMap.some((m) => m !== f && fmMatchesFd(m, x, false))) || null; // never steal a field another entry names exactly
+    };
     const scanFd = async () => {
       const scan = await act.repeatingScan();
       const sec = scan && scan.sections ? scan.sections[prefix] : null;
@@ -3739,8 +3955,23 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       recs.push(rec); await act.delay(budgets.interFieldMs); continue;
     }
     const loc = { wrapperSel: fd.wrapperSel };
+    // WIDGET-ADAPTIVE FILL (2026-07-25, the Solar Turbines school field): the SAME logical field renders
+    // as different WIDGETS across tenants — Magna's education "School or University" is a text box,
+    // cat.wd5/solarturbines renders it as a multiselect TYPEAHEAD ("0 items selected"). The observed DOM is
+    // the rulebook, so when the live scan's widgetType disagrees with the map's, the LIVE type wins and the
+    // value is re-resolved for it (a plain string → a single-candidate list for a choice widget, and the
+    // choice widget's own match ladder + commit verification then apply as usual — never a blind commit).
+    // Restricted to ADAPTIVE_WIDGETS in BOTH directions (date/year/checkbox never swap — classify() can't
+    // see a date composite). Recorded on the rec so review shows what actually filled.
+    let effWidget = f.widget;
+    if (ADAPTIVE_WIDGETS.has(f.widget) && ADAPTIVE_WIDGETS.has(fd.widgetType) && fd.widgetType !== f.widget) {
+      effWidget = fd.widgetType;
+      rec.widgetType = effWidget;
+      rec.widgetAdapted = { configured: f.widget, live: effWidget };
+      console.log(`[ApplyPilot][CDP] ${base + recName}: tenant renders this as a ${effWidget} (map says ${f.widget}) — filling as ${effWidget} (live DOM wins).`);
+    }
     rec.auditLoc = fd.wrapperSel; // M40: retain the entry-scoped locator for the post-fill audit re-read
-    rec.auditTag = f.widget === "textarea" ? "textarea" : undefined;
+    rec.auditTag = effWidget === "textarea" ? "textarea" : undefined;
     if (f.widget === "year" || f.widget === "date") { const ord = dateOrderOf(fd.dateSegments); if (ord.length) rec.date_order = ord; } // m3c: form's segment order → the summary's segmented date editor (all date fields, not just revealed ones)
     // FoS Round 3: tag so the END-OF-PAGE option-capture pass can find this record (captureKey groups
     // same-vocabulary fields across entries → one scrape). Captured at end-of-page, NOT inline — an
@@ -3759,20 +3990,22 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
         Object.assign(rec, await fillCheckboxCdp(act, loc, item[f.key] === true, budgets));
       } else {
         // textarea (WE roleDescription) resolves like text — a plain string (bulletsText).
-        const r = resolve(item[f.key], f.widget === "textarea" ? "text" : f.widget);
+        // effWidget (not f.widget): the LIVE widget wins, so a text-mapped field the tenant renders as a
+        // typeahead/dropdown resolves into a CANDIDATE list and fills through that widget's own ladder.
+        const r = resolve(item[f.key], effWidget === "textarea" ? "text" : effWidget);
         if (r.skip) {
           rec.status = "skipped";
           rec.detail = r.reason || ("empty value at " + base + f.path);
         } else {
           const arg = r.value !== undefined ? r.value : r.candidates;
           rec.resolved = arg;
-          if (f.widget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
-          else if (f.widget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
+          if (effWidget === "text") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets));
+          else if (effWidget === "textarea") Object.assign(rec, await fillTextCdp(act, loc, arg, budgets, "textarea")); // M37: roleDescription textarea
           // keepOpenForCanonicalize: when AI is on, a genuine no-match here is IMMEDIATELY followed by the
           // canonicalize block below — so fillDropdownCdp leaves the list OPEN and aiCanonicalizeField reuses
           // it (no redundant close→reopen; the canonicalize closes it). Off when AI can't canonicalize.
-          else if (f.widget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets, { keepOpenForCanonicalize: !!(aiCtx && act.aiEnabled) }));
-          else if (f.widget === "typeahead") {
+          else if (effWidget === "dropdown") Object.assign(rec, await fillDropdownCdp(act, loc, arg, budgets, { keepOpenForCanonicalize: !!(aiCtx && act.aiEnabled) }));
+          else if (effWidget === "typeahead") {
             // Fix 2: start-of-fill option capture for EVERY section typeahead (was FoS-only). makeStartCapture
             // scrapes the full leaf list at the START for a FLAT field (FoS → rec.options for the summary
             // searchable picker + the flat AI), and returns null for a TREE (cert) — no wasted scroll on a
@@ -3789,8 +4022,8 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
             Object.assign(rec, await fillTypeaheadCdp(act, loc, arg, budgets, { onCapture: cap.onCapture, ai: aiForField }));
             const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
           }
-          else if (f.widget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
-          else { rec.status = "skipped"; rec.detail = "no handler for widget " + f.widget; }
+          else if (effWidget === "radio") Object.assign(rec, await fillRadioCdp(act, loc, arg, budgets));
+          else { rec.status = "skipped"; rec.detail = "no handler for widget " + effWidget; }
         }
       }
     } catch (e) {
@@ -3803,7 +4036,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     // so ONLY this field surfaces for review while the row's deterministic fields stay clean. Mirrors the
     // flat loop's canonicalize + the repeating typeahead's inline AI (dropdowns had NONE before). AI OFF →
     // untouched. (Required-empty INFER + the keep/delete-with-memory decision are Phase 2.)
-    if (aiCtx && act.aiEnabled && f.widget === "dropdown" && rec.resolved != null && rec.genuineNoMatch === true) {
+    if (aiCtx && act.aiEnabled && effWidget === "dropdown" && rec.resolved != null && rec.genuineNoMatch === true) {
       const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: rec.isRequired, widgetType: "dropdown", wrapperSel: fd.wrapperSel };
       try {
         const aiRes = await aiCanonicalizeField(act, loc, f2, rec.resolved, budgets);
@@ -3834,7 +4067,7 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     // Save & Continue. When AI is on, run the unified filler with NO candidates → the inline AI infers from the
     // profile (no stated answer) + FORCES a pick + flags. AI OFF → stays skipped. (NOT the deleteOnNoMatch cert
     // case — that path deletes an unfillable entry; this only fires for status `skipped`, i.e. no value to try.)
-    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && f.widget === "typeahead") {
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && effWidget === "typeahead") {
       try {
         const loc2 = { wrapperSel: rec.auditLoc };
         const cap = makeStartCapture(act, loc2);
@@ -3846,6 +4079,58 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
     rec.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME]
     recs.push(rec);
     await act.delay(budgets.interFieldMs);
+  }
+
+  // ── PER-ENTRY ANSWER-BUCKET tier (2026-07-25) ── the fieldMap models the fields we KNOW; a tenant can
+  // render extra/renamed ones the map never names (Solar Turbines' education school under a foreign id;
+  // a `skills` field we don't model). Those stay EMPTY and, if required, block Save & Continue. Here any
+  // entry field the map did NOT claim gets the bucket treatment: match its WORDING to a bucket (the same
+  // label index the flat loop uses), then take the value from THIS ENTRY'S item (entryBucketValue) — the
+  // wording says which field, the ordinal says which value. DETERMINISTIC (a candidate through the same
+  // match ladder, never a blind commit) and it runs BEFORE nothing — the AI tiers above already ran for
+  // MAPPED fields only, so this is purely additive. Skipped entirely when no buckets are configured.
+  const bkIndex = bucketCtx && bucketCtx.index;
+  if (bkIndex && bkIndex.size) {
+    let entry = null;
+    try {
+      const scan = await act.repeatingScan();
+      const sec = scan && scan.sections ? scan.sections[prefix] : null;
+      entry = sec && sec.entries ? sec.entries[idx] : null;
+    } catch (e) { entry = null; }
+    // A field is HANDLED if some fieldMap entry claims it (id or label) or a record already covers its
+    // wrapper — so the bucket tier can never double-fill what the mapped loop just filled.
+    const filledLocs = new Set(recs.map((r) => r.auditLoc).filter(Boolean));
+    // rec-by-profile-path: when a bucket fills a field the map DID name but could not resolve
+    // ("field wrapper not found in entry"), update THAT record instead of emitting a duplicate.
+    const recByPath = new Map();
+    for (const r of recs) { const p = String(r.mappedPath || ""); if (p.startsWith(base)) recByPath.set(p.slice(base.length), r); }
+    for (const fd of ((entry && entry.fields) || [])) {
+      if (!fd || !fd.label || !fd.wrapperSel) continue;
+      if (filledLocs.has(fd.wrapperSel)) continue;                                  // already actuated by the mapped loop
+      if (fieldMap.some((m) => fmMatchesFd(m, fd, true))) continue;                 // the map claims it (it just had no value / failed on its own terms)
+      const bucket = bkIndex.get(apMatch.normalizeLabel(fd.label));
+      if (!bucket) continue;
+      const bv = entryBucketValue(bucket, item, bucketCtx.itemsKey, sectionName);
+      if (!bv) continue;                                                            // Mode B / another section's bucket / no value for THIS entry
+      const f2 = { fieldName: fd.fieldName, label: fd.label, isRequired: !!fd.isRequired, widgetType: fd.widgetType, wrapperSel: fd.wrapperSel };
+      let bkRes = null;
+      try { bkRes = await fillFromBucket(act, { wrapperSel: fd.wrapperSel }, f2, bucket, (aiCtx && aiCtx.profile) || {}, budgets, { rawValue: bv.rawValue }); }
+      catch (e) { bkRes = null; }                                                   // a failed bucket fill leaves the field as it was (blank → surfaces/halts as before)
+      if (!bkRes) continue;
+      const existing = recByPath.get(bv.tail);
+      if (existing && existing.status !== "filled" && existing.status !== "filled_review") {
+        Object.assign(existing, bkRes, { auditLoc: fd.wrapperSel, label: fd.label, widgetType: fd.widgetType, resolved: bv.rawValue });
+        existing.detail = (bkRes.detail || "") + " · resolved by question wording (the map's id did not match this tenant)";
+      } else {
+        recs.push(Object.assign({
+          fieldName: base + fd.fieldName, label: fd.label, widgetType: fd.widgetType, isRequired: !!fd.isRequired,
+          mappedPath: base + bv.tail, rawValue: bv.rawValue, resolved: bv.rawValue,
+          status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+          auditLoc: fd.wrapperSel
+        }, bkRes));
+      }
+      await act.delay(budgets.interFieldMs);
+    }
   }
   return recs;
 }
@@ -4038,6 +4323,42 @@ async function readLiveValueByWidget(act, widget, loc) {
   } catch (e) { return null; }
 }
 
+// ── REVIEW ORDER (operator, 2026-07-25) ── the review must list fields in the order the FORM lays
+// them out. Records are PRODUCED flat-loop-first then section-by-section, so a flat field sitting
+// BETWEEN two repeating sections used to render above both of them ("other fields first, then the
+// repeating sections"). The bundle's entry array IS the render order in both viewers, so ordering
+// here fixes both. Key = the wrapper's document position from the scan (`domIndex`); a repeating
+// section's records all take the position of its FIRST field (`sectionOrder[base]`), which keeps a
+// section's own entries/fields contiguous and in fill order. Records with no position (section ops,
+// stubs, cascade-revealed fields the scan didn't have) INHERIT the previous record's key, so they
+// stay attached to the group they belong to. STABLE (ties keep their original relative order), so
+// within a section the entry/field sequence is untouched. PURE + Node-testable.
+function orderResultsByDom(results, scanFields, sectionOrder) {
+  const secBase = {};
+  for (const s of PAGE_SECTIONS) secBase[s.name] = String(s.containerPrefix || "").replace(/-$/, "");
+  const flatIdx = {};
+  for (const f of (scanFields || [])) if (f && typeof f.domIndex === "number") flatIdx[f.fieldName] = f.domIndex;
+  const order = sectionOrder || {};
+  const keyOf = (r) => {
+    const name = String((r && r.fieldName) || "");
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*[[.]/.exec(name);       // "education[0].degree" / "website.add"
+    if (m) { const b = secBase[m[1]] || m[1]; if (order[b] != null) return order[b]; }
+    if (order[name] != null) return order[name];                    // a section STUB (bare base name)
+    if (flatIdx[name] != null) return flatIdx[name];                // a flat field
+    return null;
+  };
+  let last = -1;
+  const keyed = results.map((r, i) => {
+    const k = keyOf(r);
+    if (k != null) last = k;
+    return { r, k: k != null ? k : last, i };
+  });
+  keyed.sort((a, b) => (a.k - b.k) || (a.i - b.i));
+  results.length = 0;
+  for (const x of keyed) results.push(x.r);
+  return results;
+}
+
 async function sweepAlreadyFilled(act, results) {
   const norm = apMatch.normalize;
   const matchesOwn = (rec, live) => {
@@ -4072,6 +4393,14 @@ async function sweepAlreadyFilled(act, results) {
   // (field automation-id OR labelRegex, the fillEntryCdp findFd logic mirrored).
   let rscan = null; try { rscan = await act.repeatingScan(); } catch (e) { rscan = null; }
   const sections = (rscan && rscan.sections) || {};
+  // Wrappers some record ALREADY vouches for (2026-07-25). Identity is the DOM WRAPPER, not the record
+  // NAME: a tenant-renamed field keeps the fieldMap's canonical recName (`education[0].schoolName`) while
+  // the live automation-id is different (`school`), and a per-entry bucket fill records the live name —
+  // either way a name-keyed lookup misses and the sweep pushed a DUPLICATE "already on the form
+  // (unmapped section field) — NOT filled by ApplyPilot" row for a field this run had just filled
+  // correctly (live: Solar Turbines' school, filled + autocommit-exact, then re-surfaced as needs_review).
+  // Guards only the PUSH-a-new-record branches; the flip-an-existing-skipped-record path is untouched.
+  const claimedLocs = new Set(results.map((r) => r && r.auditLoc).filter(Boolean));
   for (const sec of PAGE_SECTIONS) {
     const s = sections[sec.containerPrefix];
     if (!s || !Array.isArray(s.entries)) continue;
@@ -4080,12 +4409,17 @@ async function sweepAlreadyFilled(act, results) {
       for (const fd of ((s.entries[i] && s.entries[i].fields) || [])) {
         // "" fieldName = the Attachments wrapper ("formField-" empty suffix) — never a sweep row
         if (!fd.fieldName || fd.widgetType === "file_upload" || nestedFields.has(fd.fieldName)) continue;
-        const fm = (sec.fieldMap || []).find((m) => m.labelRegex ? m.labelRegex.test(fd.label || "") : m.field === fd.fieldName);
+        // SAME resolution ladder as the fill (fmMatchesFd): id → altFields → labelFallback, the fallback
+        // only when no other map entry names this field by id. Without it a tenant-renamed field looks
+        // "unmapped" here and gets a duplicate row (the Solar Turbines school bug).
+        const fm = (sec.fieldMap || []).find((m) => fmMatchesFd(m, fd, false))
+          || (sec.fieldMap || []).find((m) => m.labelFallback && m.labelFallback.test(fd.label || "")
+                && !(sec.fieldMap || []).some((o) => o !== m && fmMatchesFd(o, fd, false)));
         if (fm) {
           const key = sec.name + "[" + i + "]." + (fm.name || fm.field);
           const rec = results.find((r) => r.fieldName === key && r.status !== "removed");
           if (rec && rec.status === "skipped" && !rec.flag && hasLiveValue(fd.value)) flip(rec, fd.value, fd.wrapperSel);
-          else if (!rec && hasLiveValue(fd.value)) {
+          else if (!rec && hasLiveValue(fd.value) && !claimedLocs.has(fd.wrapperSel)) {
             // a LIVE value no record vouches for — a surviving row whose records were dropped
             // (index shift after a remediation delete) or an operator-added extra entry. The
             // summary is the page's source of truth → surface it as already-filled.
@@ -4098,8 +4432,9 @@ async function sweepAlreadyFilled(act, results) {
               auditLoc: fd.wrapperSel || null
             });
           }
-        } else if (hasLiveValue(fd.value)) {
+        } else if (hasLiveValue(fd.value) && !claimedLocs.has(fd.wrapperSel)) {
           // an UNMAPPED field inside a KNOWN section holding a value — the "not mapped" edge case
+          // (claimedLocs: never for a wrapper this run already filled, e.g. via the per-entry bucket tier)
           results.push({
             fieldName: sec.name + "[" + i + "]." + fd.fieldName, label: fd.label || fd.fieldName,
             widgetType: fd.widgetType, isRequired: !!fd.isRequired,
@@ -4113,6 +4448,42 @@ async function sweepAlreadyFilled(act, results) {
       }
     }
   }
+  // ORPHAN CHECKBOXES (2026-07-25) — a consent checkbox rendered OUTSIDE any `formField-*` wrapper is
+  // invisible to the page scan, so it never reached the records at all (live: Caterpillar's page-1
+  // SMS/marketing consent, revealed by the phone number; the create-account consent needed its own
+  // finder for the same reason). Inventory them READ-ONLY at the end of the page so the review shows
+  // everything the form holds. The bot does NOT tick them: an optional consent — especially a marketing
+  // one — is the operator's call, and it's recorded UNCHECKED with its full text.
+  if (act.scanOrphanCheckboxes) {
+    let orphans = null;
+    try { orphans = await act.scanOrphanCheckboxes(); } catch (e) { orphans = null; }
+    for (const o of (orphans || [])) {
+      if (!o || !o.label) continue;
+      const fieldName = "consent." + o.key;
+      if (results.some((r) => r.fieldName === fieldName)) continue;
+      // Status semantics (operator 2026-07-25):
+      //   • CHECKED on the page → a live value ApplyPilot did NOT set → the already-filled convention
+      //     (filled_review / already_on_form): worth one look, e.g. a pre-ticked marketing consent.
+      //   • UNCHECKED + OPTIONAL → the correct resting state and the operator's own choice → plain
+      //     `skipped`: it still SHOWS in ALL FIELDS and is tickable, but it is NOT a review item.
+      //   • UNCHECKED + REQUIRED → it will block Save & Continue → needs_review, loudly.
+      const checked = !!o.checked;
+      results.push({
+        fieldName, label: o.label, widgetType: "checkbox", isRequired: !!o.required,
+        mappedPath: null, rawValue: null, resolved: null,
+        status: checked ? "filled_review" : (o.required ? "needs_review" : "skipped"),
+        matchTier: null, confidence: null, flag: checked ? "already-filled" : "consent-checkbox", verified: null,
+        after: checked ? "true" : null,
+        detail: checked
+          ? "consent checkbox OUTSIDE the form's field set — already checked on the page; verify you want it"
+          : (o.required
+            ? "REQUIRED consent checkbox OUTSIDE the form's field set — unchecked; it will block Save & Continue until you tick it"
+            : "optional consent checkbox — left unchecked (yours to give); tick it here if you want it"),
+        auditLoc: o.selector || null
+      });
+    }
+  }
+
   // NESTED records (cert ▸ specialties) — the scans above can't join them by ordinal (Workday's
   // internal counters), but every nested record carries its PROBED auditLoc: re-read any STILL-
   // skipped one at end-of-page so a value typed/committed after the section filled is never missed.
@@ -4407,7 +4778,10 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
   const fillCount = Math.min(N, await act.entryCount(containerPrefix));
   const perEntry = [];
   for (let i = 0; i < fillCount; i++) {
-    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets, section.aiContext);
+    // bucketCtx: the per-entry answer-bucket tier (wording → which field; ordinal → which value). Absent
+    // (recon/replay/tests without buckets) ⇒ the tier no-ops and the fill is byte-identical to before.
+    const bucketCtx = section.buckets ? { index: section.buckets, itemsKey: section.itemsKey || name } : null;
+    const entryRecs = await fillEntryCdp(act, containerPrefix, i, items[i], fieldMap, name, budgets, section.aiContext, bucketCtx);
     // A required pick that COMMITTED a value (filled OR filled_review) keeps the entry — it won't
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.
@@ -4677,7 +5051,7 @@ function auditActualFromRaw(widgetType, raw) {
     case "text": case "textarea": return { actual: raw ? raw.value : null, readable: !!raw };
     case "dropdown": return { actual: raw ? raw.triggerText : null, readable: !!raw };
     case "checkbox": return { actual: raw ? String(raw.checked) : null, readable: !!(raw && raw.inputId != null) };
-    case "radio": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
+    case "radio": case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; } // checkbox_group is radio-shaped: the CHECKED option's label
     case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
     case "date": {
       if (!Array.isArray(raw)) return { actual: null, readable: false };
@@ -4703,6 +5077,7 @@ async function auditReReadActual(act, e) {
       case "dropdown": raw = await act.readDropdownState(loc); break;
       case "checkbox": raw = await act.readCheckboxState(loc); break;
       case "radio": raw = await act.readRadioState(loc); break;
+      case "checkbox_group": raw = act.readCheckboxGroup ? await act.readCheckboxGroup(loc) : null; break;
       case "typeahead": raw = await act.readHier(loc); break;
       case "hierarchical": raw = await act.readSource(loc); break;
       case "date": {
@@ -4731,6 +5106,7 @@ async function auditRefillEntry(act, e, b) {
     case "typeahead": return await fillTypeaheadCdp(act, loc, [exp], b);
     case "hierarchical": return await fillTypeaheadCdp(act, loc, [exp], b); // merged: source uses the unified filler
     case "radio": return await fillRadioCdp(act, loc, [exp], b);
+    case "checkbox_group": return await fillCheckboxGroupCdp(act, loc, [exp], b);
     case "checkbox": return await fillCheckboxCdp(act, loc, String(exp) === "true", b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(exp)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
     default: throw new Error("audit re-fill: unsupported widget " + e.widgetType);
@@ -4832,6 +5208,7 @@ async function replayField(act, entry, budgets) {
     case "dropdown": return await fillDropdownCdp(act, loc, [value], b);
     case "typeahead": case "hierarchical": return await fillTypeaheadCdp(act, loc, [value], b);
     case "radio": return await fillRadioCdp(act, loc, [value], b);
+    case "checkbox_group": return await fillCheckboxGroupCdp(act, loc, [value], b); // pick-one checkbox set: unchecks the current option, then checks the approved one
     case "checkbox": return await fillCheckboxCdp(act, loc, value === true || /^(true|yes)$/i.test(String(value)), b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(value)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
     default: return { status: "needs_review", detail: "replay: unsupported widget " + widget };
@@ -5620,6 +5997,15 @@ function buildReviewBundle(results, meta) {
       return { needs_review: true, needs_review_reason: "already_on_form" }; // has a value (verify) OR required + empty (needs a value)
     }
     if (rec.flag === "already-filled-match") return { needs_review: false, needs_review_reason: null }; // already on the form AND equals the profile value → correct, no flag
+    // CONSENT CHECKBOX outside the form's field set (the orphan sweep). An OPTIONAL one left UNCHECKED
+    // is the CORRECT resting state and the operator's own choice — it SHOWS in ALL FIELDS (tickable if
+    // they want it) but must NOT nag (operator 2026-07-25: "that checkbox is optional, no need for
+    // review"). Mirrors the KNOWN-empty-section rule. A REQUIRED one left unchecked WILL block Save &
+    // Continue, so that one stays a review item (its record is pushed as needs_review).
+    if (rec.flag === "consent-checkbox") {
+      if (rec.status === "needs_review") return { needs_review: true, needs_review_reason: "already_on_form" };
+      return { needs_review: false, needs_review_reason: null };
+    }
     if (rec.flag === "nested-unfilled") return { needs_review: true, needs_review_reason: "nested_section" }; // a nested repeating field (cert → specialty) — operator fills/verifies
     if (rec.flag === "nested-section-stub") return { needs_review: true, needs_review_reason: "nested_section" }; // an EMPTY nested sub-section (reveal-by-add) — operator adds/verifies entries
     if (rec.flag === "nested-attachment") return { needs_review: true, needs_review_reason: "nested_attachment" }; // a per-entry attachment — upload on the form
@@ -5781,5 +6167,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

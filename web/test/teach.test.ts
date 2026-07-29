@@ -21,10 +21,15 @@ import {
   dottedPath,
   fieldHoldsAnswer,
   decideTeachRoute,
+  decideTeachPlan,
+  ensureDefaultFieldWordings,
+  bucketHasWording,
+  fieldIsEmpty,
   wasManuallyEdited,
   type TeachSource,
 } from "@/lib/teach";
 import { ensureStarterBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
+import { ensureHttpsUrl, looksLikeUrl, profileSchema } from "@/lib/profile-schema";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 const bucket = (over: Partial<Bucket>): Bucket => ({
@@ -369,7 +374,7 @@ test("fieldHoldsAnswer: scalar / boolean(Yes-No) / tiered-array-any-candidate; e
 test("decideTeachRoute: value already present → 'wording'; missing/different → 'answer'", () => {
   const p = { self_identification: { gender: "Male" }, personal_info: { city: "" } };
   assert.equal(decideTeachRoute(p, "self_identification.gender", "Male"), "wording"); // already holds it
-  assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "answer"); // differs → set/append
+  assert.equal(decideTeachRoute(p, "self_identification.gender", "Female"), "variant"); // holds a DIFFERENT value → the answer is a VARIANT, never an overwrite
   assert.equal(decideTeachRoute(p, "personal_info.city", "Chicago"), "answer"); // empty → set
 });
 
@@ -466,4 +471,147 @@ test("yes/no teach correctness: boolean fields cover Yes/True AND No/False + cus
 
   // flattenProfileFields ignores the answer_ladders metadata (no junk rows / phantom section)
   assert.equal(flattenProfileFields(pc).some((r) => r.section === "answer_ladders" || r.path.startsWith("answer_ladders")), false);
+});
+
+// ── TWO-AXIS teach plan (operator, 2026-07-25) ────────────────────────────────────────────────
+// The question WORDING (bucket) and the ANSWER (value / variant ladder) are independent; the case
+// where BOTH are missing was unhandled and is checked FIRST. Live example: race = "Asian" in the
+// profile, the form asked "Please select the ethnicity which most accurately describes how you
+// identify yourself" and the approved answer was "Asian (not hispanic or latino)".
+const RACE = "self_identification.race";
+const ethnicityQ = "Please select the ethnicity which most accurately describes how you identify yourself";
+const raceProfile = () => ({ self_identification: { race: "Asian" } });
+const bucketFor = (path: string, questions: string[]): Bucket => ({
+  id: "field_" + path.replace(/[^\w]+/g, "_"), profile_path: path, value: [], category: "", widget_hint: "dropdown", questions, selectors: {},
+});
+
+test("teach plan: NEW wording + NEW answer phrasing → 'both' (the merged popup), the value untouched", () => {
+  const plan = decideTeachPlan(raceProfile(), RACE, { question: ethnicityQ, answer: "Asian (not hispanic or latino)" }, []);
+  assert.equal(plan.route, "both");
+  assert.equal(plan.needsWording, true);
+  assert.equal(plan.needsAnswer, true);
+});
+
+test("teach plan: KNOWN wording + new answer phrasing → 'variant' (answer ladder only)", () => {
+  const buckets = [bucketFor(RACE, [ethnicityQ])];
+  const plan = decideTeachPlan(raceProfile(), RACE, { question: ethnicityQ, answer: "Asian (not hispanic or latino)" }, buckets);
+  assert.equal(plan.route, "variant");
+  assert.equal(plan.needsWording, false);
+  assert.equal(plan.needsAnswer, true);
+});
+
+test("teach plan: new wording + answer ALREADY held → 'wording' (question bucket only)", () => {
+  const plan = decideTeachPlan(raceProfile(), RACE, { question: ethnicityQ, answer: "Asian" }, []);
+  assert.equal(plan.route, "wording");
+  assert.equal(plan.needsAnswer, false);
+});
+
+test("teach plan: an EMPTY field sets its VALUE (not a variant)", () => {
+  const plan = decideTeachPlan({ self_identification: {} }, RACE, { question: ethnicityQ, answer: "Asian" }, []);
+  assert.equal(plan.route, "answer");
+});
+
+test("teach plan: an answer already in the field's VARIANT ladder does not resurface as an answer change", () => {
+  const p = { self_identification: { race: "Asian" }, answer_ladders: { [RACE]: { values: ["Asian (not hispanic or latino)"] } } };
+  // the variant is stored → setFieldVariants covered it; only the wording can still be new
+  const plan = decideTeachPlan(p, RACE, { question: ethnicityQ, answer: "Asian (not hispanic or latino)" }, []);
+  assert.equal(plan.needsAnswer, false, "the ladder already carries this phrasing");
+  assert.equal(plan.route, "wording");
+});
+
+test("bucketHasWording / fieldIsEmpty: the two axes, normalized", () => {
+  const buckets = [bucketFor(RACE, ["  PLEASE select the Ethnicity which most accurately describes how you identify yourself  "])];
+  assert.equal(bucketHasWording(buckets, RACE, ethnicityQ), true, "normalized wording match");
+  assert.equal(bucketHasWording(buckets, "self_identification.gender", ethnicityQ), false, "bound to a different field");
+  assert.equal(fieldIsEmpty({ self_identification: { race: "" } }, RACE), true);
+  assert.equal(fieldIsEmpty({ self_identification: { race: "Asian" } }, RACE), false);
+  assert.equal(fieldIsEmpty({ self_identification: { race: [] } }, RACE), true);
+});
+
+// ── DEFAULT FIELD WORDINGS (operator, 2026-07-26) ─────────────────────────────────────────────
+// Every profile field's bucket starts with the field's OWN NAME as a wording, so a form that labels
+// its question the way the profile labels the field fills deterministically even when the tenant's
+// automation-id isn't in FIELD_MAP. Non-destructive + idempotent, like ensureStarterBuckets.
+test("default wordings: every profile field gets a bucket seeded with its own name", () => {
+  const profile = { personal_info: { first_name: "Kevin", last_name: "Wang", postal_code: "32312" } };
+  const out = ensureDefaultFieldWordings([], profile);
+  const fn = out.find((b) => b.profile_path === "personal_info.first_name");
+  assert.ok(fn, "a bucket exists for first_name");
+  assert.deepEqual(fn!.questions, ["First Name"]);
+  assert.ok(out.find((b) => b.profile_path === "personal_info.postal_code")?.questions.includes("Postal Code"));
+});
+
+test("default wordings: EXISTING buckets keep their wordings and just gain the field name (deduped)", () => {
+  const profile = { personal_info: { first_name: "Kevin" } };
+  const mine: Bucket[] = [{
+    id: "field_personal_info_first_name", profile_path: "personal_info.first_name", value: [],
+    category: "", widget_hint: "text", questions: ["Given name"], selectors: {},
+  }];
+  const out = ensureDefaultFieldWordings(mine, profile);
+  assert.deepEqual(out[0].questions, ["Given name", "First Name"], "operator wording kept, default appended");
+  // idempotent + case/spacing-insensitive (normalizeQuestion)
+  assert.deepEqual(ensureDefaultFieldWordings(out, profile)[0].questions, ["Given name", "First Name"]);
+  const cased: Bucket[] = [{ ...mine[0], questions: ["  first   NAME "] }];
+  assert.equal(ensureDefaultFieldWordings(cased, profile)[0].questions.length, 1, "already present under a different casing");
+});
+
+test("default wordings: generic labels are skipped, and only the PRIMARY repeating entry is seeded", () => {
+  const profile = {
+    websites: [{ type: "LinkedIn", url: "https://x" }],
+    education: [{ school_or_university: "CMU", gpa: "4.0" }, { school_or_university: "FSU", gpa: "3.9" }],
+  };
+  const out = ensureDefaultFieldWordings([], profile);
+  assert.equal(out.find((b) => b.profile_path === "websites.0.type"), undefined, "'Type' is too generic to stand alone");
+  assert.ok(out.find((b) => b.profile_path === "education.0.gpa"), "primary entry seeded");
+  assert.equal(out.find((b) => b.profile_path === "education.1.gpa"), undefined, "entry 1 is NOT seeded (a bucket binds one path)");
+});
+
+test("default wordings: each WEBSITE is seeded from its TYPE (LinkedIn / GitHub / Personal Website), not 'URL'", () => {
+  const profile = {
+    websites: [
+      { type: "LinkedIn", url: "https://linkedin.com/in/x" },
+      { type: "GitHub", url: "https://github.com/x" },
+      { type: "Personal Website", url: "https://x.dev" },
+    ],
+  };
+  const out = ensureDefaultFieldWordings([], profile);
+  // EVERY entry gets its own bucket (unlike the other repeating sections) — each is a distinct question.
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.0.url")?.questions, ["LinkedIn"]);
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.1.url")?.questions, ["GitHub"]);
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.2.url")?.questions, ["Personal Website"]);
+  // no "URL"/"Type" wording anywhere, and idempotent
+  assert.ok(!out.some((b) => (b.questions || []).some((q) => /^url$/i.test(q))));
+  assert.deepEqual(ensureDefaultFieldWordings(out, profile).find((b) => b.profile_path === "websites.1.url")?.questions, ["GitHub"]);
+});
+
+test("default wordings: a website with no type is skipped; an operator's own wording is kept", () => {
+  const profile = { websites: [{ type: "", url: "https://x" }, { type: "Portfolio", url: "https://y" }] };
+  const mine: Bucket[] = [{
+    id: "field_websites_1_url", profile_path: "websites.1.url", value: [],
+    category: "", widget_hint: "text", questions: ["Portfolio link"], selectors: {},
+  }];
+  const out = ensureDefaultFieldWordings(mine, profile);
+  assert.equal(out.find((b) => b.profile_path === "websites.0.url"), undefined, "no type → nothing to seed");
+  assert.deepEqual(out.find((b) => b.profile_path === "websites.1.url")?.questions, ["Portfolio link", "Portfolio"]);
+});
+
+// ── WEBSITE URLs are stored as FULL https:// URLs (operator, 2026-07-26) ──────────────────────
+test("website URL: bare host gains https://, an explicit scheme is left alone, empty stays empty", () => {
+  assert.equal(ensureHttpsUrl("linkedin.com/in/kevin"), "https://linkedin.com/in/kevin");
+  assert.equal(ensureHttpsUrl("  github.com/x  "), "https://github.com/x");
+  assert.equal(ensureHttpsUrl("https://x.dev"), "https://x.dev", "already full → untouched");
+  assert.equal(ensureHttpsUrl("http://x.dev"), "http://x.dev", "an explicit scheme is the operator's choice");
+  assert.equal(ensureHttpsUrl(""), "");
+  assert.equal(ensureHttpsUrl(null), "");
+});
+
+test("website URL: the profile SCHEMA normalizes on parse, so what's stored/synced/filled is the full URL", () => {
+  const p = profileSchema.parse({ websites: [{ type: "LinkedIn", url: "linkedin.com/in/kevin" }, { type: "GitHub", url: "" }] });
+  assert.equal(p.websites[0].url, "https://linkedin.com/in/kevin");
+  assert.equal(p.websites[1].url, "", "an unset URL is not invented");
+});
+
+test("website URL: looksLikeUrl flags what can't be a real URL (the editor's inline error)", () => {
+  for (const ok of ["", "linkedin.com/in/x", "https://x.dev", "sub.domain.co.uk/path?q=1"]) assert.equal(looksLikeUrl(ok), true, ok);
+  for (const bad of ["not a url", "localhost", "https://", "foo bar.com"]) assert.equal(looksLikeUrl(bad), false, bad);
 });

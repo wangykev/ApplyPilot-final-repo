@@ -2,8 +2,9 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
-import { profileSchema, type Profile } from "@/lib/profile-schema";
+import { profileSchema, coerceProfile, type Profile } from "@/lib/profile-schema";
 import { bucketsSchema, coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS, type Bucket } from "@/lib/buckets";
+import { ensureDefaultFieldWordings } from "@/lib/teach";
 
 export type SaveResult = { ok: true } | { ok: false; error: string };
 
@@ -77,12 +78,18 @@ export async function loadBuckets(): Promise<Bucket[]> {
 
     const { data } = await supabase
       .from("profiles")
-      .select("buckets_json")
+      .select("buckets_json, profile_json")
       .eq("id", user.id)
       .maybeSingle();
     // Existing user → their buckets + any newly-shipped starter bindings they don't have yet
     // (e.g. the education/work-experience flat-field bindings). Non-destructive; merge is on-read.
-    if (data && data.buckets_json != null) return ensureStarterBuckets(coerceBuckets(data.buckets_json));
+    if (data && data.buckets_json != null) {
+      // + each field's own name as a default wording (non-destructive, deduped) so the bucket editor
+      // shows the same coverage the fill uses.
+      const prof = data.profile_json != null ? coerceProfile(data.profile_json) : null;
+      const withStarters = ensureStarterBuckets(coerceBuckets(data.buckets_json));
+      return prof ? ensureDefaultFieldWordings(withStarters, prof) : withStarters;
+    }
 
     // Never provisioned → seed the approved starter set (Mode-A bindings only).
     await supabase

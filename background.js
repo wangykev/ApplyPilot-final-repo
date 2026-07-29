@@ -2372,7 +2372,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${s(r.elapsedMs)}`).join(", ");
     let pacing = "?"; try { pacing = await cdpPacingLabel(); } catch (e) { /* label only */ }
-    LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
+    LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)}+${s(ph["cascade-late"])} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
   }
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
@@ -3823,6 +3823,37 @@ async function runCdpOnboard(tabId, opts) {
     return { ok: true };
   };
 
+  // ── AUTH VIEW (2026-07-25, Caterpillar) ── Sign In and Create Account are two views of the SAME
+  // widget and BOTH carry email+password inputs, so "an email field is present" does NOT mean we are on
+  // the sign-in form. Live failure: the tenant opened on Create Account, the "Sign In" link click was
+  // refused (covered by the widget's own h3#authViewTitle), the flow filled the CREATE-ACCOUNT fields,
+  // and the generic `button[type="submit"]` fallback then clicked CREATE ACCOUNT while logging "Sign In
+  // submit". These predicates key on the SUBMIT markers — the only view-distinguishing signal.
+  const onSignInView = (s) => !!(s && s.markers && s.markers.signInSubmit);
+  const onCreateView = (s) => !!(s && s.markers && s.markers.createAccountSubmit && !s.markers.signInSubmit);
+
+  // Switch the auth widget to `want` ("signin" | "create") and VERIFY the switch actually happened
+  // (never assume a click landed). Ladder: the trusted coordinate click on the canonical link →, if that
+  // is refused/not-found, a page-side element click (cdpClickAuthSwitch — safe: a view-switch link is
+  // not a submit and not a consent control; submit buttons are excluded there) → then POLL for the
+  // target view's submit marker. Returns { ok, scan }. ok:false ⇒ the caller must NOT fill this view.
+  const switchAuthView = async (want, st) => {
+    const there = want === "signin" ? onSignInView : onCreateView;
+    if (there(st)) return { ok: true, scan: st };
+    const sel = want === "signin" ? '[data-automation-id="signInLink"]' : '[data-automation-id="createAccountLink"]';
+    const label = want === "signin" ? "Sign In tab" : "Create Account tab";
+    const r = await clickTarget([sel], label);
+    if (!r.clicked) {
+      const d = await cdpEval(cdpClickAuthSwitch, want === "signin" ? "signin" : "createaccount");
+      LOG(`"${label}" coordinate click ${r.blockedBy ? `refused (covered by ${r.blockedBy})` : "not found"} — ${d && d.ok ? `clicked it directly in-page (${JSON.stringify(d.text)}, via ${d.how})` : "no view-switch control found"}.`);
+      if (!d || !d.ok) return { ok: false, scan: st };
+    }
+    const w = await waitFor(there, 8000, `${want === "signin" ? "sign-in" : "create-account"} view`);
+    const scan2 = w.scan || st;
+    if (!w.matched) LOG(`the auth widget did not switch to the ${want === "signin" ? "SIGN IN" : "CREATE ACCOUNT"} view.`);
+    return { ok: !!w.matched, scan: scan2 };
+  };
+
   const checkConsent = async () => {
     let c = await cdpEval(cdpConsentRect);
     if (!c) { LOG("no consent checkbox detected — proceeding (some tenants have none)."); return; }
@@ -3875,7 +3906,12 @@ async function runCdpOnboard(tabId, opts) {
     return false;
   };
 
-  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null }) => {
+  // `beforeRetry` (2026-07-25, Caterpillar): an optional best-effort hook run before each RE-click.
+  // Create Account passes checkConsent — a missed/unchecked consent box makes the submit no-op with
+  // the form still up ("Error: Please check the box to continue"), so re-checking it before the
+  // retry self-heals a tenant the consent detector missed (checkConsent is idempotent — an
+  // already-checked box is a no-op read, never an uncheck).
+  const submitAndWait = async ({ selectors, label, done, formStillUp, tries = 3, timeoutMs = 20000, timeouts = null, beforeRetry = null }) => {
     // Clear Chrome's password-manager autofill dropdown (it can cover the submit button and swallow the
     // coordinate click) and CONFIRM it's gone before clicking. Both onboarding submits follow credential
     // fields, so this is a no-op cost when nothing is focused.
@@ -3893,7 +3929,11 @@ async function runCdpOnboard(tabId, opts) {
       if (st && done(st)) return { scan: st };
       // Timed out. Re-click ONLY if still on this submit form; else the page advanced (done just
       // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
-      if (t < n && st && formStillUp(st)) { LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`); continue; }
+      if (t < n && st && formStillUp(st)) {
+        LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`);
+        if (beforeRetry) { try { await beforeRetry(st); } catch (e) { /* best-effort — the re-click proceeds regardless */ } }
+        continue;
+      }
       return { scan: st };
     }
     return { scan: st };
@@ -3959,7 +3999,9 @@ async function runCdpOnboard(tabId, opts) {
   const doCreateAccount = async (st) => {
     LOG(`creating a Workday account as ${creds.email}…`);
     emitRunProgress("Creating your account");
-    if (st.markers.createAccountLink) { await clickTarget(['[data-automation-id="createAccountLink"]'], "Create Account tab"); await pace(900); st = await scan() || st; }
+    // Switch to the CREATE ACCOUNT view + verify (same discipline as the sign-in switch: never fill a
+    // form we haven't confirmed we're on). Already there ⇒ no-op.
+    if (!onCreateView(st)) { const sw = await switchAuthView("create", st); st = sw.scan || st; }
     await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
     await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
     await fillVerifyPassword(creds.password);
@@ -3974,7 +4016,8 @@ async function runCdpOnboard(tabId, opts) {
       selectors: ['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Create Account"]'],
       label: "Create Account submit",
       done: (s) => classifyAuthOutcome(s) !== "unknown" || s.markers.signInSubmit || s.signInWithEmail || /already (exists|in use)|account (already )?exists|email is already/i.test(s.bodyText || ""),
-      formStillUp: (s) => !!s.markers.createAccountSubmit
+      formStillUp: (s) => !!s.markers.createAccountSubmit,
+      beforeRetry: () => checkConsent() // a no-op submit with the form still up can mean a missed consent box ("Please check the box to continue" — Caterpillar) — re-detect + check it before re-clicking (idempotent)
     });
     if (r.notFound) return { ok: false, reached_form: false, needs_operator: true, stopped: "create-account-submit-not-found", detail: r.blockedBy || "no Create Account button" };
     let post = r.scan || st;
@@ -4050,10 +4093,16 @@ async function runCdpOnboard(tabId, opts) {
       if (looksLikeSso(st)) return { ok: true, reached_form: false, needs_operator: true, stopped: "sso", detail: "this tenant uses SSO/federated login — sign in manually, then re-run (it detects the form and continues)." };
       if (!creds || !creds.email || !creds.password) return { ok: true, reached_form: false, needs_operator: true, stopped: "no-credentials", detail: "load credentials (data/credentials.json) in the popup, or sign in manually then re-run." };
 
-      // Prefer the sign-in path (switch to its tab if a link is showing).
-      if (st.markers.signInLink) { await clickTarget(['[data-automation-id="signInLink"]'], "Sign In tab"); await pace(800); st = await scan() || st; }
+      // Prefer the sign-in path — but SWITCH to the sign-in view and VERIFY the switch before touching
+      // any field. Both views carry email+password, so the old "a field is present ⇒ we're signing in"
+      // assumption typed the sign-in credentials into the CREATE-ACCOUNT form and pressed CREATE ACCOUNT
+      // while logging "Sign In submit" (Caterpillar, live) — it only recovered by accident afterwards.
+      // If the sign-in view can't be reached we fall through to the create-account branch DELIBERATELY,
+      // never by mislabelling one form as the other.
+      if (st.markers.signInLink || onCreateView(st)) { const sw = await switchAuthView("signin", st); st = sw.scan || st; }
+      if (onCreateView(st)) LOG("auth widget is on the CREATE ACCOUNT view and would not switch to Sign In — going to account creation (not filling sign-in credentials into this form).");
 
-      if (st.passwordInput || st.emailInput) {
+      if ((st.passwordInput || st.emailInput) && !onCreateView(st)) {
         LOG(`sign-in attempt ${attempt} as ${creds.email}.`);
         // data-automation-id FIRST (Workday-canonical + present on observed tenants); the generic
         // input[type=email] is the fallback. Ordering matters only for speed — a missing first
@@ -4509,6 +4558,14 @@ async function fillEngine(profile, defaults, jobContext) {
     if (wrapper.querySelector('button[aria-haspopup="listbox"]')) return "dropdown";
     // 5. Checkbox — a single checkbox input.
     if (wrapper.querySelectorAll('input[type="checkbox"]').length === 1) return "checkbox";
+    // 5b. Checkbox GROUP — several checkboxes in ONE wrapper acting as a pick-one (the OFCCP
+    // disability self-ID). LOCKSTEP with cdp.js cdpPageScan.classify. The page engine has no filler
+    // for it (the CDP path does), so it records as an unhandled type — same as today's "unknown",
+    // but honestly typed so the review editor renders a picker instead of a textbox.
+    if (wrapper.querySelectorAll('input[type="checkbox"]').length > 1) return "checkbox_group";
+    // 5c. DATE composite — `dateSection*-input` spinbuttons (no type attr, so they'd count as
+    // text-like and fall to "unknown"). LOCKSTEP with cdp.js cdpPageScan.classify.
+    if (wrapper.querySelector('[data-automation-id^="dateSection"][data-automation-id$="-input"]')) return "date";
     // 6. Text — exactly one text-like input.
     const textLike = Array.from(wrapper.querySelectorAll("input")).filter((el) => {
       const t = (el.getAttribute("type") || "").toLowerCase();

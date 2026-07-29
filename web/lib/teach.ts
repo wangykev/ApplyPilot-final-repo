@@ -1,4 +1,5 @@
 import { normalizeQuestion, type Bucket } from "@/lib/buckets";
+import { profileFieldMeta } from "@/lib/profile-fields";
 import type { ReviewEntry, ReviewBundle } from "@/lib/review-summary";
 
 /**
@@ -326,6 +327,11 @@ function rawAt(profile: unknown, path: string): unknown {
  *  answer the profile already covers does NOT resurface in teach after being taught. */
 export function fieldHoldsAnswer(profile: unknown, path: string, answer: string): boolean {
   const raw = rawAt(profile, path);
+  // The field's ANSWER-VARIANT ladder counts as HELD: answer_ladders[path].values is exactly what the
+  // extension appends as extra match candidates (appendFieldVariants), so a phrasing already taught
+  // there fills deterministically and must NOT resurface as a teach card (2026-07-25).
+  const variants = (profile as { answer_ladders?: Record<string, { values?: string[] }> } | null)?.answer_ladders?.[path]?.values;
+  if (Array.isArray(variants) && variants.some((v) => sameAnswer(String(v), answer))) return true;
   if (Array.isArray(raw)) return raw.some((v) => typeof v === "string" && sameAnswer(v, answer));
   if (typeof raw === "boolean") {
     const ladders = (profile as { answer_ladders?: Record<string, { yes?: string[]; no?: string[] }> } | null)?.answer_ladders;
@@ -336,15 +342,147 @@ export function fieldHoldsAnswer(profile: unknown, path: string, answer: string)
   return raw != null && sameAnswer(String(raw), answer);
 }
 
-/** Which route the teach confirm popup takes when a card is added to a chosen profile field:
- *  - "wording": the field already holds the card's answer → only the phrasing is missing, so add the
- *    wording (the value stays untouched);
- *  - "answer":  the field is empty OR holds a different value → set / append the answer (and file the
- *    wording too, so the card is fully taught).
- *  Splitting these is what makes the popup show exactly "the question OR the answer" that's missing. */
-export type TeachRoute = "answer" | "wording";
+/** Does this field's question bucket ALREADY contain this wording? (normalized, the fill's own key) */
+export function bucketHasWording(buckets: Bucket[], path: string, question: string): boolean {
+  const p = String(path || "").trim();
+  const k = normalizeQuestion(question);
+  if (!p || !k) return false;
+  return (buckets || []).some(
+    (b) => String(b.profile_path || "").trim() === p && (b.questions || []).some((q) => normalizeQuestion(q) === k),
+  );
+}
+
+/** Is the field EMPTY (no stored value at all)? An empty field wants its VALUE set; a field that already
+ *  holds a different value wants the tenant's phrasing filed as an answer VARIANT, never an overwrite. */
+export function fieldIsEmpty(profile: unknown, path: string): boolean {
+  const raw = rawAt(profile, path);
+  if (raw == null) return true;
+  if (Array.isArray(raw)) return raw.filter((v) => String(v ?? "").trim() !== "").length === 0;
+  if (typeof raw === "boolean") return false;
+  return String(raw).trim() === "";
+}
+
+/** Which route the teach confirm popup takes when a card is added to a chosen profile field. TWO
+ *  INDEPENDENT axes (operator, 2026-07-25) — the question WORDING (the bucket) and the ANSWER (the
+ *  field's value / its answer-variant ladder) can each be missing, so the old binary route mishandled
+ *  the case where BOTH are:
+ *  - "wording": the field already answers this → only the phrasing is new → add it to the bucket;
+ *  - "answer":  the field is EMPTY → set its value (and file the wording too);
+ *  - "variant": the field holds a DIFFERENT value and the wording is already known → the tenant's
+ *    phrasing of the answer belongs in this field's answer-variant ladder — NEVER overwrite the value
+ *    (the live case: race = "Asian", the form wanted "Asian (not hispanic or latino)");
+ *  - "both":    the field holds a different value AND the wording is new → BOTH must be taught, so the
+ *    popup shows the question bucket and the answer ladder side by side. Checked FIRST.
+ */
+export type TeachRoute = "answer" | "wording" | "variant" | "both";
 export function decideTeachRoute(profile: unknown, path: string, answer: string): TeachRoute {
-  return fieldHoldsAnswer(profile, path, answer) ? "wording" : "answer";
+  if (fieldHoldsAnswer(profile, path, answer)) return "wording"; // the answer is covered; only the phrasing can be new
+  if (fieldIsEmpty(profile, path)) return "answer";              // nothing stored yet → set the value
+  return wantsVariant(profile, path) ? "variant" : "answer";     // scalar → the answer is another PHRASING; bool/list → a real value change
+}
+
+/** Is a DIFFERENT answer on this field a new PHRASING (→ the variant ladder) or a real VALUE change?
+ *  - boolean (triBool): a different answer flips POLARITY → a value change (its per-polarity label
+ *    ladder is handled by the popup's non-standard-label editor);
+ *  - array (tiered/list): a different answer is another accepted option → appended to the field's OWN
+ *    list by the value editor;
+ *  - scalar: the profile holds one canonical value ("Asian") and the form worded it differently
+ *    ("Asian (not hispanic or latino)") → the ANSWER-VARIANT ladder, never an overwrite. */
+function wantsVariant(profile: unknown, path: string): boolean {
+  const raw = rawAt(profile, path);
+  return typeof raw !== "boolean" && !Array.isArray(raw);
+}
+
+/** The FULL decision, both axes at once — what the popup renders and what confirm must save. */
+export function decideTeachPlan(
+  profile: unknown,
+  path: string,
+  card: { question: string; answer: string },
+  buckets: Bucket[],
+): { route: TeachRoute; needsWording: boolean; needsAnswer: boolean } {
+  const answerHeld = fieldHoldsAnswer(profile, path, card.answer);
+  const wordingKnown = bucketHasWording(buckets, path, card.question);
+  const needsWording = !wordingKnown;
+  const needsAnswer = !answerHeld;
+  if (!needsAnswer) return { route: "wording", needsWording, needsAnswer };   // only the phrasing can be missing
+  if (fieldIsEmpty(profile, path)) return { route: "answer", needsWording, needsAnswer }; // empty field → set the value
+  // Holds a DIFFERENT value. A bool polarity flip / a list append is a real VALUE change (the value
+  // editor owns it, and it files the wording too); a SCALAR difference is another phrasing → the
+  // variant ladder, and when the wording is new too, BOTH are taught in one merged popup.
+  if (!wantsVariant(profile, path)) return { route: "answer", needsWording, needsAnswer };
+  return { route: needsWording ? "both" : "variant", needsWording, needsAnswer };
+}
+
+/** Field NAMES that are too generic to be a safe default question wording on their own — a form asking
+ *  "Type" or "Name" is not necessarily asking for the website type or a person's name, and a bucket
+ *  wording is an EXACT (normalized) match that would then fill from the wrong field. Everything else
+ *  ("First Name", "Postal Code", "Willing To Relocate") is specific enough to stand alone. */
+const GENERIC_FIELD_LABELS = new Set(["type", "name", "value", "other", "notes", "description", "url", "id", "status", "title"]);
+
+/** Only the PRIMARY entry of a repeating section gets a default wording — a flat tenant asks "School"
+ *  once, and a bucket binds to ONE path (the education.0.* starter convention). "education.1.gpa" etc.
+ *  are skipped. A non-indexed path always passes. */
+function isPrimaryEntryPath(path: string): boolean {
+  const m = /\.(\d+)\./.exec(path);
+  return !m || m[1] === "0";
+}
+
+/**
+ * DEFAULT QUESTION WORDINGS (operator, 2026-07-26): every profile field's question bucket starts with
+ * the field's OWN NAME as a wording — the "First Name" bucket contains "First Name" — so a form that
+ * literally labels its question the way the profile labels the field fills deterministically even when
+ * the tenant's automation-id isn't in FIELD_MAP. Matching is normalized (lower-cased, whitespace
+ * collapsed), so "First Name" also covers "first name".
+ *
+ * Non-destructive + idempotent, exactly like ensureStarterBuckets: existing wordings/values are never
+ * touched, the default is added only when that wording isn't already present (deduped by
+ * normalizeQuestion), and a bucket is created for a path only if the profile actually has the field.
+ * Applied on LOAD alongside ensureStarterBuckets, so it self-heals as the profile schema grows.
+ */
+export function ensureDefaultFieldWordings(buckets: Bucket[], profile: unknown): Bucket[] {
+  const rows = flattenProfileFields(profile);
+  let next = buckets;
+  // WEBSITES are the exception to both rules below: each entry is a DIFFERENT question (LinkedIn is not
+  // GitHub), so every entry — not just the primary — gets its own bucket, and the wording comes from the
+  // entry's TYPE rather than the field name ("Url"/"Type" are far too generic). Operator, 2026-07-26:
+  // "for linkedin, github, and personal website also make it default, no need for URL" — the wording is
+  // the type verbatim ("LinkedIn", "GitHub", "Personal Website"), matching a form that labels its field
+  // exactly that. The three built-in types are type-locked in the profile editor; a custom one the
+  // operator names works the same way.
+  const sites = (profile as { websites?: { type?: string; url?: string }[] } | null)?.websites;
+  if (Array.isArray(sites)) {
+    sites.forEach((w, i) => {
+      const type = String(w?.type || "").trim();
+      if (!type) return;
+      const path = "websites." + i + ".url";
+      const existing = next.find((b) => String(b.profile_path || "").trim() === path);
+      if (existing) {
+        const k = normalizeQuestion(type);
+        if ((existing.questions || []).some((q) => normalizeQuestion(q) === k)) return;
+        next = next.map((b) => (b === existing ? { ...b, questions: [...(b.questions || []), type] } : b));
+        return;
+      }
+      const seeded = ensureModeABucket(next, path, "text");
+      next = addWordingToBucket(seeded.buckets, seeded.bucketId, type);
+    });
+  }
+  for (const r of rows) {
+    const label = String(r.label || "").trim();
+    if (!label || GENERIC_FIELD_LABELS.has(label.toLowerCase())) continue;
+    if (!isPrimaryEntryPath(r.path)) continue;
+    const path = r.path.trim();
+    if (!path) continue;
+    const existing = next.find((b) => String(b.profile_path || "").trim() === path);
+    if (existing) {
+      const k = normalizeQuestion(label);
+      if ((existing.questions || []).some((q) => normalizeQuestion(q) === k)) continue; // already has it
+      next = next.map((b) => (b === existing ? { ...b, questions: [...(b.questions || []), label] } : b));
+      continue;
+    }
+    const seeded = ensureModeABucket(next, path, profileFieldMeta(path, undefined).bucketWidget);
+    next = addWordingToBucket(seeded.buckets, seeded.bucketId, label);
+  }
+  return next;
 }
 
 /** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */

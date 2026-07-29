@@ -102,6 +102,8 @@ export function TextField({
   label,
   value,
   onChange,
+  onBlur,
+  error,
   placeholder,
   type = "text",
   hint,
@@ -111,6 +113,11 @@ export function TextField({
   label: string;
   value: string;
   onChange: (v: string) => void;
+  /** Fired when the field loses focus — used to NORMALIZE a value without fighting the typing
+   *  (e.g. a website URL gains its https:// prefix on blur, not mid-keystroke). */
+  onBlur?: () => void;
+  /** Inline validation message shown under the field. */
+  error?: string | null;
   placeholder?: string;
   type?: string;
   hint?: string;
@@ -128,10 +135,17 @@ export function TextField({
           placeholder={placeholder}
           disabled={disabled}
           onChange={(e) => onChange(e.target.value)}
-          className={clsx(inputCls, disabled && "cursor-not-allowed text-ink-dim opacity-70", hasLadder && "pr-9")}
+          onBlur={onBlur}
+          className={clsx(
+            inputCls,
+            disabled && "cursor-not-allowed text-ink-dim opacity-70",
+            hasLadder && "pr-9",
+            error && "border-signal",
+          )}
         />
         {hasLadder && <LadderArrow bucketPath={bucketPath!} label={label} />}
       </div>
+      {error && <p className="mt-1 text-xs text-signal">{error}</p>}
     </label>
   );
 }

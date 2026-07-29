@@ -1017,7 +1017,7 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
   // partial-option note (typeahead/tree/radio-without-options)
   const partial =
     (e.tree_structure && Array.isArray(e.tree_structure.leaves) && e.tree_structure.leaves.length > 0) ||
-    (wt === "radio" && !(e.options && e.options.length)) ||
+    ((wt === "radio" || wt === "checkbox_group") && !(e.options && e.options.length)) ||
     (wt === "typeahead" && !(e.options && e.options.length) && (e.captured_options?.length || 0) > 2);
   const tier =
     (wt === "typeahead" && !(e.options && e.options.length) && (e.captured_options?.length || 0) <= 2) ||
@@ -1067,9 +1067,14 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   // toggles), which is how the field actually renders on the form. A large radio set falls back to a select.
   if (wt === "radio" && e.options && e.options.length && e.options.length <= 4)
     return <RadioButtons value={cur} options={e.options} onCommit={onCommit} />;
-  if ((wt === "dropdown" || wt === "radio") && e.options && e.options.length)
+  // CHECKBOX GROUP (2026-07-25): a pick-one set of checkboxes in ONE wrapper (the OFCCP disability
+  // self-ID — "Yes, I have a disability…" / "No…" / "I do not want to answer"). Radio-like, so it gets
+  // the same editors. Its options come from the page scan (read straight from the DOM), so a voluntary
+  // self-ID question the bot correctly left BLANK still renders a real picker instead of a textbox.
+  // Long legal option labels wrap badly as segmented buttons → always the select.
+  if ((wt === "dropdown" || wt === "radio" || wt === "checkbox_group") && e.options && e.options.length)
     return <SelectBox value={cur} options={e.options} onCommit={onCommit} />;
-  if (wt === "radio") return <TextBox value={cur} onCommit={onCommit} />;
+  if (wt === "radio" || wt === "checkbox_group") return <TextBox value={cur} onCommit={onCommit} />;
   if (wt === "checkbox")
     return (
       <label className="inline-flex items-center gap-2 text-sm text-ink-dim">

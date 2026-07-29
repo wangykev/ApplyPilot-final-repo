@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -102,7 +102,8 @@ function makeFakeAct(fields, opts) {
       fields: fields.map((f) => ({
         wrapperSel: f.wrapperSel, fieldName: f.fieldName, widgetType: f.widgetType,
         label: f.label || f.fieldName, isRequired: !!f.isRequired,
-        value: f.liveValue !== undefined ? f.liveValue : null // already-filled sweep: the field's CURRENT live value
+        value: f.liveValue !== undefined ? f.liveValue : null, // already-filled sweep: the field's CURRENT live value
+        groupOptions: f.groupOptions // checkbox_group: option labels read straight from the DOM (no actuation)
       }))
     }),
     repeatingScan: async () => o.rscan || null, // m3a: o.rscan models repeating sections (known/unknown); default null = flat-only (existing tests unchanged)
@@ -411,7 +412,7 @@ function makeFakeAct(fields, opts) {
       if (f && f.dropsFocusOnScrape) f._focusedSb = false;
       if (!f || f.scrapeFails) return { ok: false, error: "no wrapper" };
       const options = (f.scrapeOptions || []).slice();
-      return { ok: true, options, count: options.length, atBottom: true };
+      return { ok: true, options, count: options.length, atBottom: !f.scrapeNotAtBottom, cappedOut: !!f.scrapeCappedOut };
     },
     // Trusted-click commit fallback. Default: commits the named option (trusted
     // clicks work); flags: clickCommitFails (dispatched, page ignores it),
@@ -507,11 +508,24 @@ function makeFakeAct(fields, opts) {
 
     // radio / checkbox
     readRadioState: async (loc) => byLoc(loc).options.map((o) => ({ ...o })),
+    // checkbox GROUP (pick-one checkbox set — the OFCCP self-ID). Same shape as readRadioState.
+    readCheckboxGroup: async (loc) => { const f = byLoc(loc); return f.options ? f.options.map((o) => ({ ...o })) : null; },
     clickRadioLabel: async (loc, id) => {
       log.push(["clickRadioLabel", id]);
       const f = byLoc(loc);
       if (f.radioClickRectDead) return false;
-      if (!f.radioClickNoCommit) f.options.forEach((o) => { o.checked = o.id === id; });
+      if (f.radioClickNoCommit) return true;
+      if (f.widgetType === "checkbox_group") {
+        // Model the LIVE tenant quirk: a checkbox TOGGLES, and while another option is checked the
+        // tenant REFUSES a second check (the operator had to uncheck the current one first).
+        const me = f.options.find((o) => o.id === id);
+        if (!me) return true;
+        if (me.checked) { me.checked = false; return true; }          // toggle OFF
+        if (f.options.some((o) => o.checked)) return true;            // refuses while another is checked
+        me.checked = true;
+        return true;
+      }
+      f.options.forEach((o) => { o.checked = o.id === id; });
       return true;
     },
     focusInput: async (id) => { log.push(["focusInput", id]); focusedInputId = id; return true; },
@@ -2500,6 +2514,371 @@ test("required-empty typeahead (section / FoS): AI ON → infers + forces a pick
   assert.strictEqual(fos.status, "filled_review", "a required empty section typeahead is CONFIDENTLY AI-filled, not skipped");
   assert.strictEqual(fos.after, "Biology");
   assert.ok(!out.results.some((r) => r.widgetType === "removed_entry"), "a confident AI fill KEEPS the entry (not delete-with-memory)");
+});
+
+// ── Tenant-variable section fields: id alternates + WIDGET-ADAPTIVE fill (2026-07-25) ──────────
+// Live break (cat.wd5/solarturbines): education "School or University" is neither `schoolName` NOR a
+// text box — it's a multiselect TYPEAHEAD under a different id, so the single hardcoded id resolved
+// nothing ("field wrapper not found in entry"), no fill ran, and the required field blocked Save &
+// Continue. Two mechanisms fix it: altFields/labelFallback resolution, and the live DOM's widget winning.
+const SCHOOL_FM = [{ field: "schoolName", altFields: ["school"], labelFallback: /school|university/i,
+  widget: "text", key: "school_or_university", path: "school_or_university" }];
+
+test("section field: an ALT automation-id resolves the wrapper (tenant renamed schoolName → school)", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "school", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled", "resolved via altFields — NOT 'field wrapper not found in entry'");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+});
+
+test("section field: LABEL fallback resolves a wrapper whose id matches no alternate", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "e7f3a91c0000", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled", "hashed/unknown id resolved by the label fallback");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+});
+
+test("section field: the LIVE widget WINS — a text-mapped field the tenant renders as a TYPEAHEAD fills through the typeahead ladder", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "school", widgetType: "typeahead", isRequired: true, label: "School or University",
+    chips: [], scrapeOptions: ["Carnegie Mellon University", "MIT"], filterMap: { "Carnegie Mellon University": { autoCommit: "Carnegie Mellon University" } } }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled", "filled as a typeahead even though the map says text");
+  assert.strictEqual(rec.after, "Carnegie Mellon University");
+  assert.strictEqual(rec.widgetType, "typeahead", "the record reports the LIVE widget (review renders the right editor)");
+  assert.deepStrictEqual(rec.widgetAdapted, { configured: "text", live: "typeahead" }, "the swap is recorded");
+});
+
+test("section field: a matching map widget is NEVER swapped (no adaptation when config and live agree)", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "schoolName", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false }, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "education[0].schoolName");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.widgetType, "text");
+  assert.strictEqual(rec.widgetAdapted, undefined, "no swap recorded when the live DOM agrees with the map");
+});
+
+test("section field: a labelFallback NEVER steals a field another map entry names by id", async () => {
+  // "Field of Study" must go to the fieldOfStudy entry, not to school's /school|university/i fallback —
+  // and school's own field still resolves. Guards the two-pass (ids first) resolution.
+  const entry = (fkit) => ({ fkit, fields: [
+    { fieldName: "fieldOfStudy", widgetType: "text", isRequired: false, label: "Field of Study" },
+    { fieldName: "someHashedId", widgetType: "text", isRequired: true, label: "School or University" }
+  ] });
+  const fm = [SCHOOL_FM[0], { field: "fieldOfStudy", widget: "text", key: "fos", path: "field_of_study" }];
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, { name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University", fos: "Electrical Engineering" }], fieldMap: fm, deleteOnNoMatch: false }, T_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "education[0].schoolName").after, "Carnegie Mellon University");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "education[0].fieldOfStudy").after, "Electrical Engineering");
+});
+
+// ── PER-ENTRY answer buckets in a repeating section (2026-07-25, operator's design) ────────────
+// The same wording appears in EVERY entry, so the bucket identifies WHICH FIELD and the entry ORDINAL
+// picks WHICH VALUE: entry 0 → education[0]'s school, entry 1 → education[1]'s. Only fires for entry
+// fields the fieldMap does NOT claim.
+const SCHOOL_BUCKET = { questions: ["School or University"], profile_path: "education.0.school_or_university" };
+const eduBucketEntry = (fkit, fieldName) => ({ fkit, fields: [{ fieldName: fieldName || "someForeignId", widgetType: "text", isRequired: true, label: "School or University" }] });
+
+test("repeating bucket: an UNMAPPED entry field fills from its WORDING + that ENTRY's own value (ordinal picks the value)", async () => {
+  const state = { prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null"), eduBucketEntry("education-1--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }, { school_or_university: "Florida State University" }],
+    fieldMap: [{ field: "degree", widget: "dropdown", key: "degree", path: "degree" }], // school NOT in the map
+    deleteOnNoMatch: false, buckets: buildBucketIndex([SCHOOL_BUCKET])
+  }, T_BUDGETS);
+  const e0 = out.results.find((r) => r.fieldName === "education[0].someForeignId");
+  const e1 = out.results.find((r) => r.fieldName === "education[1].someForeignId");
+  assert.strictEqual(e0.after, "Carnegie Mellon University", "entry 0 got entry 0's value");
+  assert.strictEqual(e1.after, "Florida State University", "entry 1 got ENTRY 1's value — not a repeat of entry 0");
+  assert.strictEqual(e0.flag, "bucket");
+  assert.strictEqual(e0.mappedPath, "education[0].school_or_university");
+});
+
+test("repeating bucket: a bucket from ANOTHER section never fires inside this one", async () => {
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null")] });
+  const foreign = { questions: ["School or University"], profile_path: "work_experience.0.company" }; // wrong root
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University", company: "SHOULD NOT FILL" }],
+    fieldMap: [], deleteOnNoMatch: false, buckets: buildBucketIndex([foreign])
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.after === "SHOULD NOT FILL"), "a work_experience-bound bucket must never fill an education entry");
+});
+
+test("repeating bucket: Mode B (fixed value, no profile_path) does NOT fire per-entry (no indexed data = a guess)", async () => {
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null"), eduBucketEntry("education-1--null")] });
+  const modeB = { questions: ["School or University"], value: ["Some Fixed School"] };
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{}, {}], fieldMap: [], deleteOnNoMatch: false, buckets: buildBucketIndex([modeB])
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.after === "Some Fixed School"), "Mode B would fill every entry identically → not applied per-entry");
+});
+
+test("repeating bucket: NEVER double-fills a field the fieldMap already filled", async () => {
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "schoolName", widgetType: "text", isRequired: true, label: "School or University" }] });
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }],
+    fieldMap: [{ field: "schoolName", widget: "text", key: "school_or_university", path: "school_or_university" }],
+    deleteOnNoMatch: false, buckets: buildBucketIndex([SCHOOL_BUCKET])
+  }, T_BUDGETS);
+  const hits = out.results.filter((r) => r.after === "Carnegie Mellon University");
+  assert.strictEqual(hits.length, 1, "exactly one record — the mapped fill; the bucket tier skipped the claimed field");
+  assert.notStrictEqual(hits[0].flag, "bucket", "the mapped fill is NOT re-flagged as a bucket fill");
+});
+
+test("sweep: a TENANT-RENAMED section field this run FILLED is not re-surfaced as 'already on the form' (no duplicate row)", async () => {
+  // Live (Solar Turbines): education[0].schoolName filled correctly (autocommit-exact) and the sweep then
+  // pushed a SECOND record education[0].school — filled_review "already on the form (unmapped section
+  // field) — NOT filled by ApplyPilot" — because its join keyed on the map's id, which this tenant renamed.
+  const entry = (fkit) => ({ fkit, fields: [{ fieldName: "school", widgetType: "text", isRequired: true, label: "School or University", value: "" }] });
+  const state = { prefix: "education-", addable: true, deletable: true, newEntry: (i) => entry("education-new" + i), entries: [entry("education-0--null")] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: SCHOOL_FM, deleteOnNoMatch: false
+  }, T_BUDGETS);
+  // the section fill happens inside driveRepeatingSectionCdp; run the page-level sweep over its records
+  const results = out.results.slice();
+  await sweepAlreadyFilled(act, results);
+  const schoolRecs = results.filter((r) => /^education\[0\]\.(school|schoolName)$/.test(r.fieldName));
+  assert.strictEqual(schoolRecs.length, 1, "exactly ONE record for the school field — no duplicate sweep row");
+  assert.strictEqual(schoolRecs[0].fieldName, "education[0].schoolName");
+  assert.notStrictEqual(schoolRecs[0].flag, "already-filled", "the field this run filled is not re-flagged as someone else's value");
+  assert.notStrictEqual(schoolRecs[0].status, "filled_review");
+});
+
+test("repeating bucket: no buckets configured ⇒ the tier is inert (byte-identical to the pre-bucket fill)", async () => {
+  const act = makeFakeRepeatAct({ prefix: "education-", addable: true, deletable: true,
+    newEntry: (i) => eduBucketEntry("education-new" + i), entries: [eduBucketEntry("education-0--null")] });
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-", itemsKey: "education",
+    items: [{ school_or_university: "Carnegie Mellon University" }], fieldMap: [], deleteOnNoMatch: false
+  }, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.flag === "bucket"), "no bucket index → no bucket fills");
+});
+
+// ── CHECKBOX GROUP (pick-one checkbox set — Caterpillar's OFCCP disability self-ID, 2026-07-25) ──
+// Several checkboxes in ONE wrapper acting like radios; the tenant refuses a second check while one
+// is set, so the filler must UNCHECK the current option first. Options are read from the DOM by the
+// SCAN (no actuation), so even a field left BLANK carries them → the review renders a real picker.
+const SELFID_OPTS = [
+  "Yes, I have a disability, or have had one in the past",
+  "No, I do not have a disability and have not had one in the past",
+  "I do not want to answer"
+];
+const selfIdField = (over = {}) => Object.assign({
+  wrapperSel: "[w-selfid]", fieldName: "disabilityStatus", widgetType: "checkbox_group",
+  label: "Please check one of the boxes below:",
+  options: SELFID_OPTS.map((t, i) => ({ id: "cb" + i, labelText: t, checked: false })),
+  groupOptions: SELFID_OPTS.map((t, i) => ({ id: "cb" + i, labelText: t, checked: false }))
+}, over);
+
+test("checkbox group: an UNMAPPED (voluntary self-ID) group is left BLANK but still carries its OPTIONS for review", async () => {
+  const act = makeFakeAct([selfIdField()]);
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "skipped", "a voluntary self-ID question is the OPERATOR's to answer — never auto-answered");
+  assert.deepStrictEqual(rec.options, SELFID_OPTS, "options ride the record so review renders a picker, not a textbox");
+  assert.ok(!act.log.some(([m]) => m === "clickRadioLabel"), "ZERO actuation on the blank group");
+});
+
+test("checkbox group: a MAPPED value checks the matching option (label-exact) and verifies exactly one is set", async () => {
+  const field = selfIdField({ fieldName: "gender" }); // any mapped field name; FIELD_MAP.gender → self_identification.gender
+  field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: false }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Male");
+  assert.strictEqual(rec.matchTier, "label-exact");
+  assert.strictEqual(field.options.filter((o) => o.checked).length, 1, "exactly ONE option ends checked");
+});
+
+test("checkbox group: replacing a checked option UNCHECKS the current one first (the tenant refuses a second check)", async () => {
+  const field = selfIdField({ fieldName: "gender" });
+  field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: true }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "committed despite the tenant's uncheck-first rule");
+  assert.strictEqual(rec.after, "Male");
+  assert.deepStrictEqual(field.options.map((o) => o.checked), [true, false], "the prior option was unchecked, the target checked");
+  const clicks = act.log.filter(([m]) => m === "clickRadioLabel").map(([, id]) => id);
+  assert.deepStrictEqual(clicks, ["f", "m"], "uncheck the current option BEFORE checking the target");
+});
+
+test("checkbox group: no candidate matches the labels → needs_review, ZERO actuation (never a guessed self-ID answer)", async () => {
+  const field = selfIdField({ fieldName: "gender" });
+  field.options = [{ id: "a", labelText: "Male", checked: false }, { id: "b", labelText: "Female", checked: false }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Nonbinary" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.ok(!field.options.some((o) => o.checked), "nothing was checked");
+});
+
+test("checkbox group: replayField (SUBMIT) sets the approved option through the same pick-one handler", async () => {
+  const field = selfIdField({ wrapperSel: '[data-automation-id="formField-disabilityStatus"]' }); // replayField derives the selector from field_id
+  field.options = [{ id: "y", labelText: SELFID_OPTS[0], checked: false }, { id: "n", labelText: SELFID_OPTS[1], checked: true }];
+  const act = makeFakeAct([field]);
+  const entry = { widget_type: "checkbox_group", current_value: SELFID_OPTS[0], field_id: "p::formField-disabilityStatus", canonical_field: "disabilityStatus" };
+  const r = await replayField(act, entry, T_BUDGETS);
+  assert.strictEqual(r.status, "filled", "the approved self-ID answer replays");
+  assert.strictEqual(r.after, SELFID_OPTS[0]);
+  assert.deepStrictEqual(field.options.map((o) => o.checked), [true, false]);
+});
+
+// ── REVIEW ORDER: form order, sections interleaved with flat fields (operator, 2026-07-25) ──
+test("review order: a flat field BETWEEN two repeating sections stays between them (not hoisted above both)", () => {
+  // Production order: all flat records first, then section-by-section. Page layout: phone (0),
+  // workExperience (1..), "howDidYouHear" (10), education (11..), websites (20..).
+  const scanFields = [{ fieldName: "phoneNumber", domIndex: 0 }, { fieldName: "howDidYouHear", domIndex: 10 }];
+  const sectionOrder = { workExperience: 1, education: 11, webAddress: 20 };
+  const results = [
+    { fieldName: "phoneNumber" }, { fieldName: "howDidYouHear" },          // flat (produced first)
+    { fieldName: "workExperience.add" }, { fieldName: "workExperience[0].jobTitle" }, { fieldName: "workExperience[1].jobTitle" },
+    { fieldName: "education.add" }, { fieldName: "education[0].degree" },
+    { fieldName: "website.add" }, { fieldName: "website[0].url" }          // section name "website" ≠ fkit base "webAddress"
+  ];
+  orderResultsByDom(results, scanFields, sectionOrder);
+  assert.deepStrictEqual(results.map((r) => r.fieldName), [
+    "phoneNumber",
+    "workExperience.add", "workExperience[0].jobTitle", "workExperience[1].jobTitle",
+    "howDidYouHear",                                                        // BETWEEN the sections, as on the form
+    "education.add", "education[0].degree",
+    "website.add", "website[0].url"
+  ]);
+});
+
+test("review order: a section's own records keep their fill order (stable), and unpositioned records stay with their group", () => {
+  const scanFields = [{ fieldName: "firstName", domIndex: 0 }];
+  const sectionOrder = { education: 5 };
+  const results = [
+    { fieldName: "firstName" },
+    { fieldName: "education.add" },
+    { fieldName: "education[0].schoolName" },
+    { fieldName: "education[0].degree" },
+    { fieldName: "education[0].__note" },        // no position → inherits the previous key
+    { fieldName: "education[1].schoolName" }
+  ];
+  const before = results.map((r) => r.fieldName);
+  orderResultsByDom(results, scanFields, sectionOrder);
+  assert.deepStrictEqual(results.map((r) => r.fieldName), before, "already in form order → unchanged (stable)");
+});
+
+test("review order: no scan positions ⇒ order is left exactly as produced (never scrambles)", () => {
+  const results = [{ fieldName: "a" }, { fieldName: "b" }, { fieldName: "c" }];
+  orderResultsByDom(results, [], {});
+  assert.deepStrictEqual(results.map((r) => r.fieldName), ["a", "b", "c"]);
+});
+
+// ── PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25) ────────────────────────────────────────────
+// The start-scrape already has the widget's whole option list, so a candidate that provably isn't in
+// it must NOT be typed just to discover that. Gated on a COMPLETE scrape (atBottom, not capped).
+test("typeahead short-circuit: candidates ABSENT from the complete scraped list are never typed", async () => {
+  const act = makeFakeAct([taField({
+    scrapeOptions: ["Accounting", "Biology", "Electrical Engineering"],
+    filterMap: { "Electrical Engineering": { autoCommit: "Electrical Engineering" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Electrical and Computer Engineering", "Electrical Engineering"]), {}, {}, T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["Electrical Engineering"], "only the candidate that IS in the list was typed");
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Electrical Engineering");
+});
+
+test("typeahead short-circuit: NO candidate in the complete list → zero typing, straight to the AI rescue", async () => {
+  const act = makeFakeAct([taField({
+    isRequired: true,
+    scrapeOptions: ["Accounting", "Biology"],
+    filterMap: { "Biology": { autoCommit: "Biology" } }
+  })], { aiEnabled: true, ai: '{"choice":"Biology","represented":true,"confidence":"High"}' });
+  const out = await drivePageFill(act, taProfile(["Underwater Basket Weaving"]), {}, {}, T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
+  assert.ok(!typed.includes("Underwater Basket Weaving"), "the absent candidate was never typed");
+  assert.ok(act.log.some(([m]) => m === "llm"), "went straight to the AI rescue");
+  assert.strictEqual(out.results[0].status, "filled_review");
+  assert.strictEqual(out.results[0].after, "Biology");
+});
+
+test("typeahead short-circuit: an INCOMPLETE scrape (never reached the bottom) still walks the FULL ladder", async () => {
+  // A partial list cannot prove absence — the candidate must still be typed (the server may filter to it).
+  const act = makeFakeAct([taField({
+    scrapeNotAtBottom: true,
+    scrapeOptions: ["Accounting", "Biology"],
+    filterMap: { "Zoology": { autoCommit: "Zoology" } }
+  })]);
+  const out = await drivePageFill(act, taProfile(["Zoology"]), {}, {}, T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, t]) => t);
+  assert.deepStrictEqual(typed, ["Zoology"], "typed despite being absent from the PARTIAL scrape");
+  assert.strictEqual(out.results[0].status, "filled", "and it committed — no regression on server-filtered lists");
+});
+
+// ── ORPHAN CONSENT CHECKBOX (outside any formField wrapper) — Caterpillar's page-1 SMS consent ──
+test("orphan consent checkbox: inventoried for review, left UNCHECKED, zero actuation", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  const SMS = "I consent to receive periodic automated text messages … I understand that my consent is not required.";
+  act.scanOrphanCheckboxes = async () => [{ key: "smsConsent", inputId: "smsConsent", selector: "input#smsConsent", checked: false, required: false, label: SMS }];
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "consent.smsConsent");
+  assert.ok(rec, "the orphan consent checkbox reaches the review records");
+  assert.strictEqual(rec.flag, "consent-checkbox");
+  assert.strictEqual(rec.status, "skipped", "OPTIONAL + unchecked is the correct resting state — visible, but NOT a review item");
+  assert.strictEqual(rec.label, SMS);
+  assert.ok(!act.log.some(([m]) => m === "clickCheckboxLabel"), "never actuated");
+  const bundle = buildReviewBundle(out.results, { page: "p1", url: "u", tenant: "t", capturedAt: "now" });
+  const be = bundle.entries.find((e) => String(e.field_id).includes("consent.smsConsent"));
+  assert.ok(be, "reaches the bundle (ALL FIELDS)");
+  assert.strictEqual(be.needs_review, false, "does NOT nag in NEEDS REVIEW (operator: it's optional)");
+});
+
+test("orphan consent checkbox: one ALREADY checked by the tenant is surfaced for verification, not silently kept", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  act.scanOrphanCheckboxes = async () => [{ key: "marketing", checked: true, required: false, label: "Send me marketing emails" }];
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "consent.marketing");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.after, "true");
+});
+
+test("orphan consent checkbox: a REQUIRED one left unchecked IS a review item (it blocks Save & Continue)", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  act.scanOrphanCheckboxes = async () => [{ key: "mustAgree", checked: false, required: true, label: "I agree to the terms" }];
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  const rec = out.results.find((r) => r.fieldName === "consent.mustAgree");
+  assert.strictEqual(rec.status, "needs_review");
+  const bundle = buildReviewBundle(out.results, { page: "p1", url: "u", tenant: "t", capturedAt: "now" });
+  const be = bundle.entries.find((e) => String(e.field_id).includes("consent.mustAgree"));
+  assert.ok(be, "the required consent reaches the bundle");
+  assert.strictEqual(be.needs_review, true, "a REQUIRED unchecked consent must surface — it blocks the page");
+});
+
+test("orphan consent checkbox: absent substrate / none on the page ⇒ no records (inert)", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-fn]", fieldName: "legalName--firstName", widgetType: "text", value: "" }]);
+  const out = await drivePageFill(act, { personal_info: { first_name: "Kevin" } }, {}, {}, T_BUDGETS);
+  assert.ok(!out.results.some((r) => r.flag === "consent-checkbox"));
 });
 
 test("typeahead: no chip within budget → needs_review, never a silent fill", async () => {
@@ -6598,6 +6977,31 @@ test("M1 cascade: a field REVEALED after a value commits is filled + tagged casc
   assert.strictEqual(rec.status, "filled");
   assert.strictEqual(rec.after, "London");
   assert.strictEqual(out.results.filter((r) => r.fieldName === "city").length, 1, "filled exactly once (only-NEW-keys, no re-trigger)");
+});
+
+test("M1 cascade LATE reveal: a field that mounts only AFTER the audit is still caught (the post-audit pass)", async () => {
+  // Live (Solar Turbines): the LAST field filled has nothing running after it, so its reveal — an
+  // SMS-consent checkbox revealed by the phone number — was still rendering when the first cascade pass
+  // ran, and it never entered the records. The post-capture/post-audit pass catches it for the price of
+  // one read-only scanPage. Here the reveal is gated on the AUDIT having run (readAuditRaw / the audit's
+  // re-read), i.e. strictly later than the first cascade pass.
+  const fields = [{ wrapperSel: "[w-phone]", fieldName: "phoneNumber", widgetType: "text", value: "" }];
+  const late = { wrapperSel: "[w-sms]", fieldName: "city", widgetType: "text", value: "", isRequired: true };
+  const act = makeFakeAct(fields);
+  const baseScan = act.scanPage;
+  let auditRan = false;
+  const baseRead = act.readTextValue;
+  act.readTextValue = async (loc, tag) => { if (fields[0].value) auditRan = true; return baseRead(loc, tag); }; // the audit re-reads the filled field
+  act.scanPage = async () => {
+    if (auditRan && !fields.some((f) => f.fieldName === "city")) fields.push(late); // mounts only after the audit's re-read
+    return baseScan();
+  };
+  const out = await drivePageFill(act, { personal_info: { phone_number: "850-666-0266", city: "London" } }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 3 });
+  const rec = out.results.find((r) => r.fieldName === "city");
+  assert.ok(rec, "the LATE-revealed field is recorded (would have been missed by the single pre-audit pass)");
+  assert.strictEqual(rec.cascadeRevealed, true);
+  assert.strictEqual(rec.after, "London");
+  assert.strictEqual(out.results.filter((r) => r.fieldName === "city").length, 1, "filled exactly once across both passes");
 });
 
 test("M1 cascade: a page that reveals a NEW field on every scan TERMINATES (round cap) and never re-fills a field", async () => {
