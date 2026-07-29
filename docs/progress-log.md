@@ -2769,3 +2769,60 @@ Verified: extension **797/797** (`node --test`; +2 pinning the JD-vs-auth discri
 `apMatch` guards green. Live-verification pending: re-run the background submit rehearsal on solarturbines;
 the log should show either Stage 1 clicking Continue Application directly, or a hand-back line
 (`this is the JOB-DESCRIPTION page, not an auth screen ... Handing back to the apply stage`) followed by it.
+
+---
+
+## 2026-07-29 (later) - `role="alert"` is Workday's upload STATUS channel, not an error channel
+
+A rehearse run halted on page 2:
+
+```
+resume: NOT attached - resume attach failed - Workday reported an upload error:
+        "Kevin's Hardware Resume.pdf loading"
+resume NOT attached on page 2 ... the required upload blocks advancement. HALT.
+```
+
+`"Kevin's Hardware Resume.pdf loading"` is not an error. It is Workday's own aria-live PROGRESS
+announcement, and the upload was in flight. This was a self-inflicted regression from the previous
+resume fix: the new error detector matched `[role="alert"]`, and because it set `errorText`,
+`cdpAttachResumeConfirmed` took its "Workday rejected the file, don't wait" branch and **skipped the
+SW-side re-poll** - the exact wait that fix existed to perform. So the change intended to make a slow
+upload succeed instead made it fail faster.
+
+The precedent was already in the repo and I didn't heed it: dom-patterns records this channel announcing
+*"...successfully uploaded"*, and `expandErrorSamples` already drops `[role=alert]` toasts because Workday
+uses that role for non-errors.
+
+### The fix
+
+- The text is read as **`statusText`** - a status, not a verdict.
+- An **ERROR** requires unambiguous wording (`error|failed|unsuccessful|unsupported|too large|exceeds|
+  invalid|not allowed|try again`) or a dedicated `[data-automation-id="file-upload-error"]` node.
+- **Progress wording** (`loading|uploading|in progress|processing|N%`) is treated as POSITIVE evidence the
+  upload is still going: it sets `uploading`, which upgrades `sawItem` and **extends** the re-poll to 45s
+  (from 20s) rather than aborting it. Checked BEFORE `sawItem`, so "loading" alone is enough to keep
+  waiting even if the poll never caught a `file-upload-item` row.
+- The SW re-poll now re-reads the status each tick, so a genuinely LATE error stops the wait instead of
+  burning the whole budget.
+- Every failure path logs `cleared / deleted / filesSet / sawItem / uploading / status`.
+
+### Why the REPLAY run hits this and the FILL run doesn't
+
+Operator: *"this has never happened during a fill but somehow keeps happening during the rehearse/submit
+run."* Both paths share `cdpAttachResumeConfirmed`, so the code is not the difference. Leading suspect,
+**not yet confirmed**: a FILL lands on a virgin Documents section, so `attachResume`'s clear loop is a
+no-op and the upload starts immediately; a re-apply finds Workday's carried-over copy and must
+delete-then-re-upload, which adds a server round trip immediately before the upload and delays its start.
+The new `cleared=/deleted=` diagnostic settles that on the next occurrence rather than inviting another
+guess.
+
+**Deliberately NOT done:** skipping the clear+re-upload when the section already holds a row with the same
+filename. It would remove this failure mode outright and be faster, but if the operator re-uploaded a
+different resume under the same name we would silently keep the old document - a wrong-document failure,
+which is worse than a slow one for an accuracy tool. Worth doing only with an explicit decision about that
+trade-off.
+
+Verified: extension **797/797** (`node --test`, unchanged - this is I/O classification; the page-side read
+carries no pure unit). SW global-scope + `apMatch` guards green. Live-verification pending: re-run the
+rehearse; a slow upload should now log `upload still IN FLIGHT ... Workday says "... loading"` and then
+either confirm during the re-poll or fail with the full status trail.

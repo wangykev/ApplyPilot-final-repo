@@ -3227,15 +3227,26 @@ async function runCdpReplayPage(tabId) {
 const RESUME_CONFIRM_VISIBLE_MS = 10000;   // live-verified value — unchanged for the visible path
 const RESUME_CONFIRM_HIDDEN_MS = 25000;    // a hidden tab uploads AND repaints slower
 const RESUME_REPOLL_MS = 20000;            // SW-side second chance, wall-clock
+const RESUME_REPOLL_UPLOADING_MS = 45000;  // Workday itself says "<file> loading" ⇒ positive evidence it is still in flight; give it real room
 
-// Self-contained page read for the SW-side poll (deliberately tiny — it runs many times).
+// Self-contained page read for the SW-side poll (deliberately tiny — it runs many times). Reports the
+// aria-live STATUS verbatim so the poll can say "still loading" instead of guessing, and can notice a
+// genuine error that only renders late.
 function cdpReadUploadState(sectionSel) {
   const sec = document.querySelector(sectionSel || '[data-fkit-id="resumeAttachments--attachments"]') || document;
   const nameEl = sec.querySelector('[data-automation-id="file-upload-item-name"]');
+  let status = "";
+  try {
+    status = Array.prototype.slice.call(sec.querySelectorAll('[role="alert"], [aria-live], [data-automation-id="file-upload-error"]'))
+      .map((n) => (n.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).join(" | ").slice(0, 200);
+  } catch (e) { /* status is a nice-to-have */ }
   return {
     successful: !!sec.querySelector('[data-automation-id="file-upload-successful"]'),
     items: sec.querySelectorAll('[data-automation-id="file-upload-item"]').length,
-    fileName: nameEl ? (nameEl.textContent || "").trim() : null
+    fileName: nameEl ? (nameEl.textContent || "").trim() : null,
+    status,
+    uploading: /\b(loading|uploading|in progress|processing)\b|\d+\s*%/i.test(status),
+    errored: /\b(error|failed|failure|unsuccessful|not supported|unsupported|too large|exceeds|invalid|not allowed)\b/i.test(status) && !/success/i.test(status)
   };
 }
 
@@ -3254,27 +3265,49 @@ async function cdpAttachResumeConfirmed(resumeRec, LOG, sectionSel) {
 
   if (ar && ar.attached) return ar;
   if (arErr || !ar) return ar || { attached: false, detail: "attach eval failed — " + arErr };
+  // Always report what the attach actually did, on the failure path too — a clear that had to remove an
+  // existing attachment first is slower, and that difference is the leading suspect for why the REPLAY run
+  // sees this and the FILL run doesn't (the fill lands on a virgin Documents section; a re-apply can find
+  // Workday's carried-over copy already there).
+  LOG && LOG(`resume: attach not yet confirmed — cleared=${ar.cleared} deleted=${ar.deletedCount || 0} filesSet=${ar.filesSetImmediately} sawItem=${!!ar.sawItem} uploading=${!!ar.uploading}${ar.statusText ? ` status="${ar.statusText}"` : ""}${ar.errorText ? ` ERROR="${ar.errorText}"` : ""}`);
   if (ar.errorText) return ar;            // Workday REJECTED the file — a real failure, don't wait on it
-  if (!ar.sawItem) return ar;             // nothing ever started uploading — re-polling would just stall
+  // NOTE `uploading` is checked BEFORE sawItem (2026-07-29): Workday's aria-live "<file> loading" is
+  // positive evidence the upload is in flight even if the poll never caught a file-upload-item row. The
+  // first cut of this code mis-read that very text as an ERROR and returned here, skipping the re-poll
+  // entirely — which is exactly the wait it exists to perform.
+  if (!ar.sawItem && !ar.uploading) return ar; // nothing ever started uploading — re-polling would just stall
 
-  // Started but unconfirmed ⇒ the race. Keep watching from out here, where the clock is real.
-  LOG && LOG(`resume: upload started but not yet confirmed after ${Math.round(ceiling / 1000)}s (tab ${visible ? "VISIBLE" : "HIDDEN"}) — re-polling from the service worker for up to ${Math.round(RESUME_REPOLL_MS / 1000)}s.`);
+  // Started but unconfirmed ⇒ the race. Keep watching from out here, where the clock is real. When Workday
+  // itself says "loading", we have positive evidence it is still going, so allow a longer window.
+  const budget = ar.uploading ? RESUME_REPOLL_UPLOADING_MS : RESUME_REPOLL_MS;
+  LOG && LOG(`resume: upload started but not yet confirmed after ${Math.round(ceiling / 1000)}s (tab ${visible ? "VISIBLE" : "HIDDEN"})`
+    + `${ar.uploading ? ` — Workday says "${ar.statusText}", so it is STILL IN FLIGHT` : ""} — re-polling from the service worker for up to ${Math.round(budget / 1000)}s.`);
   const t0 = Date.now();
-  const deadline = t0 + RESUME_REPOLL_MS;
+  const deadline = t0 + budget;
+  let last = null;
   while (Date.now() < deadline) {
     await cdpDelay(500);
     try { await cdpWakePage(); } catch (e) { /* best effort */ }
     let s = null;
     try { s = await cdpEval(cdpReadUploadState, sectionSel || null); } catch (e) { continue; } // mid-render read → keep polling
-    if (s && s.successful) {
+    if (!s) continue;
+    last = s;
+    if (s.successful) {
       const waited = Math.round((Date.now() - t0) / 1000);
       LOG && LOG(`resume: ✓ confirmed ${waited}s later — the page-side ceiling was simply short of a slow upload.`);
       return { ...ar, attached: true, confirmationSeen: true, confirmationVia: "file-upload-successful (SW re-poll)", fileName: s.fileName || ar.fileName,
         detail: `attached + confirmed via file-upload-successful after a ${waited}s SW re-poll (cleared ${ar.deletedCount || 0} existing)` };
     }
+    // A genuine error can render LATE — stop waiting on something Workday has already rejected.
+    if (s.errored) {
+      LOG && LOG(`resume: Workday reported an upload ERROR during the re-poll — "${s.status}". Not waiting further.`);
+      return { ...ar, errorText: s.status, detail: `Workday reported an upload error: "${s.status}"` };
+    }
   }
-  const total = Math.round((ceiling + RESUME_REPOLL_MS) / 1000);
-  return { ...ar, detail: `resume upload never confirmed within ${total}s (row present, file-upload-successful absent) — tab was ${visible ? "VISIBLE" : "HIDDEN"}` };
+  const total = Math.round((ceiling + budget) / 1000);
+  return { ...ar, statusText: (last && last.status) || ar.statusText,
+    detail: `resume upload never confirmed within ${total}s (tab was ${visible ? "VISIBLE" : "HIDDEN"}`
+      + `${last ? `; last status "${last.status || "(none)"}", ${last.items} row(s)` : ""}) — cleared ${ar.deletedCount || 0} existing first` };
 }
 
 // Re-attach the stored résumé on the CURRENT page (replay path — replayField defers file_upload to
@@ -7340,14 +7373,35 @@ async function attachResume(base64, filename, mime, sectionSel, confirmCeilingMs
   const nameEl = findSection().querySelector('[data-automation-id="file-upload-item-name"]');
   const fileName = nameEl ? nameEl.textContent.trim() : null;
   const confirmationSeen = confirmationVia === "file-upload-successful";
-  // An explicit FAILURE marker distinguishes "Workday rejected this file" (retrying is pointless — the
-  // operator must act) from "still uploading" (the SW should keep polling). Without it both looked the same.
-  let errorText = null;
+  // STATUS vs ERROR — and `role="alert"` is the STATUS channel, not the error channel (2026-07-29).
+  // The first cut of this read treated any `[role="alert"]` text as a failure, and live it matched
+  // Workday's own aria-live PROGRESS announcement — *"Kevin's Hardware Resume.pdf loading"* — so a
+  // perfectly healthy in-flight upload was reported as "Workday reported an upload error", which then made
+  // the SW skip the very re-poll that exists for a slow upload. dom-patterns already recorded this channel
+  // announcing "…successfully uploaded", and `expandErrorSamples` already drops role=alert toasts for the
+  // same reason. So: read it as a STATUS, and only call it an error when the WORDING is unambiguously one.
+  // Progress wording ("loading", "uploading", "%") is POSITIVE evidence the upload is still going — it
+  // upgrades sawItem, which is what tells the SW to keep waiting.
+  let statusText = null, errorText = null, uploading = false;
   try {
-    const errEl = findSection().querySelector('[data-automation-id="file-upload-error"], [data-automation-id="errorMessage"], [role="alert"]');
-    const t = errEl ? (errEl.textContent || "").replace(/\s+/g, " ").trim() : "";
-    if (t && !/success/i.test(t)) errorText = t.slice(0, 200);
+    const nodes = Array.prototype.slice.call(findSection().querySelectorAll(
+      '[data-automation-id="file-upload-error"], [data-automation-id="errorMessage"], [role="alert"], [aria-live]'));
+    const texts = nodes.map((n) => (n.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    statusText = texts.length ? texts.join(" | ").slice(0, 200) : null;
+    for (const t of texts) {
+      if (/\b(loading|uploading|in progress|processing)\b|\d+\s*%/i.test(t)) uploading = true;
+      // An ERROR needs error wording. Anything else — including a bare filename or a progress line — is not.
+      if (/\b(error|failed|failure|unsuccessful|not supported|unsupported|too large|exceeds|invalid|not allowed|try again)\b/i.test(t)
+          && !/success/i.test(t)) errorText = t.slice(0, 200);
+    }
+    // A dedicated error element is authoritative even without the wording above.
+    const hardErr = findSection().querySelector('[data-automation-id="file-upload-error"]');
+    if (!errorText && hardErr) {
+      const t = (hardErr.textContent || "").replace(/\s+/g, " ").trim();
+      if (t && !/success/i.test(t)) errorText = t.slice(0, 200);
+    }
   } catch (e) { /* diagnostics only */ }
+  if (uploading) sawItem = true; // "loading" proves it started, even if no row was caught in the poll
   const secs = Math.round(ceiling / 1000);
 
   return {
@@ -7360,13 +7414,17 @@ async function attachResume(base64, filename, mime, sectionSel, confirmCeilingMs
     fileName,
     sawItem,                              // the SW's signal that an unconfirmed attach is worth re-polling
     errorText,
+    statusText,                           // Workday's aria-live text VERBATIM — status, not a verdict
+    uploading,                            // positive evidence it is still in flight ("… loading")
     detail: confirmationSeen
       ? `attached + confirmed via file-upload-successful (cleared ${deletedCount} existing)`
       : (errorText
           ? `Workday reported an upload error: "${errorText}"`
-          : (sawItem
-              ? `file-upload-item appeared but file-upload-successful did not within ${secs}s — upload may still be in progress`
-              : `no confirmation row within ${secs}s (input.files set immediately = ${filesSetImmediately})`))
+          : (uploading
+              ? `upload still IN FLIGHT after ${secs}s (Workday says "${statusText}") — not confirmed yet`
+              : (sawItem
+                  ? `file-upload-item appeared but file-upload-successful did not within ${secs}s — upload may still be in progress${statusText ? ` (status: "${statusText}")` : ""}`
+                  : `no confirmation row within ${secs}s (input.files set immediately = ${filesSetImmediately}${statusText ? `; status: "${statusText}"` : ""})`)))
   };
 }
 
