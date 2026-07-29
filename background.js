@@ -306,11 +306,18 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           sources: message.sources || undefined,
           knownKeys: Array.isArray(message.knownKeys) ? message.knownKeys : [],
           query: typeof message.query === "string" ? message.query : undefined,
+          // Search targeting (2026-07-29). `field` is the operator's field of study,
+          // the fallback the keywords are DERIVED from when the box is blank — a
+          // blank LinkedIn search returns its recommended feed, not their jobs.
+          field: typeof message.field === "string" ? message.field : undefined,
+          intern: message.intern,
+          cycle: typeof message.cycle === "string" ? message.cycle : undefined,
+          year: typeof message.year === "string" || typeof message.year === "number" ? String(message.year) : undefined,
+          location: typeof message.location === "string" ? message.location : undefined,
           sinceDays: message.sinceDays,
           maxPerSource: message.maxPerSource,
           maxTotal: message.maxTotal,
           maxJdOpens: message.maxJdOpens,
-          termPattern: message.termPattern,
           background: message.background !== false, // sweep tabs open UNFOCUSED by default
         });
         sendResponse(out);
@@ -339,7 +346,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       }
       discoverInFlight = true;
       try {
-        sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query, background: message.background !== false }));
+        sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query, field: message.field, intern: message.intern, location: message.location, sinceDays: message.sinceDays, background: message.background !== false }));
       } catch (e) {
         sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
       } finally {
@@ -668,6 +675,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const out = await runJobDiscovery({
           sources: message.sources || undefined,
           query: message.query,
+          field: message.field,
+          intern: message.intern,
+          cycle: message.cycle,
+          year: message.year,
+          location: message.location,
           sinceDays: message.sinceDays,
           maxJdOpens: message.maxJdOpens,
           knownKeys: [],
@@ -690,7 +702,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
       discoverInFlight = true;
-      try { sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query })); }
+      try { sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query, field: message.field, intern: message.intern, location: message.location, sinceDays: message.sinceDays })); }
       catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
       finally { discoverInFlight = false; }
     })();

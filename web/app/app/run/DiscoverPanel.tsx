@@ -10,7 +10,8 @@ import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type
 import { linkedExtensionId } from "@/lib/extension-sync";
 import {
   DISCOVER_DEFAULTS, DISCOVER_SOURCE_LABEL, DISCOVER_SOURCE_HINT, describeSweep,
-  type DiscoveredJob, type DiscoverStats, type DiscoverSourceKey,
+  DISCOVER_CYCLES, DISCOVER_DEFAULT_LOCATION, buildDiscoverQuery, discoverTermLabel,
+  type DiscoveredJob, type DiscoverStats, type DiscoverSourceKey, type DiscoverSearch,
 } from "@/lib/discover";
 import { getDiscoveryContext, saveDiscovered } from "./actions";
 import { clsx } from "@/lib/clsx";
@@ -26,7 +27,15 @@ const SOURCE_BADGE: Record<string, string> = {
 type Phase =
   | { s: "idle" }
   | { s: "running" }
-  | { s: "done"; jobs: DiscoveredJob[]; stats: DiscoverStats | null; notes: string[]; added: number; saveError: string | null };
+  | {
+      s: "done";
+      jobs: DiscoveredJob[];
+      stats: DiscoverStats | null;
+      notes: string[];
+      added: number;
+      saveError: string | null;
+      search: DiscoverSearch | null;
+    };
 
 /** "3 days ago" / "just now" — postedAt is epoch ms, null when the board gave no date. */
 function agoLabel(postedAt: number | null): string {
@@ -40,7 +49,12 @@ function agoLabel(postedAt: number | null): string {
   return `${days}d ago`;
 }
 
-export function DiscoverPanel() {
+/** Next calendar year — the sensible default season to be hunting right now. */
+function defaultYear(): string {
+  return String(new Date().getFullYear() + 1);
+}
+
+export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [progress, setProgress] = useState<RunProgress | null>(null);
@@ -48,9 +62,22 @@ export function DiscoverPanel() {
     simplify: true, linkedin: true, handshake: true,
   });
   const [query, setQuery] = useState("");
+  const [cycle, setCycle] = useState<string>("summer");
+  const [year, setYear] = useState<string>(defaultYear());
+  const [intern, setIntern] = useState(true);
+  const [location, setLocation] = useState("");
   const [sinceDays, setSinceDays] = useState(DISCOVER_DEFAULTS.sinceDays);
   const [maxJdOpens, setMaxJdOpens] = useState(DISCOVER_DEFAULTS.maxJdOpens);
   const portRef = useRef<{ disconnect: () => void } | null>(null);
+
+  // The EXACT search that will run, computed with the same pure function the
+  // extension uses. Shown below the controls so a blank/odd query can never again
+  // be invisible — that's what let an empty box quietly scrape LinkedIn's
+  // recommended feed instead of searching.
+  const preview = buildDiscoverQuery({ query, field: fieldOfStudy, intern });
+  const term = discoverTermLabel(cycle, year);
+  const locationLabel = location.trim() || DISCOVER_DEFAULT_LOCATION;
+  const noKeywords = !preview.keywords;
 
   useEffect(() => {
     setConnected(linkedExtensionId() !== null && extensionMessagingAvailable());
@@ -84,6 +111,13 @@ export function DiscoverPanel() {
       sources: enabled,
       knownKeys,
       query: query.trim(),
+      // `field` is what a BLANK keyword box derives from, so the search is still
+      // specific instead of landing on a board's recommended feed.
+      field: fieldOfStudy,
+      intern,
+      cycle,
+      year: year.trim(),
+      location: location.trim(),
       sinceDays,
       maxJdOpens,
       background: true, // sweep tabs open unfocused — you stay on this page
@@ -101,6 +135,7 @@ export function DiscoverPanel() {
         notes: [String(resp.detail || resp.error || "The sweep couldn't run.")],
         added: 0,
         saveError: null,
+        search: null,
       });
       return;
     }
@@ -118,7 +153,7 @@ export function DiscoverPanel() {
       if (saved.ok) added = saved.added;
       else saveError = saved.error;
     }
-    setPhase({ s: "done", jobs, stats, notes, added, saveError });
+    setPhase({ s: "done", jobs, stats, notes, added, saveError, search: (resp.search as DiscoverSearch) ?? null });
   }
 
   return (
@@ -166,14 +201,66 @@ export function DiscoverPanel() {
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
           <label className="min-w-0 flex-1">
             <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
-              Keyword filter (optional)
+              What to search for
             </span>
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="software engineer intern"
+              placeholder={fieldOfStudy ? `blank = ${fieldOfStudy}` : "electrical and computer engineering"}
               className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
             />
+          </label>
+          <label className="min-w-0 flex-1">
+            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
+              Location
+            </span>
+            <input
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              placeholder={`blank = ${DISCOVER_DEFAULT_LOCATION} (everywhere)`}
+              className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
+            />
+          </label>
+        </div>
+
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          <label className="shrink-0">
+            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
+              Season
+            </span>
+            <select
+              value={cycle}
+              onChange={(e) => setCycle(e.target.value)}
+              className="rounded-lg border border-hairline bg-cockpit px-3 py-2.5 text-sm text-ink outline-none focus:border-amber"
+            >
+              <option value="">Any</option>
+              {DISCOVER_CYCLES.map((c) => (
+                <option key={c} value={c}>
+                  {c[0].toUpperCase() + c.slice(1)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="shrink-0">
+            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
+              Year
+            </span>
+            <input
+              value={year}
+              onChange={(e) => setYear(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+              inputMode="numeric"
+              placeholder="2026"
+              className="w-24 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
+            />
+          </label>
+          <label
+            className={clsx(
+              "flex shrink-0 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2.5 transition-colors",
+              intern ? "border-amber/40 bg-amber/[0.04]" : "border-hairline bg-cockpit hover:border-ink-faint"
+            )}
+          >
+            <input type="checkbox" checked={intern} onChange={(e) => setIntern(e.target.checked)} className="accent-amber" />
+            <span className="text-sm text-ink">Internships</span>
           </label>
           <label className="shrink-0">
             <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
@@ -203,20 +290,66 @@ export function DiscoverPanel() {
                 value={maxJdOpens}
                 onChange={(e) => setMaxJdOpens(Math.max(0, Math.min(40, Number(e.target.value) || 0)))}
                 className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
-                title="Each job description means opening the posting in a background tab and closing it. Keep this modest."
+                title="LinkedIn descriptions are read on the search page itself. Anything else is read in ONE reused tab."
               />
               <span className="text-xs text-ink-dim">descriptions</span>
             </span>
           </label>
         </div>
+
+        {/* The exact search that will run. This exists because a blank keyword box
+            silently landed on LinkedIn's recommended feed — now you can always see
+            what's actually being searched before you press the button. */}
+        <div
+          className={clsx(
+            "rounded-lg border px-3.5 py-3 text-xs leading-relaxed",
+            noKeywords ? "border-signal/40 bg-signal/[0.05]" : "border-hairline bg-cockpit"
+          )}
+        >
+          {noKeywords ? (
+            <p className="text-signal">
+              No keywords to search. Type something above, tick Internships, or set your field of study on the{" "}
+              <Link href="/app/profile" className="underline">
+                Profile page
+              </Link>
+              . LinkedIn and Handshake will be skipped — a keyword-less search there returns their recommended
+              feed, not your jobs.
+            </p>
+          ) : (
+            <>
+              <p className="text-ink-dim">
+                <span className="font-mono text-ink">{preview.keywords}</span>
+                {" · "}
+                <span className="font-mono text-ink">{locationLabel}</span>
+                {" · posted in the last "}
+                <span className="font-mono text-ink">{sinceDays}d</span>
+                <span className="text-ink-faint"> — from {preview.derivedFrom}</span>
+              </p>
+              {term && (
+                <p className="mt-1 text-ink-faint">
+                  Season <span className="font-mono text-ink-dim">{term}</span> filters the Simplify board exactly
+                  (its listings carry the term). LinkedIn and Handshake match on the keywords + date above — add the
+                  season to the keywords if you want it there too.
+                </p>
+              )}
+            </>
+          )}
+        </div>
       </fieldset>
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
-        <button onClick={discover} disabled={running || !anySource || connected === false} className="btn-primary">
+        <button
+          onClick={discover}
+          disabled={running || !anySource || connected === false || (noKeywords && !enabled.simplify)}
+          className="btn-primary"
+        >
           {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Radar className="h-4 w-4" />}
           {running ? "Discovering…" : "Discover jobs"}
         </button>
         {!anySource && <span className="text-xs text-ink-faint">Pick at least one source.</span>}
+        {anySource && noKeywords && !enabled.simplify && (
+          <span className="text-xs text-signal">Add keywords — the selected sources can&apos;t search without them.</span>
+        )}
       </div>
 
       {running && (
@@ -271,6 +404,13 @@ function DiscoverResult({ phase }: { phase: Extract<Phase, { s: "done" }> }) {
           )}
         </div>
       </div>
+
+      {phase.search && phase.search.keywords && (
+        <p className="font-mono text-[11px] text-ink-faint">
+          searched “{phase.search.keywords}” · {phase.search.location} · last {phase.search.sinceDays}d
+          {phase.search.term ? ` · ${phase.search.term} (Simplify)` : ""}
+        </p>
+      )}
 
       {notes.length > 0 && (
         <ul className="space-y-1.5">

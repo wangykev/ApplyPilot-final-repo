@@ -43,6 +43,17 @@ export type DiscoverStats = {
   jdOpened: number;
   jdFailed: number;
   jdSkipped: number;
+  /** Descriptions read WITHOUT opening a tab (LinkedIn's details pane). */
+  jdInPage?: number;
+};
+
+/** The exact search the sweep ran — echoed back so it's never a mystery. */
+export type DiscoverSearch = {
+  keywords: string;
+  derivedFrom: string;
+  term: string;
+  location: string;
+  sinceDays: number;
 };
 
 export type DiscoverSourceKey = "simplify" | "linkedin" | "handshake";
@@ -67,6 +78,64 @@ export const DISCOVER_DEFAULTS = {
   maxJdOpens: 10,
   query: "",
 };
+
+/** No location given ⇒ search the whole country, not the profile's home city. */
+export const DISCOVER_DEFAULT_LOCATION = "United States";
+
+export const DISCOVER_CYCLES = ["summer", "fall", "winter", "spring"] as const;
+export type DiscoverCycle = (typeof DISCOVER_CYCLES)[number];
+
+/**
+ * "summer" + "2026" → "Summer 2026" — the season wording the Simplify feed's own
+ * `terms` field uses, which is why it filters that source EXACTLY.
+ * LOCKSTEP with the extension's discoverTermLabel.
+ */
+export function discoverTermLabel(cycle: string, year: string): string {
+  const c = String(cycle || "").trim().toLowerCase();
+  const y = String(year || "").trim();
+  const cap = (DISCOVER_CYCLES as readonly string[]).includes(c) ? c[0].toUpperCase() + c.slice(1) : "";
+  if (cap && y) return cap + " " + y;
+  return cap || y || "";
+}
+
+/**
+ * Compose the keyword string the board search will actually run.
+ *
+ * An empty keyword box is NOT "search everything": LinkedIn's `/jobs/search` with
+ * no `keywords` renders the signed-in RECOMMENDED feed, so a blank query used to
+ * quietly return whatever LinkedIn suggested rather than the jobs being hunted.
+ * Blank now means "derive something specific" — from the profile's field of study.
+ *
+ * LOCKSTEP with the extension's buildDiscoverQuery (test-enforced).
+ */
+export function buildDiscoverQuery(opts: {
+  query?: string;
+  field?: string;
+  intern?: boolean;
+}): { keywords: string; derivedFrom: string } {
+  const explicit = String(opts?.query || "").trim();
+  const field = String(opts?.field || "").trim();
+  const wantIntern = opts?.intern !== false;
+
+  let base = "";
+  let derivedFrom = "";
+  if (explicit) {
+    base = explicit;
+    derivedFrom = "your keywords";
+  } else if (field) {
+    base = field;
+    derivedFrom = "your field of study";
+  } else if (wantIntern) {
+    base = "";
+    derivedFrom = "the internship default";
+  }
+
+  const parts: string[] = [];
+  if (base) parts.push(base);
+  if (wantIntern && !/\bintern(ship)?s?\b/i.test(base)) parts.push("intern");
+
+  return { keywords: parts.join(" ").replace(/\s+/g, " ").trim(), derivedFrom };
+}
 
 /**
  * Stable per-JOB identity for discovery dedup — LOCKSTEP with `discoveryJobKey` in
@@ -171,6 +240,8 @@ export function describeSweep(stats: DiscoverStats | null | undefined): string {
   if (scanned) bits.push(`scanned ${scanned}`);
   if (stats.skippedKnown) bits.push(`${stats.skippedKnown} already applied or queued`);
   if (stats.skippedDupe) bits.push(`${stats.skippedDupe} listed on more than one board`);
-  if (stats.jdOpened) bits.push(`read ${stats.jdOpened - stats.jdFailed} of ${stats.jdOpened} descriptions`);
+  const inPage = stats.jdInPage || 0;
+  if (inPage) bits.push(`${inPage} description${inPage === 1 ? "" : "s"} read without opening a tab`);
+  if (stats.jdOpened) bits.push(`${stats.jdOpened - stats.jdFailed} of ${stats.jdOpened} read in the reader tab`);
   return bits.join(" · ");
 }

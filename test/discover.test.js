@@ -22,7 +22,12 @@ const {
   comparePostedDesc,
   discoverLinkedInSearchUrl,
   discoverHandshakeSearchUrl,
+  buildDiscoverQuery,
+  discoverTermLabel,
+  discoverKeywordTokens,
+  matchesDiscoverLocation,
   DISCOVER_DEFAULTS,
+  DISCOVER_DEFAULT_LOCATION,
 } = require("../discover.js");
 const { canonicalJobUrl } = require("../lib.js");
 
@@ -142,12 +147,96 @@ test("isFreshPosting: a nonsense window disables filtering rather than dropping 
 
 // ── matchesDiscoverQuery ────────────────────────────────────────────────────
 
-test("matchesDiscoverQuery: empty query matches everything; terms are ANDed", () => {
-  const job = { title: "Software Engineer Intern", company: "Acme", location: "Remote", category: "Software" };
+test("matchesDiscoverQuery: ANY meaningful token matches — AND silently dropped correct hits", () => {
+  // 2026-07-29 fix. This sieve runs ONLY on the Simplify feed (LinkedIn/Handshake
+  // are filtered by the board itself). AND-ing every token of a phrase against a
+  // row's SHORT title/company/category threw away real hits: searching
+  // "electrical and computer engineering intern" demanded "electrical" appear in a
+  // row reading title "Engineering Intern", category "Hardware".
+  const job = { title: "Engineering Intern", company: "Acme", location: "Remote", category: "Hardware" };
   assert.equal(matchesDiscoverQuery(job, ""), true);
-  assert.equal(matchesDiscoverQuery(job, "software intern"), true);
-  assert.equal(matchesDiscoverQuery(job, "software quantitative"), false); // AND, not OR
-  assert.equal(matchesDiscoverQuery(job, "ACME"), true);                    // case-insensitive
+  assert.equal(matchesDiscoverQuery(job, "electrical and computer engineering intern"), true,
+    "one meaningful token (engineering) is enough");
+  assert.equal(matchesDiscoverQuery(job, "ACME"), true); // case-insensitive
+  // Nothing relevant at all still misses.
+  assert.equal(matchesDiscoverQuery(job, "quantitative finance"), false);
+});
+
+test("discoverKeywordTokens: drops stopwords, the role word, and too-short tokens", () => {
+  assert.deepEqual(
+    discoverKeywordTokens("electrical and computer engineering intern"),
+    ["electrical", "computer", "engineering"],
+    "'and' is a stopword and 'intern' carries no signal on an internships board"
+  );
+  assert.deepEqual(discoverKeywordTokens("internship"), []);
+  assert.deepEqual(discoverKeywordTokens("AI ML"), [], "2-char tokens match far too much");
+  assert.deepEqual(discoverKeywordTokens(""), []);
+});
+
+test("matchesDiscoverLocation: whole-country matches everything; a specific place filters", () => {
+  const sf = { location: "San Francisco, CA" };
+  const remote = { location: "Remote" };
+  // The board rows carry no country, so filtering literally on "United States"
+  // would drop every row — the whole-country default must be a pass-through.
+  assert.equal(matchesDiscoverLocation(sf, ""), true);
+  assert.equal(matchesDiscoverLocation(sf, DISCOVER_DEFAULT_LOCATION), true);
+  assert.equal(matchesDiscoverLocation(sf, "San Francisco"), true);
+  assert.equal(matchesDiscoverLocation(sf, "Austin"), false);
+  assert.equal(matchesDiscoverLocation(remote, "Austin"), true, "remote always qualifies");
+  assert.equal(matchesDiscoverLocation({ location: "" }, "Austin"), true, "unknown location: surface, don't hide");
+});
+
+// ── buildDiscoverQuery — the "don't search the recommended feed" fix ─────────
+
+test("buildDiscoverQuery: explicit keywords win, and intern is appended once", () => {
+  const r = buildDiscoverQuery({ query: "electrical and computer engineering", intern: true });
+  assert.equal(r.keywords, "electrical and computer engineering intern");
+  assert.equal(r.derivedFrom, "your keywords");
+  // Already says intern ⇒ don't say it twice.
+  assert.equal(buildDiscoverQuery({ query: "software intern", intern: true }).keywords, "software intern");
+  assert.equal(buildDiscoverQuery({ query: "Software Internship", intern: true }).keywords, "Software Internship");
+});
+
+test("buildDiscoverQuery: a BLANK box derives from the field of study, not nothing", () => {
+  // The operator's point: "If the user doesn't give something specific you should
+  // look for specific jobs." Blank used to mean a keyword-less URL = the
+  // recommended feed; now it means "derive something specific".
+  const r = buildDiscoverQuery({ query: "", field: "Electrical and Computer Engineering", intern: true });
+  assert.equal(r.keywords, "Electrical and Computer Engineering intern");
+  assert.equal(r.derivedFrom, "your field of study");
+});
+
+test("buildDiscoverQuery: intern off leaves the role word out", () => {
+  assert.equal(buildDiscoverQuery({ query: "data engineering", intern: false }).keywords, "data engineering");
+  assert.equal(buildDiscoverQuery({ field: "Computer Science", intern: false }).keywords, "Computer Science");
+});
+
+test("buildDiscoverQuery: nothing to go on ⇒ 'intern' alone, and never a blank search", () => {
+  const r = buildDiscoverQuery({ intern: true });
+  assert.equal(r.keywords, "intern");
+  // With intern OFF and no field/query there is genuinely nothing — the caller
+  // must REFUSE rather than run a keyword-less board search.
+  assert.equal(buildDiscoverQuery({ intern: false }).keywords, "");
+});
+
+test("discoverTermLabel: season + year → the Simplify feed's own `terms` wording", () => {
+  assert.equal(discoverTermLabel("summer", "2026"), "Summer 2026");
+  assert.equal(discoverTermLabel("Fall", "2026"), "Fall 2026");
+  assert.equal(discoverTermLabel("summer", ""), "Summer");
+  assert.equal(discoverTermLabel("", "2026"), "2026");
+  assert.equal(discoverTermLabel("", ""), "");
+  assert.equal(discoverTermLabel("nonsense", "2026"), "2026", "an unknown season is ignored, not injected");
+});
+
+test("discoverTermLabel feeds an EXACT Simplify filter (its rows carry the season verbatim)", () => {
+  const rows = [
+    { company_name: "A", title: "SWE Intern", url: "https://x.test/a", terms: ["Summer 2026"], active: true, is_visible: true, date_posted: Math.floor((NOW - DAY) / 1000) },
+    { company_name: "B", title: "SWE Intern", url: "https://x.test/b", terms: ["Fall 2026"], active: true, is_visible: true, date_posted: Math.floor((NOW - DAY) / 1000) },
+  ];
+  const summer = simplifyListingsToJobs(rows, { nowMs: NOW, sinceDays: 7, termPattern: discoverTermLabel("summer", "2026") });
+  assert.deepEqual(summer.map((j) => j.company), ["A"]);
+  const fall = simplifyListingsToJobs(rows, { nowMs: NOW, sinceDays: 7, termPattern: discoverTermLabel("fall", "2026") });
+  assert.deepEqual(fall.map((j) => j.company), ["B"]);
 });
 
 // ── normalizeDiscoveredJob ──────────────────────────────────────────────────
@@ -233,7 +322,7 @@ test("simplifyListingsToJobs: maps the feed's field names and keys Workday rows 
 });
 
 test("simplifyListingsToJobs: honors the keyword filter and the per-source cap", () => {
-  const ds = simplifyListingsToJobs(SIMPLIFY_ROWS, { nowMs: NOW, sinceDays: 7, termPattern: "2026", query: "data science" });
+  const ds = simplifyListingsToJobs(SIMPLIFY_ROWS, { nowMs: NOW, sinceDays: 7, termPattern: "2026", keywords: "data science" });
   assert.deepEqual(ds.map((j) => j.company), ["Mercor"]);
   const capped = simplifyListingsToJobs(SIMPLIFY_ROWS, { nowMs: NOW, sinceDays: 7, termPattern: "2026", maxItems: 1 });
   assert.equal(capped.length, 1);
@@ -300,20 +389,38 @@ test("summarizeDiscovery: tallies per source", () => {
   assert.deepEqual(s.bySource, { simplify: 2, linkedin: 1 });
 });
 
-test("discoverLinkedInSearchUrl: the SOURCE does the recency filtering (f_TPR), newest first", () => {
-  const u = discoverLinkedInSearchUrl("software engineer intern", 7);
+test("discoverLinkedInSearchUrl: SOURCE-side recency (f_TPR), newest first, whole-country default", () => {
+  const u = discoverLinkedInSearchUrl({ keywords: "software engineer intern", sinceDays: 7 });
   assert.ok(u.includes("f_TPR=r604800"), u); // 7 days in seconds
   assert.ok(u.includes("sortBy=DD"), u);
   assert.ok(u.includes("keywords=software%20engineer%20intern"), u);
-  // No keyword ⇒ no empty keywords param.
-  assert.ok(!discoverLinkedInSearchUrl("", 3).includes("keywords="));
+  // No location given ⇒ the WHOLE COUNTRY, explicitly. Omitting the param lets a
+  // signed-in session silently centre the search on the profile's own city.
+  assert.ok(u.includes("location=United%20States"), u);
 });
 
-test("discoverHandshakeSearchUrl: sorts newest-first and encodes the query", () => {
-  const u = discoverHandshakeSearchUrl("data intern");
+test("discoverLinkedInSearchUrl: an explicit location is honoured", () => {
+  const u = discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7, location: "Austin, Texas" });
+  assert.ok(u.includes("location=Austin%2C%20Texas"), u);
+});
+
+test("discoverLinkedInSearchUrl: REFUSES a keyword-less search (that URL is the RECOMMENDED feed)", () => {
+  // The 2026-07-29 bug: a blank keyword box built /jobs/search with no keywords,
+  // which — signed in — renders LinkedIn's RECOMMENDED jobs. The sweep then queued
+  // whatever LinkedIn suggested instead of the jobs being hunted. Empty now yields
+  // NO url, and the caller reports the skip rather than scraping recommendations.
+  assert.equal(discoverLinkedInSearchUrl({ keywords: "", sinceDays: 3 }), "");
+  assert.equal(discoverLinkedInSearchUrl({ keywords: "   ", sinceDays: 3 }), "");
+  assert.equal(discoverLinkedInSearchUrl({}), "");
+});
+
+test("discoverHandshakeSearchUrl: sorts newest-first, encodes the query, refuses empty", () => {
+  const u = discoverHandshakeSearchUrl({ keywords: "data intern", location: "" });
   assert.ok(u.startsWith("https://app.joinhandshake.com/job-search"), u);
   assert.ok(u.includes("sort=created_at_desc"), u);
   assert.ok(u.includes("query=data%20intern"), u);
+  assert.ok(u.includes("location=United%20States"), u);
+  assert.equal(discoverHandshakeSearchUrl({ keywords: "" }), "");
 });
 
 test("DISCOVER_DEFAULTS: every expensive knob is bounded by default", () => {

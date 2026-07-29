@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { discoveryJobKey, toQueueRow, describeSweep, DISCOVER_DEFAULTS } from "../lib/discover";
+import {
+  discoveryJobKey, toQueueRow, describeSweep, DISCOVER_DEFAULTS,
+  buildDiscoverQuery, discoverTermLabel, DISCOVER_DEFAULT_LOCATION, DISCOVER_CYCLES,
+} from "../lib/discover";
 import { canonicalJobUrl } from "../lib/job-key";
 
 // The extension's copy of the same key function. discover.js is a LOCKSTEP dup of
@@ -142,7 +145,7 @@ test("describeSweep: explains WHY a sweep found few jobs, not just how many", ()
   assert.match(s, /scanned 925/);
   assert.match(s, /30 already applied or queued/);
   assert.match(s, /4 listed on more than one board/);
-  assert.match(s, /read 5 of 6 descriptions/);
+  assert.match(s, /5 of 6 read in the reader tab/);
   assert.equal(describeSweep(null), "");
 });
 
@@ -151,4 +154,64 @@ test("DISCOVER_DEFAULTS mirror the extension's caps", () => {
   assert.equal(DISCOVER_DEFAULTS.maxPerSource, extDiscover.DISCOVER_DEFAULTS.maxPerSource);
   assert.equal(DISCOVER_DEFAULTS.maxTotal, extDiscover.DISCOVER_DEFAULTS.maxTotal);
   assert.equal(DISCOVER_DEFAULTS.maxJdOpens, extDiscover.DISCOVER_DEFAULTS.maxJdOpens);
+});
+
+// ── buildDiscoverQuery / discoverTermLabel — LOCKSTEP with the extension ──────
+// These decide what a board search actually runs, so a drift between the copies
+// means the preview shown in the UI is a LIE about what the sweep will do.
+
+const QUERY_CASES = [
+  { query: "electrical and computer engineering", field: "", intern: true },
+  { query: "", field: "Electrical and Computer Engineering", intern: true },
+  { query: "", field: "Computer Science", intern: false },
+  { query: "software intern", field: "", intern: true },
+  { query: "Software Internship", field: "x", intern: true },
+  { query: "", field: "", intern: true },
+  { query: "", field: "", intern: false },
+  { query: "  spaced   out  ", field: "", intern: true },
+];
+
+test("buildDiscoverQuery is LOCKSTEP with the extension's discover.js copy", () => {
+  for (const c of QUERY_CASES) {
+    const mine = buildDiscoverQuery(c);
+    const ext = extDiscover.buildDiscoverQuery(c);
+    assert.deepEqual(mine, ext, `disagreement for ${JSON.stringify(c)}`);
+  }
+});
+
+test("discoverTermLabel is LOCKSTEP with the extension's copy", () => {
+  const cases: Array<[string, string]> = [
+    ["summer", "2026"], ["Fall", "2026"], ["winter", ""], ["", "2026"],
+    ["", ""], ["nonsense", "2026"], ["spring", "2027"],
+  ];
+  for (const [c, y] of cases) {
+    assert.equal(discoverTermLabel(c, y), extDiscover.discoverTermLabel(c, y), `disagreement for ${c}/${y}`);
+  }
+});
+
+test("buildDiscoverQuery: a blank box derives from the field of study, never nothing", () => {
+  const r = buildDiscoverQuery({ query: "", field: "Electrical and Computer Engineering", intern: true });
+  assert.equal(r.keywords, "Electrical and Computer Engineering intern");
+  assert.equal(r.derivedFrom, "your field of study");
+});
+
+test("buildDiscoverQuery: never doubles the role word", () => {
+  assert.equal(buildDiscoverQuery({ query: "software intern", intern: true }).keywords, "software intern");
+  assert.equal(buildDiscoverQuery({ query: "Data Internship", intern: true }).keywords, "Data Internship");
+});
+
+test("the shared season/location constants match the extension", () => {
+  assert.equal(DISCOVER_DEFAULT_LOCATION, extDiscover.DISCOVER_DEFAULT_LOCATION);
+  assert.deepEqual([...DISCOVER_CYCLES], [...extDiscover.DISCOVER_CYCLES]);
+});
+
+test("describeSweep reports in-page reads separately from reader-tab reads", () => {
+  // The operator's complaint was tab churn, so "read without opening a tab" is the
+  // number that shows the fix is working.
+  const s = describeSweep({
+    scanned: { linkedin: 25 }, found: 25, skippedKnown: 0, skippedDupe: 0, droppedByCap: 0,
+    newJobs: 10, bySource: { linkedin: 10 }, jdOpened: 2, jdFailed: 0, jdSkipped: 0, jdInPage: 8,
+  });
+  assert.match(s, /8 descriptions read without opening a tab/);
+  assert.match(s, /2 of 2 read in the reader tab/);
 });

@@ -60,28 +60,108 @@ const DISCOVER_DEFAULTS = {
   sinceDays: 7,       // "recently posted" window
   maxPerSource: 25,   // cap per board BEFORE merge/dedup
   maxTotal: 60,       // cap the merged, deduped list
-  maxJdOpens: 10,     // cap the open-tab-and-scrape-the-JD pass (the expensive one)
-  query: "",          // keyword filter (empty = take everything fresh)
-  termPattern: "2026", // Simplify `terms` filter — the 2026 internship season
+  maxJdOpens: 10,     // cap the read-the-job-description pass
+  query: "",          // explicit keywords; blank ⇒ derived (see buildDiscoverQuery)
+  field: "",          // the operator's field of study — the derived-keyword source
+  intern: true,       // hunting internships (adds "intern" to the keywords)
+  cycle: "",          // "summer" | "fall" | "winter" | "spring" — the season targeted
+  year: "",           // e.g. "2026"
+  location: "",       // blank ⇒ DISCOVER_DEFAULT_LOCATION (the whole country)
 };
+
+// No location given ⇒ search the whole country rather than wherever the board
+// decides to centre on (which, signed in, is the operator's profile city — a
+// silent, invisible narrowing).
+const DISCOVER_DEFAULT_LOCATION = "United States";
+
+const DISCOVER_CYCLES = ["summer", "fall", "winter", "spring"];
+
+// "summer" + "2026" → "Summer 2026". This is the SEASON label, used as the
+// Simplify feed's `terms` filter (its rows literally carry "Summer 2026"), which
+// is why it's exact there and only advisory on the keyword-matched boards.
+function discoverTermLabel(cycle, year) {
+  const c = String(cycle || "").trim().toLowerCase();
+  const y = String(year || "").trim();
+  const cap = DISCOVER_CYCLES.includes(c) ? c[0].toUpperCase() + c.slice(1) : "";
+  if (cap && y) return cap + " " + y;
+  return cap || y || "";
+}
+
+/**
+ * Compose the keyword string a board search actually runs.
+ *
+ * WHY THIS EXISTS: an empty keyword box is NOT "search everything" on LinkedIn —
+ * `/jobs/search` with no `keywords` renders the signed-in RECOMMENDED feed, so a
+ * blank query silently returned whatever LinkedIn felt like suggesting instead of
+ * the jobs being hunted (observed 2026-07-29). Blank now means "derive something
+ * specific", and a search that would still end up keyword-less is REFUSED rather
+ * than run (see discoverLinkedInSearchUrl).
+ *
+ * Pure + unit-tested. Returns { keywords, derivedFrom } — `derivedFrom` is shown
+ * in the UI so the operator can always see WHY a given search ran.
+ */
+function buildDiscoverQuery(opts) {
+  const o = opts || {};
+  const explicit = String(o.query || "").trim();
+  const field = String(o.field || "").trim();
+  const wantIntern = o.intern !== false;
+
+  let base = "";
+  let derivedFrom = "";
+  if (explicit) {
+    base = explicit;
+    derivedFrom = "your keywords";
+  } else if (field) {
+    // e.g. "Electrical and Computer Engineering" → "electrical and computer
+    // engineering intern", the search the operator asked for by example.
+    base = field;
+    derivedFrom = "your field of study";
+  } else if (wantIntern) {
+    base = "";
+    derivedFrom = "the internship default";
+  }
+
+  const parts = [];
+  if (base) parts.push(base);
+  // Don't double up if the operator already typed intern/internship themselves.
+  if (wantIntern && !/\bintern(ship)?s?\b/i.test(base)) parts.push("intern");
+
+  return { keywords: parts.join(" ").replace(/\s+/g, " ").trim(), derivedFrom };
+}
 
 // Per-source landing pages. LinkedIn's f_TPR=r<seconds> makes the SOURCE do the
 // recency filtering (far cheaper than scraping a year of postings and dropping
 // them here); sortBy=DD puts newest first so maxPerSource keeps the freshest.
-function discoverLinkedInSearchUrl(query, sinceDays) {
-  const secs = Math.max(1, Math.round((Number(sinceDays) || 1) * 86400));
-  const q = encodeURIComponent(String(query || "").trim());
+// `location` is ALWAYS sent — omitting it lets the signed-in session centre the
+// search on the profile's city without saying so.
+function discoverLinkedInSearchUrl(opts) {
+  const o = opts || {};
+  const keywords = String(o.keywords || "").trim();
+  // HARD REFUSAL: a keyword-less LinkedIn search is the recommended feed, not a
+  // search. Better to fail loudly than to queue jobs nobody asked for.
+  if (!keywords) return "";
+  const secs = Math.max(1, Math.round((Number(o.sinceDays) || 1) * 86400));
+  const loc = String(o.location || "").trim() || DISCOVER_DEFAULT_LOCATION;
   return (
-    "https://www.linkedin.com/jobs/search/?f_TPR=r" + secs + "&sortBy=DD" + (q ? "&keywords=" + q : "")
+    "https://www.linkedin.com/jobs/search/?keywords=" + encodeURIComponent(keywords) +
+    "&location=" + encodeURIComponent(loc) +
+    "&f_TPR=r" + secs +
+    "&sortBy=DD"
   );
 }
 
-function discoverHandshakeSearchUrl(query) {
-  const q = encodeURIComponent(String(query || "").trim());
-  // Handshake's search route; sort newest-first where the param is honored (an
-  // unknown param is ignored by the SPA, never an error) — the posted-date parse
-  // + the caller's sinceDays filter are the real guard.
-  return "https://app.joinhandshake.com/job-search?sort=created_at_desc" + (q ? "&query=" + q : "");
+function discoverHandshakeSearchUrl(opts) {
+  const o = opts || {};
+  const keywords = String(o.keywords || "").trim();
+  if (!keywords) return "";
+  const loc = String(o.location || "").trim() || DISCOVER_DEFAULT_LOCATION;
+  // Handshake's search route; unknown params are ignored by the SPA (never an
+  // error), and the posted-date parse + sinceDays remain the real recency guard.
+  return (
+    "https://app.joinhandshake.com/job-search?query=" + encodeURIComponent(keywords) +
+    "&location=" + encodeURIComponent(loc) +
+    "&sort=created_at_desc"
+  );
 }
 
 // ── Pure helpers (no chrome, no network — unit-tested in test/discover.test.js) ──
@@ -206,17 +286,56 @@ function isFreshPosting(tsMs, sinceDays, nowMs) {
   return tsMs >= now - days * 86400e3;
 }
 
-// Does a posting match the operator's keyword filter? Empty query ⇒ everything.
-// Every whitespace-separated term must appear somewhere in title/company/
-// category (AND semantics — "software intern" shouldn't match every "intern").
-function matchesDiscoverQuery(job, query) {
-  const q = String(query || "").trim().toLowerCase();
-  if (!q) return true;
+// Filler words + the role word itself, which carry no discriminating power when
+// matching a keyword phrase against a board row's SHORT fields.
+const DISCOVER_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "of", "for", "in", "at", "to", "with",
+  "intern", "interns", "internship", "internships", "co-op", "coop",
+]);
+
+// The meaningful tokens of a keyword phrase — what's left after stopwords and the
+// role word. "electrical and computer engineering intern" → [electrical, computer,
+// engineering]. Short tokens (<3 chars) go too: they match far too much.
+function discoverKeywordTokens(keywords) {
+  return String(keywords || "")
+    .toLowerCase()
+    .split(/[^a-z0-9+#.]+/)
+    .filter((t) => t.length >= 3 && !DISCOVER_STOPWORDS.has(t));
+}
+
+/**
+ * Does a posting match the operator's keywords? Used ONLY for sources we filter
+ * OURSELVES (the Simplify feed) — never for LinkedIn/Handshake, where the BOARD
+ * already ran the search against the full posting text.
+ *
+ * ANY-token, not every-token (fixed 2026-07-29). AND semantics over a row's short
+ * title/company/category fields silently threw away almost everything: searching
+ * "electrical and computer engineering intern" requires every token, but the row
+ * that matters reads title "Engineering Intern", category "Hardware" — no
+ * "electrical" anywhere, so a correct hit got dropped. The board search is the
+ * precise filter; this is a coarse relevance sieve over a feed that has none.
+ */
+function matchesDiscoverQuery(job, keywords) {
+  const tokens = discoverKeywordTokens(keywords);
+  if (!tokens.length) return true;
   const hay = [job.title, job.company, job.location, job.category]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
-  return q.split(/\s+/).every((term) => hay.includes(term));
+  return tokens.some((t) => hay.includes(t));
+}
+
+// Location match for a source we filter ourselves. A blank/whole-country setting
+// matches everything (the board rows carry no country, so "United States" can't be
+// matched literally — filtering on it would drop every row). A SPECIFIC place
+// matches a substring of the row's locations, and Remote always qualifies.
+function matchesDiscoverLocation(job, location) {
+  const loc = String(location || "").trim().toLowerCase();
+  if (!loc || loc === DISCOVER_DEFAULT_LOCATION.toLowerCase()) return true;
+  const hay = String(job.location || "").toLowerCase();
+  if (!hay) return true; // unknown location — surface it rather than hide it
+  if (/\bremote\b/.test(hay)) return true;
+  return loc.split(/[^a-z0-9]+/).filter((t) => t.length >= 2).some((t) => hay.includes(t));
 }
 
 // Normalize one raw source row into the common discovered-job shape. Keeps the
@@ -274,7 +393,10 @@ function simplifyListingsToJobs(listings, opts) {
     );
     if (!job) continue;
     if (!isFreshPosting(job.postedAt, o.sinceDays, now)) continue;
-    if (!matchesDiscoverQuery(job, o.query)) continue;
+    // This feed has no server-side search, so we sieve it ourselves (coarse,
+    // any-token) and honour an explicit location.
+    if (!matchesDiscoverQuery(job, o.keywords)) continue;
+    if (!matchesDiscoverLocation(job, o.location)) continue;
     out.push(job);
   }
   out.sort(comparePostedDesc);
@@ -496,6 +618,65 @@ function scrapeHandshakeJobList() {
   return { signedIn: true, jobs: Array.from(byId.values()), note: "" };
 }
 
+// LINKEDIN in-page JD read — the NO-TAB path (2026-07-29, operator: "it keeps
+// closing and opening tabs. can't it do the scan on one page?").
+//
+// LinkedIn's search page is a two-pane layout: clicking a card loads that job's
+// full description into the right rail via an SPA fetch — no navigation, no new
+// tab. So the whole JD pass can happen on the ONE search tab we already opened:
+// click card → read pane → click next. Opening a tab per posting was pure waste.
+//
+// Async injected function: it clicks, then SETTLE-POLLS the pane rather than
+// trusting a fixed delay (the same discipline the fill engine uses). Accepts only
+// a substantial pane that either CHANGED from the previously-shown job or read
+// stable twice — so the first card, which LinkedIn may already have open, isn't
+// rejected for "not changing", and a mid-fetch half-rendered pane isn't accepted.
+async function scrapeLinkedInDetailInPage(jobId, previousText) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const PANE = [
+    ".jobs-search__job-details--container", ".jobs-details__main-content",
+    "#job-details", ".jobs-description__content", ".jobs-box__html-content",
+    '[class*="jobs-description"]', ".jobs-search__right-rail",
+  ];
+  const readPane = () => {
+    let best = "";
+    for (const s of PANE) {
+      try {
+        for (const el of document.querySelectorAll(s)) {
+          const t = ((el.innerText || el.textContent) || "").trim();
+          if (t.length > best.length) best = t;
+        }
+      } catch (e) { /* skip a selector an older Chrome rejects */ }
+    }
+    return best;
+  };
+
+  const anchor = document.querySelector('a[href*="/jobs/view/' + jobId + '"]');
+  if (!anchor) return { ok: false, error: "card-not-found" };
+  try {
+    anchor.scrollIntoView({ block: "center" });
+  } catch (e) { /* non-fatal */ }
+  await sleep(120);
+  anchor.click();
+
+  const prev = String(previousText || "");
+  let last = "";
+  let stable = 0;
+  for (let i = 0; i < 40; i++) {          // ~6s ceiling, polled at 150ms
+    await sleep(150);
+    const now = readPane();
+    if (now.length >= 200) {
+      if (prev && now !== prev) return { ok: true, text: now.slice(0, 20000) };
+      stable = now === last ? stable + 1 : 0;
+      if (stable >= 2) return { ok: true, text: now.slice(0, 20000) };
+    }
+    last = now;
+  }
+  return last.length >= 200
+    ? { ok: true, text: last.slice(0, 20000), note: "pane never settled — took the last read" }
+    : { ok: false, error: "pane-empty" };
+}
+
 // GENERIC JOB-POSTING scrape — the "physically open the link, scrape the JD"
 // half. Runs on an ARBITRARY employer/ATS page (Workday, Greenhouse, Lever,
 // Ashby, Oracle, iCIMS, …), so it is a LADDER of the known description containers
@@ -658,8 +839,12 @@ async function withDiscoverTab(url, opts, work) {
 // ⚠ cdp.js tracks ONE attached tab in a module-level cdpTabId, so a CDP read here
 // would clobber a concurrently-running fill walk. background.js enforces mutual
 // exclusion between discovery and a run; this function assumes that guard holds.
-async function discoverReadPage(tabId, fn, args) {
+// `opts.keepAttach` — the caller owns the CDP attach lifecycle. Used by the
+// single-tab JD pass so ONE attach covers every navigation instead of N
+// attach/detach cycles (each of which flashes Chrome's debugging infobar).
+async function discoverReadPage(tabId, fn, args, opts) {
   const argv = args || [];
+  const keep = !!(opts && opts.keepAttach);
   try {
     const results = await chrome.scripting.executeScript({ target: { tabId }, func: fn, args: argv });
     const value = results && results[0] ? results[0].result : undefined;
@@ -668,12 +853,13 @@ async function discoverReadPage(tabId, fn, args) {
     // No host permission for this origin (the common case for employer ATS
     // pages) — fall through to CDP.
   }
+  if (keep && cdpAttachedTab() === tabId) return await cdpEval(fn, ...argv);
   const att = await cdpAttach(tabId);
   if (!att || !att.ok) throw new Error("cdp attach failed: " + ((att && att.error) || "unknown"));
   try {
     return await cdpEval(fn, ...argv);
   } finally {
-    await cdpDetach();
+    if (!keep) await cdpDetach();
   }
 }
 
@@ -731,9 +917,24 @@ async function discoverFromSimplify(opts) {
 
 // SOURCE 2/3 — a logged-in board read out of a real tab. Same shape for both, so
 // one function with the URL + scraper injected.
+//
+// NOTE ON FILTERING: we do NOT re-apply the keyword filter to these results. The
+// BOARD already ran the search against each posting's full text; re-filtering
+// locally against a card's short title/company would throw away correct hits
+// (searching "electrical and computer engineering intern" against a card that just
+// reads "Engineering Intern" — the 2026-07-29 over-filter bug). Freshness stays as
+// a belt, since a board's own date filter is the thing we can least verify.
+//
+// The known-key filter runs HERE, before the JD read, so a job already applied to
+// never costs a pane read. Cross-board duplicates survive to the global dedup —
+// they only cost one cheap in-page read, never a tab.
 async function discoverFromBoard(source, url, scraper, opts) {
   const o = opts || {};
-  discoverProgress(`Checking ${source}`, "in your signed-in session");
+  if (!url) {
+    return { jobs: [], note: `${source}: skipped — no search keywords were built (see the keyword box).`, scanned: 0 };
+  }
+  discoverProgress(`Searching ${source}`, "in your signed-in session");
+  const known = new Set((o.knownKeys || []).filter(Boolean));
   try {
     return await withDiscoverTab(url, { background: o.background !== false, settleMs: 3000 }, async (tabId) => {
       await discoverAutoScroll(tabId, o.scrollRounds != null ? o.scrollRounds : 3);
@@ -751,23 +952,77 @@ async function discoverFromBoard(source, url, scraper, opts) {
       }
       const now = typeof o.nowMs === "number" ? o.nowMs : Date.now();
       const jobs = [];
+      let skippedKnown = 0;
       for (const raw of out.jobs || []) {
         const job = normalizeDiscoveredJob(raw, source, now);
         if (!job) continue;
         if (!isFreshPosting(job.postedAt, o.sinceDays, now)) continue;
-        if (!matchesDiscoverQuery(job, o.query)) continue;
+        if (known.has(job.jobKey)) { skippedKnown++; continue; }
         jobs.push(job);
       }
       jobs.sort(comparePostedDesc);
+      const kept = jobs.slice(0, o.maxPerSource || DISCOVER_DEFAULTS.maxPerSource);
+
+      // ── The no-tab JD read. While this tab is STILL OPEN and the cards are
+      //    mounted, click each one and read the details pane. This is what
+      //    replaced opening (and closing) a tab per posting.
+      let inPage = { read: 0, failed: 0 };
+      if (source === "linkedin" && o.readDetailsInPage !== false) {
+        inPage = await readLinkedInDetailsInPage(tabId, kept, o);
+      }
+
       return {
-        jobs: jobs.slice(0, o.maxPerSource || DISCOVER_DEFAULTS.maxPerSource),
+        jobs: kept,
         note: out.note || "",
         scanned: (out.jobs || []).length,
+        skippedKnown,
+        inPage,
       };
     });
   } catch (e) {
     return { jobs: [], note: `${source}: ${String((e && e.message) || e)}`, scanned: 0 };
   }
+}
+
+// Read job descriptions for LinkedIn rows WITHOUT leaving the search page: click
+// each card, settle-poll the details pane, move on. One tab, zero navigations.
+// Bounded by the same maxJdOpens budget the tab-based pass uses; a per-card
+// failure is non-fatal (the job still queues, just without a description).
+async function readLinkedInDetailsInPage(tabId, jobs, opts) {
+  const o = opts || {};
+  const budget = Math.max(0, Number(o.maxJdOpens != null ? o.maxJdOpens : DISCOVER_DEFAULTS.maxJdOpens));
+  let read = 0;
+  let failed = 0;
+  let previous = ""; // the pane text of the PREVIOUS job — how we detect a real change
+  const targets = jobs.filter((j) => j && !j.description).slice(0, budget);
+  for (let i = 0; i < targets.length; i++) {
+    const job = targets[i];
+    const id = (job.jobKey || "").startsWith("linkedin:") ? job.jobKey.slice("linkedin:".length) : "";
+    if (!id) { failed++; continue; }
+    discoverProgress(
+      `Reading job descriptions (${i + 1}/${targets.length})`,
+      `${job.company || ""}${job.company && job.title ? " — " : ""}${job.title || ""} · on the search page, no new tab`
+    );
+    try {
+      const res = await discoverReadPage(tabId, scrapeLinkedInDetailInPage, [id, previous]);
+      if (res && res.ok && res.text) {
+        job.description = String(res.text).slice(0, 20000);
+        job.descriptionSource = "pane";
+        previous = res.text;
+        read++;
+      } else {
+        failed++;
+      }
+    } catch (e) {
+      failed++;
+      console.log(`[ApplyPilot][DISCOVER] in-page JD read failed for linkedin:${id}: ${String((e && e.message) || e)}`);
+    }
+    await discoverDelay(250); // let the pane settle before the next click
+  }
+  if (read || failed) {
+    console.log(`[ApplyPilot][DISCOVER] linkedin in-page JD reads: ${read} ok, ${failed} failed (no tabs opened)`);
+  }
+  return { read, failed };
 }
 
 // THE JD PASS — "if the job description is not on the page, physically open the
@@ -786,33 +1041,54 @@ async function fillMissingDescriptions(jobs, opts) {
   const total = Math.min(need.length, budget);
   if (!total) return { opened, failed, skipped: need.length };
 
-  for (const job of need) {
-    if (opened >= budget) break;
-    opened++;
-    discoverProgress(
-      `Reading job descriptions (${opened}/${total})`,
-      `${job.company || ""}${job.company && job.title ? " — " : ""}${job.title || job.url}`
-    );
-    try {
-      const jd = await withDiscoverTab(job.url, { background: o.background !== false, settleMs: 2500 }, (tabId) =>
-        discoverReadPage(tabId, scrapeJobPosting)
+  // ONE tab for the whole pass (2026-07-29). This used to create AND destroy a tab
+  // per posting, which read as a flicker-storm of tabs opening and closing. Now we
+  // open a single tab and NAVIGATE it from posting to posting, closing it once at
+  // the end — and because a chrome.debugger attach SURVIVES navigation (the same
+  // invariant the Workday walk relies on), one attach covers every posting instead
+  // of N attach/detach cycles flashing the debugging infobar.
+  let tabId = null;
+  try {
+    const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: o.background === false }, res));
+    if (!tab || tab.id === undefined) throw new Error("could not open the reader tab");
+    tabId = tab.id;
+
+    for (const job of need) {
+      if (opened >= budget) break;
+      opened++;
+      discoverProgress(
+        `Reading job descriptions (${opened}/${total})`,
+        `${job.company || ""}${job.company && job.title ? " — " : ""}${job.title || job.url}`
       );
-      if (jd && jd.text) {
-        job.description = String(jd.text).slice(0, 20000);
-        job.descriptionSource = "page";
-        // The posting page is a BETTER source for title/company than a list row's
-        // truncated text — but only fill gaps, never overwrite a value the board
-        // already gave us (the board's company name is the cleaner one).
-        if (!job.title && jd.title) job.title = String(jd.title).slice(0, 300);
-        if (!job.company && jd.company) job.company = String(jd.company).slice(0, 200);
-      } else {
+      try {
+        await new Promise((r) => chrome.tabs.update(tabId, { url: job.url }, () => { void chrome.runtime.lastError; r(); }));
+        await waitTabComplete(tabId, o.loadTimeoutMs || 25000);
+        await discoverDelay(o.settleMs || 2500); // SPA hydration beat
+        const jd = await discoverReadPage(tabId, scrapeJobPosting, [], { keepAttach: true });
+        if (jd && jd.text) {
+          job.description = String(jd.text).slice(0, 20000);
+          job.descriptionSource = "page";
+          // The posting page is a BETTER source for title/company than a list row's
+          // truncated text — but only fill gaps, never overwrite a value the board
+          // already gave us (the board's company name is the cleaner one).
+          if (!job.title && jd.title) job.title = String(jd.title).slice(0, 300);
+          if (!job.company && jd.company) job.company = String(jd.company).slice(0, 200);
+        } else {
+          failed++;
+        }
+      } catch (e) {
         failed++;
+        console.log(`[ApplyPilot][DISCOVER] JD scrape failed for ${job.url}: ${String((e && e.message) || e)}`);
       }
-    } catch (e) {
-      failed++;
-      console.log(`[ApplyPilot][DISCOVER] JD scrape failed for ${job.url}: ${String((e && e.message) || e)}`);
+      await discoverDelay(o.betweenJdMs != null ? o.betweenJdMs : 400); // be a polite client
     }
-    await discoverDelay(o.betweenJdMs != null ? o.betweenJdMs : 600); // be a polite client
+  } finally {
+    // Release the shared CDP client BEFORE the tab goes, then close the one tab.
+    try { if (tabId != null && cdpAttachedTab() === tabId) await cdpDetach(); } catch (e) { /* already gone */ }
+    if (tabId != null) {
+      try { await new Promise((r) => chrome.tabs.remove(tabId, () => { void chrome.runtime.lastError; r(); })); }
+      catch (e) { /* already gone */ }
+    }
   }
   return { opened, failed, skipped: Math.max(0, need.length - opened) };
 }
@@ -840,28 +1116,54 @@ async function runJobDiscovery(opts) {
   const scanned = {};
   let all = [];
 
+  // The actual search string, composed once and REPORTED — an empty/odd query must
+  // never again be invisible (the "it just looked at the recommended jobs" bug).
+  const { keywords, derivedFrom } = buildDiscoverQuery(o);
+  const term = discoverTermLabel(o.cycle, o.year);
+  const location = String(o.location || "").trim() || DISCOVER_DEFAULT_LOCATION;
+  const search = { keywords, derivedFrom, term, location, sinceDays: o.sinceDays };
+
   console.log(
     `[ApplyPilot][DISCOVER] sweep start — sources ${Object.keys(want).filter((k) => want[k]).join("+") || "none"}, ` +
-    `last ${o.sinceDays}d, query "${o.query || "(any)"}", ${(o.knownKeys || []).length} already known`
+    `keywords "${keywords || "(NONE)"}" (from ${derivedFrom || "nothing"}), ` +
+    `season "${term || "(any)"}", location "${location}", last ${o.sinceDays}d, ` +
+    `${(o.knownKeys || []).length} already known`
   );
+  if (!keywords) {
+    // The keyword-searched boards CANNOT run without this, and a blank search on
+    // LinkedIn is its recommended feed, not a search. Say so instead of scraping it.
+    notes.push("No search keywords: type some, or set your field of study on the Profile page. LinkedIn and Handshake were skipped — a keyword-less search there just returns their recommended feed, not your jobs.");
+  }
 
   // Stable source order → deterministic cross-board dedup (first wins). Simplify
   // leads because its rows carry the employer's real ATS url, which is the key
   // that lines up with the tracker.
   if (want.simplify) {
-    const r = await discoverFromSimplify({ ...o, nowMs: now });
+    // The season label is EXACT here: the feed's rows literally carry "Summer 2026"
+    // in `terms`, so this is a real filter, not a keyword guess.
+    const r = await discoverFromSimplify({ ...o, keywords, location, termPattern: term, nowMs: now });
     if (r.note) notes.push(r.note);
     scanned.simplify = r.scanned;
     all = all.concat(r.jobs);
   }
   if (want.linkedin) {
-    const r = await discoverFromBoard("linkedin", discoverLinkedInSearchUrl(o.query, o.sinceDays), scrapeLinkedInJobList, { ...o, nowMs: now });
+    const r = await discoverFromBoard(
+      "linkedin",
+      discoverLinkedInSearchUrl({ keywords, sinceDays: o.sinceDays, location }),
+      scrapeLinkedInJobList,
+      { ...o, keywords, location, nowMs: now }
+    );
     if (r.note) notes.push(r.note);
     scanned.linkedin = r.scanned;
     all = all.concat(r.jobs);
   }
   if (want.handshake) {
-    const r = await discoverFromBoard("handshake", discoverHandshakeSearchUrl(o.query), scrapeHandshakeJobList, { ...o, nowMs: now });
+    const r = await discoverFromBoard(
+      "handshake",
+      discoverHandshakeSearchUrl({ keywords, location }),
+      scrapeHandshakeJobList,
+      { ...o, keywords, location, nowMs: now }
+    );
     if (r.note) notes.push(r.note);
     scanned.handshake = r.scanned;
     all = all.concat(r.jobs);
@@ -877,9 +1179,15 @@ async function runJobDiscovery(opts) {
     notes.push(`${droppedByCap} more new job${droppedByCap === 1 ? "" : "s"} matched but were left out by the ${o.maxTotal}-job cap — raise it or narrow the keyword.`);
   }
 
+  // How many descriptions were already captured WITHOUT opening anything — the
+  // LinkedIn in-page pane reads that happened while its search tab was still up.
+  const inPageRead = capped.filter((j) => j.descriptionSource === "pane").length;
+
+  // Whatever is STILL missing a description needs a real page load, and that now
+  // happens in ONE reused tab rather than a tab per posting.
   const jd = await fillMissingDescriptions(capped, { ...o });
   if (jd.skipped > 0) {
-    notes.push(`${jd.skipped} job${jd.skipped === 1 ? "" : "s"} were queued without a description (the ${o.maxJdOpens}-page read cap).`);
+    notes.push(`${jd.skipped} job${jd.skipped === 1 ? "" : "s"} were queued without a description (the ${o.maxJdOpens}-read cap).`);
   }
   if (jd.failed > 0) {
     notes.push(`${jd.failed} job page${jd.failed === 1 ? "" : "s"} didn't yield a description — queued anyway.`);
@@ -889,13 +1197,15 @@ async function runJobDiscovery(opts) {
   console.log(
     `[ApplyPilot][DISCOVER] done — scanned ${JSON.stringify(scanned)}, found ${found}, ` +
     `${skippedKnown} already known, ${skippedDupe} cross-board dupes, ${capped.length} new ` +
-    `(${JSON.stringify(summary.bySource)}), JDs read ${jd.opened - jd.failed}/${jd.opened}`
+    `(${JSON.stringify(summary.bySource)}), JDs: ${inPageRead} read in-page (no tab), ` +
+    `${jd.opened - jd.failed}/${jd.opened} via the single reader tab`
   );
   discoverProgress("Discovery finished", `${capped.length} new job${capped.length === 1 ? "" : "s"}`);
 
   return {
     ok: true,
     jobs: capped,
+    search, // the exact keywords/season/location used — surfaced in the UI
     stats: {
       scanned,
       found,
@@ -907,6 +1217,7 @@ async function runJobDiscovery(opts) {
       jdOpened: jd.opened,
       jdFailed: jd.failed,
       jdSkipped: jd.skipped,
+      jdInPage: inPageRead, // read without opening a tab at all (LinkedIn panes)
     },
     notes,
   };
@@ -924,8 +1235,13 @@ async function runDiscoverRecon(opts) {
   const want = { linkedin: true, handshake: true, ...(o.sources || {}) };
   const out = {};
   const targets = [];
-  if (want.linkedin) targets.push(["linkedin", discoverLinkedInSearchUrl(o.query, o.sinceDays)]);
-  if (want.handshake) targets.push(["handshake", discoverHandshakeSearchUrl(o.query)]);
+  // Recon must land on the SAME page a real sweep would, so it composes the query
+  // identically — including the refusal when there are no keywords at all.
+  const { keywords } = buildDiscoverQuery(o);
+  const location = String(o.location || "").trim() || DISCOVER_DEFAULT_LOCATION;
+  if (!keywords) return { ok: false, error: "no-keywords", detail: "Type keywords (or set your field of study) — recon opens the same search a sweep would." };
+  if (want.linkedin) targets.push(["linkedin", discoverLinkedInSearchUrl({ keywords, sinceDays: o.sinceDays, location })]);
+  if (want.handshake) targets.push(["handshake", discoverHandshakeSearchUrl({ keywords, location })]);
 
   for (const [name, url] of targets) {
     discoverProgress(`Recon: ${name}`);
@@ -949,12 +1265,18 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     DISCOVER_DEFAULTS,
     DISCOVER_SIMPLIFY_URL,
+    DISCOVER_DEFAULT_LOCATION,
+    DISCOVER_CYCLES,
+    discoverTermLabel,
+    buildDiscoverQuery,
+    discoverKeywordTokens,
     discoverLinkedInSearchUrl,
     discoverHandshakeSearchUrl,
     discoveryJobKey,
     parsePostedTimestamp,
     isFreshPosting,
     matchesDiscoverQuery,
+    matchesDiscoverLocation,
     normalizeDiscoveredJob,
     simplifyListingsToJobs,
     comparePostedDesc,
