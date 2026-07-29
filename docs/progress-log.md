@@ -2233,3 +2233,44 @@ when they deliberately chose otherwise.
 Verified: extension **772/772**, web **85/85**, typecheck + build green. Live-verification pending — try
 Rehearse with the box ticked first; the banner should report HIDDEN/synthetic and it should finish in
 roughly foreground time.
+
+## 2026-07-28 — Three FALSE disagrees blocked a clean run: rows shuffled within a repeating entry
+
+```
+review page vs approved: AGREE 26 · DISAGREE 3 · MISSING 24 · EXTRA 1 · AMBIGUOUS 1 (of 54)
+    ≠ "Location": approved "Pittsburgh, PA" but the page shows "Yes"
+    ≠ "From*":    approved "9/2024"         but the page shows "No"
+    ≠ "Company*": approved "CISCOR"         but the page shows "No"
+submit gate: 1 blocker(s) — ✗ 3 review-page value(s) DISAGREE with the approved bundle
+```
+
+The operator pasted the whole review page, and it settles it: **"Pittsburgh, PA" is on the page**, in
+Work Experience 1, immediately above `I currently work here → Yes`. So the paired value ("Yes") belongs to
+the NEXT ROW. Same for `Company` → "No" and `From` → "No". These are not contradictions; the row→value
+pairing shuffled inside the entry. (Repeating entries reuse identical labels, which is exactly what makes
+that pairing fragile.) The operator's hypothesis was a render delay — but a half-rendered page yields
+MISSING, not a neighbour's value, so the mechanism is pairing, not timing.
+
+That matters more than it looks: after this week's relaxation, DISAGREE is the LAST value check that blocks
+a submit, so a false one refuses an otherwise-perfect run — which is precisely what happened.
+
+**Fix — `verdictFor` in `reconcileReviewPage`.** Before calling a keyed mismatch a contradiction, ask
+whether the approved value is the value of ANOTHER ROW OF THE SAME ENTRY (same `fkitPrefix` +
+`entryOrdinal`). If it is, the entry's rows are shuffled → **AMBIGUOUS** (`mispaired-within-entry`, logged,
+never blocking). If it isn't, it stays a DISAGREE and still blocks.
+
+**Deliberately NARROW, and the narrowing is the interesting part.** The obvious version — "if the approved
+value appears anywhere on the page, don't disagree" — was written first and **broke an existing test that
+encodes the opposite principle**: an authoritative keyed match must beat coincidental presence, because
+approved "LinkedIn" vs a page `source` reading "Indeed" is a REAL disagree even though another field's
+prose happens to say "my LinkedIn profile". Restricting the guard to *within one repeating entry* satisfies
+both: the shuffle signature is caught, coincidental presence is not, and FLAT fields keep the strict path
+untouched.
+
+Verified: extension **774/774** (+2 — the live shuffle downgrades to ambiguous; a value the page nowhere
+contains still disagrees — alongside the pre-existing keyed-disagree test, which passes unchanged).
+
+NOTE the 24 MISSING are a separate, still-open matter: the operator's page text shows most of those values
+ARE displayed (job titles, role descriptions, education, the screening answers), so the scraper is matching
+only ~26 of 54. It is non-blocking now, so it costs nothing today — but it means the review-page check is
+verifying far less than its AGREE count suggests, and that is worth its own round.

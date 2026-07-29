@@ -386,3 +386,40 @@ test("EMAIL: with NO accountEmails supplied the pass is skipped (email stays EXT
   assert.strictEqual(r.counts.disagree, 0);
   assert.strictEqual(r.counts.extra_on_review, 1);
 });
+
+// ── MIS-PAIRING GUARD (live 2026-07-28, Caterpillar/Solar Turbines) ─────────────────────────────────
+// The review-page check reported three DISAGREEs that were provably false — the operator's own copy of
+// the page showed the approved values sitting right there:
+//     ≠ "Location": approved "Pittsburgh, PA" but the page shows "Yes"
+// "Yes" is the value of the NEXT row ("I currently work here"). Repeating entries reuse identical labels
+// and the label→value pairing is heuristic, so an entry can be paired with a neighbouring row's value.
+// A DISAGREE is the last value check that BLOCKS a submit, so a false one is expensive: it refused an
+// otherwise-clean run. Rule: if the approved value appears ANYWHERE on the page, the page does not
+// CONTRADICT us — we matched the wrong record → AMBIGUOUS (logged, non-blocking).
+test("mis-pairing: an entry paired with a neighbour's value is AMBIGUOUS, not a disagree, when its own value IS on the page", () => {
+  const items = [
+    rrec({ section: "Work Experience", entryOrdinal: 1, fkitPrefix: "workExperience", key: "location", label: "Location", value: "Yes" }), // WRONG pairing (the checkbox's value)
+    rrec({ section: "Work Experience", entryOrdinal: 1, fkitPrefix: "workExperience", key: "cbx", label: "I currently work here", value: "Pittsburgh, PA" }), // where the real value ended up
+  ];
+  const entries = [entry({
+    question_label: "Location", current_value: "Pittsburgh, PA", widget_type: "text",
+    canonical_field: "workExperience[0].location", field_id: "P2::formField-workExperience[0].location",
+  })];
+  const r = reconcileReviewPage(items, entries);
+  assert.strictEqual(r.counts.disagree, 0, "the page contains 'Pittsburgh, PA' — it does not contradict us");
+  assert.strictEqual(r.counts.ambiguous, 1, "surfaced as ambiguous instead");
+  assert.match(r.ambiguous[0].tier || "", /mispaired/, "and says WHY it wasn't trusted");
+});
+
+test("mis-pairing guard does NOT hide a REAL disagree — a value the page nowhere contains still blocks", () => {
+  const items = [
+    rrec({ section: "Work Experience", entryOrdinal: 1, fkitPrefix: "workExperience", key: "location", label: "Location", value: "Detroit, MI" }),
+  ];
+  const entries = [entry({
+    question_label: "Location", current_value: "Pittsburgh, PA", widget_type: "text",
+    canonical_field: "workExperience[0].location", field_id: "P2::formField-workExperience[0].location",
+  })];
+  const r = reconcileReviewPage(items, entries);
+  assert.strictEqual(r.counts.disagree, 1, "'Pittsburgh, PA' appears NOWHERE — the page genuinely contradicts the approved value");
+  assert.strictEqual(r.counts.ambiguous, 0);
+});

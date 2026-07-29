@@ -719,6 +719,32 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
   };
 
   const agree = [], disagree = [], missing_on_review = [], ambiguous = [];
+  // ── MIS-PAIRING GUARD, scoped to ONE repeating entry (2026-07-28) ───────────────────────────────
+  // A DISAGREE means "the page shows a value that CONTRADICTS what was approved" — and it is the last
+  // value check that BLOCKS a submit, so a false one is expensive. Live on Caterpillar/Solar Turbines it
+  // reported three, all provably false:
+  //     ≠ "Location": approved "Pittsburgh, PA" but the page shows "Yes"
+  // "Yes" is the value of the NEXT row, "I currently work here" — and "Pittsburgh, PA" was sitting in the
+  // same entry all along. Repeating entries reuse identical labels, so the row→value pairing can shuffle
+  // WITHIN an entry.
+  //
+  // NARROW ON PURPOSE: the guard fires only when the approved value is the value of ANOTHER ROW OF THE
+  // SAME ENTRY (same fkitPrefix + entryOrdinal). That is the signature of a shuffle. It deliberately does
+  // NOT accept "the value appears somewhere on the page", because a keyed match must still beat
+  // coincidental presence — approved "LinkedIn" vs a page `source` reading "Indeed" is a REAL disagree
+  // even though another field's prose says "my LinkedIn profile" (pinned in review-reconcile.test.js).
+  // Flat fields therefore keep the strict path entirely.
+  const verdictFor = (base, cvs, cand) => {
+    const inSameEntry = cand && cand.entryOrdinal != null && cand.fkitPrefix
+      ? items.filter((it) => it !== cand && it.fkitPrefix === cand.fkitPrefix && it.entryOrdinal === cand.entryOrdinal)
+      : [];
+    const shuffled = inSameEntry.find((it) => valuesAgree(cvs, it.value));
+    if (shuffled) {
+      return ambiguous.push({ ...base, value_review: cand.value, tier: "mispaired-within-entry" });
+    }
+    return disagree.push({ ...base, value_review: cand.value });
+  };
+
   let skipped = 0, placeholders = 0, claimed = 0;
   const claimedValues = []; // normalized recorded values — drives the EXTRA computation
 
@@ -768,7 +794,7 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
       } else {
         claimed++; claimedValues.push(nval);
         if (valuesAgree(cvs, cand.value)) agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
-        else disagree.push({ ...base, value_review: cand.value });
+        else verdictFor(base, cvs, cand); // a row shuffled WITHIN this entry is AMBIGUOUS, not a contradiction
       }
       continue;
     }
