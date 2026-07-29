@@ -4,7 +4,8 @@
 // classifier, the Workday soft-error (refresh) detector, and SSO detection.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage } = require("../lib.js");
+const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
+  classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -176,4 +177,190 @@ test("isAlreadyApplied: an ordinary form / auth / apply page → false (no false
   assert.strictEqual(isAlreadyApplied({ markers: {}, bodyText: "Apply Apply Manually Use My Last Application" }), false);
   assert.strictEqual(isAlreadyApplied(null), false);
   assert.strictEqual(isAlreadyApplied({}), false);
+});
+
+// ── Already-applied RECOVERY: the pure decisions (2026-07-28) ───────────────────────────────────────
+// Workday shows "you've already applied" for started-but-unsubmitted applications too, so the flow now
+// checks the candidate's own applications list before believing it. These pin the three decisions that
+// could silently do the WRONG thing: mislabelling "Not Submitted", picking the wrong application row,
+// and misreading which page a click landed on.
+
+test('applicationStatusOf: "Not Submitted" is NOT submitted (the substring trap)', () => {
+  // "Not Submitted" CONTAINS "Submitted" — a positive-first test abandons every fillable application.
+  assert.strictEqual(applicationStatusOf("Not Submitted"), "not-submitted");
+  assert.strictEqual(applicationStatusOf("Software Engineer Intern — Not Submitted — 10/02/2026"), "not-submitted");
+  assert.strictEqual(applicationStatusOf("Unsubmitted"), "not-submitted");
+  assert.strictEqual(applicationStatusOf("In Progress"), "not-submitted");
+  assert.strictEqual(applicationStatusOf("Draft"), "not-submitted");
+});
+test("applicationStatusOf: a genuinely submitted row, and an unreadable one", () => {
+  assert.strictEqual(applicationStatusOf("Submitted"), "submitted");
+  assert.strictEqual(applicationStatusOf("Gas Turbine Intern — Submitted — Under Consideration"), "submitted");
+  assert.strictEqual(applicationStatusOf("Gas Turbine Intern 10/02/2026"), "unknown", "no status word ⇒ unknown, never a guess");
+  assert.strictEqual(applicationStatusOf(""), "unknown");
+  assert.strictEqual(applicationStatusOf(null), "unknown");
+});
+
+test("reqIdFromUrl: the requisition id out of a Workday job URL", () => {
+  assert.strictEqual(
+    reqIdFromUrl("https://cat.wd5.myworkdaysite.com/en-US/solarturbines/job/San-Diego%2C-California/XMLNAME-2027--Gas-Turbine-Product-Engineering-Internship_R0000382293/apply"),
+    "R0000382293");
+  assert.strictEqual(reqIdFromUrl("Requisition ID: R0000382293"), "R0000382293");
+  assert.strictEqual(reqIdFromUrl("JR-102938"), "JR-102938");
+  assert.strictEqual(reqIdFromUrl("https://x.wd1.myworkdayjobs.com/en-US/careers"), null);
+  assert.strictEqual(reqIdFromUrl(null), null);
+});
+
+const ROW = (title, href, text) => ({ title, href, text: text || title });
+
+test("pickApplicationRow: the requisition id wins — titles truncate, req ids don't", () => {
+  const rows = [
+    ROW("Mechanical Engineering Intern", "https://x/job/A_R0000111111/apply", "Mechanical Engineering Intern Submitted"),
+    ROW("2027 Gas Turbine Product Engi…", "https://x/job/B_R0000382293/apply", "2027 Gas Turbine Product Engi… Not Submitted"),
+  ];
+  const got = pickApplicationRow(rows, { url: "https://x/job/B_R0000382293/apply", title: "Something Else Entirely" });
+  assert.strictEqual(got.tier, "req-id");
+  assert.strictEqual(got.row.href, "https://x/job/B_R0000382293/apply");
+});
+test("pickApplicationRow: exact title, then single-match containment", () => {
+  const rows = [ROW("Gas Turbine Intern", "https://x/job/a"), ROW("Software Intern", "https://x/job/b")];
+  assert.strictEqual(pickApplicationRow(rows, { title: "gas  turbine   intern" }).tier, "exact-title", "normalized exact");
+  assert.strictEqual(pickApplicationRow(rows, { title: "Software" }).tier, "title-containment");
+});
+test("pickApplicationRow: AMBIGUITY REFUSES — opening the wrong application would fill someone else's", () => {
+  const dupTitle = [ROW("Engineering Intern", "https://x/job/a"), ROW("Engineering Intern", "https://x/job/b")];
+  const dup = pickApplicationRow(dupTitle, { title: "Engineering Intern" });
+  assert.strictEqual(dup.row, null);
+  assert.match(dup.reason, /2 rows share the title/);
+
+  const partial = [ROW("Engineering Intern - Summer", "https://x/job/a"), ROW("Engineering Intern - Fall", "https://x/job/b")];
+  assert.strictEqual(pickApplicationRow(partial, { title: "Engineering Intern" }).row, null, "2+ containment hits is not a confident match");
+
+  const twoReq = [ROW("A", "https://x/job/a_R0000382293"), ROW("B", "https://x/job/b_R0000382293")];
+  assert.strictEqual(pickApplicationRow(twoReq, { url: "https://x/job/c_R0000382293" }).row, null);
+});
+test("pickApplicationRow: no rows / no match reports WHY", () => {
+  assert.match(pickApplicationRow([], { title: "X" }).reason, /no rows/);
+  const miss = pickApplicationRow([ROW("Other Job", "https://x/job/z")], { url: "https://x/job/q_R0000382293", title: "Gas Turbine" });
+  assert.strictEqual(miss.row, null);
+  assert.match(miss.reason, /R0000382293/);
+});
+
+test("isMyApplicationsPage: heading + a status word; the already-applied page that LINKS to it is not it", () => {
+  assert.strictEqual(isMyApplicationsPage({ markers: {}, bodyText: "My Applications Gas Turbine Intern Not Submitted 10/02/2026" }), true);
+  assert.strictEqual(isMyApplicationsPage({ markers: { myApplicationsPage: true }, bodyText: "" }), true, "the marker alone");
+  assert.strictEqual(
+    isMyApplicationsPage({ markers: { alreadyAppliedPage: true }, bodyText: "You've already applied for this job. View My Applications" }),
+    false, "the already-applied page links to the list — it is not the list");
+  assert.strictEqual(isMyApplicationsPage({ markers: {}, bodyText: "My Applications" }), false, "a heading with no status word");
+  assert.strictEqual(isMyApplicationsPage({ markers: { formField: true }, bodyText: "My Information First name" }), false);
+});
+
+test("classifyWorkdayPage: each landing is named — the whole point is never assuming where a click went", () => {
+  assert.strictEqual(classifyWorkdayPage({ markers: { alreadyAppliedPage: true }, bodyText: "" }), "already-applied");
+  assert.strictEqual(classifyWorkdayPage({ markers: {}, bodyText: "My Applications Intern Not Submitted" }), "my-applications");
+  assert.strictEqual(classifyWorkdayPage({ markers: { applyFlowReviewPage: true }, formFieldCount: 3 }), "review");
+  assert.strictEqual(classifyWorkdayPage({ markers: { formField: true }, formFieldCount: 14, hasAuthEl: false }), "form");
+  assert.strictEqual(classifyWorkdayPage({ markers: {}, formFieldCount: 0, hasAuthEl: true, passwordInput: true }), "auth");
+  assert.strictEqual(classifyWorkdayPage({ markers: { continueButton: true }, formFieldCount: 0 }), "job-description");
+  assert.strictEqual(classifyWorkdayPage({ markers: { adventureButton: true }, formFieldCount: 0 }), "job-description");
+  assert.strictEqual(classifyWorkdayPage({ markers: {}, formFieldCount: 0, bodyText: "Something went wrong. Please refresh the page." }), "soft-error");
+  assert.strictEqual(classifyWorkdayPage({ markers: {}, formFieldCount: 0, bodyText: "" }), "unknown");
+});
+test("classifyWorkdayPage: a form page still showing auth chrome is NOT yet the form", () => {
+  // The success test everywhere else in the flow (isPastAuth) is fields AND no auth chrome — same here,
+  // so a half-rendered auth widget over a form can't be mistaken for having arrived.
+  assert.strictEqual(classifyWorkdayPage({ markers: { formField: true }, formFieldCount: 2, hasAuthEl: true }), "auth");
+});
+test("classifyWorkdayPage: transient/terminal states outrank page shape", () => {
+  // A maintenance or soft-error page can carry leftover chrome; those must win or the flow acts on a
+  // page that is about to be replaced.
+  assert.strictEqual(
+    classifyWorkdayPage({ markers: { formField: true }, formFieldCount: 5, bodyText: "Something went wrong. Please refresh the page." }),
+    "soft-error");
+  assert.strictEqual(
+    classifyWorkdayPage({ markers: { continueButton: true }, formFieldCount: 0, bodyText: "You've already applied for this job. View My Applications" }),
+    "already-applied");
+});
+
+// ── Workday's PHANTOM "required" error (2026-07-28) ─────────────────────────────────────────────────
+// Live, HIDDEN solarturbines replay page 5: "The field Name is required and must have a value" + the
+// same for Date, while both fields held correct, read-back-verified values. Cause is the synthetic-mode
+// blur race. `phantomRequiredTargets` is the SAFETY GATE on the automatic re-save, so these pin the
+// direction that actually matters: it must REFUSE anything that isn't provably the race, because a false
+// positive re-saves a page with a genuinely empty required field and hides a real problem behind a retry.
+
+const F = (fieldName, label, value) => ({ fieldName, label, value, wrapperSel: `[data-automation-id="formField-${fieldName}"]` });
+// The live page-5 shape, verbatim from the run that failed.
+const PAGE5 = [
+  F("name", "Name*", "Kevin Wang"),
+  F("dateSignedOn", "Date*", "07/28/2026"),
+  F("disabilityStatus", "Please check one of the boxes below", "No, I do not have a disability"),
+];
+const ERR_NAME = "Error-NameThe field Name is required and must have a value.";
+const ERR_DATE = "Error-DateThe field Date is required and must have a value.";
+const titlesOf = (...errs) => errs.map((e) => parseErrorFieldName(e));
+
+test("phantomRequiredTargets: the live page-5 case — both named fields hold values ⇒ PHANTOM", () => {
+  const v = phantomRequiredTargets(titlesOf(ERR_NAME, ERR_DATE), PAGE5);
+  assert.strictEqual(v.phantom, true);
+  assert.deepStrictEqual(v.targets.map((t) => t.fieldName), ["name", "dateSignedOn"]);
+  assert.deepStrictEqual(v.targets.map((t) => t.wrapperSel), [
+    '[data-automation-id="formField-name"]',
+    '[data-automation-id="formField-dateSignedOn"]',
+  ]);
+});
+
+test("phantomRequiredTargets: a GENUINELY empty required field is NOT the phantom (the dangerous direction)", () => {
+  // If this returned phantom:true the walk would nudge and re-save a page that really is incomplete,
+  // burying a real gap under a retry. One empty field among many full ones must veto the whole thing.
+  const withEmptyDate = [F("name", "Name*", "Kevin Wang"), F("dateSignedOn", "Date*", "")];
+  const v = phantomRequiredTargets(titlesOf(ERR_NAME, ERR_DATE), withEmptyDate);
+  assert.strictEqual(v.phantom, false);
+  assert.match(v.reason, /genuinely empty/);
+  assert.match(v.reason, /Date/);
+});
+
+test("phantomRequiredTargets: an UNMATCHED error title vetoes it (we don't understand that error)", () => {
+  // A field the error names but the scan can't see could be anywhere — inside a repeating section the
+  // flat scan filters out, or not rendered yet. Acting on a partial understanding is how a retry loop
+  // starts, so any unmatched title refuses.
+  const v = phantomRequiredTargets(titlesOf(ERR_NAME, "Error-SchoolThe field School is required and must have a value."), PAGE5);
+  assert.strictEqual(v.phantom, false);
+  assert.match(v.reason, /not every error maps/);
+  assert.match(v.reason, /School/);
+});
+
+test("phantomRequiredTargets: no titles / no matching field / empty page ⇒ refuse with a reason", () => {
+  assert.strictEqual(phantomRequiredTargets([], PAGE5).phantom, false);
+  assert.match(phantomRequiredTargets([], PAGE5).reason, /names no field/);
+  const none = phantomRequiredTargets(["Salary Expectation"], PAGE5);
+  assert.strictEqual(none.phantom, false);
+  assert.match(none.reason, /match no field on this page/);
+  assert.strictEqual(phantomRequiredTargets(titlesOf(ERR_NAME), []).phantom, false);
+});
+
+test("phantomRequiredTargets: matches on the automation-id when the error is worded after it", () => {
+  const byId = [F("dateSignedOn", "Signature Date", "07/28/2026")];
+  const v = phantomRequiredTargets(["dateSignedOn"], byId);
+  assert.strictEqual(v.phantom, true);
+  assert.strictEqual(v.targets[0].fieldName, "dateSignedOn");
+});
+
+test("phantomRequiredTargets: the required-marker asterisk doesn't break the label match", () => {
+  // The error says "Name"; the DOM label is "Name*" (normalizeLabel strips it). A mismatch here would
+  // silently disable the whole fix on every required field — i.e. on every field it exists for.
+  assert.strictEqual(phantomRequiredTargets(["Name"], [F("name", "Name*", "Kevin Wang")]).phantom, true);
+  assert.strictEqual(phantomRequiredTargets(["Name"], [F("name", "Name **", "Kevin Wang")]).phantom, true);
+});
+
+test("phantomRequiredTargets: a placeholder 'Select One' does not count as holding a value", () => {
+  const v = phantomRequiredTargets(["Country"], [F("country", "Country*", "Select One")]);
+  assert.strictEqual(v.phantom, false);
+  assert.match(v.reason, /genuinely empty/);
+});
+
+test("phantomRequiredTargets: a CHECKED checkbox (boolean true) counts as holding a value", () => {
+  assert.strictEqual(phantomRequiredTargets(["Acknowledgement"], [F("ack", "Acknowledgement*", true)]).phantom, true);
+  assert.strictEqual(phantomRequiredTargets(["Acknowledgement"], [F("ack", "Acknowledgement*", false)]).phantom, false);
 });

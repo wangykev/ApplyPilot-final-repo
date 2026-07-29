@@ -2449,24 +2449,19 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       uploadRec.detail = "no resume stored — upload a PDF in the popup first (the required upload blocks Save & Continue)";
       LOG("resume: NOT attached — no resume stored (upload one in the popup).");
     } else {
-      let ar = null, arErr = null;
       // The input-lock's capture-phase blocker SWALLOWS attachResume's SYNTHETIC delete/attach clicks
       // (they're dispatchEvent, not the gated cdpClickAt) whenever window.__apActing is 0 — that's why
       // clearing an EXISTING attachment intermittently failed under the walk's lock ("removed 0, N
       // remain"; a clean 0-attachment page worked because the attach's `change` event isn't blocked).
-      // Bump __apActing around the attach (exactly how the gated CDP primitives gate themselves) so
-      // attachResume's events pass (the input-lock is always installed for the fill).
-      try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ }
-      try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
-      catch (e) { arErr = String((e && e.message) || e); }
-      finally { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } }
+      // cdpAttachResumeConfirmed bumps __apActing around the attach and owns the confirmation budget.
+      const ar = await cdpAttachResumeConfirmed(resumeRec, LOG);
       if (ar && ar.attached) {
         uploadRec.status = "filled"; uploadRec.verified = true; uploadRec.after = ar.fileName || resumeRec.filename || null;
         uploadRec.detail = `resume attached (file-upload-successful, cleared ${ar.deletedCount || 0} existing)`;
         LOG(`resume: attached "${uploadRec.after}".`);
       } else {
         uploadRec.status = "needs_review"; uploadRec.verified = false;
-        uploadRec.detail = "resume attach failed — " + (arErr || (ar && ar.detail) || "no confirmation");
+        uploadRec.detail = "resume attach failed — " + ((ar && ar.detail) || "no confirmation");
         LOG("resume: NOT attached —", uploadRec.detail);
       }
     }
@@ -2773,6 +2768,26 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       });
       actions.push({ tier: 0, action: "delete-" + dup.kind + "-" + dup.mode, deleted: dup.deleted, entries: dup.values.join(", ") });
       didSomething = true;
+    }
+
+    // ── Tier 0.5 (DETERMINISTIC, no AI) — Workday's PHANTOM "required" error: it claims a field is empty
+    //    that the page visibly HOLDS. The synthetic-mode blur race (see nudgePhantomRequired); the fill
+    //    walk runs the same synthetic path on a hidden tab, so it is exposed to the same bug. Placed
+    //    BEFORE Tier 1 deliberately: Tier 1 would re-FILL an already-correct field to fix it, which
+    //    re-actuates a verified value for no reason. This just commits the edit that already landed.
+    //    Evidence-gated (every named field present AND holding a value), so anything else falls straight
+    //    through to Tier 1 with the ladder unchanged.
+    if (!didSomething) {
+      const nudge = await nudgePhantomRequired(prevErrors, (...a) => LOG("  attempt " + attempt + " (Tier 0.5)", ...a));
+      if (nudge.ran) {
+        mergeRemediationRecord(out, {
+          fieldName: "phantom-required.commit", label: "Phantom required-field workaround", widgetType: "remediation",
+          status: "needs_review", flag: "ai-remediation", after: null,
+          detail: `Workday reported ${nudge.fields.join(", ")} as required-and-empty while the page held the value (the blur race). Committed with a focus→blur nudge — no value was changed.`
+        });
+        actions.push({ tier: 0.5, action: "commit-phantom-required", fields: nudge.fields.join(", "), nudged: nudge.nudged });
+        didSomething = true;
+      }
     }
 
     // ── Tier 1 (DETERMINISTIC, no AI): re-fill the MAPPED fields the error TEXT names, from the
@@ -3196,10 +3211,74 @@ async function runCdpReplayPage(tabId) {
   }
 }
 
+// ── The résumé attach, with a THROTTLE-IMMUNE confirmation (2026-07-28) ─────────────────────────────
+// The one shared attach path for both walks. `attachResume` runs page-side and its confirmation poll is
+// therefore subject to everything a hidden tab does to a page: a slower XHR, a throttled React render,
+// and (when the CSP blocks the worker-timer override) a ~1Hz timer. Live on a BACKGROUND run it reported
+// "file-upload-item appeared but file-upload-successful did not within 10s" and the replay walk HALTED —
+// yet re-running the same job worked, which is the signature of a race, not a broken upload.
+//
+// Two changes, in the order that matters:
+//   1. the page-side ceiling SCALES with visibility (the same renderBudget reasoning as the auth waits);
+//   2. an unconfirmed-but-STARTED upload is then re-polled FROM THE SERVICE WORKER on wall-clock, waking
+//      the page each tick — the project's standing rule that a wait must never depend on a page timer.
+// An explicit Workday error, or no upload row at all, skips the re-poll: those are not races, and
+// pretending otherwise would just delay an honest failure.
+const RESUME_CONFIRM_VISIBLE_MS = 10000;   // live-verified value — unchanged for the visible path
+const RESUME_CONFIRM_HIDDEN_MS = 25000;    // a hidden tab uploads AND repaints slower
+const RESUME_REPOLL_MS = 20000;            // SW-side second chance, wall-clock
+
+// Self-contained page read for the SW-side poll (deliberately tiny — it runs many times).
+function cdpReadUploadState(sectionSel) {
+  const sec = document.querySelector(sectionSel || '[data-fkit-id="resumeAttachments--attachments"]') || document;
+  const nameEl = sec.querySelector('[data-automation-id="file-upload-item-name"]');
+  return {
+    successful: !!sec.querySelector('[data-automation-id="file-upload-successful"]'),
+    items: sec.querySelectorAll('[data-automation-id="file-upload-item"]').length,
+    fileName: nameEl ? (nameEl.textContent || "").trim() : null
+  };
+}
+
+async function cdpAttachResumeConfirmed(resumeRec, LOG, sectionSel) {
+  let visible = false;
+  try { visible = await cdpVisible(); } catch (e) { /* assume hidden — the generous budget is the safe default */ }
+  const ceiling = visible ? RESUME_CONFIRM_VISIBLE_MS : RESUME_CONFIRM_HIDDEN_MS;
+
+  let ar = null, arErr = null;
+  // The input-lock's capture-phase blocker SWALLOWS attachResume's SYNTHETIC delete/attach clicks
+  // whenever window.__apActing is 0 — bump it exactly as the gated CDP primitives do.
+  try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ }
+  try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf", sectionSel || null, ceiling); }
+  catch (e) { arErr = String((e && e.message) || e); }
+  finally { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } }
+
+  if (ar && ar.attached) return ar;
+  if (arErr || !ar) return ar || { attached: false, detail: "attach eval failed — " + arErr };
+  if (ar.errorText) return ar;            // Workday REJECTED the file — a real failure, don't wait on it
+  if (!ar.sawItem) return ar;             // nothing ever started uploading — re-polling would just stall
+
+  // Started but unconfirmed ⇒ the race. Keep watching from out here, where the clock is real.
+  LOG && LOG(`resume: upload started but not yet confirmed after ${Math.round(ceiling / 1000)}s (tab ${visible ? "VISIBLE" : "HIDDEN"}) — re-polling from the service worker for up to ${Math.round(RESUME_REPOLL_MS / 1000)}s.`);
+  const t0 = Date.now();
+  const deadline = t0 + RESUME_REPOLL_MS;
+  while (Date.now() < deadline) {
+    await cdpDelay(500);
+    try { await cdpWakePage(); } catch (e) { /* best effort */ }
+    let s = null;
+    try { s = await cdpEval(cdpReadUploadState, sectionSel || null); } catch (e) { continue; } // mid-render read → keep polling
+    if (s && s.successful) {
+      const waited = Math.round((Date.now() - t0) / 1000);
+      LOG && LOG(`resume: ✓ confirmed ${waited}s later — the page-side ceiling was simply short of a slow upload.`);
+      return { ...ar, attached: true, confirmationSeen: true, confirmationVia: "file-upload-successful (SW re-poll)", fileName: s.fileName || ar.fileName,
+        detail: `attached + confirmed via file-upload-successful after a ${waited}s SW re-poll (cleared ${ar.deletedCount || 0} existing)` };
+    }
+  }
+  const total = Math.round((ceiling + RESUME_REPOLL_MS) / 1000);
+  return { ...ar, detail: `resume upload never confirmed within ${total}s (row present, file-upload-successful absent) — tab was ${visible ? "VISIBLE" : "HIDDEN"}` };
+}
+
 // Re-attach the stored résumé on the CURRENT page (replay path — replayField defers file_upload to
-// this SW step). Mirrors fillAndPersistPage's attach block: read the bytes from IndexedDB, bump
-// window.__apActing so the input-lock passes attachResume's SYNTHETIC delete/attach clicks, run the
-// proven attachResume via cdpEval on the SAME debugger attach, gate on file-upload-successful.
+// this SW step). Reads the bytes from IndexedDB and runs the shared confirmed-attach above.
 async function replayAttachResume(LOG) {
   let resumeRec = null;
   try { resumeRec = await getResume(); } catch (e) { /* treat as none */ }
@@ -3207,16 +3286,12 @@ async function replayAttachResume(LOG) {
     LOG("resume: NOT attached — no resume stored (upload one in the popup).");
     return { attached: false, detail: "no resume stored — upload a PDF in the popup first" };
   }
-  let ar = null, arErr = null;
-  try { await cdpEval(() => { window.__apActing = (window.__apActing || 0) + 1; }); } catch (e) { /* no lock/page — ignore */ }
-  try { ar = await cdpEval(attachResume, resumeRec.base64, resumeRec.filename || "resume.pdf", resumeRec.mime || "application/pdf"); }
-  catch (e) { arErr = String((e && e.message) || e); }
-  finally { try { await cdpEval(() => { window.__apActing = Math.max(0, (window.__apActing || 1) - 1); }); } catch (e) { /* ignore */ } }
+  const ar = await cdpAttachResumeConfirmed(resumeRec, LOG);
   if (ar && ar.attached) {
     LOG(`resume: attached "${ar.fileName || resumeRec.filename}".`);
     return { attached: true, detail: `attached (cleared ${ar.deletedCount || 0} existing)`, fileName: ar.fileName || resumeRec.filename };
   }
-  const detail = "resume attach failed — " + (arErr || (ar && ar.detail) || "no confirmation");
+  const detail = "resume attach failed — " + ((ar && ar.detail) || "no confirmation");
   LOG("resume: NOT attached — " + detail);
   return { attached: false, detail };
 }
@@ -3249,6 +3324,94 @@ async function reloadAndSettle(LOG, ceilingMs = 12000) {
     if (nav && (((nav.formFieldCount || 0) > 0) || nav.applyFlowReviewPresent)) return true; // form/review back → ready
   }
   return false;
+}
+
+// ── Workday's PHANTOM "required" error — a filled field it says is empty (2026-07-28) ───────────────
+// Live on a HIDDEN solarturbines replay, page 5: every value physically correct and read-back verified
+// ("5 field(s) — 3 changed, 1 already-correct, 0 FAILED"), and Save & Continue came back with
+//   • Error-Name  The field Name is required and must have a value.
+//   • Error-Date  The field Date is required and must have a value.
+// Operator: *"The fields are physically filled correctly … manually I just click into the field text box,
+// and then press next and the error goes away."* That workaround IS the diagnosis: Workday validates on
+// BLUR, and in synthetic-input mode nothing blurs the field (see cdpCommitPendingEdits). The value is in
+// the DOM; Workday's form model never got told the edit finished.
+//
+// This is the CURATIVE half (the preventive blur lives in clickPageNext). It is EVIDENCE-GATED, which is
+// what makes it safe to run automatically: it fires ONLY when every field the error names is present on
+// the page AND visibly HOLDS a value. A genuinely empty required field returns ran:false and the caller
+// halts exactly as before — this can never paper over a real gap, and it never invents or changes a value
+// (focus → change → blur only). Deterministic; no AI, which is why it's allowed on the replay path at all.
+async function nudgePhantomRequired(errorTexts, LOG) {
+  const titles = (errorTexts || []).map((t) => parseErrorFieldName(t)).filter(Boolean);
+  if (!titles.length) return { ran: false, reason: "the error text names no field" };
+
+  let scan = null;
+  try { scan = await cdpEval(cdpPageScan); } catch (e) { return { ran: false, reason: "could not scan the page: " + String((e && e.message) || e) }; }
+
+  // The DECISION (is this the phantom, and which wrappers?) is the pure, unit-pinned
+  // phantomRequiredTargets — this function only does the I/O around it.
+  const verdict = phantomRequiredTargets(titles, (scan && scan.fields) || []);
+  if (!verdict.phantom) return { ran: false, reason: verdict.reason };
+  const matched = verdict.targets;
+
+  LOG(`  phantom-required: Workday says ${matched.map((m) => JSON.stringify(m.title)).join(" + ")} ${matched.length === 1 ? "is" : "are"} empty, but the page HOLDS ${matched.map((m) => JSON.stringify(String(m.value))).join(" + ")}. Committing ${matched.length === 1 ? "it" : "them"} with a focus→blur nudge (the manual fix) and re-saving.`);
+  let nudged = null;
+  try { nudged = await cdpEval(cdpNudgeFieldCommit, matched.map((m) => m.wrapperSel)); }
+  catch (e) { return { ran: false, reason: "the nudge eval failed: " + String((e && e.message) || e) }; }
+  const total = (nudged || []).reduce((n, r) => n + (r.nudged || 0), 0);
+  if (!total) return { ran: false, reason: `no input could be focused inside ${matched.map((m) => m.fieldName).join(", ")} — nothing to commit` };
+  LOG(`  phantom-required: nudged ${total} input(s) across ${matched.length} field(s) — ${JSON.stringify(nudged)}`);
+  await cdpDelay(700); // let Workday's blur validator run before the re-save (wall-clock; it is page-side work)
+  return { ran: true, fields: matched.map((m) => m.fieldName), nudged: total };
+}
+
+// Dump the decisive state for a "required" error on a field that looks filled (2026-07-28, round 2).
+// The blur-commit fix did not clear it, so rather than guess a third time this prints — READ-ONLY, at the
+// moment of the failure — the DOM value, REACT's internal value, the date spinbuttons' aria-valuenow, and
+// whether each error is rendered inside the field's own wrapper. See cdpDiagnoseFieldCommit for which
+// hypothesis each combination points at. Always safe to call: it reads, it never actuates.
+async function diagnoseRequiredErrorFields(errorTexts, LOG) {
+  try {
+    const titles = (errorTexts || []).map((t) => parseErrorFieldName(t)).filter(Boolean);
+    if (!titles.length) { LOG("  [FIELD-DIAG] the error text names no field — nothing to diagnose."); return; }
+    const scan = await cdpEval(cdpPageScan);
+    const fields = (scan && scan.fields) || [];
+    const sels = [], unmatched = [];
+    for (const title of titles) {
+      const want = normalizeLabel(title);
+      const hit = fields.find((f) => normalizeLabel((f && f.label) || "") === want)
+        || fields.find((f) => normalizeLabel((f && f.fieldName) || "") === want);
+      if (hit) sels.push(hit.wrapperSel); else unmatched.push(title);
+    }
+    LOG(`  [FIELD-DIAG] errors name [${titles.join(", ")}]; matched ${sels.length} wrapper(s)${unmatched.length ? `; UNMATCHED (not in the flat scan — inside a repeating section? not rendered?): ${unmatched.join(", ")}` : ""}`);
+    LOG(`  [FIELD-DIAG] the page's ${fields.length} flat field(s): ${fields.map((f) => `${f.fieldName}=${JSON.stringify(String(f.value == null ? "" : f.value)).slice(0, 40)}${f.isRequired ? "*" : ""}`).join(" · ")}`);
+    if (!sels.length) return;
+    const d = await cdpEval(cdpDiagnoseFieldCommit, sels);
+    if (!d) { LOG("  [FIELD-DIAG] the diagnostic read returned nothing."); return; }
+    LOG(`  [FIELD-DIAG] activeElement=${d.activeElement}`);
+    for (const f of d.fields || []) {
+      if (!f.present) { LOG(`  [FIELD-DIAG] ${f.sel} — WRAPPER NOT ON THE PAGE`); continue; }
+      LOG(`  [FIELD-DIAG] ${f.sel}`);
+      for (const i of f.inputs || []) {
+        LOG(`      ↳ ${i.tag}${i.automationId ? `[${i.automationId}]` : ""} type=${i.type || i.role || "?"}`
+          + ` domValue=${JSON.stringify(i.domValue)} reactProps=${JSON.stringify(i.reactPropsValue)} reactFiber=${JSON.stringify(i.reactFiberValue)}`
+          + ` ariaValueNow=${JSON.stringify(i.ariaValueNow)} ariaInvalid=${JSON.stringify(i.ariaInvalid)}`
+          + (i.checked === null ? "" : ` checked=${i.checked}`) + (i.isActiveElement ? " ← FOCUSED" : ""));
+      }
+      // Node scan first, then the wrapper's own TEXT — Workday's inline error element has no error-ish
+      // automation-id and no role=alert, so the node scan alone reported "NONE" on a wrapper that was
+      // visibly rendering the error (live 2026-07-28). Only "no node AND no text" means page-level/stale.
+      LOG(`      this field's OWN error: ${f.errorsInsideWrapper && f.errorsInsideWrapper.length ? JSON.stringify(f.errorsInsideWrapper)
+        : (f.inlineErrorInWrapperText ? `(inline, no error-ish node) ${JSON.stringify(f.inlineErrorInWrapperText)}` : "NONE — the error is page-level only, so it may be STALE")}`);
+      LOG(`      wrapper text: ${JSON.stringify(f.wrapperText)}`);
+    }
+    LOG(`  [FIELD-DIAG] all error nodes on the page: ${JSON.stringify(d.allErrorNodes)}`);
+    LOG("  [FIELD-DIAG] read this as: domValue set + reactProps/(fiber) EMPTY ⇒ React never got the value (the native setter didn't notify it);"
+      + " domValue EMPTY ⇒ the value reverted after we verified it; both set ⇒ Workday's model disagrees with its own DOM;"
+      + " no error inside any wrapper ⇒ the error is page-level/stale and the Save click may have been swallowed.");
+  } catch (e) {
+    LOG("  [FIELD-DIAG] failed: " + String((e && e.message) || e));
+  }
 }
 
 async function runCdpReplayWalk(tabId, opts) {
@@ -3309,6 +3472,8 @@ async function runCdpReplayWalk(tabId, opts) {
     // Save & Continue, so the review page can be checked for those exact values coming back.
     let phantomDeleted = [];
     let dupFixes = 0; // per-RUN budget — a duplicate error that survives the fix is a real problem, not a retry loop
+    let phantomNudges = 0; // per-RUN budget for the blur-race fix (nudgePhantomRequired) — same reasoning: if a focus→blur commit doesn't clear it, it isn't the blur race
+    let forcedRefills = 0; // per-RUN budget for the mechanism-agnostic force-re-actuate remedy (skip-if-correct OFF) — if re-WRITING the approved value doesn't clear it, re-writing it again won't either
 
     let findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
     let submitFired = false; // single-fire sentinel
@@ -3491,14 +3656,24 @@ async function runCdpReplayWalk(tabId, opts) {
         // sends the operator to re-review a bundle that is perfectly fine. Reload + restart while the
         // budget lasts; only then halt, and say honestly that the PAGE was empty.
         if (!liveNames.length && !liveSecs.length) {
+          // NAME the page before deciding it's a hiccup (operator 2026-07-28: "each redirect, detect
+          // which page you are on"). "No fields" is a SHAPE, and several very different pages share it —
+          // already-applied, the My Applications list, a maintenance window. Reloading those is useless
+          // and the halt would blame the wrong thing, so classify first and report it either way.
+          let landed = null, kind = "unknown";
+          try { landed = await cdpEval(cdpOnboardScan); kind = classifyWorkdayPage(landed); } catch (e) { /* fall through to the reload path */ }
+          if (kind === "already-applied" || kind === "my-applications" || kind === "maintenance") {
+            LOG(`⚠ replay page ${page} has no fields because the tab is on a "${kind}" page (${landed && landed.url}) — reloading would not change that. HALT.`);
+            return { ok: true, stopped: "replay-landed-" + kind, page, landed_url: (landed && landed.url) || null, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          }
           if (softReloads < MAX_REPLAY_SOFT_RELOADS) {
             softReloads++;
-            LOG(`⚠ replay page ${page} is EMPTY (no fields, no repeating sections) — that's a Workday page problem, not a gap in the approved bundle. Reloading + restarting the replay from page 1 (reload ${softReloads}/${MAX_REPLAY_SOFT_RELOADS}).`);
+            LOG(`⚠ replay page ${page} is EMPTY (no fields, no repeating sections; page reads as "${kind}") — that's a Workday page problem, not a gap in the approved bundle. Reloading + restarting the replay from page 1 (reload ${softReloads}/${MAX_REPLAY_SOFT_RELOADS}).`);
             await reloadAndSettle(LOG);
             continue restartWalk;
           }
-          LOG(`⚠ replay page ${page} is still EMPTY after ${softReloads} reload(s) — HALT. The approved bundle is fine; the PAGE never rendered. Open the tab and look.`);
-          return { ok: true, stopped: "replay-page-empty", page, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          LOG(`⚠ replay page ${page} is still EMPTY after ${softReloads} reload(s) — HALT. The approved bundle is fine; the PAGE never rendered (it reads as "${kind}"${landed && landed.url ? `, url=${landed.url}` : ""}). Open the tab and look.`);
+          return { ok: true, stopped: "replay-page-empty", page, landed_kind: kind, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
         }
         if (!refill || !prepared) {
           LOG(`⚠ page ${page}: NO matching page in the approved bundle (live flat fields: ${liveNames.slice(0, 8).join(", ") || "none"}; repeating: ${liveSecs.join(", ") || "none"}). ${refill ? "REFILL but no profile in storage — can't fresh-fill." : "The bundle never captured this page"} — HALT.`);
@@ -3575,7 +3750,11 @@ async function runCdpReplayWalk(tabId, opts) {
         // left blank (live 2026-07-27 — the `cleared` branch, an approved value that is empty). Name them.
         const skipped = results.filter((r) => r.status === "skipped");
         if (skipped.length) {
-          LOG(`page ${page}: ${skipped.length} approved entr${skipped.length === 1 ? "y was" : "ies were"} NOT actuated (left as-is): ${skipped.map((r) => `${r.field}${r.replay ? " (" + r.replay + ")" : ""}`).join(", ")}`);
+          // `r.field || r.fieldName` — repeating-section records key the name differently, so the bare
+          // r.field printed a literal "undefined" for them (live 2026-07-28). The whole value of this
+          // line is NAMING what was left blank; falling back to the flag/detail beats printing nothing.
+          const nameOf = (r) => r.field || r.fieldName || r.canonical_field || r.mappedPath || r.flag || "(unnamed record)";
+          LOG(`page ${page}: ${skipped.length} approved entr${skipped.length === 1 ? "y was" : "ies were"} NOT actuated (left as-is): ${skipped.map((r) => `${nameOf(r)}${r.replay ? " (" + r.replay + ")" : ""}`).join(", ")}`);
         }
         // Absent fields get their own line: they are the ones whose approved value did NOT reach the
         // form, so they are exactly what the review-page equality check must vouch for before a submit.
@@ -3690,6 +3869,10 @@ async function runCdpReplayWalk(tabId, opts) {
           const st = await cdpEval(cdpReadSessionState);
           samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
           if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG("    • " + s)); }
+          // Dump the decisive per-field state BEFORE any remediation tier touches the page, so the log
+          // shows the failure as it actually was (2026-07-28 round 2 — the blur fix didn't clear it and a
+          // third guess isn't worth making). Read-only.
+          if (samples.length) await diagnoseRequiredErrorFields(samples, LOG);
           diag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null };
           lastDiag = diag; // refill stamps this onto walk_status → the website review page shows WHY it stopped
         } catch (e) { /* ignore */ }
@@ -3715,6 +3898,117 @@ async function runCdpReplayWalk(tabId, opts) {
               if (!res2.timeout) { LOG(`✓ page ${page} → advanced after clearing Workday's phantom duplicate ${fix.kind} rows.`); continue; }
             }
             LOG(`⚠ page ${page}: still blocked after clearing the phantom duplicate ${fix.kind} rows — falling through to the halt below.`);
+          }
+        }
+        // ── THE FIX: re-write the error-named fields with TRUSTED INPUT (2026-07-28, LIVE-VERIFIED) ────
+        // Workday reports a required field as empty on a page where everything is visibly filled. The
+        // [FIELD-DIAG] dump nailed it down: the DOM holds the values, REACT's own props/fiber hold them for
+        // every date segment, Workday's OWN widget renders "current value is 7/29/2026" — and it still
+        // reports the field empty, with aria-invalid="true" and an inline per-field error. So the value is
+        // present in every layer we can read, and missing only from WORKDAY'S OWN FORM MODEL, the layer
+        // above React that we cannot inspect.
+        //
+        // That failure mode was ALREADY DOCUMENTED in this codebase — for the auth form, at
+        // cdpSetSyntheticInput: *"the auth app likely doesn't register native-setter values in its own
+        // state, leaving the submit inert."* Synthetic input writes via the native setter; React's input
+        // state updates (visibly), but an app tracking its own model off real key/input events never hears
+        // about it. The operator's evidence lines up exactly: this only happens on HIDDEN runs, and hidden
+        // runs are the ONLY ones using synthetic input — a VISIBLE run of this page has never shown it.
+        //
+        // LIVE-VERIFIED FIX (solarturbines page 5): re-writing `name` + `dateSignedOn` with TRUSTED input
+        // advanced the page immediately, and the run went on to reach review AGREE 53 · DISAGREE 0 and pass
+        // the submit gate. The log line below states the confirmed mechanism so a future reader doesn't
+        // have to re-derive it. Two things had to be true for this to work, and both are load-bearing:
+        // trusted input (the native-setter write is what Workday misses) and skipIfCorrect:false (the box
+        // already reads correct, so the default minimal-diff replay skips it — that skip made the first
+        // attempt at this a silent no-op).
+        //
+        // FOLLOW-UP worth considering: force trusted input for these field types (or this whole page) so
+        // the retry isn't needed at all. Left as a retry deliberately — it costs one extra Save cycle and
+        // keeps the hidden-tab speed win everywhere else.
+        //
+        // So the retry does what a visible run does: FORCE TRUSTED INPUT for the re-write, with
+        // skipIfCorrect:false so it actually re-types instead of skipping an already-correct box (that
+        // skip is why round 2's attempt was a silent no-op). Deterministic, approved values only, per-field
+        // verify unchanged, bounded per RUN — worst case it changes nothing and we halt as before.
+        // It is also DECISIVE: if the page advances here, the synthetic path is confirmed as the cause.
+        if (forcedRefills < 2) {
+          const titles = samples.map((t) => parseErrorFieldName(t)).filter(Boolean);
+          let named = new Set();
+          try {
+            const fscan = await cdpEval(cdpPageScan);
+            for (const title of titles) {
+              const want = normalizeLabel(title);
+              const hit = ((fscan && fscan.fields) || []).find((f) => normalizeLabel((f && f.label) || "") === want)
+                || ((fscan && fscan.fields) || []).find((f) => normalizeLabel((f && f.fieldName) || "") === want);
+              if (hit) named.add(hit.fieldName);
+            }
+          } catch (e) { /* no scan → nothing to force */ }
+          const toForce = (sel.entries || []).filter((e) => named.has(replayEntryFieldName(e)));
+          if (toForce.length) {
+            forcedRefills++;
+            const wasSynth = cdpSyntheticInputEnabled();
+            const vis = await cdpVisible();
+            LOG(`page ${page}: FORCE-re-filling ${toForce.length} error-named field(s) [${[...named].join(", ")}] with skip-if-correct OFF and TRUSTED input`
+              + ` (tab ${vis ? "VISIBLE" : "HIDDEN"}; synthetic was ${wasSynth ? "ON" : "OFF"}) — a real clear+type through the same path a visible run uses.`);
+            let forced = [];
+            try {
+              cdpSetSyntheticInput(false); // trusted Input.* for this re-write — see the block comment
+              forced = await replayFlatFields(act, toForce, named, Object.assign({}, DEFAULT_BUDGETS, { skipIfCorrect: false }));
+            } finally {
+              cdpSetSyntheticInput(wasSynth); // restore, so the rest of the walk keeps its hidden-tab speed
+            }
+            const bad = forced.filter((r) => r.status === "needs_review" || r.status === "error");
+            forced.forEach((r) => LOG(`    • ${r.field || r.fieldName}: ${r.status}${r.after != null ? ` → ${JSON.stringify(String(r.after))}` : ""}${r.detail ? ` — ${r.detail}` : ""}`));
+            if (forced.some((r) => r.flag === "replay-already-correct")) {
+              LOG("   ⚠ a field still reported 'already correct — no actuation' despite skipIfCorrect:false — the forced re-write did NOT happen (check replayField's skip gate).");
+            }
+            if (bad.length) LOG(`   ⚠ ${bad.length} did not take on the forced re-fill — Save & Continue will surface it again.`);
+            const sig4 = cdpPageSig(await cdpEval(cdpPageScan));
+            await cdpWakePage();
+            const click4 = await act.clickPageNext();
+            LOG(`page ${page} Save & Continue (after the forced re-fill):`, JSON.stringify(click4));
+            if (click4.clicked) {
+              const res4 = await cdpWaitNextPage(sig4);
+              if (res4.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after the forced re-fill on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (res4.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after the forced re-fill on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (!res4.timeout) {
+                LOG(`✓ page ${page} → advanced after re-writing ${[...named].join(", ")} with TRUSTED input.`);
+                LOG(`   ⇒ MECHANISM CONFIRMED: the synthetic (native-setter) write updated the DOM and React but NOT Workday's own form model — the same thing that leaves the auth form's Sign In inert. Consider forcing trusted input for these field types (or this page) instead of paying for the retry.`);
+                continue;
+              }
+            }
+            LOG(`⚠ page ${page}: still blocked even after a TRUSTED re-write of ${[...named].join(", ")} — unexpected (this is the LIVE-VERIFIED remedy for this symptom). Read the [FIELD-DIAG] dump above.`);
+          } else if (titles.length) {
+            LOG(`  (force-re-fill: the approved bundle has no entry for [${titles.join(", ")}] on this page — nothing to re-write.)`);
+          }
+        }
+        // ── FALLBACK: the focus→blur commit nudge (2026-07-28 round 1) ────────────────────────────────
+        // DEMOTED to run only after the trusted re-write above (round 3). It was the original fix for this
+        // symptom and it has now failed LIVE TWICE — real focus + change + blur on every input of both
+        // fields, then Save, still blocked — so it is kept only for the case the re-write above could not
+        // run at all (no approved bundle entry for the named field), and because it is nearly free. It runs
+        // AFTER, not before, because every failed Save costs a full nav-timeout and there is no longer any
+        // reason to spend one on this first. Evidence-gated as before: it fires only when every error-named
+        // field is on the page AND holds a value, so a genuinely empty required field still falls through
+        // to the halt below.
+        if (phantomNudges < 2) {
+          const nudge = await nudgePhantomRequired(samples, LOG);
+          if (nudge.ran) {
+            phantomNudges++;
+            const sig3 = cdpPageSig(await cdpEval(cdpPageScan));
+            await cdpWakePage();
+            const click3 = await act.clickPageNext();
+            LOG(`page ${page} Save & Continue (after committing ${nudge.fields.join(", ")}):`, JSON.stringify(click3));
+            if (click3.clicked) {
+              const res3 = await cdpWaitNextPage(sig3);
+              if (res3.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after the phantom-required fix on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (res3.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after the phantom-required fix on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (!res3.timeout) { LOG(`✓ page ${page} → advanced after committing ${nudge.fields.join(", ")} — Workday had the values all along; it just never saw the edit finish.`); continue; }
+            }
+            LOG(`⚠ page ${page}: still blocked after the focus→blur commit — as expected (this has failed live twice); the trusted re-write above is the load-bearing remedy.`);
+          } else {
+            LOG(`  (phantom-required check: not applicable — ${nudge.reason})`);
           }
         }
         // ── CASCADE-REVEALED REQUIRED FIELDS → back to REVIEW, not a blind halt (2026-07-27). ──
@@ -3962,6 +4256,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     // error is its own bullet (and success toasts don't masquerade as errors).
     const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
     if (samples.length) { LOG(`page errors (${samples.length}):`); samples.forEach((s) => LOG(`    • ${s}`)); }
+    // Same per-field diagnostic the replay walk dumps (2026-07-28 round 2) — the fill walk runs the same
+    // synthetic path on a hidden tab, so it is exposed to whatever this turns out to be. Read-only.
+    if (samples.length) await diagnoseRequiredErrorFields(samples, LOG);
     if (st && st.errorPageText) LOG(`error-page text: ${st.errorPageText}`);
     if (!samples.length && !(st && st.errorPageText)) LOG("(no error text captured on the page)");
     // Hidden-tab hint: when the page won't advance AND the tab is really hidden AND there's no error
@@ -4257,6 +4554,12 @@ async function runCdpOnboard(tabId, opts) {
   // (see isBlankAuthPage). RUN-level budget: if refreshing twice doesn't restore a real page, it's
   // not a hiccup any more and the operator gets a self-explaining halt.
   let blankReloads = 0; const MAX_BLANK_RELOADS = 2;
+  // "You've already applied" is sometimes a LIE (operator 2026-07-28) — see handleAlreadyApplied. The
+  // recovery navigates the candidate's own applications list to find out. BOUNDED per run: it ends on the
+  // application form, on a proven-submitted halt, or on an operator halt — never in a retry loop. The
+  // budget is 2 because one attempt can legitimately be consumed by the list demanding a sign-in first
+  // (that attempt hands back to the auth stage, which then re-lands here already signed in).
+  let appliedRecoveries = 0; const MAX_APPLIED_RECOVERIES = 2;
 
   // Adaptive pacing — mirrors the fill's act.delay: ~10× faster when the tab is VISIBLE (or its
   // worker-timers measure fast), FULL (throttle-safe) when hidden/backgrounded. Used for ALL
@@ -4363,7 +4666,11 @@ async function runCdpOnboard(tabId, opts) {
 
   // Poll scan() until pred(scan) is true or a timeout; runs the soft-error reload guard
   // each tick. Returns { matched, scan }.
-  const waitFor = async (pred, timeoutMs, label) => {
+  // `opts.allowAlreadyApplied` — suppress the already-applied TERMINAL exit below. Needed by exactly one
+  // caller: the already-applied RECOVERY, which is navigating AWAY from that page. Without it the first
+  // poll still sees the old page mid-navigation and the wait bails ~500ms in, before the click can land.
+  const waitFor = async (pred, timeoutMs, label, opts) => {
+    const allowAlreadyApplied = !!(opts && opts.allowAlreadyApplied);
     const start = Date.now();
     const ok0 = scanOk, fail0 = scanFail;
     let st = null, last = null; // `last` = the last SUCCESSFUL read (st can be null if the final read failed)
@@ -4381,7 +4688,7 @@ async function runCdpOnboard(tabId, opts) {
       // already-applied posting cost 20s (post-apply) + 45s (post-apply-manually) + 12s (auth-or-form)
       // before the flow noticed a state it detects instantly. Exit now; every caller's next step routes
       // these to their proper clean halts.
-      if (isAlreadyApplied(st)) { LOG(`waitFor(${label}) stopping early — this posting is ALREADY APPLIED, so "${label}" can never render.`); return { matched: false, scan: st, terminal: "already-applied" }; }
+      if (isAlreadyApplied(st) && !allowAlreadyApplied) { LOG(`waitFor(${label}) stopping early — this posting is ALREADY APPLIED, so "${label}" can never render.`); return { matched: false, scan: st, terminal: "already-applied" }; }
       if (isWorkdayMaintenance(st)) { LOG(`waitFor(${label}) stopping early — Workday is in MAINTENANCE, so "${label}" can never render.`); return { matched: false, scan: st, terminal: "workday-maintenance" }; }
     }
     // SELF-DIAGNOSING TIMEOUT (operator ask 2026-07-27: "put a log so if it happens again we can be sure
@@ -4686,6 +4993,189 @@ async function runCdpOnboard(tabId, opts) {
     return { ok: true };
   };
 
+  // A page-supplied string used as a regex must be escaped — a section label like "Application(s)" is
+  // otherwise a live pattern (or a syntax error) in cdpTagClickableByText.
+  const escapeForRx = (s) => String(s == null ? "" : s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").trim();
+
+  // ── ALREADY-APPLIED RECOVERY (operator 2026-07-28) ────────────────────────────────────────────────
+  // "Sometimes it says you have applied to this application when you have not." Workday shows the
+  // already-applied page for an application that was STARTED but never SUBMITTED, and the old code took
+  // that page at its word and halted — abandoning a perfectly fillable application.
+  //
+  // The AUTHORITY is the candidate's own applications list, exactly as the operator does it by hand:
+  //   already-applied → "View My Applications" → (expand the collapsed dropdown) → find THIS job →
+  //   read Submitted / Not Submitted → click it → the job-description page → "Continue Application" →
+  //   page 1 of the application.
+  //
+  // Two rules run through every step, both operator-stated:
+  //   • NEVER assume a click landed where it aimed — classifyWorkdayPage each redirect and report what we
+  //     ACTUALLY got. Every halt below names the page it found.
+  //   • Let everything render. Each hop settles + polls; the expand loop settles on the row COUNT rather
+  //     than a fixed beat (the same lesson as the JD page, the field set, and the review page).
+  // Safety: it only ever REACHES a form — it never fills, advances, or submits. On any ambiguity
+  // (no matching row, two matching rows, the wrong posting) it halts for the operator instead of opening
+  // an application that might not be ours.
+  // Returns { done:true, result } (halt/terminal) | { done:false, scan } (recovered — caller continues).
+  const handleAlreadyApplied = async (st0) => {
+    if (appliedRecoveries >= MAX_APPLIED_RECOVERIES) {
+      LOG(`already-applied recovery has run ${appliedRecoveries}× this session and the page still says already-applied — taking it at its word.`);
+      return { done: true, result: alreadyAppliedResult() };
+    }
+    appliedRecoveries++;
+
+    const bail = (stopped, detail, s) => ({ done: true, result: haltNeedsOperator(stopped, detail, s) });
+    // A landing we didn't expect. Says what we wanted, what we got, and where — never a bare timeout.
+    const wrongPage = (step, want, s) =>
+      bail("applied-recovery-wrong-page",
+        `after ${step} the tab landed on a "${classifyWorkdayPage(s)}" page (expected ${want}) — url=${s && s.url}. Open the job, click "View My Applications" by hand and continue from there.`, s);
+
+    LOG('⚠ Workday says "already applied" — VERIFYING against My Applications before believing it (it reports this for started-but-unsubmitted applications too).');
+    emitRunProgress("Checking your applications", "Workday says already applied — verifying");
+
+    // WHICH job are we looking for? The already-applied page IS the job's page, so its URL carries the
+    // requisition id; startUrl is the caller's copy of the same posting. The title comes off the page.
+    let ident = null;
+    try { ident = await cdpEval(cdpReadJobIdentity); } catch (e) { /* the pick can run on the req id alone */ }
+    const target = {
+      url: (st0 && st0.url) || startUrl || "",
+      reqId: reqIdFromUrl((st0 && st0.url) || "") || reqIdFromUrl(startUrl || "") || reqIdFromUrl((ident && ident.requisitionText) || ""),
+      title: (ident && ident.postingTitle) || null
+    };
+    LOG(`   looking for: requisition=${target.reqId || "(none found in the URL)"} · title=${target.title ? JSON.stringify(target.title) : "(unread)"}`);
+
+    // ── 1. "View My Applications" ───────────────────────────────────────────────────────────────────
+    const TOKEN = "ap-recover";
+    let tag = null;
+    try { tag = await cdpEval(cdpTagClickableByText, TOKEN, "view\\s+my\\s+applications|my\\s+applications|view\\s+applications", null, null); }
+    catch (e) { return bail("applied-recovery-read-failed", "could not read the already-applied page: " + String((e && e.message) || e), st0); }
+    if (!tag || !tag.tagged) {
+      return bail("applied-recovery-no-link",
+        `the already-applied page has no "View My Applications" link to follow, so the real status can't be checked. Body: ${JSON.stringify(String((st0 && st0.bodyText) || "").replace(/\s+/g, " ").trim().slice(0, 300))}`, st0);
+    }
+    LOG(`   clicking "${tag.text}".`);
+    const c1 = await clickTarget([`[data-ap-click="${TOKEN}"]`], "View My Applications");
+    if (!c1.clicked) return bail("applied-recovery-link-blocked", c1.blockedBy || 'could not click "View My Applications"', st0);
+
+    // allowAlreadyApplied: we are LEAVING the already-applied page, so waitFor's usual terminal exit on it
+    // would fire on the first poll (the old page is still up mid-navigation) and abort the recovery.
+    const w1 = await waitFor((s) => isMyApplicationsPage(s) || (!isAlreadyApplied(s) && (s.formFieldCount > 0 || s.hasAuthEl)), await renderBudget(15000, 35000), "my-applications-page", { allowAlreadyApplied: true });
+    let st = w1.scan || st0;
+    await settlePage(4000);
+    st = (await scan()) || st;
+    // CLASSIFY, don't assume. Signing in can be demanded here; the form can even appear directly.
+    const kind1 = classifyWorkdayPage(st);
+    if (kind1 === "auth") { LOG("   the applications list requires signing in first — handing back to the auth stage, which will land here again once signed in."); return { done: false, scan: st }; }
+    if (kind1 === "form") { LOG("   landed straight on the application form — recovered."); return { done: false, scan: st }; }
+    if (kind1 !== "my-applications") return wrongPage('clicking "View My Applications"', "the My Applications list", st);
+
+    // ── 2. Expand collapsed sections until the row count SETTLES ────────────────────────────────────
+    // "Sometimes the application dropdown is closed so you will have to open it to see submitted or not
+    // submitted." Expanding can reveal more rows, so this loops on the count instead of clicking once.
+    let page = null;
+    try { page = await cdpEval(cdpReadApplicationsPage); } catch (e) { return bail("applied-recovery-read-failed", "could not read the applications list: " + String((e && e.message) || e), st); }
+    for (let round = 0; round < 4; round++) {
+      if (!page || !page.collapsed || !page.collapsed.length) break;
+      const before = (page.rows || []).length;
+      LOG(`   expanding ${page.collapsed.length} collapsed section(s) (round ${round + 1}; ${before} row(s) visible).`);
+      let expandedAny = false;
+      for (const cRow of page.collapsed.slice(0, 8)) {
+        const rx = escapeForRx(cRow.label);
+        if (!rx) continue; // an unlabelled toggle can't be text-targeted — a catch-all pattern would click something arbitrary
+        const t = await cdpEval(cdpTagClickableByText, TOKEN, rx, null, null).catch(() => null);
+        if (!t || !t.tagged) continue;
+        const r = await clickTarget([`[data-ap-click="${TOKEN}"]`], `expand "${cRow.label}"`);
+        if (r.clicked) { expandedAny = true; await pace(500); }
+      }
+      if (!expandedAny) break;
+      await pace(800);
+      try { page = await cdpEval(cdpReadApplicationsPage); } catch (e) { break; }
+      if ((page.rows || []).length === before && !(page.collapsed || []).length) break; // settled
+    }
+
+    const rows = (page && page.rows) || [];
+    LOG(`   applications list: ${rows.length} row(s).`);
+    for (const r of rows.slice(0, 12)) LOG(`     • ${JSON.stringify(r.title)} — status=${r.statusText || "(none shown)"} · ${r.href || "(no href)"}`);
+
+    // ── 3. Find OUR application ─────────────────────────────────────────────────────────────────────
+    const picked = pickApplicationRow(rows, target);
+    if (!picked.row) {
+      return bail("applied-recovery-row-not-found",
+        `${picked.reason}. The list showed ${rows.length} row(s)${rows.length ? ": " + rows.map((r) => JSON.stringify(r.title)).slice(0, 8).join(", ") : ""}${(page && page.headings || []).length ? ` (page headings: ${page.headings.slice(0, 4).join(" / ")})` : ""}.`, st);
+    }
+    const row = picked.row;
+    const status = applicationStatusOf(row.text);
+    LOG(`   matched by ${picked.tier}: ${JSON.stringify(row.title)} — status reads "${row.statusText || "(none shown)"}" → ${status}.`);
+
+    // SUBMITTED for real → the original halt was right after all, now with EVIDENCE behind it.
+    if (status === "submitted") {
+      LOG("   ✓ confirmed SUBMITTED on your applications list — the already-applied page was telling the truth. Halting.");
+      return { done: true, result: { ok: true, reached_form: false, already_applied: true, stopped: "already-applied",
+        detail: `You've already applied — your My Applications list shows "${row.title}" as ${row.statusText || "submitted"}.` } };
+    }
+    if (status === "unknown") {
+      // No status word on the row. Don't guess either way: open it and let the posting decide — a
+      // "Continue Application" affordance is positive proof the application is still open.
+      LOG('   ⚠ the row shows no status word — opening it; a "Continue Application" button will settle whether it is still open.');
+    }
+
+    // ── 4. Open the row → the job-description page ──────────────────────────────────────────────────
+    let rowTag = null;
+    try { rowTag = await cdpEval(cdpTagRowByHref, TOKEN, row.href); } catch (e) { /* fall through to the check */ }
+    if (!rowTag || !rowTag.tagged) return bail("applied-recovery-row-not-clickable", `the matched row (${JSON.stringify(row.title)}) has no clickable link on the page.`, st);
+    const c2 = await clickTarget([`[data-ap-click="${TOKEN}"]`], `application "${row.title}"`);
+    if (!c2.clicked) return bail("applied-recovery-row-blocked", c2.blockedBy || `could not click the application row ${JSON.stringify(row.title)}`, st);
+
+    await waitFor((s) => !!(s.markers.continueButton || s.markers.adventureButton || s.markers.applyManually) || s.formFieldCount > 0 || s.hasAuthEl, await renderBudget(15000, 35000), "application-job-page");
+    await settlePage(4000);
+    st = (await scan()) || st;
+    const kind2 = classifyWorkdayPage(st);
+    if (kind2 === "form") { LOG("   the row opened the application form directly — recovered."); return { done: false, scan: st }; }
+    if (kind2 === "auth") { LOG("   the row led to a sign-in screen — handing back to the auth stage."); return { done: false, scan: st }; }
+    if (kind2 === "already-applied") {
+      // The row itself leads back to already-applied. Whatever the list said, Workday will not reopen it.
+      LOG("   the row leads back to the already-applied page — Workday will not reopen this application. Halting.");
+      return { done: true, result: { ok: true, reached_form: false, already_applied: true, stopped: "already-applied",
+        detail: `Your applications list showed "${row.title}" as ${row.statusText || "no status"}, but opening it returns the already-applied page — Workday will not reopen it.` } };
+    }
+    if (kind2 !== "job-description") return wrongPage("opening the application row", "the job-description page", st);
+
+    // ── 5. PROVE it's the right posting before continuing ───────────────────────────────────────────
+    let ident2 = null;
+    try { ident2 = await cdpEval(cdpReadJobIdentity); } catch (e) { /* url check below still applies */ }
+    const landedReq = reqIdFromUrl((st && st.url) || "") || reqIdFromUrl((ident2 && ident2.requisitionText) || "") || reqIdFromUrl((ident2 && ident2.postingTitle) || "");
+    if (target.reqId && landedReq && landedReq !== target.reqId) {
+      return bail("applied-recovery-wrong-job",
+        `the row opened requisition ${landedReq} but we are applying to ${target.reqId} — refusing to continue someone else's application. Landed on ${JSON.stringify((ident2 && ident2.postingTitle) || st.title)}.`, st);
+    }
+    LOG(`   ✓ on the right posting (${landedReq || "requisition unread"}${ident2 && ident2.postingTitle ? ` — ${JSON.stringify(ident2.postingTitle)}` : ""}).`);
+    if (status === "unknown" && !(ident2 && ident2.hasContinue) && !st.markers.continueButton) {
+      return { done: true, result: { ok: true, reached_form: false, already_applied: true, stopped: "already-applied",
+        detail: `Your applications list shows "${row.title}" with no status, and the posting offers no "Continue Application" — treating it as already submitted.` } };
+    }
+
+    // ── 6. Continue Application → page 1 ────────────────────────────────────────────────────────────
+    emitRunProgress("Resuming your application", "continuing an unsubmitted application");
+    let cont = ['[data-automation-id="continueButton"]'];
+    if (!st.markers.continueButton) {
+      // No canonical id — fall back to the button's words, but NEVER a "submit"/"withdraw" control.
+      const t3 = await cdpEval(cdpTagClickableByText, TOKEN, "continue\\s+application|resume\\s+application|\\bcontinue\\b", "submit|withdraw|delete|cancel", null).catch(() => null);
+      if (!t3 || !t3.tagged) return wrongPage("looking for Continue Application", 'a "Continue Application" button', st);
+      LOG(`   no continueButton id — clicking by text: "${t3.text}".`);
+      cont = [`[data-ap-click="${TOKEN}"]`];
+    }
+    const c3 = await clickTarget(cont, "Continue Application");
+    if (!c3.clicked) return bail("applied-recovery-continue-blocked", c3.blockedBy || 'could not click "Continue Application"', st);
+
+    await waitFor((s) => s.formFieldCount > 0 || s.hasAuthEl || s.markers.applyManually, await renderBudget(20000, 45000), "post-continue-application");
+    await settlePage(5000);
+    st = (await scan()) || st;
+    const kind3 = classifyWorkdayPage(st);
+    if (kind3 === "form") { LOG("   ✓ RECOVERED — the application reopened on its form. Continuing the normal flow."); return { done: false, scan: st }; }
+    if (kind3 === "auth" || kind3 === "job-description") { LOG(`   after Continue Application the page is "${kind3}" — handing back to the normal flow, which handles it.`); return { done: false, scan: st }; }
+    if (kind3 === "already-applied") return { done: true, result: alreadyAppliedResult() }; // it really is closed
+    return wrongPage('clicking "Continue Application"', "the application form", st);
+  };
+
   // Auth loop: try sign-in first; verify→re-sign-in; wrong→create-account→loop.
   const doAuth = async () => {
     // Headroom: on a chooser tenant every real step (chooser reveal, sign-in, create-account, verify,
@@ -4708,7 +5198,7 @@ async function runCdpOnboard(tabId, opts) {
       // reached during the loop fell through to the race-guard and halted `auth-form-not-rendered`: a
       // flat-wrong reason for a clean terminal state (its shape — no form, no auth chrome, no fields —
       // is exactly what that halt tests for).
-      if (isAlreadyApplied(st)) return alreadyAppliedResult();
+      if (isAlreadyApplied(st)) { const h = await handleAlreadyApplied(st); if (h.done) return h.result; continue; }
       // doVerify/doCreateAccount use their `ok` as an INTERNAL success signal; a halt object
       // (needs_operator) is a SUCCESSFUL onboarding run that needs a human, so surface it as
       // ok:true (the outer contract: ok:false ⇒ a crash only). The popup keys off needs_operator/detail.
@@ -4764,7 +5254,7 @@ async function runCdpOnboard(tabId, opts) {
         // fall through to. Say that plainly — looksLikeSso no longer claims this state on a Workday host
         // (field-absence isn't SSO evidence), so without this it would end as a vague "auth-unrecognized".
         if (isPastAuth(st)) continue;            // the form arrived while we waited — success, not a failure
-        if (isAlreadyApplied(st)) return alreadyAppliedResult(); // nothing to render: you already applied
+        if (isAlreadyApplied(st)) { const h = await handleAlreadyApplied(st); if (h.done) return h.result; continue; } // may be a started-but-unsubmitted application — verify before giving up
         if (!st.passwordInput && !st.emailInput && !st.markers.createAccountSubmit && !st.markers.createAccountLink && !st.markers.verifyPassword) {
           return haltNeedsOperator(
             "auth-form-not-rendered",
@@ -4903,7 +5393,7 @@ async function runCdpOnboard(tabId, opts) {
     if (!st) return { ok: false, error: "no-page-state (is the tab on a Workday page?)" };
     if (await maybeRefresh(st)) st = await scan() || st;
 
-    if (isAlreadyApplied(st)) return alreadyAppliedResult(); // already signed in + applied (the common Run case: navigated to Apply, Workday redirects here)
+    if (isAlreadyApplied(st)) { const h = await handleAlreadyApplied(st); if (h.done) return h.result; st = h.scan || st; } // already signed in + applied (the common Run case) — but VERIFY: Workday says this for unsubmitted applications too
     if (isPastAuth(st)) { LOG("already on the application form — nothing to onboard."); return { ok: true, reached_form: true, stopped: "already-on-form" }; }
     if (isWorkdayMaintenance({ title: st.title, bodyText: st.bodyText, formFieldCount: st.formFieldCount, passwordInputPresent: st.passwordInput, signInButtonPresent: st.signInButtonPresent })) {
       LOG("⛔ Workday planned-maintenance page — retry after the maintenance window.");
@@ -4936,7 +5426,7 @@ async function runCdpOnboard(tabId, opts) {
 
     // ── STAGE 3: Auth (+ create-account + verify) ──
     st = await scan() || st;
-    if (isAlreadyApplied(st)) return alreadyAppliedResult(); // revealed after Apply / Apply Manually — halt before the 12s auth-or-form wait
+    if (isAlreadyApplied(st)) { const h = await handleAlreadyApplied(st); if (h.done) return h.result; st = h.scan || st; } // revealed after Apply / Apply Manually — verify before halting
     if (isPastAuth(st)) { LOG("reached the form (no auth needed)."); return { ok: true, reached_form: true, stopped: "reached-form" }; }
     if (!st.hasAuthEl && !st.signInButtonPresent && st.formFieldCount === 0) {
       const w = await waitFor((s) => s.hasAuthEl || s.signInButtonPresent || s.formFieldCount > 0, 12000, "auth-or-form");
@@ -6658,7 +7148,7 @@ function probePage() {
 //   3. GATE on file-upload-successful specifically — file-upload-item also renders
 //      mid-upload / on error, so the row alone is not a confident success.
 // ============================================================================
-async function attachResume(base64, filename, mime, sectionSel) {
+async function attachResume(base64, filename, mime, sectionSel, confirmCeilingMs) {
   if (!base64) return { attached: false, detail: "no resume bytes passed (empty base64)" };
 
   // Re-resolve EVERYTHING fresh from the document on each read. Workday REPLACES the
@@ -6766,7 +7256,15 @@ async function attachResume(base64, filename, mime, sectionSel) {
   }
 
   // ── 3. Gate on file-upload-successful (the completion marker) ────────────
-  const deadline = Date.now() + 10000;
+  // The ceiling is a PARAMETER (2026-07-28): the flat 10s was tuned on a VISIBLE tab, and a hidden one
+  // both uploads and repaints far slower — live on a background run this returned "file-upload-item
+  // appeared but file-upload-successful did not within 10s" and HALTED the replay walk, while the same
+  // job attached fine on later runs. It was never a failure, just an unfinished upload. The SW passes a
+  // visibility-scaled ceiling AND re-polls afterwards (awaitResumeConfirmed), so this is the fast path,
+  // not the last word. `sawItem` is what makes the distinction reportable: a row on the page means the
+  // upload STARTED, which is "still going", not "broken".
+  const ceiling = (typeof confirmCeilingMs === "number" && confirmCeilingMs > 0) ? confirmCeilingMs : 10000;
+  const deadline = Date.now() + ceiling;
   let confirmationVia = null;
   let sawItem = false;
   while (Date.now() < deadline) {
@@ -6778,6 +7276,15 @@ async function attachResume(base64, filename, mime, sectionSel) {
   const nameEl = findSection().querySelector('[data-automation-id="file-upload-item-name"]');
   const fileName = nameEl ? nameEl.textContent.trim() : null;
   const confirmationSeen = confirmationVia === "file-upload-successful";
+  // An explicit FAILURE marker distinguishes "Workday rejected this file" (retrying is pointless — the
+  // operator must act) from "still uploading" (the SW should keep polling). Without it both looked the same.
+  let errorText = null;
+  try {
+    const errEl = findSection().querySelector('[data-automation-id="file-upload-error"], [data-automation-id="errorMessage"], [role="alert"]');
+    const t = errEl ? (errEl.textContent || "").replace(/\s+/g, " ").trim() : "";
+    if (t && !/success/i.test(t)) errorText = t.slice(0, 200);
+  } catch (e) { /* diagnostics only */ }
+  const secs = Math.round(ceiling / 1000);
 
   return {
     attached: confirmationSeen,           // confident only when the success marker rendered
@@ -6787,11 +7294,15 @@ async function attachResume(base64, filename, mime, sectionSel) {
     confirmationSeen,
     confirmationVia,
     fileName,
+    sawItem,                              // the SW's signal that an unconfirmed attach is worth re-polling
+    errorText,
     detail: confirmationSeen
       ? `attached + confirmed via file-upload-successful (cleared ${deletedCount} existing)`
-      : (sawItem
-          ? "file-upload-item appeared but file-upload-successful did not within 10s — upload may be in progress or failed"
-          : `no confirmation row within 10s (input.files set immediately = ${filesSetImmediately})`)
+      : (errorText
+          ? `Workday reported an upload error: "${errorText}"`
+          : (sawItem
+              ? `file-upload-item appeared but file-upload-successful did not within ${secs}s — upload may still be in progress`
+              : `no confirmation row within ${secs}s (input.files set immediately = ${filesSetImmediately})`))
   };
 }
 

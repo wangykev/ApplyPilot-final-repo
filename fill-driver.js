@@ -5200,8 +5200,17 @@ async function replayField(act, entry, budgets) {
   // a correct field is wasted work and re-opens the stray/false-verify risk (the degree→Associates class).
   // (Choice widgets self-skip via their keep-guards too; this covers text/date/radio/checkbox uniformly
   // and avoids even opening a correct dropdown.) A failed live read → fall through and actuate normally.
+  //
+  // OVERRIDABLE (2026-07-28): `skipIfCorrect: false` FORCES actuation even when the box already reads
+  // correct. This block used to skip UNCONDITIONALLY — it never consulted the budget the rest of the
+  // replay path uses — so a caller asking for a forced re-write silently got a no-op ("already correct on
+  // the page — left unchanged"), which is exactly what happened to the phantom-required remedy's first
+  // attempt. `undefined` still skips, so every existing caller is unchanged; only an explicit `false`
+  // forces. Needed because a value that is correct IN THE DOM is not proof Workday's own form model has
+  // it (live: Workday demanding a Name/Date it was itself rendering).
+  const skipIfCorrect = b.skipIfCorrect !== false;
   try {
-    const live = await auditReReadActual(act, { widgetType: widget, auditLoc: sel, auditTag: widget === "textarea" ? "textarea" : undefined, expected: value });
+    const live = skipIfCorrect ? await auditReReadActual(act, { widgetType: widget, auditLoc: sel, auditTag: widget === "textarea" ? "textarea" : undefined, expected: value }) : null;
     if (live && live.readable && replayValueMatches(widget, live.actual, value)) {
       return { status: "filled", verified: true, after: live.actual, replay: "already-correct", flag: "replay-already-correct", detail: "already correct on the page — left unchanged (no actuation)" };
     }

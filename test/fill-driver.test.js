@@ -7347,6 +7347,29 @@ test("replayField (SKIP-IF-CORRECT): an already-correct DROPDOWN is left as-is �
   assert.ok(!act.log.some((e) => e[0] === "openDropdown"), "a correct dropdown is not re-opened (no stray-click exposure)");
 });
 
+// REGRESSION (live, solarturbines page 5, 2026-07-28). Workday kept reporting Name/Date as required-and-
+// empty while the page (DOM, React's own props, and Workday's own "current value is 7/28/2026" rendering)
+// all held them. The remedy is to force a real RE-WRITE — but replayField's skip-if-correct block ignored
+// `budgets.skipIfCorrect` entirely, so the "forced" re-fill logged "already correct — left unchanged (no
+// actuation)" and did nothing. A whole live run was spent learning that. These pin BOTH directions.
+test("replayField: skipIfCorrect:false FORCES a re-write of an already-correct field (the forced-remedy path)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-name"]', fieldName: "name", widgetType: "text", value: "Kevin Wang" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P5::formField-name", widget_type: "text", current_value: "Kevin Wang", edit_kind: null },
+    Object.assign({}, T_BUDGETS, { skipIfCorrect: false }));
+  assert.strictEqual(r.status, "filled");
+  assert.notStrictEqual(r.flag, "replay-already-correct", "an explicit skipIfCorrect:false must NOT report already-correct");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "the field must actually be re-typed — that is the whole point of the forced remedy");
+});
+test("replayField: skipIfCorrect UNDEFINED still skips (every existing caller unchanged)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-name"]', fieldName: "name", widgetType: "text", value: "Kevin Wang" };
+  const act = makeFakeAct([f]);
+  const b = Object.assign({}, T_BUDGETS); delete b.skipIfCorrect;
+  const r = await replayField(act, { field_id: "P5::formField-name", widget_type: "text", current_value: "Kevin Wang", edit_kind: null }, b);
+  assert.strictEqual(r.flag, "replay-already-correct", "only an EXPLICIT false forces; the default must keep the minimal-diff replay");
+  assert.ok(!act.log.some((e) => e[0] === "typeText"));
+});
+
 test("replayField (SKIP-IF-CORRECT): a DIFFERING value STILL actuates (only-what-differs, not skip-everything)", async () => {
   const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Wrongname" };
   const act = makeFakeAct([f]);

@@ -2316,3 +2316,392 @@ Verified: extension **774/774** (unchanged — the settle is I/O, and like `awai
 no direct unit test; the pure verdict logic it feeds is covered). Live-verification pending: re-run the
 HIDDEN rehearse; the log should print `review page settled in Nms — 5x displayed value(s)` and the counts
 should match the foreground runs.
+
+---
+
+## 2026-07-28 — Workday's already-applied LIE, the landing classifier, and the hidden-tab résumé race
+
+Three operator-reported bugs from one background submit run. They look unrelated but share the theme the
+last several entries keep circling: **the extension believed a page instead of checking it.**
+
+### A. "You've already applied" is sometimes false — verify it against My Applications
+
+Operator: *"sometimes it says you have applied to this application when you have not. so when on that
+screen, press view my applications … here it will say for real submitted or not submitted."*
+
+`isAlreadyApplied` has been a CLEAN TERMINAL halt since 2026-07-24 — the flow stops, reports
+`already-applied`, and the website tracker records it. That is right when it's true. But Workday shows the
+same page for an application that was **STARTED and never SUBMITTED**, and there the halt threw away a
+perfectly fillable application; worse, it looked like a successful, correct outcome, so nothing flagged it.
+
+`handleAlreadyApplied` (background.js, inside `runCdpOnboard`) now does what the operator does by hand:
+
+```
+already-applied page
+  → "View My Applications"          (text-anchored click through the proven clickTarget path)
+  → expand collapsed sections       (loops until the ROW COUNT settles — the dropdown is often closed)
+  → find THIS job                   (req id → exact title → single-hit containment; ambiguity REFUSES)
+  → read Submitted / Not Submitted
+      submitted     → the original halt stands, now WITH EVIDENCE
+      not-submitted → click the row → job-description page → "Continue Application" → page 1
+      no status     → open it; a "Continue Application" affordance is positive proof it's still open
+```
+
+The decisions are PURE and unit-pinned in lib.js (`isMyApplicationsPage`, `applicationStatusOf`,
+`pickApplicationRow`, `reqIdFromUrl`); the reads are `cdpReadApplicationsPage` / `cdpReadJobIdentity`.
+
+Three things carry the safety:
+
+- **`applicationStatusOf` tests the NEGATIVE first.** `"Not Submitted"` CONTAINS `"Submitted"`, so a
+  positive-first test labels every unsubmitted draft as submitted — i.e. it would abandon exactly the
+  applications this feature exists to rescue. Regression-pinned with that string verbatim.
+- **`pickApplicationRow` refuses ambiguity.** Opening the wrong row would FILL SOMEONE ELSE'S
+  APPLICATION, so the ladder is req-id (from the row's href/text — titles truncate in the list, req ids
+  don't) → exact normalized title → containment committed ONLY on a single hit. Two matches ⇒ halt with
+  the reason, never a coin flip. Same philosophy as the fill's match ladder.
+- **The requisition is re-PROVEN on the job-description page** before "Continue Application" is clicked
+  (operator: *"make sure it is the correct application"*).
+
+Clicks reuse the existing `clickTarget` (re-measured cover-check, consent-safe auto-dismiss) via
+`cdpTagClickableByText` / `cdpTagRowByHref`, which stamp `data-ap-click` on a text-matched control. Text
+anchoring is unavoidable: no automation-id for this page is confirmed on any tenant, so instead of
+guessing one, `cdpReadApplicationsPage` enumerates the page STRUCTURALLY (every job-ish link, its
+enclosing row, that row's text) and every failure path PRINTS what it saw — headings, row titles,
+statuses, hrefs. The first live run therefore either works or self-reports the exact DOM to tighten it,
+with no separate recon round.
+
+Bounded at 2 per run (one attempt can legitimately be consumed by the list demanding a sign-in first, which
+hands back to the auth stage). It only ever REACHES a form — it never fills, advances, or submits.
+
+### B. `classifyWorkdayPage` — detect the landing, never assume it
+
+Operator: *"when you click a button, always add a fallback, don't assume you will go to an expected page,
+each redirect detect which page you are on."*
+
+Every caller tested only for the ONE thing it wanted — auth fields, a form, the review marker — so ANY
+other landing read as "the thing I wanted didn't render" and produced a halt naming the wrong cause. That
+is the same shape as the false `sso` halt (2026-07-27), the false `auth-form-not-rendered` on its own
+success, and `replay-page-not-in-bundle` blaming a good bundle for a Workday soft error.
+
+One pure classifier: `maintenance | soft-error | already-applied | my-applications | review | form | auth
+| job-description | blank | unknown`. Two ordering rules are load-bearing and pinned:
+
+- transient/terminal states **outrank page shape** — a soft-error or already-applied page can carry
+  leftover chrome, and acting on the shape means acting on a page that is about to be replaced;
+- `form` requires fields **AND** no auth chrome, the same rule as `isPastAuth`, so a half-rendered auth
+  widget over a form can't be mistaken for having arrived.
+
+Used at every hop of the recovery above, and at the replay walk's empty-page halt — which previously
+reloaded three times and blamed the bundle. It now names the page: an already-applied / my-applications /
+maintenance landing halts immediately (`replay-landed-<kind>`) because reloading those changes nothing.
+
+### C. The hidden-tab résumé upload race
+
+```
+[CDP-REPLAY-WALK] resume: NOT attached — resume attach failed — file-upload-item appeared but
+                  file-upload-successful did not within 10s — upload may be in progress or failed
+[CDP-REPLAY-WALK] ⚠ resume NOT attached on page 3 … HALT.
+```
+
+Operator: *"on a hidden run I got this error. ran it some more times and this error disappeared. it is
+probably some type of race."* Correct, and the message even said so — *"may be in progress"*.
+
+`attachResume`'s confirmation gate is a **page-side** poll on a flat 10s ceiling tuned on a VISIBLE tab. A
+hidden tab slows the XHR, throttles the React render that paints `file-upload-successful`, and (when the
+page's CSP blocks the blob worker-timer override) drops page timers to ~1Hz. The upload was fine; the
+watcher gave up. dom-patterns 2026-06-21 had actually predicted this — *"SW-pace only if a hidden walk
+ever misses it"*.
+
+`cdpAttachResumeConfirmed` is now the ONE attach path for both walks:
+
+1. the page-side ceiling is a PARAMETER, scaled by `cdpVisible()` — VISIBLE keeps the live-verified 10s,
+   HIDDEN gets 25s (same `renderBudget` reasoning as the auth waits);
+2. an upload that **started but hasn't confirmed** is re-polled **from the service worker on wall-clock**
+   for 20s more, waking the page each tick — the standing rule that no wait may depend on a page timer;
+3. an explicit Workday error row, or an upload that never started, SKIPS the re-poll — those are not
+   races, and waiting would only delay an honest failure.
+
+`attachResume` now also reports `sawItem` and `errorText` so the SW can tell those apart at all, and the
+success detail says how long the re-poll took, so a tenant that consistently needs it is visible in the log.
+
+Also fixed from the same run: the replay walk's not-actuated line printed a literal `undefined`
+(`page 2: 3 approved entries were NOT actuated: language, skills (cleared), undefined`) — repeating-section
+records key the field name differently, so the bare `r.field` missed the `|| r.fieldName` fallback the rest
+of the file uses. The whole value of that line is NAMING what was left blank.
+
+Verified: extension **785/785** (`node --test`; +20 new — the status substring trap, the row-pick ambiguity
+refusals, req-id extraction, the classifier's two ordering rules). SW global-scope + `apMatch` guards green,
+so the worker still registers. **Live-verification pending on all three:** the already-applied recovery has
+never run against a real My Applications page — its DOM is unconfirmed, which is why every step
+self-reports. Run it on a tenant that shows the false already-applied page and paste the
+`[ApplyPilot][ONBOARD]` block; the row dump will show whether the generic reader found the list.
+
+---
+
+## 2026-07-28 (later) — Workday's PHANTOM "required" error: blur is what commits a field
+
+Fourth bug from the same background submit run, and the most interesting one because the fill was
+*perfect*:
+
+```
+page 5 replay: 5 field(s) — 3 changed, 1 already-correct, 1 not-actuated, 0 FAILED.
+page 5 Save & Continue: {"clicked":true}
+  re-click fallback: error text present — NOT re-clicking (a real validation block, not a swallowed click).
+page errors (2):
+    • Error-NameThe field Name is required and must have a value.
+    • Error-DateThe field Date is required and must have a value.
+⚠ page 5 did NOT advance (nav-timeout, real error present) — a required field is empty. HALT
+```
+
+Operator: *"The fields are physically filled correctly … manually I just click into the field text box,
+and then press next and the error goes away."* — and *"not sure why this happens on hidden runs."*
+
+That workaround is the whole diagnosis. **Workday validates a field on BLUR.** Real typing ends with the
+user moving away, which fires blur/focusout. `cdpSynthSetValue` fires keydown → input → change → keyup and
+**nothing else**, and the only thing that blurs a synthetic-filled field is the NEXT synthetic click
+calling `el.focus()` (cdp.js:564), whose side effect is the previous element's blur. So:
+
+- the **last field filled on a page is still focused** when Save & Continue is clicked, and its blur — hence
+  Workday's validation commit — races the submit **in the same tick**;
+- the value is genuinely in the DOM (which is why the M40 audit, the read-backs and `0 FAILED` all agree),
+  but Workday's form model was never told the edit finished.
+
+"Why hidden runs" answers itself: synthetic input only engages when the tab is hidden. Visible runs use
+trusted `Input.*` and never had this. Page 5 is also the worst case for it — the disability self-ID page,
+whose last field is a DATE composite of spinbutton segments.
+
+### The fix — two deterministic halves, no AI
+
+**Preventive.** `clickPageNext` is the ONE method both walks advance through, so `cdpCommitPendingEdits`
+goes there: blur whatever editable is focused, then settle a beat, before every Save & Continue. It uses
+the real `.blur()` so the browser sequences genuine focus events.
+
+**Curative.** On a nav-timeout with errors, `nudgePhantomRequired` reproduces the manual fix —
+focus → change → blur every value-bearing input inside each error-named field (`cdpNudgeFieldCommit`; a
+date composite walks its month/day/year spinbuttons exactly as tabbing would) — then re-saves ONCE.
+Bounded at 2 per run, on the same reasoning as `clearPhantomDuplicates`: if a focus/blur commit doesn't
+clear it, it isn't the blur race. Wired as a replay-walk tier (which previously had no remediation at all
+and halted hard) and as fill-walk **Tier 0.5**, placed before Tier 1 deliberately — Tier 1 would re-FILL an
+already-correct field to fix this, re-actuating a verified value for no reason.
+
+Neither half touches a VALUE. They only tell the page that an edit already made has finished.
+
+### The safety gate is the pure part
+
+`phantomRequiredTargets` (lib.js) decides whether this is the phantom at all, and it is strict in one
+direction on purpose: **a false positive re-saves a page that really is incomplete, burying a real gap
+under a retry.** So it fires only when
+
+- every error-named title maps to a field ON the page — an unmatched title means we don't understand this
+  error (it could name a field inside a repeating section the flat scan filters out), and
+- every one of those fields HOLDS a value — one genuinely empty field vetoes the whole thing.
+
+Anything else returns `phantom:false` with a reason, and the walk halts exactly as it did before. Both
+refusals are pinned, along with the live page-5 shape verbatim, `"Select One"` not counting as a value,
+an unchecked checkbox not counting, and the `Name*` asterisk not breaking the label match (that last one
+would have silently disabled the fix on every required field — i.e. on every field it exists for).
+
+Verified: extension **793/793** (`node --test`; +8). SW global-scope + `apMatch` guards green.
+**Live-verification pending:** re-run the HIDDEN replay on solarturbines page 5. Expect either no error at
+all (the preventive blur did it) or `phantom-required: … Committing … and re-saving` followed by
+`✓ page 5 → advanced after committing name, dateSignedOn`. If it instead logs
+`(phantom-required check: not applicable — …)`, the reason string says which gate refused.
+
+---
+
+## 2026-07-28 (round 2) — the phantom "required" error is NOT the blur race; instrument, don't guess again
+
+The blur-commit fix from the previous entry shipped and **did not work** — operator: *"that fix did not
+work. same thing happened."* Same page (solarturbines page 5, HIDDEN replay), same two errors, same halt.
+
+So the mechanism is unconfirmed. The blur race was a plausible inference from the operator's manual
+workaround, and it is still true that synthetic mode never blurs a field — but it is evidently not what
+is producing this error. **A third guess is not worth making**, and this is exactly the situation
+CLAUDE.md's first working principle covers: trace the real thing before writing the handler.
+
+### What we can rule in/out from the failing log
+
+The pre-save re-verify (`requiredBlankOnPage`, added earlier the same day) prints a line whenever an
+approved value has gone blank before Save. **That line is absent**, so the fields were not blank at
+pre-save time — which argues against the "watched it uncheck itself" revert class, at least as measured
+by a DOM read.
+
+That leaves several live hypotheses that a DOM read cannot distinguish, because every check we own
+(read-backs, the M40 audit, `cdpPageScan`) reads *the DOM*:
+
+| # | hypothesis | signature |
+|---|---|---|
+| H1 | Workday's model disagrees with its own DOM | domValue set, react set |
+| H2 | the value reverted after we verified it | domValue EMPTY |
+| H3 | React's internal state never took the value (its next render wipes it) | domValue set, react EMPTY |
+| H4 | the error is STALE and the Save click was swallowed | no error node inside the wrapper |
+| H5 | the DATE composite behaves differently (spinbuttons) | value vs aria-valuenow disagree |
+
+### The instrument
+
+`cdpDiagnoseFieldCommit` (cdp.js) + `diagnoseRequiredErrorFields` (background.js) dump `[FIELD-DIAG]` on
+EVERY required-error nav-timeout, in **both** walks, **read-only**, and **before any remediation tier
+touches the page** so the log shows the failure as it actually was. Per input it prints:
+
+- `domValue`, `defaultValue`
+- **React's own `__reactProps$*.value` and the fiber's `memoizedProps.value`** ← the load-bearing part
+- `aria-valuenow` (where a date spinbutton's real value lives), `aria-invalid`, `aria-required`
+- `checked`, `disabled`, whether it is `document.activeElement`
+- whether each error node is rendered INSIDE that field's wrapper, plus every error node on the page
+
+DOM-vs-React divergence is precisely what a native-setter write that never notified React looks like, and
+it is invisible to everything we already log. The dump ships with its own legend mapping each combination
+back to the table above, so the next occurrence is self-interpreting rather than another round trip.
+
+### The one remedy worth adding blind
+
+Alongside the instrument, a **mechanism-agnostic** remedy: force-re-actuate every error-named field with
+**`skipIfCorrect: false`** — a real clear+type even where the box already looks correct — then re-save.
+Bounded 2/run, deterministic, approved values only, per-field verify unchanged, so the worst case is that
+it changes nothing and we halt exactly as before.
+
+It is worth adding *without* knowing the mechanism because it covers three of the hypotheses at once:
+a value that reverted (H2), a value React never took (H3), and — new, and a strong candidate — a field
+**Workday PRE-FILLED** that our skip-if-correct deliberately left untouched, so Workday's model never saw
+it completed. The failing log contains `1 already-correct`, i.e. exactly one field on that page was
+verified as matching and never actuated.
+
+And it is *diagnostic in its own right*: if a run advances at `✓ page 5 → advanced after force-re-filling
+…`, that IS the answer — the value had to be re-WRITTEN, not merely committed — and it points straight at
+H2/H3/pre-fill rather than at Workday's model.
+
+Verified: extension **793/793** (`node --test`, unchanged — the diagnostic is pure I/O and the remedy
+reuses the already-pinned `replayFlatFields`; `phantomRequiredTargets`' gates stay pinned). SW
+global-scope + `apMatch` guards green. **Status: OPEN.** The next hidden run on page 5 should be read for
+(a) the `[FIELD-DIAG]` block, and (b) whether the forced re-fill advances the page.
+
+---
+
+## 2026-07-28 (round 3) — the phantom "required" error, narrowed to Workday's own form model
+
+The `[FIELD-DIAG]` instrument from round 2 paid for itself on the first run. Operator also confirmed by
+eye: *"on the page everything is filled correctly."*
+
+### What the dump proved
+
+```
+[FIELD-DIAG] the page's 5 flat field(s): disabilityForm="English"* · name="Kevin Wang"* · employeeId=""
+                                        · dateSignedOn="07/28/2026"* · disabilityStatus="No, I do not…"*
+[FIELD-DIAG] [data-automation-id="formField-name"]
+    ↳ INPUT type=text domValue="Kevin Wang" reactProps="(none)" reactFiber="(none)" ariaInvalid="true"
+    wrapper text: "Name*Error: The field Name is required and must have a value."
+[FIELD-DIAG] [data-automation-id="formField-dateSignedOn"]
+    ↳ dateSectionMonth-input domValue="7"    reactProps="7"    reactFiber="7"    ariaValueNow="7"
+    ↳ dateSectionDay-input   domValue="28"   reactProps="28"   reactFiber="28"   ariaValueNow="28"
+    ↳ dateSectionYear-input  domValue="2026" reactProps="2026" reactFiber="2026" ariaValueNow="2026" ←FOCUSED
+    wrapper text: "Date*current value is 7/28/2026 … Error: The field Date is required and must have a value."
+```
+
+Every required field on the page holds its value. React's own state holds the date. **Workday's own widget
+renders "current value is 7/28/2026" — it is describing the value while its validator calls the field
+empty.** The fields carry `aria-invalid="true"` and an **inline, per-field** error, so this is that field's
+own validation, not a leftover banner.
+
+⇒ **The value is present in every layer we can read, and missing only from Workday's own form model** — the
+layer above React that we cannot inspect.
+
+### Ruled out, each by live evidence rather than argument
+
+| hypothesis | how it died |
+|---|---|
+| the blur race (round 1) | real focus + change + blur on all 4 inputs, then Save — still blocked, **twice** |
+| the value reverted after verify | the pre-save `requiredBlankOnPage` re-verify never fires (nothing goes blank) |
+| React never took the value | the date's `reactProps`/`reactFiber` hold `7`/`28`/`2026` |
+| stale error / swallowed Save click | the errors are inline **inside each field's wrapper**, not banner-only |
+
+(`name`'s `reactProps="(none)"` is not evidence of H3 — that input simply exposes no React `value` prop,
+i.e. it is uncontrolled. The date segments prove the reader works.)
+
+### Round 2's own bug — a silent no-op that cost a live run
+
+The "forced" re-fill logged:
+
+```
+• name: filled → "Kevin Wang" — already correct on the page — left unchanged (no actuation)
+```
+
+`replayField` had its **own** skip-if-correct block that never consulted `budgets.skipIfCorrect`, so
+passing `skipIfCorrect:false` did nothing. Now gated on `b.skipIfCorrect !== false` — `undefined` still
+skips, so every existing caller is byte-identical — and **pinned in both directions**, because this is
+exactly the kind of wiring bug that passes review and burns a whole live run.
+
+### Round 3: force a TRUSTED re-write, and let it be decisive
+
+The remaining suspect has precedent **in this codebase, for this exact symptom**. From
+`cdpSetSyntheticInput`, about the auth form: *"the auth app likely doesn't register native-setter values in
+its own state, leaving the submit inert."* Synthetic input writes via the native setter; React's input
+state updates (we can see it), but an app tracking its own model off real input/key events never hears
+about it. And the operator's own framing lines up: **this only happens on hidden runs, and hidden runs are
+the only ones that use synthetic input** — a VISIBLE run of this page has never shown it.
+
+So the retry now does what a visible run does: `cdpSetSyntheticInput(false)` (restored afterwards, so the
+rest of the walk keeps its hidden-tab speed) + `skipIfCorrect:false` → a real trusted click-focus,
+select-all, re-type, read-back — then re-save. Bounded 2/run, approved values only, per-field verify
+unchanged.
+
+This is a candidate fix AND the experiment: **if the page advances at `✓ … after re-writing … with TRUSTED
+input`, the mechanism is confirmed**, and the proper fix becomes "use trusted input for these field types
+(or this page)" instead of paying for a retry. The log states that conclusion inline so the next run
+doesn't need interpreting.
+
+Ordering also changed: the round-1 blur nudge is **demoted to run after** the trusted re-write. It has
+failed live twice and every failed Save costs a full nav-timeout, so there is no longer a reason to spend
+one on it first. And the diagnostic's own H4 test was fixed — it reported "errors inside this wrapper:
+NONE" while the wrapper text plainly showed the inline error, because Workday's inline error element
+carries neither an error-ish automation-id nor `role="alert"`; it now falls back to the wrapper TEXT, so
+only "no node AND no text" reads as page-level/possibly-stale.
+
+Verified: extension **795/795** (`node --test`; +2 pinning the skip gate). SW global-scope + `apMatch`
+guards green. **Status: still OPEN**, now with three hypotheses eliminated by evidence and one testable
+candidate armed. Read the next hidden page-5 run for the `✓ … with TRUSTED input` line.
+
+### Round 4 — SOLVED, live: the trusted re-write advanced the page
+
+```
+page 5: FORCE-re-filling 2 error-named field(s) [name, dateSignedOn] with skip-if-correct OFF
+        and TRUSTED input (tab HIDDEN; synthetic was ON)
+    - name:          filled -> "Kevin Wang" - overwrote "Kevin Wang"
+    - dateSignedOn:  filled -> "7/29/2026"  - segments {Month, Day, Year: typeChars}
+page 5 Save & Continue (after the forced re-fill): {"clicked":true}
++ page 5 -> advanced after re-writing name, dateSignedOn with TRUSTED input.
+++ reached the REVIEW page after replaying 5 page(s)
+review page vs approved: AGREE 53 . DISAGREE 0 . MISSING 1 . EXTRA 1 . AMBIGUOUS 0
+SUBMIT GATE PASSED - WOULD CLICK SUBMIT NOW (SIMULATE MODE)
+```
+
+**Mechanism confirmed.** The synthetic (native-setter) write updates the DOM and React's input state but
+never reaches Workday's own form model. Re-writing the same two values with TRUSTED input cleared both
+errors at once, the page advanced, and the run went the rest of the way to a passing submit gate.
+
+Note what the re-write log proves: `name: overwrote "Kevin Wang"` — the same value it already held. Nothing
+about the VALUE was wrong. Only the *way it was written* was invisible to Workday.
+
+**Both halves of the fix are load-bearing:**
+
+- **trusted input** — the native-setter write is exactly what Workday misses;
+- **`skipIfCorrect: false`** — the box already reads correct, so the default minimal-diff replay skips it.
+  That skip is what made the first attempt at this remedy a silent no-op, because `replayField` had its
+  OWN skip-if-correct that ignored `budgets.skipIfCorrect`. Now gated (`undefined` still skips, so every
+  existing caller is unchanged) and pinned in both directions.
+
+**An operator observation, and why the tier built on it was reverted.** By hand, a bare second Save cleared
+the Date error, then a click into the Name box + Save cleared the rest — *"and it magically works"*, with
+nothing re-typed. That is consistent with the same root cause (both give Workday a real interaction, which
+re-validates). A `resubmitStalePhantomRequired` tier was built to automate that sequence, then **reverted**
+once the trusted re-write proved out live: re-submitting without re-writing is the weaker remedy, and
+`reclickNextWhenClean`'s refusal to re-click while error text is present is a guard worth keeping rather
+than punching through.
+
+**Follow-up left open deliberately:** force trusted input for these field types (or this whole page) so the
+retry isn't needed at all. Kept as a retry for now — it costs one extra Save cycle on one page and
+preserves the hidden-tab speed win everywhere else. The retry's log line states the confirmed mechanism, so
+whoever picks this up doesn't have to re-derive it.
+
+Verified: extension **795/795** (`node --test`). SW global-scope + `apMatch` guards green. Live-verified
+end-to-end on solarturbines: 5 pages replayed, review AGREE 53 / DISAGREE 0, submit gate passed in
+SIMULATE mode.

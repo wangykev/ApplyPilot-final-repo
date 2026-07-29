@@ -1030,6 +1030,150 @@ function isBlankAuthPage(state) {
   return text.length <= BLANK_PAGE_BOILERPLATE_MAX;        // real content ⇒ not an empty shell
 }
 
+// ── Workday's PHANTOM "required" error — filled, but reported empty (2026-07-28) ────────────────────
+// PURE half of the fix (the actuation is nudgePhantomRequired in background.js). Live on a HIDDEN
+// solarturbines replay, page 5: "The field Name is required and must have a value" + the same for Date,
+// while both fields visibly held correct, read-back-verified values. Cause: Workday validates on BLUR,
+// and synthetic-input mode never blurs a field (see cdpCommitPendingEdits) — the DOM has the value, the
+// form model was never told the edit finished. The operator's manual fix is a focus/blur cycle.
+//
+// This decides WHETHER that is what we're looking at. It is the safety gate, so it is deliberately
+// strict — a false positive would re-save a page with a genuinely empty required field, hiding a real
+// problem behind a retry:
+//   • every error title must map to a field ON the page (an unmatched title ⇒ we don't understand this
+//     error, so we don't act on it);
+//   • every one of those fields must HOLD a value (one empty ⇒ a real validation block, not the race).
+// Returns { phantom, targets:[{title, fieldName, wrapperSel, value}], reason }.
+function phantomRequiredTargets(errorTitles, liveFields) {
+  const titles = (Array.isArray(errorTitles) ? errorTitles : []).map((t) => String(t == null ? "" : t).trim()).filter(Boolean);
+  const fields = Array.isArray(liveFields) ? liveFields : [];
+  if (!titles.length) return { phantom: false, targets: [], reason: "the error text names no field" };
+
+  const holds = (v) => v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
+  const matched = [], unmatched = [];
+  for (const title of titles) {
+    const want = normalizeLabel(title);
+    // Visible label first, then the automation-id — some tenants word the error after the id.
+    const hit = fields.find((f) => normalizeLabel((f && f.label) || "") === want)
+      || fields.find((f) => normalizeLabel((f && f.fieldName) || "") === want);
+    if (hit) matched.push({ title, fieldName: hit.fieldName, wrapperSel: hit.wrapperSel, value: hit.value });
+    else unmatched.push(title);
+  }
+  if (!matched.length) return { phantom: false, targets: [], reason: `the error names ${titles.map((t) => JSON.stringify(t)).join(", ")}, which match no field on this page` };
+  if (unmatched.length) return { phantom: false, targets: [], reason: `not every error maps to a field on this page (unmatched: ${unmatched.join(", ")}) — not treating this as the phantom` };
+
+  const empty = matched.filter((m) => !holds(m.value));
+  if (empty.length) return { phantom: false, targets: [], reason: `genuinely empty on the page: ${empty.map((m) => `${m.title} (${m.fieldName})`).join(", ")} — a real validation block, not the blur race` };
+
+  return { phantom: true, targets: matched, reason: null };
+}
+
+// ── "Which page am I actually on?" (operator 2026-07-28) ────────────────────────────────────────────
+// Standing rule from the already-applied bug: **after every click that navigates, DETECT the page you
+// landed on — never assume the click took you where you aimed.** Each caller used to test only for the
+// ONE thing it wanted (auth fields, a form, the review marker), so any other landing read as "the thing
+// I wanted didn't render" and produced a halt naming the wrong cause. This is the single classifier the
+// redirect points share, so an unexpected landing is REPORTED as what it is.
+//
+// Ordered most-specific first, and deliberately: the transient/terminal states (maintenance, soft error,
+// already-applied) come BEFORE the shape tests, because those pages can carry leftover chrome that would
+// otherwise match a later, wronger bucket.
+function classifyWorkdayPage(state) {
+  const s = state || {};
+  const m = s.markers || {};
+  if (isWorkdayMaintenance({ title: s.title, bodyText: s.bodyText, formFieldCount: s.formFieldCount, passwordInputPresent: s.passwordInput, signInButtonPresent: s.signInButtonPresent })) return "maintenance";
+  if (isWorkdaySoftError(s.bodyText)) return "soft-error";
+  if (isAlreadyApplied(s)) return "already-applied";
+  if (isMyApplicationsPage(s)) return "my-applications";
+  if (m.applyFlowReviewPage) return "review";
+  if ((s.formFieldCount || 0) > 0 && !s.hasAuthEl) return "form";
+  if (s.hasAuthEl || s.emailInput || s.passwordInput || s.signInWithEmail) return "auth";
+  // The apply chain lives on the JOB-DESCRIPTION page — and it is also the page the already-applied
+  // recovery lands on after clicking an application row, where the affordance is "Continue Application"
+  // (`continueButton`). Both are "a posting with a way in", so they share a bucket.
+  if (m.adventureButton || m.continueButton || m.applyManually || m.useMyLastApplication) return "job-description";
+  if (isBlankAuthPage(s)) return "blank";
+  return "unknown";
+}
+
+// Workday's candidate-home "My Applications" list — the page behind the already-applied page's "View My
+// Applications" link, and the ONLY place that says whether an application was really submitted.
+// Text-anchored on purpose: the automation-ids here are unconfirmed across tenants (no recon dump yet),
+// while the heading + a status word are what the operator actually reads off the page. Requiring BOTH a
+// list heading and a status word keeps it off an ordinary posting that merely links to the list.
+function isMyApplicationsPage(state) {
+  const s = state || {};
+  const m = s.markers || {};
+  if (m.myApplicationsPage) return true;                    // confirmed marker (once a tenant shows one)
+  const t = String(s.bodyText || "");
+  if (isAlreadyApplied(s)) return false;                    // the already-applied page LINKS to the list; it is not the list
+  const heading = /\bmy applications\b|\byour applications\b|\bapplication history\b/i.test(t);
+  return heading && APPLICATION_STATUS_RX.test(t);
+}
+
+// A row's status word. NEGATIVE FIRST — "Not Submitted" contains "Submitted", so any test that checks
+// the positive first mislabels every unsubmitted draft as submitted, which is the exact failure this
+// whole recovery exists to fix (and the dangerous direction: it would give up on a fillable application).
+const APPLICATION_STATUS_RX = /\bnot submitted\b|\bunsubmitted\b|\bsubmitted\b|\bin progress\b|\bincomplete\b|\bdraft\b|\bstarted\b/i;
+function applicationStatusOf(text) {
+  const t = String(text == null ? "" : text);
+  if (/\bnot submitted\b|\bunsubmitted\b|\bnot yet submitted\b/i.test(t)) return "not-submitted";
+  if (/\bin progress\b|\bincomplete\b|\bdraft\b|\bnot complete(d)?\b/i.test(t)) return "not-submitted";
+  if (/\bsubmitted\b|\bunder consideration\b|\breceived\b|\bactive application\b/i.test(t)) return "submitted";
+  return "unknown";
+}
+
+// The requisition id out of a job/application URL or a row's text — "…_R0000382293" → "R0000382293".
+// This is the STRONG match key for finding our application among many at the same company: titles repeat
+// and get truncated, the req id doesn't. Mirrors canonicalJobUrl's `_R(\d+)` key, then falls back to a
+// standalone R/JR/REQ token anywhere in the string.
+function reqIdFromUrl(u) {
+  const s = String(u == null ? "" : u);
+  const underscore = s.match(/_((?:R|JR|REQ)[-_]?\d{3,})\b/i);
+  if (underscore) return underscore[1].toUpperCase();
+  const bare = s.match(/\b((?:R|JR|REQ)[-_]?\d{4,})\b/i);
+  return bare ? bare[1].toUpperCase() : null;
+}
+
+// Pick OUR application out of the My Applications list. Same philosophy as the fill's match ladder: an
+// EXACT/keyed hit or nothing — never a confident-looking guess. A wrong pick here would open a DIFFERENT
+// application and fill it, so ambiguity must escalate to the operator, not resolve itself.
+//   1. req id (from the row's href or its text) — exact, unambiguous, survives title truncation
+//   2. exact normalized title
+//   3. containment, committed ONLY when exactly ONE row contains the title (the ambiguity guard)
+// Returns { row, tier } or { row: null, reason } so the caller can say WHY it refused.
+function pickApplicationRow(rows, target) {
+  const list = Array.isArray(rows) ? rows : [];
+  const t = target || {};
+  if (!list.length) return { row: null, reason: "the applications list rendered no rows" };
+
+  const wantReq = t.reqId || reqIdFromUrl(t.url || "");
+  if (wantReq) {
+    const hits = list.filter((r) => {
+      const fromHref = reqIdFromUrl(r && r.href);
+      const fromText = reqIdFromUrl(r && r.text);
+      return fromHref === wantReq || fromText === wantReq;
+    });
+    if (hits.length === 1) return { row: hits[0], tier: "req-id" };
+    if (hits.length > 1) return { row: null, reason: `${hits.length} rows carry requisition ${wantReq} — refusing to guess which` };
+  }
+
+  const wantTitle = normalize(t.title || "");
+  if (wantTitle) {
+    const exact = list.filter((r) => normalize((r && r.title) || "") === wantTitle);
+    if (exact.length === 1) return { row: exact[0], tier: "exact-title" };
+    if (exact.length > 1) return { row: null, reason: `${exact.length} rows share the title "${t.title}" — refusing to guess which` };
+    const contains = list.filter((r) => {
+      const rt = normalize((r && r.title) || "");
+      return rt && (rt.indexOf(wantTitle) >= 0 || wantTitle.indexOf(rt) >= 0);
+    });
+    if (contains.length === 1) return { row: contains[0], tier: "title-containment" };
+    if (contains.length > 1) return { row: null, reason: `${contains.length} rows partially match "${t.title}" — refusing to guess which` };
+  }
+
+  return { row: null, reason: `no row matches this job (${wantReq ? "requisition " + wantReq : "no requisition id"}${t.title ? `, title "${t.title}"` : ""})` };
+}
+
 
 // ── Locating a repeating section on the LIVE page (pure) ────────────────────────────────────────────
 // The fkit container prefix is TENANT-VARIABLE — website rows live under `webAddress-` on the observed
@@ -1231,5 +1375,5 @@ function tenantCompanyFromUrl(url) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets };
 }
