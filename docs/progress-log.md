@@ -2705,3 +2705,67 @@ whoever picks this up doesn't have to re-derive it.
 Verified: extension **795/795** (`node --test`). SW global-scope + `apMatch` guards green. Live-verified
 end-to-end on solarturbines: 5 pages replayed, review AGREE 53 / DISAGREE 0, submit gate passed in
 SIMULATE mode.
+
+---
+
+## 2026-07-29 - a job-description page is not an auth screen (the false `auth-form-not-rendered` halt)
+
+Background submit run, cat.wd5/solarturbines. The rehearsal loaded the approved bundle fine, then:
+
+```
+[SUBMIT-RUN] job page did NOT settle (ceiling) after 12156ms - 0 chars.
+[ONBOARD] Stage 3 - auth screen detected.
+[ONBOARD] waitFor(sign-in-form-render) timed out after 30000ms - 137 read(s) OK / 0 failed; tab HIDDEN.
+[ONBOARD]   last page state: url=.../XMLNAME-2027--Gas-Turbine-Product-Engineering-Internship_R0000382293
+            readyState=complete formFields=0 email=false password=false hasAuthEl=false
+            signInButtonText=false markers=[continueButton]
+[ONBOARD] HALT - auth-form-not-rendered
+```
+
+### The chain
+
+The halt state names the bug: `markers=[continueButton]` is the **job-description page**, and the flow was
+sitting on it waiting for sign-in fields.
+
+1. The posting came back **EMPTY** - `0 chars` for the full 12s ceiling; Workday served nothing.
+2. Stage 1 therefore found no Apply button (`pickApplyTarget` -> null) and **skipped**.
+3. Stage 3's condition is `st.hasAuthEl || st.signInButtonPresent`. `signInButtonPresent` is a TEXT match
+   over every clickable, and a Workday posting carries **"Sign In" in its own header** - so a JD page
+   satisfied it. "Stage 3 - auth screen detected."
+4. `doAuth` waited its full 30s hidden budget for credential fields that were never coming.
+5. During that wait the page finished rendering and revealed `continueButton` - the very button Stage 1
+   wanted - and **nothing re-checked**, so it halted claiming the sign-in fields never appeared.
+
+The empty page was the TRIGGER; the false auth detection is the BUG. It would misfire the same way on a
+merely slow posting.
+
+### Three fixes
+
+**`onJobDescription(s)`** - an apply-chain marker is POSITIVE evidence, and it beats the absence-based text
+match. It requires NO credential field (`!hasAuthEl && !passwordInput && !emailInput && !signInWithEmail`,
+zero form fields, `classifyWorkdayPage === "job-description"`), so a genuine auth screen can never match it.
+Pinned in both directions: the live JD state -> `job-description`; an auth screen with a leftover apply
+marker -> still `auth`.
+
+**Stages 1-3 are now a bounded loop** (`applyStage:`, `MAX_APPLY_ROUNDS = 2`). Discovering mid-flow that we
+are on a posting sends us back to Stage 1 rather than halting: `doAuth` returns `{backToApply:true}` and the
+caller re-runs the stage. Previously the flow was a straight line with no way back to a stage it had passed.
+
+**The wait predicate bails.** `onJobDescription` joined `sign-in-form-render`'s predicate, so it exits the
+moment the button appears instead of burning 30s. That is the third instance of the standing wait-predicate
+rule: *a wait must notice both that the GOAL arrived and that we are in the WRONG PLACE* (the first two were
+`isPastAuth` in the auth waits and the terminal-state bail in `waitFor`).
+
+### Not fixed with a reload - deliberately
+
+The operator's initial instinct was a reload-and-retry for the empty page, then, on seeing the diagnosis:
+*"if the issue isn't that the page didn't load and is something else don't change the reload"* and *"no need
+to implement the reload now if it doesn't actively fix the issue."* A `settleJobPageWithRetry` was written
+and then **reverted**. Correct call: the reload addresses the trigger, not the halt, and the three fixes
+above make the flow recover from a late-rendering posting whether or not it was ever empty. Worth
+reconsidering only if an empty posting shows up as a failure on its own.
+
+Verified: extension **797/797** (`node --test`; +2 pinning the JD-vs-auth discriminator). SW global-scope +
+`apMatch` guards green. Live-verification pending: re-run the background submit rehearsal on solarturbines;
+the log should show either Stage 1 clicking Continue Application directly, or a hand-back line
+(`this is the JOB-DESCRIPTION page, not an auth screen ... Handing back to the apply stage`) followed by it.

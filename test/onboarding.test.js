@@ -364,3 +364,33 @@ test("phantomRequiredTargets: a CHECKED checkbox (boolean true) counts as holdin
   assert.strictEqual(phantomRequiredTargets(["Acknowledgement"], [F("ack", "Acknowledgement*", true)]).phantom, true);
   assert.strictEqual(phantomRequiredTargets(["Acknowledgement"], [F("ack", "Acknowledgement*", false)]).phantom, false);
 });
+
+// REGRESSION (live, background submit run on cat.wd5/solarturbines, 2026-07-29). `signInButtonPresent` is
+// a TEXT match over every clickable, and a Workday POSTING carries "Sign In" in its own header — so the JD
+// page satisfied the onboarding's Stage-3 auth condition, doAuth waited its full 30s for credential fields
+// that were never coming, and the run halted `auth-form-not-rendered` while the final state read
+// `markers=[continueButton]` — the very button Stage 1 wanted to click. The discriminator is that an
+// apply-chain marker is POSITIVE evidence, which must beat the absence-based text match.
+test("classifyWorkdayPage: a JD page whose HEADER has a Sign In link is job-description, NOT auth", () => {
+  const jdWithSignInHeader = {
+    url: "https://cat.wd5.myworkdayjobs.com/en-US/solarturbines/job/San-Diego-California/XMLNAME-2027--Gas-Turbine-Product-Engineering-Internship_R0000382293",
+    title: "2027 Gas Turbine Product Engineering Internship",
+    readyState: "complete",
+    formFieldCount: 0,
+    emailInput: false, passwordInput: false, signInWithEmail: false, hasAuthEl: false,
+    signInButtonPresent: true,                 // <- the header link that caused the bug
+    markers: { continueButton: true },
+    bodyText: "2027 Gas Turbine Product Engineering Internship Continue Application Sign In",
+  };
+  assert.strictEqual(classifyWorkdayPage(jdWithSignInHeader), "job-description");
+  // …and the exact state the run halted on (the header link gone, Continue rendered) is the same verdict.
+  assert.strictEqual(classifyWorkdayPage({ ...jdWithSignInHeader, signInButtonPresent: false }), "job-description");
+  // A maintenance page must not be claimed by this path, and a signInButtonPresent page is never maintenance.
+  assert.notStrictEqual(classifyWorkdayPage(jdWithSignInHeader), "maintenance");
+});
+test("classifyWorkdayPage: a REAL auth screen is still auth, even with an apply marker left on the page", () => {
+  // The guard must never swallow a genuine auth screen: any credential field wins.
+  assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, passwordInput: true, hasAuthEl: true, markers: { continueButton: true } }), "auth");
+  assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, emailInput: true, hasAuthEl: true, markers: { applyManually: true } }), "auth");
+  assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, signInWithEmail: true, hasAuthEl: true, markers: {} }), "auth");
+});

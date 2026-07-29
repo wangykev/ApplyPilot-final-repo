@@ -4560,6 +4560,10 @@ async function runCdpOnboard(tabId, opts) {
   // budget is 2 because one attempt can legitimately be consumed by the list demanding a sign-in first
   // (that attempt hands back to the auth stage, which then re-lands here already signed in).
   let appliedRecoveries = 0; const MAX_APPLIED_RECOVERIES = 2;
+  // Apply→auth is a bounded LOOP: a page that turns out to be the job-description page (rendered late, or
+  // its header "Sign In" link mistaken for auth) sends us back to Stage 1 instead of halting. 2 is enough
+  // for "the page finally rendered, click Apply" without letting a genuinely stuck page spin.
+  let applyRounds = 0; const MAX_APPLY_ROUNDS = 2;
 
   // Adaptive pacing — mirrors the fill's act.delay: ~10× faster when the tab is VISIBLE (or its
   // worker-timers measure fast), FULL (throttle-safe) when hidden/backgrounded. Used for ALL
@@ -4623,6 +4627,15 @@ async function runCdpOnboard(tabId, opts) {
   // tuned, live-verified fast values; hidden gets room to actually finish rendering.
   const renderBudget = async (visibleMs, hiddenMs) => ((await cdpVisible()) ? visibleMs : hiddenMs);
   const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
+  // "We are on the JOB-DESCRIPTION page, not an auth screen" (2026-07-29). `signInButtonPresent` is a TEXT
+  // match over every clickable, and a Workday posting carries "Sign In" in its own HEADER — so a JD page
+  // satisfied the Stage-3 auth condition, and doAuth then waited its full budget for credential fields that
+  // were never coming (live: halted `auth-form-not-rendered` while the state showed `markers=[continueButton]`,
+  // i.e. the very button Stage 1 wanted). An apply-chain marker is POSITIVE evidence and beats the
+  // absence-based text match. Requires no credential field at all, so a real auth screen can never match.
+  const onJobDescription = (s) =>
+    !!s && !s.hasAuthEl && !s.passwordInput && !s.emailInput && !s.signInWithEmail
+    && (s.formFieldCount || 0) === 0 && classifyWorkdayPage(s) === "job-description";
   // "You've already applied for this job." — a CLEAN terminal state (the operator already applied), not an
   // error. Halt gracefully so the Run reports "already applied" instead of stalling on a form that never
   // appears then halting `unknown-page`/`auth-unknown`. Checked at each stage the page can reveal it.
@@ -5199,6 +5212,14 @@ async function runCdpOnboard(tabId, opts) {
       // flat-wrong reason for a clean terminal state (its shape — no form, no auth chrome, no fields —
       // is exactly what that halt tests for).
       if (isAlreadyApplied(st)) { const h = await handleAlreadyApplied(st); if (h.done) return h.result; continue; }
+      // NOT AN AUTH SCREEN AT ALL — we're on the job-description page (2026-07-29). Its header "Sign In"
+      // link is what satisfied `signInButtonPresent` and routed us here; there is no credential field and
+      // never will be. Hand back so the apply stage can click Continue/Apply, instead of burning this
+      // loop's budget and then halting `auth-form-not-rendered` on a page that shows an Apply button.
+      if (onJobDescription(st)) {
+        LOG(`this is the JOB-DESCRIPTION page, not an auth screen — apply-chain marker(s) present: [${presentApply(st).join(", ") || "none"}]. Handing back to the apply stage.`);
+        return { ok: true, backToApply: true };
+      }
       // doVerify/doCreateAccount use their `ok` as an INTERNAL success signal; a halt object
       // (needs_operator) is a SUCCESSFUL onboarding run that needs a human, so surface it as
       // ok:true (the outer contract: ok:false ⇒ a crash only). The popup keys off needs_operator/detail.
@@ -5245,8 +5266,18 @@ async function runCdpOnboard(tabId, opts) {
           // the page become the APPLICATION FORM while we sat here polling for sign-in fields. Live, that
           // is exactly what happened — the wait timed out with `formFields=14 · hasAuthEl=false` (the form
           // we wanted) and the flow halted `auth-form-not-rendered` on its own success.
-          const w = await waitFor((s) => s.passwordInput || s.emailInput || s.signInWithEmail || isPastAuth(s), await renderBudget(8000, 30000), "sign-in-form-render");
+          // onJobDescription is in the predicate for the same reason isPastAuth is (2026-07-29): this wait
+          // must also notice that we are in the WRONG PLACE, not just that the goal hasn't arrived. Live,
+          // the page finished rendering into the job-description page (Apply/Continue button and all) while
+          // this sat polling for credential fields, and burned its full 30s before halting. An apply-chain
+          // marker is positive evidence there is no auth screen here at all — exit immediately.
+          const w = await waitFor((s) => s.passwordInput || s.emailInput || s.signInWithEmail || isPastAuth(s) || onJobDescription(s), await renderBudget(8000, 30000), "sign-in-form-render");
           st = w.scan || st;
+        }
+        // WRONG PLACE, not a slow render — hand back to the apply stage (see onJobDescription).
+        if (onJobDescription(st)) {
+          LOG(`the "auth screen" turned out to be the JOB-DESCRIPTION page — apply-chain marker(s): [${presentApply(st).join(", ") || "none"}]. Handing back to the apply stage.`);
+          return { ok: true, backToApply: true };
         }
         if (isPastAuth(st)) continue;     // already on the form → the loop top returns reached_form
         if (st.signInWithEmail) continue; // a chooser appeared during the wait → re-loop so the chooser handler runs
@@ -5400,6 +5431,12 @@ async function runCdpOnboard(tabId, opts) {
       return { ok: true, reached_form: false, needs_operator: true, stopped: "workday-maintenance" };
     }
 
+    // Stages 1-3 are a bounded LOOP, not a straight line (2026-07-29). A page can turn out to be the
+    // job-description page after we've already moved past Stage 1 — because it rendered late, or because
+    // its header "Sign In" link was mistaken for an auth screen — and the old straight-line flow had no way
+    // back, so it halted on a page it knew perfectly well how to act on. Each round re-scans and re-picks.
+    applyStage: for (let applyRound = 0; ; applyRound++) {
+    st = (await scan()) || st;
     // ── STAGE 1: Apply ──
     const applyChain = presentApply(st);
     const target = pickApplyTarget(applyChain);
@@ -5433,9 +5470,36 @@ async function runCdpOnboard(tabId, opts) {
       st = w.scan || st;
       if (isPastAuth(st)) return { ok: true, reached_form: true, stopped: "reached-form" };
     }
-    if (st.hasAuthEl || st.signInButtonPresent) { LOG("Stage 3 — auth screen detected."); return await doAuth(); }
+    // A JOB-DESCRIPTION page is NOT an auth screen — even though it has a "Sign In" link (2026-07-29).
+    // `signInButtonPresent` is a TEXT match over every clickable, and a Workday posting carries "Sign In"
+    // in its own HEADER. So a JD page satisfied the auth condition below and sent the flow into doAuth,
+    // which then waited its full budget for credential fields that were never coming. Live on a background
+    // submit run: the posting came back EMPTY (`0 chars`), Stage 1 therefore found no Apply button and
+    // skipped, Stage 3 fired on that header link, and the run halted `auth-form-not-rendered` 30s later —
+    // while the final state showed `markers=[continueButton]`, i.e. the page had since rendered the very
+    // button Stage 1 wanted. Positive evidence (an apply-chain marker) beats the absence-based text match,
+    // so re-run the apply stage instead. Bounded by applyRounds; a JD page that never yields an apply
+    // target falls through to the halts below exactly as before.
+    if (applyRounds < MAX_APPLY_ROUNDS && onJobDescription(st)) {
+      applyRounds++;
+      LOG(`this is the JOB-DESCRIPTION page, not an auth screen (its header "Sign In" link is not auth chrome) — apply-chain marker(s) present: [${presentApply(st).join(", ") || "none"}]. Re-running the apply stage (round ${applyRounds}/${MAX_APPLY_ROUNDS}).`);
+      continue applyStage;
+    }
+    if (st.hasAuthEl || st.signInButtonPresent) {
+      LOG("Stage 3 — auth screen detected.");
+      const a = await doAuth();
+      // doAuth can discover mid-loop that we were never on an auth screen (same JD-header cause) — take
+      // the hand-back and re-run the apply stage rather than reporting an auth failure.
+      if (a && a.backToApply && applyRounds < MAX_APPLY_ROUNDS) {
+        applyRounds++;
+        LOG(`handed back from the auth stage — re-running the apply stage (round ${applyRounds}/${MAX_APPLY_ROUNDS}).`);
+        continue applyStage;
+      }
+      return a;
+    }
     if (st.formFieldCount > 0) return { ok: true, reached_form: true, stopped: "reached-form" };
     return haltNeedsOperator("unknown-page", `title="${st.title}" — could not find Apply/auth/form. Navigate to the job posting and re-run.`, st);
+    } // end applyStage
   } catch (e) {
     const msg = String((e && e.message) || e);
     LOG("onboarding aborted:", msg);
