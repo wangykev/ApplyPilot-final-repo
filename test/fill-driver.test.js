@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -5969,7 +5969,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
+const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -6113,6 +6113,214 @@ test("AI-4 isDuplicateWebsiteError: matches the live 'duplicate website URLs' te
   assert.strictEqual(isDuplicateWebsiteError(["The field <URL> is required."]), false);
   assert.strictEqual(isDuplicateWebsiteError([]), false);
 });
+// ── GENERIC phantom-duplicate support: EVERY repeating section (2026-07-27) ─────────────────────────
+// Workday's backend appends instead of replacing, so its stored copy holds duplicates the FORM doesn't
+// show — a visibly-clean page is rejected on Save & Continue. Website/language had bespoke handling;
+// these generalize it to work experience / education / certifications too.
+// ── findLiveSection / liveDupEntries — why the FIRST live phantom-duplicate fix deleted 0 of 2 rows ──
+// It trusted a hardcoded fkit prefix ("webAddress-"). entryCount returned 0, the delete loop bailed on
+// its first iteration, and the run reported "deleted 0/2" with no reason. The live scan DISCOVERS the
+// prefixes actually in the DOM; these pin that we find the section through any of them.
+const WEBSITE_CFG = { containerPrefix: "webAddress-", headingRegex: "websites?|web ?address" };
+
+// ── newlyRequiredGaps / cascadeEntryFor — the page-5 cascade (2026-07-27) ───────────────────────────
+// Filling an OPTIONAL name promoted "Date" and a checkbox group to REQUIRED. The approved bundle had no
+// answer for either — one was absent, one was present-but-BLANK (it was optional when reviewed) — so
+// Workday refused the page. These pin that BOTH shapes are caught and turned into review questions.
+const DATE_FIELD = { fieldName: "date", label: "Date", widgetType: "date", isRequired: true, value: null };
+const BOXES_FIELD = {
+  fieldName: "checkboxGroup", label: "Please check one of the boxes below:", widgetType: "checkbox_group",
+  isRequired: true, value: null,
+  checkboxes: [{ labelText: "Yes, I have a disability" }, { labelText: "No, I don't have a disability" }, { labelText: "I don't wish to answer" }],
+};
+
+test("newlyRequiredGaps: catches BOTH a field missing from the bundle AND one present-but-blank", () => {
+  const live = [DATE_FIELD, BOXES_FIELD, { fieldName: "name", label: "Name", widgetType: "text", isRequired: true, value: "Kevin" }];
+  const entries = [{ field_id: "P5::formField-checkboxGroup", current_value: "" }]; // reviewed while OPTIONAL → blank
+  const gaps = newlyRequiredGaps(live, entries, "P5", []);
+  assert.deepStrictEqual(gaps.map((g) => g.field.fieldName).sort(), ["checkboxGroup", "date"]);
+  assert.strictEqual(gaps.find((g) => g.field.fieldName === "date").reason, "not-in-bundle");
+  assert.strictEqual(gaps.find((g) => g.field.fieldName === "checkboxGroup").reason, "blank-in-bundle");
+});
+
+test("newlyRequiredGaps: a required field the page ALREADY holds a value for is not a gap", () => {
+  const live = [{ fieldName: "name", label: "Name", widgetType: "text", isRequired: true, value: "Kevin" }];
+  assert.deepStrictEqual(newlyRequiredGaps(live, [], "P5", []), []);
+});
+
+test("newlyRequiredGaps: an OPTIONAL blank field is not a gap, and a bundle ANSWER is not a gap", () => {
+  const optional = [{ fieldName: "middle", label: "Middle", widgetType: "text", isRequired: false, value: null }];
+  assert.deepStrictEqual(newlyRequiredGaps(optional, [], "P5", []), []);
+  // required + blank on the page, but the bundle HAS an approved answer → a replay failure, not a gap
+  // (the strict per-field verify owns that case).
+  const answered = newlyRequiredGaps([DATE_FIELD], [{ field_id: "P5::formField-date", current_value: "2026-01-01" }], "P5", []);
+  assert.deepStrictEqual(answered, []);
+});
+
+test("newlyRequiredGaps: file_upload is excluded (its own re-attach step + resume-not-attached halt)", () => {
+  const live = [{ fieldName: "resume", label: "Resume", widgetType: "file_upload", isRequired: true, value: null }];
+  assert.deepStrictEqual(newlyRequiredGaps(live, [], "P5", []), []);
+});
+
+test("cascadeEntryFor: produces an EMPTY, UNAPPROVED review question — never an invented answer", () => {
+  const e = cascadeEntryFor({ field: BOXES_FIELD, entry: null, reason: "not-in-bundle" }, "P5", 5, 0);
+  assert.strictEqual(e.current_value, null, "it asks a question, it never answers it");
+  assert.strictEqual(e.is_approved, false);
+  assert.strictEqual(e.is_required, true);
+  assert.strictEqual(e.needs_review, true);
+  assert.strictEqual(e.cascade_revealed, true, "so requiresApproval + the submit gate both demand a human");
+  assert.strictEqual(e.field_id, "P5::formField-checkboxGroup");
+  // A checkbox group carries its labels in the DOM → the operator gets a real picker, not a text box.
+  assert.deepStrictEqual(e.options.map((o) => o.text), ["Yes, I have a disability", "No, I don't have a disability", "I don't wish to answer"]);
+});
+
+// ── requiredBlankOnPage — "filled + verified, then lost it" (live 2026-07-28) ───────────────────────
+// The disability checkbox group replayed and VERIFIED checked, then Save & Continue reported it empty.
+// The fill walk catches this with its M40 audit; the replay had nothing, so it saved a page it believed
+// was complete. This is the mirror of newlyRequiredGaps: the bundle HAS an answer, the page lost it.
+test("requiredBlankOnPage: a required field the bundle answered but the page shows blank is reported", () => {
+  const live = [{ fieldName: "disabilityStatus", label: "Please check one of the boxes below:", widgetType: "checkbox_group", isRequired: true, value: null }];
+  const entries = [{ field_id: "P5::formField-disabilityStatus", current_value: "I don't wish to answer" }];
+  const lost = requiredBlankOnPage(live, entries);
+  assert.strictEqual(lost.length, 1);
+  assert.strictEqual(lost[0].approved, "I don't wish to answer", "carries the value to put back");
+});
+
+test("requiredBlankOnPage: does NOT claim fields it can't fix, or fields that are fine", () => {
+  const entries = [{ field_id: "P5::formField-x", current_value: "v" }];
+  // holds a value → fine
+  assert.deepStrictEqual(requiredBlankOnPage([{ fieldName: "x", isRequired: true, value: "v" }], entries), []);
+  // OPTIONAL blank → not our business
+  assert.deepStrictEqual(requiredBlankOnPage([{ fieldName: "x", isRequired: false, value: null }], entries), []);
+  // no approved answer to restore → newlyRequiredGaps owns it, not this
+  assert.deepStrictEqual(requiredBlankOnPage([{ fieldName: "x", isRequired: true, value: null }], [{ field_id: "P5::formField-x", current_value: "" }]), []);
+  // an unchecked checkbox stores "false", never empty — same carve-out as the submit gate
+  assert.deepStrictEqual(requiredBlankOnPage([{ fieldName: "x", isRequired: true, value: "false" }], entries), []);
+  // the résumé has its own re-attach step
+  assert.deepStrictEqual(requiredBlankOnPage([{ fieldName: "x", isRequired: true, widgetType: "file_upload", value: null }], entries), []);
+});
+
+test("cascadeEntryFor: a DATE field carries the form's segment ORDER, not the raw segment ids", () => {
+  // Live 2026-07-27: the raw scan ids were passed straight through as date_order, so the review page
+  // printed "dateSectionMonth-display / dateSectionMonth-input / …" as the field's content instead of
+  // rendering a segmented MM/DD/YYYY editor.
+  const segs = ["dateSectionMonth-display", "dateSectionMonth-input", "dateSectionDay-display", "dateSectionDay-input", "dateSectionYear-display", "dateSectionYear-input"];
+  const e = cascadeEntryFor({ field: { ...DATE_FIELD, dateSegments: segs }, entry: null, reason: "not-in-bundle" }, "P5", 5, 0);
+  assert.deepStrictEqual(e.date_order, ["month", "day", "year"]);
+  // A month/year-only composite keeps the form's own shape, and a non-date field has no order at all.
+  assert.deepStrictEqual(cascadeEntryFor({ field: { ...DATE_FIELD, dateSegments: ["dateSectionMonth-input", "dateSectionYear-input"] }, entry: null, reason: "not-in-bundle" }, "P5", 5, 0).date_order, ["month", "year"]);
+  assert.strictEqual(cascadeEntryFor({ field: BOXES_FIELD, entry: null, reason: "not-in-bundle" }, "P5", 5, 0).date_order, null);
+});
+
+test("cascadeEntryFor: the blank-in-bundle case explains WHY it's suddenly required", () => {
+  const e = cascadeEntryFor({ field: DATE_FIELD, entry: { current_value: "" }, reason: "blank-in-bundle" }, "P5", 5, 1);
+  assert.match(e.detail, /OPTIONAL and left blank/);
+  assert.strictEqual(e.widget_type, "date");
+});
+
+test("findLiveSection: prefers the canonical container prefix when the page uses it", () => {
+  const rscan = { sections: { "webAddress-": { heading: "Websites", entries: [] }, "education-": { heading: "Education", entries: [] } } };
+  assert.strictEqual(findLiveSection(rscan, "website", WEBSITE_CFG).prefix, "webAddress-");
+});
+
+test("findLiveSection: falls back to a prefix named after the SECTION when the tenant differs", () => {
+  // The regression: no "webAddress-" anywhere → the old hardcoded lookup found nothing and deleted 0.
+  const rscan = { sections: { "website-": { heading: "Websites", entries: [] } } };
+  assert.strictEqual(findLiveSection(rscan, "website", WEBSITE_CFG).prefix, "website-");
+});
+
+test("findLiveSection: last resort — match the section's HEADING (tenant-proof, as findSectionAdd does)", () => {
+  const rscan = { sections: { "socialNetworkAccount-": { heading: "Websites 3", entries: [{}] } } };
+  const loc = findLiveSection(rscan, "website", WEBSITE_CFG);
+  assert.strictEqual(loc.prefix, "socialNetworkAccount-", "an unrecognized prefix is still found by its heading");
+  assert.strictEqual(loc.live.entries.length, 1, "the live rows come back with it");
+});
+
+test("findLiveSection: a section that is genuinely absent returns null (never delete a guess)", () => {
+  assert.strictEqual(findLiveSection({ sections: { "education-": { heading: "Education" } } }, "website", WEBSITE_CFG), null);
+  assert.strictEqual(findLiveSection({ sections: {} }, "website", WEBSITE_CFG), null);
+  assert.strictEqual(findLiveSection(null, "website", WEBSITE_CFG), null, "a failed scan is not a licence to delete");
+});
+
+test("liveDupEntries: keys a website row on its url and reports the Delete control", () => {
+  const rows = [
+    { deletePresent: true, fields: [{ fieldName: "url", value: "https://www.linkedin.com/in/wangykev" }] },
+    { deletePresent: true, fields: [{ fieldName: "url", value: "https://www.github.com/wangykev" }] },
+  ];
+  const e = liveDupEntries(rows, "url");
+  assert.strictEqual(e.length, 2);
+  assert.notStrictEqual(e[0].key, e[1].key);
+  assert.strictEqual(e[0].deletePresent, true);
+  assert.strictEqual(sectionDeletionPlan(e).mode, "phantom", "two distinct live URLs = Workday's server-side ghost");
+});
+
+test("liveDupEntries: a row missing the key field falls back to its whole-row signature", () => {
+  const rows = [{ deletePresent: false, fields: [{ fieldName: "webAddress", value: "https://a.dev" }] }];
+  const e = liveDupEntries(rows, "url"); // "url" isn't this tenant's field name
+  assert.match(e[0].key, /webAddress=/, "still produces a usable key instead of an empty one");
+  assert.strictEqual(e[0].deletePresent, false, "surfaces that this row has NO Delete control");
+});
+
+test("liveDupEntries: identical live rows are detected as a REAL duplicate (delete the later one only)", () => {
+  const rows = [
+    { deletePresent: true, fields: [{ fieldName: "url", value: "https://a.dev" }] },
+    { deletePresent: true, fields: [{ fieldName: "url", value: "https://a.dev/" }] }, // same modulo trailing slash
+  ];
+  const plan = sectionDeletionPlan(liveDupEntries(rows, "url"));
+  assert.strictEqual(plan.mode, "real");
+  assert.deepStrictEqual(plan.deleteIndices, [1]);
+});
+
+test("duplicateErrorSection: routes each tenant wording to its repeating section", () => {
+  assert.strictEqual(duplicateErrorSection(["Error-URLYou can't add duplicate website URLs."]), "website"); // the LIVE solarturbines text
+  assert.strictEqual(duplicateErrorSection(["Duplicate language entries are not allowed"]), "language");
+  assert.strictEqual(duplicateErrorSection(["You cannot add duplicate Education entries"]), "education");
+  assert.strictEqual(duplicateErrorSection(["Duplicate work experience is not allowed"]), "workExperience");
+  assert.strictEqual(duplicateErrorSection(["Duplicate certification entries found"]), "certification");
+});
+test("duplicateErrorSection: a non-duplicate error, or a duplicate about nothing we model, is NOT claimed", () => {
+  assert.strictEqual(duplicateErrorSection(["The field School is required"]), null, "a plain required-field error must not trigger a section delete");
+  assert.strictEqual(duplicateErrorSection(["Duplicate entries are not allowed"]), null, "names no section → no guess");
+  assert.strictEqual(duplicateErrorSection([]), null);
+});
+
+test("sectionEntriesFromResults: builds one entry per row with a composite signature over ALL its fields", () => {
+  const results = [
+    { fieldName: "workExperience[0].jobTitle", after: "Engineer" },
+    { fieldName: "workExperience[0].companyName", after: "Acme" },
+    { fieldName: "workExperience[1].jobTitle", after: "Engineer" },
+    { fieldName: "workExperience[1].companyName", after: "Globex" },
+    { fieldName: "education[0].schoolName", after: "MIT" }, // a different section is ignored
+  ];
+  const entries = sectionEntriesFromResults(results, "workExperience");
+  assert.strictEqual(entries.length, 2);
+  assert.notStrictEqual(entries[0].key, entries[1].key, "same job title but different company ⇒ NOT the same row");
+  assert.match(entries[0].summary, /Acme/);
+});
+
+test("sectionDeletionPlan: identical rows → REAL (delete the later one); all-distinct → PHANTOM (clear the section)", () => {
+  const distinct = sectionEntriesFromResults([
+    { fieldName: "education[0].schoolName", after: "MIT" },
+    { fieldName: "education[1].schoolName", after: "Caltech" },
+  ], "education");
+  assert.strictEqual(sectionDeletionPlan(distinct).mode, "phantom", "a visibly-clean section is Workday's server-side ghost → clear it");
+  assert.deepStrictEqual(sectionDeletionPlan(distinct).deleteIndices.slice().sort(), [0, 1]);
+
+  const dupe = sectionEntriesFromResults([
+    { fieldName: "education[0].schoolName", after: "MIT" },
+    { fieldName: "education[1].schoolName", after: "Caltech" },
+    { fieldName: "education[2].schoolName", after: "  mit " }, // same row, modulo case/whitespace
+  ], "education");
+  const plan = sectionDeletionPlan(dupe);
+  assert.strictEqual(plan.mode, "real");
+  assert.deepStrictEqual(plan.deleteIndices, [2], "keep the first occurrence, delete only the later duplicate");
+});
+
+test("sectionDeletionPlan: an empty section yields nothing to delete (never a no-op delete storm)", () => {
+  assert.deepStrictEqual(sectionDeletionPlan([]).deleteIndices, []);
+  assert.deepStrictEqual(sectionEntriesFromResults([], "language"), []);
+});
+
 test("AI-4 websiteDeletionPlan: distinct URLs → PHANTOM (delete all — the stale-backend bug)", () => {
   const results = [
     { fieldName: "website[0].url", after: "https://github.com/kevin" },
@@ -7139,6 +7347,29 @@ test("replayField (SKIP-IF-CORRECT): an already-correct DROPDOWN is left as-is �
   assert.ok(!act.log.some((e) => e[0] === "openDropdown"), "a correct dropdown is not re-opened (no stray-click exposure)");
 });
 
+// REGRESSION (live, solarturbines page 5, 2026-07-28). Workday kept reporting Name/Date as required-and-
+// empty while the page (DOM, React's own props, and Workday's own "current value is 7/28/2026" rendering)
+// all held them. The remedy is to force a real RE-WRITE — but replayField's skip-if-correct block ignored
+// `budgets.skipIfCorrect` entirely, so the "forced" re-fill logged "already correct — left unchanged (no
+// actuation)" and did nothing. A whole live run was spent learning that. These pin BOTH directions.
+test("replayField: skipIfCorrect:false FORCES a re-write of an already-correct field (the forced-remedy path)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-name"]', fieldName: "name", widgetType: "text", value: "Kevin Wang" };
+  const act = makeFakeAct([f]);
+  const r = await replayField(act, { field_id: "P5::formField-name", widget_type: "text", current_value: "Kevin Wang", edit_kind: null },
+    Object.assign({}, T_BUDGETS, { skipIfCorrect: false }));
+  assert.strictEqual(r.status, "filled");
+  assert.notStrictEqual(r.flag, "replay-already-correct", "an explicit skipIfCorrect:false must NOT report already-correct");
+  assert.ok(act.log.some((e) => e[0] === "typeText"), "the field must actually be re-typed — that is the whole point of the forced remedy");
+});
+test("replayField: skipIfCorrect UNDEFINED still skips (every existing caller unchanged)", async () => {
+  const f = { wrapperSel: '[data-automation-id="formField-name"]', fieldName: "name", widgetType: "text", value: "Kevin Wang" };
+  const act = makeFakeAct([f]);
+  const b = Object.assign({}, T_BUDGETS); delete b.skipIfCorrect;
+  const r = await replayField(act, { field_id: "P5::formField-name", widget_type: "text", current_value: "Kevin Wang", edit_kind: null }, b);
+  assert.strictEqual(r.flag, "replay-already-correct", "only an EXPLICIT false forces; the default must keep the minimal-diff replay");
+  assert.ok(!act.log.some((e) => e[0] === "typeText"));
+});
+
 test("replayField (SKIP-IF-CORRECT): a DIFFERING value STILL actuates (only-what-differs, not skip-everything)", async () => {
   const f = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "Wrongname" };
   const act = makeFakeAct([f]);
@@ -7401,10 +7632,36 @@ test("submitPrecondition: a review-page value that DISAGREES with the approved b
   assert.ok(r.blockers.some((b) => /DISAGREE with the approved bundle/.test(b)));
 });
 
-test("submitPrecondition: an approved value MISSING from the review page blocks", () => {
-  const r = gate((i) => { i.findings.reviewMissing = [{ label: "Phone", value_bundle: "8506660266" }]; });
+// RELAXED 2026-07-28 (operator): "make it so it just checks if anything is filled wrong. if things are
+// missing it is fine." DISAGREE is positive evidence — the page shows a CONTRADICTING value. MISSING is
+// absence of evidence: Workday's summary doesn't render every field (live: `Language*` = "English"
+// controls the page's display language and never appears there, blocking a run that was otherwise
+// AGREE 53 · DISAGREE 0), and value-presence matching is heuristic on short values.
+test("submitPrecondition: an approved value MISSING from the review page does NOT block on its own", () => {
+  const r = gate((i) => { i.findings.reviewMissing = [{ label: "Language*", value_bundle: "English" }]; });
+  assert.strictEqual(r.ok, true, "a value the page simply doesn't display can't block a submit: " + r.blockers.join("; "));
+});
+
+test("submitPrecondition: a DISAGREE still blocks — a contradicted value is the thing we check for", () => {
+  const r = gate((i) => { i.findings.reviewDisagree = [{ label: "City", value_bundle: "Chicago", value_review: "Detroit" }]; });
   assert.strictEqual(r.ok, false);
-  assert.ok(r.blockers.some((b) => /not shown on the review page/.test(b)));
+  assert.ok(r.blockers.some((b) => /DISAGREE/.test(b)), r.blockers.join("; "));
+});
+
+// The ONE exception to the relaxation: a value WE deleted to clear Workday's phantom duplicate-entry
+// error. That fix's whole premise is that Workday retained its own copy, so absence there IS positive
+// evidence — the application would be filed without it.
+test("submitPrecondition: a value WE deleted that didn't come back on the review page still BLOCKS", () => {
+  const r = gate((i) => { i.findings.phantomLost = ["https://www.linkedin.com/in/wangykev"]; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /did NOT come back/.test(b)), r.blockers.join("; "));
+  assert.ok(r.blockers.some((b) => /linkedin/.test(b)), "names the value so the operator knows what would be lost");
+});
+
+test("submitPrecondition: a review-page scrape failure STILL blocks (can't check DISAGREE either)", () => {
+  const r = gate((i) => { i.findings.reviewScrapeFailed = true; });
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.blockers.some((b) => /could not read the review page/.test(b)));
 });
 
 test("submitPrecondition: a review-page scrape FAILURE blocks (can't confirm it matches → don't submit)", () => {
@@ -7430,7 +7687,157 @@ test("submitPrecondition: reports ALL blockers at once (nothing authorized, off-
   assert.ok(r.blockers.length >= 3, "each failed check contributes a blocker: " + r.blockers.join("; "));
 });
 
-test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload/absent)", async () => {
+// ── bundleSubmitBlockers — the BUNDLE-only half of the gate, shared with the website submit run's
+//    PRE-FLIGHT check (background.js AP_SUBMIT_APPLICATION). It must agree with submitPrecondition
+//    exactly, and must never be laxer: a pre-flight PASS is what lets a run open a tab and sign in,
+//    so anything it misses would be caught only after a full replay (and the live gate still runs).
+const preflight = (m) => { const i = cleanSubmitInputs(); if (m) m(i); return bundleSubmitBlockers(i.bundle); };
+
+test("bundleSubmitBlockers: a fully-approved bundle has NO blockers (the pre-flight lets it run)", () => {
+  assert.deepStrictEqual(preflight(), []);
+});
+
+test("bundleSubmitBlockers: an UNAPPROVED flagged field blocks (the pre-flight refuses before opening a tab)", () => {
+  const b = preflight((i) => { i.bundle.entries[1].is_approved = false; });
+  assert.ok(b.some((x) => /not approved/.test(x)), b.join("; "));
+});
+
+test("bundleSubmitBlockers: an unapproved CASCADE-REVEALED field blocks even though it filled cleanly", () => {
+  const b = preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-c", cascade_revealed: true, needs_review: false, is_approved: false }); });
+  assert.ok(b.some((x) => /not approved/.test(x)), b.join("; "));
+});
+
+test("bundleSubmitBlockers: an empty / missing bundle blocks (nothing to replay)", () => {
+  assert.ok(bundleSubmitBlockers(null).some((x) => /no approved bundle entries/.test(x)));
+  assert.ok(bundleSubmitBlockers({ entries: [] }).some((x) => /no approved bundle entries/.test(x)));
+});
+
+test("bundleSubmitBlockers: a schema_version this build doesn't accept blocks (stale bundle)", () => {
+  const b = preflight((i) => { i.bundle.schema_version = "0.9"; });
+  assert.ok(b.some((x) => /schema_version/.test(x)), b.join("; "));
+});
+
+test("bundleSubmitBlockers: an unreplaced AI placeholder blocks", () => {
+  const b = preflight((i) => { i.bundle.entries[0].flag = "ai-text-needs-answer"; i.bundle.entries[0].current_value = "[NEEDS YOUR ANSWER: why us?]"; });
+  assert.ok(b.some((x) => /placeholder/.test(x)), b.join("; "));
+});
+
+test("bundleSubmitBlockers: a soft-DELETED flagged field is EXCLUDED (mirrors the live gate)", () => {
+  const b = preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-gone", needs_review: true, is_approved: false, is_deleted: true }); });
+  assert.deepStrictEqual(b, [], "a deleted entry is not part of the approval denominator");
+});
+
+// A REQUIRED field with no value must never reach submit. Before 2026-07-27 nothing in the approval
+// layer or the gate encoded this — only Workday's own validation caught it, as a mid-replay nav-timeout
+// halt (live: page 5, "The field Date is required and must have a value").
+test("bundleSubmitBlockers: a REQUIRED field with no value blocks (approving it is not enough)", () => {
+  const b = preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-date", question_label: "Date", widget_type: "date", is_required: true, current_value: "", needs_review: true, is_approved: true }); });
+  assert.ok(b.some((x) => /REQUIRED field\(s\) have no value/.test(x)), b.join("; "));
+  assert.ok(b.some((x) => /Date/.test(x)), "names the field so the operator knows which one");
+});
+
+test("bundleSubmitBlockers: required-blank is CONSERVATIVE — no false positives on the carve-outs", () => {
+  // An unchecked checkbox stores "false", not empty → not blank.
+  assert.deepStrictEqual(preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-cb", widget_type: "checkbox", is_required: true, current_value: "false" }); }), []);
+  // The résumé has its own re-attach step + resume-not-attached halt.
+  assert.deepStrictEqual(preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-resume", widget_type: "file_upload", is_required: true, current_value: "" }); }), []);
+  // Display-only stub rows are not fields.
+  assert.deepStrictEqual(preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-s", widget_type: "section_stub", is_required: true, current_value: "" }); }), []);
+  // An OPTIONAL blank field is fine.
+  assert.deepStrictEqual(preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-o", widget_type: "text", is_required: false, current_value: "" }); }), []);
+  // A soft-deleted required-blank row is excluded like every other deleted entry.
+  assert.deepStrictEqual(preflight((i) => { i.bundle.entries.push({ field_id: "P::formField-d", widget_type: "text", is_required: true, current_value: "", is_deleted: true }); }), []);
+});
+
+test("NAMED INVARIANT — every bundle blocker is ALSO reported by submitPrecondition (pre-flight is never laxer)", () => {
+  // Each mutation that the pre-flight rejects must ALSO be rejected by the live gate, otherwise the
+  // two could disagree about whether an application is approved enough to submit.
+  const mutations = [
+    (i) => { i.bundle.entries[1].is_approved = false; },
+    (i) => { i.bundle.schema_version = "0.9"; },
+    (i) => { i.bundle.entries[0].flag = "ai-text-needs-answer"; i.bundle.entries[0].current_value = "[NEEDS YOUR ANSWER: why us?]"; },
+    (i) => { i.bundle.entries = []; },
+  ];
+  for (const m of mutations) {
+    const pre = preflight(m);
+    assert.ok(pre.length, "the pre-flight must flag this bundle");
+    const live = gate(m);
+    assert.strictEqual(live.ok, false, "the live gate must ALSO refuse: " + pre.join("; "));
+    for (const b of pre) assert.ok(live.blockers.includes(b), `live gate is missing the pre-flight blocker "${b}"`);
+  }
+});
+
+// An approved entry that is NOT on the live page used to `continue` SILENTLY — the live page-5 case
+// where 5 approved entries produced 4 replays and the missing one (an answered checkbox_group) was
+// invisible. It must now surface as needs_review so the strict verify HALTS instead of walking on
+// toward a submit that is missing an approved answer.
+test("replayFlatFields: an approved field ABSENT from the live page is REPORTED, never silently dropped", async () => {
+  const act = makeFakeAct([{ wrapperSel: '[data-automation-id="formField-here"]', fieldName: "here", widgetType: "text", value: "" }]);
+  const entries = [
+    { field_id: "P1::formField-here", widget_type: "text", current_value: "yes" },
+    { field_id: "P1::formField-gone", widget_type: "checkbox_group", question_label: "Please check one of the boxes below", current_value: "I don't wish to answer" },
+  ];
+  const results = await replayFlatFields(act, entries, new Set(["here"]), T_BUDGETS);
+  const absent = results.find((r) => r.field === "gone");
+  assert.ok(absent, "the absent entry produces a RECORD (it used to vanish)");
+  assert.strictEqual(absent.flag, "replay-field-absent");
+  assert.strictEqual(absent.status, "skipped", "visible, but the review-page check is what judges it");
+  assert.match(absent.detail, /was NOT replayed/);
+  assert.match(absent.detail, /here/, "lists the live field names, so an id mismatch is obvious");
+});
+
+// NOTE the contract change (2026-07-27): repeating + file_upload entries are still skipped SILENTLY
+// (each is handled by its own dedicated step), but an entry that is simply ABSENT from the live page is
+// now REPORTED as needs_review instead of dropped — see the dedicated test above for why.
+// SEVERITY (settled 2026-07-28): an absent field is NEVER fatal — recorded, logged, and judged at the
+// REVIEW PAGE. Halting was wrong twice live: once on a page that was merely mid-cascade (only `country`
+// had rendered), and once on an EEO page whose gender/ethnicity/veteranStatus questions Workday had
+// simply stopped asking because it already holds the answers. The entry keeps its approved value, so
+// reconcileReviewPage looks for it and submitPrecondition hard-blocks on `missing_on_review` — a value
+// that really was lost cannot be submitted, without this having to guess mid-walk.
+// The scan's name list is NOT an inventory of the page: cdpPageScan.fields filters out every field
+// inside a repeating container. Live 2026-07-28 that reported page 4's EEO dropdowns absent and halted
+// the replay while the operator was looking right at them — "all the values do exist on the page". So a
+// field missing from the list is PROBED in the DOM before we believe it.
+test("replayFlatFields: a field missing from the scan list but PRESENT in the DOM is replayed, not skipped", async () => {
+  const eeo = { wrapperSel: '[data-automation-id="formField-gender"]', fieldName: "gender", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Male" }] };
+  const terms = { wrapperSel: '[data-automation-id="formField-acceptTermsAndAgreements"]', fieldName: "acceptTermsAndAgreements", widgetType: "checkbox", checked: false };
+  const act = makeFakeAct([eeo, terms]);
+  // The fake act answers selExists from the SAME field table the fills use — i.e. the DOM has gender,
+  // even though the caller's `present` set (the filtered flat scan) does not list it.
+  act.selExists = async (sel) => [eeo, terms].some((f) => f.wrapperSel === sel);
+  const entries = [{ field_id: "P4::formField-gender", widget_type: "dropdown", is_required: true, current_value: "Male" }];
+  const results = await replayFlatFields(act, entries, new Set(["acceptTermsAndAgreements"]), T_BUDGETS);
+  assert.strictEqual(results.length, 1);
+  assert.notStrictEqual(results[0].flag, "replay-field-absent", "the DOM probe overrides the incomplete scan list");
+  assert.strictEqual(results[0].status, "filled", "and the approved value actually gets replayed");
+});
+
+test("replayFlatFields: a field absent from BOTH the scan list and the DOM is still reported absent", async () => {
+  const act = makeFakeAct([{ wrapperSel: '[data-automation-id="formField-here"]', fieldName: "here", widgetType: "text", value: "" }]);
+  act.selExists = async () => false; // genuinely not on the page
+  const results = await replayFlatFields(act, [{ field_id: "P1::formField-gone", widget_type: "text", current_value: "x" }], new Set(["here"]), T_BUDGETS);
+  assert.strictEqual(results[0].flag, "replay-field-absent");
+  assert.strictEqual(results[0].status, "skipped");
+});
+
+test("replayFlatFields: an ABSENT approved field never halts the walk — required or not", async () => {
+  const act = makeFakeAct([{ wrapperSel: '[data-automation-id="formField-here"]', fieldName: "here", widgetType: "text", value: "" }]);
+  const entries = [
+    { field_id: "P1::formField-req", widget_type: "text", is_required: true, current_value: "x" },
+    { field_id: "P1::formField-opt", widget_type: "text", is_required: false, current_value: "y" },
+  ];
+  const results = await replayFlatFields(act, entries, new Set(["here"]), T_BUDGETS);
+  for (const f of ["req", "opt"]) {
+    const r = results.find((x) => x.field === f);
+    assert.strictEqual(r.status, "skipped", `${f}: absent is never a failure — the review page decides`);
+    assert.strictEqual(r.flag, "replay-field-absent", `${f}: still visible`);
+  }
+  assert.strictEqual(results.filter((r) => r.status === "needs_review" || r.status === "error").length, 0,
+    "nothing here can trip the walk's strict-verify halt");
+});
+
+test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips repeating/file_upload; REPORTS absent)", async () => {
   const fn = { wrapperSel: '[data-automation-id="formField-legalName--firstName"]', fieldName: "legalName--firstName", widgetType: "text", value: "" };
   const cty = { wrapperSel: '[data-automation-id="formField-country"]', fieldName: "country", widgetType: "dropdown", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Canada" }] };
   const act = makeFakeAct([fn, cty]);
@@ -7439,13 +7846,17 @@ test("replayFlatFields: replays ONLY flat + present + re-fillable entries (skips
     { field_id: "P1::formField-country", canonical_field: "personal_info.country", widget_type: "dropdown", current_value: "Canada" },
     { field_id: "P2::formField-jobTitle", canonical_field: "workExperience[0].job_title", widget_type: "text", current_value: "Eng" }, // repeating → skip
     { field_id: "P2::formField-resume", canonical_field: null, widget_type: "file_upload", current_value: null },                    // file_upload → skip
-    { field_id: "P1::formField-ssn", canonical_field: "personal_info.ssn", widget_type: "text", current_value: "x" }                  // not present → skip
+    { field_id: "P1::formField-ssn", canonical_field: "personal_info.ssn", widget_type: "text", current_value: "x" }                  // not present → REPORTED (not silently dropped)
   ];
   const present = new Set(["legalName--firstName", "country"]); // the live page scan
   const results = await replayFlatFields(act, entries, present, T_BUDGETS);
-  assert.strictEqual(results.length, 2, "only the 2 present flat fields are replayed");
-  assert.deepStrictEqual(results.map((r) => r.field).sort(), ["country", "legalName--firstName"]);
-  assert.ok(results.every((r) => r.status === "filled"));
+  const filled = results.filter((r) => r.status === "filled");
+  assert.deepStrictEqual(filled.map((r) => r.field).sort(), ["country", "legalName--firstName"], "only the 2 present flat fields are actually replayed");
+  // repeating + file_upload stay SILENT (each has its own dedicated replay step)…
+  assert.ok(!results.some((r) => r.field === "jobTitle" || r.field === "resume"), "repeating/file_upload are handled elsewhere, not reported here");
+  // …but an ABSENT approved field is surfaced, never dropped.
+  const ssn = results.find((r) => r.field === "ssn");
+  assert.ok(ssn && ssn.flag === "replay-field-absent" && ssn.status === "skipped", "an approved value with nowhere to go is reported, not dropped — and not fatal");
 });
 
 // ── dropdown tier-keep: CLOSE the opened list (the degree→"Associates" stray fix) ────────────

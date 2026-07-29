@@ -80,6 +80,88 @@ export const mustReplace = (e: ReviewEntry): boolean =>
 export const isPrePopulated = (e: ReviewEntry): boolean =>
   e.flag === "already-filled" || e.flag === "already-filled-match";
 export const isCascadeRevealed = (e: ReviewEntry): boolean => !!e.cascade_revealed;
+// A field the form MADE REQUIRED after this application was reviewed (flag `cascade-required`, written
+// by the replay walk when Workday refuses a page over a field the approved bundle can't answer). It IS
+// cascade_revealed — same approval force — but different news for the human: "⤴ REVEALED" describes a
+// field that merely appeared, this one is a question the form is now demanding an answer to (operator
+// 2026-07-27). The badge checks this FIRST so only one of the two shows. Twin: review-approval.ts /
+// summary-lib.js (same predicate, kept in lockstep like isCascadeRevealed itself).
+export const isBecameRequired = (e: ReviewEntry): boolean =>
+  !!(e.cascade_revealed && e.flag === "cascade-required");
+
+/**
+ * A date composite's segment order, NORMALIZED for the editor: `["month","day","year"]` /
+ * `["month","year"]` / `["year"]`. Accepts either the already-clean form OR the raw scan
+ * automation-ids (`dateSectionMonth-display`, `dateSectionMonth-input`, …), deduping and dropping
+ * anything it doesn't recognize. Returns `[]` when nothing usable survives, which tells the editor to
+ * fall back to a plain text box.
+ *
+ * WHY the viewer normalizes instead of trusting the bundle (operator 2026-07-28, twice): a bundle whose
+ * `date_order` held raw ids rendered them as the input placeholders — "dateSectionMonth-display /
+ * dateSectionMonth-input / …" — because DateSeg fell back to `{ ph: segment }` for unknown tokens. The
+ * extension side was fixed, but a bundle is DURABLE: any already-stored bundle (and any older extension
+ * build still installed) keeps its raw ids, so the page must heal them rather than print garbage. This
+ * also means an unrecognized token can never again leak into the UI as a placeholder.
+ */
+export function normalizeDateOrder(order: unknown): string[] {
+  const out: string[] = [];
+  for (const raw of Array.isArray(order) ? order : []) {
+    const s = String(raw).toLowerCase();
+    const m = /(month|day|year)/.exec(s); // matches "month" AND "datesectionmonth-display"
+    if (m && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * TODAY, shaped to a date field's own segment order (operator 2026-07-28: "for date questions in the
+ * review page can you put a button next to it that fills with the current date").
+ *
+ * The one date a form asks for that the profile can never hold is *today* — a signature or
+ * acknowledgement date — and it's the field most likely to come back as BECAME REQUIRED, so typing it by
+ * hand is the friction worth removing. Returns one string per segment IN THE FORM'S ORDER, so a
+ * month/year or year-only composite gets only what it asks for.
+ *
+ * LOCAL date, not UTC (`getMonth`/`getDate`): "today" means the operator's today — near midnight a UTC
+ * read would sign the form with the wrong day. `now` is injectable so this is testable without freezing
+ * the clock. Zero-padded to match the MM / DD placeholders.
+ */
+export function todayForDateOrder(order: string[] | null | undefined, now?: Date): string[] {
+  const d = now || new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (Array.isArray(order) ? order : []).map((s) =>
+    s === "month" ? pad(d.getMonth() + 1) : s === "day" ? pad(d.getDate()) : s === "year" ? String(d.getFullYear()) : ""
+  );
+}
+
+/**
+ * Order for the "Needs review" list (operator 2026-07-28: "if the form fills again and goes to review
+ * can you put the new review items at the top").
+ *
+ * When a submit run sends questions BACK to review, they are the entire reason the operator reopened the
+ * page — they must not be buried in form order among fields that were already approved once. Everything
+ * NEW sorts first; the pre-existing safety ordering (loudest AI guesses, then must-replace, then the
+ * rest) is preserved underneath it, and the sort is STABLE so form order still decides within a tier.
+ *
+ * 0 = became REQUIRED after review (a question the form now demands — nothing to verify, something to
+ *     ANSWER), 1 = otherwise cascade-revealed (appeared after another value committed),
+ * 2 = super-hard (forced / low-confidence AI on a sensitive field), 3 = must-replace, 4 = everything else.
+ */
+export function reviewPriority(e: ReviewEntry): number {
+  if (isBecameRequired(e)) return 0;
+  if (isCascadeRevealed(e)) return 1;
+  if (isSuperHard(e)) return 2;
+  if (mustReplace(e)) return 3;
+  return 4;
+}
+
+/** The flagged entries in review order — NEW items first. Stable, so form order holds within a tier. */
+export function orderForReview(entries: ReviewEntry[]): ReviewEntry[] {
+  return (entries || [])
+    .map((e, i) => ({ e, i }))
+    .sort((a, b) => reviewPriority(a.e) - reviewPriority(b.e) || a.i - b.i)
+    .map((x) => x.e);
+}
 
 // ── Plain-English "what happened" line for a review card ──
 // The engine records a terse log-style `detail` (e.g. `AI canonicalized stated "Bachelor of Science"

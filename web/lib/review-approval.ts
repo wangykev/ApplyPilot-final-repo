@@ -81,6 +81,15 @@ export function effectiveValue(entry: ReviewEntry): EffectiveValue {
 // filled cleanly.
 export const isCascadeRevealed = (e: ReviewEntry): boolean => !!(e && e.cascade_revealed);
 
+// A field the form MADE REQUIRED after this application was reviewed (flag `cascade-required`, added by
+// the extension's replay when Workday refuses a page over a field the approved bundle can't answer).
+// It is a cascade_revealed entry — same approval force — but a DIFFERENT thing to tell the human:
+// "⤴ REVEALED" describes a field that merely appeared, while this one is a question the form is now
+// demanding an answer to (operator 2026-07-27: "instead can you make a different flag like became
+// required"). Checked BEFORE the generic revealed badge so only one of the two shows.
+export const isBecameRequired = (e: ReviewEntry): boolean =>
+  !!(e && e.cascade_revealed && e.flag === "cascade-required");
+
 // Which entries demand an EXPLICIT human approval before submit: the flagged ones
 // (needs_review) AND any cascade-revealed field, minus soft-deleted. Un-flagged fields are
 // approved-by-default (lower friction). super-hard / sensitive / needs-answer are ALL
@@ -89,8 +98,8 @@ export const requiresApproval = (e: ReviewEntry): boolean =>
   !e.is_deleted && (!!e.needs_review || isCascadeRevealed(e));
 
 /** Approval roll-up for the envelope + the viewer's progress UI. PURE over the entries.
- *  submit_ready = every field that requires approval IS approved AND no required field
- *  still holds an unreplaced AI placeholder. */
+ *  submit_ready = every field that requires approval IS approved, no required field still holds an
+ *  unreplaced AI placeholder, AND no required field is blank. */
 export function approvalEnvelope(entries: ReviewEntry[]): ApprovalEnvelope {
   const live = (entries || []).filter((e) => !e.is_deleted);
   // A preferred-name field HIDDEN by an unchecked "I have a preferred name" is off the form, so it
@@ -100,14 +109,30 @@ export function approvalEnvelope(entries: ReviewEntry[]): ApprovalEnvelope {
   const placeholdersLeft = live.filter(
     (e) => e.flag === "ai-text-needs-answer" && hasPlaceholder(e.current_value)
   );
+  // A REQUIRED field with NO VALUE blocks submit (operator 2026-07-27). The extension viewer refused to
+  // APPROVE a required-empty field, but that was UI-only — this envelope never encoded it, so an
+  // approved-but-blank required field read as submit_ready and only Workday's own validation stopped it
+  // (as a mid-replay halt). LOCKSTEP with bundleSubmitBlockers (fill-driver.js), including the carve-outs:
+  // a checkbox stores "false" (never empty), file_upload has its own re-attach + halt, and stub rows are
+  // display-only. Preferred-name fields are is_required:false, so a hidden one can't trip this.
+  const requiredBlank = live.filter(
+    (e) =>
+      e.is_required === true &&
+      e.widget_type !== "file_upload" &&
+      e.widget_type !== "section_stub" &&
+      e.widget_type !== "nested_section_stub" &&
+      e.widget_type !== "removed_entry" &&
+      (e.current_value == null || String(e.current_value).trim() === "")
+  );
   const all_approved = toApprove.length === approved.length;
   return {
     to_approve_count: toApprove.length,
     approved_count: approved.length,
     pending_count: toApprove.length - approved.length,
     unreplaced_placeholders: placeholdersLeft.length,
+    required_blank: requiredBlank.length,
     all_approved,
-    submit_ready: all_approved && placeholdersLeft.length === 0,
+    submit_ready: all_approved && placeholdersLeft.length === 0 && requiredBlank.length === 0,
   };
 }
 

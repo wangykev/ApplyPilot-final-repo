@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   isBucketEligibleWidget,
+  isDateOnlyQuestion,
   profileValueAt,
   teachableCards,
   coveredKeys,
@@ -596,22 +597,75 @@ test("default wordings: a website with no type is skipped; an operator's own wor
 });
 
 // ── WEBSITE URLs are stored as FULL https:// URLs (operator, 2026-07-26) ──────────────────────
-test("website URL: bare host gains https://, an explicit scheme is left alone, empty stays empty", () => {
-  assert.equal(ensureHttpsUrl("linkedin.com/in/kevin"), "https://linkedin.com/in/kevin");
-  assert.equal(ensureHttpsUrl("  github.com/x  "), "https://github.com/x");
-  assert.equal(ensureHttpsUrl("https://x.dev"), "https://x.dev", "already full → untouched");
-  assert.equal(ensureHttpsUrl("http://x.dev"), "http://x.dev", "an explicit scheme is the operator's choice");
+test("website URL: a bare host gains BOTH https:// and www, and empty stays empty", () => {
+  assert.equal(ensureHttpsUrl("linkedin.com/in/kevin"), "https://www.linkedin.com/in/kevin");
+  assert.equal(ensureHttpsUrl("  github.com/x  "), "https://www.github.com/x");
+  assert.equal(ensureHttpsUrl("https://x.dev"), "https://www.x.dev", "a scheme alone isn't the full link — the apex still gains www");
+  assert.equal(ensureHttpsUrl("http://x.dev"), "http://www.x.dev", "an explicit scheme is the operator's choice; only the host changes");
   assert.equal(ensureHttpsUrl(""), "");
   assert.equal(ensureHttpsUrl(null), "");
 });
 
+// Requiring www exists to keep the profile, the page and the approved bundle byte-identical — a bare
+// host vs the page's www form fails exact AND containment (www. is mid-string) AND fuzzy (89 vs 90),
+// which flags the audit and BLOCKS the submit gate. Idempotency keeps re-normalization a no-op.
+test("website URL: normalization is IDEMPOTENT (never stacks www.)", () => {
+  const canonical = "https://www.linkedin.com/in/kevin";
+  assert.equal(ensureHttpsUrl(canonical), canonical);
+  assert.equal(ensureHttpsUrl(ensureHttpsUrl("linkedin.com/in/kevin")), canonical);
+});
+
+// www belongs ONLY on an apex host: "www.blog.example.com" generally doesn't resolve, so adding it
+// there would break a working link — worse than the mismatch this change fixes.
+test("website URL: a host that already has a subdomain never gains www", () => {
+  assert.equal(ensureHttpsUrl("blog.example.com/post"), "https://blog.example.com/post");
+  assert.equal(ensureHttpsUrl("gist.github.com/x"), "https://gist.github.com/x");
+  assert.equal(ensureHttpsUrl("https://192.168.0.1/x"), "https://192.168.0.1/x", "an IP host is never www-prefixed");
+});
+
+test("website URL: a multi-part public suffix counts as an apex (example.co.uk → www.example.co.uk)", () => {
+  assert.equal(ensureHttpsUrl("example.co.uk/cv"), "https://www.example.co.uk/cv");
+  assert.equal(ensureHttpsUrl("www.example.co.uk"), "https://www.example.co.uk");
+});
+
 test("website URL: the profile SCHEMA normalizes on parse, so what's stored/synced/filled is the full URL", () => {
   const p = profileSchema.parse({ websites: [{ type: "LinkedIn", url: "linkedin.com/in/kevin" }, { type: "GitHub", url: "" }] });
-  assert.equal(p.websites[0].url, "https://linkedin.com/in/kevin");
+  assert.equal(p.websites[0].url, "https://www.linkedin.com/in/kevin");
   assert.equal(p.websites[1].url, "", "an unset URL is not invented");
 });
 
 test("website URL: looksLikeUrl flags what can't be a real URL (the editor's inline error)", () => {
   for (const ok of ["", "linkedin.com/in/x", "https://x.dev", "sub.domain.co.uk/path?q=1"]) assert.equal(looksLikeUrl(ok), true, ok);
   for (const bad of ["not a url", "localhost", "https://", "foo bar.com"]) assert.equal(looksLikeUrl(bad), false, bad);
+});
+
+
+// ── Date questions never become teach cards (operator 2026-07-28) ───────────────────────────────────
+// A signature/acknowledgement date is per-APPLICATION. Remembering it would teach a bucket to fill a
+// STALE date on every future form — worse than not learning it. Narrow by design: a DOB or graduation
+// date IS a reusable answer and must keep teaching.
+test("isDateOnlyQuestion: a bare date ask is excluded, however punctuated or worded", () => {
+  for (const q of ["Date", "date", "Date*", "Date:", "DATE ", "Today's Date", "Todays date", "Current Date", "Date Signed", "Date Signed On", "Signature Date", "Date of Signature", "Date Completed"]) {
+    assert.equal(isDateOnlyQuestion(q, "text"), true, q);
+  }
+});
+
+test("isDateOnlyQuestion: a date WIDGET is excluded whatever it's called (it can't be bucket-filled)", () => {
+  assert.equal(isDateOnlyQuestion("Anything at all", "date"), true);
+  assert.equal(isDateOnlyQuestion("Graduation", "year"), true);
+});
+
+test("isDateOnlyQuestion: reusable answers that merely MENTION a date still teach", () => {
+  for (const q of ["Date of Birth", "Graduation Date", "Start Date Preference", "Earliest date you can start", "What date works for an interview?"]) {
+    assert.equal(isDateOnlyQuestion(q, "text"), false, q);
+  }
+  assert.equal(isDateOnlyQuestion("First Name", "text"), false);
+});
+
+test("teachableCards: a date question is never offered as a card", () => {
+  const cards = teachableCards([src("a", [
+    entry({ question_label: "Date", widget_type: "text", current_value: "07/28/2026" }),
+    entry({ question_label: "Are you over 18?", widget_type: "radio", current_value: "Yes" }),
+  ])], [], {});
+  assert.deepEqual(cards.map((c) => c.question), ["Are you over 18?"], "the date is dropped, the real question stays");
 });

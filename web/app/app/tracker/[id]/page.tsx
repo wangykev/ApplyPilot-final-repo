@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, ExternalLink, KeyRound } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
 import { ReviewEditor } from "@/components/app/review/ReviewEditor";
@@ -29,7 +29,7 @@ async function loadApp(id: string): Promise<Loaded | null> {
     if (!user) return DEV_PREVIEW ? sampleLookup(id) : null;
     const { data } = await supabase
       .from("applications")
-      .select("id, company, role, url, status, needs_review_count, applied_at, created_at, review_bundle_json, job_description")
+      .select("id, company, role, url, status, needs_review_count, applied_at, created_at, review_bundle_json, job_description, login_email, login_tenant, login_host, login_created, login_verified, login_at")
       .eq("id", id)
       .eq("user_id", user.id)
       .maybeSingle();
@@ -42,6 +42,39 @@ async function loadApp(id: string): Promise<Loaded | null> {
   } catch {
     return DEV_PREVIEW ? sampleLookup(id) : null;
   }
+}
+
+/**
+ * WHICH Workday account this application was filed with. Workday accounts are per-tenant, so when a
+ * recruiter replies weeks later this is what tells you how to sign back in — and after a
+ * create-account run it's the record that the account exists at all. Renders nothing when unknown
+ * (an application filled before this shipped, or one where you signed in by hand) rather than
+ * implying an account we can't vouch for. The password is deliberately not here: it lives once, on
+ * the Sign-in & email page.
+ */
+function LoginLine({ app }: { app: Application }) {
+  if (!app.login_email) return null;
+  return (
+    <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-ink-dim">
+      <KeyRound className="h-3.5 w-3.5 shrink-0 text-ink-faint" />
+      <span>Signed in as</span>
+      <span className="font-mono text-ink">{app.login_email}</span>
+      {app.login_tenant && <span className="text-ink-faint">on {app.login_tenant}</span>}
+      {app.login_created && (
+        <span className="rounded border border-verified/30 bg-verified/[0.08] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-verified">
+          account created
+        </span>
+      )}
+      {app.login_verified && (
+        <span className="rounded border border-hairline px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">
+          email verified
+        </span>
+      )}
+      <Link href="/app/credentials" className="text-amber hover:underline">
+        Sign-in details
+      </Link>
+    </p>
+  );
 }
 
 export default async function ApplicationDetail({ params }: { params: Promise<{ id: string }> }) {
@@ -64,6 +97,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
               {app.company || "Application"}
             </h1>
             {app.role && <p className="mt-1 text-sm text-ink-dim">{app.role}</p>}
+            <LoginLine app={app} />
           </div>
           <div className="flex shrink-0 items-center gap-3">
             <JobDescriptionButton text={jobDescription} />

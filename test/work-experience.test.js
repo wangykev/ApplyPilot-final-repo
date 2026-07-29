@@ -16,13 +16,44 @@ test("isFluent — true only for a 'fluent' value (string or in a tiered array)"
   assert.strictEqual(isFluent(null), false);
 });
 
-test("ensureHttps prepends https:// only when there's no scheme", () => {
-  assert.strictEqual(ensureHttps("linkedin.com/in/wangykev"), "https://linkedin.com/in/wangykev");
-  assert.strictEqual(ensureHttps("https://github.com/x"), "https://github.com/x");
-  assert.strictEqual(ensureHttps("http://x.com"), "http://x.com");
-  assert.strictEqual(ensureHttps("  example.com  "), "https://example.com");
+test("ensureHttps canonicalizes to the FULL link — scheme + www on a bare apex host", () => {
+  assert.strictEqual(ensureHttps("linkedin.com/in/wangykev"), "https://www.linkedin.com/in/wangykev");
+  assert.strictEqual(ensureHttps("https://github.com/x"), "https://www.github.com/x", "a scheme alone isn't the full link — the apex still gains www");
+  assert.strictEqual(ensureHttps("http://x.com"), "http://www.x.com", "an explicit http scheme is the operator's choice; only the host changes");
+  assert.strictEqual(ensureHttps("  example.com  "), "https://www.example.com");
   assert.strictEqual(ensureHttps(""), "");
   assert.strictEqual(ensureHttps(null), "");
+});
+
+// The whole point of requiring www: the stored value must equal what the page ends up holding, or the
+// M40 audit flags it and the submit gate BLOCKS on a review-page DISAGREE (www. is inserted mid-string,
+// so containment can't save it, and fuzzy lands at 89 vs the 90 bar). Idempotency is what makes
+// re-normalizing an already-canonical profile a no-op instead of "www.www.".
+test("ensureHttps is IDEMPOTENT — an already-canonical URL is returned byte-identical", () => {
+  const canonical = "https://www.linkedin.com/in/wangykev";
+  assert.strictEqual(ensureHttps(canonical), canonical);
+  assert.strictEqual(ensureHttps(ensureHttps("linkedin.com/in/wangykev")), canonical, "normalizing twice must not stack www.");
+});
+
+// www is only correct on an APEX host. Prepending it to a host that already has a subdomain invents a
+// name that usually does not resolve ("www.blog.example.com"), which would turn a working profile link
+// into a dead one — a worse failure than the mismatch this change fixes.
+test("ensureHttps NEVER adds www to a host that already carries a subdomain", () => {
+  assert.strictEqual(ensureHttps("blog.example.com/post"), "https://blog.example.com/post");
+  assert.strictEqual(ensureHttps("gist.github.com/x"), "https://gist.github.com/x");
+  assert.strictEqual(ensureHttps("https://sub.domain.example.com"), "https://sub.domain.example.com");
+});
+
+test("ensureHttps treats a multi-part public suffix as an apex (example.co.uk gains www; www.example.co.uk doesn't)", () => {
+  assert.strictEqual(ensureHttps("example.co.uk"), "https://www.example.co.uk");
+  assert.strictEqual(ensureHttps("example.co.uk/cv"), "https://www.example.co.uk/cv");
+  assert.strictEqual(ensureHttps("www.example.co.uk"), "https://www.example.co.uk");
+});
+
+test("ensureHttps never touches an IP host, and never throws on an unparseable value", () => {
+  assert.strictEqual(ensureHttps("https://192.168.0.1/x"), "https://192.168.0.1/x");
+  assert.strictEqual(ensureHttps("localhost:3000"), "https://localhost:3000", "single-label host → no www");
+  assert.strictEqual(ensureHttps("https://"), "https://", "unparseable → returned as-is, no throw");
 });
 
 test("meaningfulEntries keeps entries with real data in ANY of the given keys", () => {

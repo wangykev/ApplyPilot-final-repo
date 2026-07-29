@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { addBackEntryRecords } from "../lib/review-approval";
-import type { RememberedField } from "../lib/review-summary";
+import { addBackEntryRecords, approvalEnvelope } from "../lib/review-approval";
+import type { RememberedField, ReviewEntry } from "../lib/review-summary";
 
 // Phase 2 (delete-with-memory): reconstruct-with-prefill for a removed_entry add-back. A deterministic
 // value comes back clean (approved-by-default); an AI value or an unfilled field needs review.
@@ -36,4 +36,44 @@ test("addBackEntryRecords: deterministic fields prefill clean; AI + unfilled fie
 
 test("addBackEntryRecords: empty remembered list → no records", () => {
   assert.deepEqual(addBackEntryRecords([], [], { sectionKey: "education", index: 0 }), []);
+});
+
+
+// ── The OUTCOME of the review page's "Today" button (operator 2026-07-28) ────────────────────────────
+// "if today is pressed, automatically approve" — so one click must move the field from blocking to
+// submit-ready. The button writes the value AND sets is_approved in ONE patch; these pin the envelope
+// semantics that make that single click actually unblock a submit.
+const dateEntry = (over: Partial<ReviewEntry>): ReviewEntry =>
+  ({
+    field_id: "P5::formField-dateSignedOn",
+    page: "P5",
+    question_label: "Date",
+    widget_type: "date",
+    is_required: true,
+    needs_review: true,
+    cascade_revealed: true,
+    flag: "cascade-required",
+    fill_status: "not_filled",
+    current_value: null,
+    ...over,
+  }) as ReviewEntry;
+
+test("approvalEnvelope: a cascade-required date BLOCKS while blank, and one click (value + approve) clears it", () => {
+  const blank = approvalEnvelope([dateEntry({})]);
+  assert.equal(blank.submit_ready, false, "blank + unapproved blocks");
+  assert.equal(blank.pending_count, 1);
+  assert.equal(blank.required_blank, 1, "and it is ALSO caught as a required-blank field");
+
+  // What the Today click writes: the value and the approval, together.
+  const done = approvalEnvelope([dateEntry({ current_value: "07/28/2026", is_approved: true, approved_at: "2026-07-28T00:00:00Z", is_edited: true, edit_kind: "filled_blank" })]);
+  assert.equal(done.submit_ready, true, "one click makes it submit-ready");
+  assert.equal(done.pending_count, 0);
+  assert.equal(done.required_blank, 0);
+});
+
+test("approvalEnvelope: a value WITHOUT approval still blocks (the auto-approve is what does the work)", () => {
+  const valueOnly = approvalEnvelope([dateEntry({ current_value: "07/28/2026", is_edited: true })]);
+  assert.equal(valueOnly.required_blank, 0, "no longer blank…");
+  assert.equal(valueOnly.submit_ready, false, "…but a flagged field still needs the approval");
+  assert.equal(valueOnly.pending_count, 1);
 });
