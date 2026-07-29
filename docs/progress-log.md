@@ -2270,10 +2270,13 @@ untouched.
 Verified: extension **774/774** (+2 — the live shuffle downgrades to ambiguous; a value the page nowhere
 contains still disagrees — alongside the pre-existing keyed-disagree test, which passes unchanged).
 
-NOTE the 24 MISSING are a separate, still-open matter: the operator's page text shows most of those values
-ARE displayed (job titles, role descriptions, education, the screening answers), so the scraper is matching
-only ~26 of 54. It is non-blocking now, so it costs nothing today — but it means the review-page check is
-verifying far less than its AGREE count suggests, and that is worth its own round.
+NOTE (written before learning the run was HIDDEN, and **superseded by the next entry**): I flagged the 24
+MISSING as a separate scraper defect — "matching only ~26 of 54 … worth its own round". It is not a separate
+defect. The half-rendered page accounts for it: FOREGROUND runs of this same job match **53 of 54**, and the
+single miss (`Language*` = "English") is legitimate — the summary renders "Languages: No Response" and never
+shows that value. So the scraper is sound on a settled page; the fix it needed was the settle, not a
+rewrite. Leaving the original text visible above rather than deleting it, because over-flagging on partial
+evidence is the mistake worth remembering.
 
 ## 2026-07-28 — The review-page scrape had no settle either (root cause of the false disagrees)
 
