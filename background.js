@@ -2001,7 +2001,11 @@ async function runCdpReviewReconcile(tabId) {
     const bundle = await new Promise((resolve) => chrome.storage.local.get("reviewSummary", (r) => resolve((r && r.reviewSummary) || null)));
     const entries = bundle && Array.isArray(bundle.entries) ? bundle.entries : [];
 
-    const dump = await cdpEval(cdpReadReviewPage);
+    // Settle before reading (same reason as the replay's check — a half-drawn summary reads as
+    // missing/mis-paired values). No `act` here; awaitReviewPageSettled falls back to cdpDelay.
+    const settledRC = await awaitReviewPageSettled(null);
+    LOG(`review page settled in ${settledRC.ms}ms — ${settledRC.records} displayed value(s).`);
+    const dump = settledRC.dump;
     if (!dump || !dump.ok) {
       LOG("not on the review page (marker applyFlowReviewPage absent). reason:", dump && dump.reason, "· url:", dump && dump.url);
       return { ok: false, error: (dump && dump.reason) || "no-dump" };
@@ -2269,6 +2273,38 @@ async function runCdpRepeatRecon(tabId) {
 // ≥1.2s of real time. Bounded at 12s; a page with no flat fields (repeating-only, e.g. My Experience)
 // bails after ~1s of all-zero reads. Genuine value-triggered cascades appear only AFTER a commit and
 // remain the cascade re-scan's job — this settles the INITIAL load only.
+// Wait for the REVIEW page's displayed values to finish rendering, then return the final scrape.
+//
+// Same discipline as awaitFieldSetSettled, for the same reason (2026-07-28): the review-page check had NO
+// settle, so on a HIDDEN tab it read the page half-drawn. Live comparison on one job — FOREGROUND runs
+// scraped it as AGREE 53 · DISAGREE 0 · MISSING 1, the first HIDDEN run as AGREE 26 · DISAGREE 3 ·
+// MISSING 24. The 3 "disagrees" were rows shuffled inside a repeating entry (a label whose own value span
+// hadn't mounted picks up the next row's), and the 24 "missing" values were, per the operator's copy of
+// the page, right there on it. Nothing was wrong with the application — we simply looked too early.
+//
+// WALL-CLOCK (`delayFull`, never `delayRender`): we are waiting on the PAGE's render, which takes real
+// time regardless of our pacing, and delayRender collapses to ~40ms on a visible tab — a count would look
+// "stable" while half the summary was still missing, which is exactly the bug. Break once a NON-ZERO
+// record count has held UNCHANGED for ≥1.2s. Returns the last successful dump so the caller doesn't
+// re-read (one fewer round-trip, and the verdict is computed on the very snapshot we settled on).
+async function awaitReviewPageSettled(act, hints) {
+  const t0 = Date.now();
+  const NO_GROWTH_MS = 1200, POLL_MS = 200, CEILING_MS = 15000;
+  let last = -1, lastChangeAt = Date.now(), dump = null;
+  while (Date.now() - t0 < CEILING_MS) {
+    let d = null;
+    try { d = await cdpEval(cdpReadReviewPage, hints); } catch (e) { /* mid-render eval → keep polling */ }
+    if (d && d.ok) dump = d;
+    const n = d && d.ok && d.counts ? d.counts.records : 0;
+    const now = Date.now();
+    if (n > 0 && n === last) { if (now - lastChangeAt >= NO_GROWTH_MS) break; }
+    else { last = n; lastChangeAt = now; }
+    // delayFull when we have an actuation; cdpDelay is the same real wall-clock for callers without one.
+    if (act && act.delayFull) await act.delayFull(POLL_MS); else await cdpDelay(POLL_MS);
+  }
+  return { dump, records: last > 0 ? last : 0, ms: Date.now() - t0 };
+}
+
 async function awaitFieldSetSettled(act) {
   const t0 = Date.now();
   const NO_GROWTH_MS = 1200, ZERO_BAIL_MS = 1000, POLL_MS = 150, CEILING_MS = 12000;
@@ -3328,7 +3364,11 @@ async function runCdpReplayWalk(tabId, opts) {
           const hints = bundle.entries
             .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
             .map((e) => ({ label: e.question_label || null, value: String(e.current_value), widget: e.widget_type || null }));
-          const dump = await cdpEval(cdpReadReviewPage, hints);
+          // SETTLE FIRST — the scrape used to run the instant we arrived, which on a HIDDEN tab read the
+          // summary half-drawn (see awaitReviewPageSettled). The settle returns the snapshot it settled on.
+          const settled = await awaitReviewPageSettled(act, hints);
+          LOG(`review page settled in ${settled.ms}ms — ${settled.records} displayed value(s).`);
+          const dump = settled.dump;
           if (dump && dump.ok && Array.isArray(dump.items)) {
             const rec = reconcileReviewPage(dump.items, bundle.entries, { accountEmails: await getAccountEmails() });
             const c = rec.counts;

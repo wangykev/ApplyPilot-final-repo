@@ -2274,3 +2274,42 @@ NOTE the 24 MISSING are a separate, still-open matter: the operator's page text 
 ARE displayed (job titles, role descriptions, education, the screening answers), so the scraper is matching
 only ~26 of 54. It is non-blocking now, so it costs nothing today — but it means the review-page check is
 verifying far less than its AGREE count suggests, and that is worth its own round.
+
+## 2026-07-28 — The review-page scrape had no settle either (root cause of the false disagrees)
+
+Follow-up to the entry above, with the context that changes its diagnosis. Operator: *"I have ran this
+multiple times and it has worked before. for more context this run was hidden."*
+
+Same job, same bundle:
+
+| run | result |
+|---|---|
+| FOREGROUND (several) | AGREE 53 · DISAGREE 0 · MISSING 1 |
+| HIDDEN (first) | AGREE 26 · DISAGREE 3 · MISSING 24 |
+
+So the previous entry treated a SYMPTOM. The row-shuffle and the 24 phantom "missing" values weren't
+inherent fragility in the pairing — they are what a **half-rendered** summary looks like. A hidden tab
+renders slower, the scrape ran the instant the walk arrived, and a label whose own value span hadn't
+mounted yet picks up the next row's value. The operator's copy of the page shows every one of those values
+present and correct.
+
+**`awaitReviewPageSettled(act, hints)`** now polls `cdpReadReviewPage` until a NON-ZERO record count holds
+UNCHANGED for ≥1.2s — wall-clock via `delayFull`, never `delayRender` (adaptive, ~40ms on a visible tab,
+which would pronounce a half-drawn page "stable": the exact trap this exists to avoid) — with a 15s
+ceiling. It RETURNS the settled snapshot, so the verdict is computed on precisely the state it settled on
+rather than a fresh read that might differ, and it costs one round-trip less. Wired into the replay walk
+and the standalone `RUN_CDP_REVIEW_CHECK` (no `act` there → falls back to `cdpDelay`).
+
+**This is the third instance of one lesson**, all found live this week: never scan a Workday page without
+settling it first. The JD page (`jobPageSettleStep`), form pages (`awaitFieldSetSettled`, whose absence in
+the replay walk made it process the same page twice), and now the review page. Each looked like a different
+bug — a truncated job description, phantom absent fields, contradicted values — and each was the same
+mistake.
+
+The mis-pairing guard from the previous commit STAYS: it is still correct that a row shuffled within an
+entry shouldn't hard-block a submit, and it is now defence-in-depth rather than the primary fix.
+
+Verified: extension **774/774** (unchanged — the settle is I/O, and like `awaitFieldSetSettled` it carries
+no direct unit test; the pure verdict logic it feeds is covered). Live-verification pending: re-run the
+HIDDEN rehearse; the log should print `review page settled in Nms — 5x displayed value(s)` and the counts
+should match the foreground runs.
