@@ -27,18 +27,30 @@ export type DiscoveredJob = {
   postedText: string;
   postedUnknown: boolean;
   description: string;
-  /** "list" (came with the row) | "pane" (read in-page) | "page" (opened it) | "" */
+  /** "list" (came with the row) | "api" (the board's own record) | "page" (opened it) | "" */
   descriptionSource: string;
   /**
    * `url` always holds the BEST known link. For a board find it is REWRITTEN to the
    * employer's real application URL when the posting exposes one, because the Run
    * pipeline drives Workday/Greenhouse/etc. and cannot drive a board url.
    * `boardUrl` remembers where the job was found; `applyKind` distinguishes
-   * "LinkedIn Easy Apply, so no employer link EXISTS" from "we couldn't find it".
+   * "board-only application, so no employer link EXISTS" from "we couldn't find it".
    */
   boardUrl?: string;
   applyKind?: string;
   applyResolved?: boolean;
+  /**
+   * Ranking (2026-07-30, "scrape wide, queue narrow"). Both boards report how many
+   * people have already applied, which is the strongest available signal; `score`
+   * orders the queue and `scoreReasons` explains it, so the ranking is auditable
+   * rather than a number to trust.
+   */
+  applicants?: number | null;
+  earlyApplicant?: boolean;
+  promoted?: boolean;
+  employmentType?: string;
+  score?: number;
+  scoreReasons?: string[];
 };
 
 /** Is this a job-BOARD link rather than an employer/ATS one? Lockstep with discover.js. */
@@ -63,8 +75,16 @@ export type DiscoverStats = {
   jdOpened: number;
   jdFailed: number;
   jdSkipped: number;
-  /** Descriptions read WITHOUT opening a tab (LinkedIn's details pane). */
+  /** Descriptions read straight from a board's own record — no tab, no clicks. */
   jdInPage?: number;
+  /** Everything that survived dedup, BEFORE the best-N cut — the "wide" of the sweep. */
+  matched?: number;
+  /** Postings rewritten to the employer's real application url. */
+  employerLinks?: number;
+  /** Board-only applications (Easy Apply / Quick apply) skipped — support is deferred. */
+  boardOnlySkipped?: number;
+  /** Postings that had already closed. */
+  closedSkipped?: number;
 };
 
 /** The exact search the sweep ran — echoed back so it's never a mystery. */
@@ -90,16 +110,39 @@ export const DISCOVER_SOURCE_HINT: Record<DiscoverSourceKey, string> = {
   handshake: "Read from your signed-in Handshake session in this browser.",
 };
 
-/** Defaults mirrored from the extension's DISCOVER_DEFAULTS — keep in step. */
+/**
+ * Defaults mirrored from the extension's DISCOVER_DEFAULTS — keep in step.
+ * `web/test/discover.test.ts` cross-loads the real discover.js and asserts every
+ * key here matches, so a drift is a test failure rather than a production surprise.
+ */
 export const DISCOVER_DEFAULTS = {
   sinceDays: 7,
   maxPerSource: 25,
   maxTotal: 60,
+  /**
+   * A board's own JSON record per posting — one cheap same-origin fetch, so this
+   * covers a whole page of candidates. Distinct from maxJdOpens (real tab loads):
+   * sharing one budget meant records were read for the NEWEST N while the queue kept
+   * the BEST N, so a queued job could end up with no JD and no employer link.
+   */
+  maxRecords: 25,
+  /** Real page loads in the reused reader tab, for anything with no board record. */
   maxJdOpens: 10,
+  /** How many result PAGES to sweep per board (scrape wide…). */
+  maxPages: 3,
+  /** …queue narrow: keep only the N best-matching. 0 ⇒ queue everything found. */
+  queueLimit: 10,
+  /** Drop postings that can only be applied to ON the board (no employer link exists). */
+  skipEasyApply: true,
   query: "",
 };
 
-/** No location given ⇒ search the whole country, not the profile's home city. */
+/**
+ * LAST-RESORT location only. The panel seeds its location box from the profile's
+ * own country, so this is what's used when there is no profile country either —
+ * and when it IS used, the sweep says so in a note rather than searching a
+ * country the operator never chose.
+ */
 export const DISCOVER_DEFAULT_LOCATION = "United States";
 
 export const DISCOVER_CYCLES = ["summer", "fall", "winter", "spring"] as const;

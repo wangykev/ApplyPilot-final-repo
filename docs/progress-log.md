@@ -2895,3 +2895,206 @@ never submits, and writes nothing itself:** the sweep RETURNS jobs and the WEBSI
   + production build green. **Live-verify PENDING** (needs the operator's signed-in Chrome): run
   **Discover recon first** per board, tighten the LinkedIn/Handshake ladders from the dump, then a real
   sweep.
+
+## 2026-07-30 — Discovery rebuilt from a live trace of both signed-in boards
+
+The 2026-07-26 discovery build shipped its LinkedIn/Handshake list scrapers
+"structure-first": written blind, because tracing them needs an authenticated session
+that wasn't available at build time. This was the trace that was meant to tighten
+them from observation. It refuted them instead, and the rebuild changed the substrate.
+
+### What the trace found
+
+**Every one of the ~30 LinkedIn selectors matched ZERO** on an ordinary signed-in
+results page. Not drift — a rewrite. LinkedIn shipped a server-driven UI where result
+cards are `div[role="button"]` containing **no anchor at all** (the old identity anchor,
+"every row carries a `/jobs/view/<id>` link, walk up from it", simply no longer exists),
+and every class is a rotating build hash. Worse, and independent of the redesign: **the
+search page silently DISCARDS `location=`, `sortBy=` and `f_E=` from its own URL**, so
+the sweep had been running an unsorted, unlocated search since it was written.
+
+Two stable, semantic, id-carrying anchors do exist, and both are what the rebuild uses:
+`componentkey="job-card-component-ref-<id>"` (LinkedIn) and
+`data-hook="job-result-card | <id>"` (Handshake).
+
+Both boards also expose the JSON their own front-ends run on, which is strictly better
+for what this branch needs: the employer's real application URL arrives as a **typed
+field** rather than being guessed from off-host anchors near an apply button, board-only
+applications are identified by that field's SHAPE instead of matching the words "easy
+apply", posted dates are exact epochs instead of "3 days ago" parsed backwards, and
+applicant counts come through — which is what makes ranking meaningful.
+
+Full DOM detail, including every verified filter code and all three trap cases:
+`docs/dom-patterns.md` 2026-07-30.
+
+### What shipped
+
+- **ONE driver for both boards.** Once traced, LinkedIn and Handshake have the same
+  shape, so `discoverFromBoard(source, opts)` + a `BOARD_CONFIG` entry does both:
+  identical paging, filtering, detail read, dedup and logging. Roughly 150 lines of
+  near-duplicate driver code became one. Both use the rendered SEARCH PAGE for
+  discovery (Handshake's JSON index ignores every filter param; LinkedIn's page runs its
+  newer SEMANTIC search and beats its own keyword API for the same words) and the
+  board's JSON RECORD per posting.
+- **No overlaps across sources**, which was the explicit ask: because both boards
+  resolve a posting to the employer's URL *before* dedup, the same job found on both
+  collapses to one `discoveryJobKey` — the same key the tracker writes after applying.
+- **The card-clicking pane reader is gone.** It clicked each result and settle-polled
+  the details rail on page timers, which is exactly what made it unreliable in a
+  background tab. One JSON read per posting replaces it, and nothing is clicked at all,
+  so the Apply button can never be touched.
+- **Scrape wide, queue narrow** (operator's design): several pages per board, then only
+  the best `queueLimit` (default 10, or "all") by the deterministic `scoreDiscovery` —
+  keyword/profile overlap, internship-by-title, freshness in hours, applicant count,
+  Run-drivability, minus a promoted penalty. Everything left behind is reported with its
+  score and reasons. Not an LLM call: cheap, stable, auditable.
+- **Location is free text again**, resolved through each board's own typeahead once per
+  (board, text) and cached. No hardcoded country anywhere; the panel seeds from the
+  profile's `personal_info.country`.
+- **Board-only applications skipped by default with support explicitly deferred**, and
+  closed/archived postings dropped — both counted and noted.
+- **Hidden-tab safe by construction:** all pacing is service-worker wall clock and the
+  injected functions contain no `setTimeout` (Chrome throttles page timers in background
+  tabs but not `fetch`). Card discovery polls for cards rather than guessing a settle
+  delay, and recon reports `readyState`/`hidden` so a zero is always interpretable.
+
+### Three bugs caught by testing against real data, not fixtures I wrote
+
+1. **Handshake's apply link is in `job_apply_setting`, not `external_apply_link`.** The
+   record has both; the obvious-looking pair is LEGACY and was `false`/`null` on **all
+   30** sampled live postings, *including* ones that plainly apply offsite. My first
+   adapter read it, my unit test passed because I wrote the fixture from the field I had
+   assumed, and the live sample said "0% of Handshake jobs have an employer link" — which
+   would have quietly reduced the whole source to zero once board-only postings are
+   skipped. Read correctly: **33%** carry a real link (Greenhouse, Workday, Google
+   Careers, Paylocity, Tesla). Pinned both directions.
+2. **A `(Verified job)` card shifted every field by one.** The a11y summary line isn't
+   byte-equal to the title, so a consecutive-dedupe left it in place and company took the
+   title's value while location took the company's — on 2 of the first 5 cards. Wrong data
+   that still looks plausible, which is the worst kind. The split moved out of the
+   injected scraper into the pure `linkedInFieldsFromLines` specifically so it could be
+   pinned against all three real card shapes.
+3. **Date-sorting LinkedIn's search API destroys keyword relevance.** `sortBy:List(DD)`
+   drops every promoted row, which looked like a free win and was briefly made
+   unconditional — but "embedded software intern" then returns *EH&S Intern*, *Audit
+   Intern*, *Finance Intern*: the newest internships of any kind. Relevance returns
+   Skydio, Anduril, Blue Origin avionics/embedded, Palantir. Now relevance for WHAT, our
+   own score for the ORDER, promoted penalised rather than sorted away.
+
+Also fixed en route: **`maxTotal` was silently inert** — the panel never sent it and
+object spread copies the `undefined` over the default, so `slice(0, undefined)` returned
+everything. Both message forwarders now pass only keys the caller actually supplied.
+
+### Verification
+
+Extension **862 pass / 0 fail**; web **107 pass / 0 fail** (the lockstep test now
+compares EVERY mirrored `DISCOVER_DEFAULTS` key, not four named ones); web typecheck +
+production build green.
+
+Verified live, in-page, against the operator's own signed-in session — running the real
+shipped functions, not approximations: both list scrapers (25/25 LinkedIn cards with 0
+field shifts, 24 Handshake), both detail APIs end-to-end through the real adapters (5/10
+Handshake postings resolving to real employer hosts, up from 0/10 before the
+`job_apply_setting` fix), the search-URL contracts (`start=25` paginates and returns a
+different 25, `jobType=3` takes 62,820 → 4,989, the closed `sort` set), and the complete
+location resolver (typed "Seattle" → 5 suggestions → clicked → `geoId=104116203`, pill
+"Seattle, WA (50 mi)").
+
+**PENDING:** the extension itself has not been reloaded, so the service-worker
+orchestration (tab lifecycle, SW-side pacing, the website round-trip) is unverified.
+Chrome blocks automation of `chrome://extensions`, so that reload is a manual step.
+
+### 2026-07-30 (same day, later) — live-verified end to end, and the five bugs live testing found
+
+The rebuild above was unit-green and in-page-verified, but the extension itself had not
+run it. Reloading and actually sweeping found five real defects that no test caught,
+each of which is now pinned or documented. Verified working end to end afterwards:
+LinkedIn + Handshake + Simplify, fully unfocused, employer links on every queued row.
+
+**1. `scanned 3` of 25 — a silent under-read.** `pollForCards` returned on the first
+NON-EMPTY read; both boards mount their list progressively, so it caught the page
+mid-render and reported success. Now it settles on a stable non-zero count (or a full
+page), with per-board budgets (LinkedIn ~8s, Handshake 15–25s). Fourth instance of the
+same lesson — never scan a progressively-rendered page without settling it first.
+
+**2. The location resolver ran before the page existed.** It fired ~2s after the tab
+opened, so the control wasn't there yet, and the failure was NOT harmless: with no
+geoId the url carries no location param and LinkedIn substitutes the SESSION's last
+location — every result came back Seattle while the operator had asked for the whole
+US. Resolve now runs after the cards settle, and a failed resolve says explicitly that
+the board used its own default.
+
+**3. The location control is a TOGGLE and was being re-clicked blind.** Click → flat
+500ms → check once → loop. The panel needs longer than 500ms, so attempt 2 closed what
+attempt 1 opened, alternating (`clicked yes, box NOT found` × 8). Now: check if already
+open, click at most once per round, then poll.
+
+**4. It typed the location into the JOB SEARCH BOX.** The worst of the five. Handshake's
+location panel is `display:none` until opened, so no location box is visible, and a
+"first input that isn't the keyword box" fallback returned the KEYWORD box — the
+resolver typed "Pittsburgh, Pennsylvania" into the job field, matched a job suggestion,
+clicked it, and reported `location-token-never-appeared`. A completely wrong ACTION
+disguised as a timing failure. (It also slipped the exclusion list because the regex
+said `describe the job` and Handshake's placeholder is "Describe **a** job you want".)
+Both boards are now matched POSITIVELY, and anything else returns null — which correctly
+means "the panel isn't open yet".
+
+**5. The record budget was spent on the wrong jobs.** `maxJdOpens` (10) was calibrated
+when a JD meant opening a tab. A board record is now one cheap fetch, but records were
+read for the NEWEST 10 while the queue kept the BEST N — different sets — so a queued
+Amazon posting arrived with no JD and no employer link (`resolved:false`). Split into
+`maxRecords` (25, covers a page) and `maxJdOpens` (10, real tab loads), plus a pre-rank
+so the budget goes to the jobs most likely to be queued.
+
+**NEVER REQUIRE FOCUS (operator, mid-session).** The resolve initially worked only in a
+foreground tab — same click, same coordinates, panel opens when presented and never when
+hidden, because the reveal defers on rAF (paused) and timers (throttled). Borrowing real
+focus was implemented and then REJECTED on the operator's instruction: a sweep must run
+unattended. Replaced with the three levers cdp.js already had — `cdpInstallPageOverrides`
+(worker timers escape throttling, behind `Page.setBypassCSP`), `cdpWakePage`
+(`setWebLifecycleState:"active"`, re-applied per poll tick since a hidden tab can be
+re-frozen), and `cdpSetFocusEmulation` (`Emulation.setFocusEmulationEnabled`, which keeps
+the page repainting). "Denver, Colorado" and "Pittsburgh, Pennsylvania" then both resolved
+with the tab unfocused, results genuinely Denver/Pittsburgh.
+
+**What made this debuggable.** The service-worker console isn't readable from outside, so
+`could-not-open-location-control` was unactionable on its own. `resolveBoardLocation` now
+returns a `diag` — attempts, whether the control was found and its label, whether the
+click happened, whether the box was found, the viewport, the filter-strip buttons it DID
+see, the suggestions offered and which was picked — and the note prints it. That is what
+located bugs 3, 4 and 5. One `return` omitted the diag and the note then blamed a missing
+control that had in fact been found and clicked; every failure path now carries it.
+A localhost-only `AP_RELOAD` message (operator-approved) restarts the worker so a
+build/verify cycle doesn't need a manual click at chrome://extensions; it is refused while
+a run or sweep is in flight.
+
+### The before/after, in the operator's own queue
+
+The queue ended the session holding both eras, which is the clearest evidence of what
+changed. 20 rows from the OLD code, every one a `linkedin.com` BOARD LINK and none of
+them a match: *National Director General Agents*, *Associate Commercial Title
+Underwriter*, *Auxiliary Operator*, *Tax Accountant – Retail Location*, *Office
+Manager*, *Audiovisual Technician III* — i.e. LinkedIn's RECOMMENDED FEED, which is
+exactly what a keyword-less/unlocated search returns. 12 rows from the rebuilt sweeps,
+every one an employer/ATS link: `sonos.wd1.myworkdayjobs.com`, `boards.greenhouse.io`
+(×2), `joinbytedance.com`, `eeho.fa.us2.oraclecloud.com`, `recruiting.paylocity.com`,
+`grnh.se`, `workforcenow.cloud.adp.com`, `www.amazon.jobs`, `jsv3.recruitics.com`,
+`www.governmentjobs.com`. 100% board links before, 100% drivable employer links after.
+
+### Live-verified runs (all with the tab UNFOCUSED unless noted)
+
+- LinkedIn, "software engineer intern", 1 page → `scanned 25`, 23 matched, best 2 queued,
+  21 reported as left behind.
+- LinkedIn, "robotics intern", Denver CO → location resolved HIDDEN, all results
+  Golden/Littleton CO, `employerLinks 20/20`, `jdOpened 0`, `jdFailed 0`, `unenriched 0`.
+- Handshake, "software engineering intern", Pittsburgh PA → location resolved HIDDEN,
+  24 → 9 matched (the filter really applied), results genuinely Pittsburgh.
+- All three sources, "software engineering intern" → `scanned {handshake:24, linkedin:25,
+  simplify:14649}`, 70 matched, best 8 queued, every one `external` + `resolved` + read
+  from a board record, `jdOpened 0`, and the cross-source guard fired: *"1 posting was
+  listed on more than one board under different employer links and was queued once."*
+- Foreground run (the new "Sweep in the background" toggle, off) → same behaviour, which
+  is how the focus dependency was isolated in the first place.
+
+Suites after all of it: extension **866 pass / 0 fail**, web **107 pass / 0 fail**,
+typecheck + production build green.

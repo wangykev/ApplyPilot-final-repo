@@ -17,27 +17,42 @@ export const dynamic = "force-dynamic";
  * primary education row is the best single answer. Never throws — a missing
  * profile / unconfigured backend just means no default, and the panel says so.
  */
-async function loadFieldOfStudy(): Promise<string> {
-  if (!isSupabaseConfigured()) return "";
+/**
+ * Both discovery defaults come out of the SAME profile read.
+ *
+ * `homeCountry` seeds the Discover panel's location box. There is deliberately no
+ * hardcoded fallback country anywhere in the sweep: the operator's own profile is
+ * the only defensible default for "where should I look", and baking in a country
+ * would silently search the wrong one for anyone whose profile says otherwise.
+ * `country` is a tiered array like `field_of_study`, so entry 0 is the answer.
+ */
+async function loadDiscoverDefaults(): Promise<{ fieldOfStudy: string; homeCountry: string }> {
+  const none = { fieldOfStudy: "", homeCountry: "" };
+  if (!isSupabaseConfigured()) return none;
   try {
     const supabase = await createClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
-    if (!user) return "";
+    if (!user) return none;
     const { data } = await supabase.from("profiles").select("profile_json").eq("id", user.id).maybeSingle();
-    if (!data?.profile_json) return "";
+    if (!data?.profile_json) return none;
     const profile = coerceProfile(data.profile_json);
-    const first = profile.education?.[0]?.field_of_study;
-    const value = Array.isArray(first) ? first[0] : first;
-    return typeof value === "string" ? value.trim() : "";
+    const tier0 = (v: unknown): string => {
+      const first = Array.isArray(v) ? v[0] : v;
+      return typeof first === "string" ? first.trim() : "";
+    };
+    return {
+      fieldOfStudy: tier0(profile.education?.[0]?.field_of_study),
+      homeCountry: tier0(profile.personal_info?.country),
+    };
   } catch {
-    return "";
+    return none;
   }
 }
 
 export default async function RunPage() {
-  const fieldOfStudy = await loadFieldOfStudy();
+  const { fieldOfStudy, homeCountry } = await loadDiscoverDefaults();
   return (
     <div className="space-y-8">
       <PageHeader
@@ -48,7 +63,7 @@ export default async function RunPage() {
       <RunPanel />
       {/* Find work to run: sweeps the job boards for new postings and fills the queue.
           Sits below Run because Run is the page's primary action — Discover feeds it. */}
-      <DiscoverPanel fieldOfStudy={fieldOfStudy} />
+      <DiscoverPanel fieldOfStudy={fieldOfStudy} homeCountry={homeCountry} />
     </div>
   );
 }

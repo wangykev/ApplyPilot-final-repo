@@ -3,14 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
-  Radar, Loader2, Check, AlertTriangle, ExternalLink, FileText, Clock, MapPin, Cable,
+  Radar, Loader2, Check, AlertTriangle, ExternalLink, FileText, Clock, MapPin, Cable, Users,
 } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type RunProgress } from "@/lib/extension";
 import { linkedExtensionId } from "@/lib/extension-sync";
 import {
   DISCOVER_DEFAULTS, DISCOVER_SOURCE_LABEL, DISCOVER_SOURCE_HINT, describeSweep,
-  DISCOVER_CYCLES, DISCOVER_DEFAULT_LOCATION, buildDiscoverQuery, discoverTermLabel,
+  DISCOVER_CYCLES, DISCOVER_DEFAULT_LOCATION, buildDiscoverQuery, discoverTermLabel, isBoardUrl,
   type DiscoveredJob, type DiscoverStats, type DiscoverSourceKey, type DiscoverSearch,
 } from "@/lib/discover";
 import { getDiscoveryContext, saveDiscovered } from "./actions";
@@ -54,7 +54,28 @@ function defaultYear(): string {
   return String(new Date().getFullYear() + 1);
 }
 
-export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) {
+/**
+ * Sticky sweep settings. Deliberately localStorage and NOT a DB column: these are
+ * per-browser UI preferences, the operator already has pending migrations, and the
+ * extension-id storage next door establishes the pattern. Nothing here is secret.
+ */
+const PREFS_KEY = "applypilot.discover.prefs";
+type Prefs = {
+  enabled?: Record<DiscoverSourceKey, boolean>;
+  query?: string; cycle?: string; year?: string; intern?: boolean; location?: string;
+  sinceDays?: number; maxRecords?: number; maxPages?: number; queueLimit?: number;
+  skipEasyApply?: boolean;
+  background?: boolean;
+};
+function loadPrefs(): Prefs {
+  try {
+    const raw = window.localStorage.getItem(PREFS_KEY);
+    const p = raw ? JSON.parse(raw) : null;
+    return p && typeof p === "object" ? (p as Prefs) : {};
+  } catch { return {}; }
+}
+
+export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOfStudy?: string; homeCountry?: string }) {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [progress, setProgress] = useState<RunProgress | null>(null);
@@ -65,9 +86,21 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
   const [cycle, setCycle] = useState<string>("summer");
   const [year, setYear] = useState<string>(defaultYear());
   const [intern, setIntern] = useState(true);
-  const [location, setLocation] = useState("");
+  // Seeded from the PROFILE's country, never a hardcoded "United States" — the
+  // operator's own answer to "where do you live" is the only sensible default, and
+  // baking one in would silently search the wrong country for anyone else.
+  const [location, setLocation] = useState(homeCountry);
   const [sinceDays, setSinceDays] = useState(DISCOVER_DEFAULTS.sinceDays);
-  const [maxJdOpens, setMaxJdOpens] = useState(DISCOVER_DEFAULTS.maxJdOpens);
+  const [maxRecords, setMaxRecords] = useState(DISCOVER_DEFAULTS.maxRecords);
+  const [maxPages, setMaxPages] = useState(DISCOVER_DEFAULTS.maxPages);
+  const [queueLimit, setQueueLimit] = useState(DISCOVER_DEFAULTS.queueLimit);
+  const [queueAll, setQueueAll] = useState(false);
+  const [skipEasyApply, setSkipEasyApply] = useState(DISCOVER_DEFAULTS.skipEasyApply);
+  // Sweep tabs open unfocused by default so you can keep working. Turning this off
+  // makes them the active tab, which is the right first move when a board's UI isn't
+  // behaving — some controls only respond in a focused tab.
+  const [background, setBackground] = useState(true);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const portRef = useRef<{ disconnect: () => void } | null>(null);
 
   // The EXACT search that will run, computed with the same pure function the
@@ -76,13 +109,43 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
   // recommended feed instead of searching.
   const preview = buildDiscoverQuery({ query, field: fieldOfStudy, intern });
   const term = discoverTermLabel(cycle, year);
-  const locationLabel = location.trim() || DISCOVER_DEFAULT_LOCATION;
+  const locationLabel = location.trim() || homeCountry || DISCOVER_DEFAULT_LOCATION;
   const noKeywords = !preview.keywords;
 
   useEffect(() => {
     setConnected(linkedExtensionId() !== null && extensionMessagingAvailable());
   }, []);
   useEffect(() => () => portRef.current?.disconnect(), []);
+
+  // Hydrate the saved knobs once, then persist on every change. A saved location
+  // wins over the profile seed (it's a deliberate choice); everything else falls
+  // back to the shared defaults.
+  useEffect(() => {
+    const p = loadPrefs();
+    if (p.enabled) setEnabled((v) => ({ ...v, ...p.enabled }));
+    if (typeof p.query === "string") setQuery(p.query);
+    if (typeof p.cycle === "string") setCycle(p.cycle);
+    if (typeof p.year === "string") setYear(p.year);
+    if (typeof p.intern === "boolean") setIntern(p.intern);
+    if (typeof p.location === "string" && p.location) setLocation(p.location);
+    if (typeof p.sinceDays === "number") setSinceDays(p.sinceDays);
+    if (typeof p.maxRecords === "number") setMaxRecords(p.maxRecords);
+    if (typeof p.maxPages === "number") setMaxPages(p.maxPages);
+    if (typeof p.queueLimit === "number") { setQueueLimit(p.queueLimit || DISCOVER_DEFAULTS.queueLimit); setQueueAll(p.queueLimit === 0); }
+    if (typeof p.skipEasyApply === "boolean") setSkipEasyApply(p.skipEasyApply);
+    if (typeof p.background === "boolean") setBackground(p.background);
+    setPrefsLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!prefsLoaded) return; // don't write the pre-hydration defaults back over saved ones
+    try {
+      window.localStorage.setItem(PREFS_KEY, JSON.stringify({
+        enabled, query, cycle, year, intern, location, sinceDays, maxRecords, maxPages,
+        queueLimit: queueAll ? 0 : queueLimit, skipEasyApply, background,
+      } satisfies Prefs));
+    } catch { /* a private-mode browser just won't remember them */ }
+  }, [prefsLoaded, enabled, query, cycle, year, intern, location, sinceDays, maxRecords, maxPages, queueLimit, queueAll, skipEasyApply, background]);
 
   const running = phase.s === "running";
   const anySource = SOURCES.some((s) => enabled[s]);
@@ -117,10 +180,17 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
       intern,
       cycle,
       year: year.trim(),
-      location: location.trim(),
+      // Free text — each board resolves it through its OWN location typeahead
+      // (neither board's location token can be constructed) and the result is
+      // cached, so a given place costs one resolve on its first use only.
+      location: location.trim() || homeCountry,
       sinceDays,
-      maxJdOpens,
-      background: true, // sweep tabs open unfocused — you stay on this page
+      maxRecords,
+      // Scrape wide, queue narrow.
+      maxPages,
+      queueLimit: queueAll ? 0 : queueLimit,
+      skipEasyApply,
+      background, // unfocused by default; off = watch it happen in the active tab
     });
 
     portRef.current?.disconnect();
@@ -217,7 +287,8 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
             <input
               value={location}
               onChange={(e) => setLocation(e.target.value)}
-              placeholder={`blank = ${DISCOVER_DEFAULT_LOCATION} (everywhere)`}
+              placeholder={homeCountry ? `blank = ${homeCountry} (from your profile)` : "city, state, or country"}
+              title="Any city, state, or country. Each board resolves it through its own location box the first time you use it, then remembers it."
               className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-amber"
             />
           </label>
@@ -260,7 +331,12 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
             )}
           >
             <input type="checkbox" checked={intern} onChange={(e) => setIntern(e.target.checked)} className="accent-amber" />
-            <span className="text-sm text-ink">Internships</span>
+            <span
+              className="text-sm text-ink"
+              title="Adds 'intern' to the keywords AND switches each board's own internship filter on (LinkedIn experience level, Handshake job type). On a live test that took 127 results down to 25 — all genuine internships and co-ops."
+            >
+              Internships
+            </span>
           </label>
           <label className="shrink-0">
             <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
@@ -286,16 +362,91 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
               <input
                 type="number"
                 min={0}
-                max={40}
-                value={maxJdOpens}
-                onChange={(e) => setMaxJdOpens(Math.max(0, Math.min(40, Number(e.target.value) || 0)))}
+                max={50}
+                value={maxRecords}
+                onChange={(e) => setMaxRecords(Math.max(0, Math.min(50, Number(e.target.value) || 0)))}
                 className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
-                title="LinkedIn descriptions are read on the search page itself. Anything else is read in ONE reused tab."
+                title="Read straight from each board's own job record — no tab is opened and nothing is clicked. This is also what resolves the employer's real application link."
               />
-              <span className="text-xs text-ink-dim">descriptions</span>
+              <span className="text-xs text-ink-dim">job records</span>
             </span>
           </label>
         </div>
+
+        {/* Scrape wide, queue narrow. The sweep looks at several pages, ranks
+            everything it finds, and queues only the best — so a daily run doesn't
+            dump 60 half-relevant rows into the queue. */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          <label className="shrink-0">
+            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
+              Queue the best
+            </span>
+            <span className="flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={queueLimit}
+                disabled={queueAll}
+                onChange={(e) => setQueueLimit(Math.max(1, Math.min(60, Number(e.target.value) || 1)))}
+                className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber disabled:opacity-40"
+                title="Everything found is ranked on how well it matches your keywords and profile, how fresh it is, how few people have applied, and whether Run can actually drive it. Only this many are queued — the rest are reported, never silently dropped."
+              />
+              <span className="text-xs text-ink-dim">jobs</span>
+            </span>
+          </label>
+          <label
+            className={clsx(
+              "flex shrink-0 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2.5 transition-colors",
+              queueAll ? "border-amber/40 bg-amber/[0.04]" : "border-hairline bg-cockpit hover:border-ink-faint"
+            )}
+          >
+            <input type="checkbox" checked={queueAll} onChange={(e) => setQueueAll(e.target.checked)} className="accent-amber" />
+            <span className="text-sm text-ink">Queue all</span>
+          </label>
+          <label className="shrink-0">
+            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
+              Scan up to
+            </span>
+            <span className="flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={maxPages}
+                onChange={(e) => setMaxPages(Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
+                className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
+                title="Result pages per board, 25 jobs each. More pages = a bigger pool to rank from, and it's how tomorrow's sweep reaches past what you've already queued."
+              />
+              <span className="text-xs text-ink-dim">pages / board</span>
+            </span>
+          </label>
+          <label
+            className={clsx(
+              "flex min-w-0 flex-1 cursor-pointer items-start gap-2.5 rounded-lg border px-3 py-2.5 transition-colors",
+              skipEasyApply ? "border-amber/40 bg-amber/[0.04]" : "border-hairline bg-cockpit hover:border-ink-faint"
+            )}
+          >
+            <input
+              type="checkbox"
+              checked={skipEasyApply}
+              onChange={(e) => setSkipEasyApply(e.target.checked)}
+              className="mt-0.5 accent-amber"
+            />
+            <span className="min-w-0">
+              <span className="block text-sm text-ink">Skip board-only applications</span>
+              <span className="mt-0.5 block text-[11px] leading-snug text-ink-faint">
+                LinkedIn Easy Apply / Handshake Quick apply have no employer link, so Run can&apos;t drive them.
+                Applying to these automatically is planned — until then, untick to queue them for manual apply.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <label className="flex cursor-pointer items-center gap-2 text-sm text-ink-dim">
+          <input type="checkbox" checked={background} onChange={(e) => setBackground(e.target.checked)} className="accent-amber" />
+          Sweep in the background (unfocused tabs — you stay on this page)
+        </label>
 
         {/* The exact search that will run. This exists because a blank keyword box
             silently landed on LinkedIn's recommended feed — now you can always see
@@ -323,7 +474,14 @@ export function DiscoverPanel({ fieldOfStudy = "" }: { fieldOfStudy?: string }) 
                 <span className="font-mono text-ink">{locationLabel}</span>
                 {" · posted in the last "}
                 <span className="font-mono text-ink">{sinceDays}d</span>
+                {intern && <> · <span className="font-mono text-ink">internships only</span></>}
                 <span className="text-ink-faint"> — from {preview.derivedFrom}</span>
+              </p>
+              <p className="mt-1 text-ink-faint">
+                Scanning up to <span className="font-mono text-ink-dim">{maxPages * 25}</span> jobs per board, then queueing{" "}
+                {queueAll ? <span className="font-mono text-ink-dim">all</span> : <>the best <span className="font-mono text-ink-dim">{queueLimit}</span></>}{" "}
+                by how well they match, how fresh they are, and how few people have applied.
+                {!location.trim() && homeCountry && <> Location comes from your profile.</>}
               </p>
               {term && (
                 <p className="mt-1 text-ink-faint">
@@ -458,12 +616,42 @@ function DiscoverResult({ phase }: { phase: Extract<Phase, { s: "done" }> }) {
                     </span>
                     <span
                       className={clsx("inline-flex items-center gap-1", j.description ? "text-verified" : "text-amber")}
-                      title={j.description ? `Scraped from the posting (${j.descriptionSource})` : "Queued without a description"}
+                      title={
+                        j.description
+                          ? j.descriptionSource === "api"
+                            ? "Read straight from the board's own job record — no tab opened"
+                            : `Scraped from the posting (${j.descriptionSource})`
+                          : "Queued without a description"
+                      }
                     >
                       <FileText className="h-3 w-3" />
                       {j.description ? `${j.description.length.toLocaleString()} char JD` : "no JD"}
                     </span>
+                    {typeof j.applicants === "number" && (
+                      <span
+                        className={clsx("inline-flex items-center gap-1", j.applicants <= 50 ? "text-verified" : j.applicants >= 2000 ? "text-signal" : "")}
+                        title="How many people have already applied, according to the board."
+                      >
+                        <Users className="h-3 w-3" />
+                        {j.applicants.toLocaleString()} applied
+                      </span>
+                    )}
+                    {/* A board link means Run can't drive it — the same warning the
+                        queue shows, surfaced here where the choice is still fresh. */}
+                    {isBoardUrl(j.url) && (
+                      <span className="text-signal" title="Still a board link, not the employer's application page — Run can't drive it.">
+                        board link
+                      </span>
+                    )}
                   </div>
+                  {/* WHY this job ranked where it did. Shown because the sweep now
+                      queues only the best N: a ranking the operator can't inspect is
+                      a ranking they have to take on faith. */}
+                  {j.scoreReasons && j.scoreReasons.length > 0 && (
+                    <div className="mt-1 font-mono text-[10px] leading-relaxed text-ink-faint">
+                      <span className="text-ink-dim">#{(j.score ?? 0)}</span> · {j.scoreReasons.join(" · ")}
+                    </div>
+                  )}
                 </div>
                 <a
                   href={j.url}

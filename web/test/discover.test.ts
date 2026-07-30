@@ -150,10 +150,55 @@ test("describeSweep: explains WHY a sweep found few jobs, not just how many", ()
 });
 
 test("DISCOVER_DEFAULTS mirror the extension's caps", () => {
-  assert.equal(DISCOVER_DEFAULTS.sinceDays, extDiscover.DISCOVER_DEFAULTS.sinceDays);
-  assert.equal(DISCOVER_DEFAULTS.maxPerSource, extDiscover.DISCOVER_DEFAULTS.maxPerSource);
-  assert.equal(DISCOVER_DEFAULTS.maxTotal, extDiscover.DISCOVER_DEFAULTS.maxTotal);
-  assert.equal(DISCOVER_DEFAULTS.maxJdOpens, extDiscover.DISCOVER_DEFAULTS.maxJdOpens);
+  // EVERY key this module mirrors is compared, not a hand-picked four: the old
+  // version named only the original caps, so a new knob (maxPages / queueLimit /
+  // skipEasyApply) could diverge between the UI and the sweep with the lockstep
+  // suite still green — the UI would then promise a bound the sweep didn't apply.
+  for (const k of Object.keys(DISCOVER_DEFAULTS) as Array<keyof typeof DISCOVER_DEFAULTS>) {
+    assert.equal(
+      DISCOVER_DEFAULTS[k],
+      extDiscover.DISCOVER_DEFAULTS[k],
+      `DISCOVER_DEFAULTS.${k} drifted between web/lib/discover.ts and discover.js`
+    );
+  }
+  // And the caps the panel relies on must actually exist on the extension side.
+  for (const k of ["sinceDays", "maxPerSource", "maxTotal", "maxJdOpens", "maxPages", "queueLimit", "skipEasyApply"]) {
+    assert.ok(k in extDiscover.DISCOVER_DEFAULTS, `discover.js is missing DISCOVER_DEFAULTS.${k}`);
+  }
+});
+
+// ── The board search contracts — LOCKSTEP-adjacent regression guards ─────────
+// These live here (rather than only in the extension suite) because the web panel
+// is what promises the operator a filtered, sorted search. Both were traced on the
+// live signed-in boards on 2026-07-30.
+
+test("the LinkedIn page url emits ONLY the params the SDUI page keeps", () => {
+  const u = extDiscover.discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7, geoId: "103644278" });
+  assert.match(u, /keywords=intern/);
+  assert.match(u, /f_TPR=r604800/);
+  assert.match(u, /geoId=103644278/);
+  // Traced: the page REWRITES its url and discards these three. Emitting them made
+  // the sweep look sorted+located when it was neither.
+  assert.doesNotMatch(u, /sortBy=/);
+  assert.doesNotMatch(u, /[?&]location=/);
+  assert.doesNotMatch(u, /f_E=/);
+});
+
+test("the Handshake url only ever uses a REAL sort value", () => {
+  const u = extDiscover.discoverHandshakeSearchUrl({ keywords: "intern", internshipOnly: true });
+  assert.match(u, /sort=posted_date_desc/);
+  assert.match(u, /jobType=3/);
+  // An invented sort value is not ignored — Handshake renders its "Something went
+  // wrong" page and the source returns zero jobs.
+  assert.doesNotMatch(u, /created_at_desc/);
+});
+
+test("a LinkedIn geoId is required for the JSON search, and a place NAME is refused", () => {
+  // locationUnion:(locationName:…) returns HTTP 500, so a name must never be sent
+  // as though it were a geoId — that would break the source, not degrade it.
+  assert.ok(extDiscover.linkedInApiSearchUrl({ keywords: "i", geoId: "103644278" }));
+  assert.equal(extDiscover.linkedInApiSearchUrl({ keywords: "i", geoId: "Austin, Texas" }), "");
+  assert.equal(extDiscover.linkedInApiSearchUrl({ keywords: "i", geoId: "" }), "");
 });
 
 // ── buildDiscoverQuery / discoverTermLabel — LOCKSTEP with the extension ──────

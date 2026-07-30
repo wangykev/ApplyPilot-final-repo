@@ -316,8 +316,19 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           location: typeof message.location === "string" ? message.location : undefined,
           sinceDays: message.sinceDays,
           maxPerSource: message.maxPerSource,
-          maxTotal: message.maxTotal,
-          maxJdOpens: message.maxJdOpens,
+          // ⚠ Pass these through ONLY when the caller actually sent them. Object
+          // spread copies a key whose value is `undefined`, so forwarding an absent
+          // field OVERWRITES the DISCOVER_DEFAULTS entry with undefined — which is
+          // how `maxTotal` came to be silently inert (`slice(0, undefined)` returns
+          // everything, so the 60-job cap never applied on the website path).
+          ...(message.maxTotal != null ? { maxTotal: message.maxTotal } : {}),
+          ...(message.maxJdOpens != null ? { maxJdOpens: message.maxJdOpens } : {}),
+          ...(message.maxRecords != null ? { maxRecords: message.maxRecords } : {}),
+          // Scrape wide, queue narrow (2026-07-30): how many result pages to sweep,
+          // and how many of the best-matching to actually return for queueing.
+          ...(message.maxPages != null ? { maxPages: message.maxPages } : {}),
+          ...(message.queueLimit != null ? { queueLimit: message.queueLimit } : {}),
+          ...(message.skipEasyApply != null ? { skipEasyApply: message.skipEasyApply } : {}),
           background: message.background !== false, // sweep tabs open UNFOCUSED by default
         });
         sendResponse(out);
@@ -331,6 +342,31 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       }
     })();
     return true; // async sendResponse — a sweep takes as long as its tab opens
+  }
+
+  // RELOAD THE SERVICE WORKER — a DEVELOPMENT convenience (operator-approved 2026-07-30).
+  //
+  // WHY: editing an unpacked extension's files does NOT reload it; that needs a click on
+  // chrome://extensions, which no page and no automation can reach. During a build/verify
+  // loop that click is the slowest step in the cycle, so this lets the local dev site ask
+  // the worker to restart itself.
+  //
+  // SAFETY: `externally_connectable` already restricts every external message to
+  // `http://localhost/*` and `http://127.0.0.1/*`, so only a page served from this
+  // machine can send it. It takes no arguments, touches no data, and reads nothing —
+  // `chrome.runtime.reload()` restarts the worker and that is all. It is REFUSED while a
+  // run or a sweep is in flight, because tearing the worker down mid-walk would strand a
+  // CDP attach and abandon a half-filled application.
+  if (type === "AP_RELOAD") {
+    if (runInFlight || discoverInFlight) {
+      sendResponse({ ok: false, error: "busy", detail: "A run or sweep is in progress — not reloading mid-flight." });
+      return true;
+    }
+    console.log("[ApplyPilot] AP_RELOAD — restarting the service worker at the local site's request");
+    sendResponse({ ok: true, reloading: true });
+    // Let the response flush before the worker goes away.
+    setTimeout(() => { try { chrome.runtime.reload(); } catch (e) { /* nothing left to do */ } }, 150);
+    return true;
   }
 
   // DISCOVERY RECON (read-only). Opens each board's search page in the operator's real
@@ -681,11 +717,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           year: message.year,
           location: message.location,
           sinceDays: message.sinceDays,
-          maxJdOpens: message.maxJdOpens,
+          // Only when actually supplied — an `undefined` here would clobber the
+          // default it is meant to override (see the AP_DISCOVER_JOBS note).
+          ...(message.maxJdOpens != null ? { maxJdOpens: message.maxJdOpens } : {}),
+          ...(message.maxRecords != null ? { maxRecords: message.maxRecords } : {}),
+          ...(message.maxPages != null ? { maxPages: message.maxPages } : {}),
+          ...(message.queueLimit != null ? { queueLimit: message.queueLimit } : {}),
+          ...(message.skipEasyApply != null ? { skipEasyApply: message.skipEasyApply } : {}),
+          // The popup is the DRY-RUN path: no website ⇒ no knownKeys ⇒ nothing is
+          // filtered as already-applied, and nothing is queued.
           knownKeys: [],
+          background: message.background !== false,
         });
         console.log("[ApplyPilot][DISCOVER] popup sweep result (nothing was queued — no website connected):", JSON.stringify(out.stats), out.notes);
-        for (const j of out.jobs) console.log(`  · [${j.source}] ${j.company || "?"} — ${j.title || "?"} (${j.description ? j.description.length + " char JD" : "no JD"}) ${j.url}`);
+        for (const j of out.jobs) console.log(`  · [${j.source}] score ${j.score} · ${j.company || "?"} — ${j.title || "?"} (${j.description ? j.description.length + " char JD" : "no JD"}) ${j.url}  ← ${(j.scoreReasons || []).join("; ")}`);
         sendResponse(out);
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e) });
@@ -702,7 +747,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
       discoverInFlight = true;
-      try { sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query, field: message.field, intern: message.intern, location: message.location, sinceDays: message.sinceDays })); }
+      // `background` is honoured here too: recon must be verifiable in a BACKGROUND
+      // tab as well as the foreground (operator 2026-07-30), since that is how a
+      // real sweep runs. Defaults to unfocused, like the sweep.
+      try { sendResponse(await runDiscoverRecon({ sources: message.sources || undefined, query: message.query, field: message.field, intern: message.intern, location: message.location, sinceDays: message.sinceDays, background: message.background !== false })); }
       catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
       finally { discoverInFlight = false; }
     })();

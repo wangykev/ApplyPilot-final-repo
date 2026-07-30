@@ -30,6 +30,9 @@ const {
   DISCOVER_DEFAULTS,
   DISCOVER_DEFAULT_LOCATION,
 } = require("../discover.js");
+// The board-JSON contract + ranking helpers are reached through the module object
+// so this list doesn't have to grow every time one is added.
+const discoverMod = require("../discover.js");
 const { canonicalJobUrl } = require("../lib.js");
 
 const DAY = 86400e3;
@@ -390,19 +393,29 @@ test("summarizeDiscovery: tallies per source", () => {
   assert.deepEqual(s.bySource, { simplify: 2, linkedin: 1 });
 });
 
-test("discoverLinkedInSearchUrl: SOURCE-side recency (f_TPR), newest first, whole-country default", () => {
+// ── The LinkedIn SEARCH PAGE url ─────────────────────────────────────────────
+// TRACED 2026-07-30 on the live signed-in page: the SDUI jobs page REWRITES its
+// own url and keeps ONLY keywords / geoId / f_TPR. `location=` (free text),
+// `sortBy=` and `f_E=` are silently DISCARDED, so emitting them was worse than
+// useless — it read as "the search is sorted and located" when it was neither.
+
+test("discoverLinkedInSearchUrl: emits ONLY the params the SDUI page actually keeps", () => {
   const u = discoverLinkedInSearchUrl({ keywords: "software engineer intern", sinceDays: 7 });
   assert.ok(u.includes("f_TPR=r604800"), u); // 7 days in seconds
-  assert.ok(u.includes("sortBy=DD"), u);
   assert.ok(u.includes("keywords=software%20engineer%20intern"), u);
-  // No location given ⇒ the WHOLE COUNTRY, explicitly. Omitting the param lets a
-  // signed-in session silently centre the search on the profile's own city.
-  assert.ok(u.includes("location=United%20States"), u);
+  // The three the page throws away must NOT be sent — see the note above.
+  assert.ok(!u.includes("sortBy="), "sortBy is discarded by the page: " + u);
+  assert.ok(!/[?&]location=/.test(u), "free-text location is discarded by the page: " + u);
+  assert.ok(!u.includes("f_E="), "f_E is discarded by the page: " + u);
 });
 
-test("discoverLinkedInSearchUrl: an explicit location is honoured", () => {
-  const u = discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7, location: "Austin, Texas" });
-  assert.ok(u.includes("location=Austin%2C%20Texas"), u);
+test("discoverLinkedInSearchUrl: a resolved geoId is the ONLY location form it emits", () => {
+  const withGeo = discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7, geoId: "103644278" });
+  assert.ok(withGeo.includes("geoId=103644278"), withGeo);
+  // A place NAME is not a geoId and must never be smuggled in as one — the API
+  // returns HTTP 500 for a name, and the page ignores it.
+  const withName = discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7, geoId: "Austin, Texas" });
+  assert.ok(!withName.includes("geoId="), withName);
 });
 
 test("discoverLinkedInSearchUrl: REFUSES a keyword-less search (that URL is the RECOMMENDED feed)", () => {
@@ -415,13 +428,432 @@ test("discoverLinkedInSearchUrl: REFUSES a keyword-less search (that URL is the 
   assert.equal(discoverLinkedInSearchUrl({}), "");
 });
 
-test("discoverHandshakeSearchUrl: sorts newest-first, encodes the query, refuses empty", () => {
-  const u = discoverHandshakeSearchUrl({ keywords: "data intern", location: "" });
+test("discoverHandshakeSearchUrl: the TRACED page params, and a VALID sort value", () => {
+  const u = discoverHandshakeSearchUrl({ keywords: "data intern" });
   assert.ok(u.startsWith("https://app.joinhandshake.com/job-search"), u);
-  assert.ok(u.includes("sort=created_at_desc"), u);
   assert.ok(u.includes("query=data%20intern"), u);
-  assert.ok(u.includes("location=United%20States"), u);
+  assert.ok(u.includes("per_page=25"), u);
+  assert.ok(u.includes("page=1"), u);
+  // ⚠ REGRESSION GUARD. Handshake's sort vocabulary is a closed set read off its
+  // own <select>; an INVENTED value ("created_at_desc", which this used to send)
+  // does not get ignored — it renders Handshake's "Something went wrong" page and
+  // the sweep returns zero jobs. Only its real values may ever appear here.
+  assert.ok(u.includes("sort=posted_date_desc"), u);
+  assert.ok(!u.includes("created_at_desc"), "created_at_desc is NOT a Handshake sort value: " + u);
   assert.equal(discoverHandshakeSearchUrl({ keywords: "" }), "");
+});
+
+test("discoverHandshakeSearchUrl: internship filter + paging + the opaque location blob", () => {
+  const u = discoverHandshakeSearchUrl({ keywords: "intern", internshipOnly: true, page: 3, perPage: 25 });
+  assert.ok(u.includes("jobType=3"), u); // traced: 62,820 → 4,989 results
+  assert.ok(u.includes("page=3"), u);
+  // locationFilter is a JSON blob produced by Handshake's OWN typeahead; it is
+  // passed through verbatim (url-encoded) and never constructed here.
+  const blob = '{"id":"place.15042796","label":"Austin, Texas, United States","distance":"50mi"}';
+  const withLoc = discoverHandshakeSearchUrl({ keywords: "intern", locationFilter: blob });
+  assert.ok(withLoc.includes("locationFilter=" + encodeURIComponent(blob)), withLoc);
+});
+
+// ── The LinkedIn JSON search url ─────────────────────────────────────────────
+
+test("linkedInApiSearchUrl: RELEVANCE by default, and REQUIRES a numeric geoId", () => {
+  const u = discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "103644278", sinceDays: 1 });
+  assert.ok(u.includes("q=jobSearch"), u);
+  assert.ok(u.includes("timePostedRange:List(r86400)"), u);
+  assert.ok(u.includes("locationUnion:(geoId:103644278)"), u);
+
+  // ⚠ REGRESSION GUARD, and a mistake worth not repeating. `sortBy:List(DD)` DOES
+  // drop every promoted row, which made it look like a free win, so an earlier
+  // version had it permanently on. Live, it also destroys keyword relevance:
+  // "embedded software intern" came back as "EH&S Intern" / "Audit Intern" /
+  // "Finance Intern" — the newest internships of ANY kind. On relevance the same
+  // query returns Skydio, Anduril, Blue Origin avionics/embedded, Palantir.
+  // Promoted rows are handled by scoreDiscovery's penalty instead.
+  assert.ok(!u.includes("sortBy:List(DD)"), "date sort must NOT be the default: " + u);
+  const dated = discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "1", sortByDate: true });
+  assert.ok(dated.includes("sortBy:List(DD)"), "…but it stays available explicitly: " + dated);
+
+  // No geoId ⇒ no url at all. `locationUnion:(locationName:…)` returns HTTP 500,
+  // so guessing a name here would break the whole source rather than degrade it.
+  assert.equal(discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "" }), "");
+  assert.equal(discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "Austin" }), "");
+  assert.equal(discoverMod.linkedInApiSearchUrl({ keywords: "", geoId: "103644278" }), "");
+});
+
+test("discoverLinkedInSearchUrl: `start` paginates the rendered page", () => {
+  // Verified live: start=25 returns a DIFFERENT 25 postings and the param survives
+  // the page's url rewrite. This is what lets a later sweep reach past what's
+  // already queued instead of re-reading page 1 forever.
+  const p1 = discoverMod.discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7 });
+  assert.ok(!p1.includes("start="), "page 1 sends no start: " + p1);
+  const p2 = discoverMod.discoverLinkedInSearchUrl({ keywords: "intern", sinceDays: 7, start: 25 });
+  assert.ok(p2.includes("start=25"), p2);
+});
+
+test("linkedInApiSearchUrl: the internship filter and start/count paging", () => {
+  const intern = discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "1", internshipOnly: true });
+  assert.ok(intern.includes("experience:List(1)"), intern); // traced: 127 → 25 results
+  const plain = discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "1", internshipOnly: false });
+  assert.ok(!plain.includes("experience:List"), plain);
+  const p2 = discoverMod.linkedInApiSearchUrl({ keywords: "intern", geoId: "1", start: 25, count: 25 });
+  assert.ok(p2.includes("start=25") && p2.includes("count=25"), p2);
+  // count is clamped to what the endpoint actually serves.
+  assert.ok(discoverMod.linkedInApiSearchUrl({ keywords: "i", geoId: "1", count: 500 }).includes("count=25"));
+});
+
+test("linkedInApiDetailUrl / handshakeDetailPath: numeric ids only", () => {
+  assert.ok(discoverMod.linkedInApiDetailUrl("4445788818").includes("/jobPostings/4445788818"));
+  assert.equal(discoverMod.linkedInApiDetailUrl("not-an-id"), "");
+  assert.equal(discoverMod.linkedInApiDetailUrl(""), "");
+  assert.equal(discoverMod.handshakeDetailPath("11244161"), "/stu/jobs/11244161.json");
+  assert.equal(discoverMod.handshakeDetailPath("x"), "");
+});
+
+test("parseLinkedInGeoId: reads the token back off a LinkedIn url", () => {
+  // This is how the geo resolver gets its answer: picking a suggestion in
+  // LinkedIn's own location box rewrites the page url to carry geoId=<n>.
+  assert.equal(discoverMod.parseLinkedInGeoId("https://www.linkedin.com/jobs/search-results/?keywords=x&geoId=104472865&f_TPR=r86400"), "104472865");
+  assert.equal(discoverMod.parseLinkedInGeoId("https://www.linkedin.com/jobs/search-results/?keywords=x"), "");
+  assert.equal(discoverMod.parseLinkedInGeoId(""), "");
+});
+
+test("geoCacheKey: per-board, case/space insensitive", () => {
+  assert.equal(discoverMod.geoCacheKey("linkedin", "Austin,  Texas"), discoverMod.geoCacheKey("LinkedIn", "austin, texas"));
+  // The two boards' tokens are different things and must never share a slot.
+  assert.notEqual(discoverMod.geoCacheKey("linkedin", "Austin"), discoverMod.geoCacheKey("handshake", "Austin"));
+});
+
+// ── The board payload adapters ───────────────────────────────────────────────
+//
+// The fixtures below are TRIMMED COPIES OF REAL RECORDS captured from the
+// operator's signed-in session on 2026-07-30 (Draper/Intel on LinkedIn,
+// CampusMesh on Handshake) — the shapes, key names and nesting are verbatim. That
+// is the point: these tests fail if either board's payload contract drifts, which
+// is the failure mode that would otherwise show up as a silently empty sweep.
+
+const LI_CARD = {
+  jobCardUnion: {
+    jobPostingCard: {
+      jobPostingUrn: "urn:li:fsd_jobPosting:4446423890",
+      title: { text: "Embedded Software Engineer Intern - Fall 2026" },
+      primaryDescription: { text: "Redwood Materials" },
+      secondaryDescription: { text: "San Francisco, CA (On-site)" },
+      footerItems: [
+        { type: "LISTED_DATE", timeAt: 1785361537000 },
+        { type: "APPLICANT_COUNT_TEXT", text: { text: "Be an early applicant" } },
+      ],
+    },
+  },
+};
+
+test("linkedInCardToRaw: id from the urn, exact date from the TYPED footer", () => {
+  const raw = discoverMod.linkedInCardToRaw(LI_CARD);
+  assert.equal(raw.url, "https://www.linkedin.com/jobs/view/4446423890/");
+  assert.equal(raw.title, "Embedded Software Engineer Intern - Fall 2026");
+  assert.equal(raw.company, "Redwood Materials");
+  assert.equal(raw.location, "San Francisco, CA (On-site)");
+  // An EXACT epoch, not "10 hours ago" parsed backwards — the whole reason the
+  // JSON is preferred over the rendered card.
+  assert.equal(raw.postedAt, 1785361537000);
+  assert.equal(raw.earlyApplicant, true);
+  assert.equal(raw.promoted, false);
+  assert.equal(discoverMod.linkedInCardToRaw({}), null);
+  assert.equal(discoverMod.linkedInCardToRaw(null), null);
+});
+
+test("linkedInCardToRaw: PROMOTED is read off the footer, applicant counts parsed", () => {
+  const promoted = {
+    jobCardUnion: { jobPostingCard: {
+      jobPostingUrn: "urn:li:fsd_jobPosting:1", title: { text: "T" },
+      primaryDescription: { text: "C" }, secondaryDescription: { text: "L" },
+      footerItems: [{ type: "PROMOTED" }, { type: "APPLICANT_COUNT_TEXT", text: { text: "1,234 applicants" } }],
+    } },
+  };
+  const raw = discoverMod.linkedInCardToRaw(promoted);
+  assert.equal(raw.promoted, true);
+  assert.equal(raw.applicants, 1234);
+  assert.equal(raw.earlyApplicant, false);
+  assert.equal(raw.postedAt, null, "no LISTED_DATE ⇒ unknown, never 'now'");
+});
+
+test("linkedInFieldsFromLines: REGRESSION — a '(Verified job)' card must not shift every field", () => {
+  // All three fixtures are VERBATIM live card text (2026-07-30). Shape A is the one
+  // that broke: consecutive-dedupe left the a11y summary in place, so company took
+  // the title's value and location took the company's — wrong data that still
+  // looked plausible, on 2 of the first 5 cards.
+  const A = ["Software Algorithm Embedded Intern (Verified job)", "Software Algorithm Embedded Intern", "STMicroelectronics", "Santa Clara, CA", "Viewed", "·", "Posted 2 days ago", "2 days ago"];
+  const B = ["AI Software Engineering Intern", "AI Software Engineering Intern", "Intel", "Hillsboro, OR (Hybrid)", "6 school alumni work here", "Be an early applicant"];
+  const C = ["Embedded Software Engineer Intern - Fall 2026", "Redwood Materials", "San Francisco, CA (On-site)", "Be an early applicant", "·", "Posted 12 hours ago"];
+
+  assert.deepEqual(discoverMod.linkedInFieldsFromLines(A), {
+    title: "Software Algorithm Embedded Intern", company: "STMicroelectronics", location: "Santa Clara, CA",
+  });
+  assert.deepEqual(discoverMod.linkedInFieldsFromLines(B), {
+    title: "AI Software Engineering Intern", company: "Intel", location: "Hillsboro, OR (Hybrid)",
+  });
+  assert.deepEqual(discoverMod.linkedInFieldsFromLines(C), {
+    title: "Embedded Software Engineer Intern - Fall 2026", company: "Redwood Materials", location: "San Francisco, CA (On-site)",
+  });
+  // The invariant that catches this class of bug generically, whatever the suffix:
+  // the company can never legitimately equal the title.
+  for (const f of [A, B, C].map(discoverMod.linkedInFieldsFromLines)) {
+    assert.notEqual(f.company, f.title, "field shift: company === title");
+    assert.ok(f.company, "company must not be empty");
+  }
+});
+
+test("linkedInFieldsFromLines: degenerate input never throws", () => {
+  assert.deepEqual(discoverMod.linkedInFieldsFromLines([]), { title: "", company: "", location: "" });
+  assert.deepEqual(discoverMod.linkedInFieldsFromLines(null), { title: "", company: "", location: "" });
+  // A single-line card yields a title and nothing invented for the rest.
+  assert.deepEqual(discoverMod.linkedInFieldsFromLines(["Only A Title"]), { title: "Only A Title", company: "", location: "" });
+});
+
+test("linkedInDetailToPatch: OffsiteApply yields the EMPLOYER's real url", () => {
+  // Verbatim shape of the real Intel record — the url is a Workday /apply link,
+  // which is exactly what the Run pipeline needs and what a linkedin.com url isn't.
+  const patch = discoverMod.linkedInDetailToPatch({
+    title: "AI Software Engineering Intern",
+    formattedLocation: "Hillsboro, OR",
+    listedAt: 1785323407000,
+    jobState: "LISTED",
+    applies: 42,
+    formattedEmploymentStatus: "Part-time",
+    description: { text: "Come build things." },
+    applyMethod: {
+      "com.linkedin.voyager.jobs.OffsiteApply": {
+        companyApplyUrl: "https://intel.wd1.myworkdayjobs.com/External/job/US-Oregon-Hillsboro/AI-Software-Engineering-Intern_JR0282639/apply",
+      },
+    },
+    companyDetails: {
+      "com.linkedin.voyager.deco.jobs.web.shared.WebJobPostingCompany": { companyResolutionResult: { name: "Intel" } },
+    },
+  });
+  assert.equal(patch.ok, true);
+  assert.equal(patch.applyKind, "external");
+  assert.ok(patch.applyUrl.includes("intel.wd1.myworkdayjobs.com"));
+  assert.equal(patch.company, "Intel");
+  assert.equal(patch.applicants, 42);
+  assert.equal(patch.closed, false);
+  // …and the resolved url keys the SAME as the tracker row written after applying,
+  // which is what makes cross-table "already applied" work.
+  assert.equal(discoveryJobKey(patch.applyUrl), canonicalJobUrl(patch.applyUrl));
+});
+
+test("linkedInDetailToPatch: Easy Apply is the union KEY, not a text match", () => {
+  // The old code sniffed the rendered page for /easy apply/. The union key is
+  // authoritative and can't be confused by surrounding copy.
+  for (const key of ["com.linkedin.voyager.jobs.ComplexOnsiteApply", "com.linkedin.voyager.jobs.SimpleOnsiteApply"]) {
+    const patch = discoverMod.linkedInDetailToPatch({ jobState: "LISTED", applyMethod: { [key]: {} } });
+    assert.equal(patch.applyKind, "easy", key);
+    assert.equal(patch.applyUrl, "", "a board-only application has NO employer url to save");
+  }
+  assert.equal(discoverMod.linkedInDetailToPatch({ jobState: "LISTED", applyMethod: {} }).applyKind, "unknown");
+});
+
+test("linkedInDetailToPatch: anything but LISTED is closed (never queue a dead posting)", () => {
+  assert.equal(discoverMod.linkedInDetailToPatch({ jobState: "CLOSED" }).closed, true);
+  assert.equal(discoverMod.linkedInDetailToPatch({ jobState: "SUSPENDED" }).closed, true);
+  assert.equal(discoverMod.linkedInDetailToPatch({ jobState: "LISTED", closed: true }).closed, true);
+  assert.equal(discoverMod.linkedInDetailToPatch({ jobState: "LISTED" }).closed, false);
+});
+
+test("handshakeDetailToPatch: the apply link comes from job_apply_setting", () => {
+  // VERBATIM shape of the real Tudor Investment record (2026-07-30). Note that
+  // `use_external_apply_link` is false and `external_apply_link` is null on this
+  // very posting even though it plainly applies offsite — see the next test.
+  const patch = discoverMod.handshakeDetailToPatch({
+    job: {
+      id: 11242894, title: "AI Engineering Summer Internship 2027",
+      employer_name: "Tudor Investment Corporation",
+      text_description: "Build models.",
+      location_names: ["New York, New York, United States"],
+      created_at: "2026-07-27T10:11:25.655-07:00",
+      applications_count: 51,
+      job_type: { name: "Internship" },
+      use_external_apply_link: false,
+      external_apply_link: null,
+      job_apply_setting: {
+        apply_type: "external",
+        external_apply_type: "url",
+        external_url: "https://job-boards.greenhouse.io/2027internshipai/jobs/8088962",
+        additional_instructions: "Please apply using the external link only. Resumes received via Handshake only will not be reviewed.",
+      },
+    },
+  });
+  assert.equal(patch.ok, true);
+  assert.equal(patch.applyKind, "external");
+  assert.equal(patch.applyUrl, "https://job-boards.greenhouse.io/2027internshipai/jobs/8088962");
+  assert.equal(patch.applyVia, "job_apply_setting.external_url");
+  assert.equal(patch.company, "Tudor Investment Corporation");
+  assert.equal(patch.applicants, 51);
+  // The employer's "apply via the link ONLY" instruction must survive to the queue.
+  assert.match(patch.applyNote, /external link only/i);
+});
+
+test("handshakeDetailToPatch: REGRESSION — the legacy external_apply_link pair is not the source of truth", () => {
+  // ⚠ This pins a near-miss. Across 30 live postings `use_external_apply_link` was
+  // false and `external_apply_link` null on EVERY one — including the 10 that do
+  // apply offsite. Reading only that pair reported "0% of Handshake jobs have an
+  // employer link" and would have silently reduced Handshake to zero queued jobs
+  // once board-only postings are skipped. job_apply_setting must win.
+  const legacyBlank = discoverMod.handshakeDetailToPatch({
+    job: {
+      id: 1, title: "T", employer_name: "E", text_description: "d",
+      use_external_apply_link: false, external_apply_link: null,
+      job_apply_setting: { apply_type: "external", external_url: "https://grnh.se/abc123" },
+    },
+  });
+  assert.equal(legacyBlank.applyKind, "external", "job_apply_setting must be believed over the legacy pair");
+  assert.equal(legacyBlank.applyUrl, "https://grnh.se/abc123");
+
+  // The legacy pair is still honoured when it IS populated and the setting isn't.
+  const legacyOnly = discoverMod.handshakeDetailToPatch({
+    job: { id: 1, title: "T", use_external_apply_link: true, external_apply_link: "https://jobs.lever.co/x/y" },
+  });
+  assert.equal(legacyOnly.applyKind, "external");
+  assert.equal(legacyOnly.applyVia, "external_apply_link (legacy)");
+});
+
+test("handshakeDetailToPatch: apply_type handshake ⇒ Quick apply; external-without-url ⇒ unknown", () => {
+  // 18 of the 30 sampled live postings are genuinely Quick-apply-only: the
+  // application happens ON Handshake, so no employer url exists to save.
+  const quick = discoverMod.handshakeDetailToPatch({
+    job: { id: 1, title: "T", employer_name: "E", text_description: "d", job_apply_setting: { apply_type: "handshake", external_url: "" } },
+  });
+  assert.equal(quick.applyKind, "easy");
+  assert.equal(quick.applyUrl, "");
+
+  // "external" with a BLANK url is a real state (link left empty / email apply).
+  // It must not be called an employer link we don't have, nor a Quick apply — both
+  // would be false; it is simply unresolved.
+  const broken = discoverMod.handshakeDetailToPatch({
+    job: { id: 1, title: "T", job_apply_setting: { apply_type: "external", external_url: "" } },
+  });
+  assert.equal(broken.applyKind, "unknown");
+  assert.equal(broken.applyUrl, "");
+  // A non-http value is not a link either.
+  const mailto = discoverMod.handshakeDetailToPatch({
+    job: { id: 1, title: "T", job_apply_setting: { apply_type: "external", external_url: "mailto:jobs@x.com" } },
+  });
+  assert.equal(mailto.applyKind, "unknown");
+});
+
+test("handshakeDetailToPatch: archived/hidden/not-postable are all closed; HTML falls back", () => {
+  const mk = (over) => discoverMod.handshakeDetailToPatch({ job: { id: 1, title: "T", ...over } });
+  assert.equal(mk({ archived: true }).closed, true);
+  assert.equal(mk({ hidden: true }).closed, true);
+  assert.equal(mk({ is_postable: false }).closed, true);
+  assert.equal(mk({}).closed, false);
+  // text_description missing ⇒ strip the HTML description rather than losing the JD.
+  const html = mk({ description: "<p>Hello <b>world</b></p>" });
+  assert.equal(html.description, "Hello world");
+  assert.equal(discoverMod.handshakeDetailToPatch({}).ok, false);
+});
+
+// ── Cross-source dedup (the "no overlaps" requirement) ──────────────────────
+
+test("dedupeCrossSource: the SAME job on two boards under different employer links queues ONCE", () => {
+  // MEASURED, not hypothetical: Simplify carries the full Greenhouse url for Redwood
+  // Materials' embedded intern posting while LinkedIn's companyApplyUrl for the very
+  // same posting is a Greenhouse SHORTLINK, so their keys can never agree and the job
+  // would otherwise be queued twice.
+  const simplify = { source: "simplify", company: "Redwood Materials", title: "Embedded Software Engineer Intern", jobKey: "greenhouse:redwoodmaterials:6126784004" };
+  const linkedin = { source: "linkedin", company: "Redwood Materials", title: "Embedded Software Engineer Intern", jobKey: "https://grnh.se/2fwkl2zj4us" };
+  assert.notEqual(simplify.jobKey, linkedin.jobKey, "the premise: key dedup cannot catch this");
+
+  const { kept, dropped } = discoverMod.dedupeCrossSource([simplify, linkedin]);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].source, "simplify", "first source wins, so it's deterministic");
+  assert.equal(dropped.length, 1);
+  assert.equal(dropped[0].keptFrom, "simplify", "the drop is attributable, so it can be reported");
+});
+
+test("dedupeCrossSource: WITHIN one source, an identical title is a REAL second posting", () => {
+  // The case that makes a bare company+title dedup unsafe in general — and why this one
+  // is cross-source only. LinkedIn genuinely lists these as two distinct postings.
+  const a = { source: "linkedin", company: "Neuralink", title: "Embedded Software Engineer Intern, Implant Embedded Systems", location: "San Francisco, CA", jobKey: "linkedin:4416595271" };
+  const b = { source: "linkedin", company: "Neuralink", title: "Embedded Software Engineer Intern, Implant Embedded Systems", location: "South San Francisco, CA", jobKey: "linkedin:4416594316" };
+  const { kept, dropped } = discoverMod.dedupeCrossSource([a, b]);
+  assert.equal(kept.length, 2, "both must survive — they are different jobs");
+  assert.equal(dropped.length, 0);
+});
+
+test("dedupeCrossSource: sparse rows never collapse into each other", () => {
+  // Without both fields there is no evidence of sameness, so nothing may be dropped.
+  const rows = [
+    { source: "simplify", company: "", title: "", jobKey: "a" },
+    { source: "linkedin", company: "", title: "", jobKey: "b" },
+    { source: "handshake", company: "Acme", title: "", jobKey: "c" },
+    { source: "linkedin", company: "", title: "Intern", jobKey: "d" },
+  ];
+  assert.equal(discoverMod.dedupeCrossSource(rows).kept.length, 4);
+  assert.equal(discoverMod.crossSourceKey({ company: "Acme", title: "" }), "");
+  assert.equal(discoverMod.crossSourceKey({ company: "", title: "Intern" }), "");
+});
+
+test("crossSourceKey: punctuation and casing don't defeat the match", () => {
+  const a = discoverMod.crossSourceKey({ company: "Redwood Materials", title: "Embedded Software Engineer Intern" });
+  const b = discoverMod.crossSourceKey({ company: "redwood  materials", title: "Embedded / Software Engineer Intern" });
+  assert.equal(a, b);
+  // …but a genuinely different title still differs.
+  assert.notEqual(a, discoverMod.crossSourceKey({ company: "Redwood Materials", title: "Mechanical Engineer Intern" }));
+});
+
+// ── Best-match ranking ──────────────────────────────────────────────────────
+
+test("scoreDiscovery: a title match beats a body mention", () => {
+  const opts = { keywords: "embedded software", nowMs: NOW, intern: false };
+  const inTitle = discoverMod.scoreDiscovery({ title: "Embedded Software Intern", description: "" }, opts);
+  const inBody = discoverMod.scoreDiscovery({ title: "Analyst", description: "some embedded software here" }, opts);
+  assert.ok(inTitle.score > inBody.score, `${inTitle.score} !> ${inBody.score}`);
+  assert.ok(inTitle.reasons.join(" ").includes("title matches"));
+});
+
+test("scoreDiscovery: low competition outranks a crowded posting", () => {
+  const opts = { keywords: "intern", nowMs: NOW };
+  const quiet = discoverMod.scoreDiscovery({ title: "SWE Intern", applicants: 6, postedAt: NOW }, opts);
+  const mobbed = discoverMod.scoreDiscovery({ title: "SWE Intern", applicants: 43106, postedAt: NOW }, opts);
+  assert.ok(quiet.score > mobbed.score, `${quiet.score} !> ${mobbed.score}`);
+  assert.ok(mobbed.reasons.join(" ").includes("crowded"));
+});
+
+test("scoreDiscovery: a Run-drivable employer link beats a board-only application", () => {
+  const opts = { keywords: "intern", nowMs: NOW };
+  const drivable = discoverMod.scoreDiscovery(
+    { title: "Intern", url: "https://x.wd1.myworkdayjobs.com/a/job/b_R1/apply", applyResolved: true, applyKind: "external" }, opts);
+  const boardOnly = discoverMod.scoreDiscovery(
+    { title: "Intern", url: "https://www.linkedin.com/jobs/view/1/", applyKind: "easy" }, opts);
+  assert.ok(drivable.score > boardOnly.score, `${drivable.score} !> ${boardOnly.score}`);
+});
+
+test("scoreDiscovery: fresher wins, and a promoted listing is penalised", () => {
+  const opts = { keywords: "intern", nowMs: NOW };
+  const fresh = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW - 3600e3 }, opts);
+  const old = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW - 20 * DAY }, opts);
+  assert.ok(fresh.score > old.score);
+  const plain = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW }, opts);
+  const promoted = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW, promoted: true }, opts);
+  assert.ok(promoted.score < plain.score, "a paid placement is not a relevance signal");
+});
+
+test("pickBestJobs: keeps the best N and RETURNS the rest (no silent narrowing)", () => {
+  const jobs = [
+    { title: "Unrelated Manager", postedAt: NOW - 10 * DAY },
+    { title: "Embedded Software Intern", postedAt: NOW, applicants: 3 },
+    { title: "Software Intern", postedAt: NOW - DAY },
+  ];
+  const opts = { keywords: "embedded software", nowMs: NOW };
+  const { kept, dropped } = discoverMod.pickBestJobs(jobs, 1, opts);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].title, "Embedded Software Intern");
+  // The caller MUST be able to report what it left behind — that's what stops a
+  // narrowing from looking like "the sweep found nothing".
+  assert.equal(dropped.length, 2);
+  assert.ok(kept[0].score > 0 && Array.isArray(kept[0].scoreReasons) && kept[0].scoreReasons.length);
+  // 0 / blank / oversized ⇒ keep everything.
+  assert.equal(discoverMod.pickBestJobs(jobs, 0, opts).kept.length, 3);
+  assert.equal(discoverMod.pickBestJobs(jobs, 99, opts).dropped.length, 0);
 });
 
 test("DISCOVER_DEFAULTS: every expensive knob is bounded by default", () => {

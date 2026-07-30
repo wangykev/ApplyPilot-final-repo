@@ -2465,3 +2465,149 @@ Operator-supplied DOM for three fields on the cat.wd5/solarturbines flow:
   anything inside a repeating entry), and they surface as `consent.<key>` records flagged
   `consent-checkbox`, **left UNCHECKED** — an optional consent, especially a marketing one, is the
   operator's to give; the record just makes it visible with its full text.
+
+## 2026-07-30 — LinkedIn's SDUI jobs rewrite + Handshake, both traced on the operator's live session
+
+The first time either board was read from a real signed-in session. Both discovery
+list scrapers shipped "structure-first" (written blind, because an authenticated
+session wasn't available at build time) and this is the trace that was supposed to
+tighten them. It refuted them instead.
+
+### LinkedIn: every previous selector reads ZERO
+
+All ~30 selectors in the old LinkedIn scrapers matched nothing on a normal signed-in
+results page. This is a rewrite, not drift:
+
+- **Result cards are not anchors.** A 25-result page contained exactly ONE
+  `a[href*="/jobs/view/"]`, and it wasn't on a card. The old identity anchor ("every
+  row carries a posting link, walk up from it") no longer exists.
+- **Cards are `div[role="button"][tabindex="0"]`** with **no anchor inside at all**.
+- **Every class is a rotating build hash** (`_778a8c0c`, `c1b80624`, `_620c85ec`), so
+  a class-based ladder is unfixable in principle rather than merely stale.
+- The page is **server-driven UI**: `data-sdui-screen="com.linkedin.sdui.flagshipnav.jobs.SemanticJobDetails"`,
+  `data-component-type="LazyColumn"`, `data-testid="lazy-column"` (a virtualized list).
+
+**THE STABLE ANCHOR — `componentkey`.** LinkedIn keeps semantic `componentkey`
+attributes alongside the hashed classes, and the card's carries the job id:
+
+    div[componentkey="job-card-component-ref-4445788818"]
+
+Verified 25/25 unique ids off a 25-result page. Same convention elsewhere on the page:
+`JobsSearchFilters`, `SearchResults_SearchTyahInputRef`, `semanticSearchBox`,
+`LocationTypeahead_TextEditor`, `semanticSearchBoxLocationList`. **`componentkey` is
+the thing to key on for this UI.** (The attribute appears on the card AND an inner
+wrapper, so take the node with the longest text per id.)
+
+**Card fields come from reading order, and there are THREE shapes.** No per-field
+selectors survive, so title/company/location are the card's text lines — but the
+leading a11y summary line varies:
+
+    A  ["Title (Verified job)", "Title", "Company", "Location", ...]   <- verified postings
+    B  ["Title",                "Title", "Company", "Location", ...]
+    C  ["Title",                         "Company", "Location", ...]
+
+A plain consecutive-dedupe handles B and C but **not A** — `"Title (Verified job)"`
+isn't byte-equal to `"Title"` — which shifted every field by one on exactly the
+verified postings: company took the title's value, location took the company's. Wrong
+data that still looks plausible. Strip the decoration FIRST, then dedupe, then drop a
+leading line that is merely a longer form of the next (`linkedInFieldsFromLines`,
+regression-pinned against all three real fixtures).
+
+### LinkedIn: the SEARCH PAGE DISCARDS most of its own URL params
+
+Navigating with `location=`, `sortBy=` or `f_E=` and then re-reading the URL shows the
+page has **rewritten it and dropped them**. Only `keywords`, `geoId`, `f_TPR`,
+`currentJobId` and `start` survive. So the old builder — which sent free-text
+`location` + `sortBy=DD` — had been running an **unsorted, unlocated** search all
+along, silently. `start=25` IS honoured and returns a different 25 postings, which is
+what makes deeper daily sweeps possible.
+
+### Both boards expose the JSON their own front-end runs on
+
+Read from inside a tab on that board, so same-origin with the operator's own cookies.
+
+**LinkedIn search** — `voyager/api/voyagerJobsDashJobCards?q=jobSearch`, filters as
+`selectedFilters:(...)`. Verified effects: `timePostedRange:List(r<secs>)`;
+`experience:List(1)` = Internship (127 -> 25 results, all genuine interns/co-ops);
+`jobType:List(I)` (8, over-filters); `workplaceType:List(2)` = Remote (22);
+`locationUnion:(geoId:<n>)` **requires a numeric geoId — `locationName:` returns HTTP
+500**; `start`/`count` paginate against a real `paging.total`.
+
+WARNING — **`sortBy:List(DD)` destroys keyword relevance.** It does drop every promoted
+row (all `promoted:false`), which looks like a free win — but date-sorted, "embedded
+software intern" returns *EH&S Intern*, *Audit Intern*, *Finance Intern*: the newest
+internships of ANY kind. On relevance the same query returns Skydio, Anduril, Blue
+Origin avionics/embedded, Palantir. Use relevance and penalise promoted rows instead.
+Note also that the page's own search is LinkedIn's newer **semantic** search and beats
+the keyword API for the same words (STMicroelectronics / Neuralink / Intel / Redwood),
+which is why the page is the primary search substrate and the JSON is the fallback.
+
+**LinkedIn detail** — `voyager/api/jobs/jobPostings/<id>`: `applyMethod` is a TYPED
+union whose KEY says everything — `...OffsiteApply` carries **`companyApplyUrl`, the
+employer's real application page** (verified across Workday, Greenhouse `grnh.se`,
+Lever, UltiPro, Oracle Cloud), while `...ComplexOnsiteApply`/`...SimpleOnsiteApply` mean
+Easy Apply, i.e. no employer url exists. Also `listedAt` (exact epoch ms), `jobState`
+(`LISTED` while live), `description.text`, `applies` (applicant count), `expireAt`.
+
+**Handshake** keeps SEMANTIC `data-hook` attributes, and the card's carries the id:
+
+    [data-hook="job-result-card | 11243659"]
+
+plus `job-result-card-footer` ("Remote / New" / "Promoted / Pittsburgh, PA + 2 / 2wk
+ago"), `job-hide-button-<id>`, `job-search-filters`,
+`job-search-results-status-announcer`. Its cards ARE anchors (`a[href*="/job-search/<id>"]`,
+25 per page). **Its JSON posting index (`/stu/postings.json`) IGNORES every filter
+param** (the total never moves off 62,820 whatever you send), so the PAGE is the only
+thing that can run a search. Page params traced: `query`, `jobType=3` (Internship;
+62,820 -> 4,989), `per_page`, `page`, `sort`, `locationFilter`. WARNING — **`sort` is a
+CLOSED set**: `relevance`, `application_deadline_asc/desc`, `posted_date_desc`,
+`posted_date_asc`. An invented value is NOT ignored: it renders Handshake's "Something
+went wrong. Please try again." page and the source returns zero.
+
+**Handshake detail** — `/stu/jobs/<id>.json` (110 fields): `text_description` (plain
+text JD), `created_at`, `applications_count`, `archived`/`hidden`/`is_postable`,
+`job_type`, `location_names`, `promoted_job`.
+
+WARNING — **THE APPLY LINK IS IN `job_apply_setting`, NOT `external_apply_link`.** The
+record has both, and the obvious-looking pair
+`use_external_apply_link`/`external_apply_link` is LEGACY: across 30 live postings it
+was `false`/`null` on **every single one**, including postings that plainly apply
+offsite. Reading it concluded "0% of Handshake jobs have an employer link" — which
+would have silently reduced the whole source to nothing once board-only postings are
+skipped. The authoritative config is nested:
+
+    job_apply_setting: { apply_type: "handshake" | "external", external_url,
+                         external_apply_type, additional_instructions }
+
+Read that way, 10 of the same 30 (33%) carry a real employer link — Greenhouse,
+Workday (`austintexas.wd5.myworkdayjobs.com`), Google Careers, Paylocity, Tesla — and
+`additional_instructions` sometimes says "apply using the external link only; resumes
+received via Handshake will not be reviewed", which is worth keeping.
+
+### The location box needs TRUSTED input, and is not an `<input>`
+
+Neither board's location token can be constructed: LinkedIn needs a numeric `geoId`,
+Handshake a JSON place blob (`{"id":"place.15042796","label":"Austin, Texas, United
+States","point":"30.268072,-97.742806","distance":"50mi"}`). Both are produced only by
+that board's own typeahead, and LinkedIn's runs through an **opaque RSC server action**
+(`/flagship-web/rsc-action/actions/server-request`, build-specific ids) so it can't be
+called directly. So the resolver drives the real control — and three things bite:
+
+1. **SYNTHETIC EVENTS DO NOT OPEN LINKEDIN'S LOCATION PANEL.** `el.click()`, a full
+   pointerdown->mousedown->pointerup->mouseup->click sequence *with*
+   pointerId/isPrimary/detail, Enter-on-focus, and clicking the inner child ALL left it
+   closed. Trusted CDP `Input.*` works. Same lesson already recorded for the Workday
+   auth form — some surfaces only register trusted events.
+2. **LinkedIn's box is a contenteditable div, not an input:**
+   `div[componentkey="LocationTypeahead_TextEditor"][contenteditable="true"][role="textbox"]`
+   — so every `querySelectorAll('input')` strategy found nothing while the box was
+   plainly open on screen. Handshake's IS a real
+   `input[placeholder="Search by city, state, or zip code"]`.
+3. **Suggestions carry NO `role="option"`/`role="listbox"`.** They are `<a>` rows inside
+   `div[componentkey="semanticSearchBoxLocationList"]`. A role-based scan returns zero
+   while five suggestions are visible; the row selector must include `a`.
+
+Selecting a suggestion rewrites the board's own URL with the token — verified
+`geoId=104472865` for "Austin, Texas, United States" and `geoId=104116203` for
+"Seattle, Washington, United States" (pill "Seattle, WA (50 mi)") — so the resolver
+reads its answer off the URL and caches it per (board, text).
