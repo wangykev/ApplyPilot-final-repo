@@ -27,9 +27,29 @@ export type DiscoveredJob = {
   postedText: string;
   postedUnknown: boolean;
   description: string;
-  /** "list" (came with the row) | "page" (we opened the posting) | "" */
+  /** "list" (came with the row) | "pane" (read in-page) | "page" (opened it) | "" */
   descriptionSource: string;
+  /**
+   * `url` always holds the BEST known link. For a board find it is REWRITTEN to the
+   * employer's real application URL when the posting exposes one, because the Run
+   * pipeline drives Workday/Greenhouse/etc. and cannot drive a board url.
+   * `boardUrl` remembers where the job was found; `applyKind` distinguishes
+   * "LinkedIn Easy Apply, so no employer link EXISTS" from "we couldn't find it".
+   */
+  boardUrl?: string;
+  applyKind?: string;
+  applyResolved?: boolean;
 };
+
+/** Is this a job-BOARD link rather than an employer/ATS one? Lockstep with discover.js. */
+export function isBoardUrl(u: string): boolean {
+  try {
+    const h = new URL(String(u)).hostname.toLowerCase();
+    return /(^|\.)linkedin\.com$/.test(h) || /joinhandshake\.com$/.test(h);
+  } catch {
+    return false;
+  }
+}
 
 /** Per-sweep tallies the extension reports, surfaced in the result panel. */
 export type DiscoverStats = {

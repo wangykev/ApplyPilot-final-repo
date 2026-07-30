@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import {
   discoveryJobKey, toQueueRow, describeSweep, DISCOVER_DEFAULTS,
-  buildDiscoverQuery, discoverTermLabel, DISCOVER_DEFAULT_LOCATION, DISCOVER_CYCLES,
+  buildDiscoverQuery, discoverTermLabel, DISCOVER_DEFAULT_LOCATION, DISCOVER_CYCLES, isBoardUrl,
 } from "../lib/discover";
 import { canonicalJobUrl } from "../lib/job-key";
 
@@ -214,4 +214,38 @@ test("describeSweep reports in-page reads separately from reader-tab reads", () 
   });
   assert.match(s, /8 descriptions read without opening a tab/);
   assert.match(s, /2 of 2 read in the reader tab/);
+});
+
+test("isBoardUrl is LOCKSTEP with the extension's copy", () => {
+  // The queue badge ("board link") and the extension's rewrite decision must agree
+  // on which links are wrappers, or the UI would mislabel what Run can drive.
+  const cases = [
+    "https://www.linkedin.com/jobs/view/4123456789/",
+    "https://app.joinhandshake.com/jobs/987",
+    "https://costar.wd1.myworkdayjobs.com/x/job/Y_R37008",
+    "https://boards.greenhouse.io/acme/jobs/1",
+    "https://jobs.ashbyhq.com/mercor/abc",
+    "not a url",
+    "",
+  ];
+  for (const u of cases) {
+    assert.equal(isBoardUrl(u), extDiscover.isBoardUrl(u), `disagreement for ${JSON.stringify(u)}`);
+  }
+});
+
+test("toQueueRow saves whatever url the sweep resolved — the REAL link when there is one", () => {
+  // The operator's ask. After the JD pass rewrites a LinkedIn find to the employer's
+  // application URL, that is what must land in the queue, keyed by the ATS key.
+  const row = toQueueRow({
+    source: "linkedin",
+    url: "https://costar.wd1.myworkdayjobs.com/x/job/Y_R37008",
+    boardUrl: "https://www.linkedin.com/jobs/view/4123456789/",
+    title: "Technology Intern",
+    company: "CoStar",
+    applyResolved: true,
+  } as never);
+  assert.ok(row);
+  assert.equal(row!.url, "https://costar.wd1.myworkdayjobs.com/x/job/Y_R37008");
+  assert.equal(row!.job_key, "wd1:r37008", "keyed by the employer requisition, not the board id");
+  assert.equal(isBoardUrl(row!.url), false);
 });

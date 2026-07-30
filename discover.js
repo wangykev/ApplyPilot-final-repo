@@ -358,6 +358,12 @@ function normalizeDiscoveredJob(raw, source, nowMs) {
     postedUnknown: postedAt == null,
     description: text.slice(0, 20000),
     descriptionSource: text ? String(raw.descriptionSource || "list") : "",
+    // Apply-link resolution (filled in by the JD pass). `url` always holds the
+    // BEST known link — rewritten to the employer's real application URL when the
+    // posting exposes one — and `boardUrl` remembers where we found it.
+    boardUrl: "",
+    applyKind: "",       // "easy" | "external" | "unknown" (LinkedIn only)
+    applyResolved: false, // true once `url` is the employer's, not the board's
   };
 }
 
@@ -651,6 +657,79 @@ async function scrapeLinkedInDetailInPage(jobId, previousText) {
     return best;
   };
 
+  // ── The EMPLOYER's real application URL ─────────────────────────────────────
+  // The operator needs the ACTUAL job link, not linkedin.com/jobs/view/<id>: the
+  // Run pipeline drives Workday/Greenhouse/etc., and a LinkedIn URL is useless to
+  // it. Extracted PASSIVELY — we never click the apply button, because on LinkedIn
+  // that can mark the posting as "applied" when it hasn't been.
+  //
+  // Only apply-button containers and LinkedIn's own applyUrl blob are searched.
+  // Deliberately NOT the description text: it routinely contains company links
+  // ("learn more at acme.com") that are not the application.
+  const isLinkedInHost = (h) => /(^|\.)linkedin\.com$/i.test(h || "");
+  const decodeRedirect = (raw) => {
+    // LinkedIn wraps offsite links as …?url=<encoded>. Unwrap one level.
+    try {
+      const u = new URL(raw, location.href);
+      const inner = u.searchParams.get("url") || u.searchParams.get("targetUrl");
+      if (inner && /^https?:\/\//i.test(inner)) return inner;
+      return raw;
+    } catch (e) { return raw; }
+  };
+  const readApply = () => {
+    // 1. LinkedIn's own applyUrl blob (a JSON string) — the cleanest source when present.
+    for (const sel of ["code#applyUrl", "#applyUrl", 'code[id*="applyUrl"]']) {
+      try {
+        const el = document.querySelector(sel);
+        const raw = el && ((el.textContent || "").trim());
+        if (raw) {
+          const m = raw.match(/https?:\/\/[^\s"'\\]+/);
+          if (m) return { url: decodeRedirect(m[0]), via: sel };
+        }
+      } catch (e) { /* skip */ }
+    }
+    // 2. An anchor inside an apply container pointing OFF LinkedIn = the employer.
+    const APPLY_SCOPES = [
+      ".jobs-apply-button--top-card", ".jobs-s-apply", ".jobs-unified-top-card__content",
+      '[class*="jobs-apply"]', ".jobs-details-top-card__actions", ".jobs-search__job-details--container",
+    ];
+    for (const scope of APPLY_SCOPES) {
+      let root;
+      try { root = document.querySelector(scope); } catch (e) { continue; }
+      if (!root) continue;
+      for (const a of root.querySelectorAll("a[href]")) {
+        const href = a.getAttribute("href") || "";
+        if (!/^https?:\/\//i.test(href) && !href.startsWith("/")) continue;
+        let host = "";
+        try { host = new URL(href, location.href).hostname; } catch (e) { continue; }
+        if (!isLinkedInHost(host)) return { url: decodeRedirect(href), via: scope + " a[href]" };
+        // A LinkedIn offsite/externalApply wrapper may still carry the real target.
+        if (/externalApply|offsite|\/redirect/i.test(href)) {
+          const unwrapped = decodeRedirect(href);
+          let uh = "";
+          try { uh = new URL(unwrapped, location.href).hostname; } catch (e) { /* ignore */ }
+          if (unwrapped !== href && !isLinkedInHost(uh)) return { url: unwrapped, via: scope + " offsite-unwrap" };
+        }
+      }
+    }
+    return { url: "", via: "" };
+  };
+  const readApplyKind = () => {
+    // "Easy Apply" = the application lives ON LinkedIn, so no employer URL exists
+    // to find. Distinguishing this from "we failed to extract" matters: one is a
+    // property of the posting, the other is a scraper gap worth fixing.
+    const scopes = ['[class*="jobs-apply"]', ".jobs-unified-top-card__content", ".jobs-search__job-details--container"];
+    for (const s of scopes) {
+      let root;
+      try { root = document.querySelector(s); } catch (e) { continue; }
+      if (!root) continue;
+      const txt = ((root.innerText || root.textContent) || "").toLowerCase();
+      if (/easy apply/.test(txt)) return "easy";
+      if (/apply on company website|apply externally|apply on/.test(txt)) return "external";
+    }
+    return "unknown";
+  };
+
   const anchor = document.querySelector('a[href*="/jobs/view/' + jobId + '"]');
   if (!anchor) return { ok: false, error: "card-not-found" };
   try {
@@ -659,6 +738,18 @@ async function scrapeLinkedInDetailInPage(jobId, previousText) {
   await sleep(120);
   anchor.click();
 
+  const done = (text, note) => {
+    const apply = readApply();
+    return {
+      ok: true,
+      text: String(text).slice(0, 20000),
+      applyUrl: apply.url || "",
+      applyVia: apply.via || "",
+      applyKind: readApplyKind(),
+      note: note || "",
+    };
+  };
+
   const prev = String(previousText || "");
   let last = "";
   let stable = 0;
@@ -666,14 +757,14 @@ async function scrapeLinkedInDetailInPage(jobId, previousText) {
     await sleep(150);
     const now = readPane();
     if (now.length >= 200) {
-      if (prev && now !== prev) return { ok: true, text: now.slice(0, 20000) };
+      if (prev && now !== prev) return done(now);
       stable = now === last ? stable + 1 : 0;
-      if (stable >= 2) return { ok: true, text: now.slice(0, 20000) };
+      if (stable >= 2) return done(now);
     }
     last = now;
   }
   return last.length >= 200
-    ? { ok: true, text: last.slice(0, 20000), note: "pane never settled — took the last read" }
+    ? done(last, "pane never settled — took the last read")
     : { ok: false, error: "pane-empty" };
 }
 
@@ -748,12 +839,56 @@ function scrapeJobPosting() {
     if (best.length > body.length) body = best;
   }
 
+  // The EMPLOYER's application link, when this page is itself a board wrapper
+  // (Handshake's posting page links out to the real ATS). Scoped to apply-ish
+  // controls and off-host only — never harvested from the description prose, which
+  // routinely contains unrelated company links.
+  let applyUrl = "";
+  let applyVia = "";
+  try {
+    const here = location.hostname.replace(/^www\./, "").toLowerCase();
+    const SCOPES = [
+      '[class*="apply"]', '[data-hook*="apply"]', '[id*="apply"]',
+      "main", "body",
+    ];
+    for (const scope of SCOPES) {
+      const root = document.querySelector(scope);
+      if (!root) continue;
+      for (const a of root.querySelectorAll('a[href^="http"]')) {
+        const label = (((a.innerText || a.textContent) || "") + " " + (a.getAttribute("aria-label") || "")).toLowerCase();
+        if (!/apply/.test(label)) continue;
+        let host = "";
+        try { host = new URL(a.href).hostname.replace(/^www\./, "").toLowerCase(); } catch (e) { continue; }
+        if (host && host !== here && !host.endsWith("." + here)) {
+          applyUrl = a.href;
+          applyVia = scope + " a(apply)";
+          break;
+        }
+      }
+      if (applyUrl) break;
+    }
+  } catch (e) { /* best-effort — a missing apply link is never fatal */ }
+
   return {
     title: (title || "").slice(0, 300),
     company: (company || "").slice(0, 200),
     text: (body || "").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
     url: location.href,
+    applyUrl,
+    applyVia,
   };
+}
+
+// Is this a job-BOARD url (a wrapper around someone else's application) rather
+// than an employer/ATS url? Only a board url is worth rewriting to a real link —
+// a Workday/Greenhouse link IS already the real thing.
+function isBoardUrl(u) {
+  try {
+    const h = new URL(String(u)).hostname.toLowerCase();
+    return /(^|\.)linkedin\.com$/.test(h) || /joinhandshake\.com$/.test(h);
+  } catch (e) {
+    return false;
+  }
 }
 
 // RECON dump (read-only). The operator runs this ONCE per source from their real
@@ -765,6 +900,11 @@ function dumpDiscoverRecon() {
     try { return document.querySelectorAll(sel).length; } catch (e) { return -1; }
   };
   const probes = [
+    // Apply controls — the source of the employer's real application link.
+    "code#applyUrl", '[class*="jobs-apply"]', ".jobs-apply-button", '[class*="apply"] a[href]',
+    'a[href*="externalApply"]', 'a[href*="offsite"]',
+    // Details pane — where the in-page JD read gets its text.
+    "#job-details", ".jobs-description__content", ".jobs-search__job-details--container",
     'a[href*="/jobs/view/"]', "[data-job-id]", "[data-occludable-job-id]",
     "li.jobs-search-results__list-item", "div.job-card-container", ".artdeco-entity-lockup__title",
     'a[href*="/jobs/"]', 'a[href*="/job-search/"]', '[data-hook*="job"]',
@@ -786,10 +926,29 @@ function dumpDiscoverRecon() {
     sample = (card.outerHTML || "").slice(0, 4000);
   }
 
+  // Every off-host link that LOOKS like an apply control, with its label — this is
+  // exactly what the real-link extractor keys on, so seeing the true shape here is
+  // what lets its ladder be tightened from observation instead of guesswork.
+  const applyLinks = [];
+  try {
+    const here = location.hostname.replace(/^www\./, "").toLowerCase();
+    for (const a of document.querySelectorAll('a[href^="http"]')) {
+      let host = "";
+      try { host = new URL(a.href).hostname.replace(/^www\./, "").toLowerCase(); } catch (e) { continue; }
+      const label = (((a.innerText || a.textContent) || "").trim() + " " + (a.getAttribute("aria-label") || "")).trim();
+      if (host !== here && (/apply/i.test(label) || /externalApply|offsite/i.test(a.href))) {
+        applyLinks.push({ host, label: label.slice(0, 80), href: a.href.slice(0, 300) });
+        if (applyLinks.length >= 12) break;
+      }
+    }
+  } catch (e) { /* best-effort */ }
+
   return {
     url: location.href,
     title: document.title || "",
     counts,
+    applyLinks,
+    applyUrlBlob: ((document.querySelector("code#applyUrl") || {}).textContent || "").slice(0, 300),
     sample,
     bodyStart: ((document.body && document.body.innerText) || "").replace(/\s+/g, " ").slice(0, 600),
   };
@@ -797,13 +956,29 @@ function dumpDiscoverRecon() {
 
 // ── Service-worker orchestration (chrome APIs) ──────────────────────────────
 
-// Progress → the website's live Run port (background.js owns it). Defensive: a
+// One prefix for every discovery line so the SW console can be filtered to
+// `[DISCOVER]` and read as a narrative of the sweep.
+function dlog(msg) {
+  try { console.log("[ApplyPilot][DISCOVER] " + msg); } catch (e) { /* ignore */ }
+}
+
+// Progress → the website's live Run port (background.js owns it). ALSO logged, so
+// the SW console and the on-page progress line tell the same story. Defensive: a
 // popup-triggered discovery runs before/without any port and must still work.
 function discoverProgress(phase, detail) {
   try {
+    dlog(`» ${phase}${detail ? " — " + detail : ""}`);
     if (typeof emitRunProgress === "function") emitRunProgress(phase, detail);
-    else console.log(`[ApplyPilot][DISCOVER] » ${phase}${detail ? " — " + detail : ""}`);
   } catch (e) { /* never let telemetry break a sweep */ }
+}
+
+// A stable, readable one-liner for a job in the log. Used at every stage so the
+// same job is recognisable as it moves through discovery → JD read → queue.
+function jobLine(job) {
+  const co = job.company || "?";
+  const title = job.title || "?";
+  const when = job.postedAt == null ? "date?" : `${Math.max(0, Math.round((Date.now() - job.postedAt) / 86400e3))}d`;
+  return `${co} — ${title} [${when}] ${job.jobKey}`;
 }
 
 const discoverDelay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -905,14 +1080,19 @@ async function discoverFromSimplify(opts) {
   } catch (e) {
     return { jobs: [], note: "Couldn't read the Simplify board: " + String((e && e.message) || e), scanned: 0 };
   }
+  const total = Array.isArray(listings) ? listings.length : 0;
+  dlog(`simplify: feed has ${total} listings; filtering to live + "${o.termPattern || "any term"}" + last ${o.sinceDays}d + "${o.keywords || "any keywords"}"`);
   const jobs = simplifyListingsToJobs(listings, {
     nowMs: o.nowMs,
     sinceDays: o.sinceDays,
-    query: o.query,
+    keywords: o.keywords,
+    location: o.location,
     termPattern: o.termPattern,
     maxItems: o.maxPerSource,
   });
-  return { jobs, note: "", scanned: Array.isArray(listings) ? listings.length : 0 };
+  dlog(`simplify: ${jobs.length} match${jobs.length === 1 ? "" : "es"}`);
+  for (let i = 0; i < jobs.length; i++) dlog(`  ${String(i + 1).padStart(2, "0")}. ${jobLine(jobs[i])}`);
+  return { jobs, note: "", scanned: total };
 }
 
 // SOURCE 2/3 — a logged-in board read out of a real tab. Same shape for both, so
@@ -934,15 +1114,20 @@ async function discoverFromBoard(source, url, scraper, opts) {
     return { jobs: [], note: `${source}: skipped — no search keywords were built (see the keyword box).`, scanned: 0 };
   }
   discoverProgress(`Searching ${source}`, "in your signed-in session");
+  dlog(`${source}: opening ${url}`);
   const known = new Set((o.knownKeys || []).filter(Boolean));
   try {
     return await withDiscoverTab(url, { background: o.background !== false, settleMs: 3000 }, async (tabId) => {
-      await discoverAutoScroll(tabId, o.scrollRounds != null ? o.scrollRounds : 3);
+      const rounds = o.scrollRounds != null ? o.scrollRounds : 3;
+      dlog(`${source}: page loaded, scrolling ${rounds}× to mount more rows`);
+      await discoverAutoScroll(tabId, rounds);
       const out = await discoverReadPage(tabId, scraper);
       if (!out || typeof out !== "object") {
+        dlog(`${source}: the injected scraper returned nothing readable`);
         return { jobs: [], note: `${source}: the page returned nothing readable.`, scanned: 0 };
       }
       if (out.signedIn === false) {
+        dlog(`${source}: NOT SIGNED IN — ${out.note || "the board redirected to its login page"}`);
         return {
           jobs: [],
           note: `${source}: you're not signed in — sign in to ${source} in this Chrome profile, then run Discover again.`,
@@ -950,36 +1135,58 @@ async function discoverFromBoard(source, url, scraper, opts) {
           signedOut: true,
         };
       }
+      const rawRows = out.jobs || [];
+      dlog(`${source}: ${rawRows.length} card${rawRows.length === 1 ? "" : "s"} found on the page${out.note ? ` (${out.note})` : ""}`);
+
       const now = typeof o.nowMs === "number" ? o.nowMs : Date.now();
       const jobs = [];
       let skippedKnown = 0;
-      for (const raw of out.jobs || []) {
+      let skippedStale = 0;
+      let skippedUnusable = 0;
+      for (const raw of rawRows) {
         const job = normalizeDiscoveredJob(raw, source, now);
-        if (!job) continue;
-        if (!isFreshPosting(job.postedAt, o.sinceDays, now)) continue;
+        if (!job) { skippedUnusable++; continue; }
+        if (!isFreshPosting(job.postedAt, o.sinceDays, now)) { skippedStale++; continue; }
         if (known.has(job.jobKey)) { skippedKnown++; continue; }
         jobs.push(job);
       }
+      dlog(
+        `${source}: ${jobs.length} candidate${jobs.length === 1 ? "" : "s"} after filters ` +
+        `(dropped ${skippedKnown} already applied/queued, ${skippedStale} older than ${o.sinceDays}d, ${skippedUnusable} unusable)`
+      );
       jobs.sort(comparePostedDesc);
-      const kept = jobs.slice(0, o.maxPerSource || DISCOVER_DEFAULTS.maxPerSource);
+      let kept = jobs.slice(0, o.maxPerSource || DISCOVER_DEFAULTS.maxPerSource);
+      if (kept.length < jobs.length) {
+        dlog(`${source}: keeping the newest ${kept.length} (maxPerSource=${o.maxPerSource || DISCOVER_DEFAULTS.maxPerSource})`);
+      }
+      for (let i = 0; i < kept.length; i++) dlog(`  ${String(i + 1).padStart(2, "0")}. ${jobLine(kept[i])}`);
 
       // ── The no-tab JD read. While this tab is STILL OPEN and the cards are
       //    mounted, click each one and read the details pane. This is what
-      //    replaced opening (and closing) a tab per posting.
-      let inPage = { read: 0, failed: 0 };
+      //    replaced opening (and closing) a tab per posting — and it's also where
+      //    each posting's REAL employer application link gets resolved.
+      let inPage = { read: 0, failed: 0, rewritten: 0, easyApply: 0, noApply: 0, droppedKnown: [] };
       if (source === "linkedin" && o.readDetailsInPage !== false) {
-        inPage = await readLinkedInDetailsInPage(tabId, kept, o);
+        inPage = await readLinkedInDetailsInPage(tabId, kept, o, known);
+        if (inPage.droppedKnown && inPage.droppedKnown.length) {
+          // These only became recognisable as already-applied once their real
+          // employer link (and therefore their real key) was resolved.
+          const drop = new Set(inPage.droppedKnown);
+          kept = kept.filter((j) => !drop.has(j));
+          skippedKnown += drop.size;
+        }
       }
 
       return {
         jobs: kept,
         note: out.note || "",
-        scanned: (out.jobs || []).length,
+        scanned: rawRows.length,
         skippedKnown,
         inPage,
       };
     });
   } catch (e) {
+    dlog(`${source}: FAILED — ${String((e && e.message) || e)}`);
     return { jobs: [], note: `${source}: ${String((e && e.message) || e)}`, scanned: 0 };
   }
 }
@@ -988,17 +1195,26 @@ async function discoverFromBoard(source, url, scraper, opts) {
 // each card, settle-poll the details pane, move on. One tab, zero navigations.
 // Bounded by the same maxJdOpens budget the tab-based pass uses; a per-card
 // failure is non-fatal (the job still queues, just without a description).
-async function readLinkedInDetailsInPage(tabId, jobs, opts) {
+async function readLinkedInDetailsInPage(tabId, jobs, opts, known) {
   const o = opts || {};
   const budget = Math.max(0, Number(o.maxJdOpens != null ? o.maxJdOpens : DISCOVER_DEFAULTS.maxJdOpens));
+  const knownSet = known || new Set();
   let read = 0;
   let failed = 0;
+  let rewritten = 0;   // jobs whose url became the EMPLOYER's real application link
+  let easyApply = 0;   // postings that live on LinkedIn — no employer link exists
+  let noApply = 0;     // external, but we couldn't extract the link (a scraper gap)
+  const droppedKnown = [];
   let previous = ""; // the pane text of the PREVIOUS job — how we detect a real change
+
   const targets = jobs.filter((j) => j && !j.description).slice(0, budget);
+  if (targets.length < jobs.length) {
+    dlog(`linkedin: reading ${targets.length} of ${jobs.length} descriptions (maxJdOpens=${budget})`);
+  }
   for (let i = 0; i < targets.length; i++) {
     const job = targets[i];
     const id = (job.jobKey || "").startsWith("linkedin:") ? job.jobKey.slice("linkedin:".length) : "";
-    if (!id) { failed++; continue; }
+    if (!id) { failed++; dlog(`  ✗ ${jobLine(job)} — not a linkedin key, skipped`); continue; }
     discoverProgress(
       `Reading job descriptions (${i + 1}/${targets.length})`,
       `${job.company || ""}${job.company && job.title ? " — " : ""}${job.title || ""} · on the search page, no new tab`
@@ -1010,19 +1226,52 @@ async function readLinkedInDetailsInPage(tabId, jobs, opts) {
         job.descriptionSource = "pane";
         previous = res.text;
         read++;
+
+        // ── Swap in the EMPLOYER's real application link ────────────────────
+        // A linkedin.com/jobs/view url is useless to the Run pipeline, which
+        // drives Workday/Greenhouse/etc. When the posting exposes its employer
+        // link, that becomes the job's url — AND its key, which is why a LinkedIn
+        // find can now dedup against a Workday application already in the tracker.
+        job.applyKind = res.applyKind || "unknown";
+        job.boardUrl = job.url;
+        if (res.applyUrl && /^https?:\/\//i.test(res.applyUrl)) {
+          const before = job.jobKey;
+          job.url = res.applyUrl;
+          job.jobKey = discoveryJobKey(res.applyUrl);
+          job.applyResolved = true;
+          rewritten++;
+          dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · REAL LINK via ${res.applyVia}`);
+          dlog(`      ${before} → ${job.jobKey}  ${job.url}`);
+          // Re-check against what's already applied to: the LinkedIn key wasn't
+          // known, but the ATS key it just resolved to may well be.
+          if (knownSet.has(job.jobKey)) {
+            droppedKnown.push(job);
+            dlog(`      ↳ already applied/queued under ${job.jobKey} — dropped`);
+          }
+        } else if (job.applyKind === "easy") {
+          easyApply++;
+          dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · EASY APPLY on LinkedIn (no employer link exists)`);
+        } else {
+          noApply++;
+          dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · ⚠ no employer link found (kept the LinkedIn url)`);
+        }
       } else {
         failed++;
+        dlog(`  ✗ ${jobLine(job)} — pane read failed (${(res && res.error) || "no result"})`);
       }
     } catch (e) {
       failed++;
-      console.log(`[ApplyPilot][DISCOVER] in-page JD read failed for linkedin:${id}: ${String((e && e.message) || e)}`);
+      dlog(`  ✗ ${jobLine(job)} — pane read threw: ${String((e && e.message) || e)}`);
     }
     await discoverDelay(250); // let the pane settle before the next click
   }
   if (read || failed) {
-    console.log(`[ApplyPilot][DISCOVER] linkedin in-page JD reads: ${read} ok, ${failed} failed (no tabs opened)`);
+    dlog(
+      `linkedin JD pass done (no tabs opened): ${read} read, ${failed} failed · ` +
+      `real employer link on ${rewritten}, easy-apply ${easyApply}, link-not-found ${noApply}`
+    );
   }
-  return { read, failed };
+  return { read, failed, rewritten, easyApply, noApply, droppedKnown };
 }
 
 // THE JD PASS — "if the job description is not on the page, physically open the
@@ -1037,9 +1286,14 @@ async function fillMissingDescriptions(jobs, opts) {
   const budget = Math.max(0, Number(o.maxJdOpens != null ? o.maxJdOpens : DISCOVER_DEFAULTS.maxJdOpens));
   let opened = 0;
   let failed = 0;
+  let rewritten = 0;
   const need = (jobs || []).filter((j) => j && !j.description);
   const total = Math.min(need.length, budget);
-  if (!total) return { opened, failed, skipped: need.length };
+  if (!total) {
+    dlog("reader tab: nothing left to read — every job already has a description");
+    return { opened, failed, rewritten, skipped: need.length };
+  }
+  dlog(`reader tab: reading ${total} of ${need.length} remaining description${need.length === 1 ? "" : "s"} in ONE reused tab`);
 
   // ONE tab for the whole pass (2026-07-29). This used to create AND destroy a tab
   // per posting, which read as a flicker-storm of tabs opening and closing. Now we
@@ -1073,12 +1327,30 @@ async function fillMissingDescriptions(jobs, opts) {
           // already gave us (the board's company name is the cleaner one).
           if (!job.title && jd.title) job.title = String(jd.title).slice(0, 300);
           if (!job.company && jd.company) job.company = String(jd.company).slice(0, 200);
+
+          // If this was a BOARD wrapper (a Handshake posting page) and it exposes
+          // the employer's application link, that link is what belongs in the
+          // queue — the Run pipeline can't drive a board url. An ATS url is
+          // already the real thing and is never rewritten.
+          if (isBoardUrl(job.url) && jd.applyUrl && /^https?:\/\//i.test(jd.applyUrl) && !isBoardUrl(jd.applyUrl)) {
+            const before = job.jobKey;
+            job.boardUrl = job.url;
+            job.url = jd.applyUrl;
+            job.jobKey = discoveryJobKey(jd.applyUrl);
+            job.applyResolved = true;
+            rewritten++;
+            dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · REAL LINK via ${jd.applyVia}`);
+            dlog(`      ${before} → ${job.jobKey}  ${job.url}`);
+          } else {
+            dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars${isBoardUrl(job.url) ? " · ⚠ no employer link found (kept the board url)" : ""}`);
+          }
         } else {
           failed++;
+          dlog(`  ✗ ${jobLine(job)} — no description found on the page`);
         }
       } catch (e) {
         failed++;
-        console.log(`[ApplyPilot][DISCOVER] JD scrape failed for ${job.url}: ${String((e && e.message) || e)}`);
+        dlog(`  ✗ ${jobLine(job)} — page read threw: ${String((e && e.message) || e)}`);
       }
       await discoverDelay(o.betweenJdMs != null ? o.betweenJdMs : 400); // be a polite client
     }
@@ -1090,7 +1362,8 @@ async function fillMissingDescriptions(jobs, opts) {
       catch (e) { /* already gone */ }
     }
   }
-  return { opened, failed, skipped: Math.max(0, need.length - opened) };
+  dlog(`reader tab: done — ${opened - failed}/${opened} read, ${rewritten} rewritten to the employer's real link`);
+  return { opened, failed, rewritten, skipped: Math.max(0, need.length - opened) };
 }
 
 /**
@@ -1146,6 +1419,9 @@ async function runJobDiscovery(opts) {
     scanned.simplify = r.scanned;
     all = all.concat(r.jobs);
   }
+  let boardRewrites = 0;
+  let easyApplyCount = 0;
+  let linkNotFound = 0;
   if (want.linkedin) {
     const r = await discoverFromBoard(
       "linkedin",
@@ -1155,6 +1431,11 @@ async function runJobDiscovery(opts) {
     );
     if (r.note) notes.push(r.note);
     scanned.linkedin = r.scanned;
+    if (r.inPage) {
+      boardRewrites += r.inPage.rewritten || 0;
+      easyApplyCount += r.inPage.easyApply || 0;
+      linkNotFound += r.inPage.noApply || 0;
+    }
     all = all.concat(r.jobs);
   }
   if (want.handshake) {
@@ -1193,13 +1474,38 @@ async function runJobDiscovery(opts) {
     notes.push(`${jd.failed} job page${jd.failed === 1 ? "" : "s"} didn't yield a description — queued anyway.`);
   }
 
+  // A queued BOARD url can't be driven by the Run pipeline, so say so plainly here
+  // rather than letting it fail later as a confusing halt.
+  const stillBoard = capped.filter((j) => isBoardUrl(j.url));
+  if (stillBoard.length) {
+    const easy = stillBoard.filter((j) => j.applyKind === "easy").length;
+    const other = stillBoard.length - easy;
+    const bits = [];
+    if (easy) bits.push(`${easy} ${easy === 1 ? "is" : "are"} LinkedIn Easy Apply (the application lives on LinkedIn, so no employer link exists to save)`);
+    if (other) bits.push(`${other} didn't expose an employer link`);
+    notes.push(
+      `${stillBoard.length} job${stillBoard.length === 1 ? "" : "s"} kept a board link instead of the employer's: ` +
+      `${bits.join("; ")}. Run can't drive those automatically — open them from the queue.`
+    );
+  }
+
   const summary = summarizeDiscovery(capped);
-  console.log(
-    `[ApplyPilot][DISCOVER] done — scanned ${JSON.stringify(scanned)}, found ${found}, ` +
+  dlog(
+    `done — scanned ${JSON.stringify(scanned)}, found ${found}, ` +
     `${skippedKnown} already known, ${skippedDupe} cross-board dupes, ${capped.length} new ` +
     `(${JSON.stringify(summary.bySource)}), JDs: ${inPageRead} read in-page (no tab), ` +
     `${jd.opened - jd.failed}/${jd.opened} via the single reader tab`
   );
+  dlog(
+    `real employer links: ${boardRewrites + (jd.rewritten || 0)} resolved, ` +
+    `${easyApplyCount} easy-apply, ${linkNotFound} not exposed, ${stillBoard.length} still on a board url`
+  );
+  dlog("queued jobs, FINAL links:");
+  for (let i = 0; i < capped.length; i++) {
+    const j = capped[i];
+    dlog(`  ${String(i + 1).padStart(2, "0")}. [${j.source}] ${j.company || "?"} — ${j.title || "?"}`);
+    dlog(`      ${j.url}${j.boardUrl ? `   (found on ${j.boardUrl})` : ""}`);
+  }
   discoverProgress("Discovery finished", `${capped.length} new job${capped.length === 1 ? "" : "s"}`);
 
   return {
@@ -1277,6 +1583,7 @@ if (typeof module !== "undefined" && module.exports) {
     isFreshPosting,
     matchesDiscoverQuery,
     matchesDiscoverLocation,
+    isBoardUrl,
     normalizeDiscoveredJob,
     simplifyListingsToJobs,
     comparePostedDesc,

@@ -30,6 +30,10 @@ function host(url: string): string {
   }
 }
 const isWorkday = (url: string) => /myworkdayjobs\.com/i.test(url);
+// A board link is one Run CANNOT drive — it's a wrapper around someone else's
+// application (LinkedIn Easy Apply, or a posting that never exposed its employer
+// link). Worth calling out distinctly from a merely non-Workday ATS link.
+const isBoard = (url: string) => /(^|\.)linkedin\.com|joinhandshake\.com/i.test(url);
 
 /** "3d ago" from an ISO posted_at — discovered rows carry it, pasted rows don't. */
 function agoLabel(iso: string | null | undefined): string {
@@ -209,11 +213,18 @@ function QueueRow({
             <div className="truncate font-mono text-[11px] text-ink-faint">{item.url}</div>
           )}
         </div>
-        {!isWorkday(item.url) && (
+        {isBoard(item.url) ? (
+          <span
+            className="shrink-0 rounded border border-signal/40 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-label text-signal"
+            title="This is still a job-board link, not the employer's application page — Run can't drive it. Open it and apply from there."
+          >
+            board link
+          </span>
+        ) : !isWorkday(item.url) ? (
           <span className="shrink-0 rounded border border-amber/40 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-label text-amber">
             not workday
           </span>
-        )}
+        ) : null}
         <span className={clsx("shrink-0 font-mono text-[10px] uppercase tracking-label", st.text)}>
           {item.status}
         </span>

@@ -26,6 +26,7 @@ const {
   discoverTermLabel,
   discoverKeywordTokens,
   matchesDiscoverLocation,
+  isBoardUrl,
   DISCOVER_DEFAULTS,
   DISCOVER_DEFAULT_LOCATION,
 } = require("../discover.js");
@@ -428,4 +429,42 @@ test("DISCOVER_DEFAULTS: every expensive knob is bounded by default", () => {
   assert.ok(DISCOVER_DEFAULTS.maxTotal > 0);
   assert.ok(DISCOVER_DEFAULTS.maxJdOpens > 0 && DISCOVER_DEFAULTS.maxJdOpens <= 25, "the tab-opening pass must stay modest");
   assert.ok(DISCOVER_DEFAULTS.sinceDays > 0);
+});
+
+// ── isBoardUrl — which links still need the employer's real URL ──────────────
+
+test("isBoardUrl: board wrappers are flagged, employer/ATS links are not", () => {
+  // The operator's ask: "save the real job link, not the linkedin apply." A board
+  // url is a WRAPPER around someone else's application — Run can't drive it — so it
+  // is the thing that must be rewritten (or, failing that, flagged).
+  assert.equal(isBoardUrl("https://www.linkedin.com/jobs/view/4123456789/"), true);
+  assert.equal(isBoardUrl("https://app.joinhandshake.com/jobs/987"), true);
+  // An employer/ATS link IS already the real thing and must never be rewritten.
+  assert.equal(isBoardUrl("https://costar.wd1.myworkdayjobs.com/x/job/Y_R37008"), false);
+  assert.equal(isBoardUrl("https://boards.greenhouse.io/acme/jobs/1"), false);
+  assert.equal(isBoardUrl("https://jobs.ashbyhq.com/mercor/abc"), false);
+  assert.equal(isBoardUrl("not a url"), false);
+  assert.equal(isBoardUrl(""), false);
+});
+
+test("a resolved employer link re-keys the job so it dedups against the tracker", () => {
+  // This is the payoff of rewriting: a LinkedIn find whose real link is a Workday
+  // requisition now keys IDENTICALLY to the application row written after applying,
+  // so it stops coming back in later sweeps.
+  const boardKey = discoveryJobKey("https://www.linkedin.com/jobs/view/4123456789/");
+  assert.equal(boardKey, "linkedin:4123456789");
+  const realKey = discoveryJobKey("https://costar.wd1.myworkdayjobs.com/x/job/Y_R37008");
+  assert.equal(realKey, "wd1:r37008");
+  assert.notEqual(boardKey, realKey);
+  // …and dedupe drops it once the tracker already holds that requisition.
+  const r = dedupeDiscovered([{ url: "https://costar.wd1.myworkdayjobs.com/x/job/Y_R37008" }], ["wd1:r37008"]);
+  assert.equal(r.jobs.length, 0);
+  assert.equal(r.skippedKnown, 1);
+});
+
+test("normalizeDiscoveredJob: carries the apply-resolution fields from the start", () => {
+  const job = normalizeDiscoveredJob({ url: "https://www.linkedin.com/jobs/view/42/", title: "T" }, "linkedin", NOW);
+  assert.equal(job.boardUrl, "");
+  assert.equal(job.applyKind, "");
+  assert.equal(job.applyResolved, false);
 });
