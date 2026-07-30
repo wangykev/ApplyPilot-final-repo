@@ -1991,14 +1991,22 @@ async function boardLocationToken(tabId, source, text, notes) {
     // NEVER silently search somewhere else. A failed resolve is reported and the
     // sweep continues WITHOUT a location filter, which is stated plainly.
     const d = r.diag || {};
-    // Distinguish "this board has no such place" from "the control didn't work". Reaching
-    // the box and still getting no token means the board's typeahead simply offered
-    // nothing for what was typed — e.g. Handshake's box takes a city, state or ZIP, so a
-    // whole COUNTRY has no match there. That is an answer, not a malfunction.
+    // Distinguish "the board offered nothing for that text" from "the control didn't
+    // work". Reaching the box and still getting no token means the typeahead returned no
+    // usable suggestion for what was typed — a misspelling, or a place that board doesn't
+    // index. That is an answer, not a malfunction, so say so plainly and carry on.
+    //
+    // ⚠ Do NOT conclude anything about what the board "supports" from this. A previous
+    // version of this branch told the operator that Handshake's box "only takes a city,
+    // state or ZIP" and therefore couldn't do countries — quoting the box's own
+    // placeholder as evidence. That was WRONG, and the operator corrected it: Handshake
+    // resolves "United States" perfectly well. The real cause was the keyword-box bug
+    // above (the text had been typed into the job-search field, so of course no place
+    // matched), and the confident-sounding explanation outlived the bug that produced it.
+    // Report the observation, never a theory about the board's capabilities.
     if (d.inputFound && (r.error === "no-location-suggestions" || r.error === "location-token-never-appeared")) {
-      const accepts = d.placeholder ? ` (its box accepts: "${d.placeholder}")` : "";
-      dlog(`${source}: "${want}" matched no place on ${source}${accepts} — searching without a location filter`);
-      if (notes) notes.push(`${source}: "${want}" doesn't match a place ${source} can filter on${accepts}. Searched without a location filter.`);
+      dlog(`${source}: ${source}'s location box offered no match for "${want}" — searching without a location filter`);
+      if (notes) notes.push(`${source}: ${source}'s location box offered no match for "${want}" (check the spelling). Searched without a location filter.`);
       return {};
     }
     const detail =

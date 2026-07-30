@@ -3098,3 +3098,13 @@ every one an employer/ATS link: `sonos.wd1.myworkdayjobs.com`, `boards.greenhous
 
 Suites after all of it: extension **866 pass / 0 fail**, web **107 pass / 0 fail**,
 typecheck + production build green.
+
+**Correction (same day).** The note above claimed Handshake's location box "only accepts a
+city, state or ZIP" and therefore could not filter by country. That was WRONG — the
+operator corrected it, and a re-test confirms Handshake resolves "United States" fine
+(25 scanned, 24 matched, every result a US location). The original failure was the
+keyword-box bug: the location text had been typed into the job-search field, so no place
+could match, and the placeholder was then quoted as if it explained the limit. The
+explanation outlived the bug that produced it. The resolver's message now reports only
+what was observed ("its location box offered no match for X — check the spelling") and
+asserts nothing about what a board supports.
