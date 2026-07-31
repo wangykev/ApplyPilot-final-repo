@@ -1372,8 +1372,63 @@ function tenantCompanyFromUrl(url) {
   return null;
 }
 
+// ── DEV LOG MIRROR — pure helpers ───────────────────────────────────────────────────────────────────
+// [ApplyPilot] output goes to the SERVICE-WORKER console, which is a worker target rather than a tab, so
+// nothing outside DevTools can read it — an agent driving this extension is blind to the one channel that
+// explains what a run actually did. background.js mirrors every console line into a bounded ring buffer
+// that the local dev site pulls over AP_DEV_LOGS (the same localhost-only external channel as AP_RELOAD).
+// The buffer mechanics live here so they're testable; background.js owns the state and the console patch.
+
+// One console call → one line. Objects are JSON'd (a console object arg is unreadable as "[object Object]")
+// and the whole line is capped, because a single log of a full review bundle would otherwise eat the ring.
+function devLogFormat(args, lineMax) {
+  const max = Number(lineMax) > 0 ? Number(lineMax) : 1200;
+  const one = (a) => {
+    if (typeof a === "string") return a;
+    if (a === null) return "null";
+    if (a === undefined) return "undefined";
+    if (a instanceof Error) return String(a.stack || a.message || a);
+    if (typeof a === "object") { try { return JSON.stringify(a); } catch (e) { return String(a); } } // circular → String()
+    return String(a);
+  };
+  const s = (Array.isArray(args) ? args : [args]).map(one).join(" ");
+  return s.length > max ? s.slice(0, max) + `…(+${s.length - max} chars)` : s;
+}
+
+// Append with a hard cap, oldest evicted first. Returns how many were dropped so the caller can keep a
+// cumulative count — a reader that sees dropped>0 knows its window missed lines rather than there being none.
+function devLogAppend(ring, entry, max) {
+  const cap = Number(max) > 0 ? Number(max) : 1200;
+  ring.push(entry);
+  if (ring.length <= cap) return 0;
+  const dropped = ring.length - cap;
+  ring.splice(0, dropped);
+  return dropped;
+}
+
+// Cursor-based read: `since` is the last `n` the caller saw, so polling during a run returns only what's
+// new. An over-limit result keeps the NEWEST lines and says so (`truncated`) — silently dropping the tail
+// of a filtered query would read as "nothing more happened". A bad regex is reported, never thrown.
+function devLogSelect(ring, opts) {
+  const o = opts || {};
+  const since = Number(o.since) || 0;
+  let lines = (Array.isArray(ring) ? ring : []).filter((e) => e && Number(e.n) > since);
+  let patternError = "";
+  if (o.pattern) {
+    try {
+      const re = new RegExp(String(o.pattern), "i");
+      lines = lines.filter((e) => re.test(String(e.msg || "")));
+    } catch (e) { patternError = String((e && e.message) || e); }
+  }
+  const matched = lines.length;
+  const limit = Number(o.limit) > 0 ? Number(o.limit) : 200;
+  const truncated = matched > limit;
+  if (truncated) lines = lines.slice(-limit);
+  return { lines, matched, truncated, patternError };
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets };
+  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect };
 }

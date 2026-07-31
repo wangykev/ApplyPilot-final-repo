@@ -1,3 +1,72 @@
+// ============================================================================
+// DEV LOG MIRROR — make the service-worker console readable from outside DevTools.
+//
+// Every [ApplyPilot] line lands in the SW console. That console belongs to a worker target, not a
+// tab, so no page and no automation can read it — which leaves an agent driving this extension blind
+// to the single channel that explains what a run did (why a field escalated, why a walk halted). This
+// mirrors console output into a bounded ring buffer that the local dev site pulls over AP_DEV_LOGS,
+// the same localhost-only external channel as AP_RELOAD.
+//
+// It PATCHES console instead of editing ~130 call sites, so cdp.js / fill-driver.js / discover.js are
+// captured for free, and it runs BEFORE importScripts so a load-time throw in any of them is captured
+// too. The original console method is called FIRST and the buffering is wrapped in try/catch: this is a
+// debugging aid, and it must never be able to break a run. Pure buffer mechanics live in lib.js
+// (devLogFormat / devLogAppend / devLogSelect) so they're unit-testable.
+// ============================================================================
+const AP_DEV_LOG_MAX = 1200;      // lines retained (~1 MB with the line cap — well inside storage.local)
+const AP_DEV_LOG_LINE_MAX = 1200; // chars per line
+const AP_DEV_WORKER_START = Date.now();
+let apDevLog = [];
+let apDevLogSeq = 0;
+let apDevLogDropped = 0;
+let apDevLogFlushTimer = null;
+
+function apDevLogPush(lvl, args) {
+  try {
+    // lib.js may not be evaluated yet (this block runs before importScripts), so degrade rather than throw.
+    const fmt = typeof devLogFormat === "function"
+      ? devLogFormat(args, AP_DEV_LOG_LINE_MAX)
+      : args.map((a) => String(a)).join(" ");
+    const entry = { n: ++apDevLogSeq, t: Date.now(), lvl, msg: fmt };
+    if (typeof devLogAppend === "function") apDevLogDropped += devLogAppend(apDevLog, entry, AP_DEV_LOG_MAX);
+    else apDevLog.push(entry);
+    // Debounced: an MV3 worker can be torn down between runs, so the buffer is persisted rather than
+    // living only in memory — otherwise the logs explaining a halt die with the worker that wrote them.
+    if (!apDevLogFlushTimer) apDevLogFlushTimer = setTimeout(apDevLogFlush, 1500);
+  } catch (e) { /* a logging aid must never break a run */ }
+}
+
+function apDevLogFlush() {
+  apDevLogFlushTimer = null;
+  try {
+    chrome.storage.local.set({ devLog: { seq: apDevLogSeq, dropped: apDevLogDropped, lines: apDevLog } });
+  } catch (e) { /* ignore */ }
+}
+
+for (const apDevLvl of ["log", "warn", "error", "info", "debug"]) {
+  const apDevOrig = console[apDevLvl] ? console[apDevLvl].bind(console) : null;
+  if (!apDevOrig) continue;
+  console[apDevLvl] = (...args) => { apDevOrig(...args); apDevLogPush(apDevLvl, args); };
+}
+
+// Carry the previous worker's tail back in. Lines this worker buffered before the restore landed are
+// renumbered past it, so a poller's `since` cursor never runs backwards across a worker restart.
+try {
+  chrome.storage.local.get("devLog", (res) => {
+    const prev = res && res.devLog;
+    if (!prev || !Array.isArray(prev.lines) || !prev.lines.length) return;
+    const base = Number(prev.seq) || Number(prev.lines[prev.lines.length - 1].n) || 0;
+    for (const e of apDevLog) e.n += base;
+    apDevLogSeq += base;
+    apDevLogDropped += Number(prev.dropped) || 0;
+    apDevLog = prev.lines.concat(apDevLog);
+    const over = apDevLog.length - AP_DEV_LOG_MAX;
+    if (over > 0) { apDevLog.splice(0, over); apDevLogDropped += over; }
+  });
+} catch (e) { /* ignore */ }
+
+console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()})`);
+
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
@@ -367,8 +436,37 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     }
     console.log("[ApplyPilot] AP_RELOAD — restarting the service worker at the local site's request");
     sendResponse({ ok: true, reloading: true });
+    apDevLogFlush(); // persist the tail NOW — the reload discards whatever is only in memory
     // Let the response flush before the worker goes away.
     setTimeout(() => { try { chrome.runtime.reload(); } catch (e) { /* nothing left to do */ } }, 150);
+    return true;
+  }
+
+  // DEV: read the service-worker console from the local dev site (see the DEV LOG MIRROR block at the
+  // top of this file for why this exists). Read-only — it returns buffered log lines and nothing else.
+  //
+  // `since` is a cursor: pass back the `cursor` from the previous reply to get only what's new, which is
+  // how a run is tailed without re-reading the whole buffer. `pattern` is a case-insensitive regex over
+  // the line text (e.g. "CDP-TIME|HALT"), `limit` caps the reply (newest kept, `truncated` says so), and
+  // `clear` empties the buffer after replying. Allowed DURING a run — watching a live walk is the point.
+  if (type === "AP_DEV_LOGS") {
+    const sel = devLogSelect(apDevLog, { since: message.since, pattern: message.pattern, limit: message.limit });
+    sendResponse({
+      ok: true,
+      lines: sel.lines,
+      // The cursor advances only to what was actually returned, so a truncated reply can't skip lines.
+      cursor: sel.lines.length ? sel.lines[sel.lines.length - 1].n : (Number(message.since) || 0),
+      seq: apDevLogSeq,
+      buffered: apDevLog.length,
+      matched: sel.matched,
+      truncated: sel.truncated,
+      dropped: apDevLogDropped, // >0 ⇒ the ring evicted lines; the window is incomplete, not empty
+      patternError: sel.patternError || undefined,
+      workerStartedAt: AP_DEV_WORKER_START, // a change here means the worker restarted mid-poll
+      runInFlight,
+      discoverInFlight,
+    });
+    if (message.clear) { apDevLog = []; apDevLogDropped = 0; apDevLogFlush(); }
     return true;
   }
 
