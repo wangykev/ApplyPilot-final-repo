@@ -7,7 +7,7 @@
     "client_id": "294371060360-3s12db5jkllfqhgil11a79cmmj246a0l.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
   },
-  "permissions": ["activeTab", "scripting", "storage", "debugger", "identity"],
+  "permissions": ["activeTab", "scripting", "storage", "debugger", "identity", "tabs"],
   "host_permissions": [
     "*://*.myworkdayjobs.com/*",
     "*://*.myworkdaysite.com/*",

@@ -2611,3 +2611,95 @@ Selecting a suggestion rewrites the board's own URL with the token — verified
 `geoId=104472865` for "Austin, Texas, United States" and `geoId=104116203` for
 "Seattle, Washington, United States" (pill "Seattle, WA (50 mi)") — so the resolver
 reads its answer off the URL and caches it per (board, text).
+
+## 2026-07-31 — Greenhouse / Lever / Ashby application forms, traced live (the multi-ATS recon)
+
+Traced read-only in the operator's browser (no logins needed on any of the three; nothing
+submitted). Forms probed: Anthropic + Figma (job-boards.greenhouse.io), Kraken
+(jobs.lever.co/kraken123), OpenAI (jobs.ashbyhq.com/openai). These are SINGLE-PAGE forms
+with no account, no session, and no server-held draft — unlike Workday, every visit starts
+from a blank form, which makes "replay" = "re-fill from approved values" rather than a diff.
+
+### Greenhouse (`job-boards.greenhouse.io/<co>/jobs/<id>`)
+
+- **`boards.greenhouse.io/<co>/jobs/<id>` REDIRECTS to `job-boards…`** — the legacy host
+  is a redirect now (Figma's own careers page links the legacy host). One form generation.
+- **The form is ON the posting page** (one `<form>`, action = same URL). No apply-click
+  needed to reach it. There is also a "Quick Apply with MyGreenhouse" button — NEVER click.
+- **Standard fields carry stable semantic ids**: `first_name`, `last_name`, `email`,
+  `phone` (type=tel), `candidate-location` (async city combobox), `resume`
+  (`input[type=file]`, visually-hidden behind an "Attach" button). EEOC block too:
+  `gender`, `hispanic_ethnicity`, `race`, `veteran_status`, `disability_status`.
+  Custom questions are `question_<digits>` with the label in `label[for]`.
+- **⚠ `#country` is NOT a country question** — it's the dial-code half of the phone
+  composite (committed value renders `<div class=iti__flag iti__us><span>+1</span>`).
+  The phone widget is intl-tel-input (`iti__*` classes, `iti-0__search-input`).
+- **Selects are react-select v5** (`.select__container/.select__control/.select__menu/
+  .select__option`, input `role=combobox` id'd like `react-select-<name>-…`), and they
+  respond to PURELY SYNTHETIC events: mousedown on the control opens, native-setter +
+  `input` on the inner input filters (244→1 verified), synthetic mousedown/click on a
+  `.select__option` COMMITS. Committed value renders in `.select__single-value`.
+  Menus render INSIDE the container (`.select-shell`), not portaled to body.
+- **⚠ Option-scrape contamination, the Workday lesson again**: a page-wide
+  `.select__option` read while another menu is open returns BOTH menus' options
+  (observed: Yes/No + Yes/No + Male/Female/Decline). Escape did NOT close the menu.
+  Scope every read to the widget's own listbox — the input's `aria-controls`
+  (`react-select-<name>-listbox`) or the option-id prefix `react-select-<name>-option-`.
+- **Required marking**: `aria-required=true` on the input + label text ends `*`. Required
+  react-selects ALSO carry a visually-hidden `input[class*=requiredInput]` INSIDE the same
+  `.select` — the native-validation mirror; its presence is itself a required signal.
+- **reCAPTCHA is on the form** (`#g-recaptcha-response-…` textarea) — invisible flavor.
+  Submit = `button[type=submit]` "Submit application".
+
+### Lever (`jobs.lever.co/<co>/<uuid>/apply`)
+
+- The posting page is `/<co>/<uuid>`; **the form is at `/apply`** — plain navigation, no
+  click needed. Classic name-keyed HTML form, the most traditional of the three:
+  `name`(Full name — ONE box), `email`, `phone`, `org` (current company), `location`
+  (`#location-input`, plain text with a suggestion dropdown — free text is accepted),
+  `urls[LinkedIn]`, `urls[GitHub]`, `urls[Portfolio]`, `urls[Twitter]`, `urls[Other]`,
+  `resume` (`#resume-upload-input`, type=file).
+- **Custom questions are `cards[<uuid>][fieldN]`** — radio groups (the `value` attr IS the
+  full answer text), textareas, selects; label lives in the `.application-question`
+  container's `.application-label`/`.text`. Required marker: the `required` attribute +
+  "✱" in the label.
+- **⚠ Conditional follow-ups are rendered AND `required` even when their controlling
+  radio is unanswered** ("If yes, tell us more…" `field1` sits `required:true` next to an
+  unanswered `field0`). Client validation presumably enforces only the visible/active ones
+  — settle at submit-recon time; until then fill-or-flag, never trust the bare attr.
+- **EEO demographics are `surveysResponses[<uuid>][responses][fieldN]` radios** — optional.
+  ⚠ The radio NodeList contains TEMPLATE rows (a JSON blob + a bare uuid as `value`)
+  before the real options — filter to visible elements.
+- **Pronouns is a CHECKBOX GROUP** (`name=pronouns`, multi-select) + an "other" text input.
+- **hCaptcha**: `#hcaptchaSubmitBtn` (hidden) next to the REAL `#btn-submit`
+  ("Submit application", `.template-btn-submit`). Invisible challenge on submit; if a
+  visible challenge renders, that is a needs_operator halt, NEVER solved by the bot.
+
+### Ashby (`jobs.ashbyhq.com/<co>/<uuid>/application`)
+
+- The posting is `/<co>/<uuid>`; **the form is the `/application` tab** — plain navigation.
+- **The field wrapper carries a SEMANTIC class**: `.ashby-application-form-field-entry`
+  (hashed css-module classes sit next to stable `ashby-*` ones — same pattern the
+  discovery scraper already relies on for `ashby-job-posting-*`).
+- **Field identity**: system fields are `_systemfield_name` / `_systemfield_email` /
+  `_systemfield_resume` (note: ONE "Legal Name" box, not first/last); custom fields'
+  id AND name are a bare uuid; labels via `label[for]`. `required` attr present.
+- **Yes/No questions are BUTTON PAIRS** (Yes | No) inside a `_yesno_*` container in the
+  field entry, with a hidden checkbox (name=uuid) tracking state.
+- **EEOC block**: radios named `<blockUuid>__systemfield_gender/_race/_veteran/_disability`,
+  label per OPTION (wrapping label). Consent checkboxes' `name` is the LABEL TEXT itself.
+- Location = `role=combobox` input; "start date" questions render a date picker
+  (`placeholder="Pick date..."`). Captcha iframe present (same policy as Lever).
+  Submit = button "Submit Application".
+
+### What this means for the fill (all three)
+
+- All three commit state from SYNTHETIC events (proven live on GH react-select; Lever is
+  plain HTML; Ashby's widgets are ordinary React handlers) → the fill can run page-side via
+  `Runtime.evaluate` — identical visible/hidden, no Input.* pipeline, no focus emulation.
+  The ONE trusted-input exception: the SUBMIT click (irreversible + captcha vendors score
+  event trust) — same rule as Workday's act.clickSubmit.
+- No login, no draft persistence ⇒ fill and submit are two visits to a BLANK form: the
+  submit run re-fills from the approved bundle, verifies, then (armed) clicks submit.
+- Required-field recon: GH = aria-required / requiredInput mirror / label `*`; Lever =
+  `required` attr / label `✱`; Ashby = `required` attr. All fail toward over-flagging.

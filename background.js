@@ -71,7 +71,7 @@ console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
+importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "ats.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
 
 // ============================================================================
 // EXTERNAL messages from ApplyPilot Web (the website → extension handoff).
@@ -253,10 +253,33 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           return;
         }
         const store = await new Promise((r) =>
-          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r)
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets"], r)
         );
         if (!store.profile) {
           sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
+          return;
+        }
+
+        // MULTI-ATS routing (2026-07-31): Greenhouse / Lever / Ashby postings run the ats.js
+        // pipeline — single page, no login, no onboarding stage. Workday (and anything
+        // unrecognized, which is treated as Workday for backward compat) keeps the existing
+        // onboard→walk path below, byte-identical.
+        const atsKind = detectAts(startUrl);
+        if (atsKind && atsKind !== "workday") {
+          runInFlight = true;
+          try {
+            const background = message.background === true;
+            emitRunProgress("Opening the job posting", (background ? "in a background tab — " : "") + atsKind);
+            const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+            if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+            await waitTabComplete(tab.id, 20000);
+            const res = await runAtsApplicationRun(tab.id, atsKind, store, startUrl);
+            sendResponse({ ...res, tabId: tab.id, startUrl });
+          } catch (e) {
+            sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+          } finally {
+            runInFlight = false;
+          }
           return;
         }
         const cfg = store.onboardConfig || {};
@@ -470,6 +493,37 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // DEV: read-only ATS form scan of a NAMED tab (the fill run returns its tabId) — the
+  // "go to the tab and see what actually happened" verification, machine-readable. CDP
+  // attach → atsInjScan (fixed function, no arbitrary code) → detach. Refused mid-run
+  // (one debugger client per tab — an attach here would clobber a running walk's).
+  if (type === "AP_DEV_ATS_SCAN") {
+    (async () => {
+      if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
+      const ats = String(message.ats || "");
+      let tabId = Number(message.tabId) || 0;
+      if (!tabId && message.urlContains) {
+        // find the run's tab by URL fragment (the caller usually lost the tabId to a page nav)
+        const tabs = await new Promise((r) => chrome.tabs.query({}, r));
+        const hit = (tabs || []).find((t) => t.url && t.url.includes(String(message.urlContains)));
+        if (hit) tabId = hit.id;
+      }
+      if (!tabId || !ats) { sendResponse({ ok: false, error: "need tabId (or urlContains) + ats" }); return; }
+      try {
+        const attached = await cdpAttach(tabId);
+        if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
+        const scan = await cdpEval(atsInjScan, ats);
+        const state = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+        sendResponse({ ok: true, scan, submitState: state });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      } finally {
+        await cdpDetach();
+      }
+    })();
+    return true;
+  }
+
   // DISCOVERY RECON (read-only). Opens each board's search page in the operator's real
   // signed-in session and dumps what the DOM actually looks like — selector hit-counts plus
   // one representative card's markup — so the list scrapers' selector ladders can be
@@ -559,6 +613,23 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           return;
         }
         LOG(`approved bundle loaded for job_key "${jobKey}" (${pull.count} field(s)) — ${arm ? "⚠ ARMED: this run WILL submit if every gate passes." : "DRY rehearsal: runs the whole gate and stops at 'would submit'."}`);
+
+        // MULTI-ATS routing (2026-07-31): a Greenhouse/Lever/Ashby submit is a re-fill of a
+        // BLANK form from the approved bundle — no sign-in, no walk. The gates keep the same
+        // shape: bundle blockers (already checked above) + strict live verify + no visible
+        // captcha + arm. Workday keeps the existing onboard→replay path below.
+        {
+          const atsKind = detectAts(startUrl);
+          if (atsKind && atsKind !== "workday") {
+            emitRunProgress(arm ? "Submitting" : "Rehearsing", atsKind + " — " + (background ? "background tab" : "foreground tab"));
+            const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+            if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
+            await waitTabComplete(tab.id, 20000);
+            const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl });
+            sendResponse({ ...res, job_key: jobKey, application_id: pull.application_id || null, tabId: tab.id, startUrl });
+            return;
+          }
+        }
 
         // ── 3. Open the posting + sign in (the form is per-session; a submit run always re-onboards). ──
         // BACKGROUND is supported (2026-07-28): the replay enables synthetic input for its field
@@ -3431,6 +3502,223 @@ async function pullApprovedBundle(LOG, opts) {
   } catch (e) {
     log(`review pull skipped: ${String((e && e.message) || e)} — keeping the local bundle.`);
     return { pulled: false, reason: "exception" };
+  }
+}
+
+// ============================================================================
+// MULTI-ATS runners (Greenhouse / Lever / Ashby — ats.js is the substrate+driver).
+// These forms are single-page, login-free and draft-free, so the two stages are
+// two visits to a blank form: FILL (profile → form → review bundle → website) and
+// SUBMIT (approved bundle → form → verify → the gated click). Everything runs
+// through the CDP attach (chrome.debugger is not host-gated — the same invariant
+// discovery relies on), so NO host permissions are needed for these sites.
+// ============================================================================
+
+// Poll the form until its field count is stable non-zero twice (the standing
+// "never scan a progressively-rendered page without settling it" rule — 5th site).
+async function waitAtsFormReady(ats, LOG, ceilingMs) {
+  const deadline = Date.now() + (ceilingMs || 20000);
+  let prev = -1;
+  while (Date.now() < deadline) {
+    await cdpWakePage();
+    let n = 0;
+    try { const s = await cdpEval(atsInjScan, ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
+    if (n > 0 && n === prev) return { ready: true, fields: n };
+    prev = n;
+    await cdpDelay(450);
+  }
+  LOG(`form did not settle within ${ceilingMs || 20000}ms (last field count ${prev})`);
+  return { ready: prev > 0, fields: Math.max(prev, 0) };
+}
+
+// The actuation for the ATS driver: page-side eval + SW wall-clock pacing + the same
+// LLM seam the Workday act uses (act.llm honors the popup toggle), + the resume attach
+// (SW owns the IndexedDB read — strings only across the eval boundary).
+function makeAtsActuation(llmConfig) {
+  const workday = makeCdpActuation(llmConfig); // borrow llm + aiEnabled so gating is identical
+  return {
+    aiEnabled: workday.aiEnabled,
+    llm: workday.llm,
+    delay: cdpAdaptiveDelay,
+    delayFull: cdpDelay,
+    eval: (fn, ...args) => cdpEval(fn, ...args),
+    attachResume: async (ref) => {
+      const stored = await getResume().catch(() => null);
+      if (!stored || !stored.base64) return { ok: false, error: "no resume stored (upload one in the popup / website)" };
+      const r = await cdpEval(atsInjAttachFile, ref.inputSel, stored.base64, stored.filename || "resume.pdf", stored.mime || "application/pdf");
+      if (!r || !r.ok) return { ok: false, error: (r && r.error) || "attach failed" };
+      // async-upload confirmation (GH uploads on change): poll for the filename to render
+      // ANYWHERE near the input OR input.files to still hold it — bounded, wall-clock.
+      const deadline = Date.now() + 15000;
+      let last = null;
+      while (Date.now() < deadline) {
+        last = await cdpEval(atsInjReadValue, ref.ats || "greenhouse", ref.inputSel, "file_upload");
+        if (last && last.ok && last.value) return { ok: true, name: last.value, verified: true };
+        await cdpDelay(700);
+      }
+      return { ok: true, name: r.name, verified: false, detail: "attached (confirmation not read — verify on the form)" };
+    },
+  };
+}
+
+// FILL run: posting → form → fill → review bundle → website. NEVER submits — there is no
+// page-advance click on these single-page forms at all; the only submit-capable click
+// lives in runAtsSubmitRun behind authorize+arm.
+async function runAtsApplicationRun(tabId, ats, store, startUrl) {
+  const LOG = (...a) => console.log("[ApplyPilot][ATS-RUN]", ...a);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
+    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
+    await cdpSetFocusEmulation(true).catch(() => {}); // hidden tab keeps repainting (the discover lever)
+
+    // JD scrape on the POSTING page (we may still be on it) before navigating away.
+    emitRunProgress("Reading the job description");
+    let jd = null;
+    try { jd = await cdpEval(scrapeJobPosting); } catch (e) { LOG("JD scrape skipped:", String((e && e.message) || e)); }
+    if (jd && jd.title) LOG(`posting: "${String(jd.title).slice(0, 70)}" @ ${jd.company || "?"} (${(jd.description || jd.text || "").length} chars)`);
+
+    const formUrl = atsFormUrl(ats, startUrl);
+    const here = await cdpEval(function () { return location.href; }).catch(() => null);
+    if (here && formUrl && here.split("#")[0] !== formUrl) {
+      LOG(`navigating to the application form: ${formUrl}`);
+      await cdpNavigate(formUrl);
+      await cdpDelay(1200);
+    }
+    emitRunProgress("Waiting for the form", ats);
+    const ready = await waitAtsFormReady(ats, LOG);
+    if (!ready.ready) { return { ok: true, needs_operator: true, stopped: "form-not-rendered", detail: "The " + ats + " application form never rendered — open the tab and check, then re-run.", jd }; }
+    LOG(`form settled — ${ready.fields} field(s).`);
+
+    const jobContext = { ...(store.jobContext || {}) };
+    if (jd && jd.company) jobContext.company = jd.company;
+    if (!jobContext.company) jobContext.company = atsCompanyFromUrl(startUrl);
+    if (jd && jd.title) jobContext.title = jd.title;
+
+    emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
+    const act = makeAtsActuation(await getLlmConfig());
+    const prepared = prepareProfile(store.profile);
+    const out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+
+    // ONE page ⇒ one bundle write (the walk's clear-once + accumulate collapses to a set).
+    const pageKey = (() => { try { return new URL(out.url).pathname; } catch (e) { return "application"; } })();
+    const bundle = buildReviewBundle(out.results, {
+      page: pageKey, pageNumber: 1, pageLabel: "Application",
+      url: out.url, tenant: jobContext.company || null, capturedAt: new Date().toISOString(),
+    });
+    await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
+    await reportApplication(bundle, jobContext);
+    LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
+    emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
+    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
+  } catch (e) {
+    return { ok: false, error: "exception:" + String((e && e.message) || e) };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// SUBMIT run: approved bundle → blank form → re-fill → verify → gate → (armed) submit.
+// The submit click is TRUSTED input (the one irreversible action; captcha vendors also
+// score event trust) and happens ONLY when: no bundle blockers, no live verify failures,
+// no visible captcha challenge, arm===true. A visible captcha challenge is a
+// needs_operator halt — NEVER solved or bypassed by the bot.
+async function runAtsSubmitRun(tabId, ats, bundle, opts) {
+  const LOG = (...a) => console.log("[ApplyPilot][ATS-SUBMIT]", ...a);
+  const arm = !!(opts && opts.arm);
+  try {
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
+    await cdpInstallPageOverrides();
+    await cdpSetFocusEmulation(true).catch(() => {});
+
+    const formUrl = atsFormUrl(ats, (opts && opts.startUrl) || bundle.url);
+    const here = await cdpEval(function () { return location.href; }).catch(() => null);
+    if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); }
+    const ready = await waitAtsFormReady(ats, LOG);
+    if (!ready.ready) return { ok: true, needs_operator: true, stopped: "form-not-rendered", submitted: false };
+
+    // Approved values by fieldName (the bundle is the SOURCE OF TRUTH — never the profile).
+    // field_id is "<page>::formField-<fieldName>"; is_deleted rows and empty values are
+    // "leave blank" (a cleared optional), a checkbox carries "true"/"false".
+    const approved = new Map();
+    for (const e of bundle.entries || []) {
+      if (!e || e.is_deleted) continue;
+      const m = /::formField-(.+)$/.exec(String(e.field_id || ""));
+      const name = m ? m[1] : String(e.field_id || "");
+      approved.set(name, e);
+    }
+    const valueFor = (f) => {
+      const e = approved.get(f.fieldName);
+      if (!e) return undefined;                       // never in the bundle → leave alone
+      if (f.widgetType === "file_upload") return "resume"; // presence = re-attach
+      const v = e.current_value;
+      if (v == null || String(v).trim() === "") return undefined; // approved-blank → leave blank
+      return String(v);
+    };
+
+    emitRunProgress(arm ? "Replaying approved values (ARMED)" : "Rehearsing the submit", ats);
+    const act = makeAtsActuation(await getLlmConfig());
+    // AI stays out of a submit run entirely: valueFor covers every field the human approved;
+    // anything else is deliberately blank. aiEnabled=false regardless of the popup toggle.
+    act.aiEnabled = false;
+    const out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+
+    // STRICT verify: every approved non-blank value must be ON the form now.
+    const failures = [];
+    for (const r of out.results) {
+      const e = approved.get(r.fieldName);
+      if (!e) continue;
+      const want = e.current_value;
+      if (want == null || String(want).trim() === "") continue;
+      if (r.status === "filled" || r.status === "filled_review") continue;
+      failures.push(`${r.fieldName} ("${(e.question_label || "").slice(0, 60)}"): ${r.status} — ${r.detail || "no detail"}`);
+    }
+    // Approved entries the live form no longer shows (form changed since the fill).
+    const liveNames = new Set(out.results.map((r) => r.fieldName));
+    for (const [name, e] of approved) {
+      if (liveNames.has(name)) continue;
+      if (e.current_value == null || String(e.current_value).trim() === "") continue;
+      failures.push(`${name} ("${(e.question_label || "").slice(0, 60)}"): approved value has NO matching field on the live form`);
+    }
+
+    const state = await cdpEval(atsInjSubmitState, ats);
+    const blockers = bundleSubmitBlockers(bundle);
+    LOG(`verify: ${out.results.length} field(s) replayed, ${failures.length} failure(s); bundle blockers: ${blockers.length}; submit button: ${state && state.hasSubmit} (disabled=${state && state.disabled}); captcha challenge visible: ${state && state.captchaChallenge}`);
+    failures.forEach((f) => LOG("  ✗ " + f));
+    blockers.forEach((b) => LOG("  ✗ bundle: " + b));
+
+    if (blockers.length || failures.length) {
+      return { ok: true, submitted: false, replayed: true, stopped: "verify-failed", failures: failures.concat(blockers), ats };
+    }
+    if (!state || !state.hasSubmit) return { ok: true, submitted: false, replayed: true, stopped: "no-submit-button", ats };
+    if (state.captchaChallenge) return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-challenge", detail: "A captcha challenge is visible — solve it yourself in the tab, then submit manually or re-run.", ats };
+
+    if (!arm) {
+      LOG("▶▶ WOULD CLICK SUBMIT ◀◀ (dry rehearsal — every gate passed; arm the run to actually submit)");
+      return { ok: true, submitted: false, replayed: true, would_submit: true, stopped: "simulate", ats };
+    }
+
+    // ── the ONE irreversible click — trusted input, forced. ──
+    LOG("⚠ ARMED — clicking Submit (trusted input).");
+    cdpSetSyntheticInput(false);
+    await cdpClickAt(state.rect.cx, state.rect.cy);
+    // Outcome: confirmation, validation errors, or a captcha challenge that popped on submit.
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await cdpDelay(1000);
+      const s2 = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+      if (s2 && s2.confirmed) { LOG("✅ SUBMITTED — confirmation detected:", s2.url); return { ok: true, submitted: true, replayed: true, confirmed: true, ats, confirmUrl: s2.url }; }
+      if (s2 && s2.captchaChallenge) { LOG("captcha challenge appeared on submit — operator must solve it in the tab."); return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-challenge", ats }; }
+      const errs = await cdpEval(atsInjErrors, ats).catch(() => null);
+      if (errs && errs.errors && errs.errors.length) { LOG("submit refused — validation errors:"); errs.errors.forEach((x) => LOG("  · " + x)); return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats }; }
+    }
+    LOG("no confirmation within 30s — VERIFY IN THE TAB before assuming either outcome.");
+    return { ok: true, submitted: false, replayed: true, stopped: "no-confirmation", detail: "Submit was clicked but no confirmation rendered within 30s — check the tab.", ats };
+  } catch (e) {
+    return { ok: false, error: "exception:" + String((e && e.message) || e) };
+  } finally {
+    await cdpDetach();
   }
 }
 

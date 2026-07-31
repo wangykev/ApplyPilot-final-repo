@@ -16,6 +16,7 @@ export function canonicalJobUrl(u: string): string {
     return (p.origin + p.pathname)
       .toLowerCase()
       .replace(/\/apply(?:\/[^/]*)*\/?$/i, "")
+      .replace(/\/application\/?$/i, "") // Ashby's form tab (2026-07-31) — lockstep with lib.js
       .replace(/\/+$/, "");
   } catch {
     return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();

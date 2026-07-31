@@ -579,7 +579,10 @@ function canonicalJobUrl(u) {
     const req = (p.pathname.match(/_R(\d+)\b/i) || [])[1];
     const dc = (p.hostname.match(/\bwd\d+\b/i) || [""])[0].toLowerCase(); // "wd3" — on both hosts
     if (req) return (dc || "wd") + ":r" + req;
-    return (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/+$/, "");
+    // Strip the FORM-page tail so a posting URL and its form URL key identically:
+    // /apply(…) (Workday + Lever) and /application (Ashby — 2026-07-31; without this a
+    // submit run keyed on the posting could never find the fill's reported bundle).
+    return (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
   } catch (e) {
     return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();
   }
