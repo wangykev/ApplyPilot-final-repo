@@ -669,3 +669,27 @@ test("teachableCards: a date question is never offered as a card", () => {
   ])], [], {});
   assert.deepEqual(cards.map((c) => c.question), ["Are you over 18?"], "the date is dropped, the real question stays");
 });
+
+// ── DEFAULT ALIAS WORDINGS (operator 2026-07-31: aliases live VISIBLY in the buckets, never
+// as hidden extension regexes; ensureDefaultFieldWordings is already imported above) ─────────
+test("alias wordings: phone gets 'Phone' etc., visible in its bucket, idempotent", () => {
+  const profile = { personal_info: { phone_number: "8506660266", email: "k@x.com", country: "United States of America" } };
+  const once = ensureDefaultFieldWordings([], profile);
+  const phone = once.find((b) => b.profile_path === "personal_info.phone_number");
+  assert.ok(phone, "phone bucket seeded");
+  const qs = (phone!.questions || []).map((q) => q.toLowerCase());
+  for (const w of ["phone number", "phone", "mobile phone", "cell phone"]) assert.ok(qs.includes(w), "missing alias: " + w);
+  const country = once.find((b) => b.profile_path === "personal_info.country");
+  assert.ok((country!.questions || []).some((q) => /country of residence/i.test(q)), "country-of-residence alias");
+  // idempotent — a second pass adds nothing
+  const twice = ensureDefaultFieldWordings(once, profile);
+  assert.equal(
+    twice.find((b) => b.profile_path === "personal_info.phone_number")!.questions.length,
+    phone!.questions.length
+  );
+});
+
+test("alias wordings: only fields the profile HAS get alias seeds (no orphan buckets)", () => {
+  const out = ensureDefaultFieldWordings([], { personal_info: { email: "k@x.com" } });
+  assert.ok(!out.find((b) => b.profile_path === "work_experience.0.company"), "no work-experience bucket without work experience");
+});

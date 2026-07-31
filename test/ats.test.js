@@ -347,17 +347,22 @@ test("router: a SPONSORSHIP question that mentions 'work authorization' routes t
   assert.match(r.detail, /requires_sponsorship/);
 });
 
-test("router: current employer + current title compose from the most recent work entry", () => {
-  assert.strictEqual(ats.atsRouteLabel("Who is your current or most recent employer?", {}, PROFILE, {}).value, "Rivian");
-  const p = JSON.parse(JSON.stringify(PROFILE));
-  p.work_experience[0].job_title = "Firmware Intern";
-  assert.strictEqual(ats.atsRouteLabel("What is your current or most recent job title?", {}, p, {}).value, "Firmware Intern");
+test("router: identity ALIASES are NOT code rungs — they live in the website's bucket wordings (operator 2026-07-31)", () => {
+  // "Phone" / current-employer / country-of-residence / preferred-name phrasings route through
+  // the BUCKET tier (DEFAULT_ALIAS_WORDINGS in web/lib/teach.ts — visible + editable on
+  // /app/teach), never through hidden regexes here. The router must return null for them.
+  assert.strictEqual(ats.atsRouteLabel("Who is your current or most recent employer?", {}, PROFILE, {}), null);
+  assert.strictEqual(ats.atsRouteLabel("What is your current country of residence?", {}, PROFILE, {}), null);
+  assert.strictEqual(ats.atsRouteLabel("Phone", {}, PROFILE, {}), null);
+  // …but a matching BUCKET (what the website seeds) fills it through the ordinary bucket tier:
+  const lib = require("../lib.js");
+  const idx = new Map([[lib.normalizeLabel("Phone"), { profile_path: "personal_info.phone_number", value: [] }]]);
+  const r = ats.atsRouteField("lever", { fieldName: "q1", label: "Phone", widgetType: "text" }, PROFILE, {}, {}, idx);
+  assert.strictEqual(r.raw, "8506660266");
+  assert.strictEqual(r.source, "bucket");
 });
 
-test("router: country-of-residence routes the profile country ladder (NOT the dial composite)", () => {
-  const p = JSON.parse(JSON.stringify(PROFILE));
-  p.personal_info.country = ["United States of America", "United States"];
-  const r = ats.atsRouteLabel("What is your current country of residence?", {}, p, {});
-  assert.deepStrictEqual(r.raw, ["United States of America", "United States"]);
-  assert.strictEqual(r.path, "personal_info.country");
+test("router: the full-name COMPOSE stays code-side (no single profile field can express it)", () => {
+  assert.strictEqual(ats.atsRouteLabel("Full Name", {}, PROFILE, {}).value, "Kevin Wang");
+  assert.strictEqual(ats.atsRouteLabel("Name of your referrer", {}, PROFILE, {}), null); // anchored — never a stray "name" hit
 });

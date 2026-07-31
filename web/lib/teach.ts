@@ -502,8 +502,41 @@ export function ensureDefaultFieldWordings(buckets: Bucket[], profile: unknown):
     const seeded = ensureModeABucket(next, path, profileFieldMeta(path, undefined).bucketWidget);
     next = addWordingToBucket(seeded.buckets, seeded.bucketId, label);
   }
+  // Known ALIAS WORDINGS for common fields — VISIBLE in the buckets (operator 2026-07-31:
+  // "don't secretly code them together on the backend; have them in the question bucket so
+  // users keep control"). These were briefly hidden regex rungs in the extension's label
+  // router; as bucket wordings the operator can see, edit, or delete every one on /app/teach.
+  // Exact-normalized matching, so casing/punctuation don't matter. Non-destructive + idempotent
+  // (addWordingToBucket dedupes); only fields the profile actually has get seeded.
+  for (const [path, aliases] of Object.entries(DEFAULT_ALIAS_WORDINGS)) {
+    const existing = next.find((b) => String(b.profile_path || "").trim() === path);
+    if (!existing) continue; // the field-name pass above only seeds fields present in the profile
+    for (const w of aliases) next = addWordingToBucket(next, existing.id, w);
+  }
   return next;
 }
+
+// path → the alias question wordings real ATS forms use for that field (each observed live:
+// Ramp labels phone just "Phone"; OpenAI "Preferred Name (if applicable)"; GitLab "What's the
+// name you'd prefer us to use throughout the interview process?" + country-of-residence;
+// Scale AI the current-employer/title pair). Extend freely — every entry is operator-visible.
+const DEFAULT_ALIAS_WORDINGS: Record<string, string[]> = {
+  "personal_info.phone_number": ["Phone", "Mobile Phone", "Cell Phone", "Mobile Number", "Phone number (with country code)"],
+  "personal_info.email": ["Email Address", "E-mail"],
+  "personal_info.preferred_first_name": [
+    "Preferred Name",
+    "Preferred Name (if applicable)",
+    "What's the name you'd prefer us to use throughout the interview process?",
+  ],
+  "personal_info.country": ["Country of Residence", "What is your current country of residence?"],
+  "work_experience.0.company": ["Current Company", "Current Employer", "Who is your current or most recent employer?"],
+  "work_experience.0.job_title": ["Current Title", "Current Job Title", "What is your current or most recent job title?"],
+  "application_questions.availability_and_preferences.salary_expectation": [
+    "Salary Expectations",
+    "What are your salary expectations for this position?",
+    "Desired Salary",
+  ],
+};
 
 /** Add a wording to a bucket (by id), deduped by normalizeQuestion. Returns a NEW array. */
 export function addWordingToBucket(buckets: Bucket[], bucketId: string, wording: string): Bucket[] {

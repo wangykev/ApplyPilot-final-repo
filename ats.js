@@ -206,36 +206,16 @@ function atsRouteLabel(label, f, profile, defaults) {
   if (/\btwitter\b|\bx (profile|url)\b/i.test(L)) { const v = atsWebsiteValue(profile, "twitter"); if (v) return { value: v, source: "website" }; }
   if (/other website|website url/i.test(L)) { const v = atsWebsiteValue(profile, "other"); if (v) return { value: v, source: "website" }; }
 
-  // Bare identity labels (ANCHORED — "name" appears in hostile contexts like "name of your
-  // referrer", so only the exact label forms route). Ramp labels its phone field just
-  // "Phone" (the bucket wording is "Phone Number") — the AI answered it correctly but a
-  // deterministic identity fill must never depend on the AI (live 2026-07-31).
-  if (/^(full |legal )?name$/i.test(L)) { const v = atsComposeValue("full_name", profile); if (v) return { value: v, source: "map", detail: "(full_name)" }; }
-  if (/^first name$/i.test(L) && has(pi.first_name)) return { value: pi.first_name, source: "map" };
-  if (/^last name$/i.test(L) && has(pi.last_name)) return { value: pi.last_name, source: "map" };
-  if (/^e-?mail( address)?$/i.test(L) && has(pi.email)) return { value: pi.email, source: "map" };
-  if (/^(mobile |cell )?phone( number)?$/i.test(L) && has(pi.phone_number)) return { value: pi.phone_number, source: "map", detail: "personal_info.phone_number" };
-
-  // Identity / contact variants. GitLab words preferred-name as "the name you'd prefer
-  // us to use throughout the interview process" — cover the prefer-phrasings too.
-  if ((/preferred\s+(first\s+)?name/i.test(L) || /name\s+(you'?d|you would)\s+prefer|prefer\s+(us\s+)?to\s+(use|call)|what should we call you/i.test(L)) && has(pi.preferred_first_name)) {
-    return { value: pi.preferred_first_name, source: "map", detail: "personal_info.preferred_first_name" };
-  }
-  // Current/most-recent employer + title (Scale AI asks both as REQUIRED text).
-  if (/(current|most recent)( or most recent)? (employer|company)|who is your (current|most recent)/i.test(L)) {
-    const v = atsComposeValue("current_company", profile);
-    if (v) return { value: v, source: "map", detail: "(current_company)" };
-  }
-  if (/(current|most recent)( or most recent)? (job )?title|what is your (current|most recent).*title/i.test(L)) {
-    const v = atsComposeValue("current_title", profile);
-    if (v) return { value: v, source: "map", detail: "(current_title)" };
-  }
-  // A REAL country question (GitLab: "What is your current country of residence?*") —
-  // distinct from GH's #country dial-code composite, which the static map catches first.
-  if (/country of residence|country (do|will) you (currently )?(live|reside|work)|country are you (currently )?(located|based|living)/i.test(L)) {
-    const c = pi.country;
-    if (c && (Array.isArray(c) ? c.length : String(c).trim())) return { raw: c, path: "personal_info.country", source: "map" };
-  }
+  // ⚠ IDENTITY-FIELD ALIASES ("Phone" for phone_number, "Current Employer", country-of-
+  // residence, preferred-name phrasings…) deliberately do NOT live here (operator
+  // 2026-07-31: "don't secretly code them together on the backend — have them visible in
+  // the question bucket so users keep control"). They ship as DEFAULT_ALIAS_WORDINGS in
+  // the website's ensureDefaultFieldWordings (web/lib/teach.ts) — visible + editable on
+  // /app/teach — and reach this driver through the ordinary BUCKET tier, which routes
+  // BEFORE this label ladder. Only two things stay code-side, because no profile path can
+  // express them: COMPOSED values (full name = first+last) and multi-fact LOGIC
+  // (sponsorship = now||future, employment recognizers).
+  if (/^(full |legal )?name$/i.test(L)) { const v = atsComposeValue("full_name", profile); if (v) return { value: v, source: "map", detail: "(full_name — composed; no single profile field)" }; }
   // Location questions on a combobox widget (Ashby's "Where are you currently located?"
   // has NO field identity at all — the label is the only durable key). kind:"location"
   // routes the driver to the type-then-scoped-read combobox flow.
