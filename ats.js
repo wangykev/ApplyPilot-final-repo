@@ -199,6 +199,13 @@ function atsRouteLabel(label, f, profile, defaults) {
   if (/preferred\s+(first\s+)?name/i.test(L) && has((profile.personal_info || {}).preferred_first_name)) {
     return { value: profile.personal_info.preferred_first_name, source: "map", detail: "personal_info.preferred_first_name" };
   }
+  // Location questions on a combobox widget (Ashby's "Where are you currently located?"
+  // has NO field identity at all — the label is the only durable key). kind:"location"
+  // routes the driver to the type-then-scoped-read combobox flow.
+  if (/where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i.test(L)) {
+    const v = atsComposeValue("city_state", profile);
+    if (v) return { kind: "location", value: v, source: "map", path: "(city+state)" };
+  }
 
   // Compensation + availability (STATED only — an empty profile value falls through to AI/blank).
   if (/salary|compensation|pay expectation|desired pay|expected (salary|pay)/i.test(L)) {
@@ -359,8 +366,16 @@ function atsInjScan(ats) {
     return out;
   }
 
-  // ashby — field units are .ashby-application-form-field-entry (semantic class, stable).
-  const entries = document.querySelectorAll(".ashby-application-form-field-entry");
+  // ashby — field units: the semantic .ashby-application-form-field-entry PLUS the
+  // hashed `_fieldEntry_*` css-module class. The EEOC survey's entries and the consent
+  // checkboxes carry ONLY the hashed one (live 2026-07-31, OpenAI) — the semantic class
+  // marks just the main section. The `_fieldEntry` LOCAL NAME is stable across builds
+  // (the hash suffix rotates); union + dedup, document order.
+  const entrySet = new Set([
+    ...document.querySelectorAll(".ashby-application-form-field-entry"),
+    ...document.querySelectorAll('[class*="_fieldEntry"]'),
+  ]);
+  const entries = [...entrySet].sort((a, b) => (a.compareDocumentPosition(b) & 2 ? 1 : -1));
   for (const entry of entries) {
     // Yes/No button pair (hidden checkbox tracks state).
     const yesno = entry.querySelector('[class*="_yesno_"]');
@@ -391,17 +406,38 @@ function atsInjScan(ats) {
       }
       continue;
     }
+    // consent checkboxes (one per entry, name = the label text itself — live, OpenAI):
+    // NOT a yes/no pair (no _yesno_ container), handled before the generic input loop.
+    const soloCbs = [...entry.querySelectorAll('input[type="checkbox"]')];
+    if (soloCbs.length && !entry.querySelector('input[type="radio"]')) {
+      for (const cbx of soloCbs) {
+        const nm = cbx.name || cbx.id; if (!nm || seen.has(nm)) continue; seen.add(nm);
+        const l = (cbx.id && document.querySelector('label[for="' + esc(cbx.id) + '"]')) || cbx.closest("label");
+        push({ fieldName: nm, inputSel: cbx.id ? "#" + esc(cbx.id) : 'input[name="' + esc(nm) + '"]', widgetType: "checkbox",
+          label: stripReq((l ? txt(l) : "") || entryLabel || nm), isRequired: cbx.required === true, value: cbx.checked ? true : null });
+      }
+      continue;
+    }
     for (const el of entry.querySelectorAll("input, textarea")) {
       if (el.type === "hidden") continue;
-      const nm = el.name || el.id || ""; if (!nm || seen.has(nm)) continue;
       const isCombo = el.getAttribute("role") === "combobox";
+      // the location combobox has NO id and NO name (live, OpenAI) — STAMP one at scan
+      // time (the discover data-ap-click idiom: React leaves foreign attributes alone
+      // unless it remounts the node; a remount just kills the selector → an honest
+      // needs_review, never a wrong fill — and every later pass re-scans fresh anyway).
+      let nm = el.name || el.id || "";
+      if (!nm && isCombo) {
+        nm = "ap-ats-combobox-" + out.fields.length;
+        try { el.id = nm; } catch (e) { continue; }
+      }
+      const inputSel = el.id ? "#" + esc(el.id) : 'input[name="' + esc(nm) + '"]';
+      if (!nm || seen.has(nm)) continue;
       const isFile = el.type === "file";
       if (!isFile && !vis(el)) continue;
       seen.add(nm);
       const required = el.required === true;
-      const inputSel = el.id ? "#" + esc(el.id) : 'input[name="' + esc(nm) + '"]';
       if (isFile) { push({ fieldName: nm, inputSel, widgetType: "file_upload", label: entryLabel || nm, isRequired: required, value: (el.files && el.files[0] && el.files[0].name) || null }); continue; }
-      if (isCombo) { push({ fieldName: nm || "location", inputSel, widgetType: "select", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
+      if (isCombo) { push({ fieldName: nm, inputSel, widgetType: "select", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
       if (el.tagName === "TEXTAREA") { push({ fieldName: nm, inputSel: "textarea[name=\"" + esc(nm) + "\"]", widgetType: "textarea", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
       const isDate = /pick date/i.test(el.placeholder || "");
       push({ fieldName: nm, inputSel, widgetType: isDate ? "date" : "text", label: entryLabel || nm, isRequired: required, value: el.value || null });
@@ -409,6 +445,7 @@ function atsInjScan(ats) {
   }
   return out;
 }
+
 
 // Set a text-like input/textarea: native setter + input/change (+blur-ish focusout) —
 // the proven React commit pattern. Returns the read-back so the driver can verify.
@@ -813,7 +850,9 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
       // The ROUTE can refine the widget (map kind "dial": the scan sees an ordinary select;
       // only the mapping knows its options carry a "+<digits>" tail that must strip for
       // matching — the country-skip bug, live 2026-07-31).
-      const effF = route && route.kind === "dial" ? Object.assign({}, f, { widgetType: "dial" }) : f;
+      const effF = route && (route.kind === "dial" || route.kind === "location")
+        ? Object.assign({}, f, { widgetType: route.kind === "dial" ? "dial" : (ats === "lever" ? "location" : (f.widgetType === "select" ? "location" : f.widgetType)) })
+        : f;
       const mopts = { containment: !!(route && route.containment) }; // stated-value routes only (EEO) — commits at the flagged filled_review tier
       const produced = await atsActuateField(act, ats, effF, ref, rec, candidates, textValue, jc, profile, mopts);
       if (!produced) {
@@ -961,6 +1000,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     } else {
       const m = atsLib.matchCandidates(candidates, matchTexts, { containment: allowContainment });
       if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
+      // stated Yes/No-leading value → the unique same-polarity option (the contraction
+      // bridge — see the radio path; select twin for GH's EEO dropdowns).
+      if (!hit && allowContainment) {
+        const lead = /^(yes|no)\b/i.exec(String(candidates[0] || ""));
+        const pol = lead ? atsFd.optionForPolarity(matchTexts, lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null;
+        if (pol) hit = { index: matchTexts.indexOf(pol), tier: "polarity-lead" };
+      }
     }
     if (!hit) { await act.eval(atsInjCloseCombo, ref.inputSel); rec.detail = "no candidate matched " + texts.length + " option(s); candidates=" + JSON.stringify(candidates.slice(0, 4)) + " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)); rec.options = texts.slice(0, 60); return false; }
     const commitText = texts[hit.index];
@@ -1012,8 +1058,15 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     let pick = m && m.targetIndex >= 0 ? texts[m.targetIndex] : null;
     let tier = m && m.targetIndex >= 0 ? m.matchTier : null;
     if (!pick) {
-      // Yes/No-leading polarity (the Workday optionForPolarity rule) for boolean ladders.
-      const pol = candidates[0] === "Yes" || candidates[0] === "No" ? atsFd.optionForPolarity(texts, candidates[0]) : null;
+      // Yes/No-leading polarity (the Workday optionForPolarity rule) for boolean ladders —
+      // and, for STATED long-form values (EEO, allowContainment), for a candidate that merely
+      // LEADS with Yes/No: "No, I do not have a disability" maps to the unique No-leading
+      // option even when the ATS words it "No, I don't have…" (a contraction neither
+      // containment nor fuzzy can bridge — live 2026-07-31, Ashby). Flagged (polarity-lead
+      // grades filled_review); 2+ same-polarity options still refuse.
+      const lead = /^(yes|no)\b/i.exec(String(candidates[0] || ""));
+      const polKey = candidates[0] === "Yes" || candidates[0] === "No" ? candidates[0] : (allowContainment && lead ? (lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null);
+      const pol = polKey ? atsFd.optionForPolarity(texts, polKey) : null;
       if (pol) { pick = pol; tier = "polarity-lead"; }
     }
     if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; rec.options = texts; return false; }

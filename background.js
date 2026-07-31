@@ -3517,17 +3517,23 @@ async function pullApprovedBundle(LOG, opts) {
 // Poll the form until its field count is stable non-zero twice (the standing
 // "never scan a progressively-rendered page without settling it" rule — 5th site).
 async function waitAtsFormReady(ats, LOG, ceilingMs) {
-  const deadline = Date.now() + (ceilingMs || 20000);
-  let prev = -1;
+  const start = Date.now();
+  const deadline = start + (ceilingMs || 25000);
+  let prev = -1, stable = 0;
   while (Date.now() < deadline) {
     await cdpWakePage();
     let n = 0;
     try { const s = await cdpEval(atsInjScan, ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
-    if (n > 0 && n === prev) return { ready: true, fields: n };
+    // THREE consecutive equal non-zero reads AND ≥2.5s elapsed — two reads 450ms apart
+    // accepted Ashby's form at 9 fields while its survey/consent entries (4 more) were
+    // still mounting (live 2026-07-31). Sections mount in bursts; a stable count between
+    // bursts is not a settled form.
+    stable = n > 0 && n === prev ? stable + 1 : 0;
+    if (stable >= 2 && Date.now() - start >= 2500) return { ready: true, fields: n };
     prev = n;
     await cdpDelay(450);
   }
-  LOG(`form did not settle within ${ceilingMs || 20000}ms (last field count ${prev})`);
+  LOG(`form did not settle within ${ceilingMs || 25000}ms (last field count ${prev})`);
   return { ready: prev > 0, fields: Math.max(prev, 0) };
 }
 
