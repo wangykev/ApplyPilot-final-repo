@@ -524,6 +524,25 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // DEV: close the tabs a test sweep opened. Each run opens a job tab and deliberately LEAVES
+  // it (so the operator can look at what happened), which piles up over a testing session.
+  // Matches on a url substring and never touches the tab that asked (the dev site).
+  if (type === "AP_DEV_CLOSE_TABS") {
+    (async () => {
+      const needle = String(message.urlContains || "");
+      if (!needle) { sendResponse({ ok: false, error: "need urlContains" }); return; }
+      const tabs = await new Promise((r) => chrome.tabs.query({}, r));
+      const senderTabId = sender && sender.tab && sender.tab.id;
+      const ids = (tabs || [])
+        .filter((t) => t.url && t.url.includes(needle) && t.id !== senderTabId)
+        .map((t) => t.id);
+      if (ids.length) await new Promise((r) => chrome.tabs.remove(ids, r));
+      console.log(`[ApplyPilot][DEV] closed ${ids.length} tab(s) matching ${JSON.stringify(needle)}`);
+      sendResponse({ ok: true, closed: ids.length });
+    })();
+    return true;
+  }
+
   // DISCOVERY RECON (read-only). Opens each board's search page in the operator's real
   // signed-in session and dumps what the DOM actually looks like — selector hit-counts plus
   // one representative card's markup — so the list scrapers' selector ladders can be
@@ -3627,8 +3646,44 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       await cdpDelay(1200);
     }
     emitRunProgress("Waiting for the form", ats);
-    const ready = await waitAtsFormReady(ats, LOG);
-    if (!ready.ready) { return { ok: true, needs_operator: true, stopped: "form-not-rendered", detail: "The " + ats + " application form never rendered — open the tab and check, then re-run.", jd }; }
+    let ready = await waitAtsFormReady(ats, LOG);
+
+    // THE LANDING MAY NOT BE THE FORM (generic, 2026-07-31): a posting URL can serve the
+    // employer's OWN careers page — live, a Greenhouse posting 302'd to the company's branded
+    // site with zero fields and only an "Apply" link. Never conclude "the form never rendered"
+    // without first checking WHERE we are and whether an apply affordance leads onward. Same
+    // rule as Workday's "detect the landing"; bounded to one hop so it can't wander.
+    if (!ready.ready && !(opts0.applyHops >= 1)) {
+      const here2 = await cdpEval(function () { return location.href; }).catch(() => null);
+      const landedAts = detectAts(here2);
+      const found = await cdpEval(atsInjFindApplyLinks).catch(() => null);
+      const link = found && atsPickApplyLink(found.links, detectAts);
+      LOG(`no form here (${here2}${landedAts ? ", " + landedAts : ", not a supported ATS host"}) — ${(found && found.links.length) || 0} apply link(s); following: ${link || "NONE (ambiguous/absent)"}`);
+      if (link) {
+        const linkAts = detectAts(link);
+        if (linkAts === "workday") {
+          return { ok: true, stopped: "redirect-to-workday", jd, redirectUrl: link,
+            detail: "This posting's application is a Workday requisition: " + link + " — run that link (the Workday pipeline drives it)." };
+        }
+        emitRunProgress("Following the apply link", linkAts || "off-ATS host");
+        await cdpNavigate(link);
+        await cdpDelay(2500);
+        const after = await cdpEval(function () { return location.href; }).catch(() => link);
+        const afterAts = detectAts(after);
+        LOG(`apply link landed on ${after} (${afterAts || "unsupported host"})`);
+        if (!afterAts || afterAts === "workday") {
+          return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after,
+            detail: "The application lives at " + after + (afterAts === "workday" ? " — a Workday requisition; run that link instead." : " — a host this pipeline can't drive yet; apply there yourself.") };
+        }
+        await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
+        return await runAtsApplicationRun(tabId, afterAts, store, after, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
+      }
+    }
+    if (!ready.ready) {
+      const hereX = await cdpEval(function () { return location.href; }).catch(() => null);
+      return { ok: true, needs_operator: true, stopped: "form-not-rendered",
+        detail: "No " + ats + " application form rendered at " + (hereX || startUrl) + " and no apply link could be followed — open the tab and check, then re-run.", jd };
+    }
     LOG(`form settled — ${ready.fields} field(s).`);
 
     const jobContext = { ...(store.jobContext || {}) };

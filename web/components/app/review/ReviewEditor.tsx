@@ -1105,7 +1105,12 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   if (wt === "typeahead") {
     if (e.options && e.options.length) return <Combobox value={cur} options={e.options} onCommit={onCommit} />;
     const co = e.captured_options || [];
-    if (co.length > 2) return <SelectBox value={cur} options={co} onCommit={onCommit} />;
+    // A PARTIAL list must not be a pick-one <select>: captured_options is only the page the
+    // fill could read (live 2026-07-31 — 60 of a ~2000-school picker, alphabetical, so the
+    // right answer is usually absent). A select there is a dead end on a REQUIRED field. Show
+    // the captured options to choose from AND let the reviewer type the value the form really
+    // wants — the replay searches the live widget for it by name.
+    if (co.length > 2) return <PartialCombobox value={cur} options={co} onCommit={onCommit} />;
     return <TierEditor e={e} ctx={ctx} />;
   }
   if (wt === "hierarchical") return <TierEditor e={e} ctx={ctx} />;
@@ -1169,6 +1174,54 @@ function RadioButtons({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+/** Editor for a PARTIAL option list (captured_options): the fill could only read one page of a
+ *  long/searchable list, so the right answer may not be in it. Filter what we captured, or type
+ *  the exact value the form wants — the replay searches the live widget by name. Never a plain
+ *  <select>, which would strand a required field whose answer is outside the captured page. */
+function PartialCombobox({
+  value,
+  options,
+  onCommit,
+}: {
+  value: string | null | undefined;
+  options: string[];
+  onCommit: (v: string | null) => void;
+}) {
+  const [v, setV] = useState(value ?? "");
+  const [open, setOpen] = useState(false);
+  useEffect(() => setV(value ?? ""), [value]);
+  const q = v.trim().toLowerCase();
+  const matches = (q === "" ? options : options.filter((o) => o.toLowerCase().includes(q))).slice(0, 40);
+  const commit = (s: string) => { setV(s); setOpen(false); onCommit(s.trim() === "" ? null : s); };
+  return (
+    <div className="relative">
+      <input
+        className="ap-input"
+        type="text"
+        value={v}
+        placeholder="Type the exact value, or pick below"
+        onChange={(ev) => { setV(ev.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => { setOpen(false); onCommit(v.trim() === "" ? null : v); }, 150)}
+        onKeyDown={(ev) => ev.key === "Enter" && commit(v)}
+      />
+      <p className="mt-1 text-xs text-ink-faint">
+        Showing {options.length} option{options.length === 1 ? "" : "s"} we could read from this form — it has more. Type the exact value if it is not listed.
+      </p>
+      {open && matches.length > 0 && (
+        <div className="absolute z-20 mt-1 max-h-64 w-full overflow-auto rounded-md border border-hairline bg-panel shadow-lg">
+          {matches.map((o) => (
+            <button key={o} type="button" onMouseDown={(ev) => ev.preventDefault()} onClick={() => commit(o)}
+              className="block w-full px-3 py-1.5 text-left text-sm hover:bg-panel-raised">
+              {o}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

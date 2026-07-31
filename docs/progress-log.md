@@ -3256,3 +3256,18 @@ Discord's 26-field SWE application broke every select while five other forms wor
 Second change, from the same evidence: **a STATED profile answer the form can't take is now `needs_review`, not a silent skip.** The profile said "Bachelor of Science"; the form offered "Bachelor's Degree"; the field simply vanished. The operator HAS an answer there, so it belongs on review (flag `stated-value-unmatched`, the live options attached so the editor renders a picker) and in teach. A genuinely unmapped question stays a quiet `skipped` — optional-blank as before.
 
 ⚠ Honest limitation kept in the docs: Discord's `school--0` async list answers a hand-typed "Carnegie Mellon" in ~2s but returns nothing to the identical query during a fill (typed + stuck + verified, ~5s of polling, foreground and background) while its sibling pickers on the same form DO answer. It ends as an honest needs_review naming the profile answer — never a wrong value.
+
+## 2026-07-31 (f) — generality round: 9 companies, apply-link following, honest option recon, 3 full end-to-ends
+
+Operator's bar for this round: it must work on ANY form of a supported type — fill correctly or surface honestly, never fill WRONG — and **never** a page-specific hack. Audited first: every literal in `ats.js` is an ATS-wide platform convention (Greenhouse's standard field ids + react-select classes, Lever's `#location-input`/`urls[...]`/`#btn-submit`, Ashby's `_systemfield_*`/`_fieldEntry`); company names appear only in provenance comments, never in code.
+
+**Three full end-to-ends, one per ATS, each fill → review (edit/approve) → dry rehearsal → `would_submit`, nothing submitted:** Palantir (Lever, NEW — two values changed in review, incl. picking a campus), Linear (Ashby, NEW — 7/7 approved), GitLab (Greenhouse — 13 fields replayed, 0 failures).
+
+New generic behaviour, each earned from a live failure:
+- **THE LANDING MAY NOT BE THE FORM.** A Greenhouse posting URL 302'd to the employer's own careers site (zero fields, only an "Apply" link). The run now classifies where it actually landed, finds the apply affordance (`atsInjFindApplyLinks` + the scored, ambiguity-refusing `atsPickApplyLink`), follows it ONE hop, re-detects the ATS, and continues there — or halts naming the real URL (live: Stripe self-hosts its application → honest `apply-off-pipeline`, nothing filled). A Workday landing is handed back for the Workday pipeline.
+- **A REVIEWED CHOICE FIELD ALWAYS CARRIES ITS OPTIONS.** The AI path returned before attaching them, so a required university dropdown reached review as "please fill it in yourself" with nothing to pick — after the fill had just read all 3302 options.
+- **A TRUNCATED LIST IS NOT AN OPTION SET.** A widget that renders one page (exactly 60 of ~2000, alphabetical) was rendering as a pick-one `<select>` — inviting a wrong-but-present pick, or stranding a required field. `atsAttachOptions` now routes a page-sized-or-longer read into `captured_options` + `widget_type:"typeahead"` (the schema's existing partial concept), and the web editor gained a `PartialCombobox`: filter what we captured **or type the exact value**, with an honest "showing N of more" note.
+- **SHOW THE OPTIONS NEAR WHAT WE WANTED.** `atsNearOptions` ranks the live list against the intended value, so a 3302-school list surfaces "Carnegie Mellon University - Pittsburgh / - Silicon Valley" — which is exactly the choice the ambiguity guard correctly refused to make. Narrowing applies ONLY to long lists; on a short list every option stays (unit-pinned both ways).
+- Fixed en route: re-attaching options left the previous set behind (stale options in review).
+
+Also: `AP_DEV_CLOSE_TABS` (dev-only) cleans up the tab each run leaves behind. Suite 933/933; web typecheck green.

@@ -739,6 +739,53 @@ function atsInjErrors(ats) {
 // attachResume(ref) } (attachResume is SW-supplied — it owns the IndexedDB read).
 // Produces Workday-record-compatible results; buildReviewBundle consumes them verbatim.
 
+// Attach a choice field's LIVE options to its review record. A list we could only read the
+// FIRST PAGE of must NOT render as a <select>: a 2000-school picker truncated to its A-names
+// invites the operator to pick a wrong-but-present option, or strands them when the right one
+// is absent (live 2026-07-31). The bundle schema already distinguishes these — `options` is a
+// COMPLETE list, `captured_options` is a partial one — and the review editor renders the
+// partial case as a type-to-filter combobox with a "partial list" note. A truncated list is,
+// from the reviewer's point of view, exactly a typeahead, so the record says so.
+// The options a human would actually be choosing between, given the value we WANTED. Searching
+// a 3302-school list for "Carnegie Mellon University" should put its two campuses in front of
+// the operator, not the alphabetical page the widget happened to render (live 2026-07-31). Pure
+// and client-side: the whole list is already in memory, so this costs no page interaction.
+// Ranks by how many significant tokens an option contains, then prefix, then brevity.
+function atsNearOptions(texts, query, limit) {
+  const q = atsLib.normalize(String(query == null ? "" : query));
+  const toks = q.split(/\s+/).filter((t) => t.length > 2);
+  if (!toks.length) return [];
+  const scored = [];
+  for (const t of (texts || [])) {
+    const n = atsLib.normalize(t);
+    let hits = 0;
+    for (const tk of toks) if (n.indexOf(tk) !== -1) hits++;
+    if (hits) scored.push({ t, hits, starts: n.indexOf(toks[0]) === 0 ? 1 : 0 });
+  }
+  scored.sort((a, b) => b.hits - a.hits || b.starts - a.starts || a.t.length - b.t.length);
+  return scored.slice(0, limit || 20).map((x) => x.t);
+}
+
+const ATS_OPTION_CAP = 60;
+function atsAttachOptions(rec, texts) {
+  const list = (texts || []).filter(Boolean);
+  if (!list.length) return;
+  // >= not >: a virtualized widget commonly returns EXACTLY one page (live: 60 of ~2000
+  // schools), so an equality read is the partial case, not a complete list that happens to fit.
+  // ALWAYS set both: a later call refines an earlier one (the raw list first, then the
+  // neighbourhood of what we wanted), and a leftover from the first call would show the
+  // operator a STALE option set in review.
+  if (list.length >= ATS_OPTION_CAP) {
+    rec.captured_options = list.slice(0, ATS_OPTION_CAP);
+    rec.options = null;
+    rec.widgetType = "typeahead"; // review-rendering only; replay/audit read the LIVE widget
+    rec.optionsPartial = true;
+  } else {
+    rec.options = list;
+    rec.captured_options = null;
+  }
+}
+
 const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_type vocabulary
   text: "text", textarea: "textarea", select: "dropdown", dial: "dropdown", location: "typeahead",
   dropdown_native: "dropdown", radio: "radio", checkbox: "checkbox", checkbox_group: "checkbox_group",
@@ -804,6 +851,57 @@ function atsInjDetectRedirect() {
     };
   }).filter(Boolean).slice(0, 60);
   return { redirect: true, phrase: (body.match(strong) || [""])[0].slice(0, 160), anchors };
+}
+
+// ── APPLY AFFORDANCES (the landing may not be the form) ─────────────────────────────────
+// A posting URL does NOT always serve the application: an employer can point its ATS link at
+// its OWN careers page, which carries only an "Apply" affordance (live 2026-07-31 — a
+// Greenhouse posting URL 302'd to the company's branded careers site with zero form fields).
+// Same shape as the Workday rule "DETECT THE LANDING — never assume a click went where it
+// aimed". Read-only; the PICK is SW-side so it can use detectAts.
+function atsInjFindApplyLinks() {
+  const seen = new Set();
+  const out = [];
+  const push = (href, text, kind) => {
+    const h = String(href || "").trim();
+    if (!/^https?:\/\//i.test(h) || seen.has(h)) return;
+    seen.add(h);
+    out.push({ href: h, text: String(text || "").replace(/\s+/g, " ").trim().slice(0, 80), kind });
+  };
+  for (const a of document.querySelectorAll("a[href]")) {
+    const t = (a.textContent || "").replace(/\s+/g, " ").trim();
+    // apply-LABELLED anchors, and anchors whose own URL says "apply" — never links harvested
+    // from description prose (the discovery lesson: a JD routinely cites unrelated companies)
+    if (/\bapply\b/i.test(t) || /\/apply|apply\?|application/i.test(a.getAttribute("href") || "")) {
+      push(a.href, t, /\bapply\b/i.test(t) ? "text" : "href");
+    }
+    if (out.length > 40) break;
+  }
+  const btns = [...document.querySelectorAll("button")]
+    .filter((b) => /\bapply\b/i.test((b.textContent || "").trim()))
+    .map((b) => (b.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60));
+  return { ok: true, url: location.href, links: out, applyButtons: btns.slice(0, 5) };
+}
+
+// Choose the apply link to follow. `isAts` is injected (detectAts) so host knowledge stays
+// SW-side. A link the pipeline can actually DRIVE wins; otherwise a single apply-labelled
+// link is followed and re-classified on landing; ambiguity refuses (report, never guess).
+function atsPickApplyLink(links, isAts) {
+  const list = (links || []).filter((l) => l && l.href);
+  const uniq = (arr) => [...new Set(arr.map((l) => l.href))];
+  const drivable = list.filter((l) => { const k = isAts(l.href); return k && k !== "workday"; });
+  if (uniq(drivable).length === 1) return drivable[0].href;
+  if (uniq(drivable).length > 1) {
+    // several drivable candidates — prefer the apply-LABELLED one if that is unambiguous
+    const labelled = drivable.filter((l) => l.kind === "text");
+    if (uniq(labelled).length === 1) return labelled[0].href;
+    return null;
+  }
+  const wd = list.filter((l) => isAts(l.href) === "workday");
+  if (uniq(wd).length === 1) return wd[0].href;
+  const labelled = list.filter((l) => l.kind === "text");
+  if (uniq(labelled).length === 1) return labelled[0].href;
+  return null;
 }
 
 // Is this label a demographic question? ORTHOGONAL to routing (2026-07-31, Zoox): a BUCKET
@@ -1166,6 +1264,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       return last;
     };
 
+    let nearMatches = []; // what a by-name search turned up — the operator's real choices
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
     let read = await pollFor(3000, (t) => t.length > 0);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
@@ -1207,6 +1306,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         }
         const seen = optsOf(found);
         try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
+        if (seen.length) nearMatches = seen;
         if (seen.length && hasHit(seen)) { read = found; break; }
       }
       if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
@@ -1249,13 +1349,24 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         if (pol) hit = { index: matchTexts.indexOf(pol), tier: "polarity-lead" };
       }
     }
-    if (!hit) { await act.eval(atsInjCloseCombo, ref.inputSel); rec.detail = "no candidate matched " + texts.length + " option(s); candidates=" + JSON.stringify(candidates.slice(0, 4)) + " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)); rec.options = texts.slice(0, 60); return false; }
+    if (!hit) {
+      await act.eval(atsInjCloseCombo, ref.inputSel);
+      // Show the operator the options that ACTUALLY relate to their answer. Searching a 3302-school
+      // list for "Carnegie Mellon University" returns its two campuses — infinitely more useful in
+      // review than the alphabetical first page the widget happens to render (live 2026-07-31).
+      const client = texts.length > ATS_OPTION_CAP ? atsNearOptions(texts, candidates[0], 20) : [];
+      const near = client.length ? client : (nearMatches.length && nearMatches.length < texts.length ? nearMatches : texts);
+      rec.detail = "no candidate matched " + texts.length + " option(s); candidates=" + JSON.stringify(candidates.slice(0, 4)) +
+        (near !== texts ? "; closest on this form: " + JSON.stringify(near.slice(0, 4)) : " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)));
+      atsAttachOptions(rec, near);
+      return false;
+    }
     const commitText = texts[hit.index];
     const c = await act.eval(atsInjCommitOption, ref.inputSel, commitText);
     await act.delay(200);
     const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
-    rec.options = texts.slice(0, 60);
+    atsAttachOptions(rec, texts);
     const backNorm = atsLib.normalize(String(rec.after == null ? "" : rec.after));
     const wantNorm = atsLib.normalize(commitText);
     // the dial composite renders "+1" (flag+code), not the option text — value-based accept:
@@ -1293,12 +1404,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const pol = lead ? atsFd.optionForPolarity(texts, lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null;
       if (pol) m = { targetIndex: texts.indexOf(pol), matchTier: "polarity-lead" };
     }
-    if (!m || m.targetIndex < 0) { rec.detail = "no candidate matched " + texts.length + " option(s)"; rec.options = texts; return false; }
+    if (!m || m.targetIndex < 0) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjSelectNative, ref.inputSel, texts[m.targetIndex]);
     await act.delay(120);
     const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
-    rec.options = texts;
+    atsAttachOptions(rec, texts);
     const okv = atsLib.normalize(String(rec.after || "")) === atsLib.normalize(texts[m.targetIndex]);
     rec.status = okv ? (m.matchTier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
     rec.matchTier = m.matchTier; rec.verified = okv;
@@ -1325,12 +1436,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const pol = polKey ? atsFd.optionForPolarity(texts, polKey) : null;
       if (pol) { pick = pol; tier = "polarity-lead"; }
     }
-    if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; rec.options = texts; return false; }
+    if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
     await act.delay(150);
     const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
-    rec.options = texts;
+    atsAttachOptions(rec, texts);
     // accept when the click landed AND the read-back holds the picked option (a pre-checked
     // equal value also reads correct — same "state, not click outcome" rule as Workday).
     const readNorm = atsLib.normalize(String(rec.after || ""));
@@ -1433,10 +1544,26 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
       }
     }
     if (!texts.length) { rec.status = "needs_review"; rec.detail = "AI fallback: no live options to choose from"; return; }
+    // ATTACH THE LIVE OPTIONS NOW, before any early return. A choice field that reaches review
+    // must carry the form's real list so the editor renders a PICKER — whatever the AI did with
+    // it. Live 2026-07-31: a required university dropdown whose AI pick wasn't a live option
+    // reached review as "please fill it in yourself" with nothing to pick from, stranding the
+    // operator even though the fill had just read all 60 options.
+    atsAttachOptions(rec, texts);
     const ai = await atsAiChooseOption(act, f, texts, profile, jobContext);
-    if (!ai.ok) { rec.status = "needs_review"; rec.detail = "AI fallback failed: " + ai.error; return; }
+    if (!ai.ok) { rec.status = "needs_review"; rec.detail = "AI fallback failed: " + ai.error + " — pick from the options here"; return; }
     const m = atsLib.matchCandidates([ai.choice], texts, { containment: true });
-    if (!m || m.targetIndex < 0) { rec.status = "needs_review"; rec.detail = "AI chose " + JSON.stringify(ai.choice) + " — not a live option"; return; }
+    if (!m || m.targetIndex < 0) {
+      rec.status = "needs_review";
+      // put the CLOSEST real options in front of the operator instead of the alphabetical page
+      // Narrow ONLY when the list is too long to show whole — on a short list every option is
+      // a legitimate choice and hiding any of them is worse than showing all (unit-pinned).
+      const near = texts.length > ATS_OPTION_CAP ? atsNearOptions(texts, ai.choice, 20) : [];
+      if (near.length) atsAttachOptions(rec, near);
+      rec.detail = "the AI suggested " + JSON.stringify(ai.choice) + ", which this form doesn't offer — pick the right option here" +
+        (near.length ? " (closest: " + JSON.stringify(near.slice(0, 3)) + ")" : "");
+      return;
+    }
     const pick = texts[m.targetIndex];
     let committed;
     if (wt === "radio" || wt === "checkbox_group") committed = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
@@ -1446,7 +1573,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     await act.delay(200);
     const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
-    rec.options = texts.slice(0, 60);
+    atsAttachOptions(rec, texts);
     const okv = committed && committed.ok && String(rec.after || "").trim() !== "";
     rec.status = okv ? "filled_review" : "needs_review"; // AI is NEVER a silent fill
     rec.resolved = [ai.choice];
@@ -1464,9 +1591,10 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
+    atsInjFindApplyLinks, atsPickApplyLink,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,

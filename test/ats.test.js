@@ -223,7 +223,7 @@ test("driver: unmapped REQUIRED select falls to AI — flagged, choice must be a
   const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
   const r = out.results[0];
   assert.strictEqual(r.status, "needs_review"); // "Maybe" is NOT a live option → refused
-  assert.match(r.detail, /not a live option/);
+  assert.match(r.detail, /which this form doesn't offer/);
 });
 
 test("driver: AI choice that IS a live option commits and is ALWAYS filled_review", async () => {
@@ -445,4 +445,117 @@ test("driver: stated-but-unmatched flags the record so review + teach can see it
   assert.strictEqual(out.results[0].flag, "stated-value-unmatched");
   assert.match(out.results[0].detail, /isn't one of this form's options/);
   assert.ok(out.results[0].options.includes("Man"), "the live options ride along so review can pick one");
+});
+
+// ── the landing may not be the form: apply-link following (live 2026-07-31) ──────────────
+test("atsPickApplyLink: prefers a DRIVABLE ats link, refuses ambiguity, falls back to one apply-labelled link", () => {
+  const isAts = ats.detectAts;
+  // a company careers page linking to its real Greenhouse form
+  assert.strictEqual(ats.atsPickApplyLink([
+    { href: "https://stripe.example/careers", text: "Careers", kind: "text" },
+    { href: "https://job-boards.greenhouse.io/co/jobs/1", text: "Apply now", kind: "text" },
+  ], isAts), "https://job-boards.greenhouse.io/co/jobs/1");
+  // two DIFFERENT drivable targets, both apply-labelled → refuse
+  assert.strictEqual(ats.atsPickApplyLink([
+    { href: "https://jobs.lever.co/a/uuid1/apply", text: "Apply", kind: "text" },
+    { href: "https://jobs.ashbyhq.com/b/uuid2/application", text: "Apply", kind: "text" },
+  ], isAts), null);
+  // no drivable link, but exactly one apply-LABELLED one → follow it and re-classify on landing
+  assert.strictEqual(ats.atsPickApplyLink([
+    { href: "https://acme.example/jobs/7", text: "Apply for this role", kind: "text" },
+    { href: "https://acme.example/about", text: "About us", kind: "href" },
+  ], isAts), "https://acme.example/jobs/7");
+  // a Workday requisition is surfaced (the caller hands it to the Workday pipeline)
+  assert.strictEqual(ats.atsPickApplyLink([
+    { href: "https://co.wd5.myworkdayjobs.com/x/job/Eng_R1", text: "Apply", kind: "text" },
+  ], isAts), "https://co.wd5.myworkdayjobs.com/x/job/Eng_R1");
+  assert.strictEqual(ats.atsPickApplyLink([], isAts), null);
+});
+
+test("atsInjFindApplyLinks is self-contained (the cdpEval contract)", () => {
+  const src = String(ats.atsInjFindApplyLinks);
+  assert.doesNotThrow(() => new Function("return (" + src + ")"));
+  for (const other of ["atsLib", "atsFd", "detectAts", "atsPickApplyLink"]) assert.ok(!src.includes(other), "references " + other);
+});
+
+// ── a reviewed choice field must ALWAYS carry the form's options (live 2026-07-31) ────────
+test("driver: an AI pick that is not a live option still leaves the OPTIONS on the record", async () => {
+  // Otherwise review renders "please fill it in yourself" with nothing to pick from, even
+  // though the fill had just read the whole list — the operator is stranded on a required field.
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => ({ ok: true, text: JSON.stringify({ choice: "Carnegie Mellon University", justification: "j", confidence: "High" }) }),
+    atsInjScan: () => ({ ...GH_SCAN, fields: [{ fieldName: "q_uni", inputSel: "#uni", widgetType: "select", label: "Which university did you attend?", isRequired: true, value: null, domIndex: 0 }] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "Other (School Not Listed)" }, { text: "MIT" }, { text: "Stanford University" }] }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  const r = out.results[0];
+  assert.strictEqual(r.status, "needs_review");
+  assert.deepStrictEqual(r.options, ["Other (School Not Listed)", "MIT", "Stanford University"],
+    "a SHORT list keeps every option — each is a legitimate choice");
+  assert.match(r.detail, /pick the right option here/);
+});
+
+// ── a TRUNCATED option list must not render as a pick-one <select> (live 2026-07-31) ─────
+test("atsAttachOptions: a complete list becomes options; a long one becomes captured_options + typeahead", () => {
+  const short = { widgetType: "dropdown" };
+  ats.atsAttachOptions(short, ["Yes", "No"]);
+  assert.deepStrictEqual(short.options, ["Yes", "No"]);
+  assert.strictEqual(short.widgetType, "dropdown", "a complete list stays a select");
+  assert.ok(!short.captured_options);
+
+  const long = { widgetType: "dropdown" };
+  ats.atsAttachOptions(long, Array.from({ length: 2000 }, (_, i) => "School " + i));
+  assert.strictEqual(long.options, null, "a partial list must NOT masquerade as the full option set");
+  assert.strictEqual(long.captured_options.length, 60);
+  assert.strictEqual(long.widgetType, "typeahead", "review renders a type-to-filter editor + partial note");
+  assert.strictEqual(long.optionsPartial, true);
+
+  // a widget that returns EXACTLY one page is the partial case too (live: 60 of ~2000 schools)
+  const exact = { widgetType: "dropdown" };
+  ats.atsAttachOptions(exact, Array.from({ length: 60 }, (_, i) => "S" + i));
+  assert.strictEqual(exact.widgetType, "typeahead", "a page-sized read is partial, not complete");
+
+  const none = { widgetType: "dropdown" };
+  ats.atsAttachOptions(none, []);
+  assert.ok(!none.options && !none.captured_options);
+});
+
+// ── review must show the options CLOSEST to the intended value (live 2026-07-31) ──────────
+test("atsNearOptions: ranks the real choices for the value we wanted", () => {
+  const schools = ["Aalborg University", "Carnegie Mellon University - Pittsburgh", "Carnegie Mellon University - Silicon Valley", "Mellon College", "Institut Polytechnique"];
+  const near = ats.atsNearOptions(schools, "Carnegie Mellon University", 10);
+  assert.deepStrictEqual(near.slice(0, 2), ["Carnegie Mellon University - Pittsburgh", "Carnegie Mellon University - Silicon Valley"],
+    "both campuses first — that IS the operator's choice");
+  assert.ok(!near.includes("Institut Polytechnique"), "an option sharing no tokens is excluded");
+  // a query with no significant tokens can't rank anything
+  assert.deepStrictEqual(ats.atsNearOptions(schools, "of", 5), []);
+  assert.deepStrictEqual(ats.atsNearOptions([], "x", 5), []);
+});
+
+test("driver: on a LONG list the review options narrow to the near-matches; a short list keeps all", async () => {
+  const long = Array.from({ length: 300 }, (_, i) => "Nowhere University " + i).concat(["Carnegie Mellon University - Pittsburgh", "Carnegie Mellon University - Silicon Valley"]);
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => ({ ok: true, text: JSON.stringify({ choice: "Carnegie Mellon University", justification: "j", confidence: "High" }) }),
+    atsInjScan: () => ({ ...GH_SCAN, fields: [{ fieldName: "q_uni", inputSel: "#uni", widgetType: "select", label: "Which university?", isRequired: true, value: null, domIndex: 0 }] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: long.map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  const r = out.results[0];
+  const shown = r.captured_options || r.options || [];
+  assert.ok(shown.includes("Carnegie Mellon University - Pittsburgh"), "the operator must SEE the real choices");
+  assert.ok(shown.length <= 20, "a 302-option list is narrowed to the relevant neighbourhood");
 });
