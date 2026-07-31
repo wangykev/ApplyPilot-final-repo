@@ -83,7 +83,11 @@ const DISCOVER_SIMPLIFY_URL =
   "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json";
 
 const DISCOVER_DEFAULTS = {
-  sinceDays: 7,       // "recently posted" window
+  // The recency WINDOW. No longer an operator knob (2026-07-30: the "Posted within N
+  // days" control was removed) — matchPercent scores freshness directly, so a wide
+  // window costs nothing: an old posting simply scores low and falls under the
+  // threshold, while a wider net finds more of what IS fresh.
+  sinceDays: 30,
   maxPerSource: 25,   // cap per board BEFORE merge/dedup
   maxTotal: 60,       // cap the merged, deduped list
   // TWO budgets, because the two things cost wildly different amounts:
@@ -100,7 +104,13 @@ const DISCOVER_DEFAULTS = {
   maxRecords: 25,
   maxJdOpens: 10,
   maxPages: 3,        // how many result PAGES to sweep per board (scrape wide…)
-  queueLimit: 10,     // …queue narrow: keep only the N best-matching (0 ⇒ all)
+  // …queue narrow, by a MATCH THRESHOLD rather than a count (operator 2026-07-30):
+  // everything scoring at or above this is queued, however many that is. 0 ⇒ queue
+  // everything found. matchPercent's components sum to 100 so this is comparable.
+  minMatchPercent: 60,
+  // How many DIFFERENT searches to run per board when the keyword box is blank and
+  // the queries are derived from the resume — see buildDiscoverQueries.
+  maxQueries: 3,
   query: "",          // explicit keywords; blank ⇒ derived (see buildDiscoverQuery)
   field: "",          // the operator's field of study — the derived-keyword source
   intern: true,       // hunting internships: keyword + the board's internship filter
@@ -187,6 +197,108 @@ const HANDSHAKE_JOB_TYPE_INTERNSHIP = "3";
 // page rather than being ignored, which is how this was found).
 const HANDSHAKE_SORT_NEWEST = "posted_date_desc";
 
+/**
+ * SEVERAL searches from the RESUME, not one from the major.
+ *
+ * Operator 2026-07-30: "when nothing specific is in the what-to-search-for, you
+ * should try and search for different things that I would be interested in based on
+ * my resume instead of just the major."
+ *
+ * One query derived from `field_of_study` only ever finds one shape of job —
+ * "electrical and computer engineering intern" misses the embedded-firmware and
+ * robotics-software roles the same person is obviously a fit for. So a blank box
+ * derives SEVERAL queries from the structured resume and runs each against BOTH
+ * boards, merging the results (dedup + the match threshold sort it out):
+ *
+ *   · each past JOB TITLE, level words stripped  — what they have actually done
+ *   · the field of study                         — the broad one
+ *   · their top SKILLS, paired                   — what they can do
+ *
+ * Titles lead because a title you have held is the strongest evidence of what you
+ * want next. An EXPLICIT query short-circuits all of it — one search, exactly what
+ * was typed. Pure + unit-tested; LOCKSTEP with web/lib/discover.ts.
+ */
+function buildDiscoverQueries(opts) {
+  const o = opts || {};
+  const wantIntern = o.intern !== false;
+  const cap = Math.max(1, Number(o.maxQueries) || DISCOVER_DEFAULTS.maxQueries);
+
+  // Add "intern" unless the phrase already says it (buildDiscoverQuery's rule).
+  const withIntern = (base) => {
+    const parts = [];
+    if (base) parts.push(base);
+    if (wantIntern && !/\bintern(ship)?s?\b/i.test(base)) parts.push("intern");
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+  };
+
+  const explicit = String(o.query || "").trim();
+  if (explicit) return { queries: [{ keywords: withIntern(explicit), from: "your keywords" }], derivedFrom: "your keywords" };
+
+  // Strip the words that describe the LEVEL or the employment relationship rather
+  // than the WORK, so "Software Engineering Intern" and "Senior Software Engineer"
+  // both reduce to the field. The second list is generic-noise: a real resume title
+  // like "Firmware Team Member" would otherwise search for "team member" as though
+  // that described a kind of job (observed on the operator's own profile).
+  const roleCore = (t) =>
+    String(t || "")
+      .replace(/\b(intern|internship|co-?op|trainee|apprentice|fellow|fellowship)\b/gi, " ")
+      .replace(/\b(senior|sr\.?|junior|jr\.?|lead|staff|principal|associate|assistant|entry[- ]level)\b/gi, " ")
+      .replace(/\b(team member|member|worker|volunteer|employee|student|part[- ]time|full[- ]time|summer|fall|winter|spring|\d{4})\b/gi, " ")
+      .replace(/[^A-Za-z0-9+#. ]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  // A title has to say something about the WORK to be worth a query slot. "Research"
+  // or "Lab" alone matches half a board; require either two meaningful tokens or one
+  // long, specific one.
+  const usefulRole = (core) => {
+    const toks = discoverKeywordTokens(core);
+    return toks.length >= 2 || (toks.length === 1 && toks[0].length >= 7);
+  };
+
+  const out = [];
+  const seen = new Set();
+  const push = (base, from) => {
+    const keywords = withIntern(base);
+    if (!keywords) return;
+    // Dedupe on the meaningful TOKEN SET, so "software engineering" and
+    // "engineering software" don't both burn a query slot.
+    const key = discoverKeywordTokens(keywords).slice().sort().join(" ");
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ keywords, from });
+  };
+
+  // RESERVE a slot for the field of study when there is one: titles are the better
+  // signal but they are also narrow, and on a real resume they filled every slot and
+  // pushed the major out entirely (observed live). Keeping one guarantees the sweep
+  // always covers the broad case as well as the specific ones.
+  const field = String(o.field || "").trim();
+  const titleCap = field ? Math.max(1, cap - 1) : cap;
+  for (const t of Array.isArray(o.jobTitles) ? o.jobTitles : []) {
+    if (out.length >= titleCap) break;
+    const core = roleCore(t);
+    if (core && usefulRole(core)) push(core, "a role on your resume");
+  }
+  if (out.length < cap && field) push(field, "your field of study");
+  // Skills, PAIRED: one skill alone is usually too broad ("Python"), two is a shape.
+  const skills = (Array.isArray(o.skills) ? o.skills : []).map((x) => String(x || "").trim()).filter(Boolean);
+  for (let i = 0; i < skills.length && out.length < cap; i += 2) {
+    push(skills.slice(i, i + 2).join(" "), "skills on your resume");
+  }
+  // Nothing usable on the resume — fall back to the plain internship default rather
+  // than a blank search (which is a board's recommended feed, not a search).
+  // NOT via push(): "intern" is a STOPWORD, so its token key is empty and push()
+  // would reject it as meaningless — which silently produced ZERO queries and thus a
+  // skipped board for anyone with an empty profile.
+  if (!out.length && wantIntern) out.push({ keywords: "intern", from: "the internship default" });
+
+  return {
+    queries: out.slice(0, cap),
+    derivedFrom: out.length ? out.map((q) => q.from).filter((v, i, a) => a.indexOf(v) === i).join(" + ") : "",
+  };
+}
+
 // The LinkedIn SEARCH PAGE url. ⚠ ONLY `keywords`, `geoId` and `f_TPR` survive a
 // page load (traced 2026-07-30) — the new SDUI jobs page REWRITES its own URL and
 // silently DISCARDS `location=` (free text), `sortBy=` and `f_E=`. This builder
@@ -233,7 +345,7 @@ function linkedInApiSearchUrl(opts) {
   // returned "EH&S Intern", "Audit Intern", "Finance Intern" — i.e. the newest
   // internships of ANY kind. On relevance the same query returns Skydio, Anduril,
   // Blue Origin avionics/embedded, Palantir. Promoted rows are handled where they
-  // belong instead — detected from footerItems and PENALISED by scoreDiscovery —
+  // belong instead — detected from footerItems and PENALISED by matchPercent —
   // which costs nothing and doesn't trade away the actual match quality.
   const filters = ["timePostedRange:List(r" + secs + ")"];
   if (o.sortByDate) filters.push("sortBy:List(DD)");
@@ -518,10 +630,37 @@ function normalizeDiscoveredJob(raw, source, nowMs) {
     applicants: raw.applicants == null ? null : Number(raw.applicants),
     earlyApplicant: !!raw.earlyApplicant,
     promoted: !!raw.promoted,
+    // ── The REAL posting date vs a REPOST (operator 2026-07-30) ───────────────
+    // Boards re-float an old posting and show the REPOST date as if it were new.
+    // Measured on LinkedIn: 2 of 3 sampled postings were reposts, one of them 63
+    // DAYS newer than its original. Ranking on the board's headline date would put
+    // a two-month-old job at the top of a daily sweep every time it was bumped, so
+    // the original is kept separately and `postedForRanking` prefers it.
+    originalPostedAt: parsePostedTimestamp(raw.originalPostedAt, nowMs),
+    reposted: !!raw.reposted,
+    // ── Details worth seeing in the queue before opening anything ─────────────
+    // Handshake publishes pay and a term; LinkedIn publishes neither (its
+    // `salaryInsights` is a link to its salary tool, not a number) — so pay stays
+    // EMPTY for LinkedIn rather than being invented.
+    pay: String(raw.pay || "").trim().slice(0, 80),
+    startDate: String(raw.startDate || "").trim().slice(0, 40),
+    endDate: String(raw.endDate || "").trim().slice(0, 40),
+    applyBy: String(raw.applyBy || "").trim().slice(0, 40),
+    workplace: String(raw.workplace || "").trim().slice(0, 24),
     employmentType: String(raw.employmentType || "").trim().slice(0, 60),
     score: 0,
+    matchPercent: 0,
     scoreReasons: [],
   };
+}
+
+// "(On-site)" / "(Hybrid)" / "(Remote)" as both boards render it on a card. Read
+// from the OBSERVED text rather than mapping LinkedIn's `workplaceType` urns, of
+// which only 2=Remote and 3=Hybrid were actually confirmed live.
+function workplaceFromText(s) {
+  const m = String(s || "").match(/\((on-?site|hybrid|remote)\)/i);
+  if (m) return m[1].replace(/^on-?site$/i, "On-site").replace(/^hybrid$/i, "Hybrid").replace(/^remote$/i, "Remote");
+  return "";
 }
 
 // ── Board payload → the common shape (PURE; the network lives in the drivers) ──
@@ -540,11 +679,13 @@ function linkedInCardToRaw(element) {
   const listed = item("LISTED_DATE");
   const applicantText = ((item("APPLICANT_COUNT_TEXT") || {}).text || {}).text || "";
   const n = String(applicantText).match(/(\d[\d,]*)/);
+  const loc = ((card.secondaryDescription || {}).text || "").trim();
   return {
     url: "https://www.linkedin.com/jobs/view/" + id + "/",
     title: ((card.title || {}).text || card.jobPostingTitle || "").trim(),
     company: ((card.primaryDescription || {}).text || "").trim(),
-    location: ((card.secondaryDescription || {}).text || "").trim(),
+    location: loc,
+    workplace: workplaceFromText(loc),
     postedAt: listed && listed.timeAt ? listed.timeAt : null,
     promoted: !!item("PROMOTED"),
     // "Be an early applicant" carries no number but IS the signal we want.
@@ -612,7 +753,20 @@ function linkedInDetailToPatch(json) {
     company: String(co).trim(),
     location: String(j.formattedLocation || "").trim(),
     description: String((j.description || {}).text || ""),
+    // `listedAt` is the LATEST listing (a repost bumps it); `originalListedAt` is
+    // when it was actually first posted. Both are carried; ranking uses the original.
     postedAt: j.listedAt || j.originalListedAt || null,
+    originalPostedAt: j.originalListedAt || null,
+    // A repost only counts as one if the two dates differ by more than an hour —
+    // they are equal (or near-equal) on a genuinely new posting.
+    reposted: !!(j.listedAt && j.originalListedAt && j.listedAt - j.originalListedAt > 3600e3),
+    // A real apply-by deadline, which is worth seeing before opening anything.
+    applyBy: j.expireAt ? new Date(j.expireAt).toISOString().slice(0, 10) : "",
+    workplace: workplaceFromText(j.formattedLocation) || (j.workRemoteAllowed ? "Remote" : ""),
+    // LinkedIn does NOT publish pay here: `salaryInsights` carries only a link to
+    // its salary tool (`insightExists:false`, `salaryExplorerUrl`), so pay is left
+    // empty rather than fabricated. Handshake does publish it.
+    pay: "",
     // jobState is "LISTED" while live; anything else (CLOSED/SUSPENDED) means
     // applying is impossible, so the row must not reach the queue.
     closed: !!j.closed || (j.jobState ? String(j.jobState).toUpperCase() !== "LISTED" : false),
@@ -640,6 +794,23 @@ function linkedInDetailToPatch(json) {
 // Read that way, 10 of the same 30 postings (33%) carry a real employer link —
 // Greenhouse, Workday, Google Careers, Paylocity, Tesla. The legacy pair is kept
 // only as a fallback in case an older record shape still populates it.
+// "2026-08-14T00:00:00-07:00" → "2026-08-14"; anything unparseable → "".
+function dateOnly(v) {
+  const s = String(v == null ? "" : v).trim();
+  if (!s) return "";
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  const t = Date.parse(s);
+  return isFinite(t) ? new Date(t).toISOString().slice(0, 10) : "";
+}
+
+// NOTE — a `handshakePayLabel` that rebuilt the pay string from the record's raw
+// numbers was REMOVED (2026-07-30). It produced "$3000/hr" and "$50K/mo" live, because
+// the record's `salary` is in CENTS and `salary_type_name` is "Paid"/"Unpaid" rather
+// than a unit — it was being read as one. Handshake already renders the correct label
+// on the card ("$30-50/hr", "Unpaid"), so the card is the source of truth and there is
+// nothing left to reconstruct. See scrapeHandshakeJobList.
+
 function handshakeDetailToPatch(json) {
   const j = (json && json.job) || null;
   if (!j) return { ok: false, error: "no-job-in-payload" };
@@ -666,6 +837,16 @@ function handshakeDetailToPatch(json) {
     // Handshake hides/archives rather than deleting; `hidden` also means the
     // operator dismissed it in the UI, which is a deliberate "not this one".
     closed: !!j.archived || !!j.hidden || (j.is_postable === false),
+    // Handshake publishes real compensation and a term — exactly the "pay, start
+    // date/end date and other important information" worth showing in the queue.
+    // NOT reconstructed from the record — see the note in scrapeHandshakeJobList. The
+    // card's own formatting is authoritative; this only fills in the paid/unpaid fact
+    // when the card didn't say, which is the one thing the record states unambiguously.
+    pay: /unpaid/i.test(String(j.salary_type_name || (j.salary_type && j.salary_type.name) || "")) ? "Unpaid" : "",
+    startDate: dateOnly(j.start_date),
+    endDate: dateOnly(j.end_date),
+    applyBy: dateOnly(j.expiration_date || j.default_expiration_date),
+    workplace: j.remote ? "Remote" : j.hybrid ? "Hybrid" : j.on_site ? "On-site" : "",
     applyKind,
     applyUrl: link,
     applyVia: link ? (link === settingUrl ? "job_apply_setting.external_url" : "external_apply_link (legacy)") : "",
@@ -679,80 +860,134 @@ function handshakeDetailToPatch(json) {
   };
 }
 
-// ── Best-match ranking (deterministic, explainable) ─────────────────────────
+// ── MATCH PERCENTAGE (deterministic, explainable, 0–100) ────────────────────
 //
-// "Scrape wide, queue narrow" (operator 2026-07-30): several pages are swept and
-// only the best are queued. The score is DELIBERATELY not an LLM call — it is
-// cheap, stable across runs, and every point is attributable, so `scoreReasons`
-// can be shown next to the job instead of asking the operator to trust a number.
-function scoreDiscovery(job, opts) {
+// The operator queues by a "% match" THRESHOLD rather than a top-N count, so the
+// number has to mean something on its own — an unbounded score can't be compared
+// against "60%". Every component therefore has a fixed maximum and they sum to 100:
+//
+//     relevance   0–65   does it match what was asked for / the resume
+//     freshness   0–30   how recently it was POSTED (the operator's main criterion)
+//     drivable    0–5    can the Run pipeline actually drive it
+//     penalties          promoted listing, board-only application
+//
+// Deliberately not an LLM call: cheap, stable across runs, and every point is
+// attributable, so `scoreReasons` is shown next to the job instead of asking the
+// operator to trust a number.
+//
+// ⚠ APPLICANT COUNT IS NOT SCORED (operator 2026-07-30: "I don't need the how many
+// people applied sort. mainly filter on when it was posted"). It is still READ and
+// displayed, because it is free and useful to a human deciding — but it no longer
+// moves the ranking, and freshness now carries the weight it used to take.
+function matchPercent(job, opts) {
   const o = opts || {};
   const now = typeof o.nowMs === "number" ? o.nowMs : Date.now();
+  const windowDays = Number(o.sinceDays) > 0 ? Number(o.sinceDays) : DISCOVER_DEFAULTS.sinceDays;
   const reasons = [];
-  let score = 0;
 
-  // 1. Does it match what was asked for? Title hits count far more than body hits:
-  //    a JD mentioning "python" once is weak evidence next to a title that says it.
+  // 1. RELEVANCE (0–65). Coverage of the search terms, with a title hit worth far
+  //    more than a body mention: a JD that says "python" once is weak evidence
+  //    against a title that says it. Scored as a FRACTION of the tokens asked for,
+  //    so a 2-word and a 6-word search are comparable.
   const tokens = discoverKeywordTokens([o.keywords, o.field].filter(Boolean).join(" "));
   const title = String(job.title || "").toLowerCase();
   const body = String(job.description || "").toLowerCase();
   const inTitle = tokens.filter((t) => title.includes(t));
   const inBody = tokens.filter((t) => !title.includes(t) && body.includes(t));
-  score += inTitle.length * 12;
-  score += Math.min(inBody.length, 5) * 3;
-  if (inTitle.length) reasons.push("title matches " + inTitle.join(", "));
+  let relevance;
+  if (!tokens.length) {
+    relevance = 40; // nothing specific asked for — neutral, don't fake precision
+  } else {
+    const covered = (inTitle.length + inBody.length * 0.35) / tokens.length;
+    relevance = Math.min(1, covered) * 55;
+    // A title that names the role is the strongest single signal available.
+    if (inTitle.length) relevance += Math.min(10, inTitle.length * 5);
+  }
+  if (inTitle.length) reasons.push("title matches " + inTitle.slice(0, 4).join(", "));
   else if (inBody.length) reasons.push("mentions " + inBody.slice(0, 3).join(", "));
+  else if (tokens.length) reasons.push("no keyword match in the title or description");
 
-  // 2. Internship intent — the checkbox already filtered the board, but a title
-  //    that SAYS intern/co-op is a stronger match than one that merely passed.
+  // Internship intent — the board filter already applied, but a title that SAYS
+  // intern/co-op is a stronger match than one that merely passed the filter.
   if (o.intern !== false && /\b(intern|internship|co-?op)\b/i.test(job.title || "")) {
-    score += 8;
+    relevance = Math.min(65, relevance + 6);
     reasons.push("an internship by title");
   }
+  relevance = Math.max(0, Math.min(65, relevance));
 
-  // 3. Freshness — hours, not days: on a daily sweep everything is "recent", so
-  //    the useful resolution is finer than a day.
-  if (job.postedAt != null) {
-    const hrs = Math.max(0, (now - job.postedAt) / 3600e3);
-    const fresh = Math.round(Math.max(0, 24 - hrs) );
-    if (fresh > 0) { score += fresh; reasons.push(hrs < 1 ? "posted within the hour" : `posted ${Math.round(hrs)}h ago`); }
+  // 2. FRESHNESS (0–30) — the operator's primary criterion. Linear decay across the
+  //    recency window, measured in HOURS so a daily sweep can tell today from
+  //    yesterday. An unknown date scores mid-range rather than 0: every source is
+  //    already time-bounded upstream, so unknown means "unparsed", not "ancient".
+  let freshness;
+  const at = postedForRanking(job);
+  if (at == null) {
+    freshness = 12;
+    reasons.push("posted date unknown");
+  } else {
+    const hrs = Math.max(0, (now - at) / 3600e3);
+    const windowHrs = windowDays * 24;
+    freshness = Math.max(0, Math.min(30, 30 * (1 - hrs / windowHrs)));
+    reasons.push(
+      hrs < 1 ? "posted within the hour" :
+      hrs < 24 ? `posted ${Math.round(hrs)}h ago` :
+      `posted ${Math.round(hrs / 24)}d ago`
+    );
+    // Say so when the board's headline date was a REPOST and this is the original.
+    if (job.reposted) reasons.push("(board shows a repost; scored on the original date)");
   }
 
-  // 4. Competition. The whole point of surfacing this: 6 applicants and 43,106
-  //    applicants are not the same opportunity, and the boards tell us which.
-  if (job.earlyApplicant) { score += 12; reasons.push("be an early applicant"); }
-  const a = job.applicants;
-  if (a != null && isFinite(a)) {
-    if (a <= 10) { score += 14; reasons.push(`only ${a} applicant${a === 1 ? "" : "s"}`); }
-    else if (a <= 50) { score += 9; reasons.push(`${a} applicants`); }
-    else if (a <= 200) { score += 4; reasons.push(`${a} applicants`); }
-    else if (a >= 2000) { score -= 10; reasons.push(`${a.toLocaleString()} applicants — crowded`); }
-    else reasons.push(`${a} applicants`);
-  }
+  // 3. DRIVABLE (0–5). A board-only application is worth strictly less to THIS tool
+  //    than an employer ATS link, whatever the posting says.
+  let drivable = 0;
+  if (job.applyResolved && !isBoardUrl(job.url)) { drivable = 5; reasons.push("employer link resolved"); }
+  else if (job.applyKind === "easy") { reasons.push("board-only application"); }
 
-  // 5. Can the Run pipeline actually drive it? A board-only application is worth
-  //    strictly less to THIS tool than an employer ATS link, whatever its content.
-  if (job.applyResolved && !isBoardUrl(job.url)) { score += 10; reasons.push("employer link resolved"); }
-  else if (job.applyKind === "easy") { score -= 12; reasons.push("board-only application"); }
+  let pct = relevance + freshness + drivable;
+  if (job.applyKind === "easy") pct -= 8;      // can't be driven at all
+  if (job.promoted) { pct -= 5; reasons.push("promoted listing"); }
 
-  // 6. A paid placement is not a relevance signal.
-  if (job.promoted) { score -= 6; reasons.push("promoted listing"); }
-
-  return { score: Math.round(score), reasons };
+  return { percent: Math.max(0, Math.min(100, Math.round(pct))), reasons };
 }
 
-// Rank, then keep the best `limit` (0/blank ⇒ keep everything). Returns BOTH
+/**
+ * The date to RANK on — the ORIGINAL posting date, not a repost.
+ *
+ * Operator 2026-07-30: "sometimes it says when it was reposted. that is different
+ * from when it was actually posted." A reposted job shows "Reposted 22 hours ago"
+ * on the card and LinkedIn's record carries BOTH `listedAt` (the repost) and
+ * `originalListedAt`. Ranking on the repost date would keep re-floating an old
+ * posting to the top of a daily sweep every time the employer bumped it.
+ */
+function postedForRanking(job) {
+  const orig = job && job.originalPostedAt;
+  const at = job && job.postedAt;
+  if (orig != null && at != null) return Math.min(orig, at); // the older of the two IS the original
+  if (orig != null) return orig;
+  return at == null ? null : at;
+}
+
+// Rank by match %, then keep everything at or above `minPercent`. Returns BOTH
 // halves so the caller can report what it left behind — a narrowing the operator
 // can't see is indistinguishable from a sweep that found nothing.
-function pickBestJobs(jobs, limit, opts) {
+function pickByThreshold(jobs, minPercent, opts) {
   const scored = (jobs || []).filter(Boolean).map((j) => {
-    const { score, reasons } = scoreDiscovery(j, opts);
-    return { ...j, score, scoreReasons: reasons };
+    const { percent, reasons } = matchPercent(j, opts);
+    return { ...j, score: percent, matchPercent: percent, scoreReasons: reasons };
   });
-  scored.sort((a, b) => (b.score - a.score) || comparePostedDesc(a, b));
-  const n = Number(limit);
-  if (!isFinite(n) || n <= 0 || n >= scored.length) return { kept: scored, dropped: [] };
-  return { kept: scored.slice(0, n), dropped: scored.slice(n) };
+  scored.sort((a, b) => (b.matchPercent - a.matchPercent) || comparePostedDesc(a, b));
+  const min = Number(minPercent);
+  if (!isFinite(min) || min <= 0) return { kept: scored, dropped: [] };
+  return {
+    kept: scored.filter((j) => j.matchPercent >= min),
+    dropped: scored.filter((j) => j.matchPercent < min),
+  };
+}
+
+// Kept as a thin alias: the driver pre-ranks candidates before spending the record
+// budget, and only needs the ORDER, not a threshold.
+function rankByMatch(jobs, opts) {
+  return pickByThreshold(jobs, 0, opts).kept;
 }
 
 // Map the Simplify feed's array to discovered jobs: live postings only
@@ -992,6 +1227,17 @@ function scrapeHandshakeJobList() {
   const cards = Array.from(document.querySelectorAll('[data-hook^="job-result-card |"]'));
   if (!cards.length) {
     const signIn = document.querySelector('form[action*="sign_in"], input[type="password"]');
+    // ⚠ "NO CARDS" AND "NO RESULTS" ARE DIFFERENT ANSWERS, and conflating them sent the
+    // operator to run recon over a scraper that was working perfectly: a narrow derived
+    // search ("Robotics Lab intern" + the internship filter) simply has no matches, and
+    // that got reported as "the layout may have changed". Handshake states the count
+    // itself in a hook we already traced, so read it and say which.
+    const announced = txt(document.querySelector('[data-hook="job-search-results-status-announcer"]'));
+    const zero = /\b0\s+jobs?\s+found\b/i.test(announced) || /no jobs found|no results/i.test(announced) ||
+      /no jobs found|no results/i.test((document.body && document.body.innerText) || "");
+    if (zero && !signIn) {
+      return { signedIn: true, jobs: [], note: "no results for this search (Handshake reported " + (announced || "0 jobs found") + ").", empty: true };
+    }
     // Handshake renders "Something went wrong. Please try again." for an INVALID
     // search param (e.g. an unknown `sort` value) — a distinct failure from an
     // empty result set, and one the caller can actually act on.
@@ -1031,10 +1277,27 @@ function scrapeHandshakeJobList() {
     const age = /ago|new/i.test(last) ? last : "";
     const loc = segs.filter((s) => s !== last && !/^promoted$/i.test(s)).join(", ");
 
+    // ── PAY + TERM, AS HANDSHAKE ITSELF FORMATS THEM ────────────────────────
+    // Read from the card, NOT reconstructed from the record's raw numbers. That
+    // reconstruction was wrong three different ways (traced 2026-07-30): the record's
+    // `salary` is in CENTS (3000 for a card reading "$30-50/hr"), `salary_type_name`
+    // is "Paid"/"Unpaid" rather than a unit — it was being used as one, producing
+    // "$3000/hr" and "$50K/mo" — and "Unpaid", which the card states plainly and which
+    // matters a lot to a student, was dropped entirely. The card is already correct.
+    const payText =
+      (body.match(/\$[\d,.]+\s*(?:-\s*\$?[\d,.]+)?\s*\/\s*(?:hr|hour|mo|month|wk|week|yr|year)/i) || [])[0] ||
+      (body.match(/\$[\d,.]+\s*(?:K|k)?\s*\/\s*(?:hr|mo|wk|yr)/i) || [])[0] ||
+      (/\bunpaid\b/i.test(body) ? "Unpaid" : "");
+    // "Aug 14—Dec 14" / "Jul 31—Dec 31" — an em-dash range of two month-day pairs.
+    const termText = (body.match(/([A-Z][a-z]{2}\s+\d{1,2})\s*[—–-]\s*([A-Z][a-z]{2}\s+\d{1,2})/) || []);
+
     jobs.push({
       // /jobs/<id> is the canonical posting page; discoveryJobKey collapses it and
       // the /job-search/<id> search route to the same key.
       url: "https://app.joinhandshake.com/jobs/" + id,
+      pay: (payText || "").replace(/\s+/g, ""),
+      startDate: termText[1] || "",
+      endDate: termText[2] || "",
       title: (title || aria).slice(0, 300),
       company: company.slice(0, 200),
       location: (loc || "").slice(0, 200),
@@ -1105,6 +1368,7 @@ async function discoverApiFetch(urls, kind) {
       return {
         title: j.title, formattedLocation: j.formattedLocation,
         listedAt: j.listedAt, originalListedAt: j.originalListedAt,
+        expireAt: j.expireAt, workRemoteAllowed: j.workRemoteAllowed,
         jobState: j.jobState, closed: j.closed,
         applyMethod: j.applyMethod,
         description: { text: ((j.description || {}).text || "").slice(0, 20000) },
@@ -1138,6 +1402,13 @@ async function discoverApiFetch(urls, kind) {
           archived: b.archived, hidden: b.hidden, is_postable: b.is_postable,
           job_type: b.job_type ? { name: (b.job_type || {}).name } : undefined,
           job_type_name: b.job_type_name,
+          salary_type_name: b.salary_type_name,
+          salary_type: b.salary_type ? { name: (b.salary_type || {}).name } : undefined,
+          salary_min_raw: b.salary_min_raw, salary_max_raw: b.salary_max_raw,
+          pay_schedule: b.pay_schedule ? { name: (b.pay_schedule || {}).name } : undefined,
+          start_date: b.start_date, end_date: b.end_date,
+          expiration_date: b.expiration_date, default_expiration_date: b.default_expiration_date,
+          remote: b.remote, on_site: b.on_site, hybrid: b.hybrid,
           promoted_job: b.promoted_job, premium_job: b.premium_job,
         },
       };
@@ -1359,6 +1630,25 @@ function discoverLocationStep(step, arg) {
     if (step === "suggestions") {
       const rows = suggestionRows();
       return { ok: true, options: rows.slice(0, 8).map((r) => ({ text: r.t, rect: rectInView(r.el) })) };
+    }
+    if (step === "clear") {
+      // Leave the box EMPTY. A board that persists its filters per session (Handshake
+      // does) will otherwise keep applying the text we abandoned, and every later
+      // search in the sweep returns nothing.
+      const i = findInput();
+      if (!i) return { ok: true, cleared: false };
+      try {
+        if (i.value !== undefined) {
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+          setter.call(i, "");
+          i.dispatchEvent(new Event("input", { bubbles: true }));
+          i.dispatchEvent(new Event("change", { bubbles: true }));
+        } else {
+          i.textContent = "";
+          i.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      } catch (e) { return { ok: true, cleared: false, error: String((e && e.message) || e) }; }
+      return { ok: true, cleared: true };
     }
     if (step === "read") {
       // Whatever the board decided, read back off its OWN url.
@@ -1814,6 +2104,20 @@ async function saveGeoToCache(source, text, token) {
   } catch (e) { /* a cache miss next time is the only cost */ }
 }
 
+// Remember a FAILED resolve so the next sweep doesn't pay for it again (see the
+// negative-cache read in boardLocationToken). Driving a board's location dropdown
+// is the most expensive thing in a sweep and a failure costs the full budget, so
+// repeating it every run is what pushed a multi-search sweep past the point where
+// the page had given up waiting. Stored with the reason + a timestamp and only
+// honoured for a day, so a transient failure self-heals tomorrow.
+async function saveGeoFailure(source, text, error) {
+  try {
+    const cache = await loadGeoCache();
+    cache[geoCacheKey(source, text)] = { failed: true, error: String(error || "unknown"), at: Date.now() };
+    await chrome.storage.local.set({ [DISCOVER_GEO_CACHE_KEY]: cache });
+  } catch (e) { /* paying it again is the only cost */ }
+}
+
 // Drives the board's real location box with TRUSTED CDP input. Every wait is
 // service-worker wall clock and every read is one instantaneous injection, so this
 // behaves the same in a background tab; trusted `Input.*` needs no paint either.
@@ -1881,7 +2185,7 @@ async function resolveBoardLocation(tabId, source, text) {
     // So: check whether it is ALREADY open before clicking, click at most once per
     // round, and then poll for the box instead of guessing how long it takes.
     let opened = null;
-    for (let round = 0; round < 3 && !opened; round++) {
+    for (let round = 0; round < 2 && !opened; round++) {
       diag.attempts = round + 1;
 
       // Already open (e.g. the previous round's click landed late)? Don't touch it.
@@ -1910,7 +2214,7 @@ async function resolveBoardLocation(tabId, source, text) {
         // Poll for the box — up to ~6s, which a hidden tab can genuinely need. Wake
         // the page each tick: a backgrounded tab can be re-frozen between reads, and a
         // frozen page will never mount the panel however long we wait.
-        for (let i = 0; i < 12 && !(inp && inp.ok); i++) {
+        for (let i = 0; i < 8 && !(inp && inp.ok); i++) {
           await discoverDelay(500);
           await cdpWakePage();
           inp = await read("inputRect");
@@ -1932,7 +2236,7 @@ async function resolveBoardLocation(tabId, source, text) {
     // 3. Wait for the board's suggestions (its typeahead is the authority on what
     //    "Austin" means — we never invent a place id).
     let options = [];
-    for (let i = 0; i < 24; i++) {
+    for (let i = 0; i < 14; i++) {
       await discoverDelay(300);
       await cdpWakePage();
       const r = await read("suggestions");
@@ -1948,7 +2252,7 @@ async function resolveBoardLocation(tabId, source, text) {
     await cdpClickAt(top.rect.x, top.rect.y);
 
     // 5. Read the token back off the board's own URL (selecting rewrites it).
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 14; i++) {
       await discoverDelay(400);
       const r = await read("read");
       if (!r || !r.ok) continue;
@@ -1961,10 +2265,41 @@ async function resolveBoardLocation(tabId, source, text) {
     }
     return { ok: false, error: "location-token-never-appeared", label: top.text, diag };
   } finally {
+    // ⚠ LEAVE THE BOX EMPTY on the way out. Handshake persists its filters per
+    // SESSION, so an abandoned "United States of America" sitting in its location box
+    // kept being applied to every later search in the same sweep — live, a board that
+    // had worked minutes earlier returned `scanned 0` three times in a row. Clearing
+    // is unconditional: on success the board has already committed the selection, so
+    // emptying the text box afterwards costs nothing.
+    try { await cdpEval(discoverLocationStep, "clear", ""); } catch (e) { /* page may be gone */ }
     // Put the page back as we found it BEFORE releasing the attach.
     try { await cdpSetFocusEmulation(false); } catch (e) { /* page may be gone */ }
     if (!hadAttach) { try { await cdpDetach(); } catch (e) { /* tab may be gone */ } }
   }
+}
+
+/**
+ * Simpler forms of a place name to try when the exact string doesn't match.
+ *
+ * The panel seeds the location from the profile's country, whose canonical value is
+ * "United States of America" — and NEITHER board's typeahead matches that (both want
+ * "United States"). One unlucky string shouldn't cost the location filter entirely,
+ * so a failed exact match falls back through progressively simpler forms. Ordered
+ * most-specific first, deduped, and always finite.
+ */
+function locationVariants(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+  const out = [raw];
+  const add = (v) => { const t = String(v || "").trim(); if (t && out.indexOf(t) < 0) out.push(t); };
+  add(raw.replace(/\s+of\s+America\b/i, ""));   // United States of America → United States
+  add(raw.replace(/\bU\.?S\.?A?\.?\b/i, "United States"));
+  if (raw.indexOf(",") >= 0) {
+    const parts = raw.split(",").map((x) => x.trim()).filter(Boolean);
+    add(parts.slice(0, 2).join(", "));            // Austin, Texas, United States → Austin, Texas
+    add(parts[0]);                                 // …→ Austin
+  }
+  return out.slice(0, 3);
 }
 
 // Cache-first token lookup. A bare number is accepted as an already-resolved
@@ -1984,9 +2319,32 @@ async function boardLocationToken(tabId, source, text, notes) {
     dlog(`${source}: location "${want}" → cached ${hit.geoId ? "geoId " + hit.geoId : "place " + String(hit.label || "")}`);
     return { ...hit, from: "cache" };
   }
+  // ── NEGATIVE cache: remember a FAILED resolve too ──────────────────────────
+  // Driving a board's location dropdown is the single most expensive thing in a
+  // sweep, and a failure costs the full budget. Without this, a location that board
+  // simply can't match was retried at full price on EVERY sweep — live, a Handshake
+  // resolve for "United States of America" burned minutes each run and pushed the
+  // whole sweep past the point where the page had given up on it. Remembered for a
+  // day, so a transient failure still gets another chance tomorrow.
+  if (hit && hit.failed && Date.now() - (hit.at || 0) < 86400e3) {
+    dlog(`${source}: location "${want}" failed to resolve earlier today (${hit.error || "unknown"}) — not retrying this sweep`);
+    if (notes) notes.push(`${source}: "${want}" couldn't be matched on ${source} earlier today, so this sweep searched without a location filter.`);
+    return {};
+  }
   dlog(`${source}: resolving location "${want}" through ${source}'s own location box (first use)`);
   discoverProgress(`Resolving location on ${source}`, want);
-  const r = await resolveBoardLocation(tabId, source, want);
+  // Try progressively simpler forms of the place name — the panel seeds the location
+  // from the profile's country, whose canonical value ("United States of America")
+  // matches NEITHER board's typeahead, and one unlucky string shouldn't cost the
+  // location filter entirely. See locationVariants.
+  let r = { ok: false, error: "no-location-text" };
+  for (const variant of locationVariants(want)) {
+    r = await resolveBoardLocation(tabId, source, variant);
+    if (r.ok) {
+      if (variant !== want) dlog(`${source}: "${want}" matched as "${variant}"`);
+      break;
+    }
+  }
   if (!r.ok) {
     // NEVER silently search somewhere else. A failed resolve is reported and the
     // sweep continues WITHOUT a location filter, which is stated plainly.
@@ -2005,7 +2363,8 @@ async function boardLocationToken(tabId, source, text, notes) {
     // matched), and the confident-sounding explanation outlived the bug that produced it.
     // Report the observation, never a theory about the board's capabilities.
     if (d.inputFound && (r.error === "no-location-suggestions" || r.error === "location-token-never-appeared")) {
-      dlog(`${source}: ${source}'s location box offered no match for "${want}" — searching without a location filter`);
+      await saveGeoFailure(source, want, r.error);
+    dlog(`${source}: ${source}'s location box offered no match for "${want}" — searching without a location filter`);
       if (notes) notes.push(`${source}: ${source}'s location box offered no match for "${want}" (check the spelling). Searched without a location filter.`);
       return {};
     }
@@ -2019,6 +2378,7 @@ async function boardLocationToken(tabId, source, text, notes) {
       (d.picked ? `, picked "${d.picked}"` : "") +
       (d.suggestions && d.suggestions.length ? `, offered: ${d.suggestions.join(" | ")}` : "") +
       (d.nearby && d.nearby.length ? `, saw: ${d.nearby.join(" | ")}` : "");
+    await saveGeoFailure(source, want, r.error);
     dlog(`${source}: could not resolve "${want}" — ${detail}`);
     if (notes) notes.push(`${source}: couldn't resolve the location "${want}" — ${detail}`);
     return {};
@@ -2065,6 +2425,48 @@ async function pollForCards(tabId, scraper, ceilingMs, opts) {
     await discoverDelay(700);
   }
   return last || { signedIn: true, jobs: [], note: "the results list never rendered before the timeout." };
+}
+
+/**
+ * Make a HIDDEN tab actually render, then re-poll for cards.
+ *
+ * Chrome pauses rAF and throttles timers to ~1Hz in a tab that has never been
+ * presented. LinkedIn's list survives that (62 cards scanned hidden), but Handshake's
+ * slower SPA does NOT: live, the very query that renders 14 cards in a foreground tab
+ * returned `scanned 0` three sweeps in a row while unfocused — and the sweep reported
+ * it as "no job cards found … run recon", i.e. blamed the scraper for a render that
+ * never happened.
+ *
+ * These are the same three levers the location resolver uses, and the ones cdp.js
+ * already documents for hidden-tab stalls: worker-timers (behind Page.setBypassCSP, or
+ * a blocking CSP silently defeats it), setWebLifecycleState to unfreeze, and
+ * Emulation.setFocusEmulationEnabled to keep the page repainting. None of them touch
+ * real window focus.
+ *
+ * Applied ONLY when a board came back empty while hidden, so a board that renders fine
+ * unfocused never pays the debugger attach.
+ */
+async function retryHiddenRender(tabId, scraper, ceilingMs) {
+  let visible = true;
+  try { visible = await cdpVisible(); } catch (e) { /* assume visible; the retry is cheap */ }
+  if (visible) return null; // a foreground tab that rendered nothing really has nothing
+
+  const hadAttach = cdpAttachedTab() === tabId;
+  if (!hadAttach) {
+    const att = await cdpAttach(tabId);
+    if (!att || !att.ok) return null;
+  }
+  try {
+    dlog("the tab is hidden and rendered no cards — enabling worker-timers + focus emulation and retrying");
+    try { await cdpInstallPageOverrides(); } catch (e) { /* best-effort */ }
+    await cdpWakePage();
+    await cdpSetFocusEmulation(true);
+    const out = await pollForCards(tabId, scraper, ceilingMs, { expect: 25 });
+    return out;
+  } finally {
+    try { await cdpSetFocusEmulation(false); } catch (e) { /* page may be gone */ }
+    if (!hadAttach) { try { await cdpDetach(); } catch (e) { /* tab may be gone */ } }
+  }
 }
 
 // Turn a board's raw rows into candidate jobs: normalize → freshness → not already
@@ -2155,8 +2557,21 @@ async function readBoardDetails(tabId, source, jobs, opts, known) {
     if (patch.employmentType) job.employmentType = patch.employmentType.slice(0, 60);
     if (patch.applicants != null && isFinite(patch.applicants)) job.applicants = patch.applicants;
     if (patch.promoted) job.promoted = true;
+    // The details worth seeing in the queue before opening anything (pay, term,
+    // deadline, on-site/remote). Only Handshake publishes pay; LinkedIn does not, and
+    // an empty string here means "the board didn't say", never "free".
+    if (patch.pay) job.pay = patch.pay.slice(0, 80);
+    if (patch.startDate) job.startDate = patch.startDate.slice(0, 40);
+    if (patch.endDate) job.endDate = patch.endDate.slice(0, 40);
+    if (patch.applyBy) job.applyBy = patch.applyBy.slice(0, 40);
+    if (patch.workplace) job.workplace = patch.workplace.slice(0, 24);
+    if (patch.applyNote) job.applyNote = String(patch.applyNote).slice(0, 300);
     const ts = parsePostedTimestamp(patch.postedAt, o.nowMs);
     if (ts != null) { job.postedAt = ts; job.postedUnknown = false; }
+    // The ORIGINAL posting date + the repost flag — what the ranking actually uses.
+    const orig = parsePostedTimestamp(patch.originalPostedAt, o.nowMs);
+    if (orig != null) job.originalPostedAt = orig;
+    if (patch.reposted) job.reposted = true;
 
     job.applyKind = patch.applyKind || "unknown";
     job.boardUrl = job.url;
@@ -2234,8 +2649,10 @@ const BOARD_CONFIG = {
     // pure, unit-pinned helper (see linkedInFieldsFromLines for the bug that caused).
     parseRow: (r) => (r && r.lines ? { ...r, ...linkedInFieldsFromLines(r.lines) } : r),
     locationTokenKey: "geoId",
-    // Observed render times: LinkedIn ~8s to a full list.
+    // Observed render times: LinkedIn ~8s to a full list — cheap enough to run every
+    // derived search against it.
     renderCeilingMs: 30000,
+    maxQueries: 3,
     pageUrl: (o, page) => discoverLinkedInSearchUrl({
       keywords: o.keywords, sinceDays: o.sinceDays, geoId: o.token, start: (page - 1) * 25,
     }),
@@ -2256,8 +2673,11 @@ const BOARD_CONFIG = {
     parseRow: (r) => r,
     locationTokenKey: "locationFilter",
     // Handshake is MUCH slower: 15–25s to render its list even in the foreground
-    // (measured), so it gets its own budget rather than sharing LinkedIn's.
+    // (measured), so it gets its own budget rather than sharing LinkedIn's — and only
+    // ONE search, because three derived searches cost it ~a minute of pure waiting (a
+    // live 3-search sweep took 224s, most of it spent right here).
     renderCeilingMs: 45000,
+    maxQueries: 1,
     pageUrl: (o, page) => discoverHandshakeSearchUrl({
       keywords: o.keywords, page, perPage: 25,
       internshipOnly: o.internshipOnly, sort: HANDSHAKE_SORT_NEWEST, locationFilter: o.token,
@@ -2269,10 +2689,17 @@ const BOARD_CONFIG = {
 async function discoverFromBoard(source, opts) {
   const o = opts || {};
   const cfg = BOARD_CONFIG[source];
-  const keywords = String(o.keywords || "").trim();
   const notes = [];
   if (!cfg) return { jobs: [], note: `${source}: unknown board.`, scanned: 0 };
-  if (!keywords) {
+  // SEVERAL searches per board when the queries were derived from the resume (see
+  // buildDiscoverQueries) — all driven through the ONE tab this board opens.
+  const allQueries = (Array.isArray(o.queries) && o.queries.length
+    ? o.queries
+    : [{ keywords: String(o.keywords || "").trim(), from: "" }]
+  ).filter((q) => q && String(q.keywords || "").trim());
+  // Per-board cap: a SLOW board runs fewer of the derived searches (see BOARD_CONFIG).
+  const queries = allQueries.slice(0, Math.max(1, Number(cfg.maxQueries) || allQueries.length));
+  if (!allQueries.length) {
     return { jobs: [], note: `${source}: skipped — no search keywords were built (see the keyword box).`, scanned: 0 };
   }
   const known = new Set((o.knownKeys || []).filter(Boolean));
@@ -2291,12 +2718,20 @@ async function discoverFromBoard(source, opts) {
     token = /^\d+$/.test(wantLocation) ? wantLocation : parseLinkedInGeoId(wantLocation);
   }
 
-  const urlFor = (page) => cfg.pageUrl({ keywords, sinceDays: o.sinceDays, internshipOnly, token }, page);
-  discoverProgress(`Searching ${source}`, "in your signed-in session");
-  dlog(`${source}: opening ${urlFor(1)}`);
+  // Pages PER QUERY: with several derived searches, one page each keeps the sweep
+  // bounded and covers more ground than three pages of a single query would.
+  const pagesPerQuery = queries.length > 1 ? 1 : maxPages;
+  const urlFor = (keywords, page) => cfg.pageUrl({ keywords, sinceDays: o.sinceDays, internshipOnly, token }, page);
+  const firstUrl = urlFor(queries[0].keywords, 1);
+  discoverProgress(`Searching ${source}`, queries.length > 1 ? `${queries.length} searches from your resume` : "in your signed-in session");
+  dlog(`${source}: ${queries.length} search(es) × ${pagesPerQuery} page(s) — ${queries.map((q) => JSON.stringify(q.keywords)).join(", ")}`);
+  if (allQueries.length > queries.length) {
+    dlog(`${source}: running ${queries.length} of ${allQueries.length} derived searches (this board renders too slowly for all of them)`);
+  }
+  dlog(`${source}: opening ${firstUrl}`);
 
   try {
-    return await withDiscoverTab(urlFor(1), { background: o.background !== false, settleMs: 2000 }, async (tabId) => {
+    return await withDiscoverTab(firstUrl, { background: o.background !== false, settleMs: 2000 }, async (tabId) => {
       const rawRows = [];
       let scanned = 0;
       let signedOut = false;
@@ -2327,12 +2762,15 @@ async function discoverFromBoard(source, opts) {
         }
       }
 
-      // 2. Page through the rendered search.
-      for (let page = 1; page <= maxPages; page++) {
-        const url = urlFor(page);
-        // Re-navigate for page 2+, and for page 1 when a location was just resolved
-        // (the resolve leaves the tab on the board's own rewritten url).
-        if (page > 1 || (wantLocation && token)) {
+      // 2. Page through each derived search in turn, all in this one tab.
+      let nav = 0;
+      for (const q of queries) {
+      for (let page = 1; page <= pagesPerQuery; page++) {
+        const url = urlFor(q.keywords, page);
+        // Re-navigate for everything except the very first render, and also for that
+        // first one when a location was just resolved (the resolve leaves the tab on
+        // the board's own rewritten url).
+        if (nav++ > 0 || (wantLocation && token)) {
           dlog(`${source}: page ${page} → ${url}`);
           await new Promise((r) => chrome.tabs.update(tabId, { url }, () => { void chrome.runtime.lastError; r(); }));
           try { await waitTabComplete(tabId, o.loadTimeoutMs || 25000); } catch (e) { /* the poll below is the real gate */ }
@@ -2340,7 +2778,19 @@ async function discoverFromBoard(source, opts) {
         // SETTLE on the cards rather than guessing a delay: Handshake's list can take
         // 15s+ even in the foreground, a hidden tab paints later still, and both mount
         // progressively (see pollForCards — reading too early captured 3 of 25).
-        const out = await pollForCards(tabId, cfg.scraper(), cfg.renderCeilingMs || 25000, { expect: 25 });
+        // The per-board ceiling is a COLD-START budget (Handshake needs 15–25s on
+        // first paint). Once one page has rendered the SPA is warm, so later pages
+        // get a much shorter one — otherwise several derived searches each pay the
+        // cold price and the sweep outlives the page waiting on it.
+        const ceiling = rawRows.length ? Math.min(12000, cfg.renderCeilingMs || 25000) : (cfg.renderCeilingMs || 25000);
+        let out = await pollForCards(tabId, cfg.scraper(), ceiling, { expect: 25 });
+        // Empty while HIDDEN is usually a render that never happened, not an empty
+        // result set — Handshake in particular needs the hidden-tab levers. `empty:true`
+        // means the board itself reported 0 results, which is a real answer.
+        if (out && out.signedIn !== false && !((out.jobs || []).length) && !out.empty) {
+          const retried = await retryHiddenRender(tabId, cfg.scraper(), ceiling);
+          if (retried && ((retried.jobs || []).length || retried.empty)) out = retried;
+        }
         if (out && out.signedIn === false) {
           signedOut = true;
           dlog(`${source}: NOT SIGNED IN — ${out.note || "redirected to login"}`);
@@ -2350,10 +2800,11 @@ async function discoverFromBoard(source, opts) {
         if (out && out.note) notes.push(`${source}: ${out.note}`);
         scanned += rows.length;
         rawRows.push(...rows);
-        dlog(`${source}: page ${page} — ${rows.length} card${rows.length === 1 ? "" : "s"}`);
-        if (!rows.length) break;                       // out of results
-        if (rawRows.length >= perSource * 2) break;    // plenty to rank from
+        dlog(`${source}: "${q.keywords}" page ${page} — ${rows.length} card${rows.length === 1 ? "" : "s"}`);
+        if (!rows.length) break;                       // this query is out of results
         await discoverDelay(500);
+      }
+        if (signedOut) break;
       }
 
       if (signedOut) {
@@ -2364,7 +2815,7 @@ async function discoverFromBoard(source, opts) {
       //    Reported, never silent — a substrate downgrade the operator can't see is
       //    how a half-broken sweep looks like a quiet day on the job market.
       if (!rawRows.length && cfg.fallbackSearch) {
-        const url = cfg.fallbackSearch({ keywords, sinceDays: o.sinceDays, internshipOnly, token }, 1);
+        const url = cfg.fallbackSearch({ keywords: queries[0].keywords, sinceDays: o.sinceDays, internshipOnly, token }, 1);
         if (url) {
           dlog(`${source}: the rendered page yielded nothing — trying the search JSON`);
           const [res] = await discoverApiBatch(tabId, [url], cfg.fallbackKind, { chunk: 1 });
@@ -2388,7 +2839,7 @@ async function discoverFromBoard(source, opts) {
         `(dropped ${f.skippedKnown} already applied/queued, ${f.skippedStale} older than ${o.sinceDays}d, ${f.skippedUnusable} unusable)`
       );
       // Newest-first here is only the CAP order (which to keep when there are more
-      // than maxPerSource); the final ordering is scoreDiscovery's, later.
+      // than maxPerSource); the final ordering is matchPercent's, later.
       f.jobs.sort(comparePostedDesc);
       let kept = f.jobs.slice(0, perSource);
       if (kept.length < f.jobs.length) dlog(`${source}: keeping the newest ${kept.length} (maxPerSource=${perSource})`);
@@ -2403,8 +2854,7 @@ async function discoverFromBoard(source, opts) {
       // Pre-ranking on what the CARD already gives us (title match, freshness,
       // applicant count) costs nothing and aligns the two sets; the final ordering is
       // still computed after enrichment, on the fuller data.
-      const preRank = pickBestJobs(kept, 0, { keywords: o.keywords, field: o.field, intern: o.intern, nowMs: o.nowMs });
-      kept = preRank.kept;
+      kept = rankByMatch(kept, { keywords: o.keywords, field: o.field, intern: o.intern, sinceDays: o.sinceDays, nowMs: o.nowMs });
 
       const detail = await readBoardDetails(tabId, source, kept, o, known);
       const after = dropJobs(kept, detail.droppedKnown, detail.droppedEasy, detail.droppedClosed);
@@ -2542,14 +2992,18 @@ async function runJobDiscovery(opts) {
 
   // The actual search string, composed once and REPORTED — an empty/odd query must
   // never again be invisible (the "it just looked at the recommended jobs" bug).
-  const { keywords, derivedFrom } = buildDiscoverQuery(o);
+  // SEVERAL searches when the box is blank — derived from the resume, not just the
+  // major (see buildDiscoverQueries). `keywords` stays the FIRST one so every existing
+  // consumer (the Simplify sieve, the echoed search, the logs) is unchanged.
+  const { queries, derivedFrom } = buildDiscoverQueries(o);
+  const keywords = queries.length ? queries[0].keywords : "";
   const term = discoverTermLabel(o.cycle, o.year);
   const location = String(o.location || "").trim() || DISCOVER_DEFAULT_LOCATION;
-  const search = { keywords, derivedFrom, term, location, sinceDays: o.sinceDays };
+  const search = { keywords, derivedFrom, term, location, sinceDays: o.sinceDays, queries: queries.map((q) => q.keywords), minMatchPercent: o.minMatchPercent == null ? DISCOVER_DEFAULTS.minMatchPercent : Number(o.minMatchPercent) };
 
   console.log(
     `[ApplyPilot][DISCOVER] sweep start — sources ${Object.keys(want).filter((k) => want[k]).join("+") || "none"}, ` +
-    `keywords "${keywords || "(NONE)"}" (from ${derivedFrom || "nothing"}), ` +
+    `search${queries.length === 1 ? "" : "es"} ${queries.length ? queries.map((q) => JSON.stringify(q.keywords)).join(" | ") : "(NONE)"} (from ${derivedFrom || "nothing"}), ` +
     `season "${term || "(any)"}", location "${location}", last ${o.sinceDays}d, ` +
     `${(o.knownKeys || []).length} already known`
   );
@@ -2588,7 +3042,7 @@ async function runJobDiscovery(opts) {
   // order is stable.
   for (const src of ["linkedin", "handshake"]) {
     if (!want[src]) continue;
-    const r = await discoverFromBoard(src, { ...o, keywords, location, nowMs: now });
+    const r = await discoverFromBoard(src, { ...o, keywords, queries, location, nowMs: now });
     if (r.note) notes.push(r.note);
     scanned[src] = r.scanned;
     tallyDetail(r.detail);
@@ -2632,24 +3086,30 @@ async function runJobDiscovery(opts) {
   // Everything found is ranked; only the best `queueLimit` are returned to be
   // queued. Both halves are reported — a narrowing the operator can't see is
   // indistinguishable from a sweep that found nothing.
-  const limit = o.queueLimit == null ? DISCOVER_DEFAULTS.queueLimit : Number(o.queueLimit);
-  const ranked = pickBestJobs(fresh, 0, { keywords, field: o.field, intern: o.intern, nowMs: now });
-  const wide = ranked.kept; // scored, best first
-  const best = pickBestJobs(wide, limit > 0 ? Math.min(limit, cappedTotal) : cappedTotal, { keywords, field: o.field, intern: o.intern, nowMs: now });
-  const capped = best.kept;
-  const droppedByCap = best.dropped.length;
-  if (droppedByCap > 0) {
-    const why = limit > 0 && limit <= cappedTotal
-      ? `you asked for the best ${limit}`
-      : `the ${cappedTotal}-job cap`;
+  // ── QUEUE BY MATCH THRESHOLD (operator 2026-07-30) ────────────────────────
+  // A "% match" the operator can edit, rather than a top-N count: everything at or
+  // above the threshold is queued, however many that is. matchPercent's components
+  // sum to 100 precisely so the number is comparable against a threshold.
+  const rankOpts = { keywords, field: o.field, intern: o.intern, sinceDays: o.sinceDays, nowMs: now };
+  const minPercent = o.minMatchPercent == null ? DISCOVER_DEFAULTS.minMatchPercent : Number(o.minMatchPercent);
+  const graded = pickByThreshold(fresh, minPercent, rankOpts);
+  const wide = graded.kept.concat(graded.dropped); // every candidate, best first
+  // maxTotal is still the hard backstop, so a low threshold can't queue hundreds.
+  const capped = graded.kept.slice(0, cappedTotal);
+  const belowThreshold = graded.dropped.length;
+  const droppedByCap = graded.kept.length - capped.length;
+  if (belowThreshold > 0) {
     notes.push(
-      `${wide.length} new job${wide.length === 1 ? "" : "s"} matched; queued the best ${capped.length} because ${why}. ` +
-      `${droppedByCap} were left behind — raise the number to take more.`
+      `${wide.length} new job${wide.length === 1 ? "" : "s"} found; queued the ${capped.length} matching ${minPercent}% or better. ` +
+      `${belowThreshold} scored lower — lower the threshold to take more.`
     );
-    dlog(`ranking: ${wide.length} matched, queued the top ${capped.length}; ${droppedByCap} left behind`);
-    for (const j of best.dropped.slice(0, 10)) {
-      dlog(`  – not queued [score ${j.score}] ${j.company || "?"} — ${j.title || "?"} (${(j.scoreReasons || []).join("; ") || "no signals"})`);
+    dlog(`ranking: ${wide.length} found, ${graded.kept.length} at/above ${minPercent}%, queued ${capped.length}`);
+    for (const j of graded.dropped.slice(0, 10)) {
+      dlog(`  – below threshold [${j.matchPercent}%] ${j.company || "?"} — ${j.title || "?"} (${(j.scoreReasons || []).join("; ") || "no signals"})`);
     }
+  }
+  if (droppedByCap > 0) {
+    notes.push(`${droppedByCap} more job${droppedByCap === 1 ? "" : "s"} met the threshold but were left out by the ${cappedTotal}-job cap.`);
   }
 
   // How many descriptions came from a board's JSON record — i.e. with no tab
@@ -2827,6 +3287,7 @@ if (typeof module !== "undefined" && module.exports) {
     DISCOVER_CYCLES,
     discoverTermLabel,
     buildDiscoverQuery,
+    buildDiscoverQueries,
     discoverKeywordTokens,
     discoverLinkedInSearchUrl,
     discoverHandshakeSearchUrl,
@@ -2837,12 +3298,17 @@ if (typeof module !== "undefined" && module.exports) {
     parseLinkedInGeoId,
     handshakeDetailPath,
     geoCacheKey,
+    locationVariants,
     linkedInCardToRaw,
     linkedInFieldsFromLines,
     linkedInDetailToPatch,
     handshakeDetailToPatch,
-    scoreDiscovery,
-    pickBestJobs,
+    matchPercent,
+    postedForRanking,
+    pickByThreshold,
+    rankByMatch,
+    workplaceFromText,
+    dateOnly,
     HANDSHAKE_SORT_NEWEST,
     LINKEDIN_EXPERIENCE_INTERNSHIP,
     HANDSHAKE_JOB_TYPE_INTERNSHIP,

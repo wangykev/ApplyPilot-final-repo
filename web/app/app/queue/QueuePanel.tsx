@@ -2,7 +2,10 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2, ExternalLink, FileText, MapPin, Clock, ChevronDown } from "lucide-react";
+import {
+  Plus, Trash2, ExternalLink, FileText, MapPin, Clock, ChevronDown,
+  DollarSign, Briefcase, CalendarRange, Hourglass, Users,
+} from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { addQueueItems, removeQueueItem, clearQueue } from "./actions";
 import { parseUrls, type QueueItem } from "./shared";
@@ -173,6 +176,9 @@ function QueueRow({
   const ago = agoLabel(item.posted_at);
   const headline = [item.company, item.role].filter(Boolean).join(" · ") || host(item.url);
   const discovered = Boolean(item.company || item.role || item.source);
+  // Migration 0012's extras. Older rows (and pasted ones) simply have none, and every
+  // key is optional — absent always means "the board didn't say".
+  const d = item.details || null;
 
   return (
     <li className="rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2.5">
@@ -202,9 +208,51 @@ function QueueRow({
                 </span>
               )}
               {ago && (
-                <span className="inline-flex items-center gap-1">
+                <span
+                  className="inline-flex items-center gap-1"
+                  title={
+                    d?.reposted && d.original_posted_at
+                      ? `The board shows a REPOST. Originally posted ${new Date(d.original_posted_at).toLocaleDateString()}.`
+                      : undefined
+                  }
+                >
                   <Clock className="h-3 w-3" />
-                  posted {ago}
+                  {/* A board re-floats an old posting and shows the BUMP as if it were
+                      new. Say which, so "posted 2h ago" can't mislead. */}
+                  {d?.reposted ? <>reposted {ago}</> : <>posted {ago}</>}
+                </span>
+              )}
+              {/* Pay / term / deadline / workplace — read from the board's own record,
+                  so the row answers "is this worth opening" without opening it.
+                  Pay is Handshake-only; LinkedIn publishes none, so it's simply absent. */}
+              {d?.pay && (
+                <span className="inline-flex items-center gap-1 text-verified">
+                  <DollarSign className="h-3 w-3" />
+                  {d.pay}
+                </span>
+              )}
+              {(d?.employment_type || d?.workplace) && (
+                <span className="inline-flex items-center gap-1">
+                  <Briefcase className="h-3 w-3" />
+                  {[d?.employment_type, d?.workplace].filter(Boolean).join(" · ")}
+                </span>
+              )}
+              {(d?.start_date || d?.end_date) && (
+                <span className="inline-flex items-center gap-1" title="The term, as the board states it">
+                  <CalendarRange className="h-3 w-3" />
+                  {[d?.start_date, d?.end_date].filter(Boolean).join(" → ")}
+                </span>
+              )}
+              {d?.apply_by && (
+                <span className="inline-flex items-center gap-1 text-amber" title="The board's own application deadline">
+                  <Hourglass className="h-3 w-3" />
+                  apply by {d.apply_by}
+                </span>
+              )}
+              {typeof d?.applicants === "number" && (
+                <span className="inline-flex items-center gap-1" title="How many people the board says have applied. Shown for context — it does not affect the match score.">
+                  <Users className="h-3 w-3" />
+                  {d.applicants.toLocaleString()} applied
                 </span>
               )}
               <span className="truncate">{host(item.url)}</span>
@@ -225,6 +273,21 @@ function QueueRow({
             not workday
           </span>
         ) : null}
+        {/* WHY this row was queued. The sweep queues by a % threshold, so showing the
+            score (and its reasons on hover) is what keeps that decision inspectable. */}
+        {typeof d?.match_percent === "number" && (
+          <span
+            className={clsx(
+              "shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] tracking-label",
+              d.match_percent >= 80 ? "border-verified/40 text-verified"
+                : d.match_percent >= 60 ? "border-amber/40 text-amber"
+                : "border-ink-faint/40 text-ink-faint"
+            )}
+            title={(d.match_reasons || []).join(" · ") || "Match score out of 100"}
+          >
+            {d.match_percent}% match
+          </span>
+        )}
         <span className={clsx("shrink-0 font-mono text-[10px] uppercase tracking-label", st.text)}>
           {item.status}
         </span>

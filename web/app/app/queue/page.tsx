@@ -22,7 +22,7 @@ async function loadQueue(): Promise<QueueItem[]> {
     if (!user) return DEV_PREVIEW ? SAMPLE : [];
     const { data } = await supabase
       .from("queue_items")
-      .select("id, url, status, position, company, role, source, location, posted_at, job_description")
+      .select("id, url, status, position, company, role, source, location, posted_at, job_description, details")
       .eq("user_id", user.id)
       .order("position", { ascending: true });
     if ((!data || data.length === 0) && DEV_PREVIEW) return SAMPLE;

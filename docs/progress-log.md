@@ -3108,3 +3108,106 @@ could match, and the placeholder was then quoted as if it explained the limit. T
 explanation outlived the bug that produced it. The resolver's message now reports only
 what was observed ("its location box offered no match for X — check the spelling") and
 asserts nothing about what a board supports.
+
+### 2026-07-30 (later still) — ranked by MATCH %, resume-derived searches, richer queue rows
+
+Five operator changes, and the live sweeps that made each of them work.
+
+**1. Applicant count no longer ranks anything.** ("I don't need the how many people
+applied sort. mainly filter on when it was posted.") It is still read and shown — it is
+free and useful to a human — but `matchPercent` ignores it and freshness took the weight
+it used to carry. Unit-pinned in both directions.
+
+**2. A REPOST is not a new posting.** ("sometimes it says when it was reposted. that is
+different from when it was actually posted.") Measured on LinkedIn: **2 of 3** sampled
+postings were reposts, one whose bump was **63 days** newer than its original. Ranking
+the bump would re-float a two-month-old job to the top of every daily sweep. The record
+carries both `listedAt` and `originalListedAt`; `postedForRanking` takes the original,
+`reposted` rides through to the queue, and the row says "reposted 2h ago" rather than
+"posted 2h ago" with the true date on hover. Live: a genuinely-new posting scores 95%
+where the 63-day repost scores 65%.
+
+**3. Three knobs removed, one added.** "Posted within N days", "Read up to N job
+records" and "Scan up to N pages" are gone; the sweep uses the shared defaults instead
+(the recency window went to 30d — matchPercent scores freshness directly, so a wide net
+costs nothing because stale postings simply fall under the threshold). In their place a
+single **"Queue matches above N%"**. That is why `matchPercent`'s components sum to
+exactly 100 — relevance 0–65, freshness 0–30, drivable 0–5 — an unbounded score cannot
+be compared against "60".
+
+**4. A blank keyword box now searches the RESUME, not just the major.** ("search for
+different things that I would be interested in based on my resume instead of just the
+major.") `buildDiscoverQueries` derives several searches — past job titles with the
+level words stripped, the field of study, then skills PAIRED — and runs each against
+both boards, merging via the existing dedup. Live on the operator's own profile it
+produced *"Robotics Lab intern · Firmware intern · Electrical and Computer Engineering
+intern"*. Two quality fixes came straight out of seeing that: "Firmware **Team Member**"
+was searching for "team member" as though that were a kind of job, and the titles filled
+every slot and pushed the major out entirely — so generic-noise nouns are stripped and
+one slot is RESERVED for the field of study.
+
+**5. The queue shows pay, term, deadline and why it matched.** ("give more information
+like the pay, start date/end date if they have and other important information.")
+Discovery already read all of it from each board's record and was throwing it away at the
+queue boundary. Migration `0012` adds one `details jsonb` — one column rather than eight
+scalars because the set is board-dependent and still settling (Handshake publishes pay
+and a term; LinkedIn publishes neither — its `salaryInsights` is a link to its salary
+tool, not a number). Rows now carry pay · employment type · workplace · term · apply-by ·
+applicants · match % + its reasons, and a `NN% match` badge whose tooltip lists why.
+
+### The bugs these rounds surfaced
+
+**Handshake's pay was being invented.** The first cut rebuilt the label from the record's
+raw numbers and produced **"$3000/hr"** and **"$50K/mo"** live. Tracing one posting
+against its own card showed why: `salary` is in **CENTS** (3000 where the card reads
+"$30-50/hr"), `salary_type_name` is **"Paid"/"Unpaid"** rather than a unit — it was being
+read as one — and **"Unpaid"**, which the card states plainly and which matters a lot to
+a student, was dropped entirely. Handshake already formats the label correctly, so the
+reconstruction was deleted and the CARD is now the source of truth. Live after: "$30-50/hr",
+"$15-20/hr", "$40-50/hr" — matching the board exactly.
+
+**Handshake wouldn't render hidden.** A query that shows 14 cards in a foreground tab
+returned `scanned 0` three sweeps running while unfocused, and the sweep blamed the
+scraper ("no job cards found … run recon"). LinkedIn survives a hidden tab; Handshake's
+slower SPA does not. `retryHiddenRender` now applies the same three levers the location
+resolver uses — worker-timers behind `Page.setBypassCSP`, `setWebLifecycleState`, and
+`Emulation.setFocusEmulationEnabled` — but ONLY when a board came back empty while
+hidden, so a board that renders fine unfocused never pays a debugger attach. Live after:
+`scanned 14`, matching the foreground count exactly.
+
+**"No cards" and "no results" were the same message.** A narrow derived search with zero
+matches was reported as "the layout may have changed — run recon", sending the operator
+to debug a scraper that was working. Handshake states the count itself in a hook already
+traced (`job-search-results-status-announcer`), so the two are now distinguished.
+
+**A failed location resolve poisoned the rest of the sweep.** Handshake persists filters
+per session, so an abandoned "United States of America" left sitting in its location box
+kept being applied to every later search. The resolver now empties the box on the way
+out, unconditionally.
+
+**The profile's country matched neither board.** Its canonical value is "United States of
+America"; both typeaheads want "United States". `locationVariants` tries progressively
+simpler forms (strip " of America", then the first comma-parts), so one unlucky string no
+longer costs the location filter entirely.
+
+**A failed resolve was retried at full price every sweep.** Driving a location dropdown
+is the most expensive thing in a sweep, and a failure costs the whole budget — repeating
+it is what pushed a 3-search sweep to **224s**, past the point where the page had given
+up waiting. Failures are now negative-cached for a day (so a transient one still
+self-heals), the resolver's own budgets are tighter, pages after the first get a shorter
+"warm" ceiling, and a SLOW board runs fewer of the derived searches (`maxQueries` per
+board: LinkedIn 3, Handshake 1). 224s → **65s**.
+
+**A python heredoc turned every `\b` into a literal 0x08 byte** in the ported regexes, so
+the word-boundary assertions silently became impossible-to-match literals. The lockstep
+test caught it as a drift. All patching now goes through a small CRLF-normalising helper
+rather than shell heredocs.
+
+### Verification
+
+Extension **875 pass / 0 fail**, web **110 pass / 0 fail** (the lockstep suite now covers
+`buildDiscoverQueries` and `discoverKeywordTokens`, and asserts neither side keeps a stale
+`queueLimit`), typecheck + production build green. Live, tab unfocused: Handshake
+`scanned 14` with correct pay/term/deadline on every row; LinkedIn `scanned 62` across
+three derived searches with 8 cross-query duplicates deduped; a 60% threshold queueing 3–4
+of 16–18 found and reporting the rest.

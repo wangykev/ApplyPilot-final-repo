@@ -26,8 +26,13 @@ export const dynamic = "force-dynamic";
  * would silently search the wrong one for anyone whose profile says otherwise.
  * `country` is a tiered array like `field_of_study`, so entry 0 is the answer.
  */
-async function loadDiscoverDefaults(): Promise<{ fieldOfStudy: string; homeCountry: string }> {
-  const none = { fieldOfStudy: "", homeCountry: "" };
+async function loadDiscoverDefaults(): Promise<{
+  fieldOfStudy: string;
+  homeCountry: string;
+  jobTitles: string[];
+  skills: string[];
+}> {
+  const none = { fieldOfStudy: "", homeCountry: "", jobTitles: [] as string[], skills: [] as string[] };
   if (!isSupabaseConfigured()) return none;
   try {
     const supabase = await createClient();
@@ -45,6 +50,13 @@ async function loadDiscoverDefaults(): Promise<{ fieldOfStudy: string; homeCount
     return {
       fieldOfStudy: tier0(profile.education?.[0]?.field_of_study),
       homeCountry: tier0(profile.personal_info?.country),
+      // The resume, for deriving SEVERAL searches when the keyword box is blank:
+      // roles actually held (the strongest evidence of what you want next) and skills.
+      jobTitles: (profile.work_experience ?? [])
+        .map((w) => String(w?.job_title || "").trim())
+        .filter(Boolean)
+        .slice(0, 6),
+      skills: (profile.skills ?? []).map((s) => String(s || "").trim()).filter(Boolean).slice(0, 8),
     };
   } catch {
     return none;
@@ -52,7 +64,7 @@ async function loadDiscoverDefaults(): Promise<{ fieldOfStudy: string; homeCount
 }
 
 export default async function RunPage() {
-  const { fieldOfStudy, homeCountry } = await loadDiscoverDefaults();
+  const { fieldOfStudy, homeCountry, jobTitles, skills } = await loadDiscoverDefaults();
   return (
     <div className="space-y-8">
       <PageHeader
@@ -63,7 +75,7 @@ export default async function RunPage() {
       <RunPanel />
       {/* Find work to run: sweeps the job boards for new postings and fills the queue.
           Sits below Run because Run is the page's primary action — Discover feeds it. */}
-      <DiscoverPanel fieldOfStudy={fieldOfStudy} homeCountry={homeCountry} />
+      <DiscoverPanel fieldOfStudy={fieldOfStudy} homeCountry={homeCountry} jobTitles={jobTitles} skills={skills} />
     </div>
   );
 }

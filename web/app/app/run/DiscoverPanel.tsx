@@ -10,7 +10,7 @@ import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type
 import { linkedExtensionId } from "@/lib/extension-sync";
 import {
   DISCOVER_DEFAULTS, DISCOVER_SOURCE_LABEL, DISCOVER_SOURCE_HINT, describeSweep,
-  DISCOVER_CYCLES, DISCOVER_DEFAULT_LOCATION, buildDiscoverQuery, discoverTermLabel, isBoardUrl,
+  DISCOVER_CYCLES, DISCOVER_DEFAULT_LOCATION, buildDiscoverQueries, discoverTermLabel, isBoardUrl,
   type DiscoveredJob, type DiscoverStats, type DiscoverSourceKey, type DiscoverSearch,
 } from "@/lib/discover";
 import { getDiscoveryContext, saveDiscovered } from "./actions";
@@ -63,7 +63,7 @@ const PREFS_KEY = "applypilot.discover.prefs";
 type Prefs = {
   enabled?: Record<DiscoverSourceKey, boolean>;
   query?: string; cycle?: string; year?: string; intern?: boolean; location?: string;
-  sinceDays?: number; maxRecords?: number; maxPages?: number; queueLimit?: number;
+  minMatchPercent?: number;
   skipEasyApply?: boolean;
   background?: boolean;
 };
@@ -75,7 +75,18 @@ function loadPrefs(): Prefs {
   } catch { return {}; }
 }
 
-export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOfStudy?: string; homeCountry?: string }) {
+export function DiscoverPanel({
+  fieldOfStudy = "",
+  homeCountry = "",
+  jobTitles = [],
+  skills = [],
+}: {
+  fieldOfStudy?: string;
+  homeCountry?: string;
+  /** Past roles + skills from the profile — a blank keyword box derives its searches from these. */
+  jobTitles?: string[];
+  skills?: string[];
+}) {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [progress, setProgress] = useState<RunProgress | null>(null);
@@ -90,11 +101,10 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
   // operator's own answer to "where do you live" is the only sensible default, and
   // baking one in would silently search the wrong country for anyone else.
   const [location, setLocation] = useState(homeCountry);
-  const [sinceDays, setSinceDays] = useState(DISCOVER_DEFAULTS.sinceDays);
-  const [maxRecords, setMaxRecords] = useState(DISCOVER_DEFAULTS.maxRecords);
-  const [maxPages, setMaxPages] = useState(DISCOVER_DEFAULTS.maxPages);
-  const [queueLimit, setQueueLimit] = useState(DISCOVER_DEFAULTS.queueLimit);
-  const [queueAll, setQueueAll] = useState(false);
+  // Queue by MATCH THRESHOLD, not a count (operator 2026-07-30). The recency window,
+  // record budget and page count are no longer knobs — matchPercent scores freshness
+  // directly, so the shared defaults are right and the threshold does the deciding.
+  const [minMatchPercent, setMinMatchPercent] = useState(DISCOVER_DEFAULTS.minMatchPercent);
   const [skipEasyApply, setSkipEasyApply] = useState(DISCOVER_DEFAULTS.skipEasyApply);
   // Sweep tabs open unfocused by default so you can keep working. Turning this off
   // makes them the active tab, which is the right first move when a board's UI isn't
@@ -107,10 +117,10 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
   // extension uses. Shown below the controls so a blank/odd query can never again
   // be invisible — that's what let an empty box quietly scrape LinkedIn's
   // recommended feed instead of searching.
-  const preview = buildDiscoverQuery({ query, field: fieldOfStudy, intern });
+  const preview = buildDiscoverQueries({ query, field: fieldOfStudy, intern, jobTitles, skills });
   const term = discoverTermLabel(cycle, year);
   const locationLabel = location.trim() || homeCountry || DISCOVER_DEFAULT_LOCATION;
-  const noKeywords = !preview.keywords;
+  const noKeywords = preview.queries.length === 0;
 
   useEffect(() => {
     setConnected(linkedExtensionId() !== null && extensionMessagingAvailable());
@@ -128,10 +138,7 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
     if (typeof p.year === "string") setYear(p.year);
     if (typeof p.intern === "boolean") setIntern(p.intern);
     if (typeof p.location === "string" && p.location) setLocation(p.location);
-    if (typeof p.sinceDays === "number") setSinceDays(p.sinceDays);
-    if (typeof p.maxRecords === "number") setMaxRecords(p.maxRecords);
-    if (typeof p.maxPages === "number") setMaxPages(p.maxPages);
-    if (typeof p.queueLimit === "number") { setQueueLimit(p.queueLimit || DISCOVER_DEFAULTS.queueLimit); setQueueAll(p.queueLimit === 0); }
+    if (typeof p.minMatchPercent === "number") setMinMatchPercent(p.minMatchPercent);
     if (typeof p.skipEasyApply === "boolean") setSkipEasyApply(p.skipEasyApply);
     if (typeof p.background === "boolean") setBackground(p.background);
     setPrefsLoaded(true);
@@ -141,11 +148,10 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
     if (!prefsLoaded) return; // don't write the pre-hydration defaults back over saved ones
     try {
       window.localStorage.setItem(PREFS_KEY, JSON.stringify({
-        enabled, query, cycle, year, intern, location, sinceDays, maxRecords, maxPages,
-        queueLimit: queueAll ? 0 : queueLimit, skipEasyApply, background,
+        enabled, query, cycle, year, intern, location, minMatchPercent, skipEasyApply, background,
       } satisfies Prefs));
     } catch { /* a private-mode browser just won't remember them */ }
-  }, [prefsLoaded, enabled, query, cycle, year, intern, location, sinceDays, maxRecords, maxPages, queueLimit, queueAll, skipEasyApply, background]);
+  }, [prefsLoaded, enabled, query, cycle, year, intern, location, minMatchPercent, skipEasyApply, background]);
 
   const running = phase.s === "running";
   const anySource = SOURCES.some((s) => enabled[s]);
@@ -184,11 +190,12 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
       // (neither board's location token can be constructed) and the result is
       // cached, so a given place costs one resolve on its first use only.
       location: location.trim() || homeCountry,
-      sinceDays,
-      maxRecords,
-      // Scrape wide, queue narrow.
-      maxPages,
-      queueLimit: queueAll ? 0 : queueLimit,
+      // A blank keyword box derives SEVERAL searches from the resume, not one from
+      // the major — so the profile's roles and skills are sent too.
+      jobTitles,
+      skills,
+      // Queue everything matching this well or better.
+      minMatchPercent,
       skipEasyApply,
       background, // unfocused by default; off = watch it happen in the active tab
     });
@@ -338,87 +345,29 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
               Internships
             </span>
           </label>
+        </div>
+
+        {/* Scrape wide, queue by MATCH. The sweep looks at several pages, scores
+            everything it finds out of 100, and queues whatever clears the bar — so a
+            daily run doesn't dump half-relevant rows into the queue, and you tune it
+            with one number instead of three. */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
           <label className="shrink-0">
             <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
-              Posted within
-            </span>
-            <span className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1}
-                max={60}
-                value={sinceDays}
-                onChange={(e) => setSinceDays(Math.max(1, Math.min(60, Number(e.target.value) || 1)))}
-                className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
-              />
-              <span className="text-xs text-ink-dim">days</span>
-            </span>
-          </label>
-          <label className="shrink-0">
-            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
-              Read up to
+              Queue matches above
             </span>
             <span className="flex items-center gap-2">
               <input
                 type="number"
                 min={0}
-                max={50}
-                value={maxRecords}
-                onChange={(e) => setMaxRecords(Math.max(0, Math.min(50, Number(e.target.value) || 0)))}
+                max={100}
+                step={5}
+                value={minMatchPercent}
+                onChange={(e) => setMinMatchPercent(Math.max(0, Math.min(100, Number(e.target.value) || 0)))}
                 className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
-                title="Read straight from each board's own job record — no tab is opened and nothing is clicked. This is also what resolves the employer's real application link."
+                title="Every job is scored out of 100 on how well it matches your search and resume, how recently it was POSTED (a repost doesn't count as new), and whether Run can drive it. Everything at or above this is queued; the rest are reported, never silently dropped. 0 = queue everything found."
               />
-              <span className="text-xs text-ink-dim">job records</span>
-            </span>
-          </label>
-        </div>
-
-        {/* Scrape wide, queue narrow. The sweep looks at several pages, ranks
-            everything it finds, and queues only the best — so a daily run doesn't
-            dump 60 half-relevant rows into the queue. */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-          <label className="shrink-0">
-            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
-              Queue the best
-            </span>
-            <span className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1}
-                max={60}
-                value={queueLimit}
-                disabled={queueAll}
-                onChange={(e) => setQueueLimit(Math.max(1, Math.min(60, Number(e.target.value) || 1)))}
-                className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber disabled:opacity-40"
-                title="Everything found is ranked on how well it matches your keywords and profile, how fresh it is, how few people have applied, and whether Run can actually drive it. Only this many are queued — the rest are reported, never silently dropped."
-              />
-              <span className="text-xs text-ink-dim">jobs</span>
-            </span>
-          </label>
-          <label
-            className={clsx(
-              "flex shrink-0 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2.5 transition-colors",
-              queueAll ? "border-amber/40 bg-amber/[0.04]" : "border-hairline bg-cockpit hover:border-ink-faint"
-            )}
-          >
-            <input type="checkbox" checked={queueAll} onChange={(e) => setQueueAll(e.target.checked)} className="accent-amber" />
-            <span className="text-sm text-ink">Queue all</span>
-          </label>
-          <label className="shrink-0">
-            <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-label text-ink-faint">
-              Scan up to
-            </span>
-            <span className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={maxPages}
-                onChange={(e) => setMaxPages(Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
-                className="w-20 rounded-lg border border-hairline bg-cockpit px-3 py-2.5 font-mono text-sm text-ink outline-none focus:border-amber"
-                title="Result pages per board, 25 jobs each. More pages = a bigger pool to rank from, and it's how tomorrow's sweep reaches past what you've already queued."
-              />
-              <span className="text-xs text-ink-dim">pages / board</span>
+              <span className="text-xs text-ink-dim">% match</span>
             </span>
           </label>
           <label
@@ -469,18 +418,27 @@ export function DiscoverPanel({ fieldOfStudy = "", homeCountry = "" }: { fieldOf
           ) : (
             <>
               <p className="text-ink-dim">
-                <span className="font-mono text-ink">{preview.keywords}</span>
+                {preview.queries.length > 1 ? (
+                  <>
+                    <span className="text-ink-faint">{preview.queries.length} searches: </span>
+                    {preview.queries.map((q, i) => (
+                      <span key={q.keywords}>
+                        {i > 0 && <span className="text-ink-faint"> · </span>}
+                        <span className="font-mono text-ink">{q.keywords}</span>
+                      </span>
+                    ))}
+                  </>
+                ) : (
+                  <span className="font-mono text-ink">{preview.queries[0]?.keywords}</span>
+                )}
                 {" · "}
                 <span className="font-mono text-ink">{locationLabel}</span>
-                {" · posted in the last "}
-                <span className="font-mono text-ink">{sinceDays}d</span>
                 {intern && <> · <span className="font-mono text-ink">internships only</span></>}
                 <span className="text-ink-faint"> — from {preview.derivedFrom}</span>
               </p>
               <p className="mt-1 text-ink-faint">
-                Scanning up to <span className="font-mono text-ink-dim">{maxPages * 25}</span> jobs per board, then queueing{" "}
-                {queueAll ? <span className="font-mono text-ink-dim">all</span> : <>the best <span className="font-mono text-ink-dim">{queueLimit}</span></>}{" "}
-                by how well they match, how fresh they are, and how few people have applied.
+                Queueing everything scoring <span className="font-mono text-ink-dim">{minMatchPercent}%</span> or better on
+                keyword match, how recently it was posted (a repost doesn&apos;t count as new), and whether Run can drive it.
                 {!location.trim() && homeCountry && <> Location comes from your profile.</>}
               </p>
               {term && (
@@ -565,7 +523,9 @@ function DiscoverResult({ phase }: { phase: Extract<Phase, { s: "done" }> }) {
 
       {phase.search && phase.search.keywords && (
         <p className="font-mono text-[11px] text-ink-faint">
-          searched “{phase.search.keywords}” · {phase.search.location} · last {phase.search.sinceDays}d
+          searched {(phase.search.queries && phase.search.queries.length ? phase.search.queries : [phase.search.keywords])
+            .map((q) => `“${q}”`).join(" · ")} · {phase.search.location} · last {phase.search.sinceDays}d
+          {phase.search.minMatchPercent ? ` · queued ≥${phase.search.minMatchPercent}% match` : ""}
           {phase.search.term ? ` · ${phase.search.term} (Simplify)` : ""}
         </p>
       )}

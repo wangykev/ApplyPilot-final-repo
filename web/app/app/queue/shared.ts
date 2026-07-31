@@ -15,6 +15,28 @@ export type QueueItem = {
   location?: string | null;
   posted_at?: string | null;
   job_description?: string | null;
+  /**
+   * Per-posting extras from discovery (migration 0012): pay, term dates, apply-by
+   * deadline, workplace, applicant count, the match score + its reasons, and the
+   * ORIGINAL posted date when the board was showing a repost. Null for pasted rows,
+   * and every key optional — absent means "the board didn't say".
+   */
+  details?: QueueItemDetails | null;
+};
+
+export type QueueItemDetails = {
+  pay?: string;
+  start_date?: string;
+  end_date?: string;
+  apply_by?: string;
+  workplace?: string;
+  employment_type?: string;
+  applicants?: number;
+  match_percent?: number;
+  match_reasons?: string[];
+  reposted?: boolean;
+  original_posted_at?: string;
+  apply_note?: string;
 };
 
 /** Pull http(s) URLs out of pasted text (one per line or whitespace-separated). */

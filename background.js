@@ -327,7 +327,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           // Scrape wide, queue narrow (2026-07-30): how many result pages to sweep,
           // and how many of the best-matching to actually return for queueing.
           ...(message.maxPages != null ? { maxPages: message.maxPages } : {}),
-          ...(message.queueLimit != null ? { queueLimit: message.queueLimit } : {}),
+          ...(message.minMatchPercent != null ? { minMatchPercent: message.minMatchPercent } : {}),
+          ...(Array.isArray(message.jobTitles) ? { jobTitles: message.jobTitles } : {}),
+          ...(Array.isArray(message.skills) ? { skills: message.skills } : {}),
+          ...(message.maxQueries != null ? { maxQueries: message.maxQueries } : {}),
           ...(message.skipEasyApply != null ? { skipEasyApply: message.skipEasyApply } : {}),
           background: message.background !== false, // sweep tabs open UNFOCUSED by default
         });
@@ -722,7 +725,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ...(message.maxJdOpens != null ? { maxJdOpens: message.maxJdOpens } : {}),
           ...(message.maxRecords != null ? { maxRecords: message.maxRecords } : {}),
           ...(message.maxPages != null ? { maxPages: message.maxPages } : {}),
-          ...(message.queueLimit != null ? { queueLimit: message.queueLimit } : {}),
+          ...(message.minMatchPercent != null ? { minMatchPercent: message.minMatchPercent } : {}),
+          ...(Array.isArray(message.jobTitles) ? { jobTitles: message.jobTitles } : {}),
+          ...(Array.isArray(message.skills) ? { skills: message.skills } : {}),
+          ...(message.maxQueries != null ? { maxQueries: message.maxQueries } : {}),
           ...(message.skipEasyApply != null ? { skipEasyApply: message.skipEasyApply } : {}),
           // The popup is the DRY-RUN path: no website ⇒ no knownKeys ⇒ nothing is
           // filtered as already-applied, and nothing is queued.

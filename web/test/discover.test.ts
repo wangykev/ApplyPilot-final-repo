@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import {
   discoveryJobKey, toQueueRow, describeSweep, DISCOVER_DEFAULTS,
-  buildDiscoverQuery, discoverTermLabel, DISCOVER_DEFAULT_LOCATION, DISCOVER_CYCLES, isBoardUrl,
+  buildDiscoverQuery, buildDiscoverQueries, discoverKeywordTokens,
+  discoverTermLabel, DISCOVER_DEFAULT_LOCATION, DISCOVER_CYCLES, isBoardUrl,
 } from "../lib/discover";
 import { canonicalJobUrl } from "../lib/job-key";
 
@@ -162,9 +163,58 @@ test("DISCOVER_DEFAULTS mirror the extension's caps", () => {
     );
   }
   // And the caps the panel relies on must actually exist on the extension side.
-  for (const k of ["sinceDays", "maxPerSource", "maxTotal", "maxJdOpens", "maxPages", "queueLimit", "skipEasyApply"]) {
+  for (const k of ["sinceDays", "maxPerSource", "maxTotal", "maxRecords", "maxJdOpens", "maxPages", "minMatchPercent", "maxQueries", "skipEasyApply"]) {
     assert.ok(k in extDiscover.DISCOVER_DEFAULTS, `discover.js is missing DISCOVER_DEFAULTS.${k}`);
   }
+  // `queueLimit` was REPLACED by a % threshold (operator 2026-07-30) — neither side
+  // may keep a stale top-N knob, or the UI and the sweep would disagree on how many
+  // jobs get queued.
+  assert.ok(!("queueLimit" in extDiscover.DISCOVER_DEFAULTS), "queueLimit was replaced by minMatchPercent");
+  assert.ok(!("queueLimit" in DISCOVER_DEFAULTS));
+});
+
+// ── buildDiscoverQueries — LOCKSTEP, and the reason it matters ────────────────
+// The panel PREVIEWS the searches that will run using its own copy. A drift means
+// the preview is a lie about what the sweep does — the exact failure the preview was
+// added to prevent.
+
+const QUERIES_CASES = [
+  { query: "", field: "Electrical and Computer Engineering", intern: true,
+    jobTitles: ["Software Engineering Intern", "Senior Embedded Firmware Engineer", "Software Engineering Intern"],
+    skills: ["C++", "Python", "FPGA", "PCB Design"] },
+  { query: "robotics intern", field: "X", intern: true, jobTitles: ["Y"], skills: ["Z"] },
+  { query: "", field: "Computer Science", intern: true, jobTitles: [], skills: ["Rust", "Embedded"] },
+  { query: "", field: "", intern: true, jobTitles: [], skills: [] },
+  { query: "", field: "", intern: false, jobTitles: [], skills: [] },
+  { query: "  spaced  out  ", field: "", intern: true, jobTitles: [], skills: [] },
+  { query: "", field: "Physics", intern: false, jobTitles: ["Lab Assistant"], skills: [] },
+];
+
+test("buildDiscoverQueries is LOCKSTEP with the extension's copy", () => {
+  for (const c of QUERIES_CASES) {
+    assert.deepEqual(
+      buildDiscoverQueries(c),
+      extDiscover.buildDiscoverQueries(c),
+      `disagreement for ${JSON.stringify(c)}`
+    );
+  }
+});
+
+test("discoverKeywordTokens is LOCKSTEP (it is what dedupes derived searches)", () => {
+  for (const s of ["electrical and computer engineering intern", "C++ Python", "intern", "", "a of the", "FPGA/PCB design"]) {
+    assert.deepEqual(discoverKeywordTokens(s), extDiscover.discoverKeywordTokens(s), `disagreement for "${s}"`);
+  }
+});
+
+test("buildDiscoverQueries: a blank box searches the RESUME, not just the major", () => {
+  const r = buildDiscoverQueries({
+    query: "", field: "Electrical and Computer Engineering", intern: true,
+    jobTitles: ["Software Engineering Intern"], skills: ["C++", "Python"],
+  });
+  assert.ok(r.queries.length > 1, "several searches, not one");
+  // A role actually held leads — it's the strongest evidence of what you want next.
+  assert.match(r.queries[0].keywords, /software engineering/i);
+  assert.ok(r.queries.some((q) => /electrical and computer engineering/i.test(q.keywords)), "the major is still covered");
 });
 
 // ── The board search contracts — LOCKSTEP-adjacent regression guards ─────────

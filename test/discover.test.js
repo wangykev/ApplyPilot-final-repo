@@ -517,6 +517,27 @@ test("parseLinkedInGeoId: reads the token back off a LinkedIn url", () => {
   assert.equal(discoverMod.parseLinkedInGeoId(""), "");
 });
 
+test("locationVariants: a profile country that no board matches still resolves", () => {
+  // The panel seeds the location from the profile's country, whose canonical value is
+  // "United States of America" — and NEITHER board's typeahead matches that string
+  // (both want "United States"). Live, that cost the location filter entirely on both
+  // boards, so the sweep silently searched whatever location the session defaulted to.
+  const v = discoverMod.locationVariants("United States of America");
+  assert.equal(v[0], "United States of America", "the exact string is always tried first");
+  assert.ok(v.includes("United States"), "…then the form the boards actually know: " + JSON.stringify(v));
+
+  // A full "city, state, country" narrows down, not up.
+  assert.deepEqual(discoverMod.locationVariants("Austin, Texas, United States"),
+    ["Austin, Texas, United States", "Austin, Texas", "Austin"]);
+
+  // Bounded and never empty-looping.
+  assert.deepEqual(discoverMod.locationVariants(""), []);
+  assert.deepEqual(discoverMod.locationVariants("   "), []);
+  assert.ok(discoverMod.locationVariants("Austin, Texas, United States, Earth, Milky Way").length <= 3);
+  // A single unambiguous place yields just itself — no wasted resolve attempts.
+  assert.deepEqual(discoverMod.locationVariants("Seattle"), ["Seattle"]);
+});
+
 test("geoCacheKey: per-board, case/space insensitive", () => {
   assert.equal(discoverMod.geoCacheKey("linkedin", "Austin,  Texas"), discoverMod.geoCacheKey("LinkedIn", "austin, texas"));
   // The two boards' tokens are different things and must never share a slot.
@@ -802,58 +823,146 @@ test("crossSourceKey: punctuation and casing don't defeat the match", () => {
 
 // ── Best-match ranking ──────────────────────────────────────────────────────
 
-test("scoreDiscovery: a title match beats a body mention", () => {
-  const opts = { keywords: "embedded software", nowMs: NOW, intern: false };
-  const inTitle = discoverMod.scoreDiscovery({ title: "Embedded Software Intern", description: "" }, opts);
-  const inBody = discoverMod.scoreDiscovery({ title: "Analyst", description: "some embedded software here" }, opts);
-  assert.ok(inTitle.score > inBody.score, `${inTitle.score} !> ${inBody.score}`);
-  assert.ok(inTitle.reasons.join(" ").includes("title matches"));
+const PCT = (job, over) => discoverMod.matchPercent(job, { keywords: "embedded software", nowMs: NOW, sinceDays: 30, ...over }).percent;
+
+test("matchPercent: is a real 0–100 scale, so a % threshold means something", () => {
+  // The operator queues by "match ≥ N%", so the number must be bounded and
+  // comparable — an unbounded score can't be compared against 60.
+  const perfect = PCT({ title: "Embedded Software Intern", postedAt: NOW, applyResolved: true, url: "https://x.wd1.myworkdayjobs.com/a/job/b_R1/apply" });
+  const awful = PCT({ title: "Retail Cashier", description: "", postedAt: NOW - 29 * DAY, applyKind: "easy", url: "https://www.linkedin.com/jobs/view/1/" });
+  assert.ok(perfect > 85 && perfect <= 100, "a strong match should be high: " + perfect);
+  assert.ok(awful < 35, "an unrelated, stale, undrivable job should be low: " + awful);
+  for (const j of [{}, { title: "x" }, { postedAt: null }]) {
+    const p = PCT(j);
+    assert.ok(p >= 0 && p <= 100, "always in range: " + p);
+  }
 });
 
-test("scoreDiscovery: low competition outranks a crowded posting", () => {
-  const opts = { keywords: "intern", nowMs: NOW };
-  const quiet = discoverMod.scoreDiscovery({ title: "SWE Intern", applicants: 6, postedAt: NOW }, opts);
-  const mobbed = discoverMod.scoreDiscovery({ title: "SWE Intern", applicants: 43106, postedAt: NOW }, opts);
-  assert.ok(quiet.score > mobbed.score, `${quiet.score} !> ${mobbed.score}`);
-  assert.ok(mobbed.reasons.join(" ").includes("crowded"));
+test("matchPercent: a title match beats a body mention", () => {
+  assert.ok(
+    PCT({ title: "Embedded Software Intern", description: "" }) >
+    PCT({ title: "Analyst", description: "some embedded software here" })
+  );
+  const r = discoverMod.matchPercent({ title: "Embedded Software Intern" }, { keywords: "embedded software", nowMs: NOW });
+  assert.ok(r.reasons.join(" ").includes("title matches"));
 });
 
-test("scoreDiscovery: a Run-drivable employer link beats a board-only application", () => {
-  const opts = { keywords: "intern", nowMs: NOW };
-  const drivable = discoverMod.scoreDiscovery(
-    { title: "Intern", url: "https://x.wd1.myworkdayjobs.com/a/job/b_R1/apply", applyResolved: true, applyKind: "external" }, opts);
-  const boardOnly = discoverMod.scoreDiscovery(
-    { title: "Intern", url: "https://www.linkedin.com/jobs/view/1/", applyKind: "easy" }, opts);
-  assert.ok(drivable.score > boardOnly.score, `${drivable.score} !> ${boardOnly.score}`);
+test("matchPercent: APPLICANT COUNT does not move the score", () => {
+  // Operator 2026-07-30: "I don't need the how many people applied sort." It is still
+  // read and displayed, but it must not affect ranking — freshness carries that weight.
+  const base = { title: "Embedded Software Intern", postedAt: NOW };
+  assert.equal(PCT({ ...base, applicants: 3 }), PCT({ ...base, applicants: 99999 }));
+  assert.equal(PCT({ ...base, earlyApplicant: true }), PCT({ ...base, earlyApplicant: false }));
 });
 
-test("scoreDiscovery: fresher wins, and a promoted listing is penalised", () => {
-  const opts = { keywords: "intern", nowMs: NOW };
-  const fresh = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW - 3600e3 }, opts);
-  const old = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW - 20 * DAY }, opts);
-  assert.ok(fresh.score > old.score);
-  const plain = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW }, opts);
-  const promoted = discoverMod.scoreDiscovery({ title: "Intern", postedAt: NOW, promoted: true }, opts);
-  assert.ok(promoted.score < plain.score, "a paid placement is not a relevance signal");
+test("matchPercent: recency dominates — it is the operator's main criterion", () => {
+  const base = { title: "Embedded Software Intern" };
+  const hourOld = PCT({ ...base, postedAt: NOW - 3600e3 });
+  const weekOld = PCT({ ...base, postedAt: NOW - 7 * DAY });
+  const monthOld = PCT({ ...base, postedAt: NOW - 29 * DAY });
+  assert.ok(hourOld > weekOld && weekOld > monthOld, `${hourOld} > ${weekOld} > ${monthOld}`);
+  // An UNKNOWN date scores mid-range, not zero: every source is time-bounded
+  // upstream, so unknown means "unparsed", not "ancient".
+  const unknown = PCT({ ...base, postedAt: null });
+  assert.ok(unknown > monthOld && unknown < hourOld, "unknown sits between: " + unknown);
 });
 
-test("pickBestJobs: keeps the best N and RETURNS the rest (no silent narrowing)", () => {
+test("matchPercent: a REPOST is scored on the ORIGINAL date, not the bump", () => {
+  // Measured live: 2 of 3 sampled LinkedIn postings were reposts, one 63 DAYS newer
+  // than its original. Scoring the bump would re-float a two-month-old posting to the
+  // top of every daily sweep.
+  const base = { title: "Embedded Software Intern" };
+  const genuinelyNew = PCT({ ...base, postedAt: NOW - 3600e3 });
+  const bumpedOld = PCT({ ...base, postedAt: NOW - 3600e3, originalPostedAt: NOW - 63 * DAY, reposted: true });
+  assert.ok(bumpedOld < genuinelyNew, `repost ${bumpedOld} must score below new ${genuinelyNew}`);
+  const r = discoverMod.matchPercent({ ...base, postedAt: NOW - 3600e3, originalPostedAt: NOW - 63 * DAY, reposted: true }, { keywords: "embedded software", nowMs: NOW, sinceDays: 30 });
+  assert.ok(r.reasons.join(" ").toLowerCase().includes("repost"), "and it says so: " + r.reasons.join("; "));
+});
+
+test("postedForRanking: prefers the ORIGINAL of the two dates", () => {
+  assert.equal(discoverMod.postedForRanking({ postedAt: 900, originalPostedAt: 100 }), 100);
+  // Even if a board reported them the other way round, the OLDER one is the original.
+  assert.equal(discoverMod.postedForRanking({ postedAt: 100, originalPostedAt: 900 }), 100);
+  assert.equal(discoverMod.postedForRanking({ postedAt: 500 }), 500);
+  assert.equal(discoverMod.postedForRanking({ originalPostedAt: 500 }), 500);
+  assert.equal(discoverMod.postedForRanking({}), null);
+});
+
+test("matchPercent: a Run-drivable employer link beats a board-only application", () => {
+  assert.ok(
+    PCT({ title: "Embedded Software Intern", url: "https://x.wd1.myworkdayjobs.com/a/job/b_R1/apply", applyResolved: true, applyKind: "external" }) >
+    PCT({ title: "Embedded Software Intern", url: "https://www.linkedin.com/jobs/view/1/", applyKind: "easy" })
+  );
+});
+
+test("matchPercent: a promoted listing is penalised (a paid placement isn't relevance)", () => {
+  const base = { title: "Embedded Software Intern", postedAt: NOW };
+  assert.ok(PCT({ ...base, promoted: true }) < PCT(base));
+});
+
+test("pickByThreshold: queues everything at/above the % and RETURNS the rest", () => {
   const jobs = [
-    { title: "Unrelated Manager", postedAt: NOW - 10 * DAY },
-    { title: "Embedded Software Intern", postedAt: NOW, applicants: 3 },
+    { title: "Unrelated Retail Manager", postedAt: NOW - 25 * DAY },
+    { title: "Embedded Software Intern", postedAt: NOW },
     { title: "Software Intern", postedAt: NOW - DAY },
   ];
-  const opts = { keywords: "embedded software", nowMs: NOW };
-  const { kept, dropped } = discoverMod.pickBestJobs(jobs, 1, opts);
-  assert.equal(kept.length, 1);
-  assert.equal(kept[0].title, "Embedded Software Intern");
+  const opts = { keywords: "embedded software", nowMs: NOW, sinceDays: 30 };
+  const { kept, dropped } = discoverMod.pickByThreshold(jobs, 70, opts);
+  assert.ok(kept.length >= 1 && kept[0].title === "Embedded Software Intern");
+  assert.ok(kept.every((j) => j.matchPercent >= 70), "everything kept clears the bar");
+  assert.ok(dropped.every((j) => j.matchPercent < 70), "everything dropped is below it");
   // The caller MUST be able to report what it left behind — that's what stops a
   // narrowing from looking like "the sweep found nothing".
-  assert.equal(dropped.length, 2);
-  assert.ok(kept[0].score > 0 && Array.isArray(kept[0].scoreReasons) && kept[0].scoreReasons.length);
-  // 0 / blank / oversized ⇒ keep everything.
-  assert.equal(discoverMod.pickBestJobs(jobs, 0, opts).kept.length, 3);
-  assert.equal(discoverMod.pickBestJobs(jobs, 99, opts).dropped.length, 0);
+  assert.equal(kept.length + dropped.length, 3);
+  assert.ok(kept[0].matchPercent > 0 && Array.isArray(kept[0].scoreReasons) && kept[0].scoreReasons.length);
+  // 0 / blank ⇒ queue everything found.
+  assert.equal(discoverMod.pickByThreshold(jobs, 0, opts).kept.length, 3);
+  assert.equal(discoverMod.pickByThreshold(jobs, 101, opts).kept.length, 0);
+  // rankByMatch is the ORDER without a threshold — used before spending the record budget.
+  assert.equal(discoverMod.rankByMatch(jobs, opts)[0].title, "Embedded Software Intern");
+});
+
+// ── Several searches from the RESUME, not one from the major ─────────────────
+
+test("buildDiscoverQueries: derives SEVERAL searches from the resume", () => {
+  const r = discoverMod.buildDiscoverQueries({
+    query: "", field: "Electrical and Computer Engineering", intern: true,
+    jobTitles: ["Software Engineering Intern", "Senior Embedded Firmware Engineer", "Software Engineering Intern"],
+    skills: ["C++", "Python", "FPGA", "PCB Design"],
+  });
+  // Titles LEAD (a role you've held is the strongest evidence of what you want next),
+  // and the level words are stripped so a title generalises to its field.
+  assert.match(r.queries[0].keywords, /^Software Engineering intern$/i);
+  assert.match(r.queries[1].keywords, /Embedded Firmware Engineer intern/i);
+  assert.ok(r.queries.length <= 3, "bounded by maxQueries");
+  // The duplicate title must not burn a second slot.
+  const keys = r.queries.map((q) => q.keywords.toLowerCase());
+  assert.equal(new Set(keys).size, keys.length, "no duplicate searches");
+  assert.match(r.derivedFrom, /resume/);
+});
+
+test("buildDiscoverQueries: an explicit query short-circuits everything", () => {
+  const r = discoverMod.buildDiscoverQueries({ query: "robotics intern", field: "X", jobTitles: ["Y"], skills: ["Z"], intern: true });
+  assert.deepEqual(r.queries, [{ keywords: "robotics intern", from: "your keywords" }]);
+  // …and the role word is not doubled.
+  assert.equal(discoverMod.buildDiscoverQueries({ query: "data intern", intern: true }).queries[0].keywords, "data intern");
+});
+
+test("buildDiscoverQueries: an empty resume still yields a real search, never a blank one", () => {
+  // A blank search is a board's RECOMMENDED FEED, not a search — the bug this whole
+  // area exists to prevent. NOTE "intern" is a stopword, so the fallback cannot go
+  // through the token-keyed dedupe or it silently produces zero queries.
+  assert.deepEqual(discoverMod.buildDiscoverQueries({ intern: true }).queries,
+    [{ keywords: "intern", from: "the internship default" }]);
+  // Nothing at all to go on and internships off ⇒ no query, and the caller skips the
+  // board with a note rather than searching for nothing.
+  assert.deepEqual(discoverMod.buildDiscoverQueries({ intern: false }).queries, []);
+});
+
+test("buildDiscoverQueries: falls back through field then skills when titles are absent", () => {
+  const noTitles = discoverMod.buildDiscoverQueries({ field: "Computer Science", skills: ["Rust", "Embedded"], intern: true, maxQueries: 3 });
+  assert.match(noTitles.queries[0].keywords, /Computer Science intern/i);
+  assert.match(noTitles.queries[1].keywords, /Rust Embedded intern/i, "skills are PAIRED — one alone is too broad");
 });
 
 test("DISCOVER_DEFAULTS: every expensive knob is bounded by default", () => {
