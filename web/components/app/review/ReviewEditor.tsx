@@ -424,7 +424,11 @@ export function ReviewEditor({
     [live]
   );
   const approval = useMemo(() => approvalEnvelope(entries), [entries]);
-  const blocked = useMemo(() => live.filter(needsAnswer), [live]);
+  // Flag AND the placeholder still present — the flag alone survives the operator REPLACING the
+  // text (provenance is permanent), so a flag-only filter kept the "Submit blocked" banner up
+  // forever after the answer was supplied (live 2026-07-31). LOCKSTEP with approvalEnvelope's
+  // placeholdersLeft — the banner must never disagree with the gate it narrates.
+  const blocked = useMemo(() => live.filter((e) => needsAnswer(e) && hasPlaceholder(e.current_value)), [live]);
 
   // NEW items first (questions a submit run sent back), then the pre-existing loudness ordering —
   // see reviewPriority. Stable, so form order still decides within a tier.

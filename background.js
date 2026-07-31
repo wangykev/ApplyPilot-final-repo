@@ -3652,15 +3652,21 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // Approved values by fieldName (the bundle is the SOURCE OF TRUTH — never the profile).
     // field_id is "<page>::formField-<fieldName>"; is_deleted rows and empty values are
     // "leave blank" (a cleared optional), a checkbox carries "true"/"false".
+    //
+    // DURABLE KEY (2026-07-31, live): Ashby's EEOC radio names carry a PER-SESSION uuid
+    // prefix ("c4787042-…__systemfield_eeoc_gender" one load, "aa058f67-…" the next), so a
+    // full-name match can never survive the fresh form a submit run opens. The
+    // __systemfield_* suffix is the stable identity — strip the uuid prefix on BOTH sides.
+    const durable = (n) => String(n == null ? "" : n).replace(/^[0-9a-f-]{16,}(?=__systemfield_)/i, "");
     const approved = new Map();
     for (const e of bundle.entries || []) {
       if (!e || e.is_deleted) continue;
       const m = /::formField-(.+)$/.exec(String(e.field_id || ""));
       const name = m ? m[1] : String(e.field_id || "");
-      approved.set(name, e);
+      approved.set(durable(name), e);
     }
     const valueFor = (f) => {
-      const e = approved.get(f.fieldName);
+      const e = approved.get(durable(f.fieldName));
       if (!e) return undefined;                       // never in the bundle → leave alone
       if (f.widgetType === "file_upload") return "resume"; // presence = re-attach
       const v = e.current_value;
@@ -3678,7 +3684,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // STRICT verify: every approved non-blank value must be ON the form now.
     const failures = [];
     for (const r of out.results) {
-      const e = approved.get(r.fieldName);
+      const e = approved.get(durable(r.fieldName));
       if (!e) continue;
       const want = e.current_value;
       if (want == null || String(want).trim() === "") continue;
@@ -3686,7 +3692,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       failures.push(`${r.fieldName} ("${(e.question_label || "").slice(0, 60)}"): ${r.status} — ${r.detail || "no detail"}`);
     }
     // Approved entries the live form no longer shows (form changed since the fill).
-    const liveNames = new Set(out.results.map((r) => r.fieldName));
+    const liveNames = new Set(out.results.map((r) => durable(r.fieldName)));
     for (const [name, e] of approved) {
       if (liveNames.has(name)) continue;
       if (e.current_value == null || String(e.current_value).trim() === "") continue;

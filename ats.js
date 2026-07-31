@@ -660,10 +660,15 @@ function atsInjSubmitState(ats) {
   if (ats === "lever") btn = document.querySelector("#btn-submit");
   if (!btn) btn = [...document.querySelectorAll('button[type="submit"], button')].find((b) => /submit application|submit$/i.test((b.textContent || "").trim()) && vis(b));
   const r = btn ? btn.getBoundingClientRect() : null;
-  // a VISIBLE captcha challenge (invisible ones keep 0-size / display:none iframes)
+  // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
+  // FULL-VIEWPORT iframe (1547×720 live) with `visibility:hidden` — a size-only test calls
+  // it a challenge and falsely halts the submit run (live 2026-07-31). A real checkbox is
+  // ~300×74 and a challenge popup ~400×580 — both COMPUTED-visible and under ~700px wide.
   const challenge = [...document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="recaptcha"]')].some((f) => {
+    const cs = getComputedStyle(f);
+    if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) < 0.1) return false;
     const fr = f.getBoundingClientRect();
-    return fr.width > 60 && fr.height > 60 && vis(f);
+    return fr.width > 60 && fr.height > 60 && fr.width < 700;
   });
   const bodyText = (document.body.innerText || "").slice(0, 4000);
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText) || /\/thanks(\?|$)/.test(location.href);
@@ -889,7 +894,11 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
       if (!live || !live.ok) { rec.flag = rec.flag || "audit-unverifiable"; continue; }
       const liveV = live.value == null ? "" : String(live.value);
       const recV = rec.after == null ? "" : String(rec.after);
-      if (f.widgetType === "checkbox" ? String(!!live.value) !== String(rec.after === true || rec.after === "true") : !atsFd.textValuesMatch(liveV, recV)) {
+      // a chip DISPLAY that is a substring of the recorded option text is a match (the dial
+      // select renders "+1" for the committed "United States +1" — same accept rule as the
+      // fill-time verify).
+      const chipSubstring = liveV && recV.toLowerCase().includes(liveV.toLowerCase());
+      if (f.widgetType === "checkbox" ? String(!!live.value) !== String(rec.after === true || rec.after === "true") : !(atsFd.textValuesMatch(liveV, recV) || chipSubstring)) {
         rec.status = "needs_review"; rec.flag = "audit-mismatch";
         rec.detail = (rec.detail ? rec.detail + "; " : "") + "audit: page now holds " + JSON.stringify(liveV);
         rec.after = liveV || null;
@@ -1019,10 +1028,19 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const wantNorm = atsLib.normalize(commitText);
     // the dial composite renders "+1" (flag+code), not the option text — value-based accept:
     // any non-empty committed value whose text is IN the chosen option counts.
-    const okv = backNorm === wantNorm || (wt === "dial" && backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm);
+    // chip-substring accept for ANY select, not just wt==="dial": the REPLAY path runs as a
+    // plain select (no route → no dial override) and must accept the "+1" chip for the
+    // committed "United States +1" too. A non-empty display CONTAINED in the option we
+    // clicked is still strong evidence of the right commit (a wrong option isn't a superstring).
+    const okv = backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm);
     if (c && c.ok && okv) {
       rec.status = hit.tier === "exact-normalized" || hit.tier === "label-exact" ? "filled" : "filled_review";
       rec.matchTier = hit.tier; rec.verified = true;
+      // Record the COMMITTED OPTION TEXT, not the chip display: the dial chip renders "+1"
+      // while the option we clicked is "United States +1" — a bundle holding "+1" can never
+      // replay (live 2026-07-31, the GH rehearsal's one failure). The option text is the
+      // truthful "what was chosen"; the audit accepts the chip as a substring of it.
+      rec.after = commitText;
       if (rec.status === "filled_review" && !rec.flag) rec.flag = "non-exact-match";
     } else {
       rec.status = "needs_review"; rec.verified = false;
