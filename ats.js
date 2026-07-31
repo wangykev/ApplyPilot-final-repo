@@ -27,7 +27,7 @@ const atsLib = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, normalizeLabel: normalizeLabel,
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
-      AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK };
+      AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
@@ -107,12 +107,15 @@ const ATS_STATIC_MAPS = {
     "candidate-location": { kind: "location" },
     "resume": { kind: "resume" },
     "cover_letter": { kind: "skip", detail: "cover letter — operator-supplied (not modeled)" },
-    // EEOC block — DETERMINISTIC from the operator's STATED self-identification (never inferred).
-    "gender": { path: "self_identification.gender" },
-    "hispanic_ethnicity": { path: "self_identification.hispanic_or_latino" },
-    "race": { path: "self_identification.race_ethnicity" },
-    "veteran_status": { path: "self_identification.veteran_status" },
-    "disability_status": { path: "self_identification.disability_status" },
+    // EEOC block — DETERMINISTIC from the operator's STATED self-identification (never
+    // inferred). containment:true — each ATS words the long-form options its own way
+    // ("No, I do not have a disability" ⊂ "… and have not had one in the past"); a unique
+    // prefix hit commits at the CONTAINMENT tier, which grades filled_review (flagged).
+    "gender": { path: "self_identification.gender", containment: true },
+    "hispanic_ethnicity": { path: "self_identification.hispanic_or_latino", containment: true },
+    "race": { path: "self_identification.race_ethnicity", containment: true },
+    "veteran_status": { path: "self_identification.veteran_status", containment: true },
+    "disability_status": { path: "self_identification.disability_status", containment: true },
   },
   lever: {
     "name": { compose: "full_name" },
@@ -218,11 +221,15 @@ function atsRouteLabel(label, f, profile, defaults) {
 
   // EEO / demographics — deterministic ONLY from stated values (the Workday rule verbatim:
   // a stated demographic fills deterministically; AI never overrides; optional+unstated → blank).
-  if (/hispanic|latino/i.test(L)) { if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo" }; return { eeoUnstated: true }; }
-  if (/race|ethnicit/i.test(L)) { if (has(si.race_ethnicity)) return { candidates: [si.race_ethnicity], source: "eeo" }; return { eeoUnstated: true }; }
-  if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo" }; return { eeoUnstated: true }; }
-  if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo" }; return { eeoUnstated: true }; }
-  if (/gender|sex\b/i.test(L)) { if (has(si.gender)) return { candidates: [si.gender], source: "eeo" }; return { eeoUnstated: true }; }
+  // containment:true — a STATED long-form demographic against each ATS's own phrasing
+  // ("No, I do not have a disability" ⊂ "…, or have had one in the past") commits at the
+  // CONTAINMENT tier, which the driver grades filled_review (flagged, human verifies) —
+  // never silent, and the ambiguity guard still refuses a 2+-option hit.
+  if (/hispanic|latino/i.test(L)) { if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true }; return { eeoUnstated: true }; }
+  if (/race|ethnicit/i.test(L)) { if (has(si.race_ethnicity)) return { candidates: [si.race_ethnicity], source: "eeo", containment: true }; return { eeoUnstated: true }; }
+  if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo", containment: true }; return { eeoUnstated: true }; }
+  if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo", containment: true }; return { eeoUnstated: true }; }
+  if (/gender|sex\b/i.test(L)) { if (has(si.gender)) return { candidates: [si.gender], source: "eeo", containment: true }; return { eeoUnstated: true }; }
   if (/pronoun/i.test(L)) return { skip: true, detail: "pronouns — not modeled in the profile (left blank)" };
 
   // Age gate (legally loaded — flag even though deterministic when stated).
@@ -558,6 +565,37 @@ function atsInjClickYesNo(inputSel, want) {
   return { ok: true };
 }
 
+// Lever's location typeahead (live 2026-07-31): free text is CLEARED on blur (the widget
+// requires a suggestion pick), and the suggestion RENDER never happens in a hidden tab
+// (0 rows through 20 polls with every unfreeze lever applied). But the widget's own
+// backend is a plain same-origin GET — `/searchLocations?text=…` → [{name, id}] — and a
+// suggestion CLICK just writes the visible input + the hidden `selectedLocation` JSON.
+// So: fetch the rows ourselves (fetch is NOT throttled hidden — the discover lesson) and
+// write exactly the state a click writes. Match policy stays SW-side; these fns only do IO.
+async function atsInjLeverLocLookup(query) {
+  try {
+    const res = await fetch("/searchLocations?text=" + encodeURIComponent(String(query)), { credentials: "same-origin" });
+    if (!res.ok) return { ok: false, error: "http-" + res.status };
+    const rows = await res.json();
+    return { ok: true, rows: (Array.isArray(rows) ? rows : []).filter((r) => r && r.name && r.id).slice(0, 20) };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function atsInjLeverLocCommit(name, id) {
+  const el = document.querySelector("#location-input");
+  const hid = document.querySelector('input[name="selectedLocation"]');
+  if (!el || !hid) return { ok: false, error: "location inputs not found" };
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  setter.call(el, name);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  hid.value = JSON.stringify({ name: name, id: id });
+  hid.dispatchEvent(new Event("change", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  el.blur();
+  el.dispatchEvent(new Event("focusout", { bubbles: true }));
+  return { ok: true, v: el.value, selected: !!hid.value };
+}
+
 // Attach the resume: rebuild the File page-side (strings only across the boundary — the
 // attachResume lesson), set input.files via DataTransfer, dispatch change.
 function atsInjAttachFile(inputSel, base64, filename, mime) {
@@ -634,6 +672,8 @@ async function atsAiChooseOption(act, f, options, profile, jobContext) {
   const system = "You fill job application forms for a candidate. Choose EXACTLY ONE option from the provided list that best answers the question for this candidate. Reply ONLY with JSON: {\"choice\":\"<verbatim option>\",\"justification\":\"<short; name the profile fact or say reasoning-from-absence>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile field path or empty>\",\"suggested_category\":\"<short category>\"}";
   const user = "QUESTION: " + (f.label || f.fieldName) + "\nOPTIONS:\n" + optTexts.map((t) => "- " + t).join("\n") +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
+    (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
+    (jobContext && jobContext.description ? "\nJOB DESCRIPTION (for context):\n" + String(jobContext.description).slice(0, 4000) : "") +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
   const res = await act.llm({ system, user, maxTokens: 400 });
   if (!res || !res.ok) return { ok: false, error: (res && res.error) || "llm-failed" };
@@ -648,6 +688,7 @@ async function atsAiWriteText(act, f, profile, jobContext) {
   const user = "QUESTION: " + (f.label || f.fieldName) +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
+    (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground your answer in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES: " + style : "") +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
   const res = await act.llm({ system, user, maxTokens: 700 });
@@ -679,7 +720,7 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
       const get = (p) => p.split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
       const nonEmpty = (v) => v !== undefined && v !== null && !(typeof v === "string" && !v.trim()) && !(Array.isArray(v) && !v.length);
       const raw = nonEmpty(get(map.path)) ? get(map.path) : (map.altPath && nonEmpty(get(map.altPath)) ? get(map.altPath) : undefined);
-      if (raw !== undefined) return { raw, path: map.path, kind: map.kind || null, source: "map" };
+      if (raw !== undefined) return { raw, path: map.path, kind: map.kind || null, source: "map", containment: !!map.containment };
       // empty mapped value → fall through (same reason as above)
     }
   }
@@ -746,7 +787,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
           : { status: f.isRequired ? "needs_review" : "skipped", detail: "resume attach failed: " + (att.error || "unknown"), flag: "resume-attach-failed" });
         results.push(rec); continue;
       }
-      if (route && route.kind === "skip") { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(rec); continue; }
+      if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(rec); continue; }
       if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(rec); continue; }
       if (route && route.eeoUnstated) { rec.status = "skipped"; rec.detail = "demographic not stated in profile — left blank (never inferred)"; rec.flag = "eeo_declined"; results.push(rec); continue; }
 
@@ -773,7 +814,8 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
       // only the mapping knows its options carry a "+<digits>" tail that must strip for
       // matching — the country-skip bug, live 2026-07-31).
       const effF = route && route.kind === "dial" ? Object.assign({}, f, { widgetType: "dial" }) : f;
-      const produced = await atsActuateField(act, ats, effF, ref, rec, candidates, textValue, jc, profile);
+      const mopts = { containment: !!(route && route.containment) }; // stated-value routes only (EEO) — commits at the flagged filled_review tier
+      const produced = await atsActuateField(act, ats, effF, ref, rec, candidates, textValue, jc, profile, mopts);
       if (!produced) {
         // Deterministic tiers produced nothing. AI fallback — REQUIRED fields only (the
         // operator rule: an optional blank costs nothing; a required blank blocks submit).
@@ -823,11 +865,44 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
 // Actuate one field with the resolved candidates. Returns true when it produced an outcome
 // (filled / filled_review / needs_review with a real attempt), false when nothing was
 // attempted (→ AI/blank fallback). Every commit is read-back-verified.
-async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, jobContext, profile) {
+async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, jobContext, profile, mopts) {
   const wt = f.widgetType;
+  const allowContainment = !!(mopts && mopts.containment); // default OFF — the "containment is a guess" rule
+
+  // Lever location: type → the widget's own suggestions → click a row → verify the
+  // committed value + the hidden selectedLocation (free text is CLEARED on blur — a
+  // bare write can never stick; live-verified 2026-07-31).
+  if (wt === "location" && ats === "lever") {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    const query = String(candidates[0]);
+    const lk = await act.eval(atsInjLeverLocLookup, query);
+    const rows = (lk && lk.rows) || [];
+    if (!rows.length) { rec.status = f.isRequired ? "needs_review" : "skipped"; rec.detail = "location lookup returned nothing" + (lk && lk.error ? " (" + lk.error + ")" : "") + " for " + JSON.stringify(query); return true; }
+    // Prefer city + state (abbrev via REGION_ABBREV: "Florida" → ", FL,"), else the first
+    // city row at the flagged containment tier — never an unrelated place silently.
+    const city = query.split(",")[0].trim().toLowerCase();
+    const state = (query.split(",")[1] || "").trim().toLowerCase();
+    const abbrev = (atsLib.REGION_ABBREV && atsLib.REGION_ABBREV[state]) || null;
+    const cityRows = rows.filter((r) => r.name.toLowerCase().startsWith(city));
+    let pick = cityRows.find((r) => (abbrev && new RegExp(",\\s*" + abbrev + "\\b", "i").test(r.name)) || (state && r.name.toLowerCase().includes(state)));
+    let tier = pick ? "exact-normalized" : null;
+    if (!pick && cityRows.length) { pick = cityRows[0]; tier = "containment"; }
+    if (!pick) { rec.status = f.isRequired ? "needs_review" : "skipped"; rec.detail = "no suggestion matched " + JSON.stringify(query) + " — offered: " + rows.slice(0, 3).map((r) => r.name).join(" | "); rec.options = rows.map((r) => r.name); return true; }
+    const c = await act.eval(atsInjLeverLocCommit, pick.name, pick.id);
+    await act.delay(150);
+    rec.after = c && c.v ? c.v : null;
+    rec.options = rows.map((r) => r.name);
+    const okv = !!(c && c.ok && c.v && c.selected);
+    rec.status = okv ? (tier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
+    rec.matchTier = tier; rec.verified = okv;
+    if (!okv) rec.detail = "location commit did not persist (selectedLocation empty)";
+    else if (tier === "containment") { rec.flag = rec.flag || "non-exact-match"; rec.detail = "picked the first city match — verify the state"; }
+    return true;
+  }
 
   // text-likes: one deterministic write + read-back.
-  if (wt === "text" || wt === "textarea" || wt === "date" || (wt === "location" && ats === "lever")) {
+  if (wt === "text" || wt === "textarea" || wt === "date") {
     if (textValue == null && candidates && candidates.length) textValue = candidates[0];
     if (textValue == null || String(textValue).trim() === "") return false;
     rec.resolved = textValue;
@@ -863,7 +938,17 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       read = await act.eval(atsInjReadOptions, ref.inputSel);
     }
     const options = (read && read.options) || [];
-    if (!options.length) { rec.status = f.isRequired ? "needs_review" : "skipped"; rec.detail = "options did not render"; await act.eval(atsInjCloseCombo, ref.inputSel); return true; }
+    if (!options.length) {
+      rec.status = f.isRequired ? "needs_review" : "skipped";
+      // GH location note (2026-07-31, Figma): the places lookup can hang on "Loading…" with ZERO
+      // network — google.maps never loads in some browsers, so even a HUMAN typing gets no options.
+      // Name that in the review row instead of a bare "did not render".
+      rec.detail = wt === "location"
+        ? "location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser; answer it in the tab before submitting)"
+        : "options did not render";
+      await act.eval(atsInjCloseCombo, ref.inputSel);
+      return true;
+    }
     const texts = options.filter((o) => !o.disabled).map((o) => o.text);
     const matchTexts = wt === "dial" ? texts.map(atsDialStrip) : texts;
     let hit = null;
@@ -874,7 +959,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const idx = texts.findIndex((t) => t.toLowerCase().includes(city));
       if (idx >= 0) hit = { index: idx, tier: texts[idx].toLowerCase().startsWith(city) ? "exact-normalized" : "containment" };
     } else {
-      const m = atsLib.matchCandidates(candidates, matchTexts, { containment: false });
+      const m = atsLib.matchCandidates(candidates, matchTexts, { containment: allowContainment });
       if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
     }
     if (!hit) { await act.eval(atsInjCloseCombo, ref.inputSel); rec.detail = "no candidate matched " + texts.length + " option(s); candidates=" + JSON.stringify(candidates.slice(0, 4)) + " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)); rec.options = texts.slice(0, 60); return false; }
@@ -923,7 +1008,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
     const texts = (f.options || []).slice();
-    const m = atsLib.matchCandidates(candidates, texts, { containment: false });
+    const m = atsLib.matchCandidates(candidates, texts, { containment: allowContainment });
     let pick = m && m.targetIndex >= 0 ? texts[m.targetIndex] : null;
     let tier = m && m.targetIndex >= 0 ? m.matchTier : null;
     if (!pick) {

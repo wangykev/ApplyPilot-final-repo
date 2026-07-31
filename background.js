@@ -3542,6 +3542,7 @@ function makeAtsActuation(llmConfig) {
     delay: cdpAdaptiveDelay,
     delayFull: cdpDelay,
     eval: (fn, ...args) => cdpEval(fn, ...args),
+    wakePage: () => cdpWakePage(), // hidden-tab unfreeze between polls (the discover rule)
     attachResume: async (ref) => {
       const stored = await getResume().catch(() => null);
       if (!stored || !stored.base64) return { ok: false, error: "no resume stored (upload one in the popup / website)" };
@@ -3594,6 +3595,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl) {
     if (jd && jd.company) jobContext.company = jd.company;
     if (!jobContext.company) jobContext.company = atsCompanyFromUrl(startUrl);
     if (jd && jd.title) jobContext.title = jd.title;
+    // The JD text grounds the AI answers (an essay written blind to the posting invents a
+    // company theme — live: "Kraken's work in the robotics space" for an ENERGY company).
+    const jdText = jd && (jd.description || jd.text);
+    if (jdText) jobContext.description = String(jdText).slice(0, 4000);
 
     emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
     const act = makeAtsActuation(await getLlmConfig());
