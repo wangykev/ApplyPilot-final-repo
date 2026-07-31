@@ -31,9 +31,12 @@ export async function GET(req: Request) {
     .maybeSingle();
   if (!keyRow) return j({ ok: false, error: "Invalid key." }, 401);
 
+  // company/role/source/posted_at ride along so a puller can show what a job IS
+  // without a second round-trip. job_description is deliberately NOT selected —
+  // it's up to 20k chars per row and nothing consuming this queue needs it.
   const { data, error } = await admin
     .from("queue_items")
-    .select("id, url, status, position")
+    .select("id, url, status, position, company, role, source, location, posted_at")
     .eq("user_id", keyRow.user_id)
     .eq("status", "pending")
     .order("position", { ascending: true });

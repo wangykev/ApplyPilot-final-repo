@@ -99,6 +99,14 @@ function cdpAttach(tabId) {
   });
 }
 
+// Which tab (if any) this debugger client is currently attached to. Read-only
+// accessor so callers that manage their own attach lifecycle (the discovery
+// sweep's single-tab JD pass) can ask "am I already attached here?" without
+// reaching into this module's internal binding. null = not attached.
+function cdpAttachedTab() {
+  return cdpTabId;
+}
+
 // Idempotent detach of the tracked attachment — safe in finally, after tab
 // close, and after an external detach (swallows "Debugger is not attached").
 function cdpDetach() {

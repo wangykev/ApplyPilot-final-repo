@@ -101,13 +101,30 @@ create table if not exists public.queue_items (
   status      text not null default 'pending'
                 check (status in ('pending','active','done','error')),
   position    integer not null default 0,
-  created_at  timestamptz not null default now()
+  created_at  timestamptz not null default now(),
+  -- Job-discovery columns (0010). A pasted row leaves these null; a discovered row
+  -- carries its board, posted date, and the description the extension scraped by
+  -- opening the posting. job_key is the dedup identity (lockstep with
+  -- web/lib/discover.ts) and matches applications.job_key for Workday postings.
+  job_key         text,
+  company         text,
+  role            text,
+  source          text,
+  location        text,
+  posted_at       timestamptz,
+  job_description text
 );
 
 alter table public.queue_items enable row level security;
 drop policy if exists "queue owner" on public.queue_items;
 create policy "queue owner" on public.queue_items
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create unique index if not exists queue_items_user_job_key_uidx
+  on public.queue_items (user_id, job_key)
+  where job_key is not null;
+create index if not exists queue_items_user_created_idx
+  on public.queue_items (user_id, created_at desc);
 
 -- --------------------------------------------------------------- reminders
 create table if not exists public.reminders (
