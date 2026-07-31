@@ -521,15 +521,22 @@ function atsInjReadValue(ats, inputSel, widgetType) {
 // Open a combobox (GH react-select / Ashby select) and read its options, SCOPED to the
 // widget's own listbox — the Workday chip-contamination lesson holds verbatim here: a
 // page-wide `.select__option` read returns OTHER open menus' options (observed live).
-function atsInjOpenAndReadOptions(inputSel) {
+// `force` clicks REGARDLESS of aria-expanded. ⚠ aria-expanded LIES (live 2026-07-31, Discord):
+// degree--0 sat at aria-expanded="true" with no menu in the DOM, so an expanded-gated open
+// skipped the click forever and every read returned zero options — the field then reported
+// "no options" on a list that opens fine by hand. The toggle-shut invariant still holds for the
+// DEFAULT path; the caller only forces after it has SEEN an empty list, where a click can only
+// improve matters (it either opens the menu or closes a phantom-open one so the next click opens).
+function atsInjOpenAndReadOptions(inputSel, force) {
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
   const fire = (n, t) => n.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
   const container = el.closest(".select__container") || el.closest('[class*="_input"]')?.parentElement || el.parentElement;
   const ctrl = (container && (container.querySelector(".select__control") || container)) || el;
   const already = el.getAttribute("aria-expanded") === "true";
-  if (!already) { fire(ctrl, "mousedown"); fire(ctrl, "mouseup"); fire(ctrl, "click"); }
-  return { ok: true, opened: true, already };
+  const clicked = force === true || !already;
+  if (clicked) { fire(ctrl, "mousedown"); fire(ctrl, "mouseup"); fire(ctrl, "click"); }
+  return { ok: true, opened: true, already, clicked };
 }
 
 function atsInjReadOptions(inputSel) {
@@ -560,6 +567,14 @@ function atsInjTypeInCombo(inputSel, text) {
   setter.call(el, text);
   el.dispatchEvent(new Event("input", { bubbles: true }));
   return { ok: true };
+}
+
+// The combobox input's CURRENT text — proves whether a typed query actually landed (a
+// controlled React input can revert it on the next render).
+function atsInjReadComboInput(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  return { ok: true, value: el.value, expanded: el.getAttribute("aria-expanded") };
 }
 
 // Commit an option BY TEXT inside the scoped listbox (synthetic mousedown/click — proven
@@ -987,8 +1002,22 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         if (f.isRequired && act.aiEnabled && ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "textarea", "text", "location", "date"].includes(f.widgetType)) {
           await atsAiFallback(act, ats, f, ref, rec, jc, profile);
         } else if (rec.status == null) {
-          rec.status = "skipped";
-          rec.detail = rec.detail || (candidates ? "no candidate matched the live options" : "no profile mapping for this question");
+          // A STATED value that the form couldn't take is NOT "blank is fine" (live 2026-07-31,
+          // Discord: the profile says "Bachelor of Science", the form offers "Bachelor's Degree",
+          // and the field vanished silently). The operator HAS an answer here — surface it so
+          // they can pick it on review and teach the variant. Genuinely unmapped questions
+          // (no candidates at all) stay a quiet `skipped`, optional-blank as before.
+          const stated = !!(candidates && candidates.length);
+          rec.status = stated ? "needs_review" : "skipped";
+          if (stated) {
+            rec.flag = rec.flag || "stated-value-unmatched";
+            // A human sentence for the review page — the raw match diagnostic is kept after it
+            // (it names the options), and rec.options already feeds the editor's picker.
+            rec.detail = "your profile answer (" + JSON.stringify(String(candidates[0])) + ") isn't one of this form's options — pick the right one here" +
+              (rec.detail ? " · " + rec.detail : "");
+          } else {
+            rec.detail = rec.detail || "no profile mapping for this question";
+          }
         }
       }
       // Route-level review force (employment "Yes" etc.).
@@ -1095,19 +1124,96 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   if (wt === "select" || wt === "dial" || wt === "location") {
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
-    await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
-    await act.delay(250);
-    // async comboboxes (location): type the query first so options exist to read.
-    if (wt === "location") {
-      await act.eval(atsInjTypeInCombo, ref.inputSel, String(candidates[0]).split(",")[0]);
-      await act.delayFull(900); // places lookup — real network time, never scaled
+    // OPEN → SETTLE → SEARCH → REPORT. One sequence, because the branchy version had three
+    // ways to end up matching against the wrong list (live 2026-07-31, Discord).
+    //   • never a one-shot read: a heavy form renders its menu well past any flat delay, and
+    //     the same form flip-flops between "100 options" and "none" run to run
+    //   • never exit a search poll on "some options": while the widget searches it keeps
+    //     showing the PREVIOUS page, so exiting early reads a stale list and calls the value
+    //     absent ("Carnegie Mellon University" resolves by hand in ~2s; the fill gave up on
+    //     the stale A-list)
+    //   • absence is only believable AFTER asking for the value BY NAME
+    const optsOf = (r) => ((r && r.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+    const hasHit = (texts) => {
+      const mt = wt === "dial" ? texts.map(atsDialStrip) : texts;
+      const m0 = atsLib.matchCandidates(candidates, mt, { containment: allowContainment });
+      return !!(m0 && m0.targetIndex >= 0);
+    };
+    // CLEAR BEFORE TYPING, SW-paced (the Workday typeahead rule, earned again 2026-07-31 on
+    // Discord's school picker): setting a controlled react-select input straight to a new
+    // value races the component's own render and React puts "" back — the query never reaches
+    // the filter and the list looks empty. A clear + settle + type sticks ("Carnegie" → 1
+    // option). The settle must be SW wall-clock; a page-side timer would be throttled hidden.
+    const typeInto = async (text) => {
+      await act.eval(atsInjTypeInCombo, ref.inputSel, "");
+      await act.delayFull(250);
+      const r = await act.eval(atsInjTypeInCombo, ref.inputSel, String(text));
+      await act.delayFull(150);
+      // READ BACK: a controlled input can silently revert (that is exactly this bug's shape),
+      // and "we typed it" is not evidence the widget received it.
+      const back = await act.eval(atsInjReadComboInput, ref.inputSel);
+      return Object.assign({}, r, { stuck: !!(back && back.value === String(text)), got: back && back.value });
+    };
+    const pollFor = async (ms, want) => {           // want(texts) → done?
+      const deadline = Date.now() + ms;
+      let last = null;
+      while (Date.now() < deadline) {
+        await act.delayFull(250);
+        const r = await act.eval(atsInjReadOptions, ref.inputSel);
+        if (r && r.options) last = r;
+        if (r && want(optsOf(r))) return r;
+      }
+      return last;
+    };
+
+    let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
+    let read = await pollFor(3000, (t) => t.length > 0);
+    // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
+    // menu), so one forced click closes it and the next opens for real. Each attempt flips the
+    // state, so two cover both "the click missed" and "it lied about being open".
+    for (let attempt = 0; attempt < 2 && !optsOf(read).length; attempt++) {
+      opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
+      read = await pollFor(2500, (t) => t.length > 0);
     }
-    let read = await act.eval(atsInjReadOptions, ref.inputSel);
-    if ((!read || !read.open || !read.options.length) && wt !== "location") {
-      // some selects only populate after a keystroke — poke once with the first candidate
-      await act.eval(atsInjTypeInCombo, ref.inputSel, String(candidates[0]).slice(0, 3));
-      await act.delayFull(600);
-      read = await act.eval(atsInjReadOptions, ref.inputSel);
+    if (wt === "location") {
+      await typeInto(String(candidates[0]).split(",")[0]);
+      read = await pollFor(6000, (t) => t.length > 0); // places lookup — real network time
+    } else if (!hasHit(optsOf(read))) {
+      // SEARCH BY NAME: types each candidate (most-specific first) and polls FOR THE HIT.
+      // ONE search attempt (the most-specific candidate). Two attempts doubled the worst-case
+      // cost on a form full of unmatched selects — a Discord fill ran into minutes — for a
+      // vanishing gain: if the widget can find the value at all, the primary candidate finds it.
+      for (const cand of candidates.slice(0, 1)) {
+        // Search with a PREFIX, not the whole value: it is what a human types, it matches
+        // more broadly, and a long async list answers it faster ("Carnegie Mellon" resolves
+        // where the full "Carnegie Mellon University" can come back empty). The MATCH is still
+        // exact against whatever the widget returns — a looser query never loosens the answer.
+        const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
+        const typed = await typeInto(query);
+        let found = await pollFor(2500, (t) => t.length > 0 && hasHit(t));
+        // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
+        // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
+        // shows nothing — live 2026-07-31 this read as "the value isn't in the list" with
+        // stuck=true, got="Carnegie Mellon University", list(0). Re-open (no-op if already
+        // open) and poll again before believing a query found nothing.
+        if (!optsOf(found).length) {
+          // FORCE the click: aria-expanded lies (see atsInjOpenAndReadOptions), so a
+          // non-forced re-open no-ops on a phantom-expanded widget and the menu stays shut
+          // forever. Re-type afterwards — opening can reset the query the widget just took.
+          await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
+          await act.delayFull(250);
+          await typeInto(query);
+          found = await pollFor(2500, (t) => t.length > 0 && hasHit(t));
+        }
+        const seen = optsOf(found);
+        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
+        if (seen.length && hasHit(seen)) { read = found; break; }
+      }
+      if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
+        await act.eval(atsInjTypeInCombo, ref.inputSel, "");
+        const restored = await pollFor(2000, (t) => t.length > 0);
+        if (optsOf(restored).length) read = restored;
+      }
     }
     const options = (read && read.options) || [];
     if (!options.length) {
@@ -1117,7 +1223,9 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // Name that in the review row instead of a bare "did not render".
       rec.detail = wt === "location"
         ? "location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser; answer it in the tab before submitting)"
-        : "options did not render";
+        // distinguish "the control never opened" from "it opened but listed nothing" — they
+        // have different causes (an unrecognized widget vs an empty/server-backed list)
+        : ((opened && opened.ok) ? "the dropdown opened but listed no options after 4s" : "could not open the dropdown (control not found)");
       await act.eval(atsInjCloseCombo, ref.inputSel);
       return true;
     }
@@ -1359,7 +1467,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsRouteLabel, atsRouteField, atsDialStrip, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
-    atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
+    atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

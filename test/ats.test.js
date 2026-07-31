@@ -427,3 +427,22 @@ test("router: profile-backed rungs carry `path` so the review entry gets canonic
     assert.strictEqual(r.path, path, label);
   }
 });
+
+// ── a STATED value the form can't take must SURFACE, not vanish (live 2026-07-31) ────────
+test("driver: stated-but-unmatched flags the record so review + teach can see it", async () => {
+  const act = fakeAct({
+    atsInjScan: () => ({ ...GH_SCAN, fields: [{ fieldName: "gender", inputSel: "#gender", widgetType: "select", label: "Gender", isRequired: false, value: null, domIndex: 0 }] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true }),
+    // the form words gender as Man/Woman — the profile says "Male": no exact, no containment
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "Man" }, { text: "Woman" }, { text: "Prefer not to say" }] }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCloseCombo: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(out.results[0].flag, "stated-value-unmatched");
+  assert.match(out.results[0].detail, /isn't one of this form's options/);
+  assert.ok(out.results[0].options.includes("Man"), "the live options ride along so review can pick one");
+});

@@ -2703,3 +2703,42 @@ from a blank form, which makes "replay" = "re-fill from approved values" rather 
   submit run re-fills from the approved bundle, verifies, then (armed) clicks submit.
 - Required-field recon: GH = aria-required / requiredInput mirror / label `*`; Lever =
   `required` attr / label `✱`; Ashby = `required` attr. All fail toward over-flagging.
+
+## 2026-07-31 (b) — react-select on a HEAVY Greenhouse form (Discord): four traps in one widget
+
+Discord's SWE application (26 fields: an education section, EEOC, screening dropdowns) broke
+every select while Anthropic/Figma/GitLab/Scale AI worked. Four separate causes, each now
+handled in `ats.js`'s combobox path — all four are "the widget lied or wasn't ready":
+
+1. **A one-shot read under-waits.** The old flat 250ms after opening reported "options did not
+   render" on EVERY select of this form, each of which opens fine by hand. The same form then
+   flip-flopped between "100 options" and "none" run to run. Menus are POLLED now (5th instance
+   of the standing settle rule).
+2. **`aria-expanded` LIES.** `degree--0` sat at `aria-expanded="true"` with NO menu in the DOM,
+   so an expanded-gated open skipped the click forever. The open call takes a `force` flag; the
+   driver forces after it has SEEN an empty list (a click can only help there — it opens the
+   menu, or shuts a phantom-open one so the next click opens). The toggle-shut invariant still
+   governs the default path.
+3. **A controlled react-select input REVERTS a directly-set value.** Setting `.value` +
+   `input` straight to the query gets replaced with `""` on the component's next render, so the
+   query never reaches the filter. `clear → settle (SW wall-clock) → type` sticks. This is the
+   Workday typeahead's "clear before typing" rule, earned again on a different framework.
+4. **A long list only renders its first page.** The school picker shows 100 options starting
+   "Aalborg University", so "Carnegie Mellon University" was declared absent from a list that
+   had simply never been searched. The driver now SEARCHES BY NAME (a 2-word prefix — what a
+   human types, and what a long async list answers fastest) and polls FOR THE HIT, never for
+   "some options": while the widget searches it keeps showing the PREVIOUS page, so an
+   exit-on-non-empty reads a stale list and calls the value absent.
+
+⚠ **Still unresolved (honest limitation):** Discord's `school--0` async list returns results for
+a hand-typed "Carnegie Mellon" in ~2s but returns NOTHING to the same query during a fill
+(`typed=true stuck=true got="Carnegie Mellon"` and `list(0)` across ~5s of polling, foreground
+AND background). The sibling race/gender pickers on the same form DO return filtered results
+through the identical path, so the mechanism is right and this one list differs. It ends as an
+honest `needs_review` naming the profile answer with the live options attached — never a wrong
+value. Next probe: watch its network request while a fill types, to see whether the search fires.
+
+Also on this form: `#country` is intl-tel-input's own dropdown (`iti__country-list`,
+`iti-0__item-af`), NOT a react-select — and its 244 `[role=option]` rows sit in the DOM
+permanently, so a page-wide option scrape "finds" 244 options for any widget. Every read stays
+scoped to the field's own `react-select-<name>-listbox`.
