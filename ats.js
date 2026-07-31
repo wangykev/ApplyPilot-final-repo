@@ -150,10 +150,14 @@ function atsComposeValue(kind, profile) {
     const s = [pi.city, pi.state_province].filter(Boolean).join(", ").trim();
     return s || null;
   }
-  if (kind === "current_company") {
+  if (kind === "current_company" || kind === "current_title") {
     const we = Array.isArray(profile && profile.work_experience) ? profile.work_experience : [];
-    const cur = we.find((w) => w && w.currently_work_here && w.company);
-    return (cur && cur.company) || null;
+    // the current job wins; else the FIRST entry (prepareProfile orders by recency; a raw
+    // profile is conventionally most-recent-first too)
+    const cur = we.find((w) => w && w.currently_work_here) || we[0] || null;
+    if (!cur) return null;
+    const v = kind === "current_company" ? cur.company : cur.job_title;
+    return (v && String(v).trim()) || null;
   }
   return null;
 }
@@ -174,18 +178,25 @@ function atsRouteLabel(label, f, profile, defaults) {
   const aq = (profile && profile.application_questions) || {};
   const wa = (profile && profile.work_authorization) || {};
   const si = (profile && profile.self_identification) || {};
+  const pi = (profile && profile.personal_info) || {};
   const has = (v) => v !== undefined && v !== null && String(v).trim() !== "";
   const bool = (v) => (v === true ? ["Yes", "True"] : v === false ? ["No", "False"] : null);
 
   // Work authorization / sponsorship — the most common screening pair everywhere.
   // BAIL to AI on export-control-style wordings ("US person") — different legal fact.
+  // ⚠ ORDER IS LOAD-BEARING: sponsorship FIRST, and the auth rung REFUSES any label
+  // mentioning sponsor*. Scale AI words sponsorship as "…require company sponsorship to
+  // retain or extend your WORK AUTHORIZATION…" — the auth rung matched that tail and
+  // answered "Yes" (authorized) where the right answer was "No" (no sponsorship needed):
+  // a SILENT WRONG deterministic fill, the one failure class the ladder exists to prevent
+  // (live 2026-07-31, regression-pinned).
   if (/\bus person\b|export control/i.test(L)) return null;
-  if (/(authorized|legally able|eligible|legal right|right)\s.*\bwork\b|work authorization/i.test(L) && wa.authorized_to_work_in_us != null) {
-    return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", detail: "work_authorization.authorized_to_work_in_us" };
-  }
   if (/sponsorship|sponsor.*visa|visa.*sponsor|require.*visa|need.*visa/i.test(L) && (wa.requires_sponsorship_now != null || wa.requires_sponsorship_future != null)) {
     const needs = !!wa.requires_sponsorship_now || !!wa.requires_sponsorship_future; // "now or in the future" — either
     return { candidates: bool(needs), source: "work_auth", detail: "work_authorization.requires_sponsorship_(now|future)" };
+  }
+  if (!/sponsor/i.test(L) && (/(authorized|legally able|eligible|legal right|right)\s.*\bwork\b|work authorization/i.test(L)) && wa.authorized_to_work_in_us != null) {
+    return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", detail: "work_authorization.authorized_to_work_in_us" };
   }
 
   // Profile links.
@@ -195,9 +206,35 @@ function atsRouteLabel(label, f, profile, defaults) {
   if (/\btwitter\b|\bx (profile|url)\b/i.test(L)) { const v = atsWebsiteValue(profile, "twitter"); if (v) return { value: v, source: "website" }; }
   if (/other website|website url/i.test(L)) { const v = atsWebsiteValue(profile, "other"); if (v) return { value: v, source: "website" }; }
 
-  // Identity / contact variants.
-  if (/preferred\s+(first\s+)?name/i.test(L) && has((profile.personal_info || {}).preferred_first_name)) {
-    return { value: profile.personal_info.preferred_first_name, source: "map", detail: "personal_info.preferred_first_name" };
+  // Bare identity labels (ANCHORED — "name" appears in hostile contexts like "name of your
+  // referrer", so only the exact label forms route). Ramp labels its phone field just
+  // "Phone" (the bucket wording is "Phone Number") — the AI answered it correctly but a
+  // deterministic identity fill must never depend on the AI (live 2026-07-31).
+  if (/^(full |legal )?name$/i.test(L)) { const v = atsComposeValue("full_name", profile); if (v) return { value: v, source: "map", detail: "(full_name)" }; }
+  if (/^first name$/i.test(L) && has(pi.first_name)) return { value: pi.first_name, source: "map" };
+  if (/^last name$/i.test(L) && has(pi.last_name)) return { value: pi.last_name, source: "map" };
+  if (/^e-?mail( address)?$/i.test(L) && has(pi.email)) return { value: pi.email, source: "map" };
+  if (/^(mobile |cell )?phone( number)?$/i.test(L) && has(pi.phone_number)) return { value: pi.phone_number, source: "map", detail: "personal_info.phone_number" };
+
+  // Identity / contact variants. GitLab words preferred-name as "the name you'd prefer
+  // us to use throughout the interview process" — cover the prefer-phrasings too.
+  if ((/preferred\s+(first\s+)?name/i.test(L) || /name\s+(you'?d|you would)\s+prefer|prefer\s+(us\s+)?to\s+(use|call)|what should we call you/i.test(L)) && has(pi.preferred_first_name)) {
+    return { value: pi.preferred_first_name, source: "map", detail: "personal_info.preferred_first_name" };
+  }
+  // Current/most-recent employer + title (Scale AI asks both as REQUIRED text).
+  if (/(current|most recent)( or most recent)? (employer|company)|who is your (current|most recent)/i.test(L)) {
+    const v = atsComposeValue("current_company", profile);
+    if (v) return { value: v, source: "map", detail: "(current_company)" };
+  }
+  if (/(current|most recent)( or most recent)? (job )?title|what is your (current|most recent).*title/i.test(L)) {
+    const v = atsComposeValue("current_title", profile);
+    if (v) return { value: v, source: "map", detail: "(current_title)" };
+  }
+  // A REAL country question (GitLab: "What is your current country of residence?*") —
+  // distinct from GH's #country dial-code composite, which the static map catches first.
+  if (/country of residence|country (do|will) you (currently )?(live|reside|work)|country are you (currently )?(located|based|living)/i.test(L)) {
+    const c = pi.country;
+    if (c && (Array.isArray(c) ? c.length : String(c).trim())) return { raw: c, path: "personal_info.country", source: "map" };
   }
   // Location questions on a combobox widget (Ashby's "Where are you currently located?"
   // has NO field identity at all — the label is the only durable key). kind:"location"
@@ -388,7 +425,11 @@ function atsInjScan(ats) {
         isRequired: cb.required === true || !!entry.querySelector('[class*="required"]'), value: picked ? txt(picked) : (cb.checked ? "Yes" : null), options: ["Yes", "No"] });
       continue;
     }
-    // radio group(s) inside the entry (EEOC block: several logical questions can share one entry).
+    // radio group(s) inside the entry (EEOC block: several logical questions can share one
+    // entry). ⚠ NO `continue` here: Ramp nests its SMS-consent radios INSIDE the Phone
+    // entry, so skipping to the next entry after the radios dropped the tel input entirely
+    // (live 2026-07-31 — the phone field vanished from the scan). Radios are scanned, then
+    // the generic input loop below still runs for the entry's OTHER inputs (dedup by seen).
     const radios = [...entry.querySelectorAll('input[type="radio"]')].filter((r) => r.name);
     if (radios.length) {
       const byName = {};
@@ -404,22 +445,23 @@ function atsInjScan(ats) {
         push({ fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: "radio", label: qlbl || nm,
           isRequired: list.some((r) => r.required), value: checked ? optLabel(checked) : null, options: list.map(optLabel).filter(Boolean) });
       }
-      continue;
     }
-    // consent checkboxes (one per entry, name = the label text itself — live, OpenAI):
-    // NOT a yes/no pair (no _yesno_ container), handled before the generic input loop.
+    // consent checkboxes (one per entry, name = the label text itself — live, OpenAI).
+    // NO `continue` (the Ramp nested-radio lesson): the generic loop below still runs for
+    // any OTHER inputs sharing the entry; `seen` prevents double-scanning these.
     const soloCbs = [...entry.querySelectorAll('input[type="checkbox"]')];
-    if (soloCbs.length && !entry.querySelector('input[type="radio"]')) {
+    if (soloCbs.length && !entry.querySelector('input[type="radio"]') && !entry.querySelector('[class*="_yesno_"]')) {
       for (const cbx of soloCbs) {
         const nm = cbx.name || cbx.id; if (!nm || seen.has(nm)) continue; seen.add(nm);
         const l = (cbx.id && document.querySelector('label[for="' + esc(cbx.id) + '"]')) || cbx.closest("label");
         push({ fieldName: nm, inputSel: cbx.id ? "#" + esc(cbx.id) : 'input[name="' + esc(nm) + '"]', widgetType: "checkbox",
           label: stripReq((l ? txt(l) : "") || entryLabel || nm), isRequired: cbx.required === true, value: cbx.checked ? true : null });
       }
-      continue;
     }
     for (const el of entry.querySelectorAll("input, textarea")) {
-      if (el.type === "hidden") continue;
+      // radios/checkboxes were handled by the branches above (a leftover here would scan
+      // as widgetType "text" — the fall-through made this reachable, so guard explicitly)
+      if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
       const isCombo = el.getAttribute("role") === "combobox";
       // the location combobox has NO id and NO name (live, OpenAI) — STAMP one at scan
       // time (the discover data-ap-click idiom: React leaves foreign attributes alone
@@ -707,6 +749,14 @@ const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_ty
 // profile value will ever contain — strip it for matching, commit by the FULL text.
 function atsDialStrip(optText) { return String(optText || "").replace(/\s*\+\d[\d\s-]*$/, "").trim(); }
 
+// Is this label a demographic question? ORTHOGONAL to routing (2026-07-31, Zoox): a BUCKET
+// can route an EEO field before the label ladder's EEO rung runs, and the bucket carries no
+// containment — so "Asian" missed Zoox's "Asian (Not Hispanic or Latino)" even though the
+// stated-EEO relief exists. The relief keys off the LABEL, whatever tier produced the value.
+function atsIsEeoLabel(label) {
+  return /hispanic|latino|race|ethnicit|veteran|disabilit|gender|\bsex\b/i.test(String(label || ""));
+}
+
 async function atsAiChooseOption(act, f, options, profile, jobContext) {
   // AI-1's contract, re-hosted: ALWAYS-GUESS for a required choice; the reply is a CANDIDATE
   // that must clear the match ladder vs the LIVE options; ALWAYS flagged for review.
@@ -803,7 +853,33 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
 
-  for (const f of scan.fields) {
+  await atsFillFields(act, ats, scan, scan.fields, results, profile, defaults, jc, bucketIndex, o);
+
+  // CASCADE RE-SCAN (the Workday M1 pattern, earned again 2026-07-31 on Ramp): these SPAs
+  // mount sections in BURSTS, and even a 3-consecutive-reads settle can catch a pause —
+  // the run scanned 8 fields while Phone + Resume were still mounting. One read-only
+  // re-scan after the fill; anything NOT yet in results (late-mounted OR revealed by a
+  // committed value) gets the identical routing + actuation, tagged cascadeRevealed.
+  for (let round = 0; round < 2; round++) {
+    await act.delayFull(900);
+    let rescan = null;
+    try { rescan = await act.eval(atsInjScan, ats); } catch (e) { break; }
+    if (!rescan || !rescan.fields) break;
+    const seen = new Set(results.map((r) => r.fieldName));
+    const fresh = rescan.fields.filter((f) => !seen.has(f.fieldName));
+    if (!fresh.length) break;
+    try { console.log(`[ApplyPilot][ATS-FILL] cascade round ${round + 1}: ${fresh.length} late-mounted field(s) — ${fresh.map((f) => f.fieldName).slice(0, 6).join(", ")}`); } catch (e) { /* log */ }
+    const before = results.length;
+    await atsFillFields(act, ats, rescan, fresh, results, profile, defaults, jc, bucketIndex, o);
+    for (let i = before; i < results.length; i++) results[i].cascadeRevealed = true;
+  }
+
+  return await atsFinishFill(act, ats, scan, results);
+}
+
+// The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder.
+async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {
+  for (const f of fields) {
     const rec = {
       fieldName: f.fieldName, label: f.label, widgetType: ATS_REVIEW_WIDGET[f.widgetType] || f.widgetType,
       isRequired: !!f.isRequired, mappedPath: null, rawValue: null, resolved: null,
@@ -858,7 +934,10 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
       const effF = route && (route.kind === "dial" || route.kind === "location")
         ? Object.assign({}, f, { widgetType: route.kind === "dial" ? "dial" : (ats === "lever" ? "location" : (f.widgetType === "select" ? "location" : f.widgetType)) })
         : f;
-      const mopts = { containment: !!(route && route.containment) }; // stated-value routes only (EEO) — commits at the flagged filled_review tier
+      // containment relief for STATED values: the route may flag it (EEO rungs / static
+      // maps), OR the label is demographic regardless of which tier produced the value
+      // (a bucket routes before the EEO rung and carries no flag — the Zoox race miss).
+      const mopts = { containment: !!(route && route.containment) || (!!candidates && atsIsEeoLabel(f.label)) };
       const produced = await atsActuateField(act, ats, effF, ref, rec, candidates, textValue, jc, profile, mopts);
       if (!produced) {
         // Deterministic tiers produced nothing. AI fallback — REQUIRED fields only (the
@@ -881,7 +960,10 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     results.push(rec);
     try { console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName} (${rec.widgetType}${rec.isRequired ? ", req" : ""}) → ${rec.status}${rec.matchTier ? " · " + rec.matchTier : ""}${rec.flag ? " · " + rec.flag : ""}${rec.after != null ? " · after=" + JSON.stringify(String(rec.after).slice(0, 60)) : ""}${rec.detail ? " · " + rec.detail : ""}`); } catch (e) { /* log only */ }
   }
+}
 
+// The audit + envelope — extracted with the loop (see atsFillFields).
+async function atsFinishFill(act, ats, scan, results) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -1054,7 +1136,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
     const texts = f.options || [];
-    const m = atsLib.matchCandidates(candidates, texts, { containment: false });
+    let m = atsLib.matchCandidates(candidates, texts, { containment: allowContainment });
+    // the stated-EEO polarity bridge, native-select twin (see the radio path)
+    if ((!m || m.targetIndex < 0) && allowContainment) {
+      const lead = /^(yes|no)\b/i.exec(String(candidates[0] || ""));
+      const pol = lead ? atsFd.optionForPolarity(texts, lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null;
+      if (pol) m = { targetIndex: texts.indexOf(pol), matchTier: "polarity-lead" };
+    }
     if (!m || m.targetIndex < 0) { rec.detail = "no candidate matched " + texts.length + " option(s)"; rec.options = texts; return false; }
     const r = await act.eval(atsInjSelectNative, ref.inputSel, texts[m.targetIndex]);
     await act.delay(120);

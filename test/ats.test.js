@@ -332,3 +332,32 @@ test("canonicalJobUrl: posting and form URLs key identically on all three ATSs",
   // Workday req-id keys unchanged (regression)
   assert.strictEqual(lib.canonicalJobUrl("https://magna.wd3.myworkdayjobs.com/x/job/T/Software_R00123/apply"), "wd3:r00123");
 });
+
+// ── the Scale AI sponsorship/auth collision (live 2026-07-31) ───────────────────────────
+test("router: a SPONSORSHIP question that mentions 'work authorization' routes to sponsorship, NEVER auth", () => {
+  // "…require company sponsorship to retain or extend your work authorization…" — the auth
+  // rung matched the tail and answered "Yes" (authorized) where the correct answer is "No"
+  // (no sponsorship needed): a silent wrong deterministic fill. Sponsorship wins; the auth
+  // rung refuses any label mentioning sponsor*.
+  const r = ats.atsRouteLabel(
+    "Will you now or in the future require company sponsorship to retain or extend your work authorization in the country where the job is located?",
+    {}, PROFILE, {}
+  );
+  assert.deepStrictEqual(r.candidates, ["No", "False"]);
+  assert.match(r.detail, /requires_sponsorship/);
+});
+
+test("router: current employer + current title compose from the most recent work entry", () => {
+  assert.strictEqual(ats.atsRouteLabel("Who is your current or most recent employer?", {}, PROFILE, {}).value, "Rivian");
+  const p = JSON.parse(JSON.stringify(PROFILE));
+  p.work_experience[0].job_title = "Firmware Intern";
+  assert.strictEqual(ats.atsRouteLabel("What is your current or most recent job title?", {}, p, {}).value, "Firmware Intern");
+});
+
+test("router: country-of-residence routes the profile country ladder (NOT the dial composite)", () => {
+  const p = JSON.parse(JSON.stringify(PROFILE));
+  p.personal_info.country = ["United States of America", "United States"];
+  const r = ats.atsRouteLabel("What is your current country of residence?", {}, p, {});
+  assert.deepStrictEqual(r.raw, ["United States of America", "United States"]);
+  assert.strictEqual(r.path, "personal_info.country");
+});
