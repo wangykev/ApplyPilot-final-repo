@@ -3571,7 +3571,7 @@ function makeAtsActuation(llmConfig) {
 // FILL run: posting → form → fill → review bundle → website. NEVER submits — there is no
 // page-advance click on these single-page forms at all; the only submit-capable click
 // lives in runAtsSubmitRun behind authorize+arm.
-async function runAtsApplicationRun(tabId, ats, store, startUrl) {
+async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   const LOG = (...a) => console.log("[ApplyPilot][ATS-RUN]", ...a);
   try {
     const attached = await cdpAttach(tabId);
@@ -3584,6 +3584,40 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl) {
     let jd = null;
     try { jd = await cdpEval(scrapeJobPosting); } catch (e) { LOG("JD scrape skipped:", String((e && e.message) || e)); }
     if (jd && jd.title) LOG(`posting: "${String(jd.title).slice(0, 70)}" @ ${jd.company || "?"} (${(jd.description || jd.text || "").length} chars)`);
+
+    // APPLY-ELSEWHERE redirect (the Anthropic/Constellation pattern, operator 2026-07-31):
+    // the hosted form is a DECOY ("you do not need to submit this Greenhouse application")
+    // and the REAL application is the partner link. Filling the decoy is worthless — detect,
+    // extract the link, and CHASE it once when it resolves to a supported ATS; otherwise
+    // halt self-explaining with the link so the operator applies there.
+    try {
+      const redir = await cdpEval(atsInjDetectRedirect);
+      if (redir && redir.redirect) {
+        const link = atsPickRedirectAnchor(redir.anchors);
+        LOG(`⚠ APPLY-ELSEWHERE posting: "${redir.phrase}" — extracted link: ${link || "NONE (ambiguous/missing)"}`);
+        if (!link) {
+          return { ok: true, needs_operator: true, stopped: "apply-elsewhere", jd,
+            detail: "This posting says its own form doesn't count (" + redir.phrase + ") but the real application link couldn't be extracted unambiguously — open the posting and apply via its link." };
+        }
+        emitRunProgress("Posting redirects elsewhere", "following the real application link");
+        await cdpNavigate(link);
+        await cdpDelay(2500); // resolve shorteners/redirect chains before reading the landing
+        const landed = await cdpEval(function () { return location.href; }).catch(() => link);
+        const landedAts = detectAts(landed);
+        LOG(`redirect landed on ${landed} (${landedAts || "unsupported host"})`);
+        if ((opts0.chase || 0) >= 1 || !landedAts) {
+          return { ok: true, needs_operator: true, stopped: "apply-elsewhere", jd, redirectUrl: landed,
+            detail: "The real application is at " + landed + (landedAts ? "" : " — a host this pipeline can't drive yet; apply there yourself.") };
+        }
+        if (landedAts === "workday") {
+          // the Workday pipeline owns its own onboarding — hand the resolved link back up.
+          return { ok: true, stopped: "redirect-to-workday", jd, redirectUrl: landed,
+            detail: "The real application is a Workday posting: " + landed + " — Run that link (the Workday pipeline will drive it)." };
+        }
+        await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
+        return await runAtsApplicationRun(tabId, landedAts, store, landed, { chase: (opts0.chase || 0) + 1 });
+      }
+    } catch (e) { LOG("redirect detection skipped:", String((e && e.message) || e)); }
 
     const formUrl = atsFormUrl(ats, startUrl);
     const here = await cdpEval(function () { return location.href; }).catch(() => null);
@@ -3648,6 +3682,18 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); }
     const ready = await waitAtsFormReady(ats, LOG);
     if (!ready.ready) return { ok: true, needs_operator: true, stopped: "form-not-rendered", submitted: false };
+
+    // A DECOY form must never be replayed or submitted — even one with an approved bundle
+    // from before the detector existed (the Anthropic/Constellation pattern).
+    try {
+      const redir = await cdpEval(atsInjDetectRedirect);
+      if (redir && redir.redirect) {
+        const link = atsPickRedirectAnchor(redir.anchors);
+        LOG(`⚠ REFUSING to ${arm ? "submit" : "rehearse"} — the posting says this form doesn't count ("${redir.phrase}"). Real link: ${link || "not extracted"}`);
+        return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "apply-elsewhere", redirectUrl: link || null,
+          detail: "This form is a decoy — the posting says applications go through " + (link || "its partner link") + ". Nothing was replayed or submitted." };
+      }
+    } catch (e) { /* detection is best-effort; the gates below still hold */ }
 
     // Approved values by fieldName (the bundle is the SOURCE OF TRUTH — never the profile).
     // field_id is "<page>::formField-<fieldName>"; is_deleted rows and empty values are

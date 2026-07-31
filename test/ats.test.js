@@ -366,3 +366,38 @@ test("router: the full-name COMPOSE stays code-side (no single profile field can
   assert.strictEqual(ats.atsRouteLabel("Full Name", {}, PROFILE, {}).value, "Kevin Wang");
   assert.strictEqual(ats.atsRouteLabel("Name of your referrer", {}, PROFILE, {}), null); // anchored — never a stray "name" hit
 });
+
+// ── the APPLY-ELSEWHERE decoy (operator 2026-07-31, Anthropic/Constellation) ─────────────
+test("redirect: the strong phrases match the live Anthropic wordings — and ordinary postings never do", () => {
+  assert.ok(ats.ATS_REDIRECT_STRONG_RE.test("You do not need to submit this Greenhouse application."));
+  assert.ok(ats.ATS_REDIRECT_STRONG_RE.test("Please note that you will not be considered unless you complete the Constellation application form."));
+  assert.ok(ats.ATS_REDIRECT_STRONG_RE.test("you don't need to fill out this application"));
+  // never on ordinary language a real form uses:
+  assert.ok(!ats.ATS_REDIRECT_STRONG_RE.test("Please complete this application form below."));
+  assert.ok(!ats.ATS_REDIRECT_STRONG_RE.test("You will be considered for future roles."));
+  assert.ok(!ats.ATS_REDIRECT_STRONG_RE.test("Submit your application when ready."));
+});
+
+test("redirect: the anchor pick prefers apply-labeled text, refuses ambiguity, ignores noise links", () => {
+  const anchors = [
+    { href: "https://www.anthropic.com/jobs", text: "", nearPhrase: false },
+    { href: "https://bit.ly/afpsafety", text: "Apply using this link", nearPhrase: false },
+    { href: "https://alignment.anthropic.com/2024/fellows/", text: "Anthropic Fellows for AI Safety Research", nearPhrase: false },
+    { href: "https://bit.ly/afpsafety", text: "application", nearPhrase: true }, // same href twice = still ONE target
+  ];
+  assert.strictEqual(ats.atsPickRedirectAnchor(anchors), "https://bit.ly/afpsafety");
+  // two DIFFERENT apply-labeled targets → ambiguous → null (report, never guess)
+  assert.strictEqual(ats.atsPickRedirectAnchor([
+    { href: "https://a.example/apply", text: "Apply here" },
+    { href: "https://b.example/apply", text: "Apply using this link" },
+  ]), null);
+  assert.strictEqual(ats.atsPickRedirectAnchor([]), null);
+});
+
+test("redirect: atsInjDetectRedirect is self-contained (the cdpEval contract)", () => {
+  const src = String(ats.atsInjDetectRedirect);
+  assert.doesNotThrow(() => new Function("return (" + src + ")"));
+  for (const other of ["atsLib", "atsFd", "ATS_REDIRECT_STRONG_RE", "atsPickRedirectAnchor"]) {
+    assert.ok(!src.includes(other), "references " + other);
+  }
+});

@@ -729,6 +729,63 @@ const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_ty
 // profile value will ever contain — strip it for matching, commit by the FULL text.
 function atsDialStrip(optText) { return String(optText || "").replace(/\s*\+\d[\d\s-]*$/, "").trim(); }
 
+// ── APPLY-ELSEWHERE REDIRECT (operator 2026-07-31, the Anthropic/Constellation pattern) ──
+// Some postings host a DECOY form: "Please note that you will not be considered unless you
+// complete the Constellation application form… You do not need to submit this Greenhouse
+// application." The REAL application is the partner link — filling/submitting the hosted
+// form is worthless. Detection is STRONG-PHRASE only (precision over recall — a false
+// positive abandons a fillable application): the page must literally say this form doesn't
+// count. LOCKSTEP: the same pattern is inlined in atsInjDetectRedirect (injected fns can't
+// reference module scope).
+const ATS_REDIRECT_STRONG_RE = /(do(?:es)?\s*n[o']t|not)\s+(?:need|have|required)\s+to\s+(?:submit|complete|fill\s+out)\s+this\s+(?:greenhouse|lever|ashby)?\s*application|will\s+not\s+be\s+considered\s+unless\s+you\s+(?:complete|apply|submit)/i;
+
+// Pick the redirect anchor from the page's off-host links. Scored, first bucket wins:
+//   1. anchor TEXT says "apply" ("Apply using this link", "apply here", "application form")
+//   2. anchor sits in the SAME text block as the strong phrase
+//   3. href itself looks like an application form (apply|application|form in the URL)
+// 2+ DISTINCT hrefs in the winning bucket → ambiguous → null (report, never guess).
+function atsPickRedirectAnchor(anchors) {
+  const list = (anchors || []).filter((a) => a && a.href);
+  const uniq = (arr) => [...new Set(arr.map((a) => a.href))];
+  const byText = list.filter((a) => /\bapply\b|application\s+form/i.test(String(a.text || "")));
+  if (uniq(byText).length === 1) return byText[0].href;
+  if (uniq(byText).length > 1) return null;
+  const near = list.filter((a) => a.nearPhrase);
+  if (uniq(near).length === 1) return near[0].href;
+  if (uniq(near).length > 1) return null;
+  const byHref = list.filter((a) => /apply|application|form/i.test(String(a.href)));
+  if (uniq(byHref).length === 1) return byHref[0].href;
+  return null;
+}
+
+// Injected: does THIS page carry the apply-elsewhere note, and which off-host anchors could
+// be the real link? Read-only; the PICK stays SW-side (atsPickRedirectAnchor — testable).
+function atsInjDetectRedirect() {
+  // LOCKSTEP with the module-scope strong-phrase regex above (unreachable from an injected fn)
+  const strong = /(do(?:es)?\s*n[o']t|not)\s+(?:need|have|required)\s+to\s+(?:submit|complete|fill\s+out)\s+this\s+(?:greenhouse|lever|ashby)?\s*application|will\s+not\s+be\s+considered\s+unless\s+you\s+(?:complete|apply|submit)/i;
+  const body = document.body ? document.body.innerText || "" : "";
+  const m = strong.exec(body);
+  if (!m) return { redirect: false };
+  // the text block(s) holding the phrase — for the nearPhrase signal
+  const phraseNodes = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const n = walker.currentNode;
+    if (n.textContent && strong.test(n.textContent)) { const el = n.parentElement && n.parentElement.closest("p, div, section, label, li"); if (el) phraseNodes.push(el); }
+  }
+  const anchors = [...document.querySelectorAll('a[href^="http"]')].map((a) => {
+    let off = false;
+    try { off = new URL(a.href).host !== location.host; } catch (e) { off = false; }
+    if (!off) return null;
+    return {
+      href: a.href,
+      text: (a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120),
+      nearPhrase: phraseNodes.some((p) => p.contains(a) || (a.closest("p, div, section, label, li") || a).parentElement === p.parentElement),
+    };
+  }).filter(Boolean).slice(0, 60);
+  return { redirect: true, phrase: (body.match(strong) || [""])[0].slice(0, 160), anchors };
+}
+
 // Is this label a demographic question? ORTHOGONAL to routing (2026-07-31, Zoox): a BUCKET
 // can route an EEO field before the label ladder's EEO rung runs, and the bucket carries no
 // containment — so "Asian" missed Zoox's "Asian (Not Hispanic or Latino)" even though the
@@ -1289,6 +1346,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
+    ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
