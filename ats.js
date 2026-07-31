@@ -190,13 +190,18 @@ function atsRouteLabel(label, f, profile, defaults) {
   // answered "Yes" (authorized) where the right answer was "No" (no sponsorship needed):
   // a SILENT WRONG deterministic fill, the one failure class the ladder exists to prevent
   // (live 2026-07-31, regression-pinned).
+  // Every rung that resolves from a KNOWN profile field carries its `path` → the record's
+  // mappedPath → the bundle's canonical_field. The teach page prefers canonical_field over
+  // the LLM's maps_to hint, so a deterministic-but-flagged fill offers the RIGHT existing
+  // field instead of "no existing field matched" (live 2026-07-31: Zoox "Race" — the EEO
+  // rungs returned candidates with no path, so teach couldn't see race_ethnicity).
   if (/\bus person\b|export control/i.test(L)) return null;
   if (/sponsorship|sponsor.*visa|visa.*sponsor|require.*visa|need.*visa/i.test(L) && (wa.requires_sponsorship_now != null || wa.requires_sponsorship_future != null)) {
     const needs = !!wa.requires_sponsorship_now || !!wa.requires_sponsorship_future; // "now or in the future" — either
-    return { candidates: bool(needs), source: "work_auth", detail: "work_authorization.requires_sponsorship_(now|future)" };
+    return { candidates: bool(needs), source: "work_auth", path: "work_authorization.requires_sponsorship_now", detail: "work_authorization.requires_sponsorship_(now|future)" };
   }
   if (!/sponsor/i.test(L) && (/(authorized|legally able|eligible|legal right|right)\s.*\bwork\b|work authorization/i.test(L)) && wa.authorized_to_work_in_us != null) {
-    return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", detail: "work_authorization.authorized_to_work_in_us" };
+    return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", path: "work_authorization.authorized_to_work_in_us", detail: "work_authorization.authorized_to_work_in_us" };
   }
 
   // Profile links.
@@ -240,7 +245,7 @@ function atsRouteLabel(label, f, profile, defaults) {
   // How-did-you-hear — the same ladder the Workday source picker uses.
   if (/how did you (hear|find)|how'd you hear|where did you (hear|find)/i.test(L)) {
     const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
-    if (hdyh && Array.isArray(hdyh.preferred) && hdyh.preferred.length) return { candidates: [...hdyh.preferred], source: "map", detail: "how_did_you_hear.preferred" };
+    if (hdyh && Array.isArray(hdyh.preferred) && hdyh.preferred.length) return { candidates: [...hdyh.preferred], source: "map", path: "how_did_you_hear.preferred", detail: "how_did_you_hear.preferred" };
   }
 
   // EEO / demographics — deterministic ONLY from stated values (the Workday rule verbatim:
@@ -249,17 +254,17 @@ function atsRouteLabel(label, f, profile, defaults) {
   // ("No, I do not have a disability" ⊂ "…, or have had one in the past") commits at the
   // CONTAINMENT tier, which the driver grades filled_review (flagged, human verifies) —
   // never silent, and the ambiguity guard still refuses a 2+-option hit.
-  if (/hispanic|latino/i.test(L)) { if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true }; return { eeoUnstated: true }; }
-  if (/race|ethnicit/i.test(L)) { if (has(si.race_ethnicity)) return { candidates: [si.race_ethnicity], source: "eeo", containment: true }; return { eeoUnstated: true }; }
-  if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo", containment: true }; return { eeoUnstated: true }; }
-  if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo", containment: true }; return { eeoUnstated: true }; }
-  if (/gender|sex\b/i.test(L)) { if (has(si.gender)) return { candidates: [si.gender], source: "eeo", containment: true }; return { eeoUnstated: true }; }
+  if (/hispanic|latino/i.test(L)) { if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true, path: "self_identification.hispanic_or_latino" }; return { eeoUnstated: true }; }
+  if (/race|ethnicit/i.test(L)) { if (has(si.race_ethnicity)) return { candidates: [si.race_ethnicity], source: "eeo", containment: true, path: "self_identification.race_ethnicity" }; return { eeoUnstated: true }; }
+  if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo", containment: true, path: "self_identification.veteran_status" }; return { eeoUnstated: true }; }
+  if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo", containment: true, path: "self_identification.disability_status" }; return { eeoUnstated: true }; }
+  if (/gender|sex\b/i.test(L)) { if (has(si.gender)) return { candidates: [si.gender], source: "eeo", containment: true, path: "self_identification.gender" }; return { eeoUnstated: true }; }
   if (/pronoun/i.test(L)) return { skip: true, detail: "pronouns — not modeled in the profile (left blank)" };
 
   // Age gate (legally loaded — flag even though deterministic when stated).
   if (/\b(18|eighteen)\b.*(age|years|older)|age of 18|at least 18/i.test(L)) {
     const v = (aq.background_and_compliance || {}).at_least_18_years_old;
-    if (v != null) return { candidates: bool(!!v), source: "map", detail: "at_least_18_years_old" };
+    if (v != null) return { candidates: bool(!!v), source: "map", path: "application_questions.background_and_compliance.at_least_18_years_old", detail: "at_least_18_years_old" };
     return null;
   }
 
@@ -1285,12 +1290,19 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     if (wt === "textarea" || wt === "text" || wt === "date") {
       const ai = await atsAiWriteText(act, f, profile, jobContext);
       if (!ai.ok || !ai.answer) {
-        // REQUIRED text with no basis: enter the placeholder so the review page demands a
-        // human answer (the AI-2 pattern — a required blank would just block submit silently).
-        const placeholder = atsLib.AI_NEEDS_ANSWER_MARK + " — AI declined: " + ((ai && ai.error) || "no basis in profile") + "]";
-        await act.eval(atsInjSetText, ref.inputSel, placeholder);
-        rec.after = placeholder; rec.status = "needs_review"; rec.flag = "ai-text-needs-answer";
-        rec.detail = "REQUIRED free-text with no profile basis — placeholder entered, replace in review";
+        // REQUIRED text the AI can't ground: write "N/A" — a real, submittable answer that reads
+        // correctly on the form (operator 2026-07-31: "never answer with AI declined, N/A would be
+        // better"; live, the Kraken conditional "if yes, tell us more…" sat next to an answered
+        // "No", where N/A IS the truthful answer). Machine jargon must never reach an employer's
+        // form. SAFETY IS UNCHANGED: the record stays needs_review, so `requiresApproval` blocks
+        // submit until a human either edits it or knowingly approves the N/A.
+        const NA = "N/A";
+        await act.eval(atsInjSetText, ref.inputSel, NA);
+        const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+        rec.after = back && back.ok && back.value != null ? back.value : NA;
+        rec.status = "needs_review"; rec.flag = "ai-no-basis";
+        rec.detail = "the AI had no basis for this REQUIRED question — entered \"N/A\"; replace it or approve the N/A" +
+          (ai && ai.error && ai.error !== "ai-declined" ? " (" + ai.error + ")" : "");
         return;
       }
       const r = await act.eval(atsInjSetText, ref.inputSel, String(ai.answer));

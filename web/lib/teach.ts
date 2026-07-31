@@ -225,7 +225,12 @@ export function teachableCards(
       // DOTTED-normalize so a repeating field (canonical_field "education[0].degree") resolves against the
       // profile + matches the dotted panel rows (else it reads "no value", never highlights, can't be added).
       const bucket_path = bucketBindingFor(buckets, key); // authoritative Mode-A binding (wording match)
-      const maps_to = dottedPath(e.maps_to || "");
+      // ⚠ maps_to is an LLM-authored path and the model INVENTS plausible ones: live 2026-07-31 an
+      // Ashby/Lever relocation question came back `screening.willing_to_relocate`, which does not
+      // exist (the real path is application_questions.availability_and_preferences.willing_to_relocate).
+      // Binding a bucket to a nonexistent path yields a Mode-A bucket that resolves undefined forever —
+      // a DEAD bucket that silently teaches nothing. Only accept a hint that names a REAL profile field.
+      const maps_to = validProfilePath(profile, dottedPath(e.maps_to || "")) ? dottedPath(e.maps_to || "") : "";
       const canonical_field = dottedPath(e.canonical_field || "");
       const known = bucket_path || canonical_field || maps_to; // bucket binding wins, then FIELD_MAP, then the AI hint
       cards.push({
@@ -246,6 +251,27 @@ export function teachableCards(
     }
   }
   return cards;
+}
+
+/** Does `path` RESOLVE to a real answerable value in THIS profile? Guards the LLM's maps_to hint
+ *  (it invents plausible paths — see teachableCards). Deliberately checks RESOLUTION, not the
+ *  teach panel's displayable rows: flattenProfileFields skips nested objects, but a Mode-A bucket
+ *  resolves any dotted path, so `application_questions.availability_and_preferences.willing_to_
+ *  relocate` is a perfectly good binding target while `screening.willing_to_relocate` (invented)
+ *  is not. Object / array-of-objects targets are rejected — a bucket can't answer with a section. */
+export function validProfilePath(profile: unknown, path: string): boolean {
+  const p = String(path || "").trim();
+  if (!p || !profile || typeof profile !== "object") return false;
+  let cur: unknown = profile;
+  for (const key of p.split(".")) {
+    if (cur == null || typeof cur !== "object") return false;
+    cur = (cur as Record<string, unknown>)[key];
+    if (cur === undefined) return false;
+  }
+  if (cur === null) return true;                                  // present but unset — still a real field
+  if (typeof cur === "object" && !Array.isArray(cur)) return false; // a whole section, not an answer
+  if (Array.isArray(cur)) return cur.every((x) => typeof x === "string"); // tiered list yes, objects no
+  return true;
 }
 
 /** Same-vs-different answer for the add-wording-vs-new-bucket decision (normalize per the plan). */

@@ -262,9 +262,12 @@ test("driver: OPTIONAL unmapped field stays blank (no AI spend), REQUIRED text g
   const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
   const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
   assert.strictEqual(by.question_1.status, "skipped");           // optional → no AI call, blank
-  assert.strictEqual(by.question_2.status, "needs_review");      // required + declined → placeholder
-  assert.strictEqual(by.question_2.flag, "ai-text-needs-answer");
-  assert.match(values["#q2"], /NEEDS YOUR ANSWER/);
+  // required + the AI has no basis → a real, submittable "N/A" (never machine jargon on an
+  // employer's form — operator 2026-07-31), still needs_review so approval gates the submit
+  assert.strictEqual(by.question_2.status, "needs_review");
+  assert.strictEqual(by.question_2.flag, "ai-no-basis");
+  assert.strictEqual(values["#q2"], "N/A");
+  assert.ok(!/NEEDS YOUR ANSWER|declined/i.test(values["#q2"]), "no jargon reaches the form");
 });
 
 test("driver: EEO select with NO stated value stays blank + eeo_declined (never AI-inferred)", async () => {
@@ -399,5 +402,28 @@ test("redirect: atsInjDetectRedirect is self-contained (the cdpEval contract)", 
   assert.doesNotThrow(() => new Function("return (" + src + ")"));
   for (const other of ["atsLib", "atsFd", "ATS_REDIRECT_STRONG_RE", "atsPickRedirectAnchor"]) {
     assert.ok(!src.includes(other), "references " + other);
+  }
+});
+
+// ── canonical_field: a deterministic rung must NAME its profile path (the teach hand-off) ──
+test("router: profile-backed rungs carry `path` so the review entry gets canonical_field", () => {
+  // Live 2026-07-31: Zoox "Race" filled deterministically from the profile but the EEO rung
+  // returned candidates with NO path → canonical_field empty → the teach page said "no
+  // existing field matched" and offered to create a duplicate answer instead of binding to
+  // self_identification.race_ethnicity.
+  const cases = [
+    ["Race", "self_identification.race_ethnicity"],
+    ["Gender", "self_identification.gender"],
+    ["Veteran Status", "self_identification.veteran_status"],
+    ["Disability Status", "self_identification.disability_status"],
+    ["Are you Hispanic/Latino?", "self_identification.hispanic_or_latino"],
+    ["Are you legally authorized to work in the United States?", "work_authorization.authorized_to_work_in_us"],
+    ["Will you now or in the future require sponsorship?", "work_authorization.requires_sponsorship_now"],
+    ["How did you hear about this job?", "how_did_you_hear.preferred"],
+  ];
+  for (const [label, path] of cases) {
+    const r = ats.atsRouteLabel(label, {}, PROFILE, {});
+    assert.ok(r, "no route for " + label);
+    assert.strictEqual(r.path, path, label);
   }
 });

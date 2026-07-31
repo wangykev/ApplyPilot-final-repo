@@ -693,3 +693,66 @@ test("alias wordings: only fields the profile HAS get alias seeds (no orphan buc
   const out = ensureDefaultFieldWordings([], { personal_info: { email: "k@x.com" } });
   assert.ok(!out.find((b) => b.profile_path === "work_experience.0.company"), "no work-experience bucket without work experience");
 });
+
+// ── maps_to is LLM-authored and can be a HALLUCINATED path (live 2026-07-31) ──────────────
+test("teachableCards: a maps_to naming a NONEXISTENT profile path is dropped, not offered", () => {
+  // An Ashby/Lever relocation question returned maps_to "screening.willing_to_relocate" — no
+  // such path (the real one is application_questions.availability_and_preferences.*). Binding
+  // a bucket there would resolve undefined forever: a dead bucket that teaches nothing.
+  const profile = {
+    personal_info: { first_name: "Kevin" },
+    application_questions: { availability_and_preferences: { willing_to_relocate: true } },
+  };
+  const cards = teachableCards(
+    [src("a", [entry({
+      question_label: "Can you relocate to New York?",
+      widget_type: "radio",
+      current_value: "Yes",
+      flag: "ai-choice",
+      needs_review: true,
+      is_approved: true,
+      maps_to: "screening.willing_to_relocate",
+    })])],
+    [],
+    profile
+  );
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].maps_to, "", "the invented path must be dropped");
+});
+
+test("teachableCards: a maps_to naming a REAL profile path survives", () => {
+  const profile = { application_questions: { availability_and_preferences: { willing_to_relocate: true } } };
+  const cards = teachableCards(
+    [src("a", [entry({
+      question_label: "Can you relocate?",
+      widget_type: "radio",
+      current_value: "Yes",
+      flag: "ai-choice",
+      needs_review: true,
+      is_approved: true,
+      maps_to: "application_questions.availability_and_preferences.willing_to_relocate",
+    })])],
+    [],
+    profile
+  );
+  assert.equal(cards[0].maps_to, "application_questions.availability_and_preferences.willing_to_relocate");
+});
+
+test("teachableCards: canonical_field (a deterministic fill's own path) beats an absent maps_to", () => {
+  const profile = { self_identification: { race_ethnicity: "Asian" } };
+  const cards = teachableCards(
+    [src("a", [entry({
+      question_label: "Race",
+      widget_type: "dropdown",
+      current_value: "Asian (Not Hispanic or Latino)",
+      flag: "non-exact-match",
+      needs_review: true,
+      is_approved: true,
+      canonical_field: "self_identification.race_ethnicity",
+    })])],
+    [],
+    profile
+  );
+  assert.equal(cards[0].canonical_field, "self_identification.race_ethnicity");
+  assert.equal(cards[0].profile_value, "Asian", "the panel shows the existing value, so the UI can offer the real field");
+});
