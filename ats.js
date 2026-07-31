@@ -1244,35 +1244,46 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // option). The settle must be SW wall-clock; a page-side timer would be throttled hidden.
     const typeInto = async (text) => {
       await act.eval(atsInjTypeInCombo, ref.inputSel, "");
-      await act.delayFull(250);
+      await act.delay(250);   // adaptive — the read-back below is the real gate
       const r = await act.eval(atsInjTypeInCombo, ref.inputSel, String(text));
-      await act.delayFull(150);
+      await act.delay(150);
       // READ BACK: a controlled input can silently revert (that is exactly this bug's shape),
       // and "we typed it" is not evidence the widget received it.
       const back = await act.eval(atsInjReadComboInput, ref.inputSel);
       return Object.assign({}, r, { stuck: !!(back && back.value === String(text)), got: back && back.value });
     };
+    // READ FIRST, then wait — and wait ADAPTIVELY. The Workday Stage-2 pacing rule: a poll
+    // gated by an interval-length-INDEPENDENT state check can shrink its interval safely, and
+    // waiting BEFORE the first read charged every already-open menu a full beat. The DEADLINE
+    // stays real wall-clock, so a genuinely slow widget still gets its full budget.
     const pollFor = async (ms, want) => {           // want(texts) → done?
       const deadline = Date.now() + ms;
       let last = null;
-      while (Date.now() < deadline) {
-        await act.delayFull(250);
+      for (;;) {
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
         if (r && r.options) last = r;
         if (r && want(optsOf(r))) return r;
+        if (Date.now() >= deadline) return last;
+        // ⚠ REAL 150ms, not the adaptive delay. Adaptive collapses to ~20ms when timers measure
+        // fast, and each poll tick is a Runtime.evaluate round trip — at that rate the polling
+        // STARVES the renderer and the menu never paints. Live 2026-07-31: switching this one
+        // interval to adaptive took a 20-field GitLab fill from 4 review items to 11, every
+        // regression reading "the dropdown opened but listed no options". The win came
+        // from reading BEFORE the first wait (an already-open menu costs nothing); the interval
+        // itself must stay real so the page has time to do its own work.
+        await act.delayFull(150);
       }
-      return last;
     };
 
     let nearMatches = []; // what a by-name search turned up — the operator's real choices
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
-    let read = await pollFor(3000, (t) => t.length > 0);
+    let read = await pollFor(1800, (t) => t.length > 0);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
     for (let attempt = 0; attempt < 2 && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-      read = await pollFor(2500, (t) => t.length > 0);
+      read = await pollFor(1500, (t) => t.length > 0);
     }
     if (wt === "location") {
       await typeInto(String(candidates[0]).split(",")[0]);
@@ -1289,7 +1300,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // exact against whatever the widget returns — a looser query never loosens the answer.
         const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
         const typed = await typeInto(query);
-        let found = await pollFor(2500, (t) => t.length > 0 && hasHit(t));
+        let found = await pollFor(2000, (t) => t.length > 0 && hasHit(t));
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
         // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
         // shows nothing — live 2026-07-31 this read as "the value isn't in the list" with
@@ -1300,9 +1311,9 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
           // non-forced re-open no-ops on a phantom-expanded widget and the menu stays shut
           // forever. Re-type afterwards — opening can reset the query the widget just took.
           await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-          await act.delayFull(250);
+          await act.delay(250);
           await typeInto(query);
-          found = await pollFor(2500, (t) => t.length > 0 && hasHit(t));
+          found = await pollFor(1500, (t) => t.length > 0 && hasHit(t));
         }
         const seen = optsOf(found);
         try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
@@ -1311,7 +1322,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       }
       if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
         await act.eval(atsInjTypeInCombo, ref.inputSel, "");
-        const restored = await pollFor(2000, (t) => t.length > 0);
+        const restored = await pollFor(1200, (t) => t.length > 0);
         if (optsOf(restored).length) read = restored;
       }
     }
@@ -1325,7 +1336,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         ? "location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser; answer it in the tab before submitting)"
         // distinguish "the control never opened" from "it opened but listed nothing" — they
         // have different causes (an unrecognized widget vs an empty/server-backed list)
-        : ((opened && opened.ok) ? "the dropdown opened but listed no options after 4s" : "could not open the dropdown (control not found)");
+        : ((opened && opened.ok) ? "the dropdown opened but listed no options" : "could not open the dropdown (control not found)");
       await act.eval(atsInjCloseCombo, ref.inputSel);
       return true;
     }
@@ -1538,9 +1549,15 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     if (wt === "select" || wt === "dial" || wt === "location" || wt === "dropdown_native") {
       if (wt !== "dropdown_native") {
         await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
-        await act.delayFull(400);
-        const read = await act.eval(atsInjReadOptions, ref.inputSel);
-        texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+        // read-first, then poll adaptively (same rule as the deterministic path) — a one-shot
+        // read after a flat wait both over-waits an open menu and under-waits a slow one
+        const optDeadline = Date.now() + 1800;
+        for (;;) {
+          const read = await act.eval(atsInjReadOptions, ref.inputSel);
+          texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+          if (texts.length || Date.now() >= optDeadline) break;
+          await act.delayFull(150); // real interval — see pollFor's note on starving the renderer
+        }
       }
     }
     if (!texts.length) { rec.status = "needs_review"; rec.detail = "AI fallback: no live options to choose from"; return; }

@@ -2742,3 +2742,27 @@ Also on this form: `#country` is intl-tel-input's own dropdown (`iti__country-li
 `iti-0__item-af`), NOT a react-select — and its 244 `[role=option]` rows sit in the DOM
 permanently, so a page-wide option scrape "finds" 244 options for any widget. Every read stays
 scoped to the field's own `react-select-<name>-listbox`.
+
+## 2026-07-31 (c) — pacing a page-side-synthetic fill: read first, but DON'T poll faster than the page can paint
+
+Multi-ATS actuates entirely through page-side synthetic events (`Runtime.evaluate`), so unlike
+Workday there is no trusted-input pipeline to pay for — yet a HIDDEN fill still measured 37%
+slower than a visible one (15.6s vs 11.4s over 20 GitLab fields). Two findings, in order:
+
+1. **Waiting before the first read charges every already-open widget a full beat.** The poll now
+   READS FIRST and only then waits, so a menu that is already open costs nothing. Free win.
+2. **⚠ But the interval itself must stay REAL wall-clock.** Routing it through the adaptive delay
+   (Workday's Stage-2 trick) collapsed it to ~20ms when timers measured fast — and since every
+   tick is a `Runtime.evaluate` round trip, the polling STARVED the renderer: the same GitLab
+   fill went from 4 review items to **11**, every regression reading "the dropdown opened but
+   listed no options". Adaptive pacing is safe for Workday's *inter-action* delays; it is NOT
+   safe for a poll whose own ticks are page evaluations. Fixed interval: 150ms.
+
+Third lever: a HEALTHY widget exits on its first read, so open/search DEADLINES are paid only by
+widgets that are failing anyway — one dead select was costing ~13s (3s open + 2×2.5s forced
+toggles + 2×2.5s search). Trimmed to ~8s total, which is what closed the remaining gap.
+
+Result: HIDDEN 21.0s vs VISIBLE 18.9s on the same 21-field form — an 11% difference, with
+identical fill quality. Remaining wall-clock is dominated by LLM latency (4 AI answers), not
+pacing. `[ATS-TIME]` logs seconds + ms/field + the tab's real visibility on every run, so the
+next pacing round retunes from evidence.

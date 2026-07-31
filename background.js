@@ -3696,6 +3696,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (jdText) jobContext.description = String(jdText).slice(0, 4000);
 
     emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
+    const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
     const out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
@@ -3708,6 +3709,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     });
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
     await reportApplication(bundle, jobContext);
+    // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
+    // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
+    const fillMs = Date.now() - fillT0;
+    const perField = out.results.length ? Math.round(fillMs / out.results.length) : 0;
+    let visNow = null; try { visNow = await cdpVisible(); } catch (e) {}
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"})`);
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
