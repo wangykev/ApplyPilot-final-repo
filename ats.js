@@ -883,6 +883,56 @@ function atsInjFindApplyLinks() {
   return { ok: true, url: location.href, links: out, applyButtons: btns.slice(0, 5) };
 }
 
+// Click an apply BUTTON (no href) and report where it left us. Some careers pages route their
+// apply action through script rather than a link, so an anchor-only search finds nothing and
+// the run stops on a page that has a perfectly good Apply button (live 2026-07-31). Text-matched
+// because these pages carry no stable attribute; refuses when the match is ambiguous.
+function atsInjClickApplyButton() {
+  // A HIDDEN tab can skip layout, so a 0x0 rect is NOT proof an element is invisible.
+  // checkVisibility() answers from computed style, which a hidden tab still maintains.
+  const vis = (el) => {
+    if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const APPLY_RE = /^apply\b|\bapply (now|here|for this)\b/i;
+  const all = [...document.querySelectorAll('button, [role="button"], a[href="#"]')].filter((b) => {
+    const t = (b.textContent || "").replace(/\s+/g, " ").trim();
+    return APPLY_RE.test(t) && t.length <= 40;
+  });
+  // Prefer a visibly-rendered one, but an all-invisible verdict falls back to the full set
+  // rather than abandoning the run on a measurement a hidden tab is known to get wrong.
+  const shown = all.filter(vis);
+  const btns = shown.length ? shown : all;
+  if (btns.length === 0) return { ok: false, reason: "no-apply-button" };
+  const uniq = [...new Set(btns.map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()))];
+  if (uniq.length > 1) return { ok: false, reason: "ambiguous", offered: uniq.slice(0, 4) };
+  btns[0].click();
+  return { ok: true, clicked: uniq[0], hiddenLayout: shown.length === 0 };
+}
+
+// An employer page can EMBED the ATS form in an iframe rather than link to it (Greenhouse's
+// "#grnhse_app" widget and its `?gh_jid=` pages are the common case; Lever and Ashby ship the
+// same kind of widget). The iframe SRC is the exact URL the employer itself uses, so reading it
+// beats constructing one from a job id: no guessing about which board host or path shape.
+// Returns every frame src so the SW can pick with detectAts and report what it saw.
+function atsInjFindEmbeddedForms() {
+  const srcs = [...document.querySelectorAll("iframe")]
+    .map((f) => f.getAttribute("src") || f.src || "")
+    .filter(Boolean);
+  return { srcs: srcs.slice(0, 20) };
+}
+
+// Pick an embedded ATS form to open. `isAts` is injected (detectAts) so host knowledge stays
+// SW-side. Refuses ambiguity the same way the apply-link picker does: two DIFFERENT ATS frames
+// on one page is not a situation to guess through.
+function atsPickEmbeddedForm(srcs, isAts) {
+  const abs = (u) => { try { return new URL(u, "https://x.invalid").href; } catch (e) { return null; } };
+  const ats = (srcs || []).map(abs).filter((u) => u && isAts(u));
+  const uniq = [...new Set(ats)];
+  return uniq.length === 1 ? uniq[0] : null;
+}
+
 // Choose the apply link to follow. `isAts` is injected (detectAts) so host knowledge stays
 // SW-side. A link the pipeline can actually DRIVE wins; otherwise a single apply-labelled
 // link is followed and re-classified on landing; ambiguity refuses (report, never guess).
@@ -1329,11 +1379,21 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const options = (read && read.options) || [];
     if (!options.length) {
       rec.status = f.isRequired ? "needs_review" : "skipped";
+      // A LOCATION box whose places service never answered still HOLDS what we typed, and that
+      // text came from the profile rather than a guess. Leave it in the field and report it as
+      // the value, so review shows something real to approve instead of "— blank —" (live
+      // 2026-08-01: google.maps never loads in this browser, so a HUMAN gets no suggestions
+      // either). Still needs_review — the form may want a places selection we could not make.
+      if (wt === "location" && candidates.length) {
+        const typed = await typeInto(String(candidates[0]));
+        if (typed && typed.ok && typed.got) { rec.after = typed.got; rec.matchTier = "typed-unverified"; }
+      }
       // GH location note (2026-07-31, Figma): the places lookup can hang on "Loading…" with ZERO
       // network — google.maps never loads in some browsers, so even a HUMAN typing gets no options.
       // Name that in the review row instead of a bare "did not render".
       rec.detail = wt === "location"
-        ? "location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser; answer it in the tab before submitting)"
+        ? ("location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser)"
+           + (rec.after ? ' — the box now holds "' + rec.after + '" from your profile; confirm it, or answer it in the tab.' : " — answer it in the tab before submitting."))
         // distinguish "the control never opened" from "it opened but listed nothing" — they
         // have different causes (an unrecognized widget vs an empty/server-backed list)
         : ((opened && opened.ok) ? "the dropdown opened but listed no options" : "could not open the dropdown (control not found)");
@@ -1611,7 +1671,8 @@ if (typeof module !== "undefined" && module.exports) {
     atsRouteLabel, atsRouteField, atsDialStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
-    atsInjFindApplyLinks, atsPickApplyLink,
+    atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
+    atsInjFindEmbeddedForms, atsPickEmbeddedForm,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,

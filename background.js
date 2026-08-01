@@ -3656,6 +3656,17 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (!ready.ready && !(opts0.applyHops >= 1)) {
       const here2 = await cdpEval(function () { return location.href; }).catch(() => null);
       const landedAts = detectAts(here2);
+      // FIRST: the form may be EMBEDDED here rather than linked (Greenhouse's #grnhse_app
+      // widget — live 2026-08-01 on two employer sites). The iframe src is the employer's own
+      // form URL, so this is evidence, not a constructed guess.
+      const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
+      const embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
+      if (embUrl) {
+        const embAts = detectAts(embUrl);
+        LOG(`the form is EMBEDDED on this page — opening the frame directly (${embAts}): ${embUrl}`);
+        await cdpDetach();
+        return await runAtsApplicationRun(tabId, embAts, store, embUrl, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
+      }
       const found = await cdpEval(atsInjFindApplyLinks).catch(() => null);
       const link = found && atsPickApplyLink(found.links, detectAts);
       LOG(`no form here (${here2}${landedAts ? ", " + landedAts : ", not a supported ATS host"}) — ${(found && found.links.length) || 0} apply link(s); following: ${link || "NONE (ambiguous/absent)"}`);
@@ -3678,6 +3689,24 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
         return await runAtsApplicationRun(tabId, afterAts, store, after, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
       }
+    }
+    // No followable LINK, but the page may route Apply through a BUTTON (live 2026-07-31).
+    if (!ready.ready && !(opts0.applyHops >= 1)) {
+      const clicked = await cdpEval(atsInjClickApplyButton).catch(() => null);
+      if (clicked && clicked.ok) {
+        LOG(`clicked the apply button (${clicked.clicked}) — waiting for the landing`);
+        await cdpDelay(3000);
+        const after2 = await cdpEval(function () { return location.href; }).catch(() => null);
+        const afterAts2 = detectAts(after2);
+        LOG(`apply button landed on ${after2} (${afterAts2 || "unsupported host"})`);
+        if (afterAts2 && afterAts2 !== "workday") {
+          await cdpDetach();
+          return await runAtsApplicationRun(tabId, afterAts2, store, after2, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
+        }
+        return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after2,
+          detail: "The application lives at " + after2 + " — a host this pipeline can't drive yet; apply there yourself." };
+      }
+      if (clicked && clicked.reason) LOG(`no apply button to follow (${clicked.reason}${clicked.offered ? ": " + clicked.offered.join(" | ") : ""})`);
     }
     if (!ready.ready) {
       const hereX = await cdpEval(function () { return location.href; }).catch(() => null);

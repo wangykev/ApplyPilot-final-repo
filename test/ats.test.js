@@ -559,3 +559,33 @@ test("driver: on a LONG list the review options narrow to the near-matches; a sh
   assert.ok(shown.includes("Carnegie Mellon University - Pittsburgh"), "the operator must SEE the real choices");
   assert.ok(shown.length <= 20, "a 302-option list is narrowed to the relevant neighbourhood");
 });
+
+// An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
+// be followed into the frame, and an ambiguous page must refuse rather than pick one.
+test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
+  const det = (u) => (/greenhouse/.test(u) ? "greenhouse" : /lever/.test(u) ? "lever" : null);
+  assert.equal(
+    ats.atsPickEmbeddedForm(["https://www.youtube.com/embed/x", "https://job-boards.greenhouse.io/embed/job_app?token=1"], det),
+    "https://job-boards.greenhouse.io/embed/job_app?token=1"
+  );
+  // the same frame twice is ONE choice, not an ambiguity
+  assert.equal(ats.atsPickEmbeddedForm(["https://job-boards.greenhouse.io/a", "https://job-boards.greenhouse.io/a"], det), "https://job-boards.greenhouse.io/a");
+  // two DIFFERENT ATS frames: refuse
+  assert.equal(ats.atsPickEmbeddedForm(["https://job-boards.greenhouse.io/a", "https://jobs.lever.co/b"], det), null);
+  assert.equal(ats.atsPickEmbeddedForm(["https://cdn.example.com/x"], det), null);
+  assert.equal(ats.atsPickEmbeddedForm([], det), null);
+});
+
+// The apply-BUTTON finder must match real apply wording and reject near-misses; it is the
+// last resort before a run gives up, so a false negative abandons a fillable application.
+test("apply button: matches apply wording, rejects near-misses", () => {
+  const src = String(ats.atsInjClickApplyButton);
+  const m = src.match(/APPLY_RE = (\/[^;]+\/i)/);
+  assert.ok(m, "APPLY_RE literal present");
+  const re = eval(m[1]);
+  for (const good of ["Apply", "Apply Now", "Apply now", "Apply here", "Apply for this job"]) assert.ok(re.test(good), good);
+  for (const bad of ["Reapply later", "Application status", "Applying soon"]) assert.ok(!re.test(bad), bad);
+  // no stray control characters (a corrupted escape once made this regex match nothing)
+  const ctrl = [...src].some((c) => { const n = c.codePointAt(0); return n < 32 && n !== 10 && n !== 13 && n !== 9; });
+  assert.equal(ctrl, false, "no control chars in the injected source");
+});
