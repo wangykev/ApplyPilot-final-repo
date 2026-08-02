@@ -638,7 +638,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // shape: bundle blockers (already checked above) + strict live verify + no visible
         // captcha + arm. Workday keeps the existing onboard→replay path below.
         {
-          const atsKind = detectAts(startUrl);
+          // URL first (cheap + covers the board-hosted case), then what the FILL recorded — an
+          // employer-hosted form is invisible to detectAts but was filled by this pipeline.
+          const atsKind = detectAts(startUrl) || (pull.bundle && pull.bundle.ats) || null;
+          if (!detectAts(startUrl) && atsKind) LOG(`the URL names no ATS, but this application was filled by the ${atsKind} pipeline — using it`);
           if (atsKind && atsKind !== "workday") {
             emitRunProgress(arm ? "Submitting" : "Rehearsing", atsKind + " — " + (background ? "background tab" : "foreground tab"));
             const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
@@ -3736,6 +3739,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       page: pageKey, pageNumber: 1, pageLabel: "Application",
       url: out.url, tenant: jobContext.company || null, capturedAt: new Date().toISOString(),
     });
+    // WHICH PIPELINE filled this, recorded on the bundle. A submit run detects the ATS from the
+    // URL, but an employer-HOSTED form (careers.<company>.com — Greenhouse/Lever/Ashby all serve
+    // under the employer's own domain) detects as nothing and used to fall through to the Workday
+    // onboard path, which halted "unknown-page" on a form we had just filled successfully
+    // (live 2026-08-01). The fill already KNOWS the answer, so it writes it down.
+    bundle.ats = ats;
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
     await reportApplication(bundle, jobContext);
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):

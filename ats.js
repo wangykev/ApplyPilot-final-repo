@@ -259,7 +259,12 @@ function atsRouteLabel(label, f, profile, defaults) {
   if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo", containment: true, path: "self_identification.veteran_status" }; return { eeoUnstated: true }; }
   if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo", containment: true, path: "self_identification.disability_status" }; return { eeoUnstated: true }; }
   if (/gender|sex\b/i.test(L)) { if (has(si.gender)) return { candidates: [si.gender], source: "eeo", containment: true, path: "self_identification.gender" }; return { eeoUnstated: true }; }
-  if (/pronoun/i.test(L)) return { skip: true, detail: "pronouns — not modeled in the profile (left blank)" };
+  // Pronouns are not modeled in the profile. OPTIONAL ⇒ leave blank (nothing is lost). REQUIRED ⇒
+  // do NOT swallow it here: returning skip bypassed the required-field machinery entirely, so a
+  // required Pronouns field reached review empty and could not be approved, blocking an otherwise
+  // complete application (live 2026-08-01). Falling through to null lets the ordinary required
+  // path run — the form^s own decline option, or an AI answer that is always flagged.
+  if (/pronoun/i.test(L)) return f && f.isRequired ? null : { skip: true, detail: "pronouns — not modeled in the profile (left blank)" };
 
   // Age gate (legally loaded — flag even though deterministic when stated).
   if (/\b(18|eighteen)\b.*(age|years|older)|age of 18|at least 18/i.test(L)) {
