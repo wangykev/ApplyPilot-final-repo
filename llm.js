@@ -98,7 +98,33 @@ const LLM_PROVIDERS = {
 // its existing single-attempt contract. Worst case adds ~10s to a failing call — acceptable;
 // the alternative is a needs_review on a field the model could have answered seconds later.
 const LLM_RETRY_STATUS = { 429: true, 500: true, 502: true, 503: true, 504: true, 529: true };
-const LLM_RETRY_DELAYS_MS = [2000, 8000]; // wait-then-retry, in order; length = max retries
+// Wait-then-retry, in order; length = max retries. Reaches ~75s because a 429 is usually a
+// per-MINUTE quota and the old 2s+8s ladder could not outlast one (live 2026-08-02: a 65-field
+// form burned its quota and fields fell to needs_review the model could have answered).
+const LLM_RETRY_DELAYS_MS = [2000, 8000, 20000, 45000];
+// A 429 usually carries Retry-After (seconds, or an HTTP date). Obeying the server beats
+// guessing — but cap it, so a header asking for an hour can't hang a run.
+const LLM_RETRY_AFTER_CAP_MS = 60000;
+// CIRCUIT BREAKER. Retrying is right for a momentary spike and wrong for an EXHAUSTED quota:
+// with a full ladder per field, one dead quota would turn a 65-field form into a ~45-minute
+// stall. After this many calls exhaust their whole ladder back-to-back, stop retrying for a
+// cooldown — each call still gets ONE attempt, so the moment the quota frees up we recover.
+const LLM_BREAKER_TRIP_AFTER = 3;
+const LLM_BREAKER_COOLDOWN_MS = 120000;
+const llmRetryState = { consecutiveExhausted: 0, coolingUntil: 0 };
+function resetLlmRetryState() { llmRetryState.consecutiveExhausted = 0; llmRetryState.coolingUntil = 0; }
+// Retry-After → ms. Accepts a delta-seconds number or an HTTP date; null when absent/unusable.
+function llmRetryAfterMs(res, nowMs) {
+  try {
+    const h = res && res.headers && typeof res.headers.get === "function" ? res.headers.get("retry-after") : null;
+    if (!h) return null;
+    const secs = Number(String(h).trim());
+    if (Number.isFinite(secs)) return Math.max(0, Math.min(secs * 1000, LLM_RETRY_AFTER_CAP_MS));
+    const when = Date.parse(String(h));
+    if (!Number.isFinite(when)) return null;
+    return Math.max(0, Math.min(when - (nowMs || Date.now()), LLM_RETRY_AFTER_CAP_MS));
+  } catch (e) { return null; }
+}
 
 // callLLM — provider-agnostic. Returns { ok:true, text } or { ok:false, error }.
 // `fetchImpl` is injectable for Node tests; in the SW/popup it defaults to global fetch.
@@ -119,22 +145,45 @@ async function callLLM(req, fetchImpl, sleepImpl) {
   try { ({ url, opts } = prov.build(cfg)); } catch (e) { return { ok: false, error: "request build failed: " + String((e && e.message) || e) }; }
   const sleep = sleepImpl || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
-  let res, attempt = 0;
+  // While the breaker is cooling, take ONE attempt and don't spend the ladder.
+  const cooling = Date.now() < llmRetryState.coolingUntil;
+  const maxRetries = cooling ? 0 : LLM_RETRY_DELAYS_MS.length;
+  let res, attempt = 0, netErr = null;
   for (;;) {
-    try { res = await fetchFn(url, opts); } catch (e) { return { ok: false, error: "network error: " + String((e && e.message) || e) }; }
-    if (res && !res.ok && LLM_RETRY_STATUS[res.status] && attempt < LLM_RETRY_DELAYS_MS.length) {
-      await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+    netErr = null;
+    try { res = await fetchFn(url, opts); }
+    catch (e) { netErr = String((e && e.message) || e); res = null; }
+    // A network throw is transient too (DNS blip, dropped socket) — it earns the same ladder.
+    const retryable = netErr !== null || (res && !res.ok && LLM_RETRY_STATUS[res.status]);
+    if (retryable && attempt < maxRetries) {
+      const after = res ? llmRetryAfterMs(res, Date.now()) : null; // the server's own advice wins
+      await sleep(after == null ? LLM_RETRY_DELAYS_MS[attempt] : after);
       attempt++;
       continue;
     }
     break;
   }
+  if (netErr !== null) {
+    if (attempt > 0) llmRetryState.consecutiveExhausted++;
+    return { ok: false, error: "network error: " + netErr + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "") };
+  }
   if (!res || !res.ok) {
+    // Only a RETRYABLE exhaustion counts toward the breaker — a 401 says nothing about capacity.
+    if (res && LLM_RETRY_STATUS[res.status]) {
+      llmRetryState.consecutiveExhausted++;
+      if (llmRetryState.consecutiveExhausted >= LLM_BREAKER_TRIP_AFTER) {
+        llmRetryState.coolingUntil = Date.now() + LLM_BREAKER_COOLDOWN_MS;
+        llmRetryState.consecutiveExhausted = 0;
+      }
+    }
     let body = "";
     try { body = await res.text(); } catch (e) { /* ignore */ }
     return { ok: false, error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : "")
-      + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "") };
+      + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "")
+      + (cooling ? " [rate-limit cooldown: not retrying for now]" : "") };
   }
+  llmRetryState.consecutiveExhausted = 0; // a success clears the run of failures
+  llmRetryState.coolingUntil = 0;
   let data;
   try { data = await res.json(); } catch (e) { return { ok: false, error: "bad JSON response: " + String((e && e.message) || e) }; }
   let text;
@@ -161,5 +210,6 @@ const LLM_DEFAULT_MODELS = { anthropic: LLM_MODELS.anthropic[0], gemini: LLM_MOD
 // UMD-lite: export for the Node test runner; in the popup/SW `module` is undefined so
 // the functions stay globals (from <script> / importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS };
+  module.exports = {
+    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS };
 }
