@@ -933,6 +933,37 @@ function atsPickEmbeddedForm(srcs, isAts) {
   return uniq.length === 1 ? uniq[0] : null;
 }
 
+// The DURABLE identity of a field, for matching a stored review entry against a live form on a
+// LATER page load. Two ATS-wide prefixes are per-session noise and must be stripped:
+//   - Ashby renders a custom question as "<form-instance-uuid>_<question-uuid>", and the FIRST
+//     uuid is regenerated on every page load (live 2026-08-01: the same two work-authorization
+//     questions came back under a different prefix, so the replay reported the approved values
+//     as having no field on the form and refused an otherwise-clean submit).
+//   - Its system fields carry the same kind of prefix before "__systemfield_".
+// Only a FULL uuid followed by more content is stripped, so a field whose real name merely
+// starts with hex is left alone.
+function atsDurableFieldName(name) {
+  let n = String(name == null ? "" : name);
+  n = n.replace(new RegExp("^" + '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' + "(?=__systemfield_)", "i"), "");
+  n = n.replace(new RegExp("^" + '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' + "_(?=.+$)", "i"), "");
+  return n;
+}
+
+// The form's OWN "no answer" option, if it offers one. A required choice question the profile
+// cannot answer must not be left blank — it blocks the submit and reaches the operator as a
+// dead end. Declining is a real, truthful, submittable answer that asserts nothing false, and a
+// form only ever OFFERS it for a question where declining is acceptable. This is the choice-
+// widget twin of the required-text "N/A" rule (operator 2026-07-31: "never answer with AI
+// declined, N/A would be better"). Anchored at the start so it can never match a real answer.
+var ATS_DECLINE_RE = /^(i )?(don't|dont|do not|prefer not|choose not|wish not|decline)\s*(to\s*)?(wish |want )?(to )?(answer|self[ -]?identify|disclose|say|state|specify|respond|provide)/i;
+function atsDeclineOption(texts) {
+  const list = (texts || []).map((t) => String(t == null ? "" : t).replace(/\s+/g, " ").trim());
+  const hits = list.filter((t) => t && ATS_DECLINE_RE.test(t));
+  // Exactly one decline option is unambiguous; two or more means the wording is doing something
+  // we do not understand, so refuse rather than pick one.
+  return hits.length === 1 ? hits[0] : null;
+}
+
 // Choose the apply link to follow. `isAts` is injected (detectAts) so host knowledge stays
 // SW-side. A link the pipeline can actually DRIVE wins; otherwise a single apply-labelled
 // link is followed and re-classified on landing; ambiguity refuses (report, never guess).
@@ -1112,7 +1143,38 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       }
       if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(rec); continue; }
       if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(rec); continue; }
-      if (route && route.eeoUnstated) { rec.status = "skipped"; rec.detail = "demographic not stated in profile — left blank (never inferred)"; rec.flag = "eeo_declined"; results.push(rec); continue; }
+      if (route && route.eeoUnstated) {
+        // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
+        // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
+        // offers one (live 2026-08-01: three required demographic questions on one form each
+        // ended blank and unapprovable, stranding an otherwise-complete application). Declining
+        // asserts nothing false and is what a form offering it expects for 'no answer'; the
+        // record still reaches review flagged, so a human can answer properly instead.
+        // NEVER inferred: we do not guess a demographic — this only ever picks 'no answer'.
+        const dec = f.isRequired ? atsDeclineOption(f.options || []) : null;
+        if (dec) {
+          const c = f.widgetType === "radio" || f.widgetType === "checkbox_group"
+            ? await act.eval(atsInjCheckOption, ref.inputSel, dec, true)
+            : f.widgetType === "dropdown_native"
+              ? await act.eval(atsInjSelectNative, ref.inputSel, dec)
+              : await act.eval(atsInjCommitOption, ref.inputSel, dec);
+          await act.delay(200);
+          const b = await act.eval(atsInjReadValue, ats, ref.inputSel, f.widgetType);
+          rec.after = b && b.ok ? b.value : null;
+          const ok = c && c.ok && String(rec.after || "").trim() !== "";
+          atsAttachOptions(rec, f.options || []);
+          rec.status = ok ? "filled_review" : "needs_review";
+          rec.flag = "declined-no-basis";
+          rec.detail = "this REQUIRED demographic isn't stated in your profile — chose the form's own " + JSON.stringify(dec) +
+            " so it cannot block the submit; answer it here if you would rather" + (ok ? "" : " (commit failed)");
+          results.push(rec); continue;
+        }
+        rec.status = f.isRequired ? "needs_review" : "skipped";
+        atsAttachOptions(rec, f.options || []);
+        rec.detail = "demographic not stated in profile — left blank (never inferred)" +
+          (f.isRequired ? ", and this form is REQUIRING it with no decline option — answer it here" : "");
+        rec.flag = "eeo_declined"; results.push(rec); continue;
+      }
 
       rec.mappedPath = (route && (route.path || null)) || null;
       rec.rawValue = route ? (route.raw !== undefined ? route.raw : (route.value != null ? route.value : (route.candidates || null))) : null;
@@ -1627,8 +1689,27 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     // reached review as "please fill it in yourself" with nothing to pick from, stranding the
     // operator even though the fill had just read all 60 options.
     atsAttachOptions(rec, texts);
+    // A REQUIRED choice with no grounded answer takes the form's own decline option rather than
+    // staying blank (see atsDeclineOption). Still needs_review — a human must approve it.
+    const declineFallback = async (why) => {
+      const dec = f.isRequired ? atsDeclineOption(texts) : null;
+      if (!dec) { rec.status = "needs_review"; rec.detail = why + " — pick from the options here"; return false; }
+      let c;
+      if (wt === "radio" || wt === "checkbox_group") c = await act.eval(atsInjCheckOption, ref.inputSel, dec, true);
+      else if (wt === "yesno") c = await act.eval(atsInjClickYesNo, ref.inputSel, dec);
+      else if (wt === "dropdown_native") c = await act.eval(atsInjSelectNative, ref.inputSel, dec);
+      else c = await act.eval(atsInjCommitOption, ref.inputSel, dec);
+      await act.delay(200);
+      const b = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+      rec.after = b && b.ok ? b.value : null;
+      const ok = c && c.ok && String(rec.after || "").trim() !== "";
+      rec.status = ok ? "filled_review" : "needs_review";
+      rec.flag = "declined-no-basis";
+      rec.detail = why + " — chose this form's own " + JSON.stringify(dec) + " so it cannot block the submit; change it here if you would rather answer" + (ok ? "" : " (commit failed)");
+      return ok;
+    };
     const ai = await atsAiChooseOption(act, f, texts, profile, jobContext);
-    if (!ai.ok) { rec.status = "needs_review"; rec.detail = "AI fallback failed: " + ai.error + " — pick from the options here"; return; }
+    if (!ai.ok) { await declineFallback("no grounded answer for this REQUIRED question (" + ai.error + ")"); return; }
     const m = atsLib.matchCandidates([ai.choice], texts, { containment: true });
     if (!m || m.targetIndex < 0) {
       rec.status = "needs_review";
@@ -1637,8 +1718,9 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
       // a legitimate choice and hiding any of them is worse than showing all (unit-pinned).
       const near = texts.length > ATS_OPTION_CAP ? atsNearOptions(texts, ai.choice, 20) : [];
       if (near.length) atsAttachOptions(rec, near);
-      rec.detail = "the AI suggested " + JSON.stringify(ai.choice) + ", which this form doesn't offer — pick the right option here" +
+      const why = "the AI suggested " + JSON.stringify(ai.choice) + ", which this form doesn't offer" +
         (near.length ? " (closest: " + JSON.stringify(near.slice(0, 3)) + ")" : "");
+      if (!(await declineFallback(why))) rec.detail = why + " — pick the right option here";
       return;
     }
     const pick = texts[m.targetIndex];
@@ -1672,7 +1754,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
-    atsInjFindEmbeddedForms, atsPickEmbeddedForm,
+    atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,

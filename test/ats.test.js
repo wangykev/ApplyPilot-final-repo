@@ -589,3 +589,41 @@ test("apply button: matches apply wording, rejects near-misses", () => {
   const ctrl = [...src].some((c) => { const n = c.codePointAt(0); return n < 32 && n !== 10 && n !== 13 && n !== 9; });
   assert.equal(ctrl, false, "no control chars in the injected source");
 });
+
+// A stored review entry must still match its field on a LATER page load. Ashby regenerates the
+// form-instance uuid it prefixes onto every custom question, which once made a clean submit
+// fail with "approved value has NO matching field on the live form".
+test("durable field name: strips per-session uuid prefixes, keeps real names", () => {
+  const d = ats.atsDurableFieldName;
+  const q = "fe19ec8e-680c-4f8d-bc5b-0c0866587f75";
+  // same question, two page loads, two different form-instance prefixes
+  assert.equal(d("2c63133a-e790-4cd0-854c-95c852291caa_" + q), q);
+  assert.equal(d("1103cd1e-73df-4bad-9f49-b61f3c364829_" + q), q);
+  assert.equal(d("2c63133a-e790-4cd0-854c-95c852291caa__systemfield_name"), "__systemfield_name");
+  // NEGATIVES: a bare question id is the name itself, and ordinary names are untouched
+  assert.equal(d(q), q);
+  assert.equal(d("_systemfield_email"), "_systemfield_email");
+  assert.equal(d("first_name"), "first_name");
+  assert.equal(d("cards[abc][field0]"), "cards[abc][field0]");
+  assert.equal(d(null), "");
+});
+
+// A REQUIRED choice the profile can't answer takes the form's OWN decline option rather than
+// staying blank and blocking the submit. The negatives matter more than the positives: a real
+// answer must never be mistaken for a decline.
+test("decline option: recognised only when the form truly offers one", () => {
+  const d = ats.atsDeclineOption;
+  assert.equal(d(["Female", "Male", "Other", "I don't wish to answer"]), "I don't wish to answer");
+  assert.equal(d(["Yes", "No", "Decline To Self Identify"]), "Decline To Self Identify");
+  assert.equal(d(["Asian", "White", "Prefer not to say"]), "Prefer not to say");
+  assert.equal(d(["Hispanic or Latino", "Not Hispanic or Latino", "I do not wish to disclose"]), "I do not wish to disclose");
+  // NEGATIVES — no decline offered, so the field must stay blank for a human
+  assert.equal(d(["Yes", "No"]), null);
+  assert.equal(d(["Male", "Female"]), null);
+  // a substantive answer that merely contains 'not' is NOT a decline
+  assert.equal(d(["I do not have a disability", "Yes, I have a disability"]), null);
+  assert.equal(d(["Not Hispanic or Latino", "Hispanic or Latino"]), null);
+  // ambiguous (two declines) refuses rather than guessing
+  assert.equal(d(["Prefer not to say", "Decline to answer"]), null);
+  assert.equal(d([]), null);
+});

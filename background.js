@@ -3794,7 +3794,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // prefix ("c4787042-…__systemfield_eeoc_gender" one load, "aa058f67-…" the next), so a
     // full-name match can never survive the fresh form a submit run opens. The
     // __systemfield_* suffix is the stable identity — strip the uuid prefix on BOTH sides.
-    const durable = (n) => String(n == null ? "" : n).replace(/^[0-9a-f-]{16,}(?=__systemfield_)/i, "");
+    const durable = atsDurableFieldName; // shared + unit-pinned in ats.js (per-session uuid prefixes)
     const approved = new Map();
     for (const e of bundle.entries || []) {
       if (!e || e.is_deleted) continue;
@@ -3816,7 +3816,30 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // AI stays out of a submit run entirely: valueFor covers every field the human approved;
     // anything else is deliberately blank. aiEnabled=false regardless of the popup toggle.
     act.aiEnabled = false;
-    const out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+
+    // CASCADE RE-REPLAY (2026-08-01). A value committed during the replay can REVEAL more
+    // questions — live on an Ashby form, two work-authorization questions mount only after an
+    // earlier answer, so the first pass could not see them and the strict verify reported the
+    // approved values as "no matching field on the live form" and refused the submit. The field
+    // set captured before the replay is therefore not final. Same fix the Workday replay walk
+    // already carries; bounded to one extra round so it can never loop, and only paid when an
+    // approved value is actually missing. Re-filling is idempotent (same approved values, and
+    // a field already holding its value is left alone), so the second pass can only add.
+    const missingAfter = (res) => {
+      const live = new Set(res.map((r) => durable(r.fieldName)));
+      return [...approved].filter(([n, e]) => !live.has(n) && e.current_value != null && String(e.current_value).trim() !== "");
+    };
+    if (missingAfter(out.results).length) {
+      const before = out.results.length;
+      LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
+      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+      // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
+      const merged = new Map(out.results.map((r) => [durable(r.fieldName), r]));
+      for (const r of again.results) merged.set(durable(r.fieldName), r);
+      out = { ...again, results: [...merged.values()] };
+      LOG(`re-scan: ${before} → ${out.results.length} field(s); ${missingAfter(out.results).length} still absent`);
+    }
 
     // STRICT verify: every approved non-blank value must be ON the form now.
     const failures = [];

@@ -2766,3 +2766,40 @@ Result: HIDDEN 21.0s vs VISIBLE 18.9s on the same 21-field form — an 11% diffe
 identical fill quality. Remaining wall-clock is dominated by LLM latency (4 AI answers), not
 pacing. `[ATS-TIME]` logs seconds + ms/field + the tab's real visibility on every run, so the
 next pacing round retunes from evidence.
+
+## 2026-08-01 (a) — multi-ATS: employer-hosted landings, and one unresolved widget
+
+**The posting URL is not always the form.** Three distinct landings observed in one session,
+all from ordinary `job-boards.greenhouse.io/<board>/jobs/<id>` links:
+
+| Landing | Evidence | Handling |
+|---|---|---|
+| Employer page **embedding** the form | one `<iframe src="job-boards.greenhouse.io/embed/job_app?for=…&token=…">` | follow the frame src (Asana) |
+| Employer page with an apply **button** (no `href`) | a single `<button>Apply Now</button>` | click it, re-detect the landing (Samsara) |
+| Employer page that genuinely **self-hosts** | apply leads back to its own host | halt `apply-off-pipeline`, name the URL (Databricks, Samsara) |
+
+- **Do NOT construct the embed URL from a job id.** `…/embed/job_app?token=<id>` alone returns
+  *Page not found* — the real src also carries `for=<board>` and a `validityToken`. Reading the
+  employer's own iframe `src` is evidence; building one is a guess that 404s.
+- **A hidden tab can skip layout**, so `getBoundingClientRect()` returns 0×0 for elements that are
+  genuinely visible. That is what made Samsara's Apply button unfindable. Use
+  `checkVisibility({checkVisibilityCSS:true})` (computed style, maintained in a hidden tab), and
+  never let an all-invisible verdict end a run — fall back to the unfiltered set.
+- **Ashby regenerates a per-page-load form-instance UUID** and prefixes it onto every custom
+  question: the same question was `2c63133a-…-caa_fe19ec8e-…` at fill time and
+  `1103cd1e-…-829_fe19ec8e-…` on the replay. The trailing question uuid is stable. Strip a FULL
+  leading uuid followed by `_` (and the same before `__systemfield_`) or a clean submit fails with
+  "approved value has NO matching field on the live form".
+- **Greenhouse's location box needs `google.maps`, which does not load in this browser** — so it
+  offers no suggestions to a HUMAN either. Not our bug; the typed text does persist in the box.
+
+**⚠ UNRESOLVED — Greenhouse *demographic* comboboxes (numeric ids, e.g. `1478`/`1479`/`57037`).**
+On the same form where every other combobox commits, these three report
+`commit did not persist (read null wanted "Male")`. Routing, matching and option capture are all
+CORRECT (the review row renders the real option list, and the match is exact). The commit click
+lands and the read-back returns null, so the fill honestly escalates to `needs_review` rather than
+claiming a value — no wrong data, but three REQUIRED fields are left for the operator. NOT yet
+traced to a cause: the form is served inside a cross-origin iframe on the employer page, so it
+could not be inspected from the top document, and guessing at a fix was refused. Next step is a
+CDP-attached trace of the embed URL itself (it is reachable directly once the frame src is read),
+watching where the committed value renders.
