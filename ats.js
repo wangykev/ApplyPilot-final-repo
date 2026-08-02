@@ -890,6 +890,42 @@ const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_ty
 // profile value will ever contain — strip it for matching, commit by the FULL text.
 function atsDialStrip(optText) { return String(optText || "").replace(/\s*\+\d[\d\s-]*$/, "").trim(); }
 
+// A dial composite's options read "<Country> +<code>", but the profile stores the phone country
+// as a LONG-FORM name with the code in parentheses — "United States of America (+1)". Stripping
+// only the OPTION's code leaves "united states" against "united states of america", which cannot
+// match by exact, containment OR fuzzy: live 2026-08-02 EVERY Greenhouse #country field failed
+// this way and reached review, on a form where the widget itself was perfectly healthy.
+//
+// Match on TWO INDEPENDENT SIGNALS AGREEING: the dial CODES are equal AND one country name is a
+// prefix of the other. Neither is safe alone — the code is shared (+1 covers the US, Canada and
+// much of the Caribbean; dial-suffix matching was PARKED for exactly that reason), and a bare
+// prefix would let "Congo" take "Congo, Democratic Republic of the". Together they disambiguate.
+// Ambiguity still refuses: 2+ options satisfying both is not a confident answer.
+function atsDialCode(s) { const m = /\+\s*(\d[\d\s-]*)/.exec(String(s == null ? "" : s)); return m ? m[1].replace(/[\s-]/g, "") : null; }
+function atsDialName(s) {
+  return String(s == null ? "" : s)
+    .replace(/\(?\s*\+\s*\d[\d\s-]*\)?/g, " ")
+    .replace(/[(),]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+function atsDialMatch(candidates, optionTexts) {
+  const opts = optionTexts || [];
+  for (const cand of candidates || []) {
+    const cc = atsDialCode(cand), cn = atsDialName(cand);
+    if (!cc || !cn) continue;
+    const hits = [];
+    opts.forEach((o, i) => {
+      if (atsDialCode(o) !== cc) return;
+      const on = atsDialName(o);
+      if (on && (on === cn || on.startsWith(cn) || cn.startsWith(on))) hits.push(i);
+    });
+    if (hits.length === 1) return { index: hits[0], tier: "dial-code+name" };
+  }
+  return null;
+}
+
 // ── APPLY-ELSEWHERE REDIRECT (operator 2026-07-31, the Anthropic/Constellation pattern) ──
 // Some postings host a DECOY form: "Please note that you will not be considered unless you
 // complete the Constellation application form… You do not need to submit this Greenhouse
@@ -1598,6 +1634,9 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         const pol = lead ? atsFd.optionForPolarity(matchTexts, lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null;
         if (pol) hit = { index: matchTexts.indexOf(pol), tier: "polarity-lead" };
       }
+      // Dial composite: the ladder above compares NAMES that can never meet (see atsDialMatch).
+      // Uses the RAW option texts — the codes are what it needs.
+      if (!hit && wt === "dial") hit = atsDialMatch(candidates, texts);
     }
     if (!hit) {
       await act.eval(atsInjCloseCombo, ref.inputSel);
@@ -1872,7 +1911,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
-    atsPreferredNameValue, atsLooksLikeApplicationForm,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsDialMatch, atsDialCode, atsDialName,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,

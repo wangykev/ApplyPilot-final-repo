@@ -2896,8 +2896,24 @@ Live: Roblox went from `apply-off-pipeline` to 32 fields filled. Third occurrenc
 wherever this pipeline concludes "no form here", it must ask BOTH what URL we are on AND whether
 a form is embedded on it.
 
-**⚠ OPEN — a typed search on Greenhouse's `#country` dial composite intermittently sees an empty
-list.** Live on a HIDDEN Robinhood run: `country search "United States" → no hit; typed=true
+**PARTLY RESOLVED 2026-08-02 — two separate things were tangled here.**
+1. **A real, deterministic MATCHING gap (fixed).** The profile stores the phone country as
+   `"United States of America (+1)"` while the option reads `"United States +1"`. Stripping only the
+   OPTION's code leaves `united states` vs `united states of america`, which cannot match by exact,
+   containment OR fuzzy — reproduced in isolation. `atsDialMatch` adds a last-resort tier requiring
+   TWO signals to agree: same dial CODE **and** one country name prefixes the other. Neither is safe
+   alone (+1 is shared by the US/Canada/Caribbean — the parked dial-suffix idea; and a bare prefix
+   would let "Congo" swallow "Congo, Democratic Republic of the"), and 2+ satisfying options refuse.
+   It runs ONLY after the normal ladder fails, so it cannot mask a working path.
+2. **The intermittent empty list is STILL UNEXPLAINED.** On a later hidden run the same field filled
+   `exact-normalized → "United States +1"` with no review, i.e. the symptom did not reproduce, and
+   the successful path did NOT go through the new tier. So the original `list(0)` remains
+   unattributed — the widget is healthy by hand (plain click → 244 options; typing "United States"
+   → exactly 1; clearing → 244), which still points at menu STATE around the typed query rather than
+   matching. Do not consider this closed.
+
+**⚠ Original observation — a typed search on Greenhouse's `#country` dial composite intermittently
+sees an empty list.** Live on a HIDDEN Robinhood run: `country search "United States" → no hit; typed=true
 stuck=true; list(0)`, ending `needs review · the dropdown opened but listed no options`. The
 widget itself is healthy — traced by hand on the same form: a plain click renders **244** options
 ("United States +1", "Afghanistan +93", …), typing "United States" filters to exactly **1**, and

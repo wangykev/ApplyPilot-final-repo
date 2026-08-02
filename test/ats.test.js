@@ -754,3 +754,35 @@ test("job key: embedded Greenhouse applications do not collide", () => {
   // a NON-embed url keeps dropping its query, as before
   assert.equal(c("https://www.sofi.com/careers/job/?gh_jid=7781335003"), "https://www.sofi.com/careers/job");
 });
+
+// Greenhouse's #country is a DIAL composite: options read "<Country> +<code>" while the profile
+// stores "United States of America (+1)". Stripping only the option's code leaves
+// "united states" vs "united states of america" — unmatched by exact, containment AND fuzzy, so
+// every such field silently reached review (live 2026-08-02). Two signals must AGREE: same dial
+// code AND one name prefixes the other. The refusals matter as much as the hits.
+test("dial match: code + name agree, and neither signal is trusted alone", () => {
+  const opts = [
+    "United States +1", "Canada +1", "Puerto Rico +1", "Afghanistan +93",
+    "United Arab Emirates +971", "United Kingdom +44",
+    "Congo +242", "Congo, Democratic Republic of the +243",
+  ];
+  const pick = (cand) => { const r = ats.atsDialMatch([cand], opts); return r ? opts[r.index] : null; };
+
+  assert.equal(pick("United States of America (+1)"), "United States +1", "the live failure");
+  assert.equal(pick("United States (+1)"), "United States +1");
+  assert.equal(pick("United Kingdom (+44)"), "United Kingdom +44");
+  // THE +1 COLLISION: the code alone would be ambiguous; the NAME decides
+  assert.equal(pick("Canada (+1)"), "Canada +1");
+  // THE PREFIX TRAP: a bare prefix would let "Congo" swallow the DRC; the CODE decides
+  assert.equal(pick("Congo (+242)"), "Congo +242");
+  assert.equal(pick("Congo, Democratic Republic of the (+243)"), "Congo, Democratic Republic of the +243");
+
+  // REFUSALS
+  assert.equal(pick("Mexico (+52)"), null, "code not offered");
+  assert.equal(pick("Narnia (+1)"), null, "code shared but no name agrees");
+  assert.equal(pick("United States of America"), null, "no dial code: not a dial candidate");
+  assert.equal(ats.atsDialMatch([], opts), null);
+  assert.equal(ats.atsDialMatch(["United States (+1)"], []), null);
+  // 2+ options satisfying both is not a confident answer
+  assert.equal(ats.atsDialMatch(["United States (+1)"], ["United States +1", "United States +1"]), null);
+});
