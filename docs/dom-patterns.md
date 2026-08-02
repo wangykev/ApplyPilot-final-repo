@@ -2883,3 +2883,28 @@ fixed: the cause is unproven and the entry could not be read back (`/api/extensi
 no bundle for that job_key). Next step is to dump the offending entry's `needs_review` /
 `cascade_revealed` / `is_approved` / `flag` from the stored bundle and diff the two predicates
 against it.
+
+## 2026-08-02 (b) — multi-ats: an apply hop can reveal the form in place
+
+**Clicking Apply does not always navigate.** On an employer careers page the Apply button
+INJECTED the Greenhouse iframe into the page it was already on — `location.href` never changed
+(it only gained `?gh_jid=`). A url-only re-check after the hop therefore saw an unsupported host
+and halted `apply-off-pipeline` on a fillable application. After ANY apply hop, classify the
+landing the same way the first landing is classified — URL, then embedded frame — and POLL for
+either (the injected frame arrives asynchronously; a single sample after a flat wait misses it).
+Live: Roblox went from `apply-off-pipeline` to 32 fields filled. Third occurrence of one rule:
+wherever this pipeline concludes "no form here", it must ask BOTH what URL we are on AND whether
+a form is embedded on it.
+
+**⚠ OPEN — a typed search on Greenhouse's `#country` dial composite intermittently sees an empty
+list.** Live on a HIDDEN Robinhood run: `country search "United States" → no hit; typed=true
+stuck=true; list(0)`, ending `needs review · the dropdown opened but listed no options`. The
+widget itself is healthy — traced by hand on the same form: a plain click renders **244** options
+("United States +1", "Afghanistan +93", …), typing "United States" filters to exactly **1**, and
+clearing restores 244. So this is menu STATE/timing, not matching: the likeliest cause is the
+forced-toggle recovery leaving the menu SHUT when the query is typed (two clicks = closed), with
+the restore-unfiltered step then also reading a closed menu. Not fixed — the failure is honest
+(`needs_review`, never a wrong country) and there is no reliable reproduction from outside yet.
+Next step: log `aria-expanded` and the menu node's presence immediately before and after
+`typeInto` on this widget, on a hidden tab, to confirm the shut-menu theory before changing the
+open/retry ladder.
