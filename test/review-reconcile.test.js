@@ -423,3 +423,37 @@ test("mis-pairing guard does NOT hide a REAL disagree — a value the page nowhe
   assert.strictEqual(r.counts.disagree, 1, "'Pittsburgh, PA' appears NOWHERE — the page genuinely contradicts the approved value");
   assert.strictEqual(r.counts.ambiguous, 0);
 });
+
+// A repeating section asks the SAME question once per entry, so its rows are interchangeable to a
+// value-anchored scrape and the pairing can shuffle BETWEEN entries, not just inside one. Live on
+// Magna 2026-08-02: two Websites rows, both labelled "URL", came back with LinkedIn and GitHub
+// SWAPPED — every value present and correct on the page, yet 2 DISAGREE blocked a clean submit gate.
+test("STRUCTURED: websites swapped BETWEEN entries is a pairing artifact, not a contradiction", () => {
+  const items = [
+    rrec({ key: "url", label: "URL", value: "https://www.github.com/wangykev", entryOrdinal: 1, fkitPrefix: "webAddress" }),
+    rrec({ key: "url", label: "URL", value: "https://www.linkedin.com/in/wangykev", entryOrdinal: 2, fkitPrefix: "webAddress" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-url", canonical_field: "website[0].url", question_label: "URL", current_value: "https://www.linkedin.com/in/wangykev" }),
+    entry({ field_id: "P::formField-url", canonical_field: "website[1].url", question_label: "URL", current_value: "https://www.github.com/wangykev" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.disagree, 0, "both values ARE on the page — a swap must not block submit");
+  assert.strictEqual(r.counts.ambiguous, 2);
+  assert.ok(r.ambiguous.every((a) => a.tier === "mispaired-across-entries"), JSON.stringify(r.ambiguous.map((a) => a.tier)));
+});
+
+// The guard stays KEYED. A row in the SAME section carrying a DIFFERENT question must not excuse a
+// mismatch — otherwise any repeating section could launder a genuinely wrong value.
+test("STRUCTURED: a different QUESTION in the same section is still a real DISAGREE", () => {
+  const items = [
+    rrec({ key: "url", label: "URL", value: "Personal", entryOrdinal: 1, fkitPrefix: "webAddress" }),
+    rrec({ key: "type", label: "Type", value: "https://www.linkedin.com/in/wangykev", entryOrdinal: 2, fkitPrefix: "webAddress" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-url", canonical_field: "website[0].url", question_label: "URL", current_value: "https://www.linkedin.com/in/wangykev" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.strictEqual(r.counts.ambiguous, 0, "a DIFFERENT label must not count as a shuffle");
+  assert.strictEqual(r.counts.disagree, 1);
+});

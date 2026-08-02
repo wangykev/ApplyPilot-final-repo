@@ -754,6 +754,23 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     if (shuffled) {
       return ambiguous.push({ ...base, value_review: cand.value, tier: "mispaired-within-entry" });
     }
+    // …and ACROSS the entries of one section (2026-08-02). A repeating section asks the SAME
+    // question once per entry, so the rows are interchangeable to a value-anchored scrape and the
+    // pairing can shuffle between them, not just inside one. Live on Magna: two Websites rows both
+    // labelled "URL" came back with LinkedIn and GitHub swapped — every value present and correct
+    // on the page, yet 2 DISAGREE blocked an otherwise-clean submit gate.
+    // Kept KEYED, for the reason the within-entry guard is: the approved value must be the value of
+    // another row in the SAME SECTION carrying the SAME LABEL — not merely "present on the page".
+    // A flat field has no fkitPrefix and keeps the strict path, so the pinned counterexample
+    // (approved "LinkedIn" vs a `source` reading "Indeed") is untouched.
+    const sameSectionSameLabel = cand && cand.fkitPrefix
+      ? items.filter((it) => it !== cand && it.fkitPrefix === cand.fkitPrefix &&
+          it.entryOrdinal !== cand.entryOrdinal && it.nlabel && it.nlabel === cand.nlabel)
+      : [];
+    const rotated = sameSectionSameLabel.find((it) => valuesAgree(cvs, it.value));
+    if (rotated) {
+      return ambiguous.push({ ...base, value_review: cand.value, tier: "mispaired-across-entries" });
+    }
     return disagree.push({ ...base, value_review: cand.value });
   };
 
