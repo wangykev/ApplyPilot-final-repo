@@ -627,3 +627,46 @@ test("decline option: recognised only when the form truly offers one", () => {
   assert.equal(d(["Prefer not to say", "Decline to answer"]), null);
   assert.equal(d([]), null);
 });
+
+// A preferred-name question with NO preferred name in the profile answers from the legal name,
+// at the granularity the field asks for. An AI guess here is both unnecessary and wrong-shaped:
+// the answer is already in the profile.
+test("preferred name: falls back to the legal name, at the right granularity", () => {
+  const v = (l, prof) => { const r = ats.atsPreferredNameValue(l, prof); return r ? r.value : null; };
+  const NONE = { personal_info: { first_name: "Kevin", last_name: "Wang", has_preferred_name: false, preferred_first_name: "", preferred_last_name: "" } };
+  assert.equal(v("Preferred Name", NONE), "Kevin Wang");
+  assert.equal(v("Preferred Name (if applicable)", NONE), "Kevin Wang");
+  assert.equal(v("What is the name you would prefer us to use?", NONE), "Kevin Wang");
+  // GRANULARITY: a surname box must never receive the full name
+  assert.equal(v("Preferred First Name", NONE), "Kevin");
+  assert.equal(v("Preferred Last Name", NONE), "Wang");
+  assert.equal(v("Preferred Given Name", NONE), "Kevin");
+  assert.equal(v("Preferred Family Name", NONE), "Wang");
+
+  // A STATED preferred name always wins over the legal one
+  const SET = { personal_info: { first_name: "Kevin", last_name: "Wang", has_preferred_name: true, preferred_first_name: "Kev", preferred_last_name: "W" } };
+  assert.equal(v("Preferred First Name", SET), "Kev");
+  assert.equal(v("Preferred Last Name", SET), "W");
+  assert.equal(v("Preferred Name", SET), "Kev W");
+  // ...but an explicit "I have no preferred name" beats stale text left in those boxes
+  const STALE = { personal_info: { first_name: "Kevin", last_name: "Wang", has_preferred_name: false, preferred_first_name: "Kev" } };
+  assert.equal(v("Preferred First Name", STALE), "Kevin");
+
+  // NEGATIVES — neighbours that share the words but are DIFFERENT questions
+  for (const l of ["Pronouns", "Preferred Pronouns", "Name Pronunciation", "Do you have a preferred name?", "Full Name", "Preferred Location", "Preferred Work Location"]) {
+    assert.equal(v(l, NONE), null, l);
+  }
+  // no name in the profile at all ⇒ nothing to derive
+  assert.equal(v("Preferred Name", { personal_info: {} }), null);
+});
+
+// The rung must fire for TEXT widgets and stay out of the way of choice widgets.
+test("preferred name: routed for text widgets, deterministic and unflagged", () => {
+  const prof = { personal_info: { first_name: "Kevin", last_name: "Wang", has_preferred_name: false } };
+  const r = ats.atsRouteLabel("Preferred Name", { widgetType: "text" }, prof, {});
+  assert.equal(r && r.value, "Kevin Wang");
+  assert.notEqual(r.source, "bucket"); // not a taught answer — derived from the profile
+  // a choice widget asking about preferred names is a different question: fall through
+  const c = ats.atsRouteLabel("Preferred Name", { widgetType: "radio" }, prof, {});
+  assert.ok(!c || c.value === undefined, "choice widget must not get a name string");
+});

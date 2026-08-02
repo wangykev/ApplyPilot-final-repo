@@ -140,6 +140,45 @@ const ATS_STATIC_MAPS = {
 };
 
 // Derived values the profile doesn't store as one field.
+// A PREFERRED-NAME question, answered from the profile. If no preferred name is set, the answer
+// is the LEGAL name at the SAME granularity the field asks for — because when you have no
+// preferred name, your preferred name IS your name (operator 2026-08-02, after an AI guessed it).
+// Deterministic and truthful: every value here is one the user typed into their own profile, so
+// it fills unflagged. Granularity matters — a "Preferred Last Name" box must get the LAST name,
+// never the full one, or the form carries wrong data.
+// Returns null when the label isn't a preferred-name field or the profile has no name at all.
+function atsPreferredNameValue(label, profile) {
+  const L = String(label || "");
+  // "prefer" AND "name", minus the two neighbours that share those words but are different
+  // questions: "Preferred Pronouns" (no "name") and "Name Pronunciation" (no "prefer").
+  if (!/prefer/i.test(L) || !/name/i.test(L)) return null;
+  if (/pronoun|pronunciation|pronounce/i.test(L)) return null;
+  // "Do you have a preferred name?" is a yes/no question, not a name box — the caller also
+  // gates on widget type, this is the wording belt.
+  if (/^(do|does|would|have|has|are|is)\b/i.test(L.trim())) return null;
+
+  const pi = (profile && profile.personal_info) || {};
+  const has = (v) => v !== undefined && v !== null && String(v).trim() !== "";
+  // An explicit "I have a preferred name: no" wins over any stale text left in those boxes.
+  const usePreferred = pi.has_preferred_name !== false;
+  const pFirst = usePreferred && has(pi.preferred_first_name) ? String(pi.preferred_first_name).trim() : null;
+  const pLast = usePreferred && has(pi.preferred_last_name) ? String(pi.preferred_last_name).trim() : null;
+  const lFirst = has(pi.first_name) ? String(pi.first_name).trim() : null;
+  const lLast = has(pi.last_name) ? String(pi.last_name).trim() : null;
+
+  if (/\b(first|given|fore)[\s_-]*name\b/i.test(L)) {
+    const v = pFirst || lFirst;
+    return v ? { value: v, path: pFirst ? "personal_info.preferred_first_name" : "personal_info.first_name", derived: !pFirst } : null;
+  }
+  if (/\b(last|family|sur)[\s_-]*name\b/i.test(L)) {
+    const v = pLast || lLast;
+    return v ? { value: v, path: pLast ? "personal_info.preferred_last_name" : "personal_info.last_name", derived: !pLast } : null;
+  }
+  // No granularity named ⇒ the whole name.
+  const v = [pFirst || lFirst, pLast || lLast].filter(Boolean).join(" ").trim();
+  return v ? { value: v, path: "(preferred name)", derived: !pFirst && !pLast } : null;
+}
+
 function atsComposeValue(kind, profile) {
   const pi = (profile && profile.personal_info) || {};
   if (kind === "full_name") {
@@ -210,6 +249,16 @@ function atsRouteLabel(label, f, profile, defaults) {
   if (/portfolio|personal (web)?site/i.test(L)) { const v = atsWebsiteValue(profile, "portfolio"); if (v) return { value: v, source: "website" }; }
   if (/\btwitter\b|\bx (profile|url)\b/i.test(L)) { const v = atsWebsiteValue(profile, "twitter"); if (v) return { value: v, source: "website" }; }
   if (/other website|website url/i.test(L)) { const v = atsWebsiteValue(profile, "other"); if (v) return { value: v, source: "website" }; }
+
+  // Preferred name — a DERIVED value, so it lives here rather than in a bucket: no single
+  // profile_path can express "the preferred name, or the legal name when there isn't one"
+  // (the same carve-out as composed full names and multi-fact logic, noted just below).
+  // Text widgets only: a choice/yes-no widget asking about preferred names is a different
+  // question and must fall through.
+  if (!f || f.widgetType === "text" || f.widgetType === "textarea") {
+    const pn = atsPreferredNameValue(L, profile);
+    if (pn) return { value: pn.value, source: "name", path: pn.path, detail: pn.derived ? "no preferred name set — used your name" : "preferred name" };
+  }
 
   // ⚠ IDENTITY-FIELD ALIASES ("Phone" for phone_number, "Current Employer", country-of-
   // residence, preferred-name phrasings…) deliberately do NOT live here (operator
@@ -1760,6 +1809,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
+    atsPreferredNameValue,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
