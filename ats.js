@@ -553,6 +553,16 @@ function atsInjReadValue(ats, inputSel, widgetType) {
     const sel = el.closest(".select");
     const sv = sel ? sel.querySelector(".select__single-value") : null;
     if (sv) return { ok: true, value: txt(sv) };
+    // A react-select MULTI has NO .select__single-value — its selection is chips. Reading only
+    // the single value fell through to el.value, which is the SEARCH input and is empty after a
+    // commit, so a perfectly good fill reported `commit did not persist (read null)` and three
+    // REQUIRED demographic questions were escalated for nothing (live 2026-08-02, Greenhouse).
+    const chips = sel ? [...sel.querySelectorAll(".select__multi-value")] : [];
+    if (chips.length) {
+      const seen = [];
+      for (const c of chips) { const t = txt(c.querySelector(".select__multi-value__label") || c); if (t && seen.indexOf(t) === -1) seen.push(t); }
+      if (seen.length) return { ok: true, value: seen.join(", ") };
+    }
     return { ok: true, value: el.value || null };
   }
   if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
@@ -633,22 +643,52 @@ function atsInjReadComboInput(inputSel) {
 
 // Commit an option BY TEXT inside the scoped listbox (synthetic mousedown/click — proven
 // to commit react-select live). Returns the committed display value for the verify gate.
-function atsInjCommitOption(inputSel, optionText) {
+async function atsInjCommitOption(inputSel, optionText) {
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
   const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const fire = (n, t) => n.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // A react-select MULTI holds its selection as CHIPS and a further commit APPENDS — it also
+  // HIDES an already-selected option, so a re-run cannot re-pick the same value and could pick a
+  // different one, leaving two contradictory answers on a single-answer question (live
+  // 2026-08-02: Male + Female on 'Please identify your sex'). Do what a person does: press the
+  // chip's little x to clear it, then pick the one we want (operator 2026-08-02). Verified live:
+  // removing a chip puts its option back in the menu, and the result is exactly one chip.
+  const shell = el.closest(".select");
+  const chipsNow = () => (shell ? [...shell.querySelectorAll(".select__multi-value")] : []);
+  const chipText = (c) => String(((c.querySelector(".select__multi-value__label") || c).textContent) || "").replace(/\s+/g, " ").trim();
+  let cleared = null;
+  const held = chipsNow().map(chipText);
+  if (held.length) {
+    // exactly the value we want, and nothing else ⇒ done, ZERO actuation
+    if (held.length === 1 && norm(held[0]) === norm(optionText)) return { ok: true, already: true, held };
+    for (const c of chipsNow()) {
+      const x = c.querySelector(".select__multi-value__remove");
+      if (x) { fire(x, "mousedown"); fire(x, "mouseup"); fire(x, "click"); await sleep(320); }
+    }
+    cleared = held;
+    await sleep(400);
+    const stuck = chipsNow().map(chipText);
+    if (stuck.length) return { ok: false, error: "could-not-clear:" + stuck.join(", "), cleared, held: stuck };
+    // Re-open: clearing closes the menu, and the removed option only reappears afterwards.
+    const ctrl = el.closest(".select__control");
+    if (ctrl) { fire(ctrl, "mousedown"); fire(ctrl, "mouseup"); fire(ctrl, "click"); await sleep(700); }
+  }
+
+  // Resolve the listbox AFTER any re-open — the old node is gone by then.
   const listboxId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
   let scope = listboxId ? document.getElementById(listboxId) : null;
   if (!scope) {
     const container = el.closest(".select__container") || el.closest(".ashby-application-form-field-entry") || document;
     scope = container.querySelector('.select__menu, [role="listbox"]');
   }
-  if (!scope) return { ok: false, error: "no-open-listbox" };
+  if (!scope) return { ok: false, error: "no-open-listbox", cleared };
   const target = [...scope.querySelectorAll('[role="option"], .select__option')].find((o) => norm(o.textContent) === norm(optionText));
-  if (!target) return { ok: false, error: "option-not-found" };
-  const fire = (n, t) => n.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  if (!target) return { ok: false, error: "option-not-found", cleared };
   fire(target, "mousedown"); fire(target, "mouseup"); fire(target, "click");
-  return { ok: true };
+  return { ok: true, cleared };
 }
 
 // Close any open react-select menus WITHOUT committing (blur + outside mousedown). The

@@ -2793,6 +2793,26 @@ all from ordinary `job-boards.greenhouse.io/<board>/jobs/<id>` links:
 - **Greenhouse's location box needs `google.maps`, which does not load in this browser** — so it
   offers no suggestions to a HUMAN either. Not our bug; the typed text does persist in the box.
 
+**RESOLVED 2026-08-02 — Greenhouse *demographic* comboboxes (numeric ids, e.g. `1478`/`1479`/`57037`)
+are react-select MULTI widgets.** The trace below was the original write-up; the cause turned out to be
+a READ bug, not a commit bug. A multi has NO `.select__single-value` — its selection renders as
+`.select__multi-value` chips — so the read-back fell through to `el.value`, which is the SEARCH input
+and is empty after a commit. The fill was landing correctly the whole time and we reported
+`commit did not persist (read null)`. Two facts, both verified live:
+- **The value is the chips.** Read `.select__multi-value` (prefer the inner `.select__multi-value__label`
+  — the chip's text otherwise includes its remove-button glyph). Joined with ", " when several.
+- **A further commit APPENDS, and an already-selected option is HIDDEN from the menu.** So a second
+  pass cannot re-pick the same value and could pick a different one — live, that produced
+  `Male` + `Female` chips on "Please identify your sex". Fix (operator's, 2026-08-02): do what a person
+  does — press each chip's `.select__multi-value__remove` ×, wait, RE-OPEN (the removed option only
+  returns to the menu afterwards), then click the wanted option. Verified: `["Male"]` → × → `[]` →
+  menu re-offers Male → click Other → exactly `["Other"]`. Already-correct single chip ⇒ zero actuation.
+  `atsInjCommitOption` is now async for this (the injected-eval path already sets `awaitPromise`).
+Live result: all three required demographics now fill (`sex → "Male"` and `race → "Asian"`
+deterministically, unflagged; the "ethnicity" one is AI-resolved because its LABEL says ethnicity while
+its OPTIONS are the Hispanic/Latino set — correct answer, correctly flagged).
+
+Original write-up:
 **⚠ UNRESOLVED — Greenhouse *demographic* comboboxes (numeric ids, e.g. `1478`/`1479`/`57037`).**
 On the same form where every other combobox commits, these three report
 `commit did not persist (read null wanted "Male")`. Routing, matching and option capture are all

@@ -693,3 +693,43 @@ test("form identity: a marketing widget is not an application form", () => {
   assert.equal(look([], SUB).ok, false);
   assert.equal(look(null, null).ok, false);
 });
+
+// react-select MULTI widgets (Greenhouse's demographic questions) hold their selection as CHIPS,
+// and a second commit APPENDS rather than replaces. Both facts were learned the hard way:
+// reading only .select__single-value fell through to the empty search input, so three REQUIRED
+// fields that had filled CORRECTLY were reported as `commit did not persist (read null)`; and a
+// re-run could append a contradictory second chip (Male + Female on one sex question).
+// Exercised against a minimal fake DOM — these are injected functions, so this is the only way
+// to pin their behaviour outside a browser.
+test("react-select multi: chips are the value, and a commit never appends", () => {
+  const mkChip = (label) => ({
+    className: "select__multi-value",
+    textContent: label + "\u00d7",           // the chip includes its remove button's glyph
+    querySelector: (sel) => (/multi-value__label/.test(sel) ? { textContent: label } : null),
+  });
+  // shell.querySelectorAll returns chips; querySelector('.select__single-value') finds none
+  const mkShell = (chips) => ({
+    querySelector: (sel) => (/single-value/.test(sel) ? null : null),
+    querySelectorAll: (sel) => (/multi-value/.test(sel) ? chips : []),
+  });
+  const install = (chips, inputValue) => {
+    const shell = mkShell(chips);
+    const el = { value: inputValue, closest: (sel) => (sel === ".select" ? shell : null) };
+    global.document = { querySelector: () => el, querySelectorAll: () => [el], getElementById: () => null };
+    return el;
+  };
+  const prevDoc = global.document;
+  try {
+    // READ: the chip is the value, and the remove-button glyph is not part of it
+    install([mkChip("Male")], "");
+    assert.equal(ats.atsInjReadValue("greenhouse", "#x", "select").value, "Male");
+    // several chips read as a list
+    install([mkChip("Male"), mkChip("Female")], "");
+    assert.equal(ats.atsInjReadValue("greenhouse", "#x", "select").value, "Male, Female");
+    // NO chips ⇒ unchanged behaviour (a single-select falls back to the input value)
+    install([], "");
+    assert.equal(ats.atsInjReadValue("greenhouse", "#x", "select").value, null);
+  } finally {
+    global.document = prevDoc;
+  }
+});
