@@ -582,7 +582,16 @@ function canonicalJobUrl(u) {
     // Strip the FORM-page tail so a posting URL and its form URL key identically:
     // /apply(…) (Workday + Lever) and /application (Ashby — 2026-07-31; without this a
     // submit run keyed on the posting could never find the fill's reported bundle).
-    return (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
+    // ⚠ An EMBED url carries its job identity ONLY in the query string: every employer's
+    // Greenhouse embed is `job-boards.greenhouse.io/embed/job_app?for=<board>&token=<id>`, so
+    // origin+pathname collapses ALL of them to one key. Live 2026-08-02 that made a submit run
+    // pull a DIFFERENT company's approved bundle — the review page showed 'all approved' while
+    // the gate refused, naming a field from the other application. Keep the job token when the
+    // path alone cannot identify the job.
+    const path = (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
+    const tok = p.searchParams.get("token") || p.searchParams.get("gh_jid");
+    if (tok && /\/embed\/job_app$|\/embed\/job_board$/.test(path)) return path + "?token=" + String(tok).toLowerCase();
+    return path;
   } catch (e) {
     return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();
   }

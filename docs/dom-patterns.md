@@ -2848,6 +2848,28 @@ and every stage has to cope:
   link the run STARTED from; `bundle.ats` records which pipeline filled it (a submit can't
   re-derive that from an employer URL).
 
+**RESOLVED 2026-08-02 — it was never a disagreement: the submit was pulling the WRONG APPLICATION.**
+`canonicalJobUrl` returns `origin + pathname`, dropping the query — but a Greenhouse EMBED url carries
+its job identity ONLY in the query (`/embed/job_app?for=<board>&token=<id>`), so EVERY employer's
+embedded application collapsed to the single key `job-boards.greenhouse.io/embed/job_app`. Two
+compounding causes:
+- the tracker row stored `bundle.url` (the FORM url = the embed url), so a submit re-deriving its
+  job_key from that row looked up the colliding key;
+- every embed-served row therefore shared one key, and the lookup returned whichever row it found.
+The evidence that cracked it: every pull logged **"loaded the website-approved bundle (14 fields)"**
+while the job being submitted had 25 (Asana) or 65 (SoFi) — 14 was a THIRD company's (Pinterest)
+bundle. The review page and the gate were each right about a DIFFERENT application, which is exactly
+why the UI could show "6 / 6 approved" while the gate named an unapproved field the operator had never
+seen ("Please select your country of residence…", `flag=ai-choice`, from the other job).
+Fixes: `canonicalJobUrl` keeps the `token`/`gh_jid` param for `/embed/job_app` urls (LOCKSTEP in
+lib.js + web/lib/job-key.ts, pinned with the non-embed shapes it must still collapse), and the row
+stores `bundle.jobKeyUrl` — the link the run STARTED from — so the tracker shows the posting rather
+than an opaque validity-token url. A blocked submit now also PRINTS each waiting field with its
+needs_review / cascade_revealed / approved / flag, which is what made this diagnosable at all.
+Verified: Asana's pull went from "14 fields" (wrong job) to "25 fields, 6/6 flagged approved" → replay
+25, 0 failures, would-submit. Rows written before the fix carry the colliding key until re-filled.
+
+Superseded write-up:
 **⚠ OPEN — the submit gate and the review UI can disagree.** On SoFi's 65-field form the review
 page reports `49 / 49 flagged fields approved` with ZERO unapproved rows rendered, while
 `bundleSubmitBlockers` refuses with `1 flagged/revealed field(s) not approved

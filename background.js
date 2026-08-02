@@ -660,6 +660,24 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         if (preBlockers.length) {
           LOG(`NOT submitting — ${preBlockers.length} blocker(s) before we even open the tab:`);
           preBlockers.forEach((b) => LOG(`    ✗ ${b}`));
+          // NAME the offending fields and the FLAGS that make each one block. The review page and
+          // this gate compute 'still needs approval' separately (web requiresApproval vs
+          // bundleSubmitBlockers), and when they disagree the operator sees 'all approved' while the
+          // submit refuses — a dead end with nothing to click (live 2026-08-02). Whatever the cause,
+          // the run must never just say no: print the evidence needed to settle it.
+          try {
+            const ents = (pull.bundle && pull.bundle.entries) || [];
+            const stuck = ents.filter((e) => e && !e.is_deleted && (e.needs_review || e.cascade_revealed) && !e.is_approved);
+            if (stuck.length) {
+              LOG(`    the ${stuck.length} field(s) this gate is waiting on:`);
+              stuck.slice(0, 10).forEach((e) => LOG(
+                `      · ${JSON.stringify(String(e.question_label || e.field_id || "").slice(0, 60))}` +
+                ` needs_review=${!!e.needs_review} cascade_revealed=${!!e.cascade_revealed} approved=${!!e.is_approved}` +
+                ` flag=${JSON.stringify(e.flag || null)} status=${JSON.stringify(e.fill_status || null)}` +
+                ` value=${JSON.stringify(String(e.current_value == null ? "" : e.current_value).slice(0, 28))}`
+              ));
+            }
+          } catch (e) { LOG("    (could not detail the blockers:", String((e && e.message) || e) + ")"); }
           sendResponse({ ok: false, error: "not-approved", blockers: preBlockers, job_key: jobKey, application_id: pull.application_id || null, detail: "Finish approving this application's review, then submit." });
           return;
         }
@@ -3467,7 +3485,10 @@ async function reportApplication(bundle, jobContext) {
     const payload = {
       company: (jobContext && jobContext.company) || bundle.tenant || null,
       role: null,
-      url: bundle.url || null,
+      // The link the run STARTED from — what the operator recognises, and what a later submit
+      // re-derives its job_key from. Storing the FORM url here (an embed url with a validity token)
+      // made the submit look up a key that matched a DIFFERENT application entirely.
+      url: bundle.jobKeyUrl || bundle.url || null,
       // WHICH account this application was filed with (null when unknown / a hand-signed-in run).
       login: await getRunLoginFor(bundle.url || null),
       // Stable per-job dedup key (tenant + requisition id) — the raw url varies every run, so the

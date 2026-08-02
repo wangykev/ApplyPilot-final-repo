@@ -13,11 +13,18 @@ export function canonicalJobUrl(u: string): string {
     const req = (p.pathname.match(/_R(\d+)\b/i) || [])[1];
     const dc = (p.hostname.match(/\bwd\d+\b/i) || [""])[0].toLowerCase(); // "wd3" — on both hosts
     if (req) return (dc || "wd") + ":r" + req;
-    return (p.origin + p.pathname)
+    // ⚠ An EMBED url carries its job identity ONLY in the query string: every employer's
+    // Greenhouse embed is `job-boards.greenhouse.io/embed/job_app?for=<board>&token=<id>`, so
+    // origin+pathname collapses ALL of them to one key (live 2026-08-02: a submit run pulled a
+    // DIFFERENT company's approved bundle). Keep the job token when the path can't identify it.
+    const path = (p.origin + p.pathname)
       .toLowerCase()
       .replace(/\/apply(?:\/[^/]*)*\/?$/i, "")
       .replace(/\/application\/?$/i, "") // Ashby's form tab (2026-07-31) — lockstep with lib.js
       .replace(/\/+$/, "");
+    const tok = p.searchParams.get("token") || p.searchParams.get("gh_jid");
+    if (tok && /\/embed\/job_app$|\/embed\/job_board$/.test(path)) return path + "?token=" + String(tok).toLowerCase();
+    return path;
   } catch {
     return String(u == null ? "" : u).split(/[?#]/)[0].toLowerCase();
   }

@@ -733,3 +733,24 @@ test("react-select multi: chips are the value, and a commit never appends", () =
     global.document = prevDoc;
   }
 });
+
+// A Greenhouse EMBED url identifies its job ONLY in the query string, and canonicalJobUrl drops
+// the query — so every employer's embedded application collapsed to ONE job_key. Live 2026-08-02
+// a submit run pulled a DIFFERENT company's approved bundle: the review page showed all approved
+// while the gate refused, naming a field belonging to the other application.
+test("job key: embedded Greenhouse applications do not collide", () => {
+  const c = require("../lib.js").canonicalJobUrl;
+  const asana = c("https://job-boards.greenhouse.io/embed/job_app?for=asana&token=8092044");
+  const sofi = c("https://job-boards.greenhouse.io/embed/job_app?for=sofi&token=7781335003");
+  assert.notEqual(asana, sofi, "two embedded applications must not share a key");
+  assert.match(asana, /8092044/);
+  // the SAME job through a different embed url (validity tokens rotate) still keys the same
+  assert.equal(c("https://job-boards.greenhouse.io/embed/job_app?for=asana&validityToken=ZZZ&token=8092044"), asana);
+
+  // EVERYTHING ELSE UNCHANGED — these are the shapes the key already had to collapse
+  assert.equal(c("https://jobs.lever.co/spotify/08d82da1/apply"), "https://jobs.lever.co/spotify/08d82da1");
+  assert.equal(c("https://jobs.ashbyhq.com/cohere/b9c8/application"), "https://jobs.ashbyhq.com/cohere/b9c8");
+  assert.equal(c("https://acme.wd3.myworkdayjobs.com/en-US/x/job/Y_R00244793/apply"), "wd3:r00244793");
+  // a NON-embed url keeps dropping its query, as before
+  assert.equal(c("https://www.sofi.com/careers/job/?gh_jid=7781335003"), "https://www.sofi.com/careers/job");
+});
