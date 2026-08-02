@@ -1523,12 +1523,22 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // stays real wall-clock, so a genuinely slow widget still gets its full budget.
     const pollFor = async (ms, want) => {           // want(texts) → done?
       const deadline = Date.now() + ms;
-      let last = null;
+      // Keep the most INFORMATIVE read, not merely the most recent. `r.options` is always an
+      // array and [] is truthy, so `last` used to be overwritten by every sample INCLUDING empty
+      // ones — and on a timeout we returned whatever the final sample happened to be. A widget
+      // mid-re-render reads as zero options for a frame, so a poll that saw the real list and
+      // then caught one empty frame at the deadline reported "listed no options" and sent a
+      // perfectly fillable field to review (live 2026-08-02, Greenhouse #country on a HIDDEN
+      // tab: by hand the same widget opens 244 / filters to 1 / restores 244, every time).
+      // Hidden tabs re-render more raggedly, which is why this surfaced there.
+      // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
+      // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
+      let last = null, lastSeen = null;
       for (;;) {
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
-        if (r && r.options) last = r;
+        if (r && Array.isArray(r.options)) { lastSeen = r; if (r.options.length) last = r; }
         if (r && want(optsOf(r))) return r;
-        if (Date.now() >= deadline) return last;
+        if (Date.now() >= deadline) return last || lastSeen;
         // ⚠ REAL 150ms, not the adaptive delay. Adaptive collapses to ~20ms when timers measure
         // fast, and each poll tick is a Runtime.evaluate round trip — at that rate the polling
         // STARVES the renderer and the menu never paints. Live 2026-07-31: switching this one

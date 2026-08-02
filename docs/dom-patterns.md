@@ -2905,7 +2905,23 @@ a form is embedded on it.
    alone (+1 is shared by the US/Canada/Caribbean — the parked dial-suffix idea; and a bare prefix
    would let "Congo" swallow "Congo, Democratic Republic of the"), and 2+ satisfying options refuse.
    It runs ONLY after the normal ladder fails, so it cannot mask a working path.
-2. **The intermittent empty list is STILL UNEXPLAINED.** On a later hidden run the same field filled
+2. **The intermittent empty list is STILL UNEXPLAINED, and did NOT reproduce on a deliberate
+   hidden re-test (2026-08-02).** Eliminated so far, each by direct test on the live widget rather
+   than reasoning: the widget itself (plain click -> 244 options, type -> 1, clear -> 244); the
+   CLEAR-then-type sequence the filler uses (operator confirmed Ctrl+A / Delete / type also yields
+   the single option); the SCOPED read (`atsInjReadOptions` run VERBATIM in the page resolves
+   `aria-controls` -> `react-select-country-listbox` and returns 244 / 244 / 1 across open, clear
+   and type); and focus emulation (`cdpSetFocusEmulation(true)` is already on for the ATS fill run,
+   same as the submit run). A deliberate HIDDEN run then filled it `exact-normalized ->
+   "United States +1"` with no review. What the log's final `listed no options` DOES tell us: the
+   FIRST poll must also have come back empty, because when the restore step reads empty the code
+   keeps the earlier non-empty list — so the menu produced nothing for ~7s across three separate
+   polls, rather than glitching once at a deadline. Still open.
+   **NOTE on how it matches today:** the log prints the SCAN's widget type (`typeahead`) while the
+   route refines it to `dial` for actuation, so options are dial-stripped to "United States" and the
+   profile's TIERED `country_phone_code` (long form first, bare "United States" later) hits
+   exact-normalized. `atsDialMatch` therefore does not fire for this profile — it is the net for a
+   profile holding only the long form. On a later hidden run the same field filled
    `exact-normalized → "United States +1"` with no review, i.e. the symptom did not reproduce, and
    the successful path did NOT go through the new tier. So the original `list(0)` remains
    unattributed — the widget is healthy by hand (plain click → 244 options; typing "United States"
