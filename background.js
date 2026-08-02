@@ -3776,13 +3776,30 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       const clicked = await cdpEval(atsInjClickApplyButton).catch(() => null);
       if (clicked && clicked.ok) {
         LOG(`clicked the apply button (${clicked.clicked}) — waiting for the landing`);
-        await cdpDelay(3000);
-        const after2 = await cdpEval(function () { return location.href; }).catch(() => null);
-        const afterAts2 = detectAts(after2);
-        LOG(`apply button landed on ${after2} (${afterAts2 || "unsupported host"})`);
+        // The click may NAVIGATE, or it may reveal the form IN PLACE by injecting the ATS's
+        // iframe into this very page — live 2026-08-02, an employer careers page did exactly
+        // that and the URL never changed, so a url-only re-check called it off-pipeline and
+        // abandoned a fillable application. Poll for EITHER outcome, then classify the same way
+        // the first landing is classified (url, then embedded frame).
+        let after2 = null, afterAts2 = null, embAfter = null;
+        for (let i = 0; i < 8; i++) {
+          await cdpDelay(1000);
+          after2 = await cdpEval(function () { return location.href; }).catch(() => null);
+          afterAts2 = detectAts(after2);
+          if (afterAts2 && afterAts2 !== "workday") break;
+          const e = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
+          embAfter = e && atsPickEmbeddedForm(e.srcs, detectAts);
+          if (embAfter) break;
+        }
+        LOG(`apply button landed on ${after2} (${afterAts2 || (embAfter ? "embedded form revealed in place" : "unsupported host")})`);
         if (afterAts2 && afterAts2 !== "workday") {
           await cdpDetach();
           return await runAtsApplicationRun(tabId, afterAts2, store, after2, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
+        }
+        if (embAfter && detectAts(embAfter) && detectAts(embAfter) !== "workday") {
+          LOG(`the apply button revealed an embedded ${detectAts(embAfter)} form — opening it: ${embAfter}`);
+          await cdpDetach();
+          return await runAtsApplicationRun(tabId, detectAts(embAfter), store, embAfter, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
         }
         return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after2,
           detail: "The application lives at " + after2 + " — a host this pipeline can't drive yet; apply there yourself." };
