@@ -2940,3 +2940,39 @@ the restore-unfiltered step then also reading a closed menu. Not fixed — the f
 Next step: log `aria-expanded` and the menu node's presence immediately before and after
 `typeInto` on this widget, on a hidden tab, to confirm the shut-menu theory before changing the
 open/retry ladder.
+
+## 2026-08-02 (c) — Workday: three new Solar Turbines postings, one fix and one open bug
+
+Ran three FRESH cat.wd5/solarturbines postings (SOX Supervisor R0000383804, Senior Supplier
+Technical Engineer R0000372989, Maintenance Technician I R0000371125) hidden, end to end.
+
+**FIXED — the fill walk never got the trusted re-write.** All three halted on PAGE 1 with the
+phantom-required error (First Name / Last Name / Phone Number reported empty on a page holding all
+three, 13 fields filled and read-back verified). Two causes, and the ORDER one was decisive:
+- Tier 1 re-filled the error-named fields with the SAME synthetic input Workday was ignoring — a
+  no-op by construction. It now forces TRUSTED input (save/restore via `cdpSyntheticInputEnabled`).
+- The phantom-required NUDGE (Tier 0.5) ran FIRST, always "ran", set `didSomething`, and CONSUMED
+  the single attempt, so Tier 1 never executed at all — fixing the input alone changed nothing, and
+  the log proved it by never printing the new Tier-1 line. The nudge is now demoted below the
+  trusted re-write, exactly as the REPLAY walk demoted it on 2026-07-28.
+All three then advanced past page 1 and reached the review page (5 pages), nothing submitted.
+NOTE this reproduced on 3/3 NEW postings of a tenant whose two OLDER applications never showed it —
+it is a property of the page, not of one job.
+
+**⚠ OPEN — the REPLAY can't resolve education entry fields that the FILL resolved fine.** On the
+rehearsal of R0000372989, page 2:
+```
+page 2 replay: 32 field(s) — 6 changed, 20 already-correct, 3 not-actuated, 3 FAILED
+   education[0].gradeAverage      (text) error — field wrapper not found in entry
+   education[0].firstYearAttended (date) error — field wrapper not found in entry
+   education[0].lastYearAttended  (date) error — field wrapper not found in entry
+→ HALT replay-mismatch
+```
+Those three fields were FILLED minutes earlier on the same page and carry values in the approved
+bundle, so the wrapper existed for the fill and not for the replay. `field wrapper not found in
+entry` is the SAME string the 2026-07-25 tenant-variable work fixed for the FILL by resolving entry
+fields through the `fmMatchesFd` ladder (labelRegex | field | altFields | labelFallback, two-pass).
+Whether the replay's repeating-section path shares that ladder — or whether the entry is simply not
+expanded/mounted at replay time — is UNVERIFIED; do not guess, read `replayRepeatingSections`
+against `fillEntryCdp` first. The outcome was SAFE (halt before advancing, nothing submitted), and
+the other 26 fields on the page replayed correctly.
