@@ -670,3 +670,26 @@ test("preferred name: routed for text widgets, deterministic and unflagged", () 
   const c = ats.atsRouteLabel("Preferred Name", { widgetType: "radio" }, prof, {});
   assert.ok(!c || c.value === undefined, "choice widget must not get a name string");
 });
+
+// A settled field count only proves the page stopped changing. Live 2026-08-02 an employer
+// careers page's direct-mail signup settled at 2 fields, so the run filled a MARKETING widget
+// and filed an application record for it. A form must be IDENTIFIED, not merely counted.
+test("form identity: a marketing widget is not an application form", () => {
+  const look = ats.atsLooksLikeApplicationForm;
+  const SUB = { hasSubmit: true }, NOSUB = { hasSubmit: false };
+  const dm = [{ fieldName: "dm-reservation-number" }, { fieldName: "dm-postal-code" }];
+  assert.equal(look(dm, NOSUB).ok, false);
+  assert.match(look(dm, NOSUB).why, /submit/i);
+  // even WITH a submit control it has no identity anchor
+  assert.equal(look(dm, SUB).ok, false);
+
+  // all three real form shapes must pass
+  assert.equal(look([{ fieldName: "first_name", label: "First Name" }, { fieldName: "email", label: "Email" }, { fieldName: "resume", widgetType: "file_upload" }], SUB).ok, true);
+  assert.equal(look([{ fieldName: "name", label: "Full name" }, { fieldName: "email", label: "Email" }], SUB).ok, true);
+  assert.equal(look([{ fieldName: "_systemfield_name", label: "Name" }, { fieldName: "_systemfield_resume", widgetType: "file_upload" }], SUB).ok, true);
+
+  // a real form whose submit control we can't see is NOT accepted — we could never submit it
+  assert.equal(look([{ fieldName: "email", label: "Email" }], NOSUB).ok, false);
+  assert.equal(look([], SUB).ok, false);
+  assert.equal(look(null, null).ok, false);
+});

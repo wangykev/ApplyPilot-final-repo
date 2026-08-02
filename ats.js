@@ -1018,6 +1018,29 @@ function atsDeclineOption(texts) {
   return hits.length === 1 ? hits[0] : null;
 }
 
+// Is this page actually an APPLICATION FORM? A settled, non-zero field count only proves the
+// page stopped changing — live 2026-08-02 an employer careers page's direct-mail signup
+// (a reservation number + a postal code) settled at 2 fields, so the run filled a MARKETING
+// widget and filed an application record for it. Nothing was submitted, but a form we cannot
+// submit is never the form we came for.
+// POSITIVE identification, the same rule as every other control here: an application form has
+// a SUBMIT control AND at least one identity anchor (resume, email, or a name field). Both
+// hold on every Greenhouse/Lever/Ashby application form; a marketing capture fails the first.
+function atsLooksLikeApplicationForm(fields, submitState) {
+  const list = Array.isArray(fields) ? fields : [];
+  const txt = (x) => (String((x && x.fieldName) || "") + " " + String((x && x.label) || "")).toLowerCase();
+  const hasEmail = list.some((x) => /e-?mail/.test(txt(x)));
+  const hasResume = list.some((x) => (x && x.widgetType === "file_upload") || /resume|\bcv\b/.test(txt(x)));
+  const hasName = list.some((x) => /(^|[^a-z])(first|last|full|preferred|legal)?[ _-]*name([^a-z]|$)/.test(txt(x)));
+  const hasSubmit = !!(submitState && submitState.hasSubmit);
+  return {
+    ok: hasSubmit && (hasResume || hasEmail || hasName),
+    hasSubmit, hasResume, hasEmail, hasName,
+    why: hasSubmit ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
+                   : "no submit control on the page — this isn't a form we could ever submit",
+  };
+}
+
 // Choose the apply link to follow. `isAts` is injected (detectAts) so host knowledge stays
 // SW-side. A link the pipeline can actually DRIVE wins; otherwise a single apply-labelled
 // link is followed and re-classified on landing; ambiguity refuses (report, never guess).
@@ -1809,7 +1832,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
-    atsPreferredNameValue,
+    atsPreferredNameValue, atsLooksLikeApplicationForm,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,

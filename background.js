@@ -336,6 +336,14 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
         // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
         const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        // The page turned out to host a non-Workday ATS in an iframe — drive it with that
+        // pipeline instead of reporting a page we could not read.
+        if (onb && onb.embeddedAts && onb.embeddedUrl) {
+          await cdpDetach();
+          const res = await runAtsApplicationRun(tabId, onb.embeddedAts, store, onb.embeddedUrl, { applyHops: 1 });
+          sendResponse({ ...res, tabId, startUrl });
+          return;
+        }
         if (!onb.ok || !onb.reached_form) {
           sendResponse({ ...onb, walked: false, jd, tabId, startUrl });
           return;
@@ -3551,11 +3559,28 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     // still mounting (live 2026-07-31). Sections mount in bursts; a stable count between
     // bursts is not a settled form.
     stable = n > 0 && n === prev ? stable + 1 : 0;
-    if (stable >= 2 && Date.now() - start >= 2500) return { ready: true, fields: n };
+    if (stable >= 2 && Date.now() - start >= 2500) {
+      // Settled — but settled on WHAT? Identify the page positively before calling it a form.
+      const scan = await cdpEval(atsInjScan, ats).catch(() => null);
+      const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+      if (!id.ok) {
+        LOG(`${n} field(s) settled here, but this is NOT an application form — ${id.why}. Not filling it.`);
+        return { ready: false, fields: n, notAForm: true, why: id.why };
+      }
+      return { ready: true, fields: n };
+    }
     prev = n;
     await cdpDelay(450);
   }
   LOG(`form did not settle within ${ceilingMs || 25000}ms (last field count ${prev})`);
+  // Same rule on the timeout path: fields we never identified as a form are not a form.
+  if (prev > 0) {
+    const scan = await cdpEval(atsInjScan, ats).catch(() => null);
+    const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+    const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+    if (!id.ok) { LOG(`the ${prev} field(s) here are not an application form — ${id.why}`); return { ready: false, fields: prev, notAForm: true, why: id.why }; }
+  }
   return { ready: prev > 0, fields: Math.max(prev, 0) };
 }
 
@@ -6300,6 +6325,20 @@ async function runCdpOnboard(tabId, opts) {
       return a;
     }
     if (st.formFieldCount > 0) return { ok: true, reached_form: true, stopped: "reached-form" };
+    // Before giving up: this may be an employer careers page that EMBEDS a non-Workday ATS.
+    // Live 2026-08-02 a Pinterest careers URL (matching no ATS host pattern, so the run arrived
+    // here) carried a Greenhouse application in an iframe. A Workday page never contains a
+    // Greenhouse/Lever/Ashby frame, so this can only fire off-Workday. Onboarding just REPORTS
+    // what it found; the caller owns the hand-off.
+    try {
+      const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
+      const embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
+      const embAts = embUrl && detectAts(embUrl);
+      if (embAts && embAts !== "workday") {
+        LOG(`this page embeds a ${embAts} application — handing it to that pipeline: ${embUrl}`);
+        return { ok: true, embeddedAts: embAts, embeddedUrl: embUrl, stopped: "embedded-ats" };
+      }
+    } catch (e) { LOG("embedded-form probe skipped:", String((e && e.message) || e)); }
     return haltNeedsOperator("unknown-page", `title="${st.title}" — could not find Apply/auth/form. Navigate to the job posting and re-run.`, st);
     } // end applyStage
   } catch (e) {
