@@ -2959,7 +2959,25 @@ All three then advanced past page 1 and reached the review page (5 pages), nothi
 NOTE this reproduced on 3/3 NEW postings of a tenant whose two OLDER applications never showed it —
 it is a property of the page, not of one job.
 
-**⚠ OPEN — the REPLAY can't resolve education entry fields that the FILL resolved fine.** On the
+**RESOLVED 2026-08-02 — and the suspicion in the note below was WRONG.** The replay DOES share the
+`fmMatchesFd` ladder (`replayRepeatingSections` → `driveRepeatingSectionCdp` → `fillEntryCdp`), and the
+entry resolved fine — `education[0].schoolName` even adapted text→typeahead on the same run. The real
+cause: the section maps are the UNION of every Workday shape observed, and **Solar Turbines' education
+entry has only School + Degree** — no GPA, no from/to years. The review page proves it (`ENTRY 1 |
+Delete | School or University* | Degree*`), and the approved bundle holds no values for them. So
+EDUCATION_MAP's gpa/date fields never resolved, and never could.
+`fillEntryCdp` reported that as `error` BEFORE checking whether there was anything to fill. The FILL
+shrugged it off; the REPLAY treats any error as "did not replay cleanly" and HALTS. Fix: a missing
+wrapper with NO value is `skipped`; a missing wrapper we DO hold a value for stays an `error` (an
+approved answer with nowhere to go must still stop the run) — pinned both ways, and the skip test is
+verified to fail without the change while the error counterexample still passes.
+Live, same job: `page 2 replay: 32 field(s) — 6 changed, 20 already-correct, 6 not-actuated, 0 FAILED`
+(was 3 FAILED → halt), all 5 pages replayed, review page AGREE 44 · DISAGREE 0 · MISSING 3 · EXTRA 1,
+SUBMIT GATE PASSED — would-submit, nothing clicked.
+**Lesson worth keeping: a union field-map means "absent" is normal, so absence must only be fatal when
+we are holding a value for it.**
+
+**Superseded note — the REPLAY can't resolve education entry fields that the FILL resolved fine.** On the
 rehearsal of R0000372989, page 2:
 ```
 page 2 replay: 32 field(s) — 6 changed, 20 already-correct, 3 not-actuated, 3 FAILED

@@ -3951,7 +3951,25 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null
     };
     if (!fd) {
-      rec.status = "error"; rec.detail = "field wrapper not found in entry";
+      // A map field the TENANT DOES NOT RENDER is not an error when there is nothing to put in it.
+      // The section maps are the UNION of every Workday shape observed, so a tenant that omits a
+      // field always resolved nothing here. Live 2026-08-02, Solar Turbines: its education entry has
+      // only School + Degree — no GPA, no from/to years — so EDUCATION_MAP's gpa and date fields
+      // never resolve, and the approved bundle holds no values for them either.
+      //
+      // The FILL shrugged that off, but the REPLAY treats ANY error as "did not replay cleanly" and
+      // HALTS, so a rehearsal died replay-mismatch on three fields that were never on the form:
+      //     page 2 replay: 32 field(s) - 6 changed, 20 already-correct, 3 not-actuated, 3 FAILED
+      //     education[0].gradeAverage / firstYearAttended / lastYearAttended - wrapper not found
+      //
+      // A missing wrapper we DO have a value for stays an ERROR: that is an approved answer with
+      // nowhere to go, and it must still stop the run.
+      const v0 = item[f.key];
+      const nothingToFill = v0 === undefined || v0 === null || String(v0).trim() === "";
+      rec.status = nothingToFill ? "skipped" : "error";
+      rec.detail = nothingToFill
+        ? "this tenant does not render the field, and there is nothing to fill"
+        : "field wrapper not found in entry";
       recs.push(rec); await act.delay(budgets.interFieldMs); continue;
     }
     const loc = { wrapperSel: fd.wrapperSel };

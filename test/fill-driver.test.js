@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -8233,4 +8233,53 @@ test("bucket Mode B: a LEGACY single-string `value` is tolerated (upgraded to on
   const rec = out.results.find((r) => r.fieldName === "legacyQ");
   assert.equal(rec.flag, "bucket", "a pre-migration string value still fills");
   assert.equal(field.value, "Blue");
+});
+
+// The section maps are the UNION of every Workday shape seen, so a tenant that OMITS a field always
+// resolved nothing for it. That was harmless on the fill and fatal on the REPLAY, which treats any
+// `error` as "did not replay cleanly" and HALTS. Live 2026-08-02, Solar Turbines R0000372989: its
+// education entry has only School + Degree, so EDUCATION_MAP's gpa/from/to died "field wrapper not
+// found in entry" and a rehearsal halted replay-mismatch on three fields that were never on the form
+// and had no approved value. A missing wrapper we DO hold a value for must still be an error.
+test("education: a field this tenant does not render, with nothing to fill, is SKIPPED not error", async () => {
+  const fkit = "education-1--null";
+  const domEntry = { fkit, fields: [
+    { fieldName: "schoolName", label: "School or University*", widgetType: "text", isRequired: true, value: "" },
+    { fieldName: "degree", label: "Degree*", widgetType: "dropdown", isRequired: true, triggerText: "Select One",
+      options: [{ text: "Select One", disabled: true }, { text: "Bachelor of Science (BS)" }] },
+  ] }; // NOTE: no gpa, no firstYearAttended, no lastYearAttended — this tenant omits them
+  const state = { prefix: "education-", addable: true, deletable: true, newEntry: () => domEntry, entries: [domEntry] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University", degree: "Bachelor of Science (BS)" }],
+    fieldMap: EDUCATION_MAP, deleteOnNoMatch: false,
+  }, T_BUDGETS);
+  const byName = (n) => out.results.find((r) => r.fieldName === n);
+  for (const n of ["education[0].gradeAverage", "education[0].firstYearAttended", "education[0].lastYearAttended"]) {
+    const r = byName(n);
+    if (!r) continue; // the map may name it differently; only assert on what was emitted
+    assert.notStrictEqual(r.status, "error", n + " must not be an error — nothing to fill (" + r.detail + ")");
+  }
+  assert.strictEqual(out.results.filter((r) => r.status === "error").length, 0,
+    "no hard errors: " + JSON.stringify(out.results.filter((r) => r.status === "error").map((r) => r.fieldName + ": " + r.detail)));
+});
+
+// The counterexample that keeps this honest: an approved value with nowhere to go is still an ERROR,
+// because that is a real place a value could silently vanish.
+test("education: a missing wrapper we DO have a value for is still an ERROR", async () => {
+  const fkit = "education-1--null";
+  const domEntry = { fkit, fields: [
+    { fieldName: "schoolName", label: "School or University*", widgetType: "text", isRequired: true, value: "" },
+  ] }; // degree is NOT rendered, but we hold a degree value
+  const state = { prefix: "education-", addable: true, deletable: true, newEntry: () => domEntry, entries: [domEntry] };
+  const act = makeFakeRepeatAct(state);
+  const out = await driveRepeatingSectionCdp(act, {
+    name: "education", headingRegex: "education", containerPrefix: "education-",
+    items: [{ school_or_university: "Carnegie Mellon University", degree: "Bachelor of Science (BS)" }],
+    fieldMap: EDUCATION_MAP, deleteOnNoMatch: false,
+  }, T_BUDGETS);
+  const deg = out.results.find((r) => r.fieldName === "education[0].degree");
+  assert.ok(deg, "a record was emitted for the unrendered degree");
+  assert.strictEqual(deg.status, "error", "an approved value with nowhere to go must still stop the run");
 });
