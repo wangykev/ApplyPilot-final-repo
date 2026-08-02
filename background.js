@@ -3208,13 +3208,54 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       didSomething = true;
     }
 
-    // ── Tier 0.5 (DETERMINISTIC, no AI) — Workday's PHANTOM "required" error: it claims a field is empty
-    //    that the page visibly HOLDS. The synthetic-mode blur race (see nudgePhantomRequired); the fill
-    //    walk runs the same synthetic path on a hidden tab, so it is exposed to the same bug. Placed
-    //    BEFORE Tier 1 deliberately: Tier 1 would re-FILL an already-correct field to fix it, which
-    //    re-actuates a verified value for no reason. This just commits the edit that already landed.
-    //    Evidence-gated (every named field present AND holding a value), so anything else falls straight
-    //    through to Tier 1 with the ladder unchanged.
+    // ── Tier 1 (DETERMINISTIC, no AI): re-fill the MAPPED fields the error TEXT names, from the
+    //    profile, through the SAME drivePageFill path. Replaces the old anchor-click-to-focus
+    //    (which didn't fire on Magna; the text-parse does). Unmapped named fields fall through to
+    //    the AI tier. Re-filling an already-correct field is harmless (same value). ──
+    if (!didSomething) {
+      const scan = await act.scanPage();
+      const refill = new Set(mappedFieldsFromErrors(prevErrors, scan.fields, FIELD_MAP));
+      if (refill.size) {
+        // ⚠ TRUSTED INPUT FOR THE RE-FILL (2026-08-02). Re-filling with the SAME synthetic input
+        // that Workday just ignored is a no-op by construction — live on three Caterpillar
+        // postings this tier ran and reported "remediation made NO PROGRESS (error set unchanged)"
+        // every time, on First Name / Last Name / Phone Number that the page was visibly holding.
+        //
+        // That is the PHANTOM-REQUIRED failure already solved on the REPLAY walk: a native-setter
+        // write reaches the DOM and even React, but never Workday's own form model, so Workday
+        // believes the field is empty. The proven remedy there was to re-write the error-named
+        // fields with TRUSTED Input.* — the fill walk simply never got that tier. It only ever
+        // happens on HIDDEN runs, the only ones using synthetic input.
+        //
+        // Restored in a finally: the rest of the page keeps the hidden-tab speed win, and this
+        // costs trusted input for a handful of named fields on a page that is already blocked.
+        const wasSynthetic = typeof cdpSyntheticInputEnabled === "function" ? cdpSyntheticInputEnabled() : true;
+        LOG(`  attempt ${attempt} (Tier 1, deterministic): error names → re-fill mapped field(s) [${[...refill].join(", ")}] from the profile with TRUSTED input (no AI).`);
+        let rOut;
+        try {
+          cdpSetSyntheticInput(false);
+          rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlyFieldNames: refill });
+        } finally {
+          cdpSetSyntheticInput(wasSynthetic);
+        }
+        for (const r of (rOut.results || [])) {
+          r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
+          r.detail = "AI-4 Tier-1 deterministic re-fill — " + (r.detail || "");
+          mergeRemediationRecord(out, r);
+        }
+        actions.push({ tier: 1, refilled: [...refill] });
+        didSomething = true;
+      }
+    }
+
+    // ── Tier 1.2 (DETERMINISTIC, no AI) — the phantom-required NUDGE, a focus→blur commit that changes
+    //    no value. DEMOTED below the trusted re-write above (2026-08-02), matching the demotion the
+    //    REPLAY walk already made. It used to run FIRST, and because it always "ran" it set
+    //    didSomething and CONSUMED the single attempt — so the trusted re-write never executed and the
+    //    ladder halted on no-progress. Live on three Caterpillar postings: Workday claimed First Name /
+    //    Last Name / Phone Number were empty on a page holding all three, the nudge fired every time,
+    //    and the error set never changed. The nudge is kept because it is free and occasionally right,
+    //    but it is no longer allowed to stand in front of the remedy that is actually proven.
     if (!didSomething) {
       const nudge = await nudgePhantomRequired(prevErrors, (...a) => LOG("  attempt " + attempt + " (Tier 0.5)", ...a));
       if (nudge.ran) {
@@ -3224,26 +3265,6 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
           detail: `Workday reported ${nudge.fields.join(", ")} as required-and-empty while the page held the value (the blur race). Committed with a focus→blur nudge — no value was changed.`
         });
         actions.push({ tier: 0.5, action: "commit-phantom-required", fields: nudge.fields.join(", "), nudged: nudge.nudged });
-        didSomething = true;
-      }
-    }
-
-    // ── Tier 1 (DETERMINISTIC, no AI): re-fill the MAPPED fields the error TEXT names, from the
-    //    profile, through the SAME drivePageFill path. Replaces the old anchor-click-to-focus
-    //    (which didn't fire on Magna; the text-parse does). Unmapped named fields fall through to
-    //    the AI tier. Re-filling an already-correct field is harmless (same value). ──
-    if (!didSomething) {
-      const scan = await act.scanPage();
-      const refill = new Set(mappedFieldsFromErrors(prevErrors, scan.fields, FIELD_MAP));
-      if (refill.size) {
-        LOG(`  attempt ${attempt} (Tier 1, deterministic): error names → re-fill mapped field(s) [${[...refill].join(", ")}] from the profile (no AI).`);
-        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlyFieldNames: refill });
-        for (const r of (rOut.results || [])) {
-          r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
-          r.detail = "AI-4 Tier-1 deterministic re-fill — " + (r.detail || "");
-          mergeRemediationRecord(out, r);
-        }
-        actions.push({ tier: 1, refilled: [...refill] });
         didSomething = true;
       }
     }
