@@ -786,3 +786,29 @@ test("dial match: code + name agree, and neither signal is trusted alone", () =>
   // 2+ options satisfying both is not a confident answer
   assert.equal(ats.atsDialMatch(["United States (+1)"], ["United States +1", "United States +1"]), null);
 });
+
+// A commit read-back must POLL. act.delay is ADAPTIVE (collapses to ~20ms when page timers
+// measure fast), so "delay then read once" sampled the widget before React had committed its
+// re-render and reported `commit did not persist (read null)` on a commit that worked — live
+// 2026-08-02 on two Greenhouse dropdowns, HIDDEN runs only. Here the value appears on the THIRD
+// read: a single sample sees null, a poll sees "No".
+test("commit read-back: polls until the value appears, instead of sampling once", async () => {
+  let reads = 0;
+  const act = {
+    delay: async () => {}, delayFull: async () => {}, delayRender: async () => {}, aiEnabled: false,
+    eval: async (fn, ...args) => {
+      const n = (fn && fn.name) || "";
+      if (n === "atsInjReadOptions") return { ok: true, open: true, options: [{ text: "Yes" }, { text: "No" }] };
+      if (n === "atsInjOpenAndReadOptions") return { ok: true };
+      if (n === "atsInjCommitOption") return { ok: true };
+      if (n === "atsInjReadValue") { reads++; return { ok: true, value: reads >= 3 ? "No" : null }; }
+      return { ok: true };
+    },
+  };
+  const rec = {};
+  const f = { fieldName: "610", label: "I have a disability (please select one):", widgetType: "select", isRequired: true, options: [] };
+  await ats.atsActuateField(act, "greenhouse", f, { inputSel: "#610" }, rec, ["No"], null, {}, {}, {});
+  assert.equal(rec.after, "No", "detail was: " + rec.detail);
+  assert.ok(/^filled/.test(String(rec.status)), "status was " + rec.status);
+  assert.ok(reads >= 3, "it actually polled (reads=" + reads + ")");
+});

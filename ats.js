@@ -888,6 +888,27 @@ const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_ty
 
 // Options for a dial-code select carry a trailing "+<digits>" ("United States +1") that no
 // profile value will ever contain — strip it for matching, commit by the FULL text.
+// Read a committed value back, POLLING until it appears. `act.delay` is ADAPTIVE — it collapses
+// to ~20ms whenever page timers measure fast — so "delay(200) then read once" could sample the
+// widget BEFORE React had committed its re-render, and report `commit did not persist (read
+// null)` on a commit that in fact worked. Live 2026-08-02 that hit two Greenhouse dropdowns on
+// HIDDEN runs (Chime, Gusto); by hand the same widgets commit and read back "No" every time.
+// It is the same trap the option poll already documents: an adaptive interval starves the
+// renderer, and this pipeline's rule is that a wait polls the condition it gates.
+// A genuinely blank field still reports blank — it just costs the full window to say so, and the
+// callers that WANT blank (the no-commit dismissal) do not use this.
+async function atsReadBackSettled(act, ats, inputSel, widgetType, ms) {
+  const deadline = Date.now() + (ms || 2000);
+  let b = null;
+  for (;;) {
+    b = await act.eval(atsInjReadValue, ats, inputSel, widgetType);
+    const v = b && b.ok ? b.value : null;
+    if (v !== null && v !== undefined && String(v).trim() !== "") return b;
+    if (Date.now() >= deadline) return b;
+    await act.delayFull(120); // REAL — see above
+  }
+}
+
 function atsDialStrip(optText) { return String(optText || "").replace(/\s*\+\d[\d\s-]*$/, "").trim(); }
 
 // A dial composite's options read "<Country> +<code>", but the profile stores the phone country
@@ -1311,8 +1332,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
             : f.widgetType === "dropdown_native"
               ? await act.eval(atsInjSelectNative, ref.inputSel, dec)
               : await act.eval(atsInjCommitOption, ref.inputSel, dec);
-          await act.delay(200);
-          const b = await act.eval(atsInjReadValue, ats, ref.inputSel, f.widgetType);
+          const b = await atsReadBackSettled(act, ats, ref.inputSel, f.widgetType);
           rec.after = b && b.ok ? b.value : null;
           const ok = c && c.ok && String(rec.after || "").trim() !== "";
           atsAttachOptions(rec, f.options || []);
@@ -1551,6 +1571,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     };
 
     let nearMatches = []; // what a by-name search turned up — the operator's real choices
+    let didSearch = false; // a typed query leaves the menu FILTERED — see the commit below
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
     let read = await pollFor(1800, (t) => t.length > 0);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
@@ -1574,7 +1595,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // where the full "Carnegie Mellon University" can come back empty). The MATCH is still
         // exact against whatever the widget returns — a looser query never loosens the answer.
         const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
-        const typed = await typeInto(query);
+        const typed = await typeInto(query); didSearch = true;
         let found = await pollFor(2000, (t) => t.length > 0 && hasHit(t));
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
         // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
@@ -1661,9 +1682,28 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       return false;
     }
     const commitText = texts[hit.index];
+    // A typed query leaves the menu FILTERED, and the match was computed against the list we
+    // READ — which may be the unfiltered one. Clicking now can miss entirely: live 2026-08-02 a
+    // disability field searched "No, I" (the first two words of the profile's long answer) on a
+    // form whose options are just Yes/No, filtering the menu to ZERO; the match still resolved
+    // via the polarity bridge, and the click then found nothing. Clear the query and wait for the
+    // option we intend to click to actually be there.
+    if (didSearch) {
+      const norm1 = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase();
+      const showing = (t) => t.some((o) => norm1(o) === norm1(commitText));
+      await act.eval(atsInjTypeInCombo, ref.inputSel, "");
+      let back = await pollFor(900, showing);
+      // A query that matches NOTHING closes the menu outright, and clearing the text does not
+      // bring it back — so re-open before giving up (live 2026-08-02: "could not click No —
+      // no-open-listbox"). Forcing is safe here: we have just established the menu is not
+      // showing our option, so a click can only improve matters.
+      if (!showing(optsOf(back))) {
+        await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
+        back = await pollFor(1200, showing);
+      }
+    }
     const c = await act.eval(atsInjCommitOption, ref.inputSel, commitText);
-    await act.delay(200);
-    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
     atsAttachOptions(rec, texts);
     const backNorm = atsLib.normalize(String(rec.after == null ? "" : rec.after));
@@ -1686,7 +1726,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       if (rec.status === "filled_review" && !rec.flag) rec.flag = "non-exact-match";
     } else {
       rec.status = "needs_review"; rec.verified = false;
-      rec.detail = "commit did not persist (read " + JSON.stringify(rec.after) + " wanted " + JSON.stringify(commitText) + ")";
+      // Distinguish the two failures: the click never found its option (a LIST problem) vs the
+      // click landed and the value did not stick (a COMMIT problem). Reporting the first as the
+      // second sent three investigations after the wrong thing.
+      rec.detail = c && c.ok
+        ? "commit did not persist (read " + JSON.stringify(rec.after) + " wanted " + JSON.stringify(commitText) + ")"
+        : "could not click " + JSON.stringify(commitText) + " — " + ((c && c.error) || "no result") + " (the menu was not showing it)";
       await act.eval(atsInjCloseCombo, ref.inputSel);
     }
     return true;
@@ -1865,8 +1910,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
       else if (wt === "yesno") c = await act.eval(atsInjClickYesNo, ref.inputSel, dec);
       else if (wt === "dropdown_native") c = await act.eval(atsInjSelectNative, ref.inputSel, dec);
       else c = await act.eval(atsInjCommitOption, ref.inputSel, dec);
-      await act.delay(200);
-      const b = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+      const b = await atsReadBackSettled(act, ats, ref.inputSel, wt);
       rec.after = b && b.ok ? b.value : null;
       const ok = c && c.ok && String(rec.after || "").trim() !== "";
       rec.status = ok ? "filled_review" : "needs_review";
@@ -1895,8 +1939,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     else if (wt === "yesno") committed = await act.eval(atsInjClickYesNo, ref.inputSel, pick);
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
-    await act.delay(200);
-    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
     atsAttachOptions(rec, texts);
     const okv = committed && committed.ok && String(rec.after || "").trim() !== "";
@@ -1922,6 +1965,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsDialMatch, atsDialCode, atsDialName,
+    atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
