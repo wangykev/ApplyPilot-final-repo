@@ -424,11 +424,11 @@ test("mis-pairing guard does NOT hide a REAL disagree — a value the page nowhe
   assert.strictEqual(r.counts.ambiguous, 0);
 });
 
-// A repeating section asks the SAME question once per entry, so its rows are interchangeable to a
-// value-anchored scrape and the pairing can shuffle BETWEEN entries, not just inside one. Live on
-// Magna 2026-08-02: two Websites rows, both labelled "URL", came back with LinkedIn and GitHub
-// SWAPPED — every value present and correct on the page, yet 2 DISAGREE blocked a clean submit gate.
-test("STRUCTURED: websites swapped BETWEEN entries is a pairing artifact, not a contradiction", () => {
+// A repeating section whose entries hold ONE field is a SET — Magna's Websites entries are a bare
+// URL and nothing else, so entry ORDER carries no information (operator 2026-08-02: "it is a
+// repeating section right? so it doesn't matter the order"). Live, two rows both labelled "URL"
+// came back with LinkedIn and GitHub swapped and 2 DISAGREE blocked an otherwise-clean submit gate.
+test("STRUCTURED: a single-field section is order-free — a swap RE-PAIRS and agrees", () => {
   const items = [
     rrec({ key: "url", label: "URL", value: "https://www.github.com/wangykev", entryOrdinal: 1, fkitPrefix: "webAddress" }),
     rrec({ key: "url", label: "URL", value: "https://www.linkedin.com/in/wangykev", entryOrdinal: 2, fkitPrefix: "webAddress" }),
@@ -438,22 +438,38 @@ test("STRUCTURED: websites swapped BETWEEN entries is a pairing artifact, not a 
     entry({ field_id: "P::formField-url", canonical_field: "website[1].url", question_label: "URL", current_value: "https://www.github.com/wangykev" }),
   ];
   const r = reconcileReviewPage(items, bundle);
-  assert.strictEqual(r.counts.disagree, 0, "both values ARE on the page — a swap must not block submit");
-  assert.strictEqual(r.counts.ambiguous, 2);
-  assert.ok(r.ambiguous.every((a) => a.tier === "mispaired-across-entries"), JSON.stringify(r.ambiguous.map((a) => a.tier)));
+  assert.strictEqual(r.counts.disagree, 0, "a reorder is not a contradiction");
+  assert.strictEqual(r.counts.agree, 2);
+  assert.ok(r.agree.some((a) => a.tier === "entry-reordered"), JSON.stringify(r.agree.map((a) => a.tier)));
 });
 
-// The guard stays KEYED. A row in the SAME section carrying a DIFFERENT question must not excuse a
-// mismatch — otherwise any repeating section could launder a genuinely wrong value.
-test("STRUCTURED: a different QUESTION in the same section is still a real DISAGREE", () => {
+// …and order-freedom must not launder a LOST value: if the page holds one URL twice, the other is
+// genuinely gone and must still block.
+test("STRUCTURED: order-free does NOT excuse a value missing from the section", () => {
   const items = [
-    rrec({ key: "url", label: "URL", value: "Personal", entryOrdinal: 1, fkitPrefix: "webAddress" }),
-    rrec({ key: "type", label: "Type", value: "https://www.linkedin.com/in/wangykev", entryOrdinal: 2, fkitPrefix: "webAddress" }),
+    rrec({ key: "url", label: "URL", value: "https://www.github.com/wangykev", entryOrdinal: 1, fkitPrefix: "webAddress" }),
+    rrec({ key: "url", label: "URL", value: "https://www.github.com/wangykev", entryOrdinal: 2, fkitPrefix: "webAddress" }),
   ];
   const bundle = [
     entry({ field_id: "P::formField-url", canonical_field: "website[0].url", question_label: "URL", current_value: "https://www.linkedin.com/in/wangykev" }),
+    entry({ field_id: "P::formField-url", canonical_field: "website[1].url", question_label: "URL", current_value: "https://www.github.com/wangykev" }),
   ];
   const r = reconcileReviewPage(items, bundle);
-  assert.strictEqual(r.counts.ambiguous, 0, "a DIFFERENT label must not count as a shuffle");
-  assert.strictEqual(r.counts.disagree, 1);
+  assert.strictEqual(r.counts.disagree, 1, "the vanished LinkedIn must still be reported");
+});
+
+// A MULTI-field section is NOT order-free: an entry pairs title+company+dates, so one value moving
+// between entries can mean genuinely mispaired data and must keep the strict verdict.
+test("STRUCTURED: a multi-field section stays strict — a cross-entry swap still DISAGREES", () => {
+  const items = [
+    rrec({ key: "jobTitle", label: "Job Title", value: "Engineer B", entryOrdinal: 1, fkitPrefix: "workExperience" }),
+    rrec({ key: "jobTitle", label: "Job Title", value: "Engineer A", entryOrdinal: 2, fkitPrefix: "workExperience" }),
+  ];
+  const bundle = [
+    entry({ field_id: "P::formField-jobTitle", canonical_field: "workExperience[0].jobTitle", question_label: "Job Title", current_value: "Engineer A" }),
+    entry({ field_id: "P::formField-companyName", canonical_field: "workExperience[0].companyName", question_label: "Company", current_value: "Acme" }),
+  ];
+  const r = reconcileReviewPage(items, bundle);
+  assert.ok(!r.agree.some((a) => a.tier === "entry-reordered"),
+    "a multi-field section must never take the order-free re-pair path: " + JSON.stringify(r.agree.map((a) => a.tier)));
 });

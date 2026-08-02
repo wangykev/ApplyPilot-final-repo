@@ -746,7 +746,7 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
   // coincidental presence — approved "LinkedIn" vs a page `source` reading "Indeed" is a REAL disagree
   // even though another field's prose says "my LinkedIn profile" (pinned in review-reconcile.test.js).
   // Flat fields therefore keep the strict path entirely.
-  const verdictFor = (base, cvs, cand) => {
+  const verdictFor = (base, cvs, cand, repSection) => {
     const inSameEntry = cand && cand.entryOrdinal != null && cand.fkitPrefix
       ? items.filter((it) => it !== cand && it.fkitPrefix === cand.fkitPrefix && it.entryOrdinal === cand.entryOrdinal)
       : [];
@@ -754,25 +754,42 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     if (shuffled) {
       return ambiguous.push({ ...base, value_review: cand.value, tier: "mispaired-within-entry" });
     }
-    // …and ACROSS the entries of one section (2026-08-02). A repeating section asks the SAME
-    // question once per entry, so the rows are interchangeable to a value-anchored scrape and the
-    // pairing can shuffle between them, not just inside one. Live on Magna: two Websites rows both
-    // labelled "URL" came back with LinkedIn and GitHub swapped — every value present and correct
-    // on the page, yet 2 DISAGREE blocked an otherwise-clean submit gate.
-    // Kept KEYED, for the reason the within-entry guard is: the approved value must be the value of
-    // another row in the SAME SECTION carrying the SAME LABEL — not merely "present on the page".
-    // A flat field has no fkitPrefix and keeps the strict path, so the pinned counterexample
-    // (approved "LinkedIn" vs a `source` reading "Indeed") is untouched.
-    const sameSectionSameLabel = cand && cand.fkitPrefix
-      ? items.filter((it) => it !== cand && it.fkitPrefix === cand.fkitPrefix &&
-          it.entryOrdinal !== cand.entryOrdinal && it.nlabel && it.nlabel === cand.nlabel)
-      : [];
-    const rotated = sameSectionSameLabel.find((it) => valuesAgree(cvs, it.value));
-    if (rotated) {
-      return ambiguous.push({ ...base, value_review: cand.value, tier: "mispaired-across-entries" });
+    // …and ACROSS the entries of an ORDER-FREE section (2026-08-02, operator: "on magna it is a
+    // repeating section right? so it doesn't matter the order"). Exactly so — Magna's Websites
+    // entries hold a URL and NOTHING else, so the section is a SET and the two rows coming back
+    // with LinkedIn and GitHub swapped is not a disagreement at all. It was blocking the gate.
+    //
+    // ORDER-FREE means the entry has ONE field. Where an entry pairs several (work experience =
+    // title + company + dates), one value moving between entries is NOT harmless — it can mean
+    // genuinely mispaired data — so those keep the strict DISAGREE. `singleFieldSections` is
+    // computed from the BUNDLE (how many distinct leaves the section records), not from the page.
+    //
+    // And where it IS order-free, RE-PAIR instead of excusing: claim the row that actually holds
+    // our value and report AGREE. That is what set semantics means, it keeps the counts honest,
+    // and a value with no home anywhere in the group still disagrees — so losing one is still caught.
+    const orderFree = cand && cand.fkitPrefix && repSection && singleFieldSections.has(repSection);
+    if (orderFree) {
+      const mate = items.find((it) => it !== cand && !it.used && it.fkitPrefix === cand.fkitPrefix &&
+        it.entryOrdinal !== cand.entryOrdinal && it.nlabel && it.nlabel === cand.nlabel &&
+        valuesAgree(cvs, it.value));
+      if (mate) {
+        cand.used = false; mate.used = true;
+        return agree.push({ ...base, value_review: mate.value, tier: "entry-reordered" });
+      }
     }
     return disagree.push({ ...base, value_review: cand.value });
   };
+
+  // Sections whose entries record exactly ONE field — a bare list (Websites is url-only), so their
+  // entry ORDER carries no information. Derived from the bundle, which is what we actually know.
+  const leavesBySection = new Map();
+  for (const e of (Array.isArray(bundleEntries) ? bundleEntries : [])) {
+    const r = e && parseCanonical(e.canonical_field);
+    if (!r || !r.path) continue;
+    if (!leavesBySection.has(r.section)) leavesBySection.set(r.section, new Set());
+    leavesBySection.get(r.section).add(r.path);
+  }
+  const singleFieldSections = new Set([...leavesBySection].filter(([, v]) => v.size === 1).map(([k]) => k));
 
   let skipped = 0, placeholders = 0, claimed = 0;
   const claimedValues = []; // normalized recorded values — drives the EXTRA computation
@@ -823,7 +840,7 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
       } else {
         claimed++; claimedValues.push(nval);
         if (valuesAgree(cvs, cand.value)) agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
-        else verdictFor(base, cvs, cand); // a row shuffled WITHIN this entry is AMBIGUOUS, not a contradiction
+        else verdictFor(base, cvs, cand, rep && rep.section); // a shuffled row is not a contradiction
       }
       continue;
     }
