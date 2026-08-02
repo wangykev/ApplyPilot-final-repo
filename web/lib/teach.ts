@@ -28,11 +28,22 @@ export function isBucketEligibleWidget(w?: string | null): boolean {
  * for one is unanswerable — and this keeps it that way if `date` is ever added to BUCKET_ELIGIBLE.
  */
 const DATE_ONLY_QUESTION =
-  /^(date|dates|todays? date|current date|date signed( on)?|signature date|date of signature|date completed|completion date)$/;
+  /^(date|dates|todays? date|current date|date signed( on)?|signature date|date of signature|date completed|completion date|date of application|application date)( of (application|signing|signature))?$/;
 export function isDateOnlyQuestion(label?: string | null, widget?: string | null): boolean {
   const w = String(widget || "");
   if (w === "date" || w === "year") return true;
-  return DATE_ONLY_QUESTION.test(normalizeQuestion(String(label || "")).replace(/[:.]+$/, "").replace(/'/g, ""));
+  const q = normalizeQuestion(String(label || ""))
+    // A real form spells out what the date is for and how to format it — live 2026-08-02 a card
+    // read "Today's Date of Application (MM/DD/YY Format)", which the bare `^todays date$` anchor
+    // missed, so a STALE 05/22/2025 was offered as a reusable answer. Drop a trailing format hint
+    // and let the today/signature family carry an "of application/signing/signature" tail.
+    // Stripping the parenthetical is safe BECAUSE the test is an exact match against the list
+    // below: "Date of Birth (MM/DD/YYYY)" becomes "date of birth", which still does not match.
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .replace(/[:.]+$/, "")
+    .replace(/'/g, "")
+    .trim();
+  return DATE_ONLY_QUESTION.test(q);
 }
 
 /** Read a dotted profile path → a display string (a tiered array shows its first candidate). A path

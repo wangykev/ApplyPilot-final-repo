@@ -650,6 +650,28 @@ test("isDateOnlyQuestion: a bare date ask is excluded, however punctuated or wor
   }
 });
 
+// A real form spells out what the date is FOR and how to format it. Live 2026-08-02 a card read
+// "Today's Date of Application (MM/DD/YY Format)" and slipped through the bare-phrase anchors, so a
+// stale 05/22/2025 was offered as a reusable answer.
+test("isDateOnlyQuestion: a spelled-out per-application date is excluded too", () => {
+  for (const q of [
+    "Today's Date of Application (MM/DD/YY Format)",
+    "Todays Date of Application",
+    "Date of Application",
+    "Application Date",
+    "Date (MM/DD/YYYY)",
+    "Signature Date (mm/dd/yy)",
+    "Date of Signing",
+  ]) assert.equal(isDateOnlyQuestion(q, "text"), true, q);
+});
+
+// The narrowness must SURVIVE the widening: a format hint does not turn a reusable answer into a
+// per-application one.
+test("isDateOnlyQuestion: a formatted DOB or graduation date still teaches", () => {
+  for (const q of ["Date of Birth (MM/DD/YYYY)", "Graduation Date (MM/YYYY)", "Date of Birth", "Availability Date"])
+    assert.equal(isDateOnlyQuestion(q, "text"), false, q);
+});
+
 test("isDateOnlyQuestion: a date WIDGET is excluded whatever it's called (it can't be bucket-filled)", () => {
   assert.equal(isDateOnlyQuestion("Anything at all", "date"), true);
   assert.equal(isDateOnlyQuestion("Graduation", "year"), true);
