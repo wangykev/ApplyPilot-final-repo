@@ -333,6 +333,30 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         if (jd && jd.company) jobContext.company = jd.company;
         if (jobContext.company) console.log("[ApplyPilot][RUN] job context company:", jobContext.company);
 
+        // BEFORE the Workday path: does this page EMBED a non-Workday application? An employer
+        // careers page matches no ATS host pattern, so it lands here — but it may be serving a
+        // Greenhouse/Lever/Ashby form from an iframe. Probing once HERE covers every way the
+        // Workday onboarding could otherwise fail on it (live 2026-08-02: one such page reported
+        // unknown-page, another auth-form-not-rendered — same cause, two symptoms). Skipped
+        // entirely for URLs that DO name an ATS, so Workday runs pay nothing for this.
+        if (!detectAts(startUrl)) {
+          try {
+            const att = await cdpAttach(tabId);
+            if (att.ok) {
+              const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
+              const embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
+              const embAts = embUrl && detectAts(embUrl);
+              await cdpDetach();
+              if (embAts && embAts !== "workday") {
+                console.log(`[ApplyPilot][RUN] this page embeds a ${embAts} application — driving it with that pipeline: ${embUrl}`);
+                const res = await runAtsApplicationRun(tabId, embAts, store, embUrl, { applyHops: 1, originUrl: startUrl });
+                sendResponse({ ...res, jd, tabId, startUrl });
+                return;
+              }
+            }
+          } catch (e) { console.log("[ApplyPilot][RUN] embedded-form probe skipped:", String((e && e.message) || e)); }
+        }
+
         // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
         // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
         const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
@@ -3449,7 +3473,9 @@ async function reportApplication(bundle, jobContext) {
       // Stable per-job dedup key (tenant + requisition id) — the raw url varies every run, so the
       // backend upserts by (user_id, job_key) instead. See canonicalJobUrl (lib.js, lockstep with
       // web/lib/job-key.ts). null when there's no url (report still works, falls back to url dedup).
-      job_key: bundle.url ? canonicalJobUrl(bundle.url) : null,
+      // Key on the link the run STARTED from when we have it, so a re-fill updates the SAME row
+      // even though a landing hop moved the form URL. Older bundles fall back to the form URL.
+      job_key: (bundle.jobKeyUrl || bundle.url) ? canonicalJobUrl(bundle.jobKeyUrl || bundle.url) : null,
       status: needs > 0 ? "needs_review" : "filling",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),
@@ -3619,6 +3645,12 @@ function makeAtsActuation(llmConfig) {
 // page-advance click on these single-page forms at all; the only submit-capable click
 // lives in runAtsSubmitRun behind authorize+arm.
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
+  // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
+  // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
+  // application on THAT made a re-fill land on a DIFFERENT tracker row — so the original row kept
+  // a stale bundle forever and its submit kept failing against fields that no longer exist (live
+  // 2026-08-02, after a bad fill had been corrected). Every hop carries the origin forward.
+  const originUrl = opts0.originUrl || startUrl;
   const LOG = (...a) => console.log("[ApplyPilot][ATS-RUN]", ...a);
   try {
     const attached = await cdpAttach(tabId);
@@ -3662,7 +3694,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
             detail: "The real application is a Workday posting: " + landed + " — Run that link (the Workday pipeline will drive it)." };
         }
         await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
-        return await runAtsApplicationRun(tabId, landedAts, store, landed, { chase: (opts0.chase || 0) + 1 });
+        return await runAtsApplicationRun(tabId, landedAts, store, landed, { chase: (opts0.chase || 0) + 1, originUrl });
       }
     } catch (e) { LOG("redirect detection skipped:", String((e && e.message) || e)); }
 
@@ -3693,7 +3725,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         const embAts = detectAts(embUrl);
         LOG(`the form is EMBEDDED on this page — opening the frame directly (${embAts}): ${embUrl}`);
         await cdpDetach();
-        return await runAtsApplicationRun(tabId, embAts, store, embUrl, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
+        return await runAtsApplicationRun(tabId, embAts, store, embUrl, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
       }
       const found = await cdpEval(atsInjFindApplyLinks).catch(() => null);
       const link = found && atsPickApplyLink(found.links, detectAts);
@@ -3715,7 +3747,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
             detail: "The application lives at " + after + (afterAts === "workday" ? " — a Workday requisition; run that link instead." : " — a host this pipeline can't drive yet; apply there yourself.") };
         }
         await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
-        return await runAtsApplicationRun(tabId, afterAts, store, after, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
+        return await runAtsApplicationRun(tabId, afterAts, store, after, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
       }
     }
     // No followable LINK, but the page may route Apply through a BUTTON (live 2026-07-31).
@@ -3729,7 +3761,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         LOG(`apply button landed on ${after2} (${afterAts2 || "unsupported host"})`);
         if (afterAts2 && afterAts2 !== "workday") {
           await cdpDetach();
-          return await runAtsApplicationRun(tabId, afterAts2, store, after2, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1 });
+          return await runAtsApplicationRun(tabId, afterAts2, store, after2, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
         }
         return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after2,
           detail: "The application lives at " + after2 + " — a host this pipeline can't drive yet; apply there yourself." };
@@ -3770,6 +3802,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // onboard path, which halted "unknown-page" on a form we had just filled successfully
     // (live 2026-08-01). The fill already KNOWS the answer, so it writes it down.
     bundle.ats = ats;
+    bundle.jobKeyUrl = originUrl; // stable identity across landing hops (see the top of this fn)
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
     await reportApplication(bundle, jobContext);
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
@@ -3802,11 +3835,28 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     await cdpInstallPageOverrides();
     await cdpSetFocusEmulation(true).catch(() => {});
 
-    const formUrl = atsFormUrl(ats, (opts && opts.startUrl) || bundle.url);
+    // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
+    // always the posting link the caller holds: an employer careers page can serve the real
+    // form from an embedded frame, and the fill followed it there. Starting from the caller's
+    // URL instead put the replay back on the employer page, where the form-identity gate
+    // (correctly) refused to treat a 1-field marketing page as an application form and the
+    // submit died at form-not-rendered — for a job that fills perfectly (live 2026-08-02).
+    // The caller's URL stays the fallback for bundles written before this was recorded.
+    const formUrl = atsFormUrl(ats, bundle.url || (opts && opts.startUrl));
     const here = await cdpEval(function () { return location.href; }).catch(() => null);
     if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); }
-    const ready = await waitAtsFormReady(ats, LOG);
-    if (!ready.ready) return { ok: true, needs_operator: true, stopped: "form-not-rendered", submitted: false };
+    let ready = await waitAtsFormReady(ats, LOG);
+    // Same landing recovery the FILL run has: the form may be EMBEDDED on this page.
+    if (!ready.ready) {
+      const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
+      const embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
+      if (embUrl && detectAts(embUrl) === ats) {
+        LOG(`the form is EMBEDDED here — opening the frame directly: ${embUrl}`);
+        await cdpNavigate(embUrl); await cdpDelay(1200);
+        ready = await waitAtsFormReady(ats, LOG);
+      }
+    }
+    if (!ready.ready) return { ok: true, needs_operator: true, stopped: "form-not-rendered", submitted: false, detail: ready.why || "the application form did not render here" };
 
     // A DECOY form must never be replayed or submitted — even one with an approved bundle
     // from before the detector existed (the Anthropic/Constellation pattern).

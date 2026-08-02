@@ -2803,3 +2803,41 @@ traced to a cause: the form is served inside a cross-origin iframe on the employ
 could not be inspected from the top document, and guessing at a fix was refused. Next step is a
 CDP-attached trace of the embed URL itself (it is reachable directly once the frame src is read),
 watching where the committed value renders.
+
+## 2026-08-02 (a) — multi-ATS: employer-hosted landings, end to end
+
+Employers host these three ATSs on their OWN domains far more often than the board URLs suggest,
+and every stage has to cope:
+
+- **A settled field count is not a form.** An employer careers page's direct-mail signup settled
+  at 2 fields (`dm-reservation-number`, `dm-postal-code`), so a run filled a MARKETING widget and
+  filed an application record. Identify the page positively instead:
+  `atsLooksLikeApplicationForm` = a SUBMIT control AND an identity anchor (resume / email / name).
+  Rejecting the widget then drops into the embedded-frame recovery, which finds the REAL form on
+  the same page — SoFi went 2 junk fields → 42 real ones.
+- **An employer careers URL matches no ATS host pattern**, so a fill falls to the Workday onboard
+  path. Two different pages failed there two different ways (`unknown-page`,
+  `auth-form-not-rendered`) for the same reason. Probe for an embedded ATS ONCE, before entering
+  that path, and hand off. Pinterest fills from `www.pinterestcareers.com` this way.
+- **The submit run must go where the FILL went** (`bundle.url`), not the caller's posting link —
+  otherwise the replay lands back on the employer page and dies at `form-not-rendered` for a job
+  that fills perfectly. It carries the same embed recovery as a second net.
+- **A job's identity must survive a landing hop.** Keying the application on the URL the fill ENDED
+  at meant a re-fill created a DIFFERENT tracker row, so the original row kept a stale bundle
+  forever and its submit failed against fields that no longer exist. `bundle.jobKeyUrl` records the
+  link the run STARTED from; `bundle.ats` records which pipeline filled it (a submit can't
+  re-derive that from an employer URL).
+
+**⚠ OPEN — the submit gate and the review UI can disagree.** On SoFi's 65-field form the review
+page reports `49 / 49 flagged fields approved` with ZERO unapproved rows rendered, while
+`bundleSubmitBlockers` refuses with `1 flagged/revealed field(s) not approved
+(/embed/job_app::formField-question_67708891)`. The operator has no way to clear it from the UI —
+a dead end. The two predicates are documented as LOCKSTEP (`requiresApproval` in
+web/lib/review-approval.ts vs `bundleSubmitBlockers` in fill-driver.js) and they have at least one
+known asymmetry: the web envelope drops `isHiddenPreferredName` entries from its denominator and
+the extension gate has no equivalent — but that exclusion needs a controlling "I have a preferred
+name" checkbox, which a Greenhouse form does not have, so it does NOT explain this instance. NOT
+fixed: the cause is unproven and the entry could not be read back (`/api/extension/review` returned
+no bundle for that job_key). Next step is to dump the offending entry's `needs_review` /
+`cascade_revealed` / `is_approved` / `flag` from the stored bundle and diff the two predicates
+against it.
