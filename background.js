@@ -4306,6 +4306,22 @@ async function nudgePhantomRequired(errorTexts, LOG) {
 // moment of the failure — the DOM value, REACT's internal value, the date spinbuttons' aria-valuenow, and
 // whether each error is rendered inside the field's own wrapper. See cdpDiagnoseFieldCommit for which
 // hypothesis each combination points at. Always safe to call: it reads, it never actuates.
+// After a blocked Save, correct any record whose value the FORM REJECTED (see rejectedValueEntries).
+// The bundle is the human's view of the page, so it must not claim a value the page threw away.
+async function syncRejectedValues(errorTexts, LOG) {
+  try {
+    const scan = await cdpEval(cdpPageScan);
+    const live = (scan && scan.fields) || [];
+    const bundle = await new Promise((res) => chrome.storage.local.get("reviewSummary", (r) => res(r && r.reviewSummary)));
+    if (!bundle || !Array.isArray(bundle.entries)) return;
+    const r = rejectedValueEntries(bundle.entries, live, errorTexts);
+    if (!r.changed.length) return;
+    bundle.entries = r.entries;
+    bundle.needs_review_count = bundle.entries.filter((e) => e && e.needs_review && !e.is_deleted).length;
+    await new Promise((res) => chrome.storage.local.set({ reviewSummary: bundle }, res));
+    for (const c of r.changed) LOG(`  ⚠ the form REJECTED ${JSON.stringify(c.was)} for "${c.label}" — the review now shows it EMPTY and asks you for an answer it will accept.`);
+  } catch (e) { LOG(`  (could not reconcile rejected values: ${String((e && e.message) || e)})`); }
+}
 async function diagnoseRequiredErrorFields(errorTexts, LOG) {
   try {
     const titles = (errorTexts || []).map((t) => parseErrorFieldName(t)).filter(Boolean);
@@ -5406,6 +5422,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           LOG(`✓ page ${page} → advanced after re-clicking Save & Continue (${reclick.attempts || "?"}x — the first click was swallowed).`);
           continue;
         }
+        // The page kept our value out; say so in the bundle before halting, so review asks the human
+        // for an answer the form accepts instead of showing one it already threw away.
+        if (reclick.errorsPresent && Array.isArray(reclick.errorSamples)) await syncRejectedValues(reclick.errorSamples, LOG);
         LOG(`⚠ nav-timeout on page ${page} — ${act.aiEnabled ? `AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason})` : "AI fill OFF (no re-fill — operator halt-on-error rule)"} ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         const diag = await reportPageErrors(out);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };

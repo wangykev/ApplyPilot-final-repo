@@ -377,6 +377,25 @@ function parseErrorFieldName(text) {
   const s = String(text);
   let m = s.match(/<([^>]+)>/);                                   // "<Field Title>"
   if (m && m[1].trim()) return m[1].trim();
+  // SPECIFIC WORDINGS FIRST, because the generic pattern below is non-greedy and a question label
+  // very often contains one of its own stop-words. Live (Copart 2026-08-03): "The field What is your
+  // anticipated graduation month and year (MM/YYYY) is required..." parsed as **"What"** — the match
+  // ended at the label's OWN "is". Every "What is your …" question — desired compensation, desired
+  // start date, anticipated graduation — hit this, and a truncated name matches no wrapper, so Tier-1
+  // deterministic remediation, the phantom-required guard and the field diagnosis were all handed a
+  // useless name and silently did nothing. Anchoring on the full trailing PHRASE fixes it: "What" is
+  // no longer a candidate because "What is required" never appears.
+  const anchored = [
+    /\bfield\s+(.+?)\s+is\s+required\b/i,
+    /\bfield\s+(.+?)\s+must\s+have\s+a\s+value\b/i,
+    /\bfield\s+(.+?)\s+is\s+not\s+valid\b/i,
+  ];
+  for (const re of anchored) {
+    m = s.match(re);
+    if (m && m[1].trim()) return m[1].trim().replace(/^["'<\s]+|["'>:\s]+$/g, "") || null;
+  }
+  // Generic fallback for wordings we have not seen. Still non-greedy, so it can still truncate a
+  // label containing a stop-word — it only runs when none of the known phrasings matched.
   m = s.match(/\bfield\s+(.+?)\s+(is|are|must|cannot|can't|should|requires?|needs?)\b/i);
   if (m && m[1].trim()) return m[1].trim().replace(/^["'<\s]+|["'>:\s]+$/g, "") || null;
   return null;
@@ -385,6 +404,56 @@ function parseErrorFieldName(text) {
 // AI-4 NO-PROGRESS guard: did a remediation attempt change the error set at all? Compares two
 // arrays of error texts as normalized SETS (trim, drop empties, sort). UNCHANGED (true) ⇒ the
 // action didn't resolve anything → HALT rather than burn the cap re-firing the same fix.
+// A value the FORM REJECTED is not a filled field (2026-08-03).
+//
+// Live on Copart: a required free-text compensation question got the "N/A" placeholder, the write
+// verified, the M40 audit re-read it and matched — and Save & Continue answered "is required and must
+// have a value" with the box empty in DOM, reactProps and fiber alike. Workday discarded it during
+// validation. Every check we have runs BEFORE that point, so nothing noticed, and the bundle kept
+// claiming "N/A". That is the worst shape for a review bundle: the human approves a value that is not
+// on the form, the replay re-enters the same rejected text, and the page fails again — a loop the
+// operator cannot break from the review editor.
+//
+// So: after a blocked Save, for each field the ERROR NAMES, compare what we recorded against what the
+// page now holds. Recorded a value + page holds nothing ⇒ rewrite the record as EMPTY and needs_review,
+// naming the value that was rejected. `bundleSubmitBlockers`'s required-blank rule then refuses submit
+// until a human answers it for real.
+//
+// NARROW on purpose — it only touches fields the error text names AND that read empty on a live scan.
+// A field the form merely dislikes for another reason keeps its value, because overwriting a real
+// answer with "" would destroy the human's data to fix a display problem. `liveFields` comes from a
+// fresh cdpPageScan; an empty/failed scan changes nothing (absence of evidence).
+function rejectedValueEntries(entries, liveFields, errorTexts) {
+  const out = { entries: Array.isArray(entries) ? entries : [], changed: [] };
+  const live = Array.isArray(liveFields) ? liveFields : [];
+  if (!out.entries.length || !live.length) return out;
+  const titles = (Array.isArray(errorTexts) ? errorTexts : [])
+    .map((t) => parseErrorFieldName(t)).filter(Boolean).map((t) => normalizeLabel(t));
+  if (!titles.length) return out;
+  const holds = (v) => v != null && String(v).trim() !== "";
+  const changed = [];
+  const next = out.entries.map((e) => {
+    if (!e || !holds(e.current_value)) return e;
+    const lbl = normalizeLabel(e.question_label || "");
+    if (!lbl || titles.indexOf(lbl) === -1) return e;                 // the error does not name it
+    const f = live.find((x) => normalizeLabel((x && x.label) || "") === lbl);
+    if (!f || holds(f.value)) return e;                               // not on the page, or still holds a value
+    const was = String(e.current_value);
+    changed.push({ label: e.question_label || lbl, was });
+    return Object.assign({}, e, {
+      current_value: "",
+      fill_status: "not_filled",
+      is_approved: false,                                              // an approval of the old value cannot carry
+      approved_at: null,
+      needs_review: true,
+      needs_review_reason: "value_rejected",
+      flag: "value-rejected",
+      detail: "The form REJECTED " + JSON.stringify(was) + " — it was entered and read back, but the page "
+        + "cleared it and reported the field as required. Please give an answer this form will accept.",
+    });
+  });
+  return { entries: next, changed };
+}
 function errorSetUnchanged(a, b) {
   const norm = (arr) => (Array.isArray(arr) ? arr : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean).sort();
   const x = norm(a), y = norm(b);
@@ -1511,6 +1580,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+  rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

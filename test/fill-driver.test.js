@@ -8352,3 +8352,75 @@ test("isPlaceholderOption: prompt rows yes, real options no", () => {
   assert.deepStrictEqual(apMatchLib.withoutPlaceholderOptions(["Select One"]), ["Select One"],
     "an ALL-placeholder list is handed back untouched — never leave the caller with nothing");
 });
+
+// ── the error parser must not stop at the LABEL's own stop-word (Copart live 2026-08-03) ──
+// Workday's banner is "The field <LABEL> is required and must have a value." The generic pattern is
+// non-greedy, so a label containing " is " ended the match early: "What is your anticipated
+// graduation month and year (MM/YYYY)" parsed as "What". A truncated name matches no wrapper, so
+// Tier-1 remediation, the phantom-required guard and the field diagnosis all got a useless name and
+// silently did nothing while the page stayed blocked.
+test("parseErrorFieldName: a label containing its own stop-word survives", () => {
+  const cases = [
+    ["Error-What is your anticipated graduation month and year (MM/YYYY)The field  What is your anticipated graduation month and year (MM/YYYY)   is required and must have a value.",
+     "What is your anticipated graduation month and year (MM/YYYY)"],
+    ["The field What is your desired compensation is required and must have a value.", "What is your desired compensation"],
+    ["The field When are you available to start is required and must have a value.", "When are you available to start"],
+    // labels with no stop-word of their own must keep working
+    ["The field Date is required and must have a value.", "Date"],
+    ["The field Are you currently enrolled in a Canadian University or College  is required and must have a value.",
+     "Are you currently enrolled in a Canadian University or College"],
+    // other known wordings + the angle-bracket form
+    ["The field Email must have a value.", "Email"],
+    ["The field <Country> is required.", "Country"],
+  ];
+  for (const [input, want] of cases) {
+    assert.strictEqual(apMatchLib.parseErrorFieldName(input), want, JSON.stringify(input));
+  }
+});
+
+// ── a value the FORM REJECTED is not a filled field (Copart live 2026-08-03) ──
+// "N/A" went into a required compensation box, the write verified, the M40 audit matched — and Save
+// & Continue answered "is required" with the box empty. Every check we own runs before validation, so
+// the bundle kept claiming "N/A": review would show an answer the form does not hold, the human would
+// approve it, and the replay would re-enter the same rejected text forever.
+const REJ_ERR = ['Error-What is your desired compensation?The field What is your desired compensation? is required and must have a value.'];
+const rejEntries = () => ([
+  { question_label: "What is your desired compensation?", current_value: "N/A", fill_status: "filled", is_approved: true, needs_review: false },
+  { question_label: "First Name", current_value: "Kevin", fill_status: "filled", is_approved: true, needs_review: false },
+]);
+
+test("rejectedValueEntries: an error-named field the page cleared becomes EMPTY + needs_review", () => {
+  const live = [{ label: "What is your desired compensation?", value: "" }, { label: "First Name", value: "Kevin" }];
+  const r = apMatchLib.rejectedValueEntries(rejEntries(), live, REJ_ERR);
+  assert.deepStrictEqual(r.changed, [{ label: "What is your desired compensation?", was: "N/A" }]);
+  const e = r.entries[0];
+  assert.strictEqual(e.current_value, "", "the bundle must not claim a value the page threw away");
+  assert.strictEqual(e.fill_status, "not_filled");
+  assert.strictEqual(e.needs_review, true);
+  assert.strictEqual(e.is_approved, false, "an approval of the rejected value cannot carry over");
+  assert.match(e.detail, /REJECTED/);
+  assert.strictEqual(r.entries[1].current_value, "Kevin", "an unrelated field is untouched");
+  assert.strictEqual(r.entries[1].is_approved, true);
+});
+
+test("rejectedValueEntries: it never blanks a field on weaker evidence", () => {
+  const live = [{ label: "What is your desired compensation?", value: "" }];
+  // the page STILL holds the value → the error is about something else about it, keep the answer
+  assert.strictEqual(apMatchLib.rejectedValueEntries(rejEntries(),
+    [{ label: "What is your desired compensation?", value: "N/A" }], REJ_ERR).changed.length, 0);
+  // the error names a DIFFERENT field
+  assert.strictEqual(apMatchLib.rejectedValueEntries(rejEntries(), live,
+    ["The field Postal Code is required and must have a value."]).changed.length, 0);
+  // no live scan (failed read) ⇒ absence of evidence, not evidence of absence
+  assert.strictEqual(apMatchLib.rejectedValueEntries(rejEntries(), [], REJ_ERR).changed.length, 0);
+  // no parseable field name in the error
+  assert.strictEqual(apMatchLib.rejectedValueEntries(rejEntries(), live, ["Something went wrong."]).changed.length, 0);
+});
+
+test("rejectedValueEntries: a blanked required field then BLOCKS submit", () => {
+  const live = [{ label: "What is your desired compensation?", value: "" }];
+  const ents = rejEntries().map((e, i) => (i === 0 ? Object.assign({}, e, { is_required: true, widget_type: "text" }) : e));
+  const r = apMatchLib.rejectedValueEntries(ents, live, REJ_ERR);
+  const blockers = bundleSubmitBlockers({ schema_version: REVIEW_SCHEMA_VERSION, entries: r.entries });
+  assert.ok(blockers.some((b) => /REQUIRED field\(s\) have no value/.test(b)), JSON.stringify(blockers));
+});
