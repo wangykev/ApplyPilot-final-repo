@@ -1109,7 +1109,24 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     // requires a human to approve or replace it.
     const ph = "N/A";
     const r = await fillTextCdp(act, loc, ph, budgets, tag);
-    return { status: "filled_review", after: (r && r.after != null) ? r.after : ph, verified: r && r.verified === true, flag: "ai-text-needs-answer",
+    // RESPECT THE WRITE RESULT. This used to hardcode filled_review and report 'entered "N/A"' whatever
+    // happened — so a field that REFUSED the text still read as answered. Live on Copart: the required
+    // "desired compensation" box only accepts a number (operator: "that textbox only lets you type a
+    // number, so if AI wants to type NA it won't and error"), the characters never landed, and the
+    // bundle claimed N/A over an empty field. The human then approves an answer that is not there and
+    // the replay re-enters text the form will reject again.
+    //
+    // No format sniffing and nothing per-tenant: we WROTE it and READ IT BACK, and the field itself
+    // tells us whether it accepted the value. When it did not, say so and ask for a real answer — for
+    // a numeric field there IS no safe placeholder, because any number we invent is a salary
+    // expectation the applicant never gave.
+    if (!r || r.status !== "filled") {
+      return { status: "needs_review", after: (r && r.after != null) ? r.after : null, verified: false, flag: "ai-text-needs-answer",
+        detail: "REQUIRED, and the AI had no basis for it (" + reason + "). This field REFUSED the \"N/A\" placeholder"
+          + (r && r.after != null && String(r.after).trim() !== "" ? " (it shows \"" + r.after + "\")" : " (it stayed empty)")
+          + " — it only accepts certain input, so please type an answer it will take.", auditLoc: loc.wrapperSel };
+    }
+    return { status: "filled_review", after: r.after != null ? r.after : ph, verified: r.verified === true, flag: "ai-text-needs-answer",
       detail: "REQUIRED, and the AI had no basis for it (" + reason + ") — entered \"N/A\" so the page can advance; replace it or approve the N/A", auditLoc: loc.wrapperSel };
   };
   // Generation master-switch: the operator's autofill_rules allowlist. ABSENT ≠ OFF (2026-08-03).
@@ -1132,7 +1149,7 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
   const style = (profile && profile.application_questions && profile.application_questions.writing_style) || "";
   const system = "You write a brief, human, professional answer to ONE job-application question for the applicant, using ONLY the applicant's profile (experience, projects, skills, essay_drafts, story_bank, open_ended). "
     + (style ? "Writing style: " + style + " " : "")
-    + "If the field asks for specific FACTUAL data not in the profile (a name, ID, code, date, number, URL, address) or you cannot answer from the profile, reply SKIP — NEVER fabricate facts about the applicant. "
+    + "You MAY answer when the value FOLLOWS from what the profile already says — e.g. the county for a city and state the applicant gave, the country for their city, the state a listed university is in. That is deriving, not inventing, and the profile is the source. Reply SKIP only when the answer is a fact about the applicant that the profile does NOT determine — a salary expectation, an employee or reference ID, a date they never gave, someone else's name, a document number. NEVER fabricate those. "
     + "When you DO answer, also give \"maps_to\" = the dotted path of the matching profile field (from the profile JSON) or \"none\", and \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const user = "Question / field label: " + String(f.label || "")
     + "\nApplicant profile: " + JSON.stringify(profile)

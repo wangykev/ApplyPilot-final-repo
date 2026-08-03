@@ -136,6 +136,10 @@ function makeFakeAct(fields, opts) {
     typeText: async (text) => {
       log.push(["typeText", text]);
       if (!focusedText) return;
+      // A field can REFUSE what you type: Copart's required "desired compensation" box only accepts a
+      // number, so "N/A" never lands and the box stays empty (operator, live 2026-08-03). Modelled
+      // generically as an accept-predicate, not as a tenant.
+      if (focusedText.textRejects && !/^[\d.,\s]*$/.test(text)) return; // non-numeric input is dropped
       const v = focusedText.mangle ? focusedText.mangle(text) : text;
       if (focusedText.valueAfterReads !== undefined) { focusedText._pending = v; focusedText._readsLeft = focusedText.valueAfterReads; } // lag model
       else focusedText.value = v;
@@ -8637,4 +8641,24 @@ test("checkbox group SET: a LEGACY bundle (joined string, no array) still replay
     current_value: "Asian; White", question_label: "Ethnicity" }, T_BUDGETS);
   assert.strictEqual(r.status, "filled", r.detail);
   assert.deepStrictEqual(r.selected_options.slice().sort(), ["Asian", "White"]);
+});
+
+test("AI-2 placeholder: a field that REFUSES \"N/A\" is never reported as answered", async () => {
+  // Copart's required "desired compensation" box only accepts a number, so the characters never land.
+  // The decline path used to hardcode filled_review and claim it entered N/A regardless — leaving the
+  // bundle asserting a value over an empty field, which a human then approves and the replay re-sends.
+  const f = aiText({ isRequired: true, textRejects: true });
+  const act = makeFakeAct([f], { aiEnabled: true, ai: JSON.stringify({ skip: true, reason: "no salary in profile" }) });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review", "a refused write is not an answer");
+  assert.match(rec.detail, /REFUSED/);
+  assert.ok(rec.after == null || String(rec.after).trim() === "", "reports what the field actually holds");
+});
+
+test("AI-2 placeholder: a field that ACCEPTS N/A still reports it, flagged", async () => {
+  const act = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: JSON.stringify({ skip: true, reason: "x" }) });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(String(rec.after).trim(), "N/A");
+  assert.strictEqual(rec.flag, "ai-text-needs-answer");
 });

@@ -4350,11 +4350,21 @@ async function syncRejectedValues(errorTexts, LOG) {
     const scan = await cdpEval(cdpPageScan);
     const live = (scan && scan.fields) || [];
     const bundle = await new Promise((res) => chrome.storage.local.get("reviewSummary", (r) => res(r && r.reviewSummary)));
-    if (!bundle || !Array.isArray(bundle.entries)) return;
+    // ALWAYS account for the run. The notes list covers the cases the reconciler can explain, but the
+    // guards ABOVE it (no scan, no bundle) returned silently — and live that was indistinguishable from
+    // "the bundle was already right", so a check that never ran looked like a check that found nothing.
+    // Twice now this session, a no-op that said nothing cost a whole run to diagnose.
+    if (!bundle || !Array.isArray(bundle.entries)) {
+      LOG(`  (rejected-value check: no stored bundle to reconcile — skipped)`);
+      return;
+    }
     const r = rejectedValueEntries(bundle.entries, live, errorTexts);
-    // Say why nothing changed. A silent no-op here is indistinguishable from "the bundle was already
-    // right", and live it hid a genuine matching failure for a whole run.
-    if (!r.changed.length) { for (const n of (r.notes || [])) LOG(`  (rejected-value check: ${n})`); return; }
+    if (!r.changed.length) {
+      const notes = r.notes || [];
+      if (notes.length) for (const n of notes) LOG(`  (rejected-value check: ${n})`);
+      else LOG(`  (rejected-value check: nothing to correct — ${live.length} live field(s), ${bundle.entries.length} bundle entr(ies), errors named ${JSON.stringify((errorTexts || []).length)})`);
+      return;
+    }
     bundle.entries = r.entries;
     bundle.needs_review_count = bundle.entries.filter((e) => e && e.needs_review && !e.is_deleted).length;
     await new Promise((res) => chrome.storage.local.set({ reviewSummary: bundle }, res));
