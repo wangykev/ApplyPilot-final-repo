@@ -2,8 +2,8 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
-import { aiConfigSchema } from "@/lib/ai-config";
-import { callLLM } from "@/lib/llm";
+import { aiConfigSchema, withLegacyMirror } from "@/lib/ai-config";
+import { callLLM, LLM_DEFAULT_MODELS, type LlmProvider } from "@/lib/llm";
 
 export type SaveResult = { ok: true } | { ok: false; error: string };
 export type TestResult = { ok: true; text: string } | { ok: false; error: string };
@@ -22,9 +22,14 @@ export async function saveAiConfig(raw: unknown): Promise<SaveResult> {
     } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "You're not signed in." };
 
+    // Keep the legacy flat `apiKey` pointing at the key rotation would try first, so an
+    // extension build older than the multi-key change — and the extension popup, which
+    // still writes the flat shape — keeps finding a key where it expects one.
+    const config = withLegacyMirror(parsed.data);
+
     const { error } = await supabase
       .from("profiles")
-      .upsert({ id: user.id, ai_config: parsed.data }, { onConflict: "id" });
+      .upsert({ id: user.id, ai_config: config }, { onConflict: "id" });
     if (error) return { ok: false, error: error.message };
     return { ok: true };
   } catch (err) {
@@ -32,16 +37,23 @@ export async function saveAiConfig(raw: unknown): Promise<SaveResult> {
   }
 }
 
-/** Round-trip a trivial prompt to verify the provider + key + model (server-side). */
-export async function testLlm(raw: unknown): Promise<TestResult> {
-  const parsed = aiConfigSchema.safeParse(raw);
-  if (!parsed.success) return { ok: false, error: "AI config didn't validate." };
-  const { provider, model, apiKey } = parsed.data;
-  if (!apiKey) return { ok: false, error: "Enter an API key to test." };
+/**
+ * Round-trip a trivial prompt with ONE specific key, server-side. Per-key rather than
+ * per-config: with several keys on a provider, "does my AI work" is not a useful answer —
+ * the operator needs to know WHICH key is the dead one.
+ *
+ * Tests against that provider's default model, which for Gemini is a free-tier model, so
+ * a free key isn't reported broken merely for being pointed at a paid-only model.
+ */
+export async function testLlmKey(input: { provider: string; key: string }): Promise<TestResult> {
+  const provider = input?.provider as LlmProvider;
+  const apiKey = typeof input?.key === "string" ? input.key.trim() : "";
+  if (!apiKey) return { ok: false, error: "Enter a key first." };
+  if (!LLM_DEFAULT_MODELS[provider]) return { ok: false, error: `Unknown provider "${input?.provider}".` };
 
   const res = await callLLM({
     provider,
-    model,
+    model: LLM_DEFAULT_MODELS[provider],
     apiKey,
     user: 'Reply with exactly the word "OK".',
     maxTokens: 16,

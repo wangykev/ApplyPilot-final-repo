@@ -200,7 +200,8 @@ export function applyLlmKeyOutcome(
     return next;
   }
 
-  const base: LlmKeySlot = { invalid: false, cooldownUntil: 0, ...(prev[slotKey] || {}) };
+  const existing = prev[slotKey];
+  const base: LlmKeySlot = existing ? { ...existing } : { invalid: false, cooldownUntil: 0 };
   if (code === "auth") {
     base.invalid = true;
   } else if (code === "quota") {
