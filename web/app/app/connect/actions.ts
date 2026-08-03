@@ -5,7 +5,7 @@ import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
 import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
 import { ensureDefaultFieldWordings } from "@/lib/teach";
-import { coerceAiConfig } from "@/lib/ai-config";
+import { coerceAiConfig, type AiConfig } from "@/lib/ai-config";
 import { coerceCredentials, coerceOnboardConfig, type Credentials, type OnboardConfig } from "@/lib/credentials";
 import { generateApiKey, hashApiKey } from "@/lib/api-key";
 
@@ -17,7 +17,12 @@ export type ProfileSlice = {
   buckets: unknown;
   jobContext: { company: string };
 };
-export type AiSlice = { llmConfig: { provider: string; model: string; apiKey: string; enabled: boolean } };
+// The WHOLE ai_config goes to the extension, not a hand-picked subset. It used to send
+// only {provider,model,apiKey,enabled}, which silently stripped the key LIST, the
+// per-action routes, the fallback chains and the thinking settings — so every one of those
+// features was dead on arrival in the extension no matter what the AI page said. Typing it
+// as AiConfig means a future hand-pick fails the typecheck instead of failing quietly.
+export type AiSlice = { llmConfig: AiConfig };
 export type ResumeSlice = { resume: { filename: string; mime: string; size: number; base64: string } | null };
 
 export type SyncBundle = ProfileSlice &
@@ -62,7 +67,7 @@ function shapeProfileSlice(row: ProfileRow): ProfileSlice {
 
 function shapeAiSlice(row: ProfileRow): AiSlice {
   const ai = coerceAiConfig(row?.ai_config);
-  return { llmConfig: { provider: ai.provider, model: ai.model, apiKey: ai.apiKey, enabled: ai.enabled } };
+  return { llmConfig: ai };
 }
 
 /** Auth + config guard shared by every slice action. */

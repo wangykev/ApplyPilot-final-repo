@@ -286,3 +286,82 @@ test("callLLMForAction with no keys at all explains itself", async () => {
   assert.match(res.ok === false ? res.error : "", /AI page/);
   assert.equal(f.calls.length, 0);
 });
+
+// ─── Persistence: what the AI page saves must survive the round trip ─────────
+// ai_config is a jsonb column, so the config goes out through JSON and comes back through
+// coerceAiConfig. Anything the schema quietly drops on the way back in is a setting the
+// operator sets and never gets — invisible until a fill uses the wrong model.
+
+import { aiConfigSchema, coerceAiConfig, withLegacyMirror, totalUsableKeys } from "../lib/ai-config";
+
+test("a full v2 config survives save → jsonb → read unchanged", () => {
+  const saved = aiConfigSchema.parse({
+    provider: "gemini",
+    model: "gemini-3.5-flash-lite",
+    thinking: "manual",
+    effort: "high",
+    enabled: true,
+    preferFreeFirst: true,
+    fallbacks: [{ provider: "gemini", model: "gemini-3.1-flash-lite", thinking: "off", effort: "" }],
+    keys: {
+      gemini: [
+        { id: "g1", label: "aistudio", key: "AIza-1", tier: "free", enabled: true },
+        { id: "g2", label: "billed", key: "AIza-2", tier: "paid", enabled: true },
+      ],
+      anthropic: [{ id: "a1", label: "", key: "sk-ant-1", tier: "paid", enabled: true }],
+    },
+    routes: {
+      essay: {
+        provider: "anthropic",
+        model: "claude-opus-5",
+        thinking: "manual",
+        effort: "max",
+        fallbacks: [{ provider: "gemini", model: "gemini-3.5-flash", thinking: "off", effort: "" }],
+      },
+    },
+  });
+
+  const readBack = coerceAiConfig(JSON.parse(JSON.stringify(saved)));
+  assert.deepEqual(readBack, saved, "the round trip must not drop or alter a single field");
+
+  // Spot-check the fields most likely to be lost, since a deepEqual failure alone
+  // wouldn't say which.
+  assert.equal(readBack.keys.gemini?.length, 2);
+  assert.equal(readBack.routes.essay?.effort, "max");
+  assert.equal(readBack.routes.essay?.fallbacks[0].model, "gemini-3.5-flash");
+  assert.equal(readBack.fallbacks[0].model, "gemini-3.1-flash-lite");
+  assert.equal(readBack.thinking, "manual");
+  assert.equal(totalUsableKeys(readBack), 3);
+});
+
+test("the legacy apiKey mirror points at the key rotation would try first", () => {
+  // An extension build older than the multi-key change reads only `apiKey`, so the mirror
+  // has to be the FREE key here — the one free-first ordering would actually pick.
+  const cfg = aiConfigSchema.parse({
+    provider: "gemini",
+    preferFreeFirst: true,
+    keys: {
+      gemini: [
+        { id: "paid", key: "AIza-paid", tier: "paid", enabled: true },
+        { id: "free", key: "AIza-free", tier: "free", enabled: true },
+      ],
+    },
+  });
+  assert.equal(withLegacyMirror(cfg).apiKey, "AIza-free");
+
+  // With no keys at all, a pre-existing v1 apiKey must NOT be wiped — that would be the
+  // only key a half-migrated account has.
+  const v1 = aiConfigSchema.parse({ provider: "gemini", apiKey: "AIza-legacy" });
+  assert.equal(withLegacyMirror(v1).apiKey, "AIza-legacy");
+});
+
+test("a route for an id that stopped being routable is dropped, not fatal", () => {
+  // teach became an alias of fill, so a config stored while it was a row must still load.
+  const cfg = coerceAiConfig({
+    provider: "gemini",
+    routes: { teach: { provider: "openai", model: "gpt-4o" }, essay: { provider: "anthropic", model: "claude-opus-5" } },
+  });
+  // Cast: the type no longer admits "teach" as a route key — which is the point.
+  assert.equal((cfg.routes as Record<string, unknown>).teach, undefined, "the stale row is dropped");
+  assert.equal(cfg.routes.essay?.model, "claude-opus-5", "the valid one survives");
+});
