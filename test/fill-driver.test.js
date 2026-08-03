@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -139,7 +139,8 @@ function makeFakeAct(fields, opts) {
       // A field can REFUSE what you type: Copart's required "desired compensation" box only accepts a
       // number, so "N/A" never lands and the box stays empty (operator, live 2026-08-03). Modelled
       // generically as an accept-predicate, not as a tenant.
-      if (focusedText.textRejects && !/^[\d.,\s]*$/.test(text)) return; // non-numeric input is dropped
+      if (focusedText.textRejectsAll) return;                                   // accepts nothing at all
+      if (focusedText.textRejects && !/^[0-9]*$/.test(text)) return;            // DIGITS only — a comma or "N/A" is dropped
       const v = focusedText.mangle ? focusedText.mangle(text) : text;
       if (focusedText.valueAfterReads !== undefined) { focusedText._pending = v; focusedText._readsLeft = focusedText.valueAfterReads; } // lag model
       else focusedText.value = v;
@@ -8650,9 +8651,52 @@ test("AI-2 placeholder: a field that REFUSES \"N/A\" is never reported as answer
   const f = aiText({ isRequired: true, textRejects: true });
   const act = makeFakeAct([f], { aiEnabled: true, ai: JSON.stringify({ skip: true, reason: "no salary in profile" }) });
   const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review", "a refused write is not an answer");
-  assert.match(rec.detail, /REFUSED/);
-  assert.ok(rec.after == null || String(rec.after).trim() === "", "reports what the field actually holds");
+  // The box takes DIGITS, so "N/A" is refused and the fill falls back to a PLACEHOLDER 0 purely so the
+  // page can advance and review can see the rest of the application (operator 2026-08-03: "nothing
+  // should halt, it should always get to the review page").
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(String(rec.after).trim(), "0");
+  assert.strictEqual(rec.flag, "ai-text-needs-answer");
+  assert.match(rec.detail, /PLACEHOLDER 0/);
+  // …and it can never be SUBMITTED while it is still the placeholder — that is what makes writing a
+  // number nobody chose acceptable.
+  const { unreplacedPlaceholders } = require("../lib.js");
+  assert.strictEqual(unreplacedPlaceholders([{ flag: rec.flag, current_value: rec.after }]).length, 1,
+    "an untouched 0 must hard-block submit");
+});
+
+test("AI-2 placeholder: a field refusing BOTH N/A and 0 is reported, not faked", async () => {
+  // A box that accepts neither is a genuine dead end — say so rather than invent something it takes.
+  const f = aiText({ isRequired: true, textRejectsAll: true });
+  const act = makeFakeAct([f], { aiEnabled: true, ai: JSON.stringify({ skip: true, reason: "x" }) });
+  const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /REFUSED both/);
+});
+
+test("text fill: a digits-only field accepts a human's \"80,000\" as 80000", async () => {
+  // Operator's case: a reviewer types a formatted figure, the field drops every non-digit, and the
+  // whole write vanishes — on a replay that halts a run over an answer they DID give.
+  const f = aiText({ isRequired: true, textRejects: true });
+  const act = makeFakeAct([f]);
+  const r = await fillTextCdp(act, { wrapperSel: f.wrapperSel }, "80,000", T_BUDGETS, "input");
+  assert.strictEqual(r.status, "filled", r.detail);
+  assert.strictEqual(r.after, "80000", "the record must report what LANDED, or the review-page check disagrees");
+  assert.strictEqual(r.numericCoerced, true);
+  assert.match(r.detail, /digits only/);
+});
+
+test("text fill: coercion never mangles a non-numeric answer, and never fires on a normal field", async () => {
+  // prose into a digits-only field has no numeric form — it must fail honestly, not become a number
+  const prose = makeFakeAct([aiText({ isRequired: true, textRejects: true })]);
+  const p = await fillTextCdp(prose, { wrapperSel: "[w-essay]" }, "Negotiable", T_BUDGETS, "input");
+  assert.strictEqual(p.status, "needs_review");
+  // an ordinary field takes the value verbatim — no coercion, commas intact
+  const ok = makeFakeAct([aiText({ isRequired: true })]);
+  const g = await fillTextCdp(ok, { wrapperSel: "[w-essay]" }, "80,000", T_BUDGETS, "input");
+  assert.strictEqual(g.status, "filled");
+  assert.strictEqual(g.after, "80,000");
+  assert.notStrictEqual(g.numericCoerced, true);
 });
 
 test("AI-2 placeholder: a field that ACCEPTS N/A still reports it, flagged", async () => {

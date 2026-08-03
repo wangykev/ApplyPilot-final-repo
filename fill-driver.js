@@ -743,7 +743,8 @@ function textValuesMatch(actual, expected) {
   return false;
 }
 
-const fillTextCdp = async (act, loc, value, budgets, tag) => {
+const fillTextCdp = async (act, loc, value, budgets, tag, opts) => {
+  // opts.noNumericRetry guards the digits-only retry below from recursing into itself.
   const pre = await act.readTextValue(loc, tag);
   if (!pre) return { status: "error", detail: "no " + (tag || "input") + " in wrapper" };
   const before = pre.value;
@@ -783,6 +784,29 @@ const fillTextCdp = async (act, loc, value, budgets, tag) => {
       return { status: "filled", after, verified: true, detail };
     }
     // mismatch → re-focus/clear/type on the next attempt (the prior type landed a wrong value)
+  }
+  // THE FIELD REFUSED THE CHARACTERS — try the same value in the only form it accepts.
+  //
+  // Workday renders some numeric questions (salary, compensation) as inputs that silently drop every
+  // non-digit keystroke. A human typing "80,000" in the review editor therefore writes NOTHING, and
+  // on a replay that is a halt on an answer they did give. The comma is formatting, not meaning.
+  //
+  // Deliberately narrow, because rewriting someone's answer is not a small thing:
+  //   • only when the box ended EMPTY — a true refusal, not a mismatch (a mismatch may be a stray, and
+  //     silently retyping over one could commit the wrong value);
+  //   • only when stripping leaves DIGITS and actually changes the string, so "N/A" or prose is never
+  //     mangled into a number;
+  //   • the record reports the value that ACTUALLY landed, never the one we were asked for — the
+  //     review page reconcile compares against the form, so a bundle claiming "80,000" over a field
+  //     holding "80000" would read as a DISAGREE and block submit.
+  const digitsOnly = String(value == null ? "" : value).replace(/[^0-9]/g, "");
+  const refused = after == null || String(after).trim() === "";
+  if (!(opts && opts.noNumericRetry) && refused && digitsOnly && digitsOnly !== String(value).trim()) {
+    const retry = await fillTextCdp(act, loc, digitsOnly, budgets, tag, { noNumericRetry: true });
+    if (retry && retry.status === "filled") {
+      return { ...retry, numericCoerced: true,
+        detail: `the field accepts digits only — typed ${JSON.stringify(digitsOnly)} for ${JSON.stringify(String(value))}` };
+    }
   }
   return { status: "needs_review", after, verified: false, detail: `read-back mismatch after ${attempts} attempt(s) (typed via ${focusMethod}, field shows "${after}")` };
 };
@@ -1121,10 +1145,27 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     // a numeric field there IS no safe placeholder, because any number we invent is a salary
     // expectation the applicant never gave.
     if (!r || r.status !== "filled") {
+      // The field refused the text placeholder — it takes digits only (live: Copart's "desired
+      // compensation", clearesult's "salary expectation"). Leaving it empty HALTS the walk on that page,
+      // so review never sees the other 50 fields that filled correctly. Operator 2026-08-03: "write 0
+      // for now, nothing should halt, it should always get to the review page so the reviewer can
+      // change it."
+      //
+      // "0" is a PLACEHOLDER, not an answer, and it is treated as one everywhere it matters:
+      // unreplacedPlaceholders counts it while the needs-answer flag is still on the entry, so the
+      // submit gate REFUSES until a human replaces it. Reaching review is the point — nobody's salary
+      // expectation is zero, and this must never be what gets filed.
+      const z = await fillTextCdp(act, loc, "0", budgets, tag);
+      if (z && z.status === "filled") {
+        return { status: "filled_review", after: z.after != null ? z.after : "0", verified: z.verified === true, flag: "ai-text-needs-answer",
+          detail: "REQUIRED, and the AI had no basis for it (" + reason + "). This field only accepts a number, so it holds a"
+            + " PLACEHOLDER 0 purely so the page could advance and you could see the rest of the application —"
+            + " replace it with a real figure. Submit stays blocked while it is still 0.", auditLoc: loc.wrapperSel };
+      }
       return { status: "needs_review", after: (r && r.after != null) ? r.after : null, verified: false, flag: "ai-text-needs-answer",
-        detail: "REQUIRED, and the AI had no basis for it (" + reason + "). This field REFUSED the \"N/A\" placeholder"
+        detail: "REQUIRED, and the AI had no basis for it (" + reason + "). This field REFUSED both the \"N/A\" and \"0\" placeholders"
           + (r && r.after != null && String(r.after).trim() !== "" ? " (it shows \"" + r.after + "\")" : " (it stayed empty)")
-          + " — it only accepts certain input, so please type an answer it will take.", auditLoc: loc.wrapperSel };
+          + " — please type an answer it will take.", auditLoc: loc.wrapperSel };
     }
     return { status: "filled_review", after: r.after != null ? r.after : ph, verified: r.verified === true, flag: "ai-text-needs-answer",
       detail: "REQUIRED, and the AI had no basis for it (" + reason + ") — entered \"N/A\" so the page can advance; replace it or approve the N/A", auditLoc: loc.wrapperSel };
@@ -6542,5 +6583,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

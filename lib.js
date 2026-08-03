@@ -359,8 +359,15 @@ function isAiPlaceholder(text) { return typeof text === "string" && text.indexOf
 // replacing the old marker did.
 function unreplacedPlaceholders(entries) {
   const untouchedNA = (v) => String(v == null ? "" : v).trim().toUpperCase().replace(/[./\s]/g, "") === "NA";
+  // A NUMERIC-only field rejects "N/A", so the fill falls back to "0" to get the page past Workday's
+  // required check and reach review (operator 2026-08-03: "nothing should halt"). That makes "0" a
+  // placeholder exactly like "N/A", and it MUST block submit for the same reason: nobody's salary
+  // expectation is zero, and filing it would state one they never gave. Only counts when the entry
+  // still carries the needs-answer flag — a human who types 0 deliberately has edited the field, which
+  // clears the flag through the normal edit path.
+  const untouchedZero = (v) => /^[0\s.,$]*0[0\s.,$]*$/.test(String(v == null ? "" : v).trim()) && /0/.test(String(v));
   return (entries || []).filter((e) => e && e.flag === "ai-text-needs-answer" &&
-    (isAiPlaceholder(e.current_value) || untouchedNA(e.current_value)));
+    (isAiPlaceholder(e.current_value) || untouchedNA(e.current_value) || untouchedZero(e.current_value)));
 }
 
 // (AI-3 NOTE: the earlier `ungrantedRequiredConsents` consent-halt was REMOVED — operator decided
