@@ -31,7 +31,9 @@ const apMatch = (typeof module !== "undefined" && module.exports)
   : { normalize: normalize, matchCandidates: matchCandidates, fuzzyRatio: fuzzyRatio, normalizeLabel: normalizeLabel,
       // M4 submit gate needs these lib pures too — they're globals in the SW (lib.js loads first).
       sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
-      tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf };
+      tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
+      // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
+      parseYearMonthDay: parseYearMonthDay };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -907,7 +909,11 @@ const isEeoField = (o) => !!o && (AI_EEO_RE.test(String(o.label || "")) || AI_EE
 const aiEligible = (f) => {
   if (!f) return false;
   if (f.fieldName === "candidateIsPreviousWorker") return false;  // employer-match path
-  return f.widgetType === "dropdown" || f.widgetType === "text" || f.widgetType === "textarea";
+  // `date` is here for the same reason text is: a REQUIRED date the profile cannot answer used to
+  // stay BLANK and block Save & Continue, halting the walk short of review (live 2026-08-02,
+  // Clearwater: "What is your desired start date?" — operator: "the AI should guess a date and then
+  // on the review page flag it, but AI did not here"). The multi-ATS driver already AI-fills dates.
+  return f.widgetType === "dropdown" || f.widgetType === "text" || f.widgetType === "textarea" || f.widgetType === "date";
 };
 
 // Did the deterministic pass produce NOTHING usable? (the AI-fallback trigger) — either
@@ -1042,6 +1048,39 @@ const parseAiText = (text) => {
 const AI_NEEDS_ANSWER_MARK_FD = "[NEEDS YOUR ANSWER";
 const aiPlaceholderText = (reason) => AI_NEEDS_ANSWER_MARK_FD + " — AI declined: " + (reason || "no basis in profile") + "]";
 
+// AI date fill — a REQUIRED date composite the deterministic pass could not answer. Workday will not
+// advance a page with a required date empty, so leaving it blank halts the walk; the operator's rule
+// is to GUESS and FLAG (2026-08-02). Asks for a bare ISO date, parses it with the SAME pure parser the
+// mapped date fields use (so an unparseable reply can never reach the form), fills the composite, and
+// is ALWAYS filled_review — a guessed date is never a silent fill.
+const aiFillDate = async (act, loc, f, profile, jobContext, budgets) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const sys = "You fill job-application forms. Answer with a DATE ONLY, in YYYY-MM-DD form, and nothing else. " +
+    "If the question asks when the candidate can start, choose a reasonable near-future weekday.";
+  const user = "Today is " + today + ".\nQuestion: " + String(f.label || f.fieldName || "") +
+    "\nCandidate profile (JSON):\n" + JSON.stringify(profile || {}).slice(0, 4000) +
+    "\n\nReply with just the date, YYYY-MM-DD.";
+  let raw = null;
+  try {
+    const res = await act.llm({ system: sys, user, maxTokens: 24 });
+    raw = res && res.ok ? String(res.text || "").trim() : null;
+  } catch (e) { raw = null; }
+  const iso = raw && (raw.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
+  const parsed = iso ? apMatch.parseYearMonthDay(iso) : null;
+  if (!parsed) {
+    return { status: "needs_review", after: null, flag: "ai-date-no-basis",
+      detail: "REQUIRED date the profile does not answer, and the AI did not return a usable date" +
+        (raw ? " (replied " + JSON.stringify(raw.slice(0, 40)) + ")" : "") + " — answer it here",
+      auditLoc: loc.wrapperSel };
+  }
+  const r = await fillDateCompositeCdp(act, loc, parsed, budgets);
+  const ok = r && r.verified === true;
+  return { status: ok ? "filled_review" : "needs_review", after: (r && r.after != null) ? r.after : iso,
+    verified: ok, flag: "ai-date-guess", matchTier: "ai_inference", confidence: "low",
+    detail: "AI guessed this REQUIRED date (" + iso + ") so the page can advance — verify it" + (ok ? "" : " (commit not verified)"),
+    auditLoc: loc.wrapperSel };
+};
+
 // AI-2 free-text / essay fill (LLM). ALWAYS-GUESS adapted to text: GENERATE an answer from the
 // profile, or SKIP for factual data it shouldn't fabricate — but **NEVER leave a REQUIRED field
 // blank** (a blank halts the walk short of review). OPTIONAL skip → blank needs_review; REQUIRED
@@ -1053,10 +1092,17 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
   // OPTIONAL decline → blank+flag; REQUIRED decline → placeholder so the walk reaches review.
   const declineOrPlaceholder = async (reason) => {
     if (!required) return { status: "needs_review", after: null, flag: "ai-text-skip", detail: "AI declined: " + reason, auditLoc: loc.wrapperSel };
-    const ph = aiPlaceholderText(reason);
+    // Write a REAL, submittable answer — "N/A" — not a bracketed marker. Two reasons, both live:
+    // machine jargon must never reach an employer's form (operator 2026-07-31), and Workday
+    // REJECTS the marker in a constrained field, so the walk halted at Save & Continue instead of
+    // reaching review (2026-08-02: Clearwater + Radiance, a required "desired Annual Salary").
+    // Safety is UNCHANGED: the record stays flagged ai-text-needs-answer, so unreplacedPlaceholders
+    // still HARD-BLOCKS the submit while the value is an untouched N/A, and the review gate still
+    // requires a human to approve or replace it.
+    const ph = "N/A";
     const r = await fillTextCdp(act, loc, ph, budgets, tag);
     return { status: "filled_review", after: (r && r.after != null) ? r.after : ph, verified: r && r.verified === true, flag: "ai-text-needs-answer",
-      detail: "REQUIRED — AI declined (" + reason + "); placeholder filled so the walk advances — REPLACE before submit", auditLoc: loc.wrapperSel };
+      detail: "REQUIRED, and the AI had no basis for it (" + reason + ") — entered \"N/A\" so the page can advance; replace it or approve the N/A", auditLoc: loc.wrapperSel };
   };
   // Generation master-switch: the operator's autofill_rules allowlist (empty ⇒ generation OFF).
   const genAllowed = !!(profile && profile.autofill_rules && Array.isArray(profile.autofill_rules.generation_allowed_only_for)
@@ -3076,7 +3122,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
             ? await aiFillField(act, loc, f, profile, jobContext, budgets)
-            : await aiFillText(act, loc, f, profile, jobContext, budgets);
+            : (f.widgetType === "date")
+              ? await aiFillDate(act, loc, f, profile, jobContext, budgets)
+              : await aiFillText(act, loc, f, profile, jobContext, budgets);
           // EEO retraction: an AI-INFERRED demographic still gets the loud demographic badge. Only a
           // committed inference (filled_review); canonicalize keeps ai-canonicalized (maps a STATED value).
           if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess";

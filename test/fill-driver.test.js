@@ -1555,13 +1555,17 @@ test("AI-2: an OPTIONAL field gets NO AI fallback — deterministic skip, BLANK,
   assert.ok(!act.log.some(([m]) => m === "llm"), "the LLM is NEVER consulted for an optional field");
 });
 
-test("AI-2 PRINCIPLE: a REQUIRED field the AI SKIPs → conspicuous placeholder, never blank (walk reaches review; submit hard-blocks)", async () => {
+test("AI-2 PRINCIPLE: a REQUIRED field the AI SKIPs → a submittable N/A, never blank (walk advances; submit still hard-blocks)", async () => {
   const act = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: '{"skip":true,"reason":"asks for a specific employee ID"}' });
   const rec = (await drivePageFill(act, GEN_ON, {}, {}, T_BUDGETS)).results[0];
   assert.strictEqual(rec.status, "filled_review", "non-blank so the walk advances");
   assert.strictEqual(rec.flag, "ai-text-needs-answer");
-  assert.match(rec.after, /^\[NEEDS YOUR ANSWER/, "a detectable, conspicuous placeholder is filled");
-  // the placeholder is detectable by the submit-precondition seam
+  // A REAL, submittable answer: machine jargon must never reach an employer's form, and Workday
+  // REJECTS a bracketed marker in a constrained field — live 2026-08-02 a required "desired Annual
+  // Salary" box blocked Save & Continue on two tenants and the walk halted short of review.
+  assert.strictEqual(String(rec.after).trim(), "N/A", "a submittable answer, not machine jargon");
+  // …and it is STILL hard-blocked at submit: the block keys on the FLAG plus an untouched value,
+  // now that the value itself is innocuous.
   const { unreplacedPlaceholders } = require("../lib.js");
   const entries = buildReviewBundle((await drivePageFill(makeFakeAct([aiText()], { aiEnabled: true, ai: '{"skip":true,"reason":"x"}' }), GEN_ON, {}, {}, T_BUDGETS)).results, {}).entries;
   assert.strictEqual(unreplacedPlaceholders(entries).length, 1, "the bundle entry is detected as an unreplaced placeholder (submit-blocked)");

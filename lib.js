@@ -325,8 +325,18 @@ const AI_NEEDS_ANSWER_MARK = "[NEEDS YOUR ANSWER";
 function isAiPlaceholder(text) { return typeof text === "string" && text.indexOf(AI_NEEDS_ANSWER_MARK) !== -1; }
 // The submit-precondition seam: bundle entries flagged ai-text-needs-answer whose value STILL
 // carries the marker (the bundle is a snapshot; the authoritative submit gate re-reads the LIVE field).
+// An `ai-text-needs-answer` field is unreplaced while it still holds what the fill put there.
+// It used to be a bracketed marker, which read as machine junk on an employer's form and — worse
+// — Workday REJECTED it in a constrained field, so Save & Continue blocked and the walk halted
+// short of review (live 2026-08-02, two tenants, a required "desired Annual Salary"). The value
+// written is now plain "N/A" (operator 2026-07-31: "never answer with AI declined, N/A would be
+// better"), so the HARD BLOCK can no longer key on the text alone: it keys on the FLAG plus the
+// value still being untouched. A human who edits it to anything else clears the block, exactly as
+// replacing the old marker did.
 function unreplacedPlaceholders(entries) {
-  return (entries || []).filter((e) => e && e.flag === "ai-text-needs-answer" && isAiPlaceholder(e.current_value));
+  const untouchedNA = (v) => String(v == null ? "" : v).trim().toUpperCase().replace(/[./\s]/g, "") === "NA";
+  return (entries || []).filter((e) => e && e.flag === "ai-text-needs-answer" &&
+    (isAiPlaceholder(e.current_value) || untouchedNA(e.current_value)));
 }
 
 // (AI-3 NOTE: the earlier `ungrantedRequiredConsents` consent-halt was REMOVED — operator decided
