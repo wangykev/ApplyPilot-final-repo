@@ -145,3 +145,107 @@ test("every free-tier model is offerable and carries real limits", () => {
   }
   assert.ok(isFreeTierModel("gemini", LLM_DEFAULT_MODELS.gemini), "the default Gemini model must be reachable by a free key");
 });
+
+// ─── Server-side rotation (web/lib/llm.ts) ──────────────────────────────────
+// The website's own callers (resume parse, cover letter, teach) go through
+// callLLMForAction, so these cover the path they actually take.
+
+import { callLLM, callLLMForAction } from "../lib/llm";
+
+type Canned = { status: number; json?: unknown; body?: string };
+function fakeFetch(responses: Canned[]) {
+  const calls: Array<{ url: string; key: string }> = [];
+  const queue = responses.slice();
+  const impl = (async (url: unknown, opts: unknown) => {
+    const o = (opts ?? {}) as { headers?: Record<string, string> };
+    const h = o.headers ?? {};
+    calls.push({
+      url: String(url),
+      key: h["x-api-key"] || h.Authorization || (String(url).match(/key=([^&]+)/) || [])[1] || "",
+    });
+    const next = queue.shift();
+    if (!next) throw new Error("unexpected fetch #" + calls.length);
+    return {
+      ok: next.status >= 200 && next.status < 300,
+      status: next.status,
+      json: async () => next.json,
+      text: async () => next.body ?? JSON.stringify(next.json ?? ""),
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+  return { calls, impl };
+}
+
+const okGemini = (text: string): Canned => ({ status: 200, json: { candidates: [{ content: { parts: [{ text }] } }] } });
+const twoGeminiKeys: LlmKey[] = [
+  { id: "k1", label: "", key: "AIza-one", tier: "free", enabled: true },
+  { id: "k2", label: "", key: "AIza-two", tier: "free", enabled: true },
+];
+
+test("server rotation: a rate-limited key hands off to the next", async () => {
+  const f = fakeFetch([{ status: 429, body: '{"error":{"status":"RESOURCE_EXHAUSTED"}}' }, okGemini("second key")]);
+  const res = await callLLM(
+    { provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "", user: "hi", keys: twoGeminiKeys },
+    f.impl
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.ok && res.text, "second key");
+  assert.equal(f.calls.length, 2);
+  assert.ok(f.calls[1].key.includes("two"));
+});
+
+test("server rotation: a plain 400 stops at the first key", async () => {
+  const f = fakeFetch([{ status: 400, body: '{"error":{"message":"Unknown name \\"foo\\""}}' }]);
+  const res = await callLLM(
+    { provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "", user: "hi", keys: twoGeminiKeys },
+    f.impl
+  );
+  assert.equal(res.ok, false);
+  assert.equal(f.calls.length, 1);
+});
+
+test("callLLMForAction uses the action's own model", async () => {
+  const cfg = {
+    provider: "gemini",
+    model: "gemini-3.1-flash-lite",
+    keys: { anthropic: [{ id: "a1", label: "", key: "sk-ant-x", tier: "paid", enabled: true }] },
+    routes: { cover_letter: { provider: "anthropic", model: "claude-opus-4-8", fallbacks: [] } },
+  };
+  const f = fakeFetch([{ status: 200, json: { content: [{ type: "text", text: "letter" }] } }]);
+  const res = await callLLMForAction(cfg, "cover_letter", { user: "hi" }, f.impl);
+  assert.equal(res.ok, true);
+  assert.match(f.calls[0].url, /api\.anthropic\.com/);
+  assert.equal(f.calls[0].key, "sk-ant-x");
+});
+
+test("callLLMForAction falls through to the default when the routed provider has no key", async () => {
+  const cfg = {
+    provider: "gemini",
+    model: "gemini-3.1-flash-lite",
+    keys: { gemini: [twoGeminiKeys[0]] },
+    // Routed at OpenAI, but no OpenAI key exists — a per-action override must not be able
+    // to break an otherwise working setup.
+    routes: { teach: { provider: "openai", model: "gpt-4o", fallbacks: [] } },
+  };
+  const f = fakeFetch([okGemini("default answered")]);
+  const res = await callLLMForAction(cfg, "teach", { user: "hi" }, f.impl);
+  assert.equal(res.ok, true);
+  assert.equal(f.calls.length, 1, "the keyless provider is skipped without a request");
+  assert.match(f.calls[0].url, /generativelanguage/);
+});
+
+test("callLLMForAction on a v1 config is one attempt with one key", async () => {
+  const v1 = { provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "AIza-legacy", enabled: true };
+  const f = fakeFetch([okGemini("legacy")]);
+  const res = await callLLMForAction(v1, "fill", { user: "hi" }, f.impl);
+  assert.equal(res.ok, true);
+  assert.equal(f.calls.length, 1);
+  assert.ok(f.calls[0].key.includes("legacy"));
+});
+
+test("callLLMForAction with no keys at all explains itself", async () => {
+  const f = fakeFetch([]);
+  const res = await callLLMForAction({ provider: "gemini", model: "gemini-3.1-flash-lite" }, "fill", { user: "hi" }, f.impl);
+  assert.equal(res.ok, false);
+  assert.match(res.ok === false ? res.error : "", /AI page/);
+  assert.equal(f.calls.length, 0);
+});

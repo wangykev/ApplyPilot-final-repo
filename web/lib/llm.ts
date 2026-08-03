@@ -6,6 +6,11 @@
  * matches the extension's model lists exactly.
  */
 
+import {
+  llmKeysFor, resolveLlmRoute, orderLlmKeys, classifyLlmFailure, applyLlmKeyOutcome, newLlmKeyState,
+  type LlmKey, type LlmKeyState, type LlmAction,
+} from "@/lib/llm-keys";
+
 export type LlmProvider = "anthropic" | "gemini" | "openai";
 
 export type LlmRequest = {
@@ -15,9 +20,19 @@ export type LlmRequest = {
   system?: string;
   user: string;
   maxTokens?: number;
+  /**
+   * Rotation (lockstep with llm.js): when a key LIST is supplied, each key is tried in
+   * turn until one answers. Omit it and this is the original single-key path.
+   */
+  keys?: LlmKey[];
+  preferFreeFirst?: boolean;
+  keyState?: LlmKeyState;
+  onKeyState?: (s: LlmKeyState) => void;
 };
 
-export type LlmResult = { ok: true; text: string } | { ok: false; error: string };
+export type LlmResult =
+  | { ok: true; text: string }
+  | { ok: false; error: string; status?: number; body?: string; networkError?: string };
 
 type Built = { url: string; opts: RequestInit };
 
@@ -107,7 +122,16 @@ const PROVIDERS: Record<
   },
 };
 
-export async function callLLM(
+/**
+ * ONE key. The original path, unchanged — callLLM (below) wraps it to walk a key list.
+ *
+ * Deliberately has NO wait-ladder, unlike the extension's llm.js: these run inside server
+ * actions and API routes, where sitting out a 75s retry would hang the page the operator
+ * is looking at. Rotation is the server-side answer to a spent key; waiting is the
+ * extension's, because a background fill can afford it. That asymmetry is intentional and
+ * documented in WEBSITE.md.
+ */
+export async function callLLMOnce(
   req: LlmRequest,
   fetchImpl: typeof fetch = fetch
 ): Promise<LlmResult> {
@@ -129,7 +153,7 @@ export async function callLLM(
   try {
     res = await fetchImpl(built.url, built.opts);
   } catch (e) {
-    return { ok: false, error: "network error: " + msg(e) };
+    return { ok: false, networkError: msg(e), error: "network error: " + msg(e) };
   }
   if (!res || !res.ok) {
     let body = "";
@@ -138,7 +162,14 @@ export async function callLLM(
     } catch {
       /* ignore */
     }
-    return { ok: false, error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : "") };
+    // status/body are surfaced so the rotation layer can classify WHY without re-parsing
+    // the error string.
+    return {
+      ok: false,
+      status: res ? res.status : 0,
+      body,
+      error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : ""),
+    };
   }
 
   let data: unknown;
@@ -161,6 +192,95 @@ export async function callLLM(
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Key rotation — lockstep with llm.js's callLLM. With 0 or 1 usable key this is
+ * callLLMOnce verbatim; with several, each is tried in turn until one answers.
+ *
+ *   key's own fault (auth / quota / 429) → park it, try the next
+ *   provider down, or our bad request   → stop; no other key can help
+ *
+ * Free keys go first, so the metered ones stay in reserve.
+ */
+export async function callLLM(req: LlmRequest, fetchImpl: typeof fetch = fetch): Promise<LlmResult> {
+  const supplied = Array.isArray(req?.keys) ? req.keys : null;
+  if (!supplied || supplied.length === 0) return callLLMOnce(req, fetchImpl);
+
+  const now = Date.now();
+  let state = req.keyState ?? newLlmKeyState();
+  const ordered = orderLlmKeys(supplied, { provider: req.provider, preferFreeFirst: req.preferFreeFirst !== false }, state, now);
+  const commit = () => req.onKeyState?.(state);
+
+  if (!ordered.keys.length) {
+    commit();
+    const wait = ordered.nextAvailableAt ? ` (first frees up in ~${Math.ceil((ordered.nextAvailableAt - now) / 1000)}s)` : "";
+    return { ok: false, error: `no usable ${req.provider} API key: every key is disabled, rejected, or resting${wait}` };
+  }
+
+  let last: LlmResult | null = null;
+  for (const k of ordered.keys) {
+    const res = await callLLMOnce({ ...req, apiKey: k.key }, fetchImpl);
+    if (res.ok) {
+      state = applyLlmKeyOutcome(state, req.provider, k.id, "ok", Date.now());
+      commit();
+      return res;
+    }
+    const verdict = classifyLlmFailure({ status: res.status, body: res.body, networkError: res.networkError });
+    last = res;
+    if (verdict.keyFault) state = applyLlmKeyOutcome(state, req.provider, k.id, verdict.code, Date.now());
+    if (!verdict.rotate) break;
+  }
+  commit();
+  return last ?? { ok: false, error: "no attempt was made" };
+}
+
+/**
+ * The entry point every server caller should use: resolve the operator's route for this
+ * ACTION (its model, then its fallback chain, then the configured default), and rotate
+ * through that provider's keys at each step.
+ *
+ * `config` is the stored `ai_config` — v1 or v2. A v1 config resolves to exactly one
+ * attempt with one key, so existing callers behave identically after switching to this.
+ *
+ * Key state is per-call: server actions are request-scoped, so a cooldown can't outlive
+ * the request. Rotation within the call is what matters here.
+ */
+export async function callLLMForAction(
+  config: unknown,
+  action: LlmAction,
+  prompt: { system?: string; user: string; maxTokens?: number },
+  fetchImpl: typeof fetch = fetch
+): Promise<LlmResult> {
+  const cfg = (config ?? {}) as { preferFreeFirst?: boolean };
+  const attempts = resolveLlmRoute(config, action, LLM_DEFAULT_MODELS);
+  if (!attempts.length) return { ok: false, error: "No AI model configured — set one on the AI page." };
+
+  let state = newLlmKeyState();
+  let last: LlmResult | null = null;
+  for (const attempt of attempts) {
+    const keys = llmKeysFor(config, attempt.provider);
+    if (!keys.length) {
+      last = { ok: false, error: `No ${attempt.provider} API key — add one on the AI page.` };
+      continue;
+    }
+    const res = await callLLM(
+      {
+        provider: attempt.provider,
+        model: attempt.model,
+        apiKey: "",
+        keys,
+        preferFreeFirst: cfg.preferFreeFirst !== false,
+        keyState: state,
+        onKeyState: (s) => { state = s; },
+        ...prompt,
+      },
+      fetchImpl
+    );
+    if (res.ok) return res;
+    last = res;
+  }
+  return last ?? { ok: false, error: "No AI attempt was made." };
 }
 
 // The ONLY place model ids live (matches llm.js). First entry = provider default.

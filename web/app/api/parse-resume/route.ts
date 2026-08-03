@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { extractText, getDocumentProxy } from "unpdf";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
-import { coerceAiConfig } from "@/lib/ai-config";
-import { callLLM } from "@/lib/llm";
+import { coerceAiConfig, totalUsableKeys } from "@/lib/ai-config";
+import { callLLMForAction } from "@/lib/llm";
 import { buildResumePrompt, parseProfileFromReply } from "@/lib/resume-prompt";
 
 export const runtime = "nodejs";
@@ -34,7 +34,9 @@ export async function POST(req: Request) {
     .eq("id", user.id)
     .maybeSingle();
   const ai = coerceAiConfig(row?.ai_config);
-  if (!ai.apiKey) return bad("Add an API key on the AI page before parsing.", 400);
+  // totalUsableKeys, not ai.apiKey: with the multi-key config a v2 account can have
+  // several keys and an empty legacy mirror, and rejecting it here would be wrong.
+  if (!totalUsableKeys(ai)) return bad("Add an API key on the AI page before parsing.", 400);
 
   // --- extract text ---
   let text = "";
@@ -50,14 +52,9 @@ export async function POST(req: Request) {
 
   // --- LLM extraction ---
   const { system, user: prompt } = buildResumePrompt(text);
-  const res = await callLLM({
-    provider: ai.provider,
-    model: ai.model,
-    apiKey: ai.apiKey,
-    system,
-    user: prompt,
-    maxTokens: 4096,
-  });
+  // "resume_parse" picks this action's model (falling back to the default pair), then
+  // rotates through that provider's keys.
+  const res = await callLLMForAction(ai, "resume_parse", { system, user: prompt, maxTokens: 4096 });
   if (!res.ok) return bad("AI request failed: " + res.error, 502);
 
   const profile = parseProfileFromReply(res.text);

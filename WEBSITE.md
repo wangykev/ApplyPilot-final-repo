@@ -247,9 +247,47 @@ The standalone `/app/job` editor page + its sidebar entry were removed; the valu
 letter** page (no dedicated editor UI for now).
 
 ### AI config — `llmConfig` shape (extension `chrome.storage.local.llmConfig`)
-`{ provider: "anthropic"|"gemini"|"openai", model, apiKey, enabled }`. Model lists from `LLM_MODELS`
-(`llm.js`); default `gemini-3.1-flash-lite`. `web/lib/llm.ts` is a TS port of `callLLM` (never-throws
-contract) — single source for resume parsing + AI-config parity.
+**The website's AI page is the SOLE editor of this object.** It is pushed via `AP_SET_LLM` and stored
+**wholesale, never merged** — the whole thing (default pair, key lists, routes, chains) is edited as one
+unit, and a partial merge could leave the extension holding a route naming a provider whose keys were just
+removed. The extension **popup shows it read-only**: its Save used to write the flat v1 shape over the whole
+object, silently destroying `keys`/`routes`/`fallbacks`. `AP_SET_LLM` also records the sending origin as
+`webOrigin`, so the popup can link to the AI page without the extension hardcoding a site URL.
+
+```
+{ provider, model, apiKey, enabled,             // v1 fields — still present, see below
+  preferFreeFirst: bool,                        // spend free-tier keys before paid ones
+  keys:      { [provider]: [{ id, label, key, tier: "free"|"paid", enabled }] },
+  fallbacks: [{ provider, model }],             // default chain
+  routes:    { [action]: { provider, model, fallbacks: [{provider,model}] } } }
+```
+
+`action` ∈ `fill` | `resume_parse` | `cover_letter` | `teach` (`LLM_ACTIONS`, `llm-keys.js`); an unset action
+follows the default pair. Model lists from `LLM_MODELS` (`llm.js`); default `gemini-3.1-flash-lite`.
+
+**v1 compatibility is load-bearing in both directions.** Reading: a stored v1 config has no `keys`, and
+`llmKeysFor` treats the flat `apiKey` as a single key for the flat provider — an untouched account needs no
+migration. Writing: `withLegacyMirror` keeps `apiKey` pointing at whichever key rotation would try first, so
+an extension build older than this change still finds a key where it expects one; dropping the field would
+silently turn AI fill off on the next sync.
+
+**Free tier is Gemini-only, and membership is enforced rather than cosmetic:** `GEMINI_FREE_TIER` (`llm.js`)
+holds per-model `rpm`/`tpm`/`rpd`, and a model absent from it (e.g. `gemini-2.5-pro`) cannot be reached by a
+free key at all — so when every Gemini key is marked free, the AI page narrows the model picker to that
+table. Per-model daily limits are also why a fallback chain wants a second MODEL, not just a second key.
+
+**Lockstep pairs — drift is a test failure** (`web/test/llm-keys.test.ts` cross-loads the real `.js`):
+`llm-keys.js` ↔ `web/lib/llm-keys.ts` (key order, failure classification, route resolution) and `llm.js` ↔
+`web/lib/llm.ts` (`callLLM` never-throws contract, `LLM_MODELS`, `GEMINI_FREE_TIER`, `LLM_PRICING`). Key
+failure state (cooldowns, rejections) is deliberately **not** in `llmConfig` — that is config the website
+owns, so a cooldown stored there would be wiped by the next sync; it lives in memory per runtime
+(`cdpLlmKeyState` in the extension, per-request on the server).
+
+**One intentional asymmetry:** `llm.js` keeps its wait-ladder + circuit breaker; the TS port has neither. A
+server action that sat out a 75s retry would hang the page the operator is looking at, so server-side the
+answer to a spent key is rotation, while a background fill can additionally afford to wait.
+`web/lib/llm.ts` exposes `callLLMForAction(config, action, prompt)` — the entry point every server caller
+uses (`parse-resume`, `cover-letter`, `teach`).
 
 ### Resume — IndexedDB `ApplyPilot`/`resume`/`resume:default`
 `{ key, filename, mime, size, base64, savedAt }` (raw base64, not a data: URL). Base64 string crosses

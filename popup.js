@@ -387,56 +387,75 @@ document.getElementById("cdp-review-check").addEventListener("click", () => {
   });
 });
 
-// ── AI config (AI-0): multi-provider LLM adapter ────────────────────────────
-// chrome.storage.local.llmConfig = { provider, model, apiKey, enabled }. Restore on open;
-// "Save" persists; "Test connection" round-trips a trivial prompt (RUN_LLM_TEST → callLLM in
-// the SW). The toggle (enabled) is the opt-in: OFF = the fill never calls the LLM (no spend).
-const llmProviderEl = document.getElementById("llm-provider");
-const llmModelEl = document.getElementById("llm-model");
-const llmKeyEl = document.getElementById("llm-key");
-const llmEnabledEl = document.getElementById("llm-enabled");
-// Fill the model <select> from this provider's CURATED list (llm.js LLM_MODELS), marking the
-// default. The list is exactly LLM_MODELS — a stale/retired SAVED model (e.g. gemini-2.0-flash
-// from an older config) is NOT shown; selection falls back to the default, and a Save replaces it.
-function populateModelOptions(provider, selected) {
-  const def = LLM_DEFAULT_MODELS[provider] || "";
-  const models = LLM_MODELS[provider] || [];
-  llmModelEl.innerHTML = "";
-  for (const m of models) {
-    const opt = document.createElement("option");
-    opt.value = m;
-    opt.textContent = m === def ? `${m} (default)` : m;
-    llmModelEl.appendChild(opt);
-  }
-  llmModelEl.value = (selected && models.includes(selected)) ? selected : def;
+// ── AI config (AI-0) — READ-ONLY MIRROR ─────────────────────────────────────
+// The WEBSITE'S AI PAGE IS THE ONLY EDITOR. It owns chrome.storage.local.llmConfig and
+// pushes it through AP_SET_LLM; that object now holds the per-provider key LIST, the
+// per-action model routes and their fallback chains.
+//
+// Why this panel stopped being an editor: its Save built the flat
+// {provider, model, apiKey, enabled} shape and wrote it over the WHOLE object, which
+// silently destroyed keys/routes/fallbacks the moment anyone pressed it. Merging would have
+// papered over the real problem — two editors for a config that is edited as one unit on the
+// website. So: one owner, and this just shows what it decided.
+const llmSummaryEl = document.getElementById("llm-summary");
+
+// Enough to answer "is my AI set up?" without becoming a second source of truth.
+function describeLlmConfig(c) {
+  if (!c || !c.provider) return "AI: not configured yet — set it up on the website's AI page.";
+  const keyCounts = ["gemini", "anthropic", "openai"]
+    .map((p) => {
+      const list = typeof llmKeysFor === "function" ? llmKeysFor(c, p) : [];
+      const on = list.filter((k) => k.key && k.enabled !== false);
+      if (!on.length) return null;
+      const free = on.filter((k) => k.tier === "free").length;
+      return `${p} ×${on.length}${free ? ` (${free} free)` : ""}`;
+    })
+    .filter(Boolean);
+  const routes = c.routes && typeof c.routes === "object" ? Object.keys(c.routes) : [];
+  return [
+    `AI fill ${c.enabled ? "ON" : "OFF"} — default ${c.provider}/${c.model || "(no model)"}`,
+    keyCounts.length ? `Keys: ${keyCounts.join(", ")}` : "Keys: none — AI calls will fail",
+    routes.length ? `Per-action: ${routes.join(", ")}` : "Per-action: all following the default"
+  ].join("\n");
 }
-chrome.storage.local.get("llmConfig", ({ llmConfig }) => {
-  const c = llmConfig || {};
-  if (c.provider) llmProviderEl.value = c.provider;
-  populateModelOptions(llmProviderEl.value, c.model);
-  if (c.apiKey) llmKeyEl.value = c.apiKey;
-  llmEnabledEl.checked = !!c.enabled;
+
+let llmConfigCache = {};
+let webOriginCache = "";
+const refreshLlmSummary = () =>
+  chrome.storage.local.get(["llmConfig", "webOrigin"], ({ llmConfig, webOrigin }) => {
+    llmConfigCache = llmConfig || {};
+    webOriginCache = webOrigin || "";
+    llmSummaryEl.textContent = describeLlmConfig(llmConfigCache);
+  });
+refreshLlmSummary();
+// The website can push config while this popup is open; mirror it live.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes.llmConfig || changes.webOrigin)) refreshLlmSummary();
+});
+
+// Straight to the editor. The origin is whatever last synced (recorded by AP_SET_LLM), so the
+// extension never hardcodes a site URL — dev is localhost, prod will be the real host.
+document.getElementById("llm-open-site").addEventListener("click", () => {
+  if (!webOriginCache) {
+    setStatus("Not synced with the website yet — open its Connect page once, then this jumps straight to the AI page.");
+    return;
+  }
+  chrome.tabs.create({ url: webOriginCache + "/app/ai" });
 });
 // Debug input-trace toggle — logs every CDP keystroke/click in the SW console. Saved IMMEDIATELY on
 // change (no Save button — an easy on/off); cdp.js reads chrome.storage.local.debugInputTrace per run.
 const debugInputTraceEl = document.getElementById("debug-input-trace");
 chrome.storage.local.get("debugInputTrace", ({ debugInputTrace }) => { debugInputTraceEl.checked = !!debugInputTrace; });
 debugInputTraceEl.addEventListener("change", () => chrome.storage.local.set({ debugInputTrace: debugInputTraceEl.checked }));
-// On provider change, repopulate the model list + select that provider's default.
-llmProviderEl.addEventListener("change", () => populateModelOptions(llmProviderEl.value));
-const readLlmConfig = () => ({ provider: llmProviderEl.value, model: llmModelEl.value, apiKey: llmKeyEl.value.trim(), enabled: llmEnabledEl.checked });
-document.getElementById("llm-save").addEventListener("click", async () => {
-  const cfg = readLlmConfig();
-  await chrome.storage.local.set({ llmConfig: cfg });
-  setStatus(`AI config saved — ${cfg.provider}/${cfg.model || "(no model)"}, AI fill ${cfg.enabled ? "ON" : "OFF"}${cfg.apiKey ? "" : " (no key!)"}.`);
-});
+// Test the STORED config — no `config` in the message, so the SW reads what the website
+// saved and rotates through the key list exactly as a real fill would. Writes nothing.
 document.getElementById("llm-test").addEventListener("click", () => {
-  const cfg = readLlmConfig();
-  if (!cfg.apiKey) { setStatus("Enter an API key first."); return; }
-  setStatus(`Testing ${cfg.provider}/${cfg.model}… see [LLM-TEST] in the service worker console.`);
-  chrome.runtime.sendMessage({ type: "RUN_LLM_TEST", config: cfg }, (resp) => {
+  const c = llmConfigCache;
+  if (!c || !c.provider) { setStatus("No AI config yet — set one up on the website's AI page."); return; }
+  setStatus(`Testing ${c.provider}/${c.model || "(no model)"}… see [LLM-TEST] in the service worker console.`);
+  chrome.runtime.sendMessage({ type: "RUN_LLM_TEST" }, (resp) => {
     if (chrome.runtime.lastError || !resp) { setStatus("Test failed (no response) — see the service worker console."); return; }
-    setStatus(resp.ok ? `✓ AI connected — reply: "${resp.text}". Save the config to use it.` : `✗ AI test failed: ${resp.error}`);
+    setStatus(resp.ok ? `✓ AI connected — reply: "${resp.text}".` : `✗ AI test failed: ${resp.error}`);
   });
 });
 
