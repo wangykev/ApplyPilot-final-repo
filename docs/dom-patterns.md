@@ -3138,3 +3138,27 @@ WOULD CLICK SUBMIT. Nothing submitted.
 Still open: Copart's required "What is your desired compensation" is unanswerable from the profile —
 the AI correctly refuses to invent a salary and the form rejects "N/A". That one needs a profile
 answer, not a code fix.
+
+## 2026-08-03 (b) — the checkbox-group SET, live-verified end to end
+
+Closing the gap left when PSECU was wedged at sign-in. After the multi-key AI merge it signed in
+again, and the whole path ran on the real form:
+
+  fill        -> ethnicityMulti AI-filled "Asian", flagged AI-GUESSED DEMOGRAPHIC
+  review      -> renders SEVEN real checkboxes, exactly as the form does (not a <select>)
+  human edit  -> ticked "White" as a second answer; the row showed "2 selected — this form
+                 accepts more than one", and the edit RESET that field's approval
+  approve     -> 8/8, submit-ready
+  rehearse    -> AGREE 49 · DISAGREE 0 -> WOULD CLICK SUBMIT (nothing submitted)
+
+And the part that actually matters, checked INDEPENDENTLY rather than taken from the replay's own
+report — walked the live application back to page 4 by hand afterwards and read the DOM:
+
+    checkedOnTheFORM: ["Asian (United States of America)", "White (United States of America)"]
+
+Both boxes really are checked on the form. A replay reporting success is not the same claim as the
+form holding the values, and only the second one is worth anything.
+
+The ethnicity set lands in MISSING on the review-page reconcile, which is correct and non-blocking:
+Workday's own summary page does not render the self-identification section at all, so absence there
+is not evidence the value was lost (the 2026-07-28 rule).
