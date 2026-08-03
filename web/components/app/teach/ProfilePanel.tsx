@@ -26,6 +26,7 @@ export function ProfilePanel({
   onSelectPath,
   onCancelSelect,
   buckets,
+  onOpenRemembered,
 }: {
   profile: unknown;
   /** Mode-B remembered answers (a bucket with its own value and no profile_path). They are NOT
@@ -33,6 +34,10 @@ export function ProfilePanel({
    *  teach card therefore vanished the moment it was saved (operator 2026-08-02: "when I add a new
    *  field, it should render in the teach profile, it currently doesn't"). Shown as their own box. */
   buckets?: { profile_path?: string; value?: unknown; questions?: unknown; category?: string }[];
+  /** Open a remembered answer for editing — its question WORDINGS and its answer LADDER live in the
+   *  same object, so one editor serves both (operator 2026-08-02: "the questions should be buckets
+   *  and the answer should be a ladder that I can edit"). Index into `buckets`. */
+  onOpenRemembered?: (bucketIndex: number) => void;
   highlightPath: string;
   onOpenBucket: (path: string, label: string, bucketWidget: string) => void;
   onOpenAnswer: (path: string, label?: string) => void;
@@ -70,21 +75,27 @@ export function ProfilePanel({
   const employers = strList(p.employment_history_companies).join(", ");
 
   // Mode-B = no profile_path. Label it by its FIRST taught wording (that is how the operator will
-  // recognise it); fall back to the category, then a generic. Value = its first candidate.
-  const rememberedRows: FieldRowData[] = (buckets || [])
-    .filter((b) => b && String(b.profile_path || "").trim() === "")
-    .map((b, i) => {
-      const qs = Array.isArray(b.questions) ? (b.questions as unknown[]).map((q) => String(q ?? "")).filter(Boolean) : [];
-      const vals = Array.isArray(b.value) ? (b.value as unknown[]).map((v) => String(v ?? "")).filter(Boolean) : [];
+  // recognise it); fall back to the category. Value = its first candidate. Keep the bucket's REAL
+  // index so the editor opens the right one after filtering.
+  const remembered = (buckets || [])
+    .map((b, i) => ({ b, i }))
+    .filter((x) => x.b && String(x.b.profile_path || "").trim() === "")
+    .map((x) => {
+      const qs = Array.isArray(x.b.questions) ? (x.b.questions as unknown[]).map((q) => String(q ?? "")).filter(Boolean) : [];
+      const vals = Array.isArray(x.b.value) ? (x.b.value as unknown[]).map((v) => String(v ?? "")).filter(Boolean) : [];
       return {
-        path: "",  // no profile path — see the prop doc; these rows are display-only
-        label: qs[0] || (b.category || "").trim() || `Remembered answer ${i + 1}`,
-        value: vals[0] || "",
+        idx: x.i,
+        category: (x.b.category || "").trim() || "Other",
+        row: { path: REMEMBERED_PATH + x.i, label: qs[0] || (x.b.category || "").trim() || "Remembered answer", value: vals[0] || "" },
       };
     });
-
+  // MERGED categories sit inside the matching profile section, exactly as the profile page does;
+  // everything else (Experience / Education / customs / Other) gets its own box.
+  const rememberedIn = (sectionKey: string) =>
+    remembered.filter((r) => MERGED_CATEGORY_SECTION[r.category] === sectionKey).map((r) => r.row);
+  const ownBoxCats = Array.from(new Set(remembered.filter((r) => !MERGED_CATEGORY_SECTION[r.category]).map((r) => r.category)));
   const common = { onOpenBucket, onOpenAnswer, disabled, highlightPath, selectMode: !!selectMode, onSelectPath };
-  const anyContent = sections.length > 0 || websiteRows.length > 0 || skills || employers || rememberedRows.length > 0;
+  const anyContent = sections.length > 0 || websiteRows.length > 0 || skills || employers || remembered.length > 0;
 
   // Auto-scroll the recommended (highlighted) row into view within this panel, so the teach card on
   // the left and its target field on the right are on the same screen.
@@ -132,25 +143,26 @@ export function ProfilePanel({
       )}
       <div className="mt-4 space-y-5">
         {sections.map((s) => (
-          <FieldBox key={s.key} label={s.label} rows={s.rows.map((r) => ({ path: r.path, label: r.label, value: r.value }))} {...common} />
+          <FieldBox
+            key={s.key}
+            label={s.label}
+            rows={[...s.rows.map((r) => ({ path: r.path, label: r.label, value: r.value })), ...rememberedIn(s.key)]}
+            {...common}
+            onOpenRemembered={onOpenRemembered}
+          />
         ))}
         {websiteRows.length > 0 && <FieldBox label="Websites" rows={websiteRows} {...common} />}
         <ListBox label="Skills" path="skills" value={skills} onOpenAnswer={onOpenAnswer} disabled={disabled} />
         <ListBox label="Employer history" path="employment_history_companies" value={employers} onOpenAnswer={onOpenAnswer} disabled={disabled} />
-        {/* Display-only: a remembered answer has no profile path, so it is not a retarget target
-            and its rows do not open the field editors. It is here so a newly created answer is
-            visibly THERE. */}
-        {rememberedRows.length > 0 && (
+        {ownBoxCats.map((cat) => (
           <FieldBox
-            label="Remembered answers"
-            rows={rememberedRows}
-            highlightPath=""
-            onOpenBucket={() => {}}
-            onOpenAnswer={() => {}}
-            disabled
-            selectMode={false}
+            key={"remembered-" + cat}
+            label={cat}
+            rows={remembered.filter((r) => r.category === cat).map((r) => r.row)}
+            {...common}
+            onOpenRemembered={onOpenRemembered}
           />
-        )}
+        ))}
         {!anyContent && <p className="text-sm text-ink-faint">No profile fields yet — fill out your Profile first.</p>}
       </div>
     </div>
@@ -158,6 +170,20 @@ export function ProfilePanel({
 }
 
 type FieldRowData = { path: string; label: string; value: string };
+
+/** A remembered (Mode-B) answer has no profile path, so it carries a synthetic one that both marks it
+ *  as remembered and holds its index into `buckets`. Rows keyed this way open the remembered editor
+ *  instead of the field editors, and are never offered as a retarget target. */
+const REMEMBERED_PATH = "__remembered__.";
+const rememberedIndexOf = (path: string) =>
+  path.startsWith(REMEMBERED_PATH) ? Number(path.slice(REMEMBERED_PATH.length)) : -1;
+/** bucket category → the profile section it merges into (mirrors the profile page's MERGED_CATEGORIES). */
+const MERGED_CATEGORY_SECTION: Record<string, string> = {
+  Screening: "screening",
+  "Work authorization": "work_authorization",
+  Demographics: "self_identification",
+  Personal: "personal_info",
+};
 
 /** A category box of name↔answer rows: the name opens the field's advanced-options (question-wordings)
  *  bucket, the answer opens the value editor. */
@@ -170,6 +196,7 @@ function FieldBox({
   disabled,
   selectMode,
   onSelectPath,
+  onOpenRemembered,
 }: {
   label: string;
   rows: FieldRowData[];
@@ -179,6 +206,7 @@ function FieldBox({
   disabled?: boolean;
   selectMode?: boolean;
   onSelectPath?: (path: string, label: string) => void;
+  onOpenRemembered?: (bucketIndex: number) => void;
 }) {
   return (
     <div>
@@ -188,6 +216,17 @@ function FieldBox({
         {rows.map((r) => {
           const hot = !!highlightPath && r.path === highlightPath;
           const meta = profileFieldMeta(r.path, undefined);
+          const remIdx = rememberedIndexOf(r.path); // >= 0 ⇒ a remembered answer, not a profile field
+          if (selectMode && remIdx >= 0) {
+            // Not a retarget target: "pick the field this answer belongs to" has no meaning for
+            // another remembered answer. Shown, but inert, so the list stays complete.
+            return (
+              <div key={r.path} className="flex items-baseline justify-between gap-3 px-3 py-1.5 opacity-40">
+                <span className="truncate text-sm text-ink-dim">{r.label}</span>
+                <span className="block max-w-[55%] truncate font-mono text-xs text-ink-faint">{r.value || "—"}</span>
+              </div>
+            );
+          }
           if (selectMode) {
             // RETARGET: the whole row is ONE target — no name/answer split, no editors.
             return (
@@ -219,7 +258,7 @@ function FieldBox({
               <button
                 type="button"
                 disabled={disabled}
-                onClick={() => onOpenBucket(r.path, r.label, meta.bucketWidget)}
+                onClick={() => (remIdx >= 0 ? onOpenRemembered && onOpenRemembered(remIdx) : onOpenBucket(r.path, r.label, meta.bucketWidget))}
                 title="Advanced options — the questions that map to this answer"
                 className="group inline-flex min-w-0 items-center gap-1.5 text-left disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -236,7 +275,7 @@ function FieldBox({
               <button
                 type="button"
                 disabled={disabled}
-                onClick={() => onOpenAnswer(r.path, r.label)}
+                onClick={() => (remIdx >= 0 ? onOpenRemembered && onOpenRemembered(remIdx) : onOpenAnswer(r.path, r.label))}
                 title="Modify this answer"
                 className="group min-w-0 max-w-[55%] text-right disabled:cursor-not-allowed disabled:opacity-60"
               >

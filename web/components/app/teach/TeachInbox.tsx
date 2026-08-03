@@ -63,6 +63,10 @@ export function TeachInbox({
   // field was neither.
   const [retarget, setRetarget] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
+  // Editing an EXISTING remembered answer from the profile panel. Its question wordings and its
+  // answer ladder live in the same bucket, so one editor serves both clicks (operator 2026-08-02).
+  // Index into `buckets`, NOT a copy — the popup edits a draft and commits on Done.
+  const [remEdit, setRemEdit] = useState<number | null>(null);
   // teach-time AI fallback: recommendation per card.key for cards with no stamped maps_to hint
   const [recCache, setRecCache] = useState<Record<string, FieldRecommendation>>({});
   const [recLoading, setRecLoading] = useState(false);
@@ -283,6 +287,26 @@ export function TeachInbox({
     questions: card ? [card.question] : [],
     selectors: {},
   });
+  // Save an edited remembered answer in place. Persisted through the SAME commit() the teach card
+  // uses, so it saves, live-syncs to the extension and shows the same toast — but it must NOT
+  // advance the queue: editing the profile panel is not answering the current card.
+  const commitRemEdit = (draft: Bucket) => {
+    const i = remEdit;
+    setRemEdit(null);
+    if (i == null) return;
+    const next = buckets.map((b, j) => (j === i ? draft : b));
+    setBuckets(next);
+    void persistBuckets(next);
+  };
+  const deleteRemEdit = () => {
+    const i = remEdit;
+    setRemEdit(null);
+    if (i == null) return;
+    const next = buckets.filter((_, j) => j !== i);
+    setBuckets(next);
+    void persistBuckets(next);
+  };
+
   const commitNew = (draft: Bucket) => {
     const ids = new Set(buckets.map((b) => b.id));
     let d = draft;
@@ -404,6 +428,7 @@ export function TeachInbox({
       <ProfilePanel
         profile={profile}
         buckets={buckets}
+        onOpenRemembered={(i) => setRemEdit(i)}
         highlightPath={recPath}
         note={panelNote}
         onOpenBucket={(path, label, widget) => setBucketPopup({ path, label, widget })}
@@ -464,6 +489,20 @@ export function TeachInbox({
           onDone={commitNew}
           onCancel={() => setNewOpen(false)}
           onDelete={() => setNewOpen(false)}
+        />
+      )}
+
+      {/* EDIT an existing remembered answer, opened from the profile panel — same editor as Add, so
+          the question WORDINGS and the answer LADDER are edited in one place. */}
+      {remEdit != null && buckets[remEdit] && (
+        <RememberedAnswerPopup
+          initial={buckets[remEdit]}
+          mode="edit"
+          title="Edit remembered answer"
+          categoryOptions={categoryOptions}
+          onDone={commitRemEdit}
+          onCancel={() => setRemEdit(null)}
+          onDelete={deleteRemEdit}
         />
       )}
     </div>
