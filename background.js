@@ -4989,7 +4989,16 @@ async function runCdpReplayWalk(tabId, opts) {
         } catch (e) {
           LOG(`(could not capture newly-required fields: ${String((e && e.message) || e)} — falling through to the plain halt.)`);
         }
-        LOG(`⚠ page ${page} did NOT advance (nav-timeout${reclick.errorsPresent ? ", real error present" : ", re-click fallback exhausted"}) — a required field is empty. HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
+        // QUOTE the page, don't diagnose it. This line used to assert "a required field is empty" for
+        // EVERY non-advancing page, and live that was simply untrue: the page said "32312 is not a valid
+        // postal code for Georgia" — a consistency check between two FILLED fields, nothing empty
+        // anywhere. Sending the operator to hunt for a blank field when the page already named the real
+        // problem wastes their time, and the same over-confident phrasing is what made the sign-in stall
+        // read as a Chrome breach dialog (2026-08-02). Workday's own error text is the better answer.
+        const errSay = reclick.errorsPresent && Array.isArray(reclick.errorSamples) && reclick.errorSamples.length
+          ? ` Workday says: ${reclick.errorSamples.slice(0, 3).map((t) => JSON.stringify(String(t).slice(0, 160))).join("; ")}`
+          : " Workday showed no error text, so the block is not stated on the page — a required field left empty is the usual cause.";
+        LOG(`⚠ page ${page} did NOT advance (nav-timeout${reclick.errorsPresent ? ", real error present" : ", re-click fallback exhausted"}).${errSay} HALT — eyeball the page, re-review/approve, then re-run. (No blind AI remediation on replay.)`);
         return { ok: true, stopped: "replay-blocked", nav_timeout_page: page, pages_replayed: pagesReplayed.length, pages: pagesReplayed, ...diag };
       }
       LOG(`✓ page ${page} → advanced.`);
@@ -5106,7 +5115,10 @@ async function reclickNextWhenClean(act, prevSig, tries, LOG) {
     if (st && st.applyFlowReviewPresent) return { advanced: true, reachedReview: true };  // it DID reach review
     if (st && sessionLooksDead(st)) return { advanced: false, sessionDead: true, state: st };
     const samples = expandErrorSamples((st && st.errorMarkers && st.errorMarkers.samples) || []);
-    if (samples.length || (st && st.errorPageText)) { LOG(`  re-click fallback: error text present — NOT re-clicking (a real validation block, not a swallowed click).`); return { advanced: false, errorsPresent: true }; }
+    // Carry the error TEXT out, not just the boolean — the caller's halt message quotes it rather than
+    // guessing at a cause (2026-08-02: it used to say "a required field is empty" for a postal-code
+    // mismatch between two filled fields).
+    if (samples.length || (st && st.errorPageText)) { LOG(`  re-click fallback: error text present — NOT re-clicking (a real validation block, not a swallowed click).`); return { advanced: false, errorsPresent: true, errorSamples: samples.length ? samples : [st && st.errorPageText].filter(Boolean) }; }
     LOG(`  re-click fallback ${i}/${tries}: clicked but no advance + no error/session-death — re-clicking Save & Continue.`);
     await cdpWakePage();
     const click = await act.clickPageNext();
@@ -5701,22 +5713,51 @@ async function runCdpOnboard(tabId, opts) {
 
   // Focus → clear → insertText → read-back a text/email/password input by the first
   // matching selector. Trusted CDP path (survives blur), same technique as the fill's focusText.
+  // The CLEAR is verified before we type, and a bad write is RETRIED (2026-08-02).
+  //
+  // Live: the email box already held a different address (Chrome autofill / a previous run), Ctrl+A
+  // Delete did not take, and cdpInsertText APPENDED — giving Workday
+  // "wangykev+1@gmail.comtester+10@gmail.com". The read-back caught it and said so in the log, but the
+  // caller ignored the return value and clicked Sign In anyway (fixed below), so the run failed on
+  // credentials that were never ours.
+  //
+  // Two strategies because they fail differently: the keyboard clear needs the field to hold both
+  // focus and a selection (either can be lost to a re-render or a click that landed a pixel off),
+  // while the page-side setter clear needs neither. Neither is trusted blind — the field is READ
+  // after clearing, and only an actually-empty box gets typed into.
+  const clearFieldVerified = async (sel) => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt === 1) await cdpSelectAllDelete();
+      else { try { await cdpEval(cdpSynthSetValue, "", false); } catch (e) { await cdpSelectAllDelete(); } }
+      await pace(120);
+      const r = await cdpEval(cdpReadInputBySel, sel);
+      if (!r || String(r.value || "") === "") return true;
+      LOG(`clear attempt ${attempt} left ${JSON.stringify(r.value)} in the box — retrying with a different clear.`);
+    }
+    return false;
+  };
   const fillField = async (selectors, value, label) => {
     for (const sel of selectors) {
       const rect = await cdpRectReady(sel, true);
       if (!rect) continue;
-      await cdpClickAt(rect.cx, rect.cy);
-      await pace(200);
-      let s = await cdpEval(cdpReadInputBySel, sel);
-      if (!s || !s.focused) { try { await cdpDomFocus(sel); } catch (e) { /* fall through */ } }
-      await cdpSelectAllDelete();
-      await pace(120);
-      await cdpInsertText(String(value));
-      await pace(300);
-      s = await cdpEval(cdpReadInputBySel, sel);
-      const ok = !!s && String(s.value) === String(value);
-      LOG(`filled "${label}" — ${ok ? "read-back ok" : "read-back MISMATCH (got " + JSON.stringify(s && s.value) + ")"}.`);
-      return { ok, sel };
+      let s = null, ok = false;
+      for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+        await cdpClickAt(rect.cx, rect.cy);
+        await pace(200);
+        s = await cdpEval(cdpReadInputBySel, sel);
+        if (!s || !s.focused) { try { await cdpDomFocus(sel); } catch (e) { /* fall through */ } }
+        const cleared = await clearFieldVerified(sel);
+        if (!cleared) LOG(`could not empty "${label}" — typing anyway would APPEND, so this attempt is abandoned.`);
+        else {
+          await cdpInsertText(String(value));
+          await pace(300);
+          s = await cdpEval(cdpReadInputBySel, sel);
+          ok = !!s && String(s.value) === String(value);
+        }
+        if (!ok && attempt === 1) LOG(`"${label}" did not take (got ${JSON.stringify(s && s.value)}) — re-clicking and writing it again.`);
+      }
+      LOG(`filled "${label}" — ${ok ? "read-back ok" : "read-back MISMATCH (got " + JSON.stringify(s && s.value) + ") — NOT usable"}.`);
+      return { ok, sel, actual: s ? s.value : null };
     }
     LOG(`could not find an input for "${label}" (${selectors.join(", ")}).`);
     return { ok: false };
@@ -6249,8 +6290,17 @@ async function runCdpOnboard(tabId, opts) {
         // input[type=email] is the fallback. Ordering matters only for speed — a missing first
         // selector burns the ~2.5s cdpRectReady ceiling before falling through (live: Comcast has
         // no input[type=email], so the old order stalled 2.6s on the sign-in email field).
-        await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
-        await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
+        // Submitting a field we could not write is worse than stopping: Workday answers "wrong
+        // credentials", the flow reads that as a real rejection and can go on to CREATE AN ACCOUNT
+        // for an address that is not ours. So a failed write halts here, naming the box (2026-08-02).
+        const fe = await fillField(['[data-automation-id="email"]', 'input[type="email"]'], creds.email, "email");
+        const fp = await fillField(['[data-automation-id="password"]', 'input[type="password"]'], creds.password, "password");
+        if (!fe.ok || !fp.ok) {
+          const which = !fe.ok && !fp.ok ? "email and password fields" : !fe.ok ? "email field" : "password field";
+          return haltNeedsOperator("credentials-not-entered",
+            `Couldn't put the sign-in credentials into the ${which} — the box kept content we didn't type (browser autofill is the usual cause), so signing in would have used the wrong value. Clear the saved entry for this site (or turn off autofill for it) and re-run.`,
+            await scan());
+        }
         // FIXED (not paced) — a real page-reaction wait: Workday enables/wires the Sign In submit a
         // beat AFTER the fields fill, and a submit click has no self-correcting gate. Keep it SHORT
         // (200ms) so the common case is fast; if the first click still no-ops, submitAndWait's
@@ -6281,7 +6331,7 @@ async function runCdpOnboard(tabId, opts) {
         // never advance a page or submit an application. Fire ONCE the moment the stall is detected (~6s,
         // not the old ~20s), THEN wait the full time for the real outcome; the routing below handles it.
         if (out === "unknown" && st.markers.signInSubmit) {
-          LOG("sign-in stalled ~6s with the form present and no outcome — likely Chrome's 'password found in a data breach' dialog blocking it; pressing Enter to dismiss (safe: still on the sign-in form).");
+          LOG("sign-in stalled ~6s with the form present and no outcome — pressing Enter, which dismisses Chrome's data-breach warning if that is what is blocking it (safe either way: we are still on the sign-in form). This is a guess, not a diagnosis.");
           emitRunProgress("Dismissing Chrome's data-breach password warning");
           try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
           const wb = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-breach-dismiss outcome");
@@ -6323,7 +6373,12 @@ async function runCdpOnboard(tabId, opts) {
         if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
         // Sign-in never resolved and the form is STILL up → a block (most likely the breach dialog) is up
         // and Enter didn't clear it. Halt SPECIFICALLY (not a vague auth-unknown) so the operator can act.
-        if (st.markers.signInSubmit) return haltNeedsOperator("password-breach-dialog", "Sign-in didn't complete — the likely cause is Chrome's \"the password you just used was found in a data breach\" warning blocking it. Dismiss that warning in the tab (or use a unique Workday password / turn off Chrome's breach warning), then re-run.", st);
+        // Do NOT name a cause we have not observed. This branch used to assert Chrome's data-breach
+        // dialog, and live it was wrong — the real cause was a contaminated email box (fixed above),
+        // and the confident wrong explanation is what sent the debugging the wrong way (operator
+        // 2026-08-02: "this was not a password breach"). Report the fact, offer the dialog as ONE
+        // possibility among the ordinary ones.
+        if (st.markers.signInSubmit) return haltNeedsOperator("signin-no-outcome", "Sign-in didn't complete — the form is still up and Workday showed neither an error nor the next page. Look at the tab: something may be blocking the button (Chrome's data-breach password warning does this), or the credentials may have been rejected without a message.", st);
         return haltNeedsOperator("auth-unknown", `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}`, st);
       }
 
