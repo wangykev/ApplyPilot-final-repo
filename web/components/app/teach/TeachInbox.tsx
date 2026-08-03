@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, PenLine, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
+import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
 import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
@@ -20,7 +20,6 @@ import { saveDismissed, saveDeleted, recommendField, type FieldRecommendation } 
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
 import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
 import { TeachAddPopup, type ConfirmTarget, type AddResult } from "@/components/app/teach/TeachAddPopup";
-import { TargetPicker, type PickedTarget } from "@/components/app/teach/TargetPicker";
 import { RememberedAnswerPopup } from "@/components/app/RememberedAnswerPopup";
 
 // Categories a new remembered answer can carry (fixed set + any custom already in use + "Other").
@@ -53,13 +52,14 @@ export function TeachInbox({
   const [confirmClear, setConfirmClear] = useState(false);
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  // the three add surfaces: the end-step confirm popup (a chosen target), the "wrong field" picker, and
-  // the shared new-answer popup (identical to the profile page's "Add remembered answer").
+  // the two add surfaces: the end-step confirm popup (a chosen target), and the shared new-answer
+  // popup (identical to the profile page's "Add remembered answer").
   const [confirm, setConfirm] = useState<{ target: ConfirmTarget } | null>(null);
-  const [picker, setPicker] = useState(false);
   // RETARGET (2026-07-25, operator): "Wrong field?" points at the profile ALREADY shown on the right
-  // instead of opening a search popup over it. The picker stays reachable for the things a row-click
-  // can't express (a brand-new answer, or an existing bucket).
+  // instead of opening a search popup over it. The search-all-fields popup is GONE entirely
+  // (operator 2026-08-02: "the all fields popup is not needed") — when the AI's suggestion is wrong
+  // or hallucinated, the two useful moves are click the right field on the right, or save a new
+  // answer, and a searchable list of every field was neither.
   const [retarget, setRetarget] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
   // teach-time AI fallback: recommendation per card.key for cards with no stamped maps_to hint
@@ -210,7 +210,6 @@ export function TeachInbox({
       setNote(r.toast);
       setConfirm(null);
       setNewOpen(false);
-      setPicker(false);
       advance();
     } else {
       setNote(`Couldn't save: ${err}`);
@@ -290,13 +289,6 @@ export function TeachInbox({
     void commit({ buckets: [...buckets, d], toast: "Saved as a new answer ✓" });
   };
 
-  const pickTarget = (t: PickedTarget) => {
-    setPicker(false);
-    setRetarget(false);
-    if (t.kind === "new") setNewOpen(true);
-    else if (t.kind === "field") setConfirm({ target: { kind: "field", path: t.path, label: humanize(t.path) } });
-    else setConfirm({ target: { kind: "existing", id: t.id } });
-  };
 
   return (
     <div className="space-y-6">
@@ -377,26 +369,18 @@ export function TeachInbox({
                   <button onClick={() => setRetarget(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving || retarget}>
                     {retarget ? "Pick a field on the right →" : "Wrong field?"}
                   </button>
-                  {retarget && (
-                    <button onClick={() => { setRetarget(false); setPicker(true); }} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                      Search all fields…
-                    </button>
-                  )}
                 </div>
               </div>
             ) : (
               <div className="mt-4 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
                 <p className="text-xs text-ink-dim">
                   This looks like a <span className="font-medium text-ink">new answer</span> — no existing field matched.
+                  Save it below, or click a field on the right to attach it there.
                 </p>
                 <div className="mt-2.5 flex flex-wrap gap-2">
                   <button onClick={() => setNewOpen(true)} className="btn-primary" disabled={saving}>
                     <Plus className="h-4 w-4" />
                     Save as a new answer
-                  </button>
-                  <button onClick={() => setPicker(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
-                    <PenLine className="h-3.5 w-3.5" />
-                    Choose a field…
                   </button>
                 </div>
               </div>
@@ -444,10 +428,6 @@ export function TeachInbox({
         />
       )}
 
-      {/* the "wrong field" chooser — pick a different field / saved answer / make new */}
-      {picker && card && (
-        <TargetPicker profile={profile} buckets={buckets} onPick={pickTarget} onClose={() => setPicker(false)} />
-      )}
 
       {/* the END-STEP confirm — shows exactly what's added, highlighted, before it commits */}
       {confirm && card && (
