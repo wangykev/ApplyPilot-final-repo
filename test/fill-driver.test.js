@@ -8424,3 +8424,18 @@ test("rejectedValueEntries: a blanked required field then BLOCKS submit", () => 
   const blockers = bundleSubmitBlockers({ schema_version: REVIEW_SCHEMA_VERSION, entries: r.entries });
   assert.ok(blockers.some((b) => /REQUIRED field\(s\) have no value/.test(b)), JSON.stringify(blockers));
 });
+
+// ── ABSENT autofill_rules is UNCONFIGURED, not opted out (2026-08-03) ──
+// The website's profile model carries no autofill_rules (nor application_questions / writing_style),
+// so every profile synced from it read as "generation off": required free-text questions all got the
+// "N/A" placeholder while the log blamed an operator setting nobody made. Live on Copart the form then
+// REJECTED the N/A and the walk halted. An EXPLICIT [] still means off — that stays pinned above.
+test("AI-2: a profile with NO autofill_rules (a website-synced one) still generates", async () => {
+  const WEBSITE_PROFILE = { first_name: "Kevin", application_questions: { open_ended: {} } }; // no autofill_rules key at all
+  const act = makeFakeAct([aiText({ isRequired: true })], { aiEnabled: true, ai: '{"answer":"Open to a competitive market rate."}' });
+  const rec = (await drivePageFill(act, WEBSITE_PROFILE, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(act.log.some(([m]) => m === "llm"), "an unconfigured allowlist must not silently disable generation");
+  assert.strictEqual(rec.status, "filled_review", "a generated answer is never silently trusted");
+  assert.strictEqual(rec.after, "Open to a competitive market rate.");
+  assert.notStrictEqual(rec.flag, "ai-text-needs-answer", "it answered, so it is not the needs-answer placeholder");
+});

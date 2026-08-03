@@ -1110,10 +1110,22 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     return { status: "filled_review", after: (r && r.after != null) ? r.after : ph, verified: r && r.verified === true, flag: "ai-text-needs-answer",
       detail: "REQUIRED, and the AI had no basis for it (" + reason + ") — entered \"N/A\" so the page can advance; replace it or approve the N/A", auditLoc: loc.wrapperSel };
   };
-  // Generation master-switch: the operator's autofill_rules allowlist (empty ⇒ generation OFF).
-  const genAllowed = !!(profile && profile.autofill_rules && Array.isArray(profile.autofill_rules.generation_allowed_only_for)
-    && profile.autofill_rules.generation_allowed_only_for.indexOf("application_questions.open_ended") !== -1);
-  if (!genAllowed) return await declineOrPlaceholder("AI text generation is off (autofill_rules)");
+  // Generation master-switch: the operator's autofill_rules allowlist. ABSENT ≠ OFF (2026-08-03).
+  //
+  // An allowlist that was never written is UNCONFIGURED, not opted out. That distinction is
+  // load-bearing right now: the WEBSITE's profile model carries no `autofill_rules` at all (nor
+  // `application_questions` / `writing_style` — see web/lib/profile-schema.ts), so every profile that
+  // reaches the extension through AP_SYNC_PROFILE — the primary path — read as "generation off". Every
+  // required free-text question on every website-driven run therefore got the "N/A" placeholder, while
+  // the log blamed an operator setting the operator never made. Live on Copart, where the form then
+  // REJECTED the N/A and the walk halted three pages in.
+  //
+  // An EXPLICIT list still decides: [] means off, and that stays pinned. Only the absent case defaults
+  // to the shipped behaviour (data/profile.example.json allows open_ended). Safety is unchanged either
+  // way — a generated answer is ALWAYS filled_review, flagged, and a human approves it before submit.
+  const genList = profile && profile.autofill_rules && profile.autofill_rules.generation_allowed_only_for;
+  const genAllowed = Array.isArray(genList) ? genList.indexOf("application_questions.open_ended") !== -1 : true;
+  if (!genAllowed) return await declineOrPlaceholder("AI text generation is switched off for open-ended questions (the autofill_rules allowlist excludes them)");
 
   const style = (profile && profile.application_questions && profile.application_questions.writing_style) || "";
   const system = "You write a brief, human, professional answer to ONE job-application question for the applicant, using ONLY the applicant's profile (experience, projects, skills, essay_drafts, story_bank, open_ended). "
