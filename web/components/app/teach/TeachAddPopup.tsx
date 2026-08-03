@@ -115,10 +115,9 @@ export function TeachAddPopup({
     ? ((profile as { answer_ladders?: Record<string, { values?: string[] }> })?.answer_ladders?.[path]?.values ?? [])
     : [];
   const [variants, setVariants] = useState<string[]>(() => dedupWordings([...existingVariants, card.answer]));
-  // BOTH route = two independent teaches. The operator often wants only ONE of them (operator
-  // 2026-08-02) — and emptying a list cannot express that: an empty wordings list would WIPE the
-  // bucket's existing wordings and an empty ladder would CLEAR the variants, which is a different,
-  // destructive thing. So each side is opt-out, both on by default.
+  // BOTH route = two independent teaches, and the operator often wants only ONE. A side can be
+  // dropped either way — untick it, or just EMPTY its list — and both mean SKIP, never an empty
+  // write (which would wipe the bucket's wordings / clear the stored variants). See bothTeach* below.
   const [teachWording, setTeachWording] = useState(true);
   const [teachVariant, setTeachVariant] = useState(true);
 
@@ -157,8 +156,8 @@ export function TeachAddPopup({
       // "Asian (not hispanic or latino)" would corrupt the profile). "both" files the wording too.
       // On the BOTH route each half is written only if it is still ticked; on the VARIANT route
       // there is only one half and it is always the answer.
-      const doVariant = route === "both" ? teachVariant : true;
-      const doWording = route === "both" ? teachWording : false;
+      const doVariant = route === "both" ? bothTeachVariant : true;
+      const doWording = route === "both" ? bothTeachWording : false;
       const withVariants = doVariant ? (setFieldVariants(profile, path, variants) as Profile) : null;
       const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
       const next = doWording ? withB.map((b) => (b.id === bucketId ? { ...b, questions: dedupWordings(wordings) } : b)) : withB;
@@ -188,6 +187,16 @@ export function TeachAddPopup({
     }
   };
 
+  // BOTH route: a side is taught only if it is TICKED and still has content. Emptying a list is the
+  // natural way to say "not this one" — the operator clears the answer variant because their stored
+  // "Tallahassee" already covers the form's wordier phrasing, and expects Confirm to teach just the
+  // wording (operator 2026-08-02: "I want to remove the text … it won't let me press confirm").
+  // An empty side is SKIPPED, never written — which is also why it can never wipe the bucket's
+  // existing wordings or clear the stored variants, the thing an empty WRITE would have done.
+  // Confirm needs only ONE side to survive.
+  const bothTeachWording = teachWording && wordings.length > 0;
+  const bothTeachVariant = teachVariant && variants.length > 0;
+
   // A non-standard yes/no label needs a definite polarity (Yes or No) before we can file it in a ladder.
   const canConfirm =
     isField && route === "answer"
@@ -195,9 +204,7 @@ export function TeachAddPopup({
       : isField && route === "variant"
         ? variants.length > 0
         : isField && route === "both"
-          ? (teachWording || teachVariant) &&
-            (!teachVariant || variants.length > 0) &&
-            (!teachWording || wordings.length > 0)
+          ? bothTeachWording || bothTeachVariant
           : wordings.length > 0;
 
   const title =
