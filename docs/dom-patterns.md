@@ -3064,3 +3064,77 @@ The sharpest evidence is an accident: editing State to Georgia while leaving the
 Workday itself reject the combination. The replay wrote the human's Georgia and kept the unedited
 32312 — it did not quietly repair the pair from the profile. A bot that silently "fixed" that would
 have hidden a human's edit, which is the one thing this stage exists to prevent.
+
+## 2026-08-03 — five bugs found by running the whole human flow, twice per job
+
+Method (operator): find the job, run it from the website, open the review, approve and CHANGE
+answers, rehearse. Copart and PSECU. Every one of these was invisible from the outside — the run
+either halted several steps from the cause, or reported success while something was quietly wrong.
+
+### 1. The error parser stopped at the LABEL's own stop-word
+
+Workday's banner is `The field <LABEL> is required and must have a value.` The pattern was non-greedy
+over `(is|are|must|...)`, so a label containing " is " ended the match early:
+
+    The field What is your desired compensation is required...   ->   "What"
+
+Every "What is your …" question hits it. A truncated name matches no wrapper, so Tier-1 remediation,
+the phantom-required guard and `[FIELD-DIAG]` all received a useless name and did nothing — while the
+log said "matched 0 wrapper(s) — inside a repeating section? not rendered?", pointing the
+investigation at the wrong thing entirely. Fixed by trying the known full phrasings first.
+
+### 2. A value the FORM rejected still counted as filled
+
+"N/A" went into a required compensation box. The write verified; the M40 audit re-read it and matched.
+Save & Continue then answered "is required" with the box empty in DOM, reactProps and fiber alike —
+Workday discarded it during validation. **Every check we own runs before that point**, so the bundle
+kept claiming `current_value:"N/A"`: review would show an answer the form does not hold, the human
+would approve it, and the replay would re-enter the same rejected text forever.
+
+`rejectedValueEntries` now compares record vs live scan for each field the error NAMES, and blanks
+only those (needs_review, un-approved, naming the rejected value). Narrow, because blanking destroys
+data. **Its first version was itself a silent no-op** — it matched by LABEL, and after a blocked save
+the scan's label is `"What is your desired compensation *Error: The field ... is required..."`,
+since Workday renders the message INSIDE the wrapper. Now keyed on the scan's `fieldName` (which the
+entry's `field_id` encodes) or a UNIQUE label prefix, and every no-op says why.
+
+### 3. An absent allowlist read as "switched off"
+
+`autofill_rules.generation_allowed_only_for` gates AI free-text. The check required the key to be
+PRESENT and to list open_ended — and **the website's profile model has no such key** (nor
+`application_questions` / `writing_style`; see web/lib/profile-schema.ts). So every profile arriving
+through AP_SYNC_PROFILE — the primary path — disabled generation, every required free-text question
+got "N/A", and the log blamed an operator setting nobody had made. Absent now takes the shipped
+default; an EXPLICIT `[]` still means off.
+
+### 4. A required pick-one CHECKBOX GROUP had no path to an answer
+
+PSECU's required ethnicity question renders as a checkbox group. No FIELD_MAP entry; `aiEligible`
+excludes checkboxes; the required-radio pass keys on `widgetType === "radio"`; AI-4's Tier 2 declined,
+correctly ("a single value string via refill would not satisfy a checkbox widget"). Four layers each
+right locally, and the field still could not be filled — so Save & Continue could never pass and the
+walk halted on that tenant every time.
+
+`aiFillCheckboxGroup` mirrors `aiFillRadio`. The line that matters: a bare **checkbox** stays excluded
+because ticking one is an ASSERTION ("I agree", "I certify") and an AI must not assert for someone; a
+checkbox **group** is a pick-one SET, the same shape as a radio.
+
+### 5. A requisition id is not always `R<digits>`
+
+`canonicalJobUrl` matched `_R\d+`. Copart and PSECU issue `JR109393` / `JR100897`, which fell through
+to the origin+pathname fallback — and that is not stable, because **Workday redirects the URL you
+paste to its own spelling**: `Harrisburg-PA` -> `Harrisburg%2C-PA`. One posting produced TWO tracker
+rows, and the rehearsal REFUSED its own approved bundle (rightly — it cannot tell "my bundle under
+another key" from "another application's bundle"). Any letters+digits token now keys the same way;
+the `_R` tier still matches first, so existing keys are byte-identical.
+
+### What passed
+
+PSECU HR Intern, the whole flow: 4 pages filled -> review -> approve 8 flagged -> change the
+AI-guessed demographic and the phone device type -> re-approve (a value edit correctly RESET its
+approval) -> rehearse -> **AGREE 49 · DISAGREE 0**, `"Mobile"->"Landline"` committed on the form,
+WOULD CLICK SUBMIT. Nothing submitted.
+
+Still open: Copart's required "What is your desired compensation" is unanswerable from the profile —
+the AI correctly refuses to invent a salary and the form rejects "N/A". That one needs a profile
+answer, not a code fix.

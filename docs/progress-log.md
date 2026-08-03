@@ -3301,3 +3301,28 @@ Extension 961/961; web 117/117; typecheck + build green.
 **Blocked, not a code fault:** the Gemini free-tier key is out of quota (HTTP 429; Test connection
 confirms), so new fills needing an AI answer leave those fields `needs_review`. Rehearsals are
 unaffected — the replay runs with AI off by design.
+
+## 2026-08-03 — running the full human flow, twice per job
+
+Operator: find the job, run it from the website, review, approve/change fields, rehearse — "this
+process should have no errors". Five bugs, each invisible from outside the logs. Detail:
+dom-patterns 2026-08-03.
+
+- **The error parser truncated any label containing its own stop-word** ("What is your desired
+  compensation" -> "What"), which silently disabled Tier-1 remediation, the phantom-required guard
+  and the field diagnosis, and pointed the log at the wrong explanation.
+- **A value the form REJECTED still counted as filled.** Every verification we own runs before
+  Workday validates, so a discarded value stayed in the bundle as an answer. Now reconciled against
+  a live scan, narrowly, and every no-op explains itself — the first cut was silent and hid its own
+  failure for a whole run.
+- **An absent autofill_rules allowlist read as "off"**, and the website never sends one — so AI
+  free-text was disabled on every website-driven run while the log blamed the operator.
+- **A required pick-one checkbox group had no path to an answer** on any layer, so PSECU could never
+  advance. A bare checkbox stays excluded: ticking one is an assertion, not a choice.
+- **Requisition ids that are not R<digits>** (JR109393) fell back to a path key that Workday's own
+  redirect rewrites — two tracker rows for one job, and a rehearsal refusing its own bundle.
+
+PSECU then ran the whole flow clean: fill -> approve 8 -> change the AI demographic + phone type ->
+re-approve -> rehearse -> AGREE 49 · DISAGREE 0 -> would-submit. Nothing submitted.
+
+Extension 972/972; web 117/117; typecheck green.
