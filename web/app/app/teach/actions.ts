@@ -4,7 +4,7 @@ import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { aiConfigSchema, totalUsableKeys } from "@/lib/ai-config";
-import { callLLMForAction } from "@/lib/llm";
+import { callLLMTracked } from "@/lib/llm-server";
 
 export type SaveResult = { ok: true } | { ok: false; error: string };
 export type FieldRecommendation = { maps_to: string; suggested_category: string };
@@ -150,7 +150,7 @@ export async function recommendField(input: { question: string; answer: string }
       "\nApplicant's answer: " + input.answer +
       "\nProfile: " + JSON.stringify(data?.profile_json ?? {}) +
       "\n\nReply ONLY with a JSON object and nothing else:\n{\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other>\"}";
-    const res = await callLLMForAction(cfg.data, "teach", { system, user: userPrompt, maxTokens: 200 });
+    const res = await callLLMTracked(cfg.data, "teach", { system, user: userPrompt, maxTokens: 200 });
     return res.ok ? parseRecommendation(res.text) : none;
   } catch {
     return none;

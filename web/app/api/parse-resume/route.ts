@@ -3,7 +3,7 @@ import { extractText, getDocumentProxy } from "unpdf";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceAiConfig, totalUsableKeys } from "@/lib/ai-config";
-import { callLLMForAction } from "@/lib/llm";
+import { callLLMTracked } from "@/lib/llm-server";
 import { buildResumePrompt, parseProfileFromReply } from "@/lib/resume-prompt";
 
 export const runtime = "nodejs";
@@ -54,7 +54,7 @@ export async function POST(req: Request) {
   const { system, user: prompt } = buildResumePrompt(text);
   // "resume_parse" picks this action's model (falling back to the default pair), then
   // rotates through that provider's keys.
-  const res = await callLLMForAction(ai, "resume_parse", { system, user: prompt, maxTokens: 4096 });
+  const res = await callLLMTracked(ai, "resume_parse", { system, user: prompt, maxTokens: 4096 });
   if (!res.ok) return bad("AI request failed: " + res.error, 502);
 
   const profile = parseProfileFromReply(res.text);
