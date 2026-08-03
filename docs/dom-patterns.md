@@ -2994,3 +2994,73 @@ Whether the replay's repeating-section path shares that ladder — or whether th
 expanded/mounted at replay time — is UNVERIFIED; do not guess, read `replayRepeatingSections`
 against `fillEntryCdp` first. The outcome was SAFE (halt before advancing, nothing submitted), and
 the other 26 fields on the page replayed correctly.
+
+## 2026-08-02 (d) — the prompt row, the contaminated sign-in box, and halts that named the wrong cause
+
+Three findings from a Workday session whose point was the REVIEW→REHEARSE contract: approve a bundle,
+deliberately change some answers, and check the replay follows the human, not the profile.
+
+### "Select One" is a real, ENABLED option on some tenants (Waystar wd1)
+
+Workday normally marks the placeholder `aria-disabled="true"`, and every option reader here already
+drops those. Waystar's is a plain enabled option. So it reached `aiFillField` inside `enabledTexts`,
+the model was told to pick exactly one, and it picked the prompt row. The fill recorded
+`filled_review` with a justification — a confident-looking answer — and Workday then rejected the page:
+
+    Error-... The field ... is required and must have a value.
+
+Two properties of the placeholder matter, and the second came from the operator:
+  * it is not an answer — the form counts it as unanswered even though it renders as a value;
+  * on Workday it is TEMPORARY. Once a real option is chosen the placeholder LEAVES the menu and
+    cannot be chosen again. So the review editor was offering a choice the form no longer permits.
+
+`isPlaceholderOption` (lib.js, pure) recognises it by TEXT — generic across tenants and ATSs, no
+page-specific selector. Narrow on purpose: the prompt vocabulary (select/choose/pick/please select),
+pure punctuation, and only when the row carries no answer content of its own. "Select One" matches;
+"Select all that apply to you" must not. The failure direction is deliberate — a missed placeholder
+costs one flagged review row, while eating a real option would silently delete a valid answer.
+Applied to the three AI dropdown prompts, the review editor's option lists, and the blank test in
+`bundleSubmitBlockers`/`approvalEnvelope` (scoped to CHOICE widgets — a text answer reading "select
+one" is a real answer). LIVE-VERIFIED on the same Waystar question afterwards: it committed "Yes, I am
+open to relocating".
+
+### The sign-in email box kept content we did not type, and the clear silently failed
+
+    filled "email" — read-back MISMATCH (got "wangykev+1@gmail.comtester+10@gmail.com")
+
+The box already held another address (browser autofill), `cdpSelectAllDelete` did not take, and
+`cdpInsertText` APPENDED. This reproduces reliably on this tenant — the retry log now shows it every
+run: `clear attempt 1 left "wangykev+1@gmail.com" in the box`. The keyboard clear needs the field to
+hold BOTH focus and a selection; a page-side native-setter clear needs neither, and recovers it.
+The rule that generalises: **a clear is an action with an outcome, so read it back before typing** —
+the same discipline every other commit in this codebase already follows.
+
+`fillField` also already RETURNED `{ok:false}` and logged the mismatch; the sign-in caller dropped the
+value and clicked Sign In anyway. That is worse than stopping, because Workday answers "wrong
+credentials", the flow believes it, and can go on to CREATE AN ACCOUNT for an address that is not ours.
+
+### Two halts asserted causes nobody had observed — and both were wrong in the same session
+
+  * the stalled sign-in was reported as Chrome's "password found in a data breach" dialog. Operator:
+    "this was not a password breach." The real cause was the contaminated box above, and the confident
+    wrong explanation is what sent the debugging the wrong way.
+  * the replay's non-advancing page said "a required field is empty" for EVERY nav-timeout. Live it
+    said that while Workday's own banner read **"32312 is not a valid postal code for Georgia"** — a
+    consistency check between two FILLED fields, nothing empty anywhere.
+
+Both now report what was observed and quote the page. Standing rule, third instance: **a halt may state
+what it saw and what it tried; it may not name a cause it has not verified.** A wrong diagnosis is more
+expensive than none, because it is believed.
+
+### The review→rehearse contract, verified end to end
+
+Two Magna applications, seven deliberate edits made by hand in the website review editor, spanning
+text, dropdown, repeating-entry text, textarea and a self-ID dropdown. Both replays followed the human
+value, visibly overwriting the bot's: `"Florida"→"Georgia"`, `"Mobile"→"Landline"`,
+`"Male"→"Undeclared"`. Review page came back **AGREE 46 · DISAGREE 0 · MISSING 0** and
+**AGREE 45 · DISAGREE 0** → WOULD CLICK SUBMIT. Nothing was submitted.
+
+The sharpest evidence is an accident: editing State to Georgia while leaving the Tallahassee ZIP made
+Workday itself reject the combination. The replay wrote the human's Georgia and kept the unedited
+32312 — it did not quietly repair the pair from the profile. A bot that silently "fixed" that would
+have hidden a human's edit, which is the one thing this stage exists to prevent.

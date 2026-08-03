@@ -3271,3 +3271,33 @@ New generic behaviour, each earned from a live failure:
 - Fixed en route: re-attaching options left the previous set behind (stale options in review).
 
 Also: `AP_DEV_CLOSE_TABS` (dev-only) cleans up the tab each run leaves behind. Suite 933/933; web typecheck green.
+
+## 2026-08-02 — placeholder guard, sign-in clear, honest halts; review→rehearse verified with human edits
+
+Session goal (operator): "physically go and approve things … maybe change an answer here or there to
+test if the rehearsal run truly will follow the human approved answers." It does — and getting there
+turned up three bugs. Full DOM detail: dom-patterns 2026-08-02 (d).
+
+- **A menu's prompt row is never an answer.** Waystar's "Select One" is a plain ENABLED option, so it
+  reached the AI as a legitimate choice and got picked; Workday rejected the page as required-empty.
+  `isPlaceholderOption` (lib.js, pure, text-based, deliberately narrow) now keeps it out of the three AI
+  dropdown prompts, out of the review editor's lists (the operator's point: on Workday the placeholder
+  is TEMPORARY and cannot be re-chosen, so offering it offers something the form disallows), and counts
+  as BLANK in the submit gate. Live-verified: the same question now answers "Yes, I am open to
+  relocating".
+- **Verify the clear before typing.** Browser autofill left an address in the sign-in email box, the
+  keyboard clear silently failed, and the insert APPENDED. The clear is now read back, retried with a
+  second strategy, and a field we could not write HALTS instead of submitting garbage (which Workday
+  reads as wrong credentials — and the flow could then create an account under a foreign address).
+- **Stop naming unverified causes.** The stalled sign-in blamed Chrome's data-breach dialog (it was the
+  contaminated box); the replay's nav-timeout blamed an empty required field (Workday's banner said
+  "32312 is not a valid postal code for Georgia"). Both now quote what they saw.
+- **The contract holds.** Seven hand-made edits across two Magna applications — text, dropdown,
+  repeating-entry text, textarea, self-ID dropdown — all replayed as the human left them:
+  AGREE 46 · DISAGREE 0 and AGREE 45 · DISAGREE 0 → WOULD CLICK SUBMIT, nothing submitted.
+
+Extension 961/961; web 117/117; typecheck + build green.
+
+**Blocked, not a code fault:** the Gemini free-tier key is out of quota (HTTP 429; Test connection
+confirms), so new fills needing an AI answer leave those fields `needs_review`. Rehearsals are
+unaffected — the replay runs with AI off by design.
