@@ -58,8 +58,9 @@ export function TeachInbox({
   // RETARGET (2026-07-25, operator): "Wrong field?" points at the profile ALREADY shown on the right
   // instead of opening a search popup over it. The search-all-fields popup is GONE entirely
   // (operator 2026-08-02: "the all fields popup is not needed") — when the AI's suggestion is wrong
-  // or hallucinated, the two useful moves are click the right field on the right, or save a new
-  // answer, and a searchable list of every field was neither.
+  // or hallucinated, the two useful moves are click the right field on the right, or CREATE a new
+  // field for it — both offered inline in retarget mode — and a searchable list of every existing
+  // field was neither.
   const [retarget, setRetarget] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
   // teach-time AI fallback: recommendation per card.key for cards with no stamped maps_to hint
@@ -369,6 +370,16 @@ export function TeachInbox({
                   <button onClick={() => setRetarget(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving || retarget}>
                     {retarget ? "Pick a field on the right →" : "Wrong field?"}
                   </button>
+                  {/* The AI's field is wrong, and the RIGHT one may not exist yet — the answer belongs
+                      nowhere on the profile. Offer creating it here, next to "pick one on the right",
+                      so both moves are visible at the moment the operator has rejected the guess
+                      (operator 2026-08-02). Same popup the no-match card uses. */}
+                  {retarget && (
+                    <button onClick={() => { setRetarget(false); setNewOpen(true); }} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
+                      <Plus className="h-3.5 w-3.5" />
+                      Create new field
+                    </button>
+                  )}
                 </div>
               </div>
             ) : (
