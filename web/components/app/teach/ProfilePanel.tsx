@@ -25,8 +25,14 @@ export function ProfilePanel({
   selectMode,
   onSelectPath,
   onCancelSelect,
+  buckets,
 }: {
   profile: unknown;
+  /** Mode-B remembered answers (a bucket with its own value and no profile_path). They are NOT
+   *  profile fields, so the flat walk never sees them — and a brand-new answer created from the
+   *  teach card therefore vanished the moment it was saved (operator 2026-08-02: "when I add a new
+   *  field, it should render in the teach profile, it currently doesn't"). Shown as their own box. */
+  buckets?: { profile_path?: string; value?: unknown; questions?: unknown; category?: string }[];
   highlightPath: string;
   onOpenBucket: (path: string, label: string, bucketWidget: string) => void;
   onOpenAnswer: (path: string, label?: string) => void;
@@ -63,8 +69,22 @@ export function ProfilePanel({
   const skills = strList(p.skills).join(", ");
   const employers = strList(p.employment_history_companies).join(", ");
 
+  // Mode-B = no profile_path. Label it by its FIRST taught wording (that is how the operator will
+  // recognise it); fall back to the category, then a generic. Value = its first candidate.
+  const rememberedRows: FieldRowData[] = (buckets || [])
+    .filter((b) => b && String(b.profile_path || "").trim() === "")
+    .map((b, i) => {
+      const qs = Array.isArray(b.questions) ? (b.questions as unknown[]).map((q) => String(q ?? "")).filter(Boolean) : [];
+      const vals = Array.isArray(b.value) ? (b.value as unknown[]).map((v) => String(v ?? "")).filter(Boolean) : [];
+      return {
+        path: "",  // no profile path — see the prop doc; these rows are display-only
+        label: qs[0] || (b.category || "").trim() || `Remembered answer ${i + 1}`,
+        value: vals[0] || "",
+      };
+    });
+
   const common = { onOpenBucket, onOpenAnswer, disabled, highlightPath, selectMode: !!selectMode, onSelectPath };
-  const anyContent = sections.length > 0 || websiteRows.length > 0 || skills || employers;
+  const anyContent = sections.length > 0 || websiteRows.length > 0 || skills || employers || rememberedRows.length > 0;
 
   // Auto-scroll the recommended (highlighted) row into view within this panel, so the teach card on
   // the left and its target field on the right are on the same screen.
@@ -117,6 +137,20 @@ export function ProfilePanel({
         {websiteRows.length > 0 && <FieldBox label="Websites" rows={websiteRows} {...common} />}
         <ListBox label="Skills" path="skills" value={skills} onOpenAnswer={onOpenAnswer} disabled={disabled} />
         <ListBox label="Employer history" path="employment_history_companies" value={employers} onOpenAnswer={onOpenAnswer} disabled={disabled} />
+        {/* Display-only: a remembered answer has no profile path, so it is not a retarget target
+            and its rows do not open the field editors. It is here so a newly created answer is
+            visibly THERE. */}
+        {rememberedRows.length > 0 && (
+          <FieldBox
+            label="Remembered answers"
+            rows={rememberedRows}
+            highlightPath=""
+            onOpenBucket={() => {}}
+            onOpenAnswer={() => {}}
+            disabled
+            selectMode={false}
+          />
+        )}
         {!anyContent && <p className="text-sm text-ink-faint">No profile fields yet — fill out your Profile first.</p>}
       </div>
     </div>

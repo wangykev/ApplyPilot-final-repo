@@ -403,6 +403,7 @@ export function TeachInbox({
       {/* RIGHT — the profile, physically displayed + editable in place */}
       <ProfilePanel
         profile={profile}
+        buckets={buckets}
         highlightPath={recPath}
         note={panelNote}
         onOpenBucket={(path, label, widget) => setBucketPopup({ path, label, widget })}
