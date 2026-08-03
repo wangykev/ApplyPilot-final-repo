@@ -231,3 +231,148 @@ test("the default Gemini model is on the free tier", () => {
   // A first-time free-key operator must not land on a model their key can't reach.
   assert.ok(isFreeTierModel("gemini", LLM_DEFAULT_MODELS.gemini));
 });
+
+// ─── Rotation through callLLM ───────────────────────────────────────────────
+// The behaviour the key list exists for. The load-bearing assertion in most of these is
+// `waits` — rotating to the next key must cost ZERO waiting, because the alternative
+// (llm.js's ladder) sits out ~75s on a 429.
+
+const { callLLM, resetLlmRetryState } = require("../llm.js");
+
+function harness(responses) {
+  const calls = [];
+  const waits = [];
+  const queue = responses.slice();
+  const fetchImpl = async (url, opts) => {
+    const headers = opts && opts.headers ? opts.headers : {};
+    calls.push({ url, key: headers["x-api-key"] || headers.Authorization || (String(url).match(/key=([^&]+)/) || [])[1] || "" });
+    const next = queue.shift();
+    if (!next) throw new Error("unexpected fetch #" + calls.length);
+    if (next.throw) throw new Error(next.throw);
+    return {
+      ok: next.status >= 200 && next.status < 300,
+      status: next.status,
+      json: async () => next.json,
+      text: async () => (typeof next.body === "string" ? next.body : JSON.stringify(next.body || "")),
+      headers: { get: (h) => (next.headers || {})[String(h).toLowerCase()] || null }
+    };
+  };
+  return { calls, waits, fetchImpl, sleepImpl: async (ms) => { waits.push(ms); } };
+}
+
+const geminiOk = (text) => ({ status: 200, json: { candidates: [{ content: { parts: [{ text }] } }] } });
+const twoKeys = [
+  { id: "k1", key: "AIza-one", tier: "free", enabled: true },
+  { id: "k2", key: "AIza-two", tier: "free", enabled: true }
+];
+const req = (over) => Object.assign({ provider: "gemini", model: "gemini-3.1-flash-lite", user: "hi", keys: twoKeys }, over);
+
+test("rotation: a rate-limited key hands off to the next WITHOUT waiting", () => {
+  resetLlmRetryState();
+  const h = harness([{ status: 429, body: { error: { status: "RESOURCE_EXHAUSTED" } } }, geminiOk("second key answered")]);
+  return callLLM(req(), h.fetchImpl, h.sleepImpl).then((res) => {
+    assert.equal(res.ok, true);
+    assert.equal(res.text, "second key answered");
+    assert.equal(h.calls.length, 2);
+    assert.ok(h.calls[0].key.includes("one") && h.calls[1].key.includes("two"), "should have moved to the second key");
+    assert.deepEqual(h.waits, [], "rotating must not spend a single wait — that is the entire point");
+  });
+});
+
+test("rotation: a rejected key is parked in the returned state, so the next call skips it", async () => {
+  resetLlmRetryState();
+  let saved = null;
+  const h = harness([{ status: 400, body: { error: { message: "API key not valid. Please pass a valid API key." } } }, geminiOk("ok")]);
+  const res = await callLLM(req({ onKeyState: (s) => { saved = s; } }), h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, true);
+  assert.equal(saved.keys["gemini/k1"].invalid, true);
+  assert.deepEqual(h.waits, []);
+
+  // Second call with that state: k1 is skipped entirely — one fetch, on k2.
+  const h2 = harness([geminiOk("straight to k2")]);
+  const res2 = await callLLM(req({ keyState: saved }), h2.fetchImpl, h2.sleepImpl);
+  assert.equal(res2.ok, true);
+  assert.equal(h2.calls.length, 1);
+  assert.ok(h2.calls[0].key.includes("two"));
+});
+
+test("rotation: every key spent → one cheap probe each, no ladder, and the error says so", async () => {
+  resetLlmRetryState();
+  const h = harness([
+    { status: 429, body: { error: { status: "RESOURCE_EXHAUSTED" } } },
+    { status: 429, body: { error: { status: "RESOURCE_EXHAUSTED" } } }
+  ]);
+  const res = await callLLM(req(), h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, false);
+  assert.match(res.error, /all 2 gemini keys are spent/);
+  assert.match(res.error, /frees up in ~\d+s/, "should say when a key returns");
+  assert.equal(h.calls.length, 2, "one attempt per key, never a ladder per key");
+  assert.deepEqual(h.waits, []);
+});
+
+test("rotation: a 5xx does NOT burn the key list — the provider is down, so the ladder runs", async () => {
+  resetLlmRetryState();
+  // Probe k1 → 503 (provider_down, no rotate) → hand k1 to the full ladder, which
+  // recovers on its first wait. k2 is never touched: it would hit the same dead endpoint.
+  const h = harness([{ status: 503, body: "overloaded" }, { status: 503, body: "overloaded" }, geminiOk("recovered")]);
+  const res = await callLLM(req(), h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, true);
+  assert.equal(res.text, "recovered");
+  assert.ok(h.waits.length >= 1, "an outage still gets the wait ladder it always had");
+  assert.ok(h.calls.every((c) => c.key.includes("one")), "must not rotate on a provider outage");
+});
+
+test("rotation: a malformed request stops at the first key", async () => {
+  resetLlmRetryState();
+  const h = harness([{ status: 400, body: { error: { message: 'Unknown name "foo": Cannot find field.' } } }]);
+  const res = await callLLM(req(), h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, false);
+  assert.equal(h.calls.length, 1, "every other key would fail identically");
+  assert.deepEqual(h.waits, []);
+});
+
+test("rotation: free keys are tried before paid ones", async () => {
+  resetLlmRetryState();
+  const keys = [
+    { id: "paid", key: "AIza-paid", tier: "paid", enabled: true },
+    { id: "free", key: "AIza-free", tier: "free", enabled: true }
+  ];
+  const h = harness([geminiOk("free first")]);
+  await callLLM(req({ keys }), h.fetchImpl, h.sleepImpl);
+  assert.ok(h.calls[0].key.includes("free"), "the free key should be spent first");
+});
+
+test("rotation: Retry-After parks the key for exactly as long as the server asked", async () => {
+  resetLlmRetryState();
+  let saved = null;
+  const h = harness([{ status: 429, body: "slow down", headers: { "retry-after": "5" } }, geminiOk("ok")]);
+  await callLLM(req({ onKeyState: (s) => { saved = s; } }), h.fetchImpl, h.sleepImpl);
+  const until = saved.keys["gemini/k1"].cooldownUntil - Date.now();
+  assert.ok(until > 0 && until <= 5000, `cooldown should honour Retry-After: 5 (got ${until}ms)`);
+});
+
+test("rotation: one usable key still gets the full ladder — nothing to rotate to", async () => {
+  resetLlmRetryState();
+  const h = harness([{ status: 503, body: "x" }, geminiOk("ok")]);
+  const res = await callLLM(req({ keys: [twoKeys[0]] }), h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, true);
+  assert.ok(h.waits.length >= 1, "with a single key, waiting IS the remedy");
+});
+
+test("rotation: no usable key names the reason instead of calling out", async () => {
+  resetLlmRetryState();
+  const h = harness([]);
+  const res = await callLLM(req({ keys: [{ id: "off", key: "AIza-x", tier: "free", enabled: false }] }), h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, false);
+  assert.match(res.error, /no usable API key for gemini/);
+  assert.equal(h.calls.length, 0);
+});
+
+test("a caller still passing a bare apiKey is untouched by any of this", async () => {
+  resetLlmRetryState();
+  const h = harness([geminiOk("legacy path")]);
+  const res = await callLLM({ provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "AIza-legacy", user: "hi" }, h.fetchImpl, h.sleepImpl);
+  assert.equal(res.ok, true);
+  assert.equal(res.text, "legacy path");
+  assert.equal(h.calls.length, 1);
+});

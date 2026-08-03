@@ -126,12 +126,18 @@ function llmRetryAfterMs(res, nowMs) {
   } catch (e) { return null; }
 }
 
-// callLLM — provider-agnostic. Returns { ok:true, text } or { ok:false, error }.
+// callLLMOnce — ONE key, the original single-key path: build → fetch → wait-ladder →
+// breaker → normalize. Behaviour here is unchanged; callLLM (below) wraps it to walk a
+// list of keys. Returns { ok:true, text } or { ok:false, error }, and on an HTTP failure
+// also `status` + `body` so the rotation layer can classify WHY without re-parsing the
+// error string.
+// `cfg.noRetry` skips the ladder entirely — that is what makes rotation cheap: probing
+// the next key must not cost the 75s a full ladder does.
 // `fetchImpl` is injectable for Node tests; in the SW/popup it defaults to global fetch.
 // `sleepImpl` is injectable the same way (retry tests pass a capture so they don't wait).
 // NEVER throws — every failure is a normalized { ok:false, error } (the caller flags
 // the field for review; a thrown adapter must not crash a fill).
-async function callLLM(req, fetchImpl, sleepImpl) {
+async function callLLMOnce(req, fetchImpl, sleepImpl) {
   const fetchFn = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
   if (!fetchFn) return { ok: false, error: "no fetch available in this context" };
   const cfg = req || {};
@@ -146,8 +152,10 @@ async function callLLM(req, fetchImpl, sleepImpl) {
   const sleep = sleepImpl || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
   // While the breaker is cooling, take ONE attempt and don't spend the ladder.
+  // A rotation probe (noRetry) likewise takes one attempt — the next KEY is the cheaper
+  // remedy than waiting, so the ladder is saved for when every key has been tried.
   const cooling = Date.now() < llmRetryState.coolingUntil;
-  const maxRetries = cooling ? 0 : LLM_RETRY_DELAYS_MS.length;
+  const maxRetries = cfg.noRetry || cooling ? 0 : LLM_RETRY_DELAYS_MS.length;
   let res, attempt = 0, netErr = null;
   for (;;) {
     netErr = null;
@@ -165,11 +173,13 @@ async function callLLM(req, fetchImpl, sleepImpl) {
   }
   if (netErr !== null) {
     if (attempt > 0) llmRetryState.consecutiveExhausted++;
-    return { ok: false, error: "network error: " + netErr + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "") };
+    return { ok: false, networkError: netErr, error: "network error: " + netErr + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "") };
   }
   if (!res || !res.ok) {
     // Only a RETRYABLE exhaustion counts toward the breaker — a 401 says nothing about capacity.
-    if (res && LLM_RETRY_STATUS[res.status]) {
+    // Rotation probes are excluded: three keys each seeing one 429 is not three exhausted
+    // ladders, and counting them would trip the breaker and suppress the ladder for 2min.
+    if (!cfg.noRetry && res && LLM_RETRY_STATUS[res.status]) {
       llmRetryState.consecutiveExhausted++;
       if (llmRetryState.consecutiveExhausted >= LLM_BREAKER_TRIP_AFTER) {
         llmRetryState.coolingUntil = Date.now() + LLM_BREAKER_COOLDOWN_MS;
@@ -178,7 +188,10 @@ async function callLLM(req, fetchImpl, sleepImpl) {
     }
     let body = "";
     try { body = await res.text(); } catch (e) { /* ignore */ }
-    return { ok: false, error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : "")
+    // Surfaced so a rotation probe can park the key for exactly as long as the server
+    // asked, instead of falling back to the per-code default cooldown.
+    return { ok: false, status: res ? res.status : 0, body, retryAfterMs: llmRetryAfterMs(res, Date.now()),
+      error: "HTTP " + (res ? res.status : "?") + (body ? ": " + body.slice(0, 300) : "")
       + (attempt > 0 ? " (gave up after " + (attempt + 1) + " attempts)" : "")
       + (cooling ? " [rate-limit cooldown: not retrying for now]" : "") };
   }
@@ -190,6 +203,102 @@ async function callLLM(req, fetchImpl, sleepImpl) {
   try { text = prov.parse(data); } catch (e) { return { ok: false, error: "parse failed: " + String((e && e.message) || e) }; }
   if (text == null || String(text).trim() === "") return { ok: false, error: "no text in response: " + JSON.stringify(data).slice(0, 300) };
   return { ok: true, text: String(text).trim() };
+}
+
+// ─── Key rotation ───────────────────────────────────────────────────────────
+// callLLM — the entry point every caller uses. Accepts EITHER the original single
+// `apiKey` or a `keys` list (llmConfig.keys[provider]); with 0 or 1 usable key it is
+// callLLMOnce verbatim, so the single-key contract — ladder, Retry-After, breaker, error
+// strings — is untouched.
+//
+// WITH SEVERAL KEYS, ROTATION COMES BEFORE WAITING. That ordering is the whole point: a
+// 429 on key 1 costs one cheap request to discover and then key 2 answers, where the
+// ladder alone would sit out ~75s (the live 2026-08-02 incident — a 65-field form burned
+// its quota and fields fell to needs_review the model could have answered). So:
+//   pass 1  probe each usable key once, no waiting
+//             success            → done
+//             key's own fault    → park that key, try the next
+//             provider down/our  → stop; no other key can help
+//   pass 2  every key key-faulted → the ladder wouldn't help either; report which keys
+//             were parked and when the first frees up.
+//           provider down        → hand the FIRST key to the full ladder, so an outage
+//             still gets the resilience it always had.
+//
+// `keyState`/`onKeyState` thread the in-memory cooldown map (llm-keys.js) through, so a
+// key parked on one call is skipped on the next. Optional — omit them and rotation is
+// still correct within the single call.
+function llmKeysApi() {
+  // llm-keys.js is a global in the SW/popup (importScripts / <script>) and a require in
+  // Node. Missing entirely → rotation degrades to single-key, never crashes.
+  if (typeof orderLlmKeys === "function") {
+    return { orderLlmKeys, classifyLlmFailure, applyLlmKeyOutcome, newLlmKeyState };
+  }
+  try { return require("./llm-keys.js"); } catch (e) { return null; }
+}
+
+async function callLLM(req, fetchImpl, sleepImpl) {
+  const cfg = req || {};
+  const api = llmKeysApi();
+  const supplied = Array.isArray(cfg.keys) ? cfg.keys : null;
+
+  // Not a rotation call → the original path, unchanged.
+  if (!api || !supplied || supplied.length === 0) {
+    return callLLMOnce(cfg, fetchImpl, sleepImpl);
+  }
+
+  const now = () => Date.now();
+  let state = cfg.keyState || api.newLlmKeyState();
+  const ordered = api.orderLlmKeys(supplied, { provider: cfg.provider, preferFreeFirst: cfg.preferFreeFirst !== false }, state, now());
+  const commit = () => { if (typeof cfg.onKeyState === "function") cfg.onKeyState(state); };
+
+  if (!ordered.keys.length) {
+    commit();
+    const wait = ordered.nextAvailableAt ? " (first one frees up in ~" + Math.ceil((ordered.nextAvailableAt - now()) / 1000) + "s)" : "";
+    return { ok: false, error: "no usable API key for " + cfg.provider + ": every key is disabled, rejected, or resting" + wait };
+  }
+  if (ordered.keys.length === 1) {
+    // One key → give it the full ladder rather than a bare probe; there is nothing to
+    // rotate to, so waiting IS the remedy.
+    const res = await callLLMOnce({ ...cfg, apiKey: ordered.keys[0].key }, fetchImpl, sleepImpl);
+    const verdict = res.ok ? null : api.classifyLlmFailure({ status: res.status, body: res.body, networkError: res.networkError });
+    state = api.applyLlmKeyOutcome(state, cfg.provider, ordered.keys[0].id, res.ok ? "ok" : verdict.code, now(), llmRetryAfterMsFromBody(res));
+    commit();
+    return res;
+  }
+
+  let last = null;
+  let ladderKey = null;
+  for (const k of ordered.keys) {
+    const res = await callLLMOnce({ ...cfg, apiKey: k.key, noRetry: true }, fetchImpl, sleepImpl);
+    if (res.ok) {
+      state = api.applyLlmKeyOutcome(state, cfg.provider, k.id, "ok", now());
+      commit();
+      return res;
+    }
+    const verdict = api.classifyLlmFailure({ status: res.status, body: res.body, networkError: res.networkError });
+    last = res;
+    if (verdict.keyFault) {
+      state = api.applyLlmKeyOutcome(state, cfg.provider, k.id, verdict.code, now(), llmRetryAfterMsFromBody(res));
+    }
+    if (!verdict.rotate) { ladderKey = verdict.code === "provider_down" ? k : null; break; }
+  }
+  commit();
+
+  // The provider itself is down or our request is malformed — another key changes
+  // nothing, but an outage still deserves the ladder it has always had.
+  if (ladderKey) return callLLMOnce({ ...cfg, apiKey: ladderKey.key }, fetchImpl, sleepImpl);
+
+  const parked = api.orderLlmKeys(supplied, { provider: cfg.provider }, state, now());
+  const wait = parked.nextAvailableAt ? "; earliest frees up in ~" + Math.ceil((parked.nextAvailableAt - now()) / 1000) + "s" : "";
+  return { ok: false, error: "all " + ordered.keys.length + " " + cfg.provider + " keys are spent" + wait
+    + (last && last.error ? " — last: " + last.error : "") };
+}
+
+// Retry-After the rotation layer can reuse: callLLMOnce already parsed and capped it for
+// its own ladder, but a probe never reads headers, so fall back to null and let the
+// per-code default cooldown apply.
+function llmRetryAfterMsFromBody(res) {
+  return res && typeof res.retryAfterMs === "number" ? res.retryAfterMs : null;
 }
 
 // Selectable models per provider for the popup dropdown — the operator PICKS one (no typing,
@@ -252,6 +361,6 @@ const LLM_PRICING_URLS = {
 // the functions stay globals (from <script> / importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
+    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS };
 }

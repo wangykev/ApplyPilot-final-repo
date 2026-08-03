@@ -71,7 +71,10 @@ console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "ats.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
+// llm-keys.js loads BEFORE llm.js on purpose: callLLM's rotation layer resolves its
+// helpers (orderLlmKeys / classifyLlmFailure / applyLlmKeyOutcome) as globals, and
+// degrades to the original single-key path if they aren't there.
+importScripts("db.js", "lib.js", "llm-keys.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "ats.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
 
 // ============================================================================
 // EXTERNAL messages from ApplyPilot Web (the website → extension handoff).
