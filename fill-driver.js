@@ -2012,6 +2012,9 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // highlighted row). So focus is re-asserted BEFORE every candidate, not just
   // at open. Returns the focused state, or null if focus can't be confirmed —
   // in which case the caller MUST NOT actuate (no blind clear/type/Enter).
+  // Filled by ensureSearchFocused so a failure can be read after the fact — see the focus-diag note
+  // in cdpFocusDiag. Kept on the record, not just the log, because this fires mid-walk.
+  const focusDiag = [];
   const ensureSearchFocused = async () => {
     // Bounded open+focus retry (M29). A fast-paced open can race the prior field's
     // post-commit re-render so the searchBox isn't focusable on the first try (the
@@ -2031,11 +2034,19 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
           if (st && st.searchBox.visible) break;
         }
       }
+      let diag = null;
       if (st && st.searchBox.visible && !st.searchBox.focused) {
-        await act.focusHierSearch(loc); // already-visible search → focus only, never re-open
+        // Prefer the diagnostic twin when the substrate offers it — identical action, richer answer.
+        if (act.focusHierSearchDiag) diag = await act.focusHierSearchDiag(loc);
+        else await act.focusHierSearch(loc); // already-visible search → focus only, never re-open
         st = await act.readHier(loc);
       }
       if (st && st.searchBox.focused) return st;
+      focusDiag.push({ attempt,
+        present: !!(st && st.searchBox.present), visible: !!(st && st.searchBox.visible),
+        focusedAfterRead: !!(st && st.searchBox.focused),
+        focusTook: diag ? diag.focused : null, holdsFocus: diag ? diag.after : null,
+        box: diag ? diag.box : null, note: diag ? diag.note : "searchBox never became visible" });
       await act.delay(budgets.reopenSettleMs); // let a racing re-render settle, then retry
     }
     return null;
@@ -2109,8 +2120,14 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // exact path that committed a stray "Afghanistan" via the listbox highlight).
     if (!(await ensureSearchFocused())) {
       step.note = "could not focus search field — not actuating blind";
+      step.focusDiag = focusDiag; // WHY, per attempt — the three causes look identical without this
       await act.pressTab(); // BLUR before leaving: a prior candidate's no-match ARMED row-0 (e.g. "Accounting"); Tab abandons it so the next field's focus can't blur-commit the stray
-      return { status: "needs_review", after: null, verified: false, detail: "could not focus the search field — not actuating blind (no clear/type/Enter)", settle_trace: trace };
+      return { status: "needs_review", after: null, verified: false, focus_diag: focusDiag,
+        detail: "could not focus the search field — not actuating blind (no clear/type/Enter)" +
+          (focusDiag.length ? " | " + focusDiag.map((d) => `#${d.attempt} present:${d.present} visible:${d.visible}`
+            + ` focusTook:${d.focusTook} holds:${d.holdsFocus ? (d.holdsFocus.aid || d.holdsFocus.tag) : "?"}`
+            + (d.box ? ` box:${d.box.w}x${d.box.h}/${d.box.display}/${d.box.vis}` : "") + ` (${d.note})`).join(" ; ") : ""),
+        settle_trace: trace };
     }
     // FIRST-OPEN RENDER GATE (the open-race fix): ensureSearchFocused above returns the moment the searchBox is
     // merely visible+focused, but the freshly-opened OPTION LIST is still rendering. Typing into that mid-render

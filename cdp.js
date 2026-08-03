@@ -1017,7 +1017,16 @@ async function cdpWaitHidden(timeoutMs = 60000, pollMs = 500) {
 function cdpPageScan() {
   const classify = (wrapper) => {
     const fieldName = (wrapper.getAttribute("data-automation-id") || "").slice("formField-".length);
-    if (fieldName === "source") return "hierarchical";
+    // `source` is the hierarchical picker on the tenants that shaped this rule — but NOT everywhere.
+    // Aptiv renders it as a plain dropdown (button[aria-haspopup="listbox"], no multiselect container,
+    // no search box), and the name-first shortcut routed it to the typeahead filler, which waits for a
+    // searchBox that never mounts: "could not focus the search field", present:false on every attempt,
+    // and on the REPLAY that halts the whole run. So require the multiselect SHAPE, and let anything
+    // else fall through to the ladder below and be classified as what it actually is.
+    //
+    // The searchBox itself is no use as a marker here: it only mounts once the widget is OPEN. These
+    // three are present while closed.
+    if (fieldName === "source" && (wrapper.querySelector('[data-uxi-widget-type="multiselect"]') || wrapper.querySelector('[data-automation-id="multiselectInputContainer"]') || wrapper.hasAttribute("data-automation-hiddensearch"))) return "hierarchical";
     if (wrapper.querySelector('input[type="file"]')) return "file_upload";
     if (wrapper.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
     if (wrapper.querySelector('input[type="radio"]')) return "radio";
@@ -1174,7 +1183,16 @@ function cdpPageScan() {
 function cdpCascadeScan() {
   const classify = (w) => {
     const fieldName = (w.getAttribute("data-automation-id") || "").slice("formField-".length);
-    if (fieldName === "source") return "hierarchical";
+    // `source` is the hierarchical picker on the tenants that shaped this rule — but NOT everywhere.
+    // Aptiv renders it as a plain dropdown (button[aria-haspopup="listbox"], no multiselect container,
+    // no search box), and the name-first shortcut routed it to the typeahead filler, which waits for a
+    // searchBox that never mounts: "could not focus the search field", present:false on every attempt,
+    // and on the REPLAY that halts the whole run. So require the multiselect SHAPE, and let anything
+    // else fall through to the ladder below and be classified as what it actually is.
+    //
+    // The searchBox itself is no use as a marker here: it only mounts once the widget is OPEN. These
+    // three are present while closed.
+    if (fieldName === "source" && (w.querySelector('[data-uxi-widget-type="multiselect"]') || w.querySelector('[data-automation-id="multiselectInputContainer"]') || w.hasAttribute("data-automation-hiddensearch"))) return "hierarchical";
     if (w.querySelector('input[type="file"]')) return "file_upload";
     if (w.querySelector('[data-uxi-widget-type="multiselect"]')) return "typeahead";
     if (w.querySelector('input[type="radio"]')) return "radio";
@@ -2386,6 +2404,26 @@ function cdpFocusBySel(sel) {
   if (!el || !el.focus) return false;
   el.focus();
   return document.activeElement === el;
+}
+
+// Same focus attempt, but it REPORTS what happened instead of a bare boolean — whether the node was
+// there, whether focus() took, and if not, what holds focus instead. "Could not focus" has at least
+// three causes with different fixes, and a boolean cannot tell them apart.
+function cdpFocusDiag(sel) {
+  const d = (e) => e ? { tag: e.tagName, id: e.id || null, aid: e.getAttribute && e.getAttribute("data-automation-id"),
+    type: e.getAttribute && e.getAttribute("type"), cls: String((e.className && e.className.baseVal) || e.className || "").slice(0, 60) } : null;
+  const el = document.querySelector(sel);
+  const before = d(document.activeElement);
+  if (!el) return { present: false, focused: false, before, after: before, note: "node not in the DOM" };
+  const r = el.getBoundingClientRect();
+  const cs = window.getComputedStyle(el);
+  const box = { w: Math.round(r.width), h: Math.round(r.height), display: cs.display, vis: cs.visibility,
+    disabled: !!el.disabled, readOnly: !!el.readOnly, tabIndex: el.tabIndex };
+  if (!el.focus) return { present: true, focused: false, before, after: before, box, note: "no focus() on the node" };
+  el.focus();
+  const okNow = document.activeElement === el;
+  return { present: true, focused: okNow, before, after: d(document.activeElement), box,
+    note: okNow ? "focused" : "focus() did not stick" };
 }
 
 // Dropdown state, fresh each call: trigger text + the aria-controls-scoped
@@ -3688,6 +3726,8 @@ function makeCdpActuation(llmConfig) {
     // Perf: read MANY fields' raw state in ONE round-trip for the M40 audit (see cdpReadAuditRaw).
     readAuditRaw: (specs) => cdpReadAuditRaw(specs),
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    // Diagnostic twin — same attempt, but returns WHY it failed (see cdpFocusDiag).
+    focusHierSearchDiag: (loc) => cdpEval(cdpFocusDiag, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
     probeHierLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),
