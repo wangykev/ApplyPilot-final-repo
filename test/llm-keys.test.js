@@ -498,3 +498,71 @@ test("manual effort rides the route through resolveLlmRoute", () => {
   assert.equal(resolveLlmRoute({ ...cfg, thinking: "adaptive" }, "essay", LLM_DEFAULT_MODELS)[0].effort, "");
   assert.equal(resolveLlmRoute({ ...cfg, thinking: "off" }, "essay", LLM_DEFAULT_MODELS)[0].effort, "");
 });
+
+// ─── Usage + cost: the foundation of the spend/quota tracker ─────────────────
+
+const { llmCostUsd } = require("../llm.js");
+
+test("token usage is extracted from all three provider shapes", async () => {
+  const run = async (provider, model, json) => {
+    const fetchImpl = async () => ({ ok: true, status: 200, json: async () => json, headers: { get: () => null } });
+    return await callLLM({ provider, model, apiKey: "k", user: "hi", thinking: "off" }, fetchImpl);
+  };
+
+  const a = await run("anthropic", "claude-opus-5", { content: [{ type: "text", text: "hi" }], usage: { input_tokens: 120, output_tokens: 34 } });
+  assert.deepEqual(a.usage, { input: 120, output: 34 });
+
+  // Gemini reports thinking tokens SEPARATELY from candidates, but bills them as output —
+  // omitting them would make a thinking call look cheaper than it was.
+  const g = await run("gemini", "gemini-3.5-flash-lite", {
+    candidates: [{ content: { parts: [{ text: "hi" }] } }],
+    usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 10, thoughtsTokenCount: 40 }
+  });
+  assert.deepEqual(g.usage, { input: 90, output: 50 });
+
+  const o = await run("openai", "gpt-4o", { choices: [{ message: { content: "hi" } }], usage: { prompt_tokens: 7, completion_tokens: 3 } });
+  assert.deepEqual(o.usage, { input: 7, output: 3 });
+
+  // A response with no usage block must not throw or poison the answer.
+  const bare = await run("openai", "gpt-4o", { choices: [{ message: { content: "hi" } }] });
+  assert.equal(bare.ok, true);
+  assert.deepEqual(bare.usage, { input: 0, output: 0 });
+});
+
+test("a successful call reports WHICH key served it, and on which tier", async () => {
+  // A spend tracker can't attribute a call, or know it was free, without both.
+  const keys = [
+    { id: "free1", key: "AIza-free", tier: "free", enabled: true },
+    { id: "paid1", key: "AIza-paid", tier: "paid", enabled: true }
+  ];
+  let n = 0;
+  const fetchImpl = async () => {
+    n++;
+    if (n === 1) return { ok: false, status: 429, text: async () => "slow down", json: async () => ({}), headers: { get: () => null } };
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "hi" }] } }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 } }), headers: { get: () => null } };
+  };
+  const res = await callLLM({ provider: "gemini", model: "gemini-3.5-flash-lite", user: "hi", keys }, fetchImpl, async () => {});
+  assert.equal(res.ok, true);
+  assert.equal(res.keyId, "paid1", "the key that actually answered, not the first one tried");
+  assert.equal(res.keyTier, "paid");
+});
+
+test("cost is 0 for a free-tier call, a real number when priced, and NULL when unknown", () => {
+  const u = { input: 1_000_000, output: 1_000_000 };
+
+  // A free Gemini key genuinely costs nothing — that is the point of the tier flag, and the
+  // model id alone can't tell you, so the tier has to be passed in.
+  assert.equal(llmCostUsd("gemini-3.5-flash-lite", u, "free"), 0);
+
+  // Priced model: $5 in + $25 out per 1M.
+  assert.equal(llmCostUsd("claude-opus-5", u, "paid"), 30);
+  assert.equal(llmCostUsd("claude-haiku-4-5-20251001", { input: 2_000_000, output: 0 }, "paid"), 2);
+
+  // UNKNOWN, not zero. Reporting an unpriced model as free would silently under-report
+  // spend, which is worse than admitting the rate isn't known.
+  assert.equal(llmCostUsd("gemini-2.5-pro", u, "paid"), null);
+  assert.equal(llmCostUsd("gpt-4o", u, "paid"), null);
+
+  // A paid-tier call on a free-tier MODEL still costs money, so it must not shortcut to 0.
+  assert.equal(llmCostUsd("gemini-3.5-flash-lite", u, "paid"), null);
+});
