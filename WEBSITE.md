@@ -80,6 +80,7 @@ handoff contract).
 | `AP_SYNC_RESUME` | store the resume | IndexedDB via `saveResume({filename,mime,size,base64,savedAt})` |
 | `AP_SET_SESSION` | reporting + review-pull credential | `chrome.storage.local` ← `{ ingestUrl, ingestKey, reviewUrl }` |
 | `AP_SET_LLM` *(optional)* | mirror AI config | `chrome.storage.local` ← `llmConfig` |
+| *(no message)* — the extension POSTs | **AI usage ingest** → `POST /api/extension/usage`, Bearer `ingestKey` | batched `llm_calls` rows; the fill is the highest-volume model caller and the SW has no DB |
 | `AP_CLEAR_RESUME` | remove the stored resume (inverse of `AP_SYNC_RESUME`) | IndexedDB `deleteResume()` — idempotent |
 | `AP_DISCOVER_JOBS` | **sweep the job boards** (the `/app/run` Discover button) — reads only, writes NOTHING | returns `{ ok, jobs[], stats, notes[] }`; the WEBSITE persists them via `saveDiscovered` |
 | `AP_DISCOVER_RECON` | read-only DOM dump of the LinkedIn/Handshake search pages, for tightening the list scrapers | returns `{ ok, recon }` — queues nothing |

@@ -3454,6 +3454,90 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
 // the whole page in one click. SINGLE page (no advance) — accumulates, reset via the
 // "Clear summary" button. [CDP-PAGE] in the SW console.
 // ============================================================================
+
+// ── AI usage ingest (the /app/usage tracker) ────────────────────────────────
+// The fill is the highest-volume model caller — one application asks dozens of screening
+// questions — and the SW has no database. So each call is buffered here and POSTed in
+// BATCHES to the website, which owns the llm_calls ledger. One request per field would add
+// a network round trip to every single one.
+//
+// Auth reuses the per-user ingest key from AP_SET_SESSION, and the URL is derived from
+// ingestUrl (…/api/extension/report → …/api/extension/usage) so an older session that never
+// carried a usage URL still works.
+//
+// Fire-and-forget by design: a dropped usage row is a gap in a chart, while a fill that
+// stalls or fails because the ledger was unreachable would be a real cost. Nothing here can
+// throw into the fill.
+const LLM_USAGE_FLUSH_AT = 25;      // batch size that triggers an immediate flush
+const LLM_USAGE_DEBOUNCE_MS = 4000; // …otherwise flush shortly after the last call
+const LLM_USAGE_MAX_BUFFER = 200;   // hard cap so a long offline run can't grow without bound
+let llmUsageBuffer = [];
+let llmUsageTimer = null;
+
+function recordLlmUsage(entry) {
+  try {
+    if (!entry) return;
+    llmUsageBuffer.push(entry);
+    // Drop the OLDEST beyond the cap: recent calls are the ones the operator is looking at.
+    if (llmUsageBuffer.length > LLM_USAGE_MAX_BUFFER) llmUsageBuffer = llmUsageBuffer.slice(-LLM_USAGE_MAX_BUFFER);
+    if (llmUsageBuffer.length >= LLM_USAGE_FLUSH_AT) { flushLlmUsage(); return; }
+    if (llmUsageTimer) clearTimeout(llmUsageTimer);
+    llmUsageTimer = setTimeout(flushLlmUsage, LLM_USAGE_DEBOUNCE_MS);
+  } catch (e) { /* never let accounting touch the fill */ }
+}
+
+async function flushLlmUsage() {
+  if (llmUsageTimer) { clearTimeout(llmUsageTimer); llmUsageTimer = null; }
+  if (!llmUsageBuffer.length) return;
+  // Take the batch BEFORE awaiting, so calls arriving mid-flush aren't lost or double-sent.
+  const batch = llmUsageBuffer;
+  llmUsageBuffer = [];
+  try {
+    const apSession = await new Promise((r) => chrome.storage.local.get("apSession", (x) => r((x && x.apSession) || null)));
+    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return; // not connected — nothing to report to
+    const url = String(apSession.usageUrl || apSession.ingestUrl.replace(/\/report\/?$/, "/usage"));
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
+      body: JSON.stringify({ calls: batch })
+    });
+    if (!res || !res.ok) console.log("[ApplyPilot][USAGE] ingest rejected:", res && res.status);
+    else console.log("[ApplyPilot][USAGE] reported", batch.length, "call(s)");
+  } catch (e) {
+    console.log("[ApplyPilot][USAGE] ingest failed:", (e && e.message) || e);
+  }
+}
+
+// Build a ledger row from a callLLM result. Kept here (not in cdp.js) so the cost rule lives
+// with the other storage/I-O concerns, and so act.llm stays a one-line call.
+function llmUsageEntry(action, res) {
+  const ok = !!(res && res.ok);
+  const usage = (ok && res.usage) || { input: 0, output: 0 };
+  const model = (ok && res.model) || "";
+  return {
+    provider: (ok && res.provider) || "",
+    model,
+    action: action || "fill",
+    key_id: (ok && res.keyId) || "",
+    key_tier: (ok && res.keyTier) || null,
+    tokens_in: usage.input || 0,
+    tokens_out: usage.output || 0,
+    // null = rate unknown, NEVER 0-as-free (see migration 0013). llmCostUsd enforces that.
+    cost_usd: ok && typeof llmCostUsd === "function" ? llmCostUsd(model, usage, res.keyTier) : null,
+    ok,
+    error_code: ok ? "" : llmUsageErrorCode(res),
+    created_at: new Date().toISOString()
+  };
+}
+
+// A failed callLLM returns a human error string; the tracker wants the classified code.
+function llmUsageErrorCode(res) {
+  try {
+    if (typeof classifyLlmFailure !== "function") return "unknown";
+    return classifyLlmFailure({ status: res && res.status, body: res && res.body, networkError: res && res.networkError }).code;
+  } catch (e) { return "unknown"; }
+}
+
 // AI-0 seam: read the operator's LLM config for act.llm. act.llm enforces the opt-in
 // (enabled===false ⇒ no provider call). Only the FILL paths (full-page + walk) thread it in;
 // recon/section harnesses build a config-less act (act.llm short-circuits OFF). Returns {} if unset.
