@@ -17,6 +17,34 @@ const sumNorm = (v: unknown): string => (v == null ? "" : String(v));
 /** Edit provenance for the strict-replay SUBMIT: compare the bot's pick
  *  (original_ai_value) against the current (possibly human-edited) value.
  *  null = unedited. */
+/** A menu's PROMPT row ("Select One", "-- Please select --") is not an answer. On Workday it is
+ *  TEMPORARY: once a real option is chosen the placeholder is gone from the menu and cannot be chosen
+ *  again, so offering it in this editor would offer something the form itself no longer allows
+ *  (operator 2026-08-02). LOCKSTEP with `isPlaceholderOption` in lib.js — change both. */
+const PLACEHOLDER_OPTION_RE =
+  /^(?:[-–—_.*\s]*)(?:(?:please\s+)?(?:select|choose|pick)(?:\s+(?:an?|one|any|option|value|item))?|none\s+selected|no\s+selection|make\s+a\s+selection)(?:\s*(?:one|option|value|item))?(?:[-–—_.*\s]*)$/i;
+export function isPlaceholderOption(text: unknown): boolean {
+  const t = String(text ?? "").replace(/\u00a0/g, " ").trim();
+  if (!t) return true;
+  if (/^[-–—_.*\s]+$/.test(t)) return true;
+  return PLACEHOLDER_OPTION_RE.test(t);
+}
+/** Drop prompt rows from an option list. Never returns empty — a list that is ALL placeholder is
+ *  handed back untouched rather than leaving the reviewer with no choices at all. */
+export function withoutPlaceholderOptions(texts: string[] | null | undefined): string[] {
+  const all = Array.isArray(texts) ? texts : [];
+  const keep = all.filter((t) => !isPlaceholderOption(t));
+  return keep.length ? keep : all.slice();
+}
+/** Only a menu has a prompt row — a TEXT answer reading "select one" is a real answer. LOCKSTEP with
+ *  CHOICE_WIDGETS / isChoiceWidget in fill-driver.js. */
+const CHOICE_WIDGETS = ["dropdown", "radio", "typeahead", "source", "sourceTree", "checkbox_group", "multiselect"];
+export const isChoiceWidget = (w: unknown): boolean => CHOICE_WIDGETS.indexOf(String(w ?? "")) !== -1;
+/** The value a field EFFECTIVELY holds is empty when it is blank OR still on the menu's prompt row. */
+export const holdsNoValue = (e: { current_value?: unknown; widget_type?: unknown }): boolean =>
+  e.current_value == null ||
+  String(e.current_value).trim() === "" ||
+  (isChoiceWidget(e.widget_type) && isPlaceholderOption(e.current_value));
 export function editKindOf(e: ReviewEntry): ReviewEntry["edit_kind"] {
   // An OPERATOR-ADDED entry keeps STICKY "added_entry" provenance — a value edit must
   // NOT flip it to override/filled_blank, so the strict-replay knows the whole entry is
@@ -122,7 +150,9 @@ export function approvalEnvelope(entries: ReviewEntry[]): ApprovalEnvelope {
       e.widget_type !== "section_stub" &&
       e.widget_type !== "nested_section_stub" &&
       e.widget_type !== "removed_entry" &&
-      (e.current_value == null || String(e.current_value).trim() === "")
+      // A placeholder is BLANK: it reads like an answer in the bundle but the form counts it as
+      // unanswered — live, an AI-picked "Select One" got Waystar's page rejected as required-empty.
+      holdsNoValue(e)
   );
   const all_approved = toApprove.length === approved.length;
   return {

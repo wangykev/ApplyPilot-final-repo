@@ -8287,3 +8287,68 @@ test("education: a missing wrapper we DO have a value for is still an ERROR", as
   assert.ok(deg, "a record was emitted for the unrendered degree");
   assert.strictEqual(deg.status, "error", "an approved value with nowhere to go must still stop the run");
 });
+
+const apMatchLib = require("../lib.js");
+const { REVIEW_SCHEMA_VERSION } = require("../fill-driver.js");
+// ── the PLACEHOLDER row is never an answer (Waystar live 2026-08-02) ─────────
+// Workday's "Select One" is normally aria-disabled and the option readers drop it. Waystar's is a
+// plain ENABLED option, so it reached the AI as a legitimate choice, the AI picked it, and Workday
+// rejected the page: "The field ... is required and must have a value". A placeholder is also
+// TEMPORARY on Workday — once a real option is chosen it leaves the menu and cannot be chosen again
+// (operator 2026-08-02), so it must not be offerable anywhere.
+const phDd = (flags) => Object.assign({
+  wrapperSel: "[w-ph]", fieldName: "relocate_q", widgetType: "dropdown", isRequired: true,
+  label: "Would you be open to relocating for this role?",
+  // ENABLED placeholder — exactly Waystar's shape (contrast aiDd above, whose placeholder is disabled).
+  triggerText: "Select One",
+  options: [{ text: "Select One" }, { text: "Yes, I am open to relocating" }, { text: "No, I am not open to relocating" }]
+}, flags || {});
+
+test("AI dropdown: an ENABLED 'Select One' placeholder is never OFFERED to the AI", async () => {
+  const act = makeFakeAct([phDd()], { aiEnabled: true, ai: '{"choice":"Yes, I am open to relocating","justification":"j","confidence":"High"}' });
+  await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const prompts = act.log.filter(([m]) => m === "llm").map(([, u]) => String(u));
+  assert.ok(prompts.length, "the AI ran");
+  const optLine = prompts.find((p) => /Answer options/.test(p)) || "";
+  assert.ok(/Yes, I am open to relocating/.test(optLine), "the real options are still offered");
+  assert.ok(!/Select One/.test(optLine), "the placeholder must NOT be in the AI's option list");
+});
+
+test("AI dropdown: the AI cannot COMMIT the placeholder even if it names it", async () => {
+  // The model replies with the prompt row. It is not in the offered list, so it must not match —
+  // the field lands in review instead of committing a value the form counts as empty.
+  const act = makeFakeAct([phDd()], { aiEnabled: true, ai: '{"choice":"Select One","justification":"j","confidence":"High"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.notStrictEqual(rec.after, "Select One", "the placeholder is never committed as the answer");
+  assert.strictEqual(rec.status, "needs_review", "no valid choice → review, not a bogus fill");
+});
+
+test("submit gate: a REQUIRED choice field still holding the placeholder BLOCKS submit", async () => {
+  // A bundle written by an older build can hold one. It reads like an answer, so nothing else catches it.
+  const bundle = { schema_version: REVIEW_SCHEMA_VERSION, entries: [
+    { field_id: "p::formField-relocate", question_label: "Open to relocating?", widget_type: "dropdown",
+      is_required: true, current_value: "Select One", is_approved: true },
+  ] };
+  const blockers = bundleSubmitBlockers(bundle);
+  assert.ok(blockers.some((b) => /REQUIRED field\(s\) have no value/.test(b)),
+    "a placeholder is not a value: " + JSON.stringify(blockers));
+});
+
+test("submit gate: a TEXT field whose real answer reads like a prompt is NOT treated as blank", async () => {
+  // Scope guard: only a MENU has a prompt row. Free text must never be second-guessed.
+  const bundle = { schema_version: REVIEW_SCHEMA_VERSION, entries: [
+    { field_id: "p::formField-note", question_label: "Instructions you follow", widget_type: "text",
+      is_required: true, current_value: "Select one", is_approved: true },
+  ] };
+  assert.ok(!bundleSubmitBlockers(bundle).some((b) => /have no value/.test(b)), "a text answer is a value");
+});
+
+test("isPlaceholderOption: prompt rows yes, real options no", () => {
+  const yes = ["Select One", "select one", "-- Select --", "Please select", "Choose...", "", "---", "Select an option", "None selected"];
+  const no = ["Yes", "No", "Other", "Select all that apply to you", "Selected Reservist", "Choose Health Plan A", "I choose not to disclose"];
+  for (const t of yes) assert.ok(apMatchLib.isPlaceholderOption(t), JSON.stringify(t) + " is a placeholder");
+  for (const t of no) assert.ok(!apMatchLib.isPlaceholderOption(t), JSON.stringify(t) + " is a REAL option");
+  assert.deepStrictEqual(apMatchLib.withoutPlaceholderOptions(["Select One", "Yes", "No"]), ["Yes", "No"]);
+  assert.deepStrictEqual(apMatchLib.withoutPlaceholderOptions(["Select One"]), ["Select One"],
+    "an ALL-placeholder list is handed back untouched — never leave the caller with nothing");
+});

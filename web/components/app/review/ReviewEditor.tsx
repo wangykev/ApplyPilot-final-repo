@@ -23,6 +23,8 @@ import {
   editKindOf,
   checkedOf,
   tokenFor,
+  withoutPlaceholderOptions,
+  isPlaceholderOption,
   requiresApproval,
   approvalEnvelope,
   hasPlaceholder,
@@ -1076,19 +1078,27 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   if (wt === "section_stub" || wt === "nested_section_stub") return null;
 
   // tree-AI (cert): searchable over the chosen category's leaves (partial)
-  if (e.tree_structure && Array.isArray(e.tree_structure.leaves) && e.tree_structure.leaves.length)
-    return <Combobox value={cur} options={e.tree_structure.leaves} onCommit={onCommit} />;
+  // The menu's PROMPT row is not an answer, and on Workday it is TEMPORARY: once a real option is
+  // chosen the placeholder leaves the menu and cannot be chosen again (operator 2026-08-02). Offering
+  // it here would offer something the form no longer allows — and picking it would replay a value
+  // Workday counts as empty, which is exactly how a live Waystar page got rejected. Stripped ONCE
+  // here so every choice editor below (select / segmented / combobox) is covered by one rule.
+  const opts = withoutPlaceholderOptions(e.options);
+  const leaves = withoutPlaceholderOptions(e.tree_structure?.leaves ?? null);
+  const capOpts = withoutPlaceholderOptions(e.captured_options);
+  if (e.tree_structure && Array.isArray(e.tree_structure.leaves) && leaves.length)
+    return <Combobox value={cur} options={leaves} onCommit={onCommit} />;
   // RADIO with a small option set → segmented Yes/No-style buttons (the same look as the profile's
   // toggles), which is how the field actually renders on the form. A large radio set falls back to a select.
-  if (wt === "radio" && e.options && e.options.length && e.options.length <= 4)
-    return <RadioButtons value={cur} options={e.options} onCommit={onCommit} />;
+  if (wt === "radio" && opts.length && opts.length <= 4)
+    return <RadioButtons value={cur} options={opts} onCommit={onCommit} />;
   // CHECKBOX GROUP (2026-07-25): a pick-one set of checkboxes in ONE wrapper (the OFCCP disability
   // self-ID — "Yes, I have a disability…" / "No…" / "I do not want to answer"). Radio-like, so it gets
   // the same editors. Its options come from the page scan (read straight from the DOM), so a voluntary
   // self-ID question the bot correctly left BLANK still renders a real picker instead of a textbox.
   // Long legal option labels wrap badly as segmented buttons → always the select.
-  if ((wt === "dropdown" || wt === "radio" || wt === "checkbox_group") && e.options && e.options.length)
-    return <SelectBox value={cur} options={e.options} onCommit={onCommit} />;
+  if ((wt === "dropdown" || wt === "radio" || wt === "checkbox_group") && opts.length)
+    return <SelectBox value={cur} options={opts} onCommit={onCommit} />;
   if (wt === "radio" || wt === "checkbox_group") return <TextBox value={cur} onCommit={onCommit} />;
   if (wt === "checkbox")
     return (
@@ -1103,8 +1113,8 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
       </label>
     );
   if (wt === "typeahead") {
-    if (e.options && e.options.length) return <Combobox value={cur} options={e.options} onCommit={onCommit} />;
-    const co = e.captured_options || [];
+    if (opts.length) return <Combobox value={cur} options={opts} onCommit={onCommit} />;
+    const co = capOpts;
     // A PARTIAL list must not be a pick-one <select>: captured_options is only the page the
     // fill could read (live 2026-07-31 — 60 of a ~2000-school picker, alphabetical, so the
     // right answer is usually absent). A select there is a dead end on a REQUIRED field. Show
@@ -1131,9 +1141,13 @@ function SelectBox({
   onCommit: (v: string | null) => void;
 }) {
   const list = options.slice();
-  if (value != null && value !== "" && !list.includes(value)) list.unshift(value);
+  // An off-list CURRENT value is normally preserved as a row so an edit never silently drops it —
+  // but NOT a prompt row. A bundle can hold one (an older build let the AI pick "Select One"), and
+  // re-offering it would let the reviewer approve a non-answer. It falls through to "— choose —".
+  const phValue = isPlaceholderOption(value);
+  if (value != null && value !== "" && !phValue && !list.includes(value)) list.unshift(value);
   return (
-    <select className="ap-input" value={value ?? ""} onChange={(e) => onCommit(e.target.value || null)}>
+    <select className="ap-input" value={phValue ? "" : value ?? ""} onChange={(e) => onCommit(e.target.value || null)}>
       <option value="" className="bg-panel text-ink-faint">— choose —</option>
       {list.map((o) => (
         <option key={o} value={o} className="bg-panel text-ink">

@@ -33,7 +33,9 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
       tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
       // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
-      parseYearMonthDay: parseYearMonthDay };
+      parseYearMonthDay: parseYearMonthDay,
+      // The AI's option list must never include a menu's prompt row ("Select One").
+      isPlaceholderOption: isPlaceholderOption, withoutPlaceholderOptions: withoutPlaceholderOptions };
 
 // ── M27 flag taxonomy ───────────────────────────────────────────────────────
 // The SINGLE source of the (status, confidence, flag) triple for a choice-widget
@@ -968,7 +970,11 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
     return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-no-options" : "ai-no-options-stray",
       detail: "AI fallback: dropdown options did not render (not actuated)" + keptPrefillNote(cz), options: enabledTextsSafe(state), auditLoc: loc.wrapperSel };
   }
-  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  const allTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  // The AI is choosing an ANSWER, so the prompt row must not be on the menu (Waystar live: it picked
+  // \"Select One\" and Workday rejected the page as empty). Only the AI's list is narrowed — the record
+  // below still reports every option the form renders, so review shows the form as it is.
+  const enabledTexts = apMatch.withoutPlaceholderOptions(allTexts);
   const system = "You help an applicant fill out REQUIRED job-application screening questions. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim — e.g. work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record. These questions are REQUIRED: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble or restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give your confidence: High, Medium, or Low. ALSO map this question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\" or \"self_identification.gender\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const user = "Question: " + String(f.label || "")
     + "\nAnswer options (choose exactly one; reply with its EXACT text): " + JSON.stringify(enabledTexts)
@@ -1148,7 +1154,7 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
     return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-no-options",
       detail: "AI canonicalize: options did not render (not actuated)" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
   }
-  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  const enabledTexts = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
   const system = "The applicant has ALREADY STATED a value for this field. Your ONLY job is to pick the option from the provided list that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything about the applicant. If NO option means the same, reply UNKNOWN. Never pick an option that differs in meaning.";
   const user = "Field: " + String(f.label || "")
     + "\nThe applicant's STATED value: " + JSON.stringify(statedStr)
@@ -1199,7 +1205,7 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
     const cz = await closeAndVerifyBlank(act, loc, before, budgets);
     return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-eeo-no-options", detail: "AI EEO: options did not render" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
   }
-  const enabledTexts = state.options.filter((o) => !o.disabled).map((o) => o.text);
+  const enabledTexts = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
   const declineOpt = enabledTexts.find((o) => AI_EEO_DECLINE_RE.test(o)) || null;
   const system = "The applicant did NOT provide this demographic, and it is REQUIRED. Infer it from their profile (e.g. name) ONLY if you can make a CONFIDENT, well-supported guess; otherwise you MUST decline. Choose the matching option text if confident, or the option that declines to answer if not. Never guess at low confidence.";
   const user = "Field: " + String(f.label || "")
@@ -5814,6 +5820,11 @@ function isTransientRenderFailure(records) {
 //     milliseconds instead of after a full onboard + replay walk.
 // It can only ever ADD blockers — the live gate still re-runs it, so a pre-flight pass is never a
 // licence to submit.
+// Only a menu has a prompt row. A TEXT answer that happens to read "select one" is a real answer, so
+// the placeholder test is scoped to widgets that render options.
+const CHOICE_WIDGETS = ["dropdown", "radio", "typeahead", "source", "sourceTree", "checkbox_group", "multiselect"];
+function isChoiceWidget(w) { return CHOICE_WIDGETS.indexOf(String(w || "")) !== -1; }
+
 function bundleSubmitBlockers(bundle) {
   const blockers = [];
   const entries = bundle && Array.isArray(bundle.entries) ? bundle.entries.filter((e) => !e.is_deleted) : [];
@@ -5844,7 +5855,11 @@ function bundleSubmitBlockers(bundle) {
     e && e.is_required === true &&
     e.widget_type !== "file_upload" && e.widget_type !== "section_stub" &&
     e.widget_type !== "nested_section_stub" && e.widget_type !== "removed_entry" &&
-    (e.current_value == null || String(e.current_value).trim() === "")
+    // A placeholder counts as BLANK: the row reads like an answer in the bundle but the form treats it
+    // as unanswered, which is exactly how the Waystar page died. Covers a placeholder an older build
+    // already committed AND a human mis-picking the prompt row in the review editor's <select>.
+    (e.current_value == null || String(e.current_value).trim() === "" ||
+      (isChoiceWidget(e.widget_type) && apMatch.isPlaceholderOption(e.current_value)))
   );
   if (requiredBlank.length) {
     blockers.push(`${requiredBlank.length} REQUIRED field(s) have no value (${requiredBlank.slice(0, 3).map((e) => e.question_label || e.canonical_field || e.field_id).join(", ")}${requiredBlank.length > 3 ? ", …" : ""}) — Workday will refuse the page`);
@@ -6342,5 +6357,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { isChoiceWidget, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

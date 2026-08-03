@@ -188,6 +188,30 @@ function isFluent(value) {
 
 // Normalize an option string for matching: lowercase, strip a trailing
 // "(+digits)" suffix, collapse whitespace.
+// A dropdown PLACEHOLDER row ("Select One", "-- Please select --", "Choose...") is a prompt, not an
+// answer. Workday usually marks it aria-disabled and the option readers already drop those — but not
+// always: Waystar's is a plain enabled option, so it reached the AI as a legitimate choice and the AI
+// picked it, committing a value Workday then rejected as empty (live 2026-08-02). Recognised by TEXT,
+// which is generic across tenants and ATSs — no page-specific selector.
+//
+// Deliberately NARROW. It matches the fixed prompt vocabulary (select / choose / pick / please select)
+// and pure punctuation, and ONLY when the text carries no answer content of its own: "Select One" is a
+// placeholder, "Select all that apply to you" is a real option and must not be eaten. The failure
+// direction matters — a missed placeholder costs one flagged review row, while eating a real option
+// would silently remove a valid answer from the AI's list.
+const PLACEHOLDER_OPTION_RE = /^(?:[-–—_.*\s]*)(?:(?:please\s+)?(?:select|choose|pick)(?:\s+(?:an?|one|any|option|value|item))?|none\s+selected|no\s+selection|make\s+a\s+selection)(?:\s*(?:one|option|value|item))?(?:[-–—_.*\s]*)$/i;
+function isPlaceholderOption(text) {
+  const t = String(text == null ? "" : text).replace(/\u00a0/g, " ").trim();
+  if (!t) return true;                                   // an empty row is never an answer
+  if (/^[-–—_.*\s]+$/.test(t)) return true;               // pure punctuation separators
+  return PLACEHOLDER_OPTION_RE.test(t);
+}
+// Strip placeholders from a list of option texts. Used on the AI's CHOICE list only — the human's
+// review list keeps every row the form renders, so the editor still shows the form as it is.
+function withoutPlaceholderOptions(texts) {
+  const keep = (Array.isArray(texts) ? texts : []).filter((t) => !isPlaceholderOption(t));
+  return keep.length ? keep : (Array.isArray(texts) ? texts.slice() : []); // never hand back an EMPTY list
+}
 function normalize(s) {
   return s.toLowerCase().replace(/\s*\(\+\d+\)\s*$/, "").replace(/\s+/g, " ").trim();
 }
@@ -1486,5 +1510,7 @@ function devLogSelect(ring, opts) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  module.exports = {
+  isPlaceholderOption, withoutPlaceholderOptions,
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

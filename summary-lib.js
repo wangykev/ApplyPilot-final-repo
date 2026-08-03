@@ -73,6 +73,26 @@ const requiresApproval = (e) => !e.is_deleted && (!!e.needs_review || isCascadeR
 // Approval roll-up for the envelope + the viewer's progress UI. PURE over the entries.
 // submit_ready = every field that requires approval IS approved AND no required field still
 // holds an unreplaced AI placeholder. This is what the future SUBMIT (Plan 1) reads.
+// A menu's PROMPT row ("Select One") is not an answer, and on Workday it is TEMPORARY — once a real
+// option is chosen it leaves the menu for good. LOCKSTEP with lib.js isPlaceholderOption and
+// web/lib/review-approval.ts.
+var PLACEHOLDER_OPTION_RE = /^(?:[-–—_.*\s]*)(?:(?:please\s+)?(?:select|choose|pick)(?:\s+(?:an?|one|any|option|value|item))?|none\s+selected|no\s+selection|make\s+a\s+selection)(?:\s*(?:one|option|value|item))?(?:[-–—_.*\s]*)$/i;
+var PH_CHOICE_WIDGETS = ["dropdown", "radio", "typeahead", "source", "sourceTree", "checkbox_group", "multiselect"];
+function isPlaceholderOption(text) {
+  var t = String(text == null ? "" : text).replace(/\u00a0/g, " ").trim();
+  if (!t) return true;
+  if (/^[-–—_.*\s]+$/.test(t)) return true;
+  return PLACEHOLDER_OPTION_RE.test(t);
+}
+function withoutPlaceholderOptions(texts) {
+  var all = Array.isArray(texts) ? texts : [];
+  var keep = all.filter(function (t) { return !isPlaceholderOption(t); });
+  return keep.length ? keep : all.slice();
+}
+function holdsNoValue(e) {
+  if (!e || e.current_value == null || String(e.current_value).trim() === "") return true;
+  return PH_CHOICE_WIDGETS.indexOf(String(e.widget_type || "")) !== -1 && isPlaceholderOption(e.current_value);
+}
 function approvalEnvelope(entries) {
   const live = (entries || []).filter((e) => !e.is_deleted);
   // A preferred-name field HIDDEN by an unchecked "I have a preferred name" is off the form, so it
@@ -85,10 +105,11 @@ function approvalEnvelope(entries) {
   // refuses to approve one in the UI; this makes the ENVELOPE agree, so submit_ready can't say yes while
   // a mandatory field is empty. Carve-outs: a checkbox stores "false" (never empty), file_upload has its
   // own re-attach + halt, stub rows are display-only.
+  // A placeholder counts as BLANK — LOCKSTEP with bundleSubmitBlockers + review-approval.ts.
   const requiredBlank = live.filter((e) => e.is_required === true
     && e.widget_type !== "file_upload" && e.widget_type !== "section_stub"
     && e.widget_type !== "nested_section_stub" && e.widget_type !== "removed_entry"
-    && (e.current_value == null || String(e.current_value).trim() === ""));
+    && holdsNoValue(e));
   const all_approved = toApprove.length === approved.length;
   return {
     to_approve_count: toApprove.length,
@@ -238,5 +259,5 @@ function newEntryRecords(shape, meta) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, isBecameRequired, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, isPreferredNameField, isPreferredCheckField, ensurePreferredNameEntries, visibleEntryItems, newEntryRecords };
+  module.exports = { isPlaceholderOption, withoutPlaceholderOptions, holdsNoValue, editKindOf, checkedOf, tokenFor, effectiveValue, requiresApproval, isCascadeRevealed, isBecameRequired, approvalEnvelope, submitReady, hasPlaceholder, SUMMARY_PLACEHOLDER_MARK, isCurrentlyWorkHere, isWorkExpEndDate, isHiddenPreferredName, isPreferredNameField, isPreferredCheckField, ensurePreferredNameEntries, visibleEntryItems, newEntryRecords };
 }
