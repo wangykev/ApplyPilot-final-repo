@@ -3,8 +3,8 @@
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
-import { coerceAiConfig } from "@/lib/ai-config";
-import { callLLM } from "@/lib/llm";
+import { coerceAiConfig, totalUsableKeys } from "@/lib/ai-config";
+import { callLLMForAction } from "@/lib/llm";
 import { buildCoverLetterPrompt, type JobInput } from "@/lib/cover-letter";
 
 export type GenResult = { ok: true; text: string } | { ok: false; error: string };
@@ -29,18 +29,11 @@ export async function generateCoverLetter(job: JobInput): Promise<GenResult> {
       .eq("id", user.id)
       .maybeSingle();
     const ai = coerceAiConfig(data?.ai_config);
-    if (!ai.apiKey) return { ok: false, error: "Add an API key on the AI page first." };
+    if (!totalUsableKeys(ai)) return { ok: false, error: "Add an API key on the AI page first." };
 
     const profile = coerceProfile(data?.profile_json);
     const { system, user: prompt } = buildCoverLetterPrompt(profile, job);
-    const res = await callLLM({
-      provider: ai.provider,
-      model: ai.model,
-      apiKey: ai.apiKey,
-      system,
-      user: prompt,
-      maxTokens: 900,
-    });
+    const res = await callLLMForAction(ai, "cover_letter", { system, user: prompt, maxTokens: 900 });
     if (!res.ok) return { ok: false, error: "AI request failed: " + res.error };
     return { ok: true, text: res.text };
   } catch (err) {

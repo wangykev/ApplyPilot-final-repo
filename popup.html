@@ -125,27 +125,19 @@
          reviewSummary bundle. Disagreements flag fill bugs. NEVER submits. [REVIEW-CHECK]. -->
     <button id="cdp-review-check">CDP: review-page CHECK (diff vs summary, read-only)</button>
     <hr>
-    <!-- AI config (AI-0): the multi-provider LLM adapter. Provider + model + API key are
-         stored in chrome.storage.local.llmConfig; "AI fill ON" is the opt-in toggle (OFF =
-         the fill never calls the LLM = no API spend). "Test connection" round-trips a trivial
-         prompt to prove the call path. [LLM-TEST] in the SW console. Key stays local to the
-         extension on this machine. -->
-    <label><input id="llm-enabled" type="checkbox"> AI fill ON (opt-in — uses your API key)</label>
+    <!-- AI config (AI-0) — READ-ONLY HERE. The website's AI page owns chrome.storage.local
+         .llmConfig and pushes it via AP_SET_LLM: it holds the key LIST per provider, the
+         per-action model routes and their fallback chains. This panel used to be a second
+         editor, and its Save wrote the flat {provider,model,apiKey,enabled} shape over the
+         whole object — silently destroying the key list and routes. One owner instead of
+         two, so that can't happen. "Test" round-trips the STORED config ([LLM-TEST] in the
+         SW console) without writing anything. -->
+    <div id="llm-summary">AI: reading config…</div>
+    <button id="llm-open-site">Edit on the website → AI page</button>
+    <button id="llm-test">Test the stored AI config</button>
     <!-- DEBUG: log every CDP keystroke/click ([ApplyPilot][INPUT]) in the SW console. Saved on toggle;
          cdp.js reads it at each run start. Off by default (keeps production fills quiet). -->
     <label><input id="debug-input-trace" type="checkbox"> Debug: log every keystroke/click (SW console)</label>
-    <label for="llm-provider">AI provider:</label>
-    <select id="llm-provider">
-      <option value="gemini">Gemini (Google)</option>
-      <option value="anthropic">Anthropic (Claude)</option>
-      <option value="openai">OpenAI</option>
-    </select>
-    <label for="llm-model">Model:</label>
-    <select id="llm-model"></select>
-    <label for="llm-key">API key (stored locally):</label>
-    <input id="llm-key" type="password" placeholder="paste your provider API key">
-    <button id="llm-save">Save AI config</button>
-    <button id="llm-test">Test connection</button>
     <hr>
     <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
     <label for="company">Company for this application (temporary):</label>
@@ -153,6 +145,7 @@
     <button id="set-company">Set company</button>
     <div id="status"></div>
     <script src="db.js"></script>
+    <script src="llm-keys.js"></script>
     <script src="llm.js"></script>
     <script src="popup.js"></script>
   </body>

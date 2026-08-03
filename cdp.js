@@ -3471,6 +3471,13 @@ async function cdpReadAuditRaw(specs) {
 // attachment (cdpTabId) is the target; callers attach/detach around a run.
 // `llmConfig` (AI-0 seam): the operator's {provider,model,apiKey,enabled} from storage,
 // captured for act.llm. Omitted by recon/section harnesses (act.llm then short-circuits OFF).
+// Per-key cooldown map for act.llm's rotation, in memory for the service worker's
+// lifetime. Deliberately NOT persisted: llmConfig is config the website owns, so a
+// cooldown written into storage would be wiped by the next sync (see llm-keys.js).
+// Module scope, not per-actuation, so a key parked while filling field 3 stays parked for
+// fields 4..60 rather than being re-probed on every one.
+let cdpLlmKeyState = null;
+
 function makeCdpActuation(llmConfig) {
   return {
     // AI-1: the brain gates the AI-fallback on this BEFORE opening a field (so a disabled
@@ -3949,9 +3956,41 @@ function makeCdpActuation(llmConfig) {
     // config) ⇒ no provider call, no spend. NEVER throws — returns the normalized
     // {ok,text}|{ok:false,error}; the brain flags the field for review on !ok. The brain stays
     // Node-testable: tests pass a FAKE act.llm with canned replies (the real one isn't loaded).
-    llm: async ({ system, user, maxTokens }) => {
+    // `action` picks the operator's per-action model (default "fill"); the route resolver
+    // walks that action's model, its fallback chain, then the configured default — and for
+    // each of those, callLLM rotates through every key the operator holds for that
+    // provider. A v1 config still resolves to exactly one attempt with one key, so this
+    // path is byte-identical for anyone who hasn't added a second key.
+    llm: async ({ system, user, maxTokens, action }) => {
       if (!llmConfig || !llmConfig.enabled) return { ok: false, error: "AI fill OFF (enable it in the popup)" };
-      return await callLLM({ provider: llmConfig.provider, model: llmConfig.model, apiKey: llmConfig.apiKey, system, user, maxTokens });
+      const attempts = typeof resolveLlmRoute === "function"
+        ? resolveLlmRoute(llmConfig, action || "fill", LLM_DEFAULT_MODELS)
+        : [{ provider: llmConfig.provider, model: llmConfig.model }];
+      if (!attempts.length) return { ok: false, error: "no AI model configured (set one on the website's AI page)" };
+
+      let last = null;
+      for (const attempt of attempts) {
+        const keys = typeof llmKeysFor === "function" ? llmKeysFor(llmConfig, attempt.provider) : [];
+        const res = await callLLM({
+          provider: attempt.provider,
+          model: attempt.model,
+          thinking: attempt.thinking,
+          effort: attempt.effort,
+          // llmKeysFor already folds a v1 flat apiKey into a one-key list, so passing
+          // apiKey as well would just duplicate it.
+          keys,
+          apiKey: keys.length ? "" : llmConfig.apiKey,
+          preferFreeFirst: llmConfig.preferFreeFirst !== false,
+          // Cooldowns live for the service worker's lifetime, so a key parked on one
+          // field is skipped for the rest of the form instead of being re-probed 60 times.
+          keyState: cdpLlmKeyState,
+          onKeyState: (s) => { cdpLlmKeyState = s; },
+          system, user, maxTokens
+        });
+        if (res.ok) return res;
+        last = res;
+      }
+      return last || { ok: false, error: "no AI attempt made" };
     }
   };
 }

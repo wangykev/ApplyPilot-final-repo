@@ -3,8 +3,8 @@
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
-import { aiConfigSchema } from "@/lib/ai-config";
-import { callLLM } from "@/lib/llm";
+import { aiConfigSchema, totalUsableKeys } from "@/lib/ai-config";
+import { callLLMForAction } from "@/lib/llm";
 
 export type SaveResult = { ok: true } | { ok: false; error: string };
 export type FieldRecommendation = { maps_to: string; suggested_category: string };
@@ -142,7 +142,7 @@ export async function recommendField(input: { question: string; answer: string }
     if (!user) return none;
     const { data } = await supabase.from("profiles").select("ai_config, profile_json").eq("id", user.id).maybeSingle();
     const cfg = aiConfigSchema.safeParse(data?.ai_config);
-    if (!cfg.success || !cfg.data.apiKey) return none;
+    if (!cfg.success || !totalUsableKeys(cfg.data)) return none;
     const system =
       "You map a job-application question to an applicant's stored profile. Given the profile (JSON), one question, and the answer the applicant gave, identify which profile field this question corresponds to as a dotted path (using the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\" or \"self_identification.gender\"), or \"none\" if no existing field fits.";
     const userPrompt =
@@ -150,14 +150,7 @@ export async function recommendField(input: { question: string; answer: string }
       "\nApplicant's answer: " + input.answer +
       "\nProfile: " + JSON.stringify(data?.profile_json ?? {}) +
       "\n\nReply ONLY with a JSON object and nothing else:\n{\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other>\"}";
-    const res = await callLLM({
-      provider: cfg.data.provider,
-      model: cfg.data.model,
-      apiKey: cfg.data.apiKey,
-      system,
-      user: userPrompt,
-      maxTokens: 200,
-    });
+    const res = await callLLMForAction(cfg.data, "teach", { system, user: userPrompt, maxTokens: 200 });
     return res.ok ? parseRecommendation(res.text) : none;
   } catch {
     return none;
