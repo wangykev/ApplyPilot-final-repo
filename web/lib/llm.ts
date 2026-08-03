@@ -166,8 +166,59 @@ function msg(e: unknown): string {
 // The ONLY place model ids live (matches llm.js). First entry = provider default.
 export const LLM_MODELS: Record<LlmProvider, string[]> = {
   anthropic: ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
-  gemini: ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  gemini: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"],
+};
+
+/**
+ * Free tier — GEMINI ONLY (lockstep with llm.js). Gemini is the only one of the three
+ * with a usable free tier, which is why it is the only provider offering a free/paid key
+ * toggle; Anthropic and OpenAI keys are always metered, so offering the choice there
+ * would be a lie.
+ *
+ * Membership is not cosmetic: a model absent here cannot be reached with a free key at
+ * all (gemini-2.5-pro is paid-only), so the settings UI must not offer it while the key
+ * is free — picking it would fail every request with a quota error. Limits are PER
+ * MODEL, which is exactly why a fallback chain wants a second MODEL and not just a
+ * second key: requests-per-day is counted per model, so when 3.1-flash-lite's 500 RPD is
+ * spent the same key still has 2.5-flash-lite's own allowance.
+ * Operator-supplied from the AI Studio limits dashboard, 2026-08-03.
+ */
+export type GeminiFreeLimits = { rpm: number; tpm: number; rpd: number };
+export const GEMINI_FREE_TIER: Record<string, GeminiFreeLimits> = {
+  "gemini-3.1-flash-lite": { rpm: 15, tpm: 250_000, rpd: 500 },
+  "gemini-3.5-flash-lite": { rpm: 15, tpm: 250_000, rpd: 500 },
+  "gemini-2.5-flash-lite": { rpm: 10, tpm: 250_000, rpd: 20 },
+  "gemini-3.5-flash": { rpm: 5, tpm: 250_000, rpd: 20 },
+  "gemini-3.6-flash": { rpm: 5, tpm: 250_000, rpd: 20 },
+  "gemini-2.5-flash": { rpm: 5, tpm: 250_000, rpd: 20 },
+};
+
+export function geminiFreeTierModels(): string[] {
+  return Object.keys(GEMINI_FREE_TIER);
+}
+
+export function isFreeTierModel(provider: string, model: string): boolean {
+  return provider === "gemini" && !!GEMINI_FREE_TIER[model];
+}
+
+/**
+ * Paid rates, USD per 1M tokens — shown next to each model so the cost of a choice is
+ * visible before it is made. Deliberately incomplete: only rates verified against the
+ * provider's own pricing page are listed, and an unlisted model renders as a "see
+ * pricing" link rather than a guessed number. A wrong number on a cost display is worse
+ * than no number.
+ */
+export const LLM_PRICING: Record<string, { in: number; out: number }> = {
+  "claude-opus-4-8": { in: 5, out: 25 },
+  "claude-sonnet-4-6": { in: 3, out: 15 },
+  "claude-haiku-4-5-20251001": { in: 1, out: 5 },
+};
+
+export const LLM_PRICING_URLS: Record<LlmProvider, string> = {
+  anthropic: "https://platform.claude.com/docs/en/pricing",
+  gemini: "https://ai.google.dev/gemini-api/docs/pricing",
+  openai: "https://openai.com/api/pricing",
 };
 
 export const LLM_DEFAULT_MODELS: Record<LlmProvider, string> = {

@@ -201,15 +201,57 @@ async function callLLM(req, fetchImpl, sleepImpl) {
 // free RPD) is the high-volume alternative; 3.5-flash = quality.
 const LLM_MODELS = {
   anthropic: ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
-  gemini: ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  gemini: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"]
 };
 // Default = the first listed model per provider (single source of truth — can't drift from the list).
 const LLM_DEFAULT_MODELS = { anthropic: LLM_MODELS.anthropic[0], gemini: LLM_MODELS.gemini[0], openai: LLM_MODELS.openai[0] };
 
+// ─── Free tier — GEMINI ONLY ────────────────────────────────────────────────
+// Gemini is the only provider of the three that serves a usable free tier, which is why
+// it is the only one with a free/paid key toggle. Anthropic and OpenAI keys are always
+// metered, so offering the choice there would be a lie.
+//
+// Membership is NOT cosmetic: a model absent from this table cannot be reached with a
+// free key at all (gemini-2.5-pro is paid-only), so the settings UI must not offer it
+// while the key is free — picking it would fail every request with a quota error.
+//
+// Limits are PER MODEL, and that is the whole reason a fallback chain wants a second
+// MODEL and not just a second key: requests-per-day is counted per model, so when
+// 3.1-flash-lite's 500 RPD is gone, the same key still has 2.5-flash-lite's allowance.
+// rpm = requests/min, tpm = tokens/min, rpd = requests/day.
+// Operator-supplied from the AI Studio limits dashboard, 2026-08-03.
+const GEMINI_FREE_TIER = {
+  "gemini-3.1-flash-lite": { rpm: 15, tpm: 250000, rpd: 500 },
+  "gemini-3.5-flash-lite": { rpm: 15, tpm: 250000, rpd: 500 },
+  "gemini-2.5-flash-lite": { rpm: 10, tpm: 250000, rpd: 20 },
+  "gemini-3.5-flash": { rpm: 5, tpm: 250000, rpd: 20 },
+  "gemini-3.6-flash": { rpm: 5, tpm: 250000, rpd: 20 },
+  "gemini-2.5-flash": { rpm: 5, tpm: 250000, rpd: 20 }
+};
+function geminiFreeTierModels() { return Object.keys(GEMINI_FREE_TIER); }
+function isFreeTierModel(provider, model) { return provider === "gemini" && !!GEMINI_FREE_TIER[model]; }
+
+// ─── Paid rates — USD per 1M tokens ─────────────────────────────────────────
+// Shown next to each model so the cost of a choice is visible BEFORE it is made.
+// Deliberately incomplete: only rates verified against the provider's own pricing page
+// are listed. An unlisted model renders as "see pricing" with a link rather than a
+// guessed number — a wrong price on a cost display is worse than no price.
+const LLM_PRICING = {
+  "claude-opus-4-8": { in: 5, out: 25 },
+  "claude-sonnet-4-6": { in: 3, out: 15 },
+  "claude-haiku-4-5-20251001": { in: 1, out: 5 }
+};
+const LLM_PRICING_URLS = {
+  anthropic: "https://platform.claude.com/docs/en/pricing",
+  gemini: "https://ai.google.dev/gemini-api/docs/pricing",
+  openai: "https://openai.com/api/pricing"
+};
+
 // UMD-lite: export for the Node test runner; in the popup/SW `module` is undefined so
 // the functions stay globals (from <script> / importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS };
+    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
+    GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS };
 }
