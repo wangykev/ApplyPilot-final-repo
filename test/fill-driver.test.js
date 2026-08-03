@@ -8512,3 +8512,27 @@ test("checkbox group: the AI's pick must clear the match ladder, and a bare chec
   // a bare CHECKBOX is an ASSERTION, not a choice — still excluded
   assert.strictEqual(aiEligible({ widgetType: "checkbox", isRequired: true }), false);
 });
+
+// ── a requisition id is not always R<digits> (PSECU/Copart live 2026-08-03) ──
+// canonicalJobUrl only matched _R<digits>, so "HR-Intern_JR100897" fell through to origin+pathname —
+// and that is NOT stable, because Workday redirects the posting URL you paste to its own spelling
+// ("Harrisburg-PA" -> "Harrisburg%2C-PA"). One job made TWO tracker rows, and the submit run REFUSED
+// its own approved bundle: the fill stored the key under the redirected path, the submit computed it
+// from the pasted one.
+test("canonicalJobUrl: a JR-style requisition keys stably across Workday's own redirect", () => {
+  const k = "wd12:jr100897";
+  for (const u of [
+    "https://psecu.wd12.myworkdayjobs.com/en-US/PSECU/job/Harrisburg-PA/HR-Intern_JR100897",
+    "https://psecu.wd12.myworkdayjobs.com/en-US/PSECU/job/Harrisburg%2C-PA/HR-Intern_JR100897/apply",
+    "https://psecu.wd12.myworkdayjobs.com/en-US/PSECU/job/Harrisburg%2C-PA/HR-Intern_JR100897/apply/applyManually",
+  ]) assert.strictEqual(canonicalJobUrl(u), k, u);
+  assert.strictEqual(canonicalJobUrl("https://copart.wd12.myworkdayjobs.com/en-US/copart/job/Dallas-TX---Headquarters/Software-Engineering-Intern_JR109393"), "wd12:jr109393");
+});
+
+test("canonicalJobUrl: existing key shapes are byte-identical", () => {
+  // the _R tier still matches FIRST, so nothing already stored changes meaning
+  assert.strictEqual(canonicalJobUrl("https://wd3.myworkdaysite.com/en-US/recruiting/magna/Magna/job/Brampton%2C-Ontario%2C-CA/Design-Project-Coordinator_R00254745/apply/applyManually"), "wd3:r00254745");
+  assert.strictEqual(canonicalJobUrl("https://waystar.wd1.myworkdayjobs.com/en-US/Waystar/job/Atlanta-GA/Application-Engineer-Co-Op_R3313-1"), "wd1:r3313");
+  assert.strictEqual(canonicalJobUrl("https://job-boards.greenhouse.io/embed/job_app?for=acme&token=12345"), "https://job-boards.greenhouse.io/embed/job_app?token=12345");
+  assert.strictEqual(canonicalJobUrl("https://jobs.lever.co/acme/abc-123/apply"), "https://jobs.lever.co/acme/abc-123");
+});

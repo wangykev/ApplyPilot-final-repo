@@ -13,6 +13,16 @@ export function canonicalJobUrl(u: string): string {
     const req = (p.pathname.match(/_R(\d+)\b/i) || [])[1];
     const dc = (p.hostname.match(/\bwd\d+\b/i) || [""])[0].toLowerCase(); // "wd3" — on both hosts
     if (req) return (dc || "wd") + ":r" + req;
+    // Requisition ids are not all "R<digits>" (2026-08-03). Copart and PSECU use JR109393 / JR100897,
+    // and those fell through to the origin+pathname fallback — which is NOT stable, because Workday
+    // redirects the posting URL you paste to its own canonical spelling ("Harrisburg-PA" ->
+    // "Harrisburg%2C-PA"). Live that produced TWO tracker rows for one job, and a submit run that
+    // refused its own approved bundle: the fill stored the key under the redirected path, the submit
+    // computed it from the pasted one. Any letters+digits requisition token now keys the same way.
+    // The _R tier above is untouched and still matches FIRST, so every existing wdN:r<digits> key is
+    // byte-identical — only URLs that had no key at all get one.
+    const alt = (p.pathname.match(/_([A-Za-z]{1,4}\d[\w-]*?)(?=\/|$)/g) || []).pop();
+    if (alt) return (dc || "wd") + ":" + alt.slice(1).toLowerCase();
     // ⚠ An EMBED url carries its job identity ONLY in the query string: every employer's
     // Greenhouse embed is `job-boards.greenhouse.io/embed/job_app?for=<board>&token=<id>`, so
     // origin+pathname collapses ALL of them to one key (live 2026-08-02: a submit run pulled a
