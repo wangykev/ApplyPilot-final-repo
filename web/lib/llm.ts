@@ -40,10 +40,31 @@ export const ANTHROPIC_THINKING_ADJUSTABLE: Record<string, boolean> = {
  * max_tokens caps thinking PLUS the answer, so a thinking request needs a real budget —
  * otherwise reasoning eats this adapter's small allowances and the reply comes back empty.
  */
+export const ANTHROPIC_EFFORT_LEVELS: Record<string, string[]> = {
+  "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-8": ["low", "medium", "high", "xhigh", "max"],
+  // xhigh arrived with Opus 4.7, so 4.6 tops out at high/max. Haiku 4.5 predates effort
+  // entirely and is absent — "manual" degrades to plain adaptive there.
+  "claude-sonnet-4-6": ["low", "medium", "high", "max"],
+};
+
 export const ANTHROPIC_THINKING_MIN_TOKENS = 4096;
+/** Truncation guard, not a target — scaled by effort. */
+const ANTHROPIC_EFFORT_MIN_TOKENS: Record<string, number> = {
+  low: 4096, medium: 4096, high: 8192, xhigh: 16384, max: 32768,
+};
+
+export function anthropicEffortFor(model: string, thinking?: LlmThinking, effort?: string): string | undefined {
+  if (thinking !== "manual") return undefined;
+  const allowed = ANTHROPIC_EFFORT_LEVELS[model];
+  return allowed && effort && allowed.includes(effort) ? effort : undefined;
+}
 
 export function anthropicThinkingFor(model: string, want?: LlmThinking): { type: "adaptive" | "disabled" } | undefined {
-  if (want === "adaptive" && ANTHROPIC_THINKING_ADJUSTABLE[model]) return { type: "adaptive" };
+  // "manual" is adaptive PLUS a pinned effort: the model still decides WHEN, the operator
+  // caps HOW MUCH. A fixed budget_tokens would 400 on Claude 5.
+  if ((want === "adaptive" || want === "manual") && ANTHROPIC_THINKING_ADJUSTABLE[model]) return { type: "adaptive" };
   if (ANTHROPIC_THINKING_DEFAULT_ON[model]) return { type: "disabled" };
   return undefined;
 }
@@ -59,8 +80,9 @@ export type LlmRequest = {
    * Rotation (lockstep with llm.js): when a key LIST is supplied, each key is tried in
    * turn until one answers. Omit it and this is the original single-key path.
    */
-  /** "adaptive" turns Claude thinking on where the model supports it. */
+  /** "adaptive" turns Claude thinking on; "manual" also pins `effort`. */
   thinking?: LlmThinking;
+  effort?: string;
   keys?: LlmKey[];
   preferFreeFirst?: boolean;
   keyState?: LlmKeyState;
@@ -78,7 +100,7 @@ const PROVIDERS: Record<
   { build: (req: LlmRequest) => Built; parse: (data: unknown) => string | null }
 > = {
   anthropic: {
-    build: ({ model, apiKey, system, user, maxTokens, thinking }) => ({
+    build: ({ model, apiKey, system, user, maxTokens, thinking, effort }) => ({
       url: "https://api.anthropic.com/v1/messages",
       opts: {
         method: "POST",
@@ -92,11 +114,19 @@ const PROVIDERS: Record<
           model,
           max_tokens:
             anthropicThinkingFor(model, thinking)?.type === "adaptive"
-              ? Math.max(maxTokens || 1024, ANTHROPIC_THINKING_MIN_TOKENS)
+              ? Math.max(
+                  maxTokens || 1024,
+                  ANTHROPIC_EFFORT_MIN_TOKENS[anthropicEffortFor(model, thinking, effort) ?? ""] ??
+                    ANTHROPIC_THINKING_MIN_TOKENS
+                )
               : maxTokens || 1024,
           // Claude 5 thinks by default so it must be turned OFF for short answers; 4.6/4.8
           // stay off unless the operator asks. Lockstep with llm.js.
           thinking: anthropicThinkingFor(model, thinking),
+          // effort lives in output_config, not top-level, and only on "manual".
+          output_config: anthropicEffortFor(model, thinking, effort)
+            ? { effort: anthropicEffortFor(model, thinking, effort) }
+            : undefined,
           system: system || undefined,
           messages: [{ role: "user", content: user }],
         }),
@@ -312,6 +342,7 @@ export async function callLLMForAction(
         provider: attempt.provider,
         model: attempt.model,
         thinking: attempt.thinking,
+        effort: attempt.effort,
         apiKey: "",
         keys,
         preferFreeFirst: cfg.preferFreeFirst !== false,

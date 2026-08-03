@@ -226,17 +226,18 @@ function resolveLlmRoute(config, action, defaultModels) {
 
   // `thinking` rides along per attempt ("off" | "adaptive"): the right answer differs by
   // JOB on the same model — prose wants deliberation, a yes/no does not.
-  const push = (provider, model, thinking, source) => {
+  const push = (provider, model, thinking, effort, source) => {
     if (!provider) return;
     const resolved = model || models[provider] || "";
-    const think = thinking === "adaptive" ? "adaptive" : "off";
-    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think)) return;
-    out.push({ provider, model: resolved, thinking: think, source });
+    const think = thinking === "adaptive" || thinking === "manual" ? thinking : "off";
+    const eff = think === "manual" && typeof effort === "string" ? effort : "";
+    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think && a.effort === eff)) return;
+    out.push({ provider, model: resolved, thinking: think, effort: eff, source });
   };
 
   const pushChain = (chain, source) => {
     (Array.isArray(chain) ? chain : []).forEach((f) => {
-      if (f && typeof f === "object") push(f.provider, f.model, f.thinking, source);
+      if (f && typeof f === "object") push(f.provider, f.model, f.thinking, f.effort, source);
     });
   };
 
@@ -246,11 +247,11 @@ function resolveLlmRoute(config, action, defaultModels) {
   const act = action && LLM_ACTION_ALIASES[action] ? LLM_ACTION_ALIASES[action] : action;
   const route = act && routes[act] && typeof routes[act] === "object" ? routes[act] : null;
   if (route && route.provider) {
-    push(route.provider, route.model, route.thinking, "action");
+    push(route.provider, route.model, route.thinking, route.effort, "action");
     pushChain(route.fallbacks, "action-fallback");
   }
 
-  push(cfg.provider, cfg.model, cfg.thinking, "default");
+  push(cfg.provider, cfg.model, cfg.thinking, cfg.effort, "default");
   pushChain(cfg.fallbacks, "default-fallback");
   return out;
 }

@@ -6,7 +6,7 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { SelectField, FieldLabel } from "@/components/form/fields";
 import {
   LLM_MODELS, LLM_DEFAULT_MODELS, LLM_PROVIDER_LABELS, GEMINI_FREE_TIER, LLM_PRICING, LLM_PRICING_URLS,
-  LLM_MODEL_META, ANTHROPIC_THINKING_ADJUSTABLE, type LlmProvider,
+  LLM_MODEL_META, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_EFFORT_LEVELS, type LlmProvider,
 } from "@/lib/llm";
 import { LLM_ACTIONS, type LlmAction } from "@/lib/llm-keys";
 import { PROVIDERS, keysForProvider, totalUsableKeys, type AiConfig, type LlmKeyEntry } from "@/lib/ai-config";
@@ -29,6 +29,19 @@ const ACTION_COPY: Record<LlmAction, { label: string; desc: string }> = {
     desc: "Reading an uploaded PDF into profile fields. Runs once per resume, so quality matters more than cost here.",
   },
   cover_letter: { label: "Cover letter", desc: "Drafting a letter from your profile and the job description." },
+};
+
+/**
+ * Effort levels, in the operator's terms. "manual" pins one of these instead of letting
+ * the model choose; there is no fixed token budget to set, because that parameter was
+ * removed on Claude 5 (it returns a 400).
+ */
+const EFFORT_COPY: Record<string, string> = {
+  low: "Low — barely thinks",
+  medium: "Medium",
+  high: "High — the API default",
+  xhigh: "Very high",
+  max: "Max — slowest, priciest",
 };
 
 const money = (n: number) => (Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`);
@@ -160,7 +173,13 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
         subtitle="Used by every action that does not override it below. A fallback is tried once every key for the provider above it is spent."
       >
         <RouteEditor
-          target={{ provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, fallbacks: cfg.fallbacks }}
+          target={{
+            provider: cfg.provider,
+            model: cfg.model,
+            thinking: cfg.thinking,
+            effort: cfg.effort,
+            fallbacks: cfg.fallbacks,
+          }}
           modelOptions={modelOptions}
           onChange={(next) =>
             edit((c) => ({
@@ -168,6 +187,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
               provider: next.provider,
               model: next.model,
               thinking: next.thinking ?? "off",
+              effort: next.effort ?? "",
               fallbacks: next.fallbacks,
             }))
           }
@@ -473,7 +493,8 @@ function KeyRow({
 
 // thinking is REQUIRED here: the schema always supplies it, so making it optional just
 // pushed undefined into every consumer.
-type RouteTarget = { provider: LlmProvider; model: string; thinking: "off" | "adaptive" };
+type ThinkingMode = "off" | "adaptive" | "manual";
+type RouteTarget = { provider: LlmProvider; model: string; thinking: ThinkingMode; effort: string };
 type RouteValue = RouteTarget & { fallbacks: RouteTarget[] };
 
 function RouteEditor({
@@ -487,8 +508,14 @@ function RouteEditor({
 }) {
   const providerOptions = PROVIDERS.map((p) => ({ value: p, label: LLM_PROVIDER_LABELS[p] }));
 
-  const setPair = (i: number | null, provider: LlmProvider, model: string, thinking?: "off" | "adaptive") => {
-    const next: RouteTarget = { provider, model, thinking: thinking ?? "off" };
+  const setPair = (i: number | null, provider: LlmProvider, model: string, thinking?: ThinkingMode, effort?: string) => {
+    const mode: ThinkingMode = thinking ?? "off";
+    // Effort only means anything on "manual", and must be one this model accepts — the
+    // levels differ (xhigh arrived with Opus 4.7). Fall back to the model's middle option
+    // rather than sending something it would reject.
+    const levels = ANTHROPIC_EFFORT_LEVELS[model] ?? [];
+    const eff = mode === "manual" ? (levels.includes(effort ?? "") ? (effort as string) : levels[2] ?? levels[0] ?? "") : "";
+    const next: RouteTarget = { provider, model, thinking: mode, effort: eff };
     if (i === null) return onChange({ ...target, ...next });
     onChange({ ...target, fallbacks: target.fallbacks.map((f, j) => (j === i ? next : f)) });
   };
@@ -501,13 +528,13 @@ function RouteEditor({
       const p = v as LlmProvider;
       const list = modelOptions(p);
       const keep = list.some((o) => o.value === pair.model) ? pair.model : list[0]?.value || LLM_DEFAULT_MODELS[p];
-      setPair(i, p, keep, pair.thinking);
+      setPair(i, p, keep, pair.thinking, pair.effort);
     };
     // Only Claude 4.6-and-newer accept an adaptive/off choice, so anything else would be a
     // knob that silently does nothing — it isn't shown.
     const canThink = !!ANTHROPIC_THINKING_ADJUSTABLE[pair.model];
     return (
-      <div key={i ?? "primary"} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[10rem_1fr_auto_2.5rem]">
+      <div key={i ?? "primary"} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto_auto_2.5rem]">
         <SelectField
           label={i === null ? "Provider" : `Fallback ${i + 1}`}
           value={pair.provider}
@@ -518,20 +545,32 @@ function RouteEditor({
           label="Model"
           value={pair.model}
           options={opts}
-          onChange={(v) => setPair(i, pair.provider, v, pair.thinking)}
+          onChange={(v) => setPair(i, pair.provider, v, pair.thinking, pair.effort)}
         />
         {canThink ? (
           <SelectField
             label="Thinking"
             value={pair.thinking ?? "off"}
             options={[
-              { value: "off", label: "Off — faster, cheaper" },
-              { value: "adaptive", label: "Adaptive — better on hard answers" },
+              { value: "off", label: "Off — fastest, cheapest" },
+              { value: "adaptive", label: "Adaptive — the model decides" },
+              { value: "manual", label: "Manual — you set the depth" },
             ]}
-            onChange={(v) => setPair(i, pair.provider, pair.model, v as "off" | "adaptive")}
+            onChange={(v) => setPair(i, pair.provider, pair.model, v as ThinkingMode, pair.effort)}
           />
         ) : (
           <span />
+        )}
+        {canThink && pair.thinking === "manual" && (
+          <SelectField
+            label="Depth"
+            value={pair.effort || ""}
+            options={(ANTHROPIC_EFFORT_LEVELS[pair.model] ?? []).map((lvl) => ({
+              value: lvl,
+              label: EFFORT_COPY[lvl] ?? lvl,
+            }))}
+            onChange={(v) => setPair(i, pair.provider, pair.model, "manual", v)}
+          />
         )}
         {i === null ? (
           <span />
@@ -551,7 +590,7 @@ function RouteEditor({
 
   return (
     <div className="space-y-3">
-      {row({ provider: target.provider, model: target.model, thinking: target.thinking }, null)}
+      {row({ provider: target.provider, model: target.model, thinking: target.thinking, effort: target.effort }, null)}
       {target.fallbacks.map((f, i) => row(f, i))}
       {target.fallbacks.length < 4 && (
         <button
@@ -561,7 +600,12 @@ function RouteEditor({
               ...target,
               fallbacks: [
                 ...target.fallbacks,
-                { provider: target.provider, model: modelOptions(target.provider)[1]?.value || target.model, thinking: "off" },
+                {
+                  provider: target.provider,
+                  model: modelOptions(target.provider)[1]?.value || target.model,
+                  thinking: "off",
+                  effort: "",
+                },
               ],
             })
           }
@@ -572,7 +616,9 @@ function RouteEditor({
         </button>
       )}
       <p className="text-xs leading-relaxed text-ink-dim">
-        Thinking is per row, so the same model can deliberate for an essay and answer instantly for a yes/no.
+        Thinking is per row, so the same model can deliberate for an essay and answer instantly for a yes/no —
+        <span className="text-ink"> Adaptive</span> lets the model judge how much is needed,
+        <span className="text-ink"> Manual</span> pins the depth yourself.
         A fallback can be another <span className="text-ink">model</span> or another <span className="text-ink">provider</span>{" "}
         entirely. Both matter on Gemini&apos;s free tier, where requests-per-day is counted per model — when one
         model&apos;s daily allowance is gone, the same key still has the next one&apos;s.
@@ -615,7 +661,7 @@ function ActionRoute({
               setRoute(
                 e.target.checked
                   ? null
-                  : { provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, fallbacks: [] }
+                  : { provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, effort: cfg.effort, fallbacks: [] }
               )
             }
           />

@@ -441,3 +441,60 @@ test("the Anthropic list leads with a current-generation model", () => {
   assert.equal(LLM_MODELS.anthropic[0], "claude-sonnet-5");
   assert.ok(LLM_MODELS.anthropic.includes("claude-opus-5"));
 });
+
+// ─── Thinking: off / adaptive / manual ──────────────────────────────────────
+
+test("thinking modes send the right Anthropic parameters", async () => {
+  const bodyFor = async (model, thinking, effort) => {
+    let sent = null;
+    const fetchImpl = async (_u, opts) => {
+      sent = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "OK" }] }), headers: { get: () => null } };
+    };
+    const r = await callLLM({ provider: "anthropic", model, apiKey: "sk-ant-x", user: "hi", maxTokens: 24, thinking, effort }, fetchImpl);
+    assert.equal(r.ok, true);
+    return sent;
+  };
+
+  // OFF on a Claude 5 model must explicitly disable (it thinks by default) and must NOT
+  // pin an effort — on Opus 5 a disabled block is only accepted at effort <= high.
+  const off = await bodyFor("claude-opus-5", "off");
+  assert.deepEqual(off.thinking, { type: "disabled" });
+  assert.equal(off.output_config, undefined);
+  assert.equal(off.max_tokens, 24, "off keeps the caller's small budget");
+
+  // ADAPTIVE: thinking on, no effort pinned, and max_tokens floored so reasoning can't
+  // consume the whole 24-token allowance and return an empty answer.
+  const adaptive = await bodyFor("claude-opus-5", "adaptive");
+  assert.deepEqual(adaptive.thinking, { type: "adaptive" });
+  assert.equal(adaptive.output_config, undefined);
+  assert.ok(adaptive.max_tokens >= 4096);
+
+  // MANUAL: adaptive PLUS an effort in output_config (not top-level), with a floor that
+  // scales — a deeper level needs more room before the answer gets truncated.
+  const manualMax = await bodyFor("claude-opus-5", "manual", "max");
+  assert.deepEqual(manualMax.thinking, { type: "adaptive" });
+  assert.deepEqual(manualMax.output_config, { effort: "max" });
+  assert.ok(manualMax.max_tokens > (await bodyFor("claude-opus-5", "manual", "low")).max_tokens);
+
+  // An effort the model does not accept is DROPPED, never sent: xhigh arrived with Opus
+  // 4.7, so Sonnet 4.6 would reject it.
+  const bad = await bodyFor("claude-sonnet-4-6", "manual", "xhigh");
+  assert.equal(bad.output_config, undefined, "an unsupported effort must not be sent");
+  assert.deepEqual(bad.thinking, { type: "adaptive" }, "…but thinking still turns on");
+
+  // A model that predates the parameter shape gets neither field.
+  const haiku = await bodyFor("claude-haiku-4-5-20251001", "manual", "high");
+  assert.equal("thinking" in haiku, false);
+  assert.equal(haiku.output_config, undefined);
+});
+
+test("manual effort rides the route through resolveLlmRoute", () => {
+  const cfg = { provider: "anthropic", model: "claude-opus-5", thinking: "manual", effort: "high" };
+  const a = resolveLlmRoute(cfg, "essay", LLM_DEFAULT_MODELS)[0];
+  assert.equal(a.thinking, "manual");
+  assert.equal(a.effort, "high");
+  // off/adaptive never carry an effort, so a stale value can't leak into a request.
+  assert.equal(resolveLlmRoute({ ...cfg, thinking: "adaptive" }, "essay", LLM_DEFAULT_MODELS)[0].effort, "");
+  assert.equal(resolveLlmRoute({ ...cfg, thinking: "off" }, "essay", LLM_DEFAULT_MODELS)[0].effort, "");
+});

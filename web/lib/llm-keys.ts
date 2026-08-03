@@ -62,13 +62,16 @@ export type LlmKeyVerdict = { code: LlmFailureCode; rotate: boolean; keyFault: b
 export type LlmKeySlot = { invalid: boolean; cooldownUntil: number; lastCode?: LlmFailureCode };
 export type LlmKeyState = { keys: Record<string, LlmKeySlot> };
 
-export type LlmThinking = "off" | "adaptive";
+/** "manual" = adaptive with a pinned effort level (see ANTHROPIC_EFFORT_LEVELS). */
+export type LlmThinking = "off" | "adaptive" | "manual";
 
 export type LlmRouteAttempt = {
   provider: LlmProvider;
   model: string;
   /** Per-ROUTE, not per-model: prose wants deliberation, a yes/no does not. */
   thinking: LlmThinking;
+  /** Only meaningful when thinking === "manual"; "" otherwise. */
+  effort: string;
   source: "action" | "action-fallback" | "default" | "default-fallback";
 };
 
@@ -253,11 +256,12 @@ export function resolveLlmRoute(
   defaultModels: Partial<Record<string, string>>
 ): LlmRouteAttempt[] {
   const cfg = (config && typeof config === "object" ? config : {}) as {
-    routes?: Record<string, { provider?: string; model?: string; thinking?: unknown; fallbacks?: unknown }>;
+    routes?: Record<string, { provider?: string; model?: string; thinking?: unknown; effort?: unknown; fallbacks?: unknown }>;
     fallbacks?: unknown;
     provider?: string;
     model?: string;
     thinking?: unknown;
+    effort?: unknown;
   };
   const models = defaultModels || {};
   const out: LlmRouteAttempt[] = [];
@@ -266,19 +270,21 @@ export function resolveLlmRoute(
     provider: string | undefined,
     model: string | undefined,
     thinking: unknown,
+    effort: unknown,
     source: LlmRouteAttempt["source"]
   ) => {
     if (!provider) return;
     const resolved = model || models[provider] || "";
-    const think: LlmThinking = thinking === "adaptive" ? "adaptive" : "off";
-    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think)) return;
-    out.push({ provider: provider as LlmProvider, model: resolved, thinking: think, source });
+    const think: LlmThinking = thinking === "adaptive" || thinking === "manual" ? thinking : "off";
+    const eff = think === "manual" && typeof effort === "string" ? effort : "";
+    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think && a.effort === eff)) return;
+    out.push({ provider: provider as LlmProvider, model: resolved, thinking: think, effort: eff, source });
   };
 
   const pushChain = (chain: unknown, source: LlmRouteAttempt["source"]) => {
     (Array.isArray(chain) ? chain : []).forEach((f) => {
-      const t = f as { provider?: string; model?: string; thinking?: unknown };
-      if (f && typeof f === "object") push(t.provider, t.model, t.thinking, source);
+      const t = f as { provider?: string; model?: string; thinking?: unknown; effort?: unknown };
+      if (f && typeof f === "object") push(t.provider, t.model, t.thinking, t.effort, source);
     });
   };
 
@@ -287,10 +293,10 @@ export function resolveLlmRoute(
   const act = action ? LLM_ACTION_ALIASES[action] ?? action : action;
   const route = act && cfg.routes && typeof cfg.routes === "object" ? cfg.routes[act] : null;
   if (route?.provider) {
-    push(route.provider, route.model, route.thinking, "action");
+    push(route.provider, route.model, route.thinking, route.effort, "action");
     pushChain(route.fallbacks, "action-fallback");
   }
-  push(cfg.provider, cfg.model, cfg.thinking, "default");
+  push(cfg.provider, cfg.model, cfg.thinking, cfg.effort, "default");
   pushChain(cfg.fallbacks, "default-fallback");
   return out;
 }

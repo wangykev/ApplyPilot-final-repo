@@ -27,13 +27,40 @@ const ANTHROPIC_THINKING_ADJUSTABLE = {
 // Thinking needs room to happen: max_tokens caps thinking PLUS the answer, so leaving this
 // adapter's small budgets (as low as 24) in place would spend the whole allowance on
 // reasoning and return an empty reply. When thinking is ON, floor the budget.
+// Effort levels each model accepts. NOT uniform: xhigh arrived with Opus 4.7, so 4.6 tops
+// out at high/max, and Haiku 4.5 predates effort entirely (it is absent, so "manual" falls
+// back to plain adaptive there rather than sending a parameter that errors).
+const ANTHROPIC_EFFORT_LEVELS = {
+  "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-8": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-4-6": ["low", "medium", "high", "max"]
+};
+// Thinking shares max_tokens with the answer, so a thinking request needs headroom or the
+// reply truncates to nothing. Scaled by effort: this is a TRUNCATION GUARD, not a target —
+// the model stops when it is done, it does not spend to the ceiling.
 const ANTHROPIC_THINKING_MIN_TOKENS = 4096;
+const ANTHROPIC_EFFORT_MIN_TOKENS = { low: 4096, medium: 4096, high: 8192, xhigh: 16384, max: 32768 };
+function anthropicEffortFor(model, thinking, effort) {
+  if (thinking !== "manual") return undefined; // off/adaptive never pin an effort
+  const allowed = ANTHROPIC_EFFORT_LEVELS[model];
+  return allowed && allowed.indexOf(effort) !== -1 ? effort : undefined;
+}
+function anthropicMaxTokens(model, thinking, effort, maxTokens) {
+  const t = anthropicThinkingFor(model, thinking);
+  if (!t || t.type !== "adaptive") return maxTokens || 1024;
+  const eff = anthropicEffortFor(model, thinking, effort);
+  const floor = (eff && ANTHROPIC_EFFORT_MIN_TOKENS[eff]) || ANTHROPIC_THINKING_MIN_TOKENS;
+  return Math.max(maxTokens || 1024, floor);
+}
 function anthropicThinkingWants(model, want, type) {
   const t = anthropicThinkingFor(model, want);
   return !!(t && t.type === type);
 }
 function anthropicThinkingFor(model, want) {
-  if (want === "adaptive" && ANTHROPIC_THINKING_ADJUSTABLE[model]) return { type: "adaptive" };
+  // "manual" is adaptive PLUS a pinned effort — the model still decides WHEN to think,
+  // the operator caps HOW MUCH. A fixed budget_tokens would 400 on Claude 5.
+  if ((want === "adaptive" || want === "manual") && ANTHROPIC_THINKING_ADJUSTABLE[model]) return { type: "adaptive" };
   if (ANTHROPIC_THINKING_DEFAULT_ON[model]) return { type: "disabled" };
   return undefined; // older models: omit the parameter entirely
 }
@@ -42,7 +69,7 @@ function anthropicThinkingFor(model, want) {
 // fetch and a parse(data)→text. Adding a provider = one entry here, nothing else.
 const LLM_PROVIDERS = {
   anthropic: {
-    build: ({ model, apiKey, system, user, maxTokens, thinking }) => ({
+    build: ({ model, apiKey, system, user, maxTokens, thinking, effort }) => ({
       url: "https://api.anthropic.com/v1/messages",
       opts: {
         method: "POST",
@@ -59,12 +86,14 @@ const LLM_PROVIDERS = {
           // max_tokens caps thinking PLUS the answer, so a thinking request needs a real
           // budget — otherwise reasoning eats a 24-token allowance and the reply comes back
           // empty, indistinguishable from a broken model.
-          max_tokens: anthropicThinkingWants(model, thinking, "adaptive")
-            ? Math.max(maxTokens || 1024, ANTHROPIC_THINKING_MIN_TOKENS)
-            : (maxTokens || 1024),
+          max_tokens: anthropicMaxTokens(model, thinking, effort, maxTokens),
           // Claude 5 thinks by default, so it must be turned OFF explicitly for short
           // answers; 4.6/4.8 stay off unless the operator asks. See anthropicThinkingFor.
           thinking: anthropicThinkingFor(model, thinking),
+          // effort lives in output_config, not top-level, and only on "manual".
+          output_config: anthropicEffortFor(model, thinking, effort)
+            ? { effort: anthropicEffortFor(model, thinking, effort) }
+            : undefined,
           system: system || undefined,
           messages: [{ role: "user", content: user }]
         })
@@ -432,5 +461,6 @@ if (typeof module !== "undefined" && module.exports) {
     LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
     LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
-    ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor };
+    ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor, ANTHROPIC_EFFORT_LEVELS,
+    ANTHROPIC_EFFORT_MIN_TOKENS, anthropicEffortFor, anthropicMaxTokens };
 }

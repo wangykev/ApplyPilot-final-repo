@@ -50,7 +50,9 @@ const routeTargetSchema = z.object({
    * and matches how every call behaved before this existed. Ignored for models that can't
    * take the parameter (see ANTHROPIC_THINKING_ADJUSTABLE).
    */
-  thinking: z.enum(["off", "adaptive"]).default("off"),
+  thinking: z.enum(["off", "adaptive", "manual"]).default("off"),
+  /** Only used when thinking === "manual"; ignored (and unsent) otherwise. */
+  effort: z.string().default(""),
 });
 
 const routeSchema = routeTargetSchema.extend({
@@ -63,7 +65,8 @@ export const aiConfigSchema = z
     // The default pair — also the v1 fields, kept at the top level for compatibility.
     provider: providerEnum.default("gemini"),
     model: z.string().default(LLM_DEFAULT_MODELS.gemini),
-    thinking: z.enum(["off", "adaptive"]).default("off"),
+    thinking: z.enum(["off", "adaptive", "manual"]).default("off"),
+    effort: z.string().default(""),
     apiKey: z.string().default(""),
     enabled: z.boolean().default(false),
 
