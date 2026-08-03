@@ -1771,6 +1771,58 @@ const aiFillRadio = async (act, loc, f, profile, jobContext, budgets) => {
     options: optionLabels, auditLoc: loc.wrapperSel };
 };
 
+// A REQUIRED pick-one CHECKBOX GROUP the deterministic pass could not answer (2026-08-03).
+//
+// Live on PSECU: a required "Please select the ethnicity (or ethnicities) which most accurately
+// describe(s) how you identify yourself" renders as a checkbox GROUP, not a dropdown or radio. It was
+// unmapped, aiEligible excludes checkboxes, and the required-radio post-pass keys on widgetType
+// "radio" — so nothing could fill it and Save & Continue could never pass.
+//
+// A single CHECKBOX stays excluded and that distinction is the point: ticking one is an ASSERTION
+// ("I agree", "I certify") and an AI must not assert on someone's behalf. A checkbox GROUP is a
+// pick-one SET — the same shape as a radio, which is why fillCheckboxGroupCdp already unchecks the
+// current option and verifies exactly one ends checked. Choosing among offered options is what the
+// AI does everywhere else.
+//
+// Same contract as aiFillRadio: the pick is a CANDIDATE that must clear the match ladder against the
+// LIVE labels, the commit is the proven one, and the result is ALWAYS filled_review — for a
+// demographic the caller re-tags it ai-eeo-guess so review shows the loud DEMOGRAPHIC badge.
+const aiFillCheckboxGroup = async (act, loc, f, profile, jobContext, budgets) => {
+  const opts = act.readCheckboxGroup ? await act.readCheckboxGroup(loc) : null;
+  if (!opts || !opts.length) return { status: "needs_review", after: null, flag: "ai-no-options",
+    detail: "AI checkbox-group fallback: no checkboxes found in the wrapper (not actuated)", auditLoc: loc.wrapperSel };
+  const optionLabels = opts.map((o) => o.labelText).filter(Boolean);
+  if (!optionLabels.length) return { status: "needs_review", after: null, flag: "ai-no-options",
+    detail: "AI checkbox-group fallback: the checkboxes carry no labels to choose between", options: optionLabels, auditLoc: loc.wrapperSel };
+  const sensitive = legallyLoaded(f.label);
+  const system = "You help an applicant fill out a REQUIRED job-application question. Given the applicant's profile (JSON), one question, and its exact answer options, choose the SINGLE best option. INFER from the profile even when it is not stated verbatim. This question is REQUIRED and the form will not accept the page without it: always choose the most likely option, never refuse. Keep the justification SHORT — one terse phrase, about 12 words, no preamble — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information. Give your confidence: High, Medium, or Low. ALSO map this question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field, or \"none\"; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
+  const user = "Question: " + String(f.label || "")
+    + "\nAnswer options (choose exactly one; reply with its EXACT text): " + JSON.stringify(optionLabels)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}";
+  const res = await act.llm({ system, user, maxTokens: 512 });
+  if (!res || !res.ok) return { status: "needs_review", after: null, flag: "ai-call-failed",
+    detail: "AI call failed — " + ((res && res.error) || "no reply"), options: optionLabels, auditLoc: loc.wrapperSel };
+  const ai = parseAiReply(res.text);
+  const conf = ai.confidence;
+  const hint = { maps_to: ai.maps_to || "", suggested_category: ai.suggested_category || "" };
+  const m = ai.choice ? apMatch.matchCandidates([ai.choice], optionLabels) : { targetIndex: -1, matchTier: null };
+  if (m.targetIndex === -1) return { status: "needs_review", after: null, flag: "ai-nomatch", confidence: conf, ...hint,
+    detail: "AI chose \"" + ai.choice + "\" — not one of the options" + (ai.justification ? " (" + ai.justification + ")" : ""),
+    options: optionLabels, auditLoc: loc.wrapperSel };
+  const target = optionLabels[m.targetIndex];
+  const cr = await fillCheckboxGroupCdp(act, loc, [target], budgets); // unchecks any other, verifies exactly one ends checked
+  if (!cr || cr.status !== "filled") return { status: "needs_review", after: (cr && cr.after != null) ? cr.after : null,
+    flag: "ai-commit-failed", confidence: conf, ...hint,
+    detail: "AI chose \"" + target + "\" but the checkbox group did not commit (" + ((cr && cr.detail) || "no result") + ")",
+    options: optionLabels, auditLoc: loc.wrapperSel };
+  return { status: "filled_review", after: cr.after, verified: true, matchTier: m.matchTier,
+    flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf, ...hint,
+    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + cr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
+    options: optionLabels, auditLoc: loc.wrapperSel };
+};
+
 // Checkbox: reconcile to the desired boolean (the M22 fillMappedEntry checkbox
 // semantics) — label-click primary, focus+Space fallback, checked read-back.
 const fillCheckboxCdp = async (act, loc, want, budgets) => {
@@ -3195,6 +3247,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI radio fallback error: " + String((e && e.message) || e); }
     }
 
+    // ── Required CHECKBOX-GROUP AI fallback ── same reasoning as the radio pass above, for the
+    // pick-one SET shape. A required one nothing can answer blocks Save & Continue forever (live:
+    // PSECU's required ethnicity group). A bare `checkbox` is deliberately NOT here — ticking one is
+    // an assertion, not a choice.
+    if (act.aiEnabled && f.isRequired && f.widgetType === "checkbox_group" && record.resolved == null
+        && record.status !== "filled" && record.status !== "filled_review") {
+      try {
+        const aiRes = await aiFillCheckboxGroup(act, loc, f, profile, jobContext, budgets);
+        if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess"; // demographic → loud badge
+        if (aiRes) Object.assign(record, aiRes);
+      } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI checkbox-group fallback error: " + String((e && e.message) || e); }
+    }
     record.auditLoc = f.wrapperSel; // M40: retain the locator (a selector string, re-resolved fresh) for the post-fill audit re-read
     // A checkbox GROUP always carries its option labels into the bundle — even when the field is left
     // BLANK. The scan reads them straight from the DOM (no open/actuation), and without them the review
@@ -6369,5 +6433,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { isChoiceWidget, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { isChoiceWidget, aiFillCheckboxGroup, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

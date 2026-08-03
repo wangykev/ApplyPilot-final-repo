@@ -8471,3 +8471,44 @@ test("rejectedValueEntries: an ambiguous prefix REFUSES, and every no-op says wh
   // and a no-op is never silent
   assert.ok(apMatchLib.rejectedValueEntries(ents, [{ fieldName: "z", label: "Other", value: "" }], REJ_ERR2).notes.length);
 });
+
+// ── a REQUIRED pick-one checkbox GROUP is answerable (PSECU live 2026-08-03) ──
+// A required "select the ethnicity ... which most accurately describe(s) how you identify yourself"
+// renders as a checkbox GROUP. It was unmapped, aiEligible excludes checkboxes, and the required-radio
+// pass keys on widgetType "radio" — so nothing could fill it and Save & Continue could never pass.
+const ETH_OPTS = ["American Indian or Alaska Native", "Asian", "Black or African American", "White", "Two or more races"];
+const ethField = (over = {}) => Object.assign({
+  wrapperSel: "[w-eth]", fieldName: "ethnicityMulti", widgetType: "checkbox_group", isRequired: true,
+  label: "Please select the ethnicity (or ethnicities) which most accurately describe(s) how you identify yourself.",
+  options: ETH_OPTS.map((t, i) => ({ id: "e" + i, labelText: t, checked: false })),
+  groupOptions: ETH_OPTS.map((t, i) => ({ id: "e" + i, labelText: t, checked: false })),
+}, over);
+
+test("checkbox group: a REQUIRED unmapped one gets an AI answer + the loud DEMOGRAPHIC badge", async () => {
+  const act = makeFakeAct([ethField()], { aiEnabled: true, ai: '{"choice":"Asian","justification":"profile states Asian","confidence":"High"}' });
+  const rec = (await drivePageFill(act, { self_identification: {} }, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", "an AI guess is never silently trusted");
+  assert.strictEqual(rec.after, "Asian");
+  assert.strictEqual(rec.flag, "ai-eeo-guess", "a demographic gets the loud badge, not a plain ai-choice");
+  assert.ok(act.log.some(([m]) => m === "llm"), "the AI was consulted");
+});
+
+test("checkbox group: the AI's pick must clear the match ladder, and a bare checkbox is still never AI-filled", async () => {
+  // a paraphrase that is not an option must NOT be committed
+  const bad = makeFakeAct([ethField()], { aiEnabled: true, ai: '{"choice":"Prefer not to disclose","confidence":"High"}' });
+  const r1 = (await drivePageFill(bad, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(r1.status, "needs_review");
+  assert.strictEqual(r1.flag, "ai-nomatch");
+  // OPTIONAL stays blank — a blank optional does not block the page, so there is nothing to guess for
+  const opt = makeFakeAct([ethField({ isRequired: false })], { aiEnabled: true, ai: '{"choice":"Asian"}' });
+  const r2 = (await drivePageFill(opt, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!opt.log.some(([m]) => m === "llm"), "optional → no AI call, no spend");
+  assert.strictEqual(r2.after, null);
+  // AI OFF → never fires
+  const off = makeFakeAct([ethField()], { aiEnabled: false, ai: '{"choice":"Asian"}' });
+  const r3 = (await drivePageFill(off, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!off.log.some(([m]) => m === "llm"));
+  assert.strictEqual(r3.after, null);
+  // a bare CHECKBOX is an ASSERTION, not a choice — still excluded
+  assert.strictEqual(aiEligible({ widgetType: "checkbox", isRequired: true }), false);
+});
