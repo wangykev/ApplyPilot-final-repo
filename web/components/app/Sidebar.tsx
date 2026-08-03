@@ -16,7 +16,6 @@ import {
   GraduationCap,
   BarChart3,
   LogOut,
-  Gauge,
 } from "lucide-react";
 import { LogoMark } from "@/components/Logo";
 import { clsx } from "@/lib/clsx";
@@ -33,9 +32,6 @@ const PRIMARY = [
   { href: "/app/queue", label: "Queue", icon: ListChecks },
   { href: "/app/tracker", label: "Tracker", icon: Activity },
   { href: "/app/teach", label: "Teach", icon: GraduationCap },
-  // Sits next to AI, not under Analytics: it answers "what is my AI costing me", which is
-  // a question about the AI config, not about application outcomes.
-  { href: "/app/usage", label: "AI usage", icon: Gauge },
   { href: "/app/analytics", label: "Analytics", icon: BarChart3 },
 ];
 
