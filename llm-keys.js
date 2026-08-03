@@ -26,7 +26,18 @@ const LLM_KEY_COOLDOWN = { RATE_LIMIT_MS: 60000, QUOTA_MS: 900000 };
 // The actions that route to a model. Ids match the real call sites, so adding a
 // capability means adding an id here plus passing it at the call site — never a
 // change to the settings UI, which renders this list.
-const LLM_ACTIONS = ["fill", "resume_parse", "cover_letter", "teach"];
+//
+// The pair that matters to an operator is fill vs essay, and they pull in opposite
+// directions: `fill` answers short screening questions dozens of times per application
+// (so: cheap and fast), while `essay` writes a paragraph of prose once or twice (so:
+// worth a stronger model). Keeping them separate is the whole point of per-action routing.
+const LLM_ACTIONS = ["fill", "essay", "resume_parse", "cover_letter"];
+
+// Actions that deliberately RIDE another action's route instead of having their own row.
+// `teach` classifies a question the same way the fill does — same kind of judgement, same
+// prompt shape — so giving it a separate model would be a knob with no real decision
+// behind it. It follows whatever `fill` is set to, including fill's fallback chain.
+const LLM_ACTION_ALIASES = { teach: "fill" };
 
 // ─── Config normalization ───────────────────────────────────────────────────
 
@@ -213,27 +224,33 @@ function resolveLlmRoute(config, action, defaultModels) {
   const models = defaultModels || {};
   const out = [];
 
-  const push = (provider, model, source) => {
+  // `thinking` rides along per attempt ("off" | "adaptive"): the right answer differs by
+  // JOB on the same model — prose wants deliberation, a yes/no does not.
+  const push = (provider, model, thinking, source) => {
     if (!provider) return;
     const resolved = model || models[provider] || "";
-    if (out.some((a) => a.provider === provider && a.model === resolved)) return; // no repeats
-    out.push({ provider, model: resolved, source });
+    const think = thinking === "adaptive" ? "adaptive" : "off";
+    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think)) return;
+    out.push({ provider, model: resolved, thinking: think, source });
   };
 
   const pushChain = (chain, source) => {
     (Array.isArray(chain) ? chain : []).forEach((f) => {
-      if (f && typeof f === "object") push(f.provider, f.model, source);
+      if (f && typeof f === "object") push(f.provider, f.model, f.thinking, source);
     });
   };
 
   const routes = cfg.routes && typeof cfg.routes === "object" ? cfg.routes : {};
-  const route = action && routes[action] && typeof routes[action] === "object" ? routes[action] : null;
+  // An alias resolves to its target BEFORE the lookup, so `teach` picks up fill's own
+  // override — not the global default, which is what an unknown action would fall to.
+  const act = action && LLM_ACTION_ALIASES[action] ? LLM_ACTION_ALIASES[action] : action;
+  const route = act && routes[act] && typeof routes[act] === "object" ? routes[act] : null;
   if (route && route.provider) {
-    push(route.provider, route.model, "action");
+    push(route.provider, route.model, route.thinking, "action");
     pushChain(route.fallbacks, "action-fallback");
   }
 
-  push(cfg.provider, cfg.model, "default");
+  push(cfg.provider, cfg.model, cfg.thinking, "default");
   pushChain(cfg.fallbacks, "default-fallback");
   return out;
 }
@@ -242,7 +259,7 @@ function resolveLlmRoute(config, action, defaultModels) {
 // cross-load); in the SW/popup `module` is undefined so these stay globals.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    LLM_KEY_COOLDOWN, LLM_ACTIONS, normalizeLlmKey, llmKeysFor, newLlmKeyState,
+    LLM_KEY_COOLDOWN, LLM_ACTIONS, LLM_ACTION_ALIASES, normalizeLlmKey, llmKeysFor, newLlmKeyState,
     orderLlmKeys, classifyLlmFailure, applyLlmKeyOutcome, resolveLlmRoute
   };
 }

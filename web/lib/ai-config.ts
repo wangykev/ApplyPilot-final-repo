@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { LLM_DEFAULT_MODELS, type LlmProvider } from "@/lib/llm";
-import { LLM_ACTIONS } from "@/lib/llm-keys";
+import { LLM_ACTIONS, type LlmAction } from "@/lib/llm-keys";
 
 /**
  * Mirrors the extension's chrome.storage.local `llmConfig` (see WEBSITE.md → Data
@@ -8,8 +8,9 @@ import { LLM_ACTIONS } from "@/lib/llm-keys";
  *
  *   keys      — MANY keys per provider, tried in order, so one hitting its limit doesn't
  *               stop a fill. Free keys lead (see `preferFreeFirst`).
- *   routes    — a provider+model per ACTION (fill / resume parse / cover letter / teach),
- *               each with its own fallback chain. Unset = follow the default pair.
+ *   routes    — a provider+model per ACTION (fill / essay / resume parse / cover letter),
+ *               each with its own fallback chain. Unset = follow the default pair. `teach`
+ *               is not a row — it is aliased to `fill` in llm-keys.
  *   fallbacks — the default chain, used by any action without its own.
  *
  * v1 COMPATIBILITY IS LOAD-BEARING, in both directions:
@@ -43,6 +44,13 @@ export type LlmKeyEntry = z.infer<typeof llmKeySchema>;
 const routeTargetSchema = z.object({
   provider: providerEnum,
   model: z.string().default(""),
+  /**
+   * Claude thinking, per ROUTE rather than per model — the same model wants deliberation
+   * for an essay and none for a yes/no. Defaults OFF: that is the cheaper, faster answer
+   * and matches how every call behaved before this existed. Ignored for models that can't
+   * take the parameter (see ANTHROPIC_THINKING_ADJUSTABLE).
+   */
+  thinking: z.enum(["off", "adaptive"]).default("off"),
 });
 
 const routeSchema = routeTargetSchema.extend({
@@ -55,6 +63,7 @@ export const aiConfigSchema = z
     // The default pair — also the v1 fields, kept at the top level for compatibility.
     provider: providerEnum.default("gemini"),
     model: z.string().default(LLM_DEFAULT_MODELS.gemini),
+    thinking: z.enum(["off", "adaptive"]).default("off"),
     apiKey: z.string().default(""),
     enabled: z.boolean().default(false),
 
@@ -62,7 +71,10 @@ export const aiConfigSchema = z
     /** Spend free-tier keys before metered ones. Only Gemini can hold a mix. */
     preferFreeFirst: z.boolean().default(true),
     fallbacks: z.array(routeTargetSchema).max(4).default([]),
-    routes: z.record(z.enum(LLM_ACTIONS), routeSchema).default({}),
+    // Keyed permissively, then filtered to LLM_ACTIONS in the transform. An id can stop
+    // being routable (teach now rides fill), and a stored route for it must be DROPPED
+    // rather than fail validation and take the whole config down with it.
+    routes: z.record(z.string(), routeSchema).default({}),
   })
   .transform((cfg) => {
     // Only Gemini has a free tier, so no other provider's key may claim one — otherwise
@@ -74,7 +86,11 @@ export const aiConfigSchema = z
         tier: provider === "gemini" ? k.tier : "paid",
       }));
     }
-    return { ...cfg, keys };
+    const routes: Partial<Record<LlmAction, z.infer<typeof routeSchema>>> = {};
+    for (const [action, route] of Object.entries(cfg.routes ?? {})) {
+      if ((LLM_ACTIONS as readonly string[]).includes(action)) routes[action as LlmAction] = route;
+    }
+    return { ...cfg, keys, routes };
   });
 
 export type AiConfig = z.infer<typeof aiConfigSchema>;

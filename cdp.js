@@ -3974,6 +3974,7 @@ function makeCdpActuation(llmConfig) {
         const res = await callLLM({
           provider: attempt.provider,
           model: attempt.model,
+          thinking: attempt.thinking,
           // llmKeysFor already folds a v1 flat apiKey into a one-key list, so passing
           // apiKey as well would just duplicate it.
           keys,

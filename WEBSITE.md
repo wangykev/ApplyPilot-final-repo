@@ -262,8 +262,13 @@ object, silently destroying `keys`/`routes`/`fallbacks`. `AP_SET_LLM` also recor
   routes:    { [action]: { provider, model, fallbacks: [{provider,model}] } } }
 ```
 
-`action` ∈ `fill` | `resume_parse` | `cover_letter` | `teach` (`LLM_ACTIONS`, `llm-keys.js`); an unset action
-follows the default pair. Model lists from `LLM_MODELS` (`llm.js`); default `gemini-3.1-flash-lite`.
+`action` ∈ `fill` | `essay` | `resume_parse` | `cover_letter` (`LLM_ACTIONS`, `llm-keys.js`); an unset action
+follows the default pair. **`fill` vs `essay` is the distinction that matters to an operator** — dozens of short
+screening answers per application (cheap, fast) versus a paragraph or two of prose (worth a stronger model);
+`aiFillText` in fill-driver.js is the essay call site, every other `act.llm` defaults to `fill`.
+`teach` is NOT a row: `LLM_ACTION_ALIASES` maps it to `fill`, so it rides fill's route and fallback chain —
+same kind of judgement, so a separate model would be a knob with no decision behind it. An alias resolves
+BEFORE the route lookup, so it picks up fill's override rather than the global default. Model lists from `LLM_MODELS` (`llm.js`); default `gemini-3.1-flash-lite`.
 
 **v1 compatibility is load-bearing in both directions.** Reading: a stored v1 config has no `keys`, and
 `llmKeysFor` treats the flat `apiKey` as a single key for the flat provider — an untouched account needs no

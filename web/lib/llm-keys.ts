@@ -17,9 +17,25 @@ import type { LlmProvider } from "@/lib/llm";
 
 export const LLM_KEY_COOLDOWN = { RATE_LIMIT_MS: 60_000, QUOTA_MS: 900_000 } as const;
 
-/** Actions that route to a model. Ids match the real call sites. */
-export const LLM_ACTIONS = ["fill", "resume_parse", "cover_letter", "teach"] as const;
+/**
+ * Actions that route to a model. Ids match the real call sites.
+ *
+ * The pair that matters to an operator is fill vs essay, and they pull in opposite
+ * directions: `fill` answers short screening questions dozens of times per application
+ * (cheap and fast), while `essay` writes a paragraph of prose once or twice (worth a
+ * stronger model). Keeping those separate is the point of per-action routing.
+ */
+export const LLM_ACTIONS = ["fill", "essay", "resume_parse", "cover_letter"] as const;
 export type LlmAction = (typeof LLM_ACTIONS)[number];
+
+/**
+ * Actions that deliberately RIDE another action's route instead of getting their own row.
+ * `teach` classifies a question the same way the fill does, so a separate model would be a
+ * knob with no real decision behind it — it follows `fill`, including fill's fallbacks.
+ */
+export const LLM_ACTION_ALIASES: Record<string, LlmAction> = { teach: "fill" };
+/** What a caller may ask for: a routable action, or an alias of one. */
+export type LlmActionInput = LlmAction | keyof typeof LLM_ACTION_ALIASES;
 
 export type LlmKeyTier = "free" | "paid";
 
@@ -46,9 +62,13 @@ export type LlmKeyVerdict = { code: LlmFailureCode; rotate: boolean; keyFault: b
 export type LlmKeySlot = { invalid: boolean; cooldownUntil: number; lastCode?: LlmFailureCode };
 export type LlmKeyState = { keys: Record<string, LlmKeySlot> };
 
+export type LlmThinking = "off" | "adaptive";
+
 export type LlmRouteAttempt = {
   provider: LlmProvider;
   model: string;
+  /** Per-ROUTE, not per-model: prose wants deliberation, a yes/no does not. */
+  thinking: LlmThinking;
   source: "action" | "action-fallback" | "default" | "default-fallback";
 };
 
@@ -233,33 +253,44 @@ export function resolveLlmRoute(
   defaultModels: Partial<Record<string, string>>
 ): LlmRouteAttempt[] {
   const cfg = (config && typeof config === "object" ? config : {}) as {
-    routes?: Record<string, { provider?: string; model?: string; fallbacks?: unknown }>;
+    routes?: Record<string, { provider?: string; model?: string; thinking?: unknown; fallbacks?: unknown }>;
     fallbacks?: unknown;
     provider?: string;
     model?: string;
+    thinking?: unknown;
   };
   const models = defaultModels || {};
   const out: LlmRouteAttempt[] = [];
 
-  const push = (provider: string | undefined, model: string | undefined, source: LlmRouteAttempt["source"]) => {
+  const push = (
+    provider: string | undefined,
+    model: string | undefined,
+    thinking: unknown,
+    source: LlmRouteAttempt["source"]
+  ) => {
     if (!provider) return;
     const resolved = model || models[provider] || "";
-    if (out.some((a) => a.provider === provider && a.model === resolved)) return;
-    out.push({ provider: provider as LlmProvider, model: resolved, source });
+    const think: LlmThinking = thinking === "adaptive" ? "adaptive" : "off";
+    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think)) return;
+    out.push({ provider: provider as LlmProvider, model: resolved, thinking: think, source });
   };
 
   const pushChain = (chain: unknown, source: LlmRouteAttempt["source"]) => {
     (Array.isArray(chain) ? chain : []).forEach((f) => {
-      if (f && typeof f === "object") push((f as { provider?: string }).provider, (f as { model?: string }).model, source);
+      const t = f as { provider?: string; model?: string; thinking?: unknown };
+      if (f && typeof f === "object") push(t.provider, t.model, t.thinking, source);
     });
   };
 
-  const route = action && cfg.routes && typeof cfg.routes === "object" ? cfg.routes[action] : null;
+  // An alias resolves to its target BEFORE the lookup, so `teach` picks up fill's own
+  // override rather than the global default an unknown action would fall to.
+  const act = action ? LLM_ACTION_ALIASES[action] ?? action : action;
+  const route = act && cfg.routes && typeof cfg.routes === "object" ? cfg.routes[act] : null;
   if (route?.provider) {
-    push(route.provider, route.model, "action");
+    push(route.provider, route.model, route.thinking, "action");
     pushChain(route.fallbacks, "action-fallback");
   }
-  push(cfg.provider, cfg.model, "default");
+  push(cfg.provider, cfg.model, cfg.thinking, "default");
   pushChain(cfg.fallbacks, "default-fallback");
   return out;
 }

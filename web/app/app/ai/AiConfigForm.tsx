@@ -6,7 +6,7 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { SelectField, FieldLabel } from "@/components/form/fields";
 import {
   LLM_MODELS, LLM_DEFAULT_MODELS, LLM_PROVIDER_LABELS, GEMINI_FREE_TIER, LLM_PRICING, LLM_PRICING_URLS,
-  type LlmProvider,
+  LLM_MODEL_META, ANTHROPIC_THINKING_ADJUSTABLE, type LlmProvider,
 } from "@/lib/llm";
 import { LLM_ACTIONS, type LlmAction } from "@/lib/llm-keys";
 import { PROVIDERS, keysForProvider, totalUsableKeys, type AiConfig, type LlmKeyEntry } from "@/lib/ai-config";
@@ -17,15 +17,18 @@ import { clsx } from "@/lib/clsx";
 /** What each routable action is, in the operator's words. Order = display order. */
 const ACTION_COPY: Record<LlmAction, { label: string; desc: string }> = {
   fill: {
-    label: "Form fill",
-    desc: "Screening questions the deterministic matcher can't answer. The highest-volume caller by far — one application can ask dozens.",
+    label: "Fill — short answers",
+    desc: "Screening questions the deterministic matcher can't answer: dropdowns, yes/no, a line of text. The highest-volume caller by far — one application can ask dozens, so this is where a cheap fast model pays off. Also used when you correct a fill on the Teach page.",
+  },
+  essay: {
+    label: "Fill — essays and long answers",
+    desc: "“Why do you want to work here?” — a paragraph of prose written from your profile. A handful per application at most, so it's the one worth spending a stronger model on.",
   },
   resume_parse: {
     label: "Resume parsing",
     desc: "Reading an uploaded PDF into profile fields. Runs once per resume, so quality matters more than cost here.",
   },
   cover_letter: { label: "Cover letter", desc: "Drafting a letter from your profile and the job description." },
-  teach: { label: "Teach", desc: "Working out which profile field a question belongs to when you correct a fill." },
 };
 
 const money = (n: number) => (Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`);
@@ -39,6 +42,23 @@ function modelRate(provider: LlmProvider, model: string, free: boolean): string 
   }
   const price = LLM_PRICING[model];
   return price ? `${money(price.in)} in / ${money(price.out)} out per 1M` : "see pricing";
+}
+
+/**
+ * One option in a model picker. A raw id is not a decision — "claude-haiku-4-5-20251001"
+ * says nothing about when to choose it, and the date suffix is pure noise. So each option
+ * leads with the model's NAME, then what it's for, then what it costs:
+ *
+ *   Claude Opus 4.8 · most capable — $5 in / $25 out per 1M
+ *   Gemini 3.1 Flash-Lite · fastest, cheapest — free · 15/min · 500/day
+ *
+ * The raw id stays the option's VALUE, so what's stored and sent is unchanged.
+ */
+function modelOptionLabel(provider: LlmProvider, model: string, free: boolean): string {
+  const meta = LLM_MODEL_META[model];
+  const name = meta?.label ?? model;
+  const role = meta?.role ? ` · ${meta.role}` : "";
+  return `${name}${role} — ${modelRate(provider, model, free)}`;
 }
 
 export function AiConfigForm({ initial }: { initial: AiConfig }) {
@@ -68,7 +88,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
   const modelOptions = (provider: LlmProvider) => {
     const freeOnly = provider === "gemini" && geminiFreeOnly;
     const ids = freeOnly ? LLM_MODELS.gemini.filter((m) => GEMINI_FREE_TIER[m]) : LLM_MODELS[provider];
-    return ids.map((m) => ({ value: m, label: `${m} — ${modelRate(provider, m, freeOnly)}` }));
+    return ids.map((m) => ({ value: m, label: modelOptionLabel(provider, m, freeOnly) }));
   };
 
   const save = () =>
@@ -140,10 +160,16 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
         subtitle="Used by every action that does not override it below. A fallback is tried once every key for the provider above it is spent."
       >
         <RouteEditor
-          target={{ provider: cfg.provider, model: cfg.model, fallbacks: cfg.fallbacks }}
+          target={{ provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, fallbacks: cfg.fallbacks }}
           modelOptions={modelOptions}
           onChange={(next) =>
-            edit((c) => ({ ...c, provider: next.provider, model: next.model, fallbacks: next.fallbacks }))
+            edit((c) => ({
+              ...c,
+              provider: next.provider,
+              model: next.model,
+              thinking: next.thinking ?? "off",
+              fallbacks: next.fallbacks,
+            }))
           }
         />
       </SectionCard>
@@ -445,7 +471,9 @@ function KeyRow({
 
 /* ─── A provider+model pair with its fallback chain ──────────────────────── */
 
-type RouteTarget = { provider: LlmProvider; model: string };
+// thinking is REQUIRED here: the schema always supplies it, so making it optional just
+// pushed undefined into every consumer.
+type RouteTarget = { provider: LlmProvider; model: string; thinking: "off" | "adaptive" };
 type RouteValue = RouteTarget & { fallbacks: RouteTarget[] };
 
 function RouteEditor({
@@ -459,9 +487,10 @@ function RouteEditor({
 }) {
   const providerOptions = PROVIDERS.map((p) => ({ value: p, label: LLM_PROVIDER_LABELS[p] }));
 
-  const setPair = (i: number | null, provider: LlmProvider, model: string) => {
-    if (i === null) return onChange({ ...target, provider, model });
-    onChange({ ...target, fallbacks: target.fallbacks.map((f, j) => (j === i ? { provider, model } : f)) });
+  const setPair = (i: number | null, provider: LlmProvider, model: string, thinking?: "off" | "adaptive") => {
+    const next: RouteTarget = { provider, model, thinking: thinking ?? "off" };
+    if (i === null) return onChange({ ...target, ...next });
+    onChange({ ...target, fallbacks: target.fallbacks.map((f, j) => (j === i ? next : f)) });
   };
 
   const row = (pair: RouteTarget, i: number | null) => {
@@ -472,17 +501,38 @@ function RouteEditor({
       const p = v as LlmProvider;
       const list = modelOptions(p);
       const keep = list.some((o) => o.value === pair.model) ? pair.model : list[0]?.value || LLM_DEFAULT_MODELS[p];
-      setPair(i, p, keep);
+      setPair(i, p, keep, pair.thinking);
     };
+    // Only Claude 4.6-and-newer accept an adaptive/off choice, so anything else would be a
+    // knob that silently does nothing — it isn't shown.
+    const canThink = !!ANTHROPIC_THINKING_ADJUSTABLE[pair.model];
     return (
-      <div key={i ?? "primary"} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[11rem_1fr_2.5rem]">
+      <div key={i ?? "primary"} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[10rem_1fr_auto_2.5rem]">
         <SelectField
           label={i === null ? "Provider" : `Fallback ${i + 1}`}
           value={pair.provider}
           options={providerOptions}
           onChange={onProvider}
         />
-        <SelectField label="Model" value={pair.model} options={opts} onChange={(v) => setPair(i, pair.provider, v)} />
+        <SelectField
+          label="Model"
+          value={pair.model}
+          options={opts}
+          onChange={(v) => setPair(i, pair.provider, v, pair.thinking)}
+        />
+        {canThink ? (
+          <SelectField
+            label="Thinking"
+            value={pair.thinking ?? "off"}
+            options={[
+              { value: "off", label: "Off — faster, cheaper" },
+              { value: "adaptive", label: "Adaptive — better on hard answers" },
+            ]}
+            onChange={(v) => setPair(i, pair.provider, pair.model, v as "off" | "adaptive")}
+          />
+        ) : (
+          <span />
+        )}
         {i === null ? (
           <span />
         ) : (
@@ -501,7 +551,7 @@ function RouteEditor({
 
   return (
     <div className="space-y-3">
-      {row({ provider: target.provider, model: target.model }, null)}
+      {row({ provider: target.provider, model: target.model, thinking: target.thinking }, null)}
       {target.fallbacks.map((f, i) => row(f, i))}
       {target.fallbacks.length < 4 && (
         <button
@@ -511,7 +561,7 @@ function RouteEditor({
               ...target,
               fallbacks: [
                 ...target.fallbacks,
-                { provider: target.provider, model: modelOptions(target.provider)[1]?.value || target.model },
+                { provider: target.provider, model: modelOptions(target.provider)[1]?.value || target.model, thinking: "off" },
               ],
             })
           }
@@ -522,6 +572,7 @@ function RouteEditor({
         </button>
       )}
       <p className="text-xs leading-relaxed text-ink-dim">
+        Thinking is per row, so the same model can deliberate for an essay and answer instantly for a yes/no.
         A fallback can be another <span className="text-ink">model</span> or another <span className="text-ink">provider</span>{" "}
         entirely. Both matter on Gemini&apos;s free tier, where requests-per-day is counted per model — when one
         model&apos;s daily allowance is gone, the same key still has the next one&apos;s.
@@ -561,7 +612,11 @@ function ActionRoute({
             type="checkbox"
             checked={!route}
             onChange={(e) =>
-              setRoute(e.target.checked ? null : { provider: cfg.provider, model: cfg.model, fallbacks: [] })
+              setRoute(
+                e.target.checked
+                  ? null
+                  : { provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, fallbacks: [] }
+              )
             }
           />
           Use default
@@ -575,8 +630,9 @@ function ActionRoute({
       ) : (
         <p className="mt-2 flex items-baseline gap-2 text-xs text-ink-faint">
           <FieldLabel>Following default</FieldLabel>
-          <span className="font-mono">
-            {cfg.provider} / {cfg.model || LLM_DEFAULT_MODELS[cfg.provider]}
+          <span>
+            {LLM_PROVIDER_LABELS[cfg.provider]} ·{" "}
+            {LLM_MODEL_META[cfg.model]?.label ?? cfg.model ?? LLM_DEFAULT_MODELS[cfg.provider]}
           </span>
         </p>
       )}

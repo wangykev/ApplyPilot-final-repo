@@ -12,11 +12,37 @@
 // guess that gets a human review); this file never decides anything about a fill.
 // ============================================================================
 
+// Claude models whose thinking is ON unless told otherwise. Sending {type:"disabled"} to
+// a model that doesn't expect the parameter risks a 400, so this is an allowlist, not a
+// blanket flag. (Opus 4.8/4.7 run WITHOUT thinking when the field is omitted, so they are
+// deliberately absent.)
+const ANTHROPIC_THINKING_DEFAULT_ON = { "claude-opus-5": true, "claude-sonnet-5": true };
+
+// Claude models where the OPERATOR may turn thinking on (adaptive) or off. 4.6-and-newer
+// take {type:"adaptive"}; Haiku 4.5 predates that shape (it wants budget_tokens), so it is
+// NOT adjustable and the setting is ignored for it rather than risking a 400.
+const ANTHROPIC_THINKING_ADJUSTABLE = {
+  "claude-opus-5": true, "claude-sonnet-5": true, "claude-opus-4-8": true, "claude-sonnet-4-6": true
+};
+// Thinking needs room to happen: max_tokens caps thinking PLUS the answer, so leaving this
+// adapter's small budgets (as low as 24) in place would spend the whole allowance on
+// reasoning and return an empty reply. When thinking is ON, floor the budget.
+const ANTHROPIC_THINKING_MIN_TOKENS = 4096;
+function anthropicThinkingWants(model, want, type) {
+  const t = anthropicThinkingFor(model, want);
+  return !!(t && t.type === type);
+}
+function anthropicThinkingFor(model, want) {
+  if (want === "adaptive" && ANTHROPIC_THINKING_ADJUSTABLE[model]) return { type: "adaptive" };
+  if (ANTHROPIC_THINKING_DEFAULT_ON[model]) return { type: "disabled" };
+  return undefined; // older models: omit the parameter entirely
+}
+
 // Per-provider request builders + response parsers. Each returns { url, opts } for
 // fetch and a parse(data)→text. Adding a provider = one entry here, nothing else.
 const LLM_PROVIDERS = {
   anthropic: {
-    build: ({ model, apiKey, system, user, maxTokens }) => ({
+    build: ({ model, apiKey, system, user, maxTokens, thinking }) => ({
       url: "https://api.anthropic.com/v1/messages",
       opts: {
         method: "POST",
@@ -30,7 +56,15 @@ const LLM_PROVIDERS = {
         },
         body: JSON.stringify({
           model,
-          max_tokens: maxTokens || 1024,
+          // max_tokens caps thinking PLUS the answer, so a thinking request needs a real
+          // budget — otherwise reasoning eats a 24-token allowance and the reply comes back
+          // empty, indistinguishable from a broken model.
+          max_tokens: anthropicThinkingWants(model, thinking, "adaptive")
+            ? Math.max(maxTokens || 1024, ANTHROPIC_THINKING_MIN_TOKENS)
+            : (maxTokens || 1024),
+          // Claude 5 thinks by default, so it must be turned OFF explicitly for short
+          // answers; 4.6/4.8 stay off unless the operator asks. See anthropicThinkingFor.
+          thinking: anthropicThinkingFor(model, thinking),
           system: system || undefined,
           messages: [{ role: "user", content: user }]
         })
@@ -309,12 +343,42 @@ function llmRetryAfterMsFromBody(res) {
 // answers correctly, and ~15 RPM is ample for the small screening page; 2.5-flash-lite (highest
 // free RPD) is the high-volume alternative; 3.5-flash = quality.
 const LLM_MODELS = {
-  anthropic: ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
+  anthropic: ["claude-sonnet-5", "claude-opus-5", "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
   gemini: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"]
 };
 // Default = the first listed model per provider (single source of truth — can't drift from the list).
 const LLM_DEFAULT_MODELS = { anthropic: LLM_MODELS.anthropic[0], gemini: LLM_MODELS.gemini[0], openai: LLM_MODELS.openai[0] };
+
+
+// ─── Human labels for the model pickers ─────────────────────────────────────
+// A raw id tells an operator nothing about which to choose — "claude-haiku-4-5-20251001"
+// is noise, and the date suffix actively hurts. Each model gets a display name plus a
+// one-word ROLE, so the dropdown reads as a decision ("most capable" vs "fastest,
+// cheapest") instead of a list of strings. A model missing from here would fall back to
+// its bare id, so a test asserts every entry of LLM_MODELS is covered.
+const LLM_MODEL_META = {
+  "claude-opus-5": { label: "Claude Opus 5", role: "most capable" },
+  "claude-sonnet-5": { label: "Claude Sonnet 5", role: "balanced, recommended" },
+  "claude-opus-4-8": { label: "Claude Opus 4.8", role: "previous generation" },
+  "claude-sonnet-4-6": { label: "Claude Sonnet 4.6", role: "previous generation" },
+  "claude-haiku-4-5-20251001": { label: "Claude Haiku 4.5", role: "fastest, cheapest" },
+
+  "gemini-3.1-flash-lite": { label: "Gemini 3.1 Flash-Lite", role: "fastest, cheapest" },
+  "gemini-3.5-flash-lite": { label: "Gemini 3.5 Flash-Lite", role: "fast" },
+  "gemini-2.5-flash-lite": { label: "Gemini 2.5 Flash-Lite", role: "fast, older" },
+  "gemini-3.6-flash": { label: "Gemini 3.6 Flash", role: "balanced, newest" },
+  "gemini-3.5-flash": { label: "Gemini 3.5 Flash", role: "balanced" },
+  "gemini-2.5-flash": { label: "Gemini 2.5 Flash", role: "balanced, older" },
+  "gemini-2.5-pro": { label: "Gemini 2.5 Pro", role: "most capable" },
+
+  "gpt-4o": { label: "GPT-4o", role: "balanced" },
+  "gpt-4o-mini": { label: "GPT-4o mini", role: "fastest, cheapest" }
+};
+function llmModelLabel(model) {
+  const m = LLM_MODEL_META[model];
+  return m ? m.label : String(model || "");
+}
 
 // ─── Free tier — GEMINI ONLY ────────────────────────────────────────────────
 // Gemini is the only provider of the three that serves a usable free tier, which is why
@@ -347,6 +411,10 @@ function isFreeTierModel(provider, model) { return provider === "gemini" && !!GE
 // are listed. An unlisted model renders as "see pricing" with a link rather than a
 // guessed number — a wrong price on a cost display is worse than no price.
 const LLM_PRICING = {
+  "claude-opus-5": { in: 5, out: 25 },
+  // Sonnet 5 has introductory pricing ($2/$10) through 2026-08-31; the STANDARD rate is
+  // listed so the number doesn't quietly become wrong in a few weeks.
+  "claude-sonnet-5": { in: 3, out: 15 },
   "claude-opus-4-8": { in: 5, out: 25 },
   "claude-sonnet-4-6": { in: 3, out: 15 },
   "claude-haiku-4-5-20251001": { in: 1, out: 5 }
@@ -362,5 +430,7 @@ const LLM_PRICING_URLS = {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
-    GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS };
+    GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
+    LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
+    ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor };
 }

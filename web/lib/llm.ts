@@ -8,10 +8,45 @@
 
 import {
   llmKeysFor, resolveLlmRoute, orderLlmKeys, classifyLlmFailure, applyLlmKeyOutcome, newLlmKeyState,
-  type LlmKey, type LlmKeyState, type LlmAction,
+  type LlmKey, type LlmKeyState, type LlmActionInput, type LlmThinking,
 } from "@/lib/llm-keys";
 
 export type LlmProvider = "anthropic" | "gemini" | "openai";
+
+/**
+ * Claude models whose thinking is ON unless told otherwise (lockstep with llm.js). An
+ * allowlist, not a blanket flag: sending a `disabled` block to a model that doesn't expect
+ * the parameter risks a 400. Opus 4.8/4.7 run without thinking when it's omitted, so
+ * they're deliberately absent.
+ */
+const ANTHROPIC_THINKING_DEFAULT_ON: Record<string, boolean> = {
+  "claude-opus-5": true,
+  "claude-sonnet-5": true,
+};
+
+/**
+ * Claude models where the OPERATOR may turn thinking on (adaptive) or off. 4.6-and-newer
+ * take {type:"adaptive"}; Haiku 4.5 predates that shape, so it is not adjustable and the
+ * setting is ignored for it rather than risking a 400. Lockstep with llm.js.
+ */
+export const ANTHROPIC_THINKING_ADJUSTABLE: Record<string, boolean> = {
+  "claude-opus-5": true,
+  "claude-sonnet-5": true,
+  "claude-opus-4-8": true,
+  "claude-sonnet-4-6": true,
+};
+
+/**
+ * max_tokens caps thinking PLUS the answer, so a thinking request needs a real budget —
+ * otherwise reasoning eats this adapter's small allowances and the reply comes back empty.
+ */
+export const ANTHROPIC_THINKING_MIN_TOKENS = 4096;
+
+export function anthropicThinkingFor(model: string, want?: LlmThinking): { type: "adaptive" | "disabled" } | undefined {
+  if (want === "adaptive" && ANTHROPIC_THINKING_ADJUSTABLE[model]) return { type: "adaptive" };
+  if (ANTHROPIC_THINKING_DEFAULT_ON[model]) return { type: "disabled" };
+  return undefined;
+}
 
 export type LlmRequest = {
   provider: LlmProvider;
@@ -24,6 +59,8 @@ export type LlmRequest = {
    * Rotation (lockstep with llm.js): when a key LIST is supplied, each key is tried in
    * turn until one answers. Omit it and this is the original single-key path.
    */
+  /** "adaptive" turns Claude thinking on where the model supports it. */
+  thinking?: LlmThinking;
   keys?: LlmKey[];
   preferFreeFirst?: boolean;
   keyState?: LlmKeyState;
@@ -41,7 +78,7 @@ const PROVIDERS: Record<
   { build: (req: LlmRequest) => Built; parse: (data: unknown) => string | null }
 > = {
   anthropic: {
-    build: ({ model, apiKey, system, user, maxTokens }) => ({
+    build: ({ model, apiKey, system, user, maxTokens, thinking }) => ({
       url: "https://api.anthropic.com/v1/messages",
       opts: {
         method: "POST",
@@ -53,7 +90,13 @@ const PROVIDERS: Record<
         },
         body: JSON.stringify({
           model,
-          max_tokens: maxTokens || 1024,
+          max_tokens:
+            anthropicThinkingFor(model, thinking)?.type === "adaptive"
+              ? Math.max(maxTokens || 1024, ANTHROPIC_THINKING_MIN_TOKENS)
+              : maxTokens || 1024,
+          // Claude 5 thinks by default so it must be turned OFF for short answers; 4.6/4.8
+          // stay off unless the operator asks. Lockstep with llm.js.
+          thinking: anthropicThinkingFor(model, thinking),
           system: system || undefined,
           messages: [{ role: "user", content: user }],
         }),
@@ -248,7 +291,7 @@ export async function callLLM(req: LlmRequest, fetchImpl: typeof fetch = fetch):
  */
 export async function callLLMForAction(
   config: unknown,
-  action: LlmAction,
+  action: LlmActionInput,
   prompt: { system?: string; user: string; maxTokens?: number },
   fetchImpl: typeof fetch = fetch
 ): Promise<LlmResult> {
@@ -268,6 +311,7 @@ export async function callLLMForAction(
       {
         provider: attempt.provider,
         model: attempt.model,
+        thinking: attempt.thinking,
         apiKey: "",
         keys,
         preferFreeFirst: cfg.preferFreeFirst !== false,
@@ -285,10 +329,42 @@ export async function callLLMForAction(
 
 // The ONLY place model ids live (matches llm.js). First entry = provider default.
 export const LLM_MODELS: Record<LlmProvider, string[]> = {
-  anthropic: ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
+  anthropic: ["claude-sonnet-5", "claude-opus-5", "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
   gemini: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"],
 };
+
+
+/**
+ * Human labels for the model pickers (lockstep with llm.js). A raw id tells an operator
+ * nothing about which to pick — "claude-haiku-4-5-20251001" is noise, and the date suffix
+ * actively hurts. Each model gets a display name plus a one-word ROLE so the dropdown
+ * reads as a decision ("most capable" vs "fastest, cheapest") rather than a list of
+ * strings. A model missing from here falls back to its bare id, so a test asserts every
+ * entry of LLM_MODELS is covered.
+ */
+export const LLM_MODEL_META: Record<string, { label: string; role: string }> = {
+  "claude-opus-5": { label: "Claude Opus 5", role: "most capable" },
+  "claude-sonnet-5": { label: "Claude Sonnet 5", role: "balanced, recommended" },
+  "claude-opus-4-8": { label: "Claude Opus 4.8", role: "previous generation" },
+  "claude-sonnet-4-6": { label: "Claude Sonnet 4.6", role: "previous generation" },
+  "claude-haiku-4-5-20251001": { label: "Claude Haiku 4.5", role: "fastest, cheapest" },
+
+  "gemini-3.1-flash-lite": { label: "Gemini 3.1 Flash-Lite", role: "fastest, cheapest" },
+  "gemini-3.5-flash-lite": { label: "Gemini 3.5 Flash-Lite", role: "fast" },
+  "gemini-2.5-flash-lite": { label: "Gemini 2.5 Flash-Lite", role: "fast, older" },
+  "gemini-3.6-flash": { label: "Gemini 3.6 Flash", role: "balanced, newest" },
+  "gemini-3.5-flash": { label: "Gemini 3.5 Flash", role: "balanced" },
+  "gemini-2.5-flash": { label: "Gemini 2.5 Flash", role: "balanced, older" },
+  "gemini-2.5-pro": { label: "Gemini 2.5 Pro", role: "most capable" },
+
+  "gpt-4o": { label: "GPT-4o", role: "balanced" },
+  "gpt-4o-mini": { label: "GPT-4o mini", role: "fastest, cheapest" },
+};
+
+export function llmModelLabel(model: string): string {
+  return LLM_MODEL_META[model]?.label ?? String(model || "");
+}
 
 /**
  * Free tier — GEMINI ONLY (lockstep with llm.js). Gemini is the only one of the three
@@ -330,6 +406,10 @@ export function isFreeTierModel(provider: string, model: string): boolean {
  * than no number.
  */
 export const LLM_PRICING: Record<string, { in: number; out: number }> = {
+  "claude-opus-5": { in: 5, out: 25 },
+  // Sonnet 5 has introductory pricing ($2/$10) through 2026-08-31; the STANDARD rate is
+  // listed so the number doesn't quietly go wrong in a few weeks.
+  "claude-sonnet-5": { in: 3, out: 15 },
   "claude-opus-4-8": { in: 5, out: 25 },
   "claude-sonnet-4-6": { in: 3, out: 15 },
   "claude-haiku-4-5-20251001": { in: 1, out: 5 },

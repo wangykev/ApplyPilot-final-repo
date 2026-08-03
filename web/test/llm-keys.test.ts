@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import {
   LLM_KEY_COOLDOWN, LLM_ACTIONS, llmKeysFor, newLlmKeyState, orderLlmKeys,
-  classifyLlmFailure, applyLlmKeyOutcome, resolveLlmRoute, type LlmKey,
+  classifyLlmFailure, applyLlmKeyOutcome, resolveLlmRoute, LLM_ACTION_ALIASES, type LlmKey,
 } from "../lib/llm-keys";
 import {
   LLM_DEFAULT_MODELS, LLM_MODELS, GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING,
+  LLM_MODEL_META,
 } from "../lib/llm";
 
 // The extension's copies. llm-keys.ts is a LOCKSTEP dup of llm-keys.js and llm.ts of
@@ -71,7 +72,9 @@ test("LOCKSTEP — resolveLlmRoute agrees across both copies", () => {
   const configs: unknown[] = [
     { provider: "gemini", model: "gemini-3.1-flash-lite" },
     { provider: "gemini", model: "gemini-3.1-flash-lite", fallbacks: [{ provider: "gemini", model: "gemini-2.5-flash-lite" }, { provider: "anthropic", model: "claude-sonnet-4-6" }] },
-    { provider: "gemini", routes: { teach: { provider: "anthropic" } } },
+    { provider: "gemini", routes: { essay: { provider: "anthropic" } } },
+    // teach is an alias for fill — both copies must agree it rides fill's route.
+    { provider: "openai", model: "gpt-4o", routes: { fill: { provider: "gemini", model: "gemini-2.5-flash-lite" } } },
     { provider: "gemini", model: "x", routes: { cover_letter: { provider: "anthropic", model: "claude-opus-4-8", fallbacks: [{ provider: "openai", model: "gpt-4o" }] } } },
     {},
   ];
@@ -105,9 +108,11 @@ test("LOCKSTEP — the model catalog, free tier, and pricing match the extension
   assert.deepEqual(LLM_DEFAULT_MODELS, extLlm.LLM_DEFAULT_MODELS);
   assert.deepEqual(GEMINI_FREE_TIER, extLlm.GEMINI_FREE_TIER);
   assert.deepEqual(LLM_PRICING, extLlm.LLM_PRICING);
+  assert.deepEqual(LLM_MODEL_META, extLlm.LLM_MODEL_META);
   assert.deepEqual(geminiFreeTierModels(), extLlm.geminiFreeTierModels());
   assert.deepEqual(LLM_KEY_COOLDOWN, extKeys.LLM_KEY_COOLDOWN);
   assert.deepEqual([...LLM_ACTIONS], extKeys.LLM_ACTIONS);
+  assert.deepEqual(LLM_ACTION_ALIASES, extKeys.LLM_ACTION_ALIASES);
 });
 
 // ─── The port's own behaviour ───────────────────────────────────────────────
@@ -135,6 +140,21 @@ test("only Gemini has a free tier, and 2.5-pro is not in it", () => {
   assert.equal(isFreeTierModel("gemini", "gemini-2.5-pro"), false);
   assert.equal(isFreeTierModel("anthropic", "claude-sonnet-4-6"), false);
   assert.equal(isFreeTierModel("openai", "gpt-4o"), false);
+});
+
+test("every offerable model has a human label and a role — no raw ids in the picker", () => {
+  // A model in LLM_MODELS but missing from LLM_MODEL_META would render as its bare id
+  // ("claude-haiku-4-5-20251001"), which is exactly the unclear dropdown this replaced.
+  for (const [provider, models] of Object.entries(LLM_MODELS)) {
+    for (const m of models) {
+      const meta = LLM_MODEL_META[m];
+      assert.ok(meta, `${provider}/${m} has no LLM_MODEL_META entry — it would show as a raw id`);
+      // Model ids are all-lowercase; a display name carries capitals ("Gemini 3.1 Flash-Lite",
+      // "GPT-4o"). Cheapest way to catch someone pasting the raw id in as the label.
+      assert.ok(/[A-Z]/.test(meta.label), `${m} label should be a display name, got "${meta.label}"`);
+      assert.ok(meta.role, `${m} needs a role so the option reads as a decision`);
+    }
+  }
 });
 
 test("every free-tier model is offerable and carries real limits", () => {
@@ -224,10 +244,10 @@ test("callLLMForAction falls through to the default when the routed provider has
     keys: { gemini: [twoGeminiKeys[0]] },
     // Routed at OpenAI, but no OpenAI key exists — a per-action override must not be able
     // to break an otherwise working setup.
-    routes: { teach: { provider: "openai", model: "gpt-4o", fallbacks: [] } },
+    routes: { essay: { provider: "openai", model: "gpt-4o", fallbacks: [] } },
   };
   const f = fakeFetch([okGemini("default answered")]);
-  const res = await callLLMForAction(cfg, "teach", { user: "hi" }, f.impl);
+  const res = await callLLMForAction(cfg, "essay", { user: "hi" }, f.impl);
   assert.equal(res.ok, true);
   assert.equal(f.calls.length, 1, "the keyless provider is skipped without a request");
   assert.match(f.calls[0].url, /generativelanguage/);

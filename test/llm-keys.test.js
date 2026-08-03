@@ -6,7 +6,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  LLM_KEY_COOLDOWN, llmKeysFor, newLlmKeyState, orderLlmKeys,
+  LLM_KEY_COOLDOWN, LLM_ACTIONS, LLM_ACTION_ALIASES, llmKeysFor, newLlmKeyState, orderLlmKeys,
   classifyLlmFailure, applyLlmKeyOutcome, resolveLlmRoute
 } = require("../llm-keys.js");
 const { LLM_DEFAULT_MODELS, GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_MODELS } = require("../llm.js");
@@ -200,8 +200,41 @@ test("a free-Gemini chain can hop MODEL then PROVIDER", () => {
   ]);
 });
 
+test("teach RIDES fill's route — including fill's own override, not the global default", () => {
+  // teach is an alias, so setting a model for the fill sets it for teach too. Without the
+  // alias, teach would be an unknown action and fall to the DEFAULT pair — quietly using a
+  // different model from the fill it is meant to mirror.
+  const cfg = {
+    provider: "openai", model: "gpt-4o",                                  // the global default
+    routes: { fill: { provider: "gemini", model: "gemini-2.5-flash-lite", fallbacks: [{ provider: "anthropic", model: "claude-sonnet-4-6" }] } }
+  };
+  assert.deepEqual(
+    resolveLlmRoute(cfg, "teach", LLM_DEFAULT_MODELS).map((a) => a.provider + "/" + a.model),
+    ["gemini/gemini-2.5-flash-lite", "anthropic/claude-sonnet-4-6", "openai/gpt-4o"]
+  );
+  // …and identical to what the fill itself resolves to.
+  assert.deepEqual(resolveLlmRoute(cfg, "teach", LLM_DEFAULT_MODELS), resolveLlmRoute(cfg, "fill", LLM_DEFAULT_MODELS));
+});
+
+test("the action catalog is fill / essay / resume_parse / cover_letter, and teach is an alias", () => {
+  // fill vs essay is the distinction the operator actually cares about: dozens of short
+  // answers per application versus a couple of paragraphs.
+  assert.deepEqual(LLM_ACTIONS, ["fill", "essay", "resume_parse", "cover_letter"]);
+  assert.equal(LLM_ACTION_ALIASES.teach, "fill");
+  assert.equal(LLM_ACTIONS.includes("teach"), false, "teach must not be a routable row");
+});
+
+test("essay routes independently of fill", () => {
+  const cfg = {
+    provider: "gemini", model: "gemini-3.1-flash-lite",
+    routes: { essay: { provider: "anthropic", model: "claude-opus-4-8", fallbacks: [] } }
+  };
+  assert.equal(resolveLlmRoute(cfg, "essay", LLM_DEFAULT_MODELS)[0].model, "claude-opus-4-8");
+  assert.equal(resolveLlmRoute(cfg, "fill", LLM_DEFAULT_MODELS)[0].model, "gemini-3.1-flash-lite");
+});
+
 test("a route with no model falls back to that provider's default", () => {
-  const attempts = resolveLlmRoute({ provider: "gemini", routes: { teach: { provider: "anthropic" } } }, "teach", LLM_DEFAULT_MODELS);
+  const attempts = resolveLlmRoute({ provider: "gemini", routes: { essay: { provider: "anthropic" } } }, "essay", LLM_DEFAULT_MODELS);
   assert.equal(attempts[0].model, LLM_DEFAULT_MODELS.anthropic);
 });
 
@@ -375,4 +408,36 @@ test("a caller still passing a bare apiKey is untouched by any of this", async (
   assert.equal(res.ok, true);
   assert.equal(res.text, "legacy path");
   assert.equal(h.calls.length, 1);
+});
+
+// ─── Claude 5: thinking must be off for short-answer fills ──────────────────
+
+test("Claude 5 requests disable thinking; older Claude models don't get the parameter", async () => {
+  // On Opus 5 / Sonnet 5 thinking is ON by default and max_tokens caps thinking PLUS the
+  // answer — so a 24-token yes/no fill would return an EMPTY reply, looking like a broken
+  // model. Older models must NOT receive the parameter at all: a `disabled` block isn't
+  // accepted everywhere (Haiku 4.5 predates this shape), and a 400 there is a dead key.
+  const bodyFor = async (model) => {
+    let sent = null;
+    const fetchImpl = async (_url, opts) => {
+      sent = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "OK" }] }), headers: { get: () => null } };
+    };
+    const res = await callLLM({ provider: "anthropic", model, apiKey: "sk-ant-x", user: "hi", maxTokens: 24 }, fetchImpl);
+    assert.equal(res.ok, true);
+    return sent;
+  };
+
+  for (const model of ["claude-opus-5", "claude-sonnet-5"]) {
+    assert.deepEqual((await bodyFor(model)).thinking, { type: "disabled" }, `${model} must disable thinking`);
+  }
+  for (const model of ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"]) {
+    assert.equal("thinking" in (await bodyFor(model)), false, `${model} must not receive a thinking block`);
+  }
+});
+
+test("the Anthropic list leads with a current-generation model", () => {
+  // First entry = the default (LLM_DEFAULT_MODELS), so it must not be a previous generation.
+  assert.equal(LLM_MODELS.anthropic[0], "claude-sonnet-5");
+  assert.ok(LLM_MODELS.anthropic.includes("claude-opus-5"));
 });
