@@ -189,6 +189,16 @@ export function explainFill(e: ReviewEntry): string | null {
   const stated = statedFromDetail(e.detail);
   const from = stated ? `Your profile value “${stated}”` : "Your profile value";
 
+  // NEVER say the AI "filled" a field that holds nothing. Live on Copart: a required compensation box
+  // only accepts a number, so the "N/A" placeholder never landed — and the row still read
+  // 'AI filled this as "—"', which is both false and useless to act on. An empty value means the
+  // opposite of filled, whatever the flag says, so tell the operator what to actually do.
+  if ((e.current_value == null || String(e.current_value).trim() === "") && isAiFlag(e)) {
+    return (e.detail && /REFUSED/.test(e.detail))
+      ? "This form refused the placeholder AI tried — it only accepts certain input. Please fill it in."
+      : "AI couldn’t answer this from your profile — please fill it in.";
+  }
+
   // Vocab-match of a value you DID provide (dropdown canonicalize, or a typeahead pick the AI judged
   // genuinely present in the list) — NOT an inference.
   if (flag === "ai-canonicalized" || (flag === "ai-choice" && e.match_tier !== "ai-source-tree"))
