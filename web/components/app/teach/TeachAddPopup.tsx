@@ -115,6 +115,12 @@ export function TeachAddPopup({
     ? ((profile as { answer_ladders?: Record<string, { values?: string[] }> })?.answer_ladders?.[path]?.values ?? [])
     : [];
   const [variants, setVariants] = useState<string[]>(() => dedupWordings([...existingVariants, card.answer]));
+  // BOTH route = two independent teaches. The operator often wants only ONE of them (operator
+  // 2026-08-02) — and emptying a list cannot express that: an empty wordings list would WIPE the
+  // bucket's existing wordings and an empty ladder would CLEAR the variants, which is a different,
+  // destructive thing. So each side is opt-out, both on by default.
+  const [teachWording, setTeachWording] = useState(true);
+  const [teachVariant, setTeachVariant] = useState(true);
 
   // ── non-standard yes/no label: the editable fill-ladder draft (same reorderable editor as the profile
   // page), seeded with the polarity's defaults + the card's label; re-seeded when the Yes/No toggle flips. ──
@@ -149,13 +155,20 @@ export function TeachAddPopup({
       // The field HOLDS a different value → the card's answer is another PHRASING of it, so it goes in
       // the answer-variant ladder; the stored value is left ALONE (overwriting "Asian" with the form's
       // "Asian (not hispanic or latino)" would corrupt the profile). "both" files the wording too.
-      const withVariants = setFieldVariants(profile, path, variants) as Profile;
+      // On the BOTH route each half is written only if it is still ticked; on the VARIANT route
+      // there is only one half and it is always the answer.
+      const doVariant = route === "both" ? teachVariant : true;
+      const doWording = route === "both" ? teachWording : false;
+      const withVariants = doVariant ? (setFieldVariants(profile, path, variants) as Profile) : null;
       const { buckets: withB, bucketId } = ensureModeABucket(buckets, path, card.widget);
-      const next = withB.map((b) => (b.id === bucketId ? { ...b, questions: dedupWordings(wordings) } : b));
+      const next = doWording ? withB.map((b) => (b.id === bucketId ? { ...b, questions: dedupWordings(wordings) } : b)) : withB;
+      const taught = doWording && doVariant ? "wording + answer" : doWording ? "wording" : "answer";
       onConfirm({
-        profile: withVariants,
-        buckets: next,
-        toast: route === "both" ? `Taught — wording + answer for ${fieldLabel} ✓` : `Answer variant added to ${fieldLabel} ✓`,
+        // Omit a half entirely rather than writing it back unchanged — a no-op write is still a write,
+        // and profile/buckets are only persisted when present.
+        ...(withVariants ? { profile: withVariants } : {}),
+        ...(doWording ? { buckets: next } : {}),
+        toast: route === "both" ? `Taught — ${taught} for ${fieldLabel} ✓` : `Answer variant added to ${fieldLabel} ✓`,
       });
     } else if (isField) {
       // wording route — the value's already there, only the phrasing is new
@@ -182,7 +195,9 @@ export function TeachAddPopup({
       : isField && route === "variant"
         ? variants.length > 0
         : isField && route === "both"
-          ? variants.length > 0 && wordings.length > 0
+          ? (teachWording || teachVariant) &&
+            (!teachVariant || variants.length > 0) &&
+            (!teachWording || wordings.length > 0)
           : wordings.length > 0;
 
   const title =
@@ -258,11 +273,14 @@ export function TeachAddPopup({
           <div className="space-y-3">
             <p className="text-xs text-ink-dim">
               This is a new <span className="text-ink">wording</span> AND a new <span className="text-ink">answer phrasing</span> for your{" "}
-              <span className="text-ink">{fieldLabel}</span> — both get taught. Your stored value stays as it is.
+              <span className="text-ink">{fieldLabel}</span>. Untick either one to teach only the other. Your stored value stays as it is.
             </p>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <div className="rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
-                <p className="mb-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">Question bucket</p>
+              <div className={clsx("rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5", !teachWording && "opacity-50")}>
+                <label className="mb-2 flex items-center gap-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">
+                  <input type="checkbox" checked={teachWording} onChange={(e) => setTeachWording(e.target.checked)} />
+                  Question bucket
+                </label>
                 <TagListField
                   label="Question wordings"
                   value={wordings}
@@ -271,8 +289,11 @@ export function TeachAddPopup({
                   placeholder="Add another wording, press Enter"
                 />
               </div>
-              <div className="rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
-                <p className="mb-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">Answer ladder</p>
+              <div className={clsx("rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5", !teachVariant && "opacity-50")}>
+                <label className="mb-2 flex items-center gap-2 font-mono text-[10px] uppercase tracking-label text-ink-dim">
+                  <input type="checkbox" checked={teachVariant} onChange={(e) => setTeachVariant(e.target.checked)} />
+                  Answer ladder
+                </label>
                 <p className="mb-2 text-xs text-ink-faint">
                   Your {fieldLabel}: <span className="font-medium text-ink">{profileValueAt(profile, path) || "—"}</span>
                 </p>
