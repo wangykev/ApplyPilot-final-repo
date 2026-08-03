@@ -26,7 +26,7 @@ create table if not exists public.profiles (
   profile_json      jsonb not null default '{}'::jsonb,
   defaults_json     jsonb not null default '{}'::jsonb,
   job_context_json  jsonb not null default '{}'::jsonb,
-  ai_config         jsonb not null default '{}'::jsonb,  -- {provider,model,apiKey,enabled}
+  ai_config         jsonb not null default '{}'::jsonb,  -- v2: + keys{} routes{} fallbacks[] preferFreeFirst thinking effort (WEBSITE.md); apiKey kept as a legacy mirror
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now()
 );

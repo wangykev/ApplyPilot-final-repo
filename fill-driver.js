@@ -1155,7 +1155,9 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"answer\":\"<your answer>\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}  OR  {\"skip\":true,\"reason\":\"<short reason>\"}";
-  const res = await act.llm({ system, user, maxTokens: 1024 });
+  // action:"essay" — this is the free-text/prose path, routed separately from the short
+  // screening answers every other act.llm call makes (which default to "fill").
+  const res = await act.llm({ system, user, maxTokens: 1024, action: "essay" });
   if (!res || !res.ok) return await declineOrPlaceholder("AI call failed — " + ((res && res.error) || "no reply"));
   const parsed = parseAiText(res.text);
   if (parsed.skip || !parsed.answer) return await declineOrPlaceholder(parsed.reason || "AI returned no answer");

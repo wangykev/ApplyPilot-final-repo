@@ -71,7 +71,10 @@ console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_
 // service worker, so importScripts brings db.js's functions into the SW scope (the
 // popup loads the same file via <script>). Used by the M16.2 attach path to read
 // the stored resume's bytes here, then pass them as a string into the injection.
-importScripts("db.js", "lib.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "ats.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
+// llm-keys.js loads BEFORE llm.js on purpose: callLLM's rotation layer resolves its
+// helpers (orderLlmKeys / classifyLlmFailure / applyLlmKeyOutcome) as globals, and
+// degrades to the original single-key path if they aren't there.
+importScripts("db.js", "lib.js", "llm-keys.js", "llm.js", "gmail.js", "cdp.js", "fill-driver.js", "ats.js", "discover.js"); // db.js = IndexedDB storage; lib.js = pure helpers (parse*, match ladder, onboarding classifiers); llm.js = multi-provider LLM adapter (callLLM); gmail.js = Gmail auto-verify adapter (getAuthToken + readonly REST); cdp.js = CDP substrate (off-loop actuation + onboarding navigation); fill-driver.js = the substrate-agnostic CDP fill brain (needs lib.js loaded first); discover.js = the job-discovery sweep (LinkedIn/Handshake/Simplify → the website queue; needs lib.js for canonicalJobUrl)
 
 // ============================================================================
 // EXTERNAL messages from ApplyPilot Web (the website → extension handoff).
@@ -160,12 +163,22 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
-  // AI config — same shape as the popup's llmConfig.
+  // AI config. The WEBSITE'S AI PAGE OWNS THIS OBJECT — it is stored wholesale, not
+  // merged, because the whole config (default pair, key lists, per-action routes,
+  // fallback chains) is edited there as one unit and a partial merge could leave the
+  // extension holding a route that names a provider whose keys were just removed. The
+  // popup shows it read-only for the same reason.
+  // Also remembers WHERE the config came from, so the popup can offer a link straight to
+  // the AI page without the extension hardcoding a site URL (dev is localhost, and
+  // externally_connectable already restricts who may send this).
   if (type === "AP_SET_LLM") {
     if (!message.llmConfig || typeof message.llmConfig !== "object") {
       sendResponse({ ok: false, error: "no llmConfig" }); return true;
     }
-    chrome.storage.local.set({ llmConfig: message.llmConfig }, () => {
+    const data = { llmConfig: message.llmConfig };
+    const origin = sender && sender.origin ? sender.origin : (sender && sender.url ? new URL(sender.url).origin : "");
+    if (origin) data.webOrigin = origin;
+    chrome.storage.local.set(data, () => {
       const err = chrome.runtime.lastError;
       sendResponse(err ? { ok: false, error: err.message } : { ok: true });
     });
@@ -1209,9 +1222,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // popup sends the current config (test-before-save). No tab/attach needed (direct SW fetch).
   if (message.type === "RUN_LLM_TEST") {
     (async () => {
-      const cfg = message.config || {};
-      console.log("[ApplyPilot][LLM-TEST] testing", cfg.provider, "/", cfg.model, "…");
-      const res = await callLLM({ provider: cfg.provider, model: cfg.model, apiKey: cfg.apiKey, system: "You are a connectivity probe. Reply with exactly: OK", user: "Reply with exactly: OK", maxTokens: 16 });
+      // No config supplied → read the stored one, which the website owns. The popup is a
+      // read-only mirror now, so it asks for a test of what is actually saved.
+      const cfg = message.config || (await getLlmConfig());
+      const keys = typeof llmKeysFor === "function" ? llmKeysFor(cfg, cfg.provider) : [];
+      console.log("[ApplyPilot][LLM-TEST] testing", cfg.provider, "/", cfg.model, "with", keys.length || 1, "key(s) …");
+      const res = await callLLM({
+        provider: cfg.provider, model: cfg.model,
+        keys, apiKey: keys.length ? "" : cfg.apiKey,
+        preferFreeFirst: cfg.preferFreeFirst !== false,
+        system: "You are a connectivity probe. Reply with exactly: OK", user: "Reply with exactly: OK", maxTokens: 16
+      });
       if (res.ok) console.log("[ApplyPilot][LLM-TEST] ✓ reply:", JSON.stringify(res.text));
       else console.log("[ApplyPilot][LLM-TEST] ✗", res.error);
       sendResponse(res);

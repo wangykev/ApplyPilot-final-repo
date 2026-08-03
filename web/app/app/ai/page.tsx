@@ -32,7 +32,7 @@ export default async function AiPage() {
       <PageHeader
         eyebrow="Engine"
         title="AI configuration"
-        description="Pick a provider and model, add your API key, and toggle AI fill. These mirror the extension's AI settings and sync to it."
+        description="Add as many API keys per provider as you like — they're tried in turn, so one hitting its limit doesn't stop a fill. Then give any job its own model. These mirror the extension's AI settings and sync to it."
       />
       <AiConfigForm initial={initial} />
     </div>
