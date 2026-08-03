@@ -8439,3 +8439,35 @@ test("AI-2: a profile with NO autofill_rules (a website-synced one) still genera
   assert.strictEqual(rec.after, "Open to a competitive market rate.");
   assert.notStrictEqual(rec.flag, "ai-text-needs-answer", "it answered, so it is not the needs-answer placeholder");
 });
+const REJ_ERR2 = ["Error-What is your desired compensation The field What is your desired compensation  is required and must have a value."];
+
+test("rejectedValueEntries: the live label carries Workday's INLINE ERROR — match on the prefix", () => {
+  // The real shape after a blocked save: Workday renders its message inside the field wrapper, so the
+  // scan's label no longer equals the title parsed out of that very error. Live this made the whole
+  // reconciler a silent no-op. Keyed by field_id -> fieldName, or a UNIQUE label prefix.
+  const ents = [
+    { field_id: "p3::formField-ded8cb", question_label: "What is your desired compensation *", current_value: "N/A", fill_status: "filled", is_approved: true },
+    { field_id: "p3::formField-fn", question_label: "First Name", current_value: "Kevin", is_approved: true },
+  ];
+  const live = [
+    { fieldName: "ded8cb", label: "What is your desired compensation *Error: The field What is your desired compensation  is required and must have a value.", value: "" },
+    { fieldName: "fn", label: "First Name", value: "Kevin" },
+  ];
+  const r = apMatchLib.rejectedValueEntries(ents, live, REJ_ERR2);
+  assert.deepStrictEqual(r.changed.map((c) => c.was), ["N/A"], JSON.stringify(r.notes));
+  assert.strictEqual(r.entries[0].current_value, "");
+  assert.strictEqual(r.entries[1].current_value, "Kevin");
+});
+
+test("rejectedValueEntries: an ambiguous prefix REFUSES, and every no-op says why", () => {
+  const ents = [{ field_id: "p3::formField-a", question_label: "What is your desired compensation *", current_value: "N/A", is_approved: true }];
+  const amb = [
+    { fieldName: "a", label: "What is your desired compensation (base)*Error: x", value: "" },
+    { fieldName: "b", label: "What is your desired compensation (bonus)*Error: y", value: "" },
+  ];
+  const r = apMatchLib.rejectedValueEntries(ents, amb, REJ_ERR2);
+  assert.strictEqual(r.changed.length, 0, "two candidates -> blanking either could destroy an answer");
+  assert.match(r.notes.join(" "), /ambiguous/);
+  // and a no-op is never silent
+  assert.ok(apMatchLib.rejectedValueEntries(ents, [{ fieldName: "z", label: "Other", value: "" }], REJ_ERR2).notes.length);
+});

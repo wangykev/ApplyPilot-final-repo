@@ -4315,7 +4315,9 @@ async function syncRejectedValues(errorTexts, LOG) {
     const bundle = await new Promise((res) => chrome.storage.local.get("reviewSummary", (r) => res(r && r.reviewSummary)));
     if (!bundle || !Array.isArray(bundle.entries)) return;
     const r = rejectedValueEntries(bundle.entries, live, errorTexts);
-    if (!r.changed.length) return;
+    // Say why nothing changed. A silent no-op here is indistinguishable from "the bundle was already
+    // right", and live it hid a genuine matching failure for a whole run.
+    if (!r.changed.length) { for (const n of (r.notes || [])) LOG(`  (rejected-value check: ${n})`); return; }
     bundle.entries = r.entries;
     bundle.needs_review_count = bundle.entries.filter((e) => e && e.needs_review && !e.is_deleted).length;
     await new Promise((res) => chrome.storage.local.set({ reviewSummary: bundle }, res));

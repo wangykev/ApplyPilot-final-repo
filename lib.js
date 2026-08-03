@@ -424,26 +424,53 @@ function parseErrorFieldName(text) {
 // answer with "" would destroy the human's data to fix a display problem. `liveFields` comes from a
 // fresh cdpPageScan; an empty/failed scan changes nothing (absence of evidence).
 function rejectedValueEntries(entries, liveFields, errorTexts) {
-  const out = { entries: Array.isArray(entries) ? entries : [], changed: [] };
+  const list = Array.isArray(entries) ? entries : [];
   const live = Array.isArray(liveFields) ? liveFields : [];
-  if (!out.entries.length || !live.length) return out;
+  const out = { entries: list, changed: [], notes: [] };
   const titles = (Array.isArray(errorTexts) ? errorTexts : [])
-    .map((t) => parseErrorFieldName(t)).filter(Boolean).map((t) => normalizeLabel(t));
+    .map((t) => parseErrorFieldName(t)).filter(Boolean);
   if (!titles.length) return out;
+  if (!live.length) { out.notes.push("no live field scan — cannot tell what the page kept"); return out; }
   const holds = (v) => v != null && String(v).trim() !== "";
-  const changed = [];
-  const next = out.entries.map((e) => {
-    if (!e || !holds(e.current_value)) return e;
-    const lbl = normalizeLabel(e.question_label || "");
-    if (!lbl || titles.indexOf(lbl) === -1) return e;                 // the error does not name it
-    const f = live.find((x) => normalizeLabel((x && x.label) || "") === lbl);
-    if (!f || holds(f.value)) return e;                               // not on the page, or still holds a value
-    const was = String(e.current_value);
-    changed.push({ label: e.question_label || lbl, was });
+  // An entry's field_id is "<page>::formField-<fieldName>", so the live scan's fieldName identifies it
+  // independently of the LABEL — which is the fragile key here, since the wrapper's text now also
+  // carries Workday's inline error.
+  const nameOf = (e) => String((e && e.field_id) || "").split("formField-").pop() || "";
+  const byName = new Map(), changedIdx = new Map();
+  list.forEach((e, i) => { const n = nameOf(e); if (n) byName.set(n, i); });
+  for (const title of titles) {
+    const want = normalizeLabel(title);
+    // Exact, then fieldName, then a UNIQUE prefix. The prefix tier is the one that matters after a
+    // blocked save: Workday renders its message INSIDE the field wrapper, so the scan's label becomes
+    // "What is your desired compensation *Error: The field ... is required and must have a value." and
+    // no longer equals the title parsed out of that very error. It is a prefix, though, because the
+    // message is appended. Ambiguity refuses rather than guesses — two fields sharing a prefix means we
+    // cannot tell which one the error is about, and blanking the wrong field destroys an answer.
+    let f = live.find((x) => normalizeLabel((x && x.label) || "") === want)
+      || live.find((x) => normalizeLabel((x && x.fieldName) || "") === want);
+    if (!f) {
+      const pre = live.filter((x) => normalizeLabel((x && x.label) || "").indexOf(want) === 0);
+      if (pre.length === 1) f = pre[0];
+      else if (pre.length > 1) { out.notes.push(`"${title}" prefixes ${pre.length} fields on the page — too ambiguous to act on`); continue; }
+    }
+    if (!f) { out.notes.push(`"${title}" is not in the live scan — cannot check what the page kept`); continue; }
+    if (holds(f.value)) { out.notes.push(`"${title}" still holds ${JSON.stringify(String(f.value))} on the page — left alone`); continue; }
+    let idx = f.fieldName != null && byName.has(f.fieldName) ? byName.get(f.fieldName) : -1;
+    if (idx === -1) idx = list.findIndex((e) => e && normalizeLabel(e.question_label || "") === want);
+    if (idx === -1) { out.notes.push(`"${title}" is empty on the page but no bundle entry matches it`); continue; }
+    const e = list[idx];
+    if (!holds(e.current_value)) continue;                       // already honest — nothing to correct
+    changedIdx.set(idx, String(e.current_value));
+  }
+  if (!changedIdx.size) return out;
+  out.entries = list.map((e, i) => {
+    if (!changedIdx.has(i)) return e;
+    const was = changedIdx.get(i);
+    out.changed.push({ label: e.question_label || nameOf(e), was });
     return Object.assign({}, e, {
       current_value: "",
       fill_status: "not_filled",
-      is_approved: false,                                              // an approval of the old value cannot carry
+      is_approved: false,                                         // an approval of the old value cannot carry
       approved_at: null,
       needs_review: true,
       needs_review_reason: "value_rejected",
@@ -452,7 +479,7 @@ function rejectedValueEntries(entries, liveFields, errorTexts) {
         + "cleared it and reported the field as required. Please give an answer this form will accept.",
     });
   });
-  return { entries: next, changed };
+  return out;
 }
 function errorSetUnchanged(a, b) {
   const norm = (arr) => (Array.isArray(arr) ? arr : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean).sort();
