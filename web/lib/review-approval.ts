@@ -45,6 +45,20 @@ export const holdsNoValue = (e: { current_value?: unknown; widget_type?: unknown
   e.current_value == null ||
   String(e.current_value).trim() === "" ||
   (isChoiceWidget(e.widget_type) && isPlaceholderOption(e.current_value));
+/** A checkbox GROUP holds a SET, not a value. Traced live on PSECU's `ethnicityMulti`: checking a
+ *  second option leaves BOTH on and both survive Save & Continue, while Caterpillar's OFCCP
+ *  disability group is genuinely pick-one — so the editor must carry whatever the human chose.
+ *  `current_value` stays the JOINED display string (every existing consumer keeps working) and
+ *  `selected_options` is authoritative when present. LOCKSTEP with lib.js groupSelection/join/split. */
+export const GROUP_JOIN = "; ";
+export function groupSelection(entry: { selected_options?: unknown; current_value?: unknown }): string[] {
+  if (Array.isArray(entry?.selected_options)) return entry.selected_options.map((s) => String(s)).filter((s) => s.trim() !== "");
+  const v = entry?.current_value;
+  if (v == null || String(v).trim() === "") return [];
+  return String(v).split(GROUP_JOIN).map((s) => s.trim()).filter(Boolean);
+}
+export const joinGroupValue = (labels: string[]): string =>
+  (Array.isArray(labels) ? labels : []).map((s) => String(s)).filter((s) => s.trim() !== "").join(GROUP_JOIN);
 export function editKindOf(e: ReviewEntry): ReviewEntry["edit_kind"] {
   // An OPERATOR-ADDED entry keeps STICKY "added_entry" provenance — a value edit must
   // NOT flip it to override/filled_blank, so the strict-replay knows the whole entry is

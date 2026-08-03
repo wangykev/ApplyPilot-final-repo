@@ -529,6 +529,43 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // "go to the tab and see what actually happened" verification, machine-readable. CDP
   // attach → atsInjScan (fixed function, no arbitrary code) → detach. Refused mid-run
   // (one debugger client per tab — an attach here would clobber a running walk's).
+  // DEV-ONLY (localhost): experiment on a live Workday checkbox group to learn whether it is
+  // pick-one or multi. Reads the groups, then optionally checks two boxes in turn and reports the
+  // state after each — "trace the real DOM before writing a handler" applied to an INTERACTION rule
+  // rather than a shape. Never submits, never clicks anything but the boxes it is told to.
+  if (type === "AP_DEV_WD_PROBE") {
+    (async () => {
+      if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
+      let tabId = Number(message.tabId) || 0;
+      if (!tabId && message.urlContains) {
+        const tabs = await new Promise((r) => chrome.tabs.query({}, r));
+        const hit = (tabs || []).find((t) => t.url && t.url.includes(String(message.urlContains)));
+        if (hit) tabId = hit.id;
+      }
+      if (!tabId) { sendResponse({ ok: false, error: "no tab matched" }); return; }
+      try {
+        const attached = await cdpAttach(tabId);
+        if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
+        const steps = [];
+        let groups = await cdpEval(cdpDevGroups);
+        steps.push({ step: "initial", groups });
+        const target = (groups || []).find((g) => !message.fieldName || g.fieldName === message.fieldName);
+        if (target && Array.isArray(message.checkIds)) {
+          for (const id of message.checkIds) {
+            const r = await cdpEval(cdpDevClickBox, { wrapperSel: target.wrapperSel, id });
+            await cdpDelay(900);
+            groups = await cdpEval(cdpDevGroups);
+            const g = (groups || []).find((x) => x.fieldName === target.fieldName);
+            steps.push({ step: "clicked " + id, click: r, checked: g ? g.boxes.filter((b) => b.checked).map((b) => b.label) : null });
+          }
+        }
+        sendResponse({ ok: true, url: (await new Promise((r) => chrome.tabs.get(tabId, r))).url, steps });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      } finally { await cdpDetach(); }
+    })();
+    return true;
+  }
   if (type === "AP_DEV_ATS_SCAN") {
     (async () => {
       if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }

@@ -1097,10 +1097,16 @@ function cdpPageScan() {
       if (wt === "typeahead" || wt === "hierarchical") { const chip = wr.querySelector('[data-automation-id="selectedItem"]'); return chip ? (chip.textContent || "").trim() : null; }
       if (wt === "checkbox") { const c = wr.querySelector('input[type="checkbox"]'); return c ? !!c.checked : null; }
       if (wt === "radio") { const r = wr.querySelector('input[type="radio"]:checked'); if (!r) return null; const lab = r.id ? wr.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(r.id) : r.id) + '"]') : null; return lab ? (lab.textContent || "").trim() : "selected"; }
-      if (wt === "checkbox_group") { // the CHECKED option's label (radio-like) — the review's "current value"
-        const c = wr.querySelector('input[type="checkbox"]:checked'); if (!c) return null;
-        const lab = c.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(c.id) : c.id) + '"]') : null;
-        return lab ? (lab.textContent || "").trim() : "selected";
+      if (wt === "checkbox_group") { // EVERY checked label, joined — a group can be genuinely MULTI
+        // (PSECU's ethnicityMulti keeps two checked and saves both). Reading only the FIRST :checked
+        // silently dropped the rest, so a two-answer field looked like a one-answer field everywhere
+        // downstream — review, audit, replay.
+        const cs = Array.from(wr.querySelectorAll('input[type="checkbox"]:checked'));
+        if (!cs.length) return null;
+        return cs.map((c) => {
+          const lab = c.id ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(c.id) : c.id) + '"]') : null;
+          return lab ? (lab.textContent || "").trim() : "selected";
+        }).join("; ");
       }
       const segs = Array.from(wr.querySelectorAll('[data-automation-id^="dateSection"][data-automation-id$="-display"]')).map((s) => (s.textContent || "").trim()).filter((t) => t && !/^[MDY]+$/.test(t));
       if (segs.length) return segs.join("/");
@@ -2518,6 +2524,41 @@ function cdpScanOrphanCheckboxes() {
 // inside ONE wrapper (the OFCCP disability self-ID pick-one). Radio-shaped on purpose: the driver's
 // label-exact match + the label-click commit are reused verbatim. The caller is responsible for the
 // pick-one semantics (this tenant requires UNCHECKING the current option before another can be set).
+
+// READ-ONLY inventory of every checkbox GROUP on the page: its wrapper, label, and each box's
+// id/label/checked. Paired with cdpDevClickBox below it answers the one question the scan cannot:
+// does this group allow TWO boxes checked at once?
+function cdpDevGroups() {
+  const out = [];
+  const wraps = Array.from(document.querySelectorAll('[data-automation-id^="formField-"]'));
+  for (const w of wraps) {
+    const boxes = Array.from(w.querySelectorAll('input[type="checkbox"]'));
+    if (boxes.length < 2) continue;
+    const aid = w.getAttribute("data-automation-id") || "";
+    const lab = (w.querySelector("label, legend") || {}).textContent || "";
+    out.push({
+      wrapperSel: '[data-automation-id="' + aid + '"]',
+      fieldName: aid.replace(/^formField-/, ""),
+      label: String(lab).trim().slice(0, 120),
+      groupRole: (w.querySelector('[role="group"]') ? "group" : null),
+      boxes: boxes.map((cb) => ({ id: cb.id || null, checked: !!cb.checked, disabled: !!cb.disabled,
+        label: ((cb.id && document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(cb.id) : cb.id) + '"]')) || {}).textContent || "" })),
+    });
+  }
+  return out;
+}
+
+// Click ONE checkbox's label (native label activation — the same primitive the filler uses) and
+// return the group's state afterwards. Deliberately does NOT uncheck anything first: the point is to
+// see what the PAGE does when a second box is checked.
+function cdpDevClickBox(args) {
+  const w = document.querySelector(args.wrapperSel);
+  if (!w) return { ok: false, error: "wrapper not found" };
+  const lab = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(args.id) : args.id) + '"]');
+  if (!lab) return { ok: false, error: "label not found for " + args.id };
+  lab.click();
+  return { ok: true };
+}
 function cdpReadCheckboxGroupState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;

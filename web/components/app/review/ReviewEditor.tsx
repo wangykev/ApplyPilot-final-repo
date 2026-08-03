@@ -25,6 +25,8 @@ import {
   tokenFor,
   withoutPlaceholderOptions,
   isPlaceholderOption,
+  groupSelection,
+  joinGroupValue,
   requiresApproval,
   approvalEnvelope,
   hasPlaceholder,
@@ -133,14 +135,19 @@ export function ReviewEditor({
   // RESETS approval (re-review) — UNLESS the caller passes { approve: true }, which one-click buttons
   // that write a single self-evident value use (see "Today"). null = cleared.
   const commit = useCallback(
-    (entry: ReviewEntry, val: string | null, opts?: { approve?: boolean }) => {
+    (entry: ReviewEntry, val: string | null, opts?: { approve?: boolean; patch?: Partial<ReviewEntry> }) => {
       const value = val === "" || val == null ? null : val;
-      const merged: ReviewEntry = { ...entry, current_value: value };
+      const merged: ReviewEntry = { ...entry, current_value: value, ...(opts?.patch || {}) };
       const edit_kind = editKindOf(merged);
       const patch: Partial<ReviewEntry> = {
         current_value: value,
         edit_kind,
         is_edited: edit_kind !== null,
+        // Structured state a widget owns alongside the display value — today only a checkbox group's
+        // selected_options, the AUTHORITATIVE set behind the joined current_value. Without threading
+        // it here the array was computed and silently dropped, so a two-option selection persisted as
+        // a joined string with no array, and the replay had to guess by splitting it.
+        ...(opts?.patch || {}),
       };
       // APPROVE IN THE SAME PATCH (operator 2026-07-28: "if today is pressed, automatically approve").
       // A value edit normally RESETS approval — a changed value deserves a fresh look. The exception is a
@@ -577,7 +584,7 @@ export function ReviewEditor({
 // ─────────────────────────────────────────────────────────────────────────────
 // Row context threaded through the tree (avoids prop-drilling the mutators everywhere).
 type RowCtx = {
-  commit: (e: ReviewEntry, v: string | null, opts?: { approve?: boolean }) => void;
+  commit: (e: ReviewEntry, v: string | null, opts?: { approve?: boolean; patch?: Partial<ReviewEntry> }) => void;
   setApproved: (e: ReviewEntry, on: boolean) => void;
   setTiers: (e: ReviewEntry, tiers: string[]) => void;
   registerRow: (id: string, node: HTMLDivElement | null) => void;
@@ -1063,7 +1070,7 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
 function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   const wt = e.widget_type;
   const cur = e.current_value;
-  const onCommit = (v: string | null) => ctx.commit(e, v);
+  const onCommit = (v: string | null, patch?: Partial<ReviewEntry>) => ctx.commit(e, v, patch ? { patch } : undefined);
   // "Today" writes one self-evident value, so it also approves — see commit()'s approve option.
   const onCommitApproved = (v: string | null) => ctx.commit(e, v, { approve: true });
 
@@ -1097,7 +1104,12 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   // the same editors. Its options come from the page scan (read straight from the DOM), so a voluntary
   // self-ID question the bot correctly left BLANK still renders a real picker instead of a textbox.
   // Long legal option labels wrap badly as segmented buttons → always the select.
-  if ((wt === "dropdown" || wt === "radio" || wt === "checkbox_group") && opts.length)
+  // A checkbox GROUP is a SET, and some are genuinely multi (PSECU's ethnicityMulti keeps two
+  // checked and saves both). A <select> could only ever express one, so the review silently
+  // narrowed what the form allows. Render it the way the form does — real checkboxes.
+  if (wt === "checkbox_group" && opts.length)
+    return <CheckboxGroupBox entry={e} options={opts} onCommit={onCommit} />;
+  if ((wt === "dropdown" || wt === "radio") && opts.length)
     return <SelectBox value={cur} options={opts} onCommit={onCommit} />;
   if (wt === "radio" || wt === "checkbox_group") return <TextBox value={cur} onCommit={onCommit} />;
   if (wt === "checkbox")
@@ -1130,6 +1142,44 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   return <TextBox value={cur} onCommit={onCommit} />;
 }
 
+
+// Checkbox GROUP — the form's own shape. Ticking a second option ADDS it (that is what the page
+// does); unticking removes it. The committed value is the joined set, so everything downstream —
+// the submit gate's blank test, the review-page reconcile, the replay — keeps reading one string,
+// while `selected_options` carries the authoritative array.
+function CheckboxGroupBox({
+  entry,
+  options,
+  onCommit,
+}: {
+  entry: ReviewEntry;
+  options: string[];
+  onCommit: (v: string | null, extra?: Partial<ReviewEntry>) => void;
+}) {
+  const selected = groupSelection(entry);
+  const isOn = (o: string) => selected.some((s) => norm(s) === norm(o));
+  const toggle = (o: string) => {
+    // Preserve the FORM's option order, not click order — it is the order a reviewer reads.
+    const next = isOn(o) ? selected.filter((s) => norm(s) !== norm(o)) : [...selected, o];
+    const ordered = options.filter((opt) => next.some((s) => norm(s) === norm(opt)));
+    const extras = next.filter((s) => !options.some((opt) => norm(opt) === norm(s))); // an approved value not on this form
+    const all = [...ordered, ...extras];
+    onCommit(all.length ? joinGroupValue(all) : null, { selected_options: all });
+  };
+  return (
+    <div className="flex flex-col gap-1.5">
+      {options.map((o) => (
+        <label key={o} className="inline-flex cursor-pointer items-start gap-2 text-sm text-ink-dim hover:text-ink">
+          <input type="checkbox" className="ap-check mt-0.5 shrink-0" checked={isOn(o)} onChange={() => toggle(o)} />
+          <span>{o}</span>
+        </label>
+      ))}
+      {selected.length > 1 && (
+        <p className="mt-0.5 font-mono text-[10px] text-ink-faint">{selected.length} selected — this form accepts more than one.</p>
+      )}
+    </div>
+  );
+}
 // ── small editor primitives ──
 function SelectBox({
   value,

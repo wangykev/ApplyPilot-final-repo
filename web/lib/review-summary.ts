@@ -69,6 +69,10 @@ export type ReviewEntry = {
   detail?: string | null;
   options?: string[] | null; // full list, plain dropdowns
   captured_options?: string[] | null; // partial filtered set, typeaheads
+  // checkbox_group: the AUTHORITATIVE selection, because a group can hold more than one (traced live
+  // on PSECU's ethnicityMulti — two options checked, both saved). current_value stays the joined
+  // display string so the blank tests / submit gate / review reconcile keep reading one value.
+  selected_options?: string[] | null;
   tree_structure?: TreeStructure; // cert/source tree-AI (chosen category + leaves)
   date_order?: string[] | null; // segment order for the segmented date editor
   tiers?: string[] | null; // ordered candidate list for a hierarchical/tree field

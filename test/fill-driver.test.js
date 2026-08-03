@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -516,12 +516,16 @@ function makeFakeAct(fields, opts) {
       if (f.radioClickRectDead) return false;
       if (f.radioClickNoCommit) return true;
       if (f.widgetType === "checkbox_group") {
-        // Model the LIVE tenant quirk: a checkbox TOGGLES, and while another option is checked the
-        // tenant REFUSES a second check (the operator had to uncheck the current one first).
+        // BOTH shapes exist and the fake has to model both (2026-08-03). Default is ordinary checkbox
+        // semantics — a toggle, several can be on at once — which is what PSECU's ethnicityMulti does
+        // live ("Asian" + "White" both checked, both saved). `pickOne: true` reproduces the
+        // Caterpillar tenant quirk: while another option is checked a second check is REFUSED, so the
+        // caller must uncheck first. The fake used to hardcode the quirk, which is precisely the
+        // assumption that hid the multi case.
         const me = f.options.find((o) => o.id === id);
         if (!me) return true;
         if (me.checked) { me.checked = false; return true; }          // toggle OFF
-        if (f.options.some((o) => o.checked)) return true;            // refuses while another is checked
+        if (f.pickOne && f.options.some((o) => o.checked)) return true; // pick-one tenant refuses
         me.checked = true;
         return true;
       }
@@ -5973,7 +5977,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
+const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -8535,4 +8539,102 @@ test("canonicalJobUrl: existing key shapes are byte-identical", () => {
   assert.strictEqual(canonicalJobUrl("https://waystar.wd1.myworkdayjobs.com/en-US/Waystar/job/Atlanta-GA/Application-Engineer-Co-Op_R3313-1"), "wd1:r3313");
   assert.strictEqual(canonicalJobUrl("https://job-boards.greenhouse.io/embed/job_app?for=acme&token=12345"), "https://job-boards.greenhouse.io/embed/job_app?token=12345");
   assert.strictEqual(canonicalJobUrl("https://jobs.lever.co/acme/abc-123/apply"), "https://jobs.lever.co/acme/abc-123");
+});
+
+// ── a checkbox GROUP holds a SET (PSECU traced live 2026-08-03) ──────────────
+// Verified by hand on the live form: with "Asian" checked, clicking "White" left BOTH on, and both
+// survived Save & Continue. "I do not wish to answer" is not exclusive either. Caterpillar's OFCCP
+// disability group is the other shape (pick-one), so neither can be assumed.
+const ETH = ["American Indian or Alaska Native", "Asian", "Black or African American", "I do not wish to answer.", "White"];
+const ethBoxes = (checked = []) => ETH.map((t, i) => ({ id: "e" + i, labelText: t, checked: checked.includes(t) }));
+const ethMulti = (checked = [], over = {}) => Object.assign({
+  wrapperSel: "[w-eth]", fieldName: "ethnicityMulti", widgetType: "checkbox_group", isRequired: true,
+  label: "Please select the ethnicity (or ethnicities) which most accurately describe(s) how you identify yourself.",
+  options: ethBoxes(checked), groupOptions: ethBoxes(checked),
+}, over);
+
+test("checkbox group SET: value model round-trips through join/split/selection", () => {
+  assert.deepStrictEqual(apMatchLib.groupSelection({ selected_options: ["Asian", "White"] }), ["Asian", "White"]);
+  assert.strictEqual(apMatchLib.joinGroupValue(["Asian", "White"]), "Asian; White");
+  assert.deepStrictEqual(apMatchLib.splitGroupValue("Asian; White"), ["Asian", "White"]);
+  // an OLDER bundle has no array — its single current_value IS the set, which is what it meant
+  assert.deepStrictEqual(apMatchLib.groupSelection({ current_value: "Asian" }), ["Asian"]);
+  assert.deepStrictEqual(apMatchLib.groupSelection({ current_value: "" }), []);
+});
+
+test("checkbox group SET: the replay checks TWO options when the human approved two", async () => {
+  const act = makeFakeAct([ethMulti()]);
+  const loc = { wrapperSel: "[w-eth]" };
+  const r = await setCheckboxGroupCdp(act, loc, ["Asian", "White"], T_BUDGETS);
+  assert.strictEqual(r.status, "filled", r.detail);
+  assert.deepStrictEqual(r.selected_options.slice().sort(), ["Asian", "White"]);
+  assert.strictEqual(r.after, "Asian; White");
+});
+
+test("checkbox group SET: REMOVE one and CHECK another in a single reconcile", async () => {
+  // The operator's exact case. Starting state has Asian checked; the approved set is White only.
+  const act = makeFakeAct([ethMulti(["Asian"])]);
+  const r = await setCheckboxGroupCdp(act, { wrapperSel: "[w-eth]" }, ["White"], T_BUDGETS);
+  assert.strictEqual(r.status, "filled", r.detail);
+  assert.deepStrictEqual(r.selected_options, ["White"], "Asian was removed, White added");
+});
+
+test("checkbox group SET: swapping one of TWO keeps the other", async () => {
+  const act = makeFakeAct([ethMulti(["Asian", "White"])]);
+  const r = await setCheckboxGroupCdp(act, { wrapperSel: "[w-eth]" }, ["Asian", "Black or African American"], T_BUDGETS);
+  assert.strictEqual(r.status, "filled", r.detail);
+  assert.deepStrictEqual(r.selected_options.slice().sort(), ["Asian", "Black or African American"]);
+});
+
+test("checkbox group SET: already-correct is a no-op, not a re-click", async () => {
+  const act = makeFakeAct([ethMulti(["Asian", "White"])]);
+  const r = await setCheckboxGroupCdp(act, { wrapperSel: "[w-eth]" }, ["White", "Asian"], T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.match(r.detail, /already correct/);
+  assert.ok(!act.log.some(([m]) => m === "clickRadioLabel"), "nothing was actuated");
+});
+
+test("checkbox group SET: a PICK-ONE page that refuses the second box is reported, never passed", async () => {
+  // Caterpillar's shape. The fake refuses to hold two at once, exactly as that tenant does.
+  const f = ethMulti();
+  f.pickOne = true;
+  const act = makeFakeAct([f]);
+  const r = await setCheckboxGroupCdp(act, { wrapperSel: "[w-eth]" }, ["Asian", "White"], T_BUDGETS);
+  assert.strictEqual(r.status, "needs_review", "a partly-applied selection must never read as success");
+  assert.strictEqual(r.flag, "checkbox-group-partial");
+  assert.match(r.detail, /did not accept/);
+});
+
+test("checkbox group SET: an approved option that is not on this form is named, not silently dropped", async () => {
+  const act = makeFakeAct([ethMulti()]);
+  const r = await setCheckboxGroupCdp(act, { wrapperSel: "[w-eth]" }, ["Asian", "Klingon"], T_BUDGETS);
+  assert.strictEqual(r.status, "needs_review");
+  assert.match(r.detail, /not on this form: Klingon/);
+  assert.deepStrictEqual(r.selected_options, ["Asian"], "what DID apply is still reported");
+});
+
+test("checkbox group SET: the review-page reconcile checks EACH option, not the joined string", () => {
+  const entry = { field_id: "p4::formField-ethnicityMulti", question_label: "Ethnicity", widget_type: "checkbox_group",
+    current_value: "Asian; White", selected_options: ["Asian", "White"], is_required: true };
+  // Workday prints them as separate rows — the joined string appears nowhere on the page.
+  const page = [{ section: "Self Identify", label: "Ethnicity", value: "Asian" }, { section: "Self Identify", label: "Ethnicity", value: "White" }];
+  const ok = reconcileReviewPage(page, [entry]);
+  assert.strictEqual(ok.missing_on_review.length, 0, JSON.stringify(ok.missing_on_review));
+  assert.strictEqual(ok.agree.length, 1);
+  // one of the two genuinely absent => MISSING, naming which
+  const half = reconcileReviewPage([{ section: "Self Identify", label: "Ethnicity", value: "Asian" }], [entry]);
+  assert.strictEqual(half.missing_on_review.length, 1);
+  assert.match(half.missing_on_review[0].detail, /White/);
+});
+
+test("checkbox group SET: a LEGACY bundle (joined string, no array) still replays both options", async () => {
+  // Bundles written before selected_options existed hold only the joined current_value, so it has to be
+  // split back apart. Both copies of groupSelection must agree about that — lib.js did not split at
+  // first and the legacy replay silently applied nothing.
+  assert.deepStrictEqual(apMatchLib.groupSelection({ current_value: "Asian; White" }), ["Asian", "White"]);
+  const act = makeFakeAct([ethMulti([], { wrapperSel: '[data-automation-id="formField-eth"]' })]);
+  const r = await replayField(act, { field_id: "p4::formField-eth", widget_type: "checkbox_group",
+    current_value: "Asian; White", question_label: "Ethnicity" }, T_BUDGETS);
+  assert.strictEqual(r.status, "filled", r.detail);
+  assert.deepStrictEqual(r.selected_options.slice().sort(), ["Asian", "White"]);
 });

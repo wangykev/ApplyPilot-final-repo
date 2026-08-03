@@ -34,6 +34,8 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
       // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
       parseYearMonthDay: parseYearMonthDay,
+      // a checkbox GROUP holds a SET — the join/split must agree everywhere
+      groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // The AI's option list must never include a menu's prompt row ("Select One").
       isPlaceholderOption: isPlaceholderOption, withoutPlaceholderOptions: withoutPlaceholderOptions };
 
@@ -1677,6 +1679,7 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
     detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
   return { status: "filled", after, verified: true, matchTier: "label-exact", options: optionLabels,
+    selected_options: on.map((o) => o.labelText),
     detail: before && before !== after ? `label-click (replaced "${before}")` : "label-click" };
 };
 
@@ -1821,6 +1824,62 @@ const aiFillCheckboxGroup = async (act, loc, f, profile, jobContext, budgets) =>
     flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf, ...hint,
     detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + cr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
     options: optionLabels, auditLoc: loc.wrapperSel };
+};
+
+// Reconcile a checkbox GROUP to EXACTLY `wanted` (2026-08-03) — the replay's actuator, because the
+// human's selection is a SET and may hold more than one option.
+//
+// fillCheckboxGroupCdp above stays as it is: the FILL and the AI pick a single value from a ladder,
+// and unchecking the rest is right for them. This one starts from the approved set instead, checks
+// what is missing and unchecks what is extra — so "remove one and check another" is one operation,
+// not a re-pick.
+//
+// It does NOT assume the page will accept the whole set. A pick-one group (Caterpillar's OFCCP
+// disability self-ID) refuses a second check, so asking for two there ends with fewer boxes on than
+// asked for — and that is reported as needs_review naming the difference, never as success. Silence
+// about a partly-applied selection would be the worst outcome: the review says two, the form holds
+// one, and nothing notices.
+const setCheckboxGroupCdp = async (act, loc, wanted, budgets) => {
+  if (!act.readCheckboxGroup) return { status: "needs_review", detail: "substrate cannot read a checkbox group" };
+  const want = (Array.isArray(wanted) ? wanted : [wanted]).map((w) => String(w == null ? "" : w)).filter((w) => w.trim() !== "");
+  let opts = await act.readCheckboxGroup(loc);
+  if (!opts || !opts.length) return { status: "error", detail: "no checkboxes in wrapper" };
+  const optionLabels = opts.map((o) => o.labelText);
+  const before = opts.filter((o) => o.checked).map((o) => o.labelText);
+  // Resolve each wanted label to a real box, label-exact (the same rule the pick-one filler uses).
+  const targets = [], missing = [];
+  for (const w of want) {
+    const hit = opts.find((o) => o.labelText.toLowerCase() === w.toLowerCase());
+    if (hit) targets.push(hit); else missing.push(w);
+  }
+  if (missing.length && !targets.length) return { status: "needs_review", after: apMatch.joinGroupValue(before), options: optionLabels,
+    detail: "none of the approved options exist on this form (" + missing.join("; ") + ")" };
+  const wantIds = new Set(targets.map((t) => t.id));
+  // UNCHECK the extras first: on a pick-one group a stale check is exactly what blocks the new one.
+  for (const o of opts) {
+    if (!o.checked || wantIds.has(o.id)) continue;
+    await act.clickRadioLabel(loc, o.id); // label-click — native activation, same primitive as radio
+    await pollCheckedIs(act, o.id, false, budgets);
+  }
+  for (const t of targets) {
+    const now = (await act.readCheckboxGroup(loc)) || [];
+    if ((now.find((o) => o.id === t.id) || {}).checked) continue;
+    await act.clickRadioLabel(loc, t.id);
+    await pollCheckedIs(act, t.id, true, budgets);
+  }
+  opts = (await act.readCheckboxGroup(loc)) || [];
+  const on = opts.filter((o) => o.checked).map((o) => o.labelText);
+  const after = apMatch.joinGroupValue(on);
+  const norm = (a) => a.map((x) => String(x).toLowerCase()).sort().join("|");
+  if (norm(on) !== norm(targets.map((t) => t.labelText))) {
+    return { status: "needs_review", after, options: optionLabels, selected_options: on, flag: "checkbox-group-partial",
+      detail: "the form did not accept the approved selection — asked for [" + targets.map((t) => t.labelText).join("; ")
+        + "] and it holds [" + on.join("; ") + "]" + (missing.length ? "; not on this form: " + missing.join("; ") : "") };
+  }
+  if (missing.length) return { status: "needs_review", after, options: optionLabels, selected_options: on, flag: "checkbox-group-partial",
+    detail: "applied [" + on.join("; ") + "] but these approved options are not on this form: " + missing.join("; ") };
+  return { status: "filled", after, verified: true, matchTier: "label-exact", options: optionLabels, selected_options: on,
+    detail: apMatch.joinGroupValue(before) === after ? "already correct" : "set to [" + on.join("; ") + "]" };
 };
 
 // Checkbox: reconcile to the desired boolean (the M22 fillMappedEntry checkbox
@@ -5205,7 +5264,10 @@ function auditActualFromRaw(widgetType, raw) {
     case "text": case "textarea": return { actual: raw ? raw.value : null, readable: !!raw };
     case "dropdown": return { actual: raw ? raw.triggerText : null, readable: !!raw };
     case "checkbox": return { actual: raw ? String(raw.checked) : null, readable: !!(raw && raw.inputId != null) };
-    case "radio": case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; } // checkbox_group is radio-shaped: the CHECKED option's label
+    case "radio": { const ok = Array.isArray(raw) && raw.length > 0; const c = ok && raw.find((o) => o.checked); return { actual: c ? c.labelText : null, readable: ok }; }
+    // a GROUP can hold several — compare the whole set, or a two-answer field reads as a mismatch
+    case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const on = ok ? raw.filter((o) => o.checked).map((o) => o.labelText) : [];
+      return { actual: on.length ? apMatch.joinGroupValue(on) : null, readable: ok }; }
     case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
     case "date": {
       if (!Array.isArray(raw)) return { actual: null, readable: false };
@@ -5260,7 +5322,7 @@ async function auditRefillEntry(act, e, b) {
     case "typeahead": return await fillTypeaheadCdp(act, loc, [exp], b);
     case "hierarchical": return await fillTypeaheadCdp(act, loc, [exp], b); // merged: source uses the unified filler
     case "radio": return await fillRadioCdp(act, loc, [exp], b);
-    case "checkbox_group": return await fillCheckboxGroupCdp(act, loc, [exp], b);
+    case "checkbox_group": return await setCheckboxGroupCdp(act, loc, apMatch.splitGroupValue(exp), b);
     case "checkbox": return await fillCheckboxCdp(act, loc, String(exp) === "true", b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(exp)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
     default: throw new Error("audit re-fill: unsupported widget " + e.widgetType);
@@ -5321,6 +5383,11 @@ async function replayField(act, entry, budgets) {
   if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
   const loc = { wrapperSel: sel };
   const value = entry.current_value;
+  // A checkbox GROUP's answer is a SET. `groupSelection` prefers the authoritative array the review
+  // editor writes and falls back to splitting the joined string for a bundle written before it
+  // existed — so the replay never has to re-derive the human's choice from a display string when the
+  // real one is right there.
+  const groupSet = widget === "checkbox_group" ? apMatch.groupSelection(entry) : null;
   const cleared = entry.edit_kind === "cleared" || value == null || value === "";
 
   // CLEARED (human emptied it, or the approved value is empty): leave blank. A fresh submit form starts
@@ -5371,7 +5438,10 @@ async function replayField(act, entry, budgets) {
     case "dropdown": return await fillDropdownCdp(act, loc, [value], b);
     case "typeahead": case "hierarchical": return await fillTypeaheadCdp(act, loc, [value], b);
     case "radio": return await fillRadioCdp(act, loc, [value], b);
-    case "checkbox_group": return await fillCheckboxGroupCdp(act, loc, [value], b); // pick-one checkbox set: unchecks the current option, then checks the approved one
+    // A group holds a SET: the approved value may name several options ("Asian; White"). Reconcile to
+    // exactly that, so removing one and adding another is a single operation and a partial apply is
+    // reported rather than passing as success.
+    case "checkbox_group": return await setCheckboxGroupCdp(act, loc, groupSet || apMatch.splitGroupValue(value), b);
     case "checkbox": return await fillCheckboxCdp(act, loc, value === true || /^(true|yes)$/i.test(String(value)), b);
     case "date": { const obj = {}; for (const [seg, v] of auditDateSegments(value)) obj[seg.toLowerCase()] = v; return await fillDateCompositeCdp(act, loc, obj, b); }
     default: return { status: "needs_review", detail: "replay: unsupported widget " + widget };
@@ -6352,6 +6422,9 @@ function buildReviewBundle(results, meta) {
       cascade_revealed: !!rec.cascadeRevealed, // M6: this field appeared only AFTER an earlier value committed (cascade re-scan) → the viewer badges it + it FORCES a second review before submit
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
+      // A checkbox GROUP holds a SET; current_value is the joined display string and this is the
+      // authoritative array. Absent for every other widget.
+      selected_options: Array.isArray(rec.selected_options) ? rec.selected_options : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
       remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them
@@ -6433,5 +6506,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { isChoiceWidget, aiFillCheckboxGroup, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

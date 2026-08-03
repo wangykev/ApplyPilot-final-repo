@@ -481,6 +481,50 @@ function rejectedValueEntries(entries, liveFields, errorTexts) {
   });
   return out;
 }
+// A checkbox GROUP holds a SET, not a value (2026-08-03).
+//
+// Traced live on PSECU's `ethnicityMulti`: checking "White" while "Asian" was checked left BOTH on,
+// and both survived Save & Continue. Its label says "the ethnicity (or ethnicities)" and Workday
+// means it. Caterpillar's OFCCP disability group is the other shape — genuinely pick-one — so the
+// code cannot assume either; it has to carry whatever the human chose and reproduce exactly that.
+//
+// The bundle keeps `current_value` as the JOINED display string, so every existing consumer (blank
+// tests, the submit gate, the audit's readable form) keeps working untouched, and adds
+// `selected_options` as the authoritative array. An older bundle has no array — its single
+// current_value is then the set, which is exactly what it meant.
+const GROUP_JOIN = "; ";
+function groupSelection(entry) {
+  if (!entry) return [];
+  if (Array.isArray(entry.selected_options)) return entry.selected_options.map((s) => String(s)).filter((s) => s.trim() !== "");
+  // No array ⇒ a bundle written before selected_options existed. Its current_value is the only record
+  // of the set, so it has to be split back apart — which is exactly why the array exists: splitting is
+  // only sound while no option label contains the separator, and going forward nothing depends on it.
+  // (Must match the web copy in review-approval.ts, which splits here too.)
+  return splitGroupValue(entry.current_value);
+}
+// Join a selection for display / storage in current_value. Order is preserved — it is the order the
+// options appear in on the form, which is the order a human reading the review expects.
+function joinGroupValue(labels) {
+  return (Array.isArray(labels) ? labels : []).map((s) => String(s)).filter((s) => s.trim() !== "").join(GROUP_JOIN);
+}
+// The inverse: a set that arrives as the joined STRING (an older bundle, or current_value) or already
+// as an array. Kept beside joinGroupValue so the two can never disagree about the separator.
+function splitGroupValue(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x)).filter((x) => x.trim() !== "");
+  const s = String(v == null ? "" : v);
+  return s.trim() === "" ? [] : s.split(GROUP_JOIN).map((x) => x.trim()).filter(Boolean);
+}
+// A checkbox GROUP's recorded value is a JOINED set ("Asian; White"), and Workday's review page
+// prints the options separately — so looking for the joined string finds nothing and a correct
+// two-answer field reads as MISSING. Expand a group entry into its individual values before matching.
+function reviewValuesOf(entry) {
+  if (entry && entry.widget_type === "checkbox_group") {
+    const sel = groupSelection(entry);
+    if (sel.length) return sel;
+  }
+  const v = entry && entry.current_value;
+  return v == null || String(v).trim() === "" ? [] : [String(v)];
+}
 function errorSetUnchanged(a, b) {
   const norm = (arr) => (Array.isArray(arr) ? arr : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean).sort();
   const x = norm(a), y = norm(b);
@@ -955,6 +999,23 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
 
     // ── unchecked checkbox → skipped (the review page doesn't render it — absence isn't a bug). ──
     if (wt === "checkbox" && !TRUEISH.test(cvs.trim())) { skipped++; continue; }
+
+    // ── checkbox GROUP: a SET, printed as separate values on the review page. Matching the JOINED
+    //    string would find nothing and call a correct two-answer field MISSING, so each selected
+    //    option is checked on its own and the row AGREES only when every one of them is present.
+    //    A group with a single selection falls through to the normal path unchanged. ──
+    const groupVals = wt === "checkbox_group" ? groupSelection(e) : [];
+    if (groupVals.length > 1) {
+      claimed++; claimedValues.push(...groupVals.map((g) => normalize(g)));
+      const absent = groupVals.filter((g) => {
+        const n = normalize(g);
+        if (n.length >= 4 || (n.length >= 3 && !AMBIGUOUS_SHORT.test(n))) return !presentTier(g);
+        return !items.some((it) => it.nlabel && labelMatches(it.nlabel, nlabel) && valueTier(n, it.nval));
+      });
+      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: "checkbox-group-set" });
+      else missing_on_review.push({ ...base, detail: "not shown on the review page: " + absent.join("; ") });
+      continue;
+    }
 
     // ── AUTHORITATIVE id/entry-scoped match (structured records). Found ⇒ resolve here, NEVER fall
     //    through (a keyed/entry mismatch is a real disagree — falling through to value-presence could
@@ -1617,6 +1678,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
