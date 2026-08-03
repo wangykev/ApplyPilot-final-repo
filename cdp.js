@@ -4012,6 +4012,14 @@ function makeCdpActuation(llmConfig) {
       let last = null;
       for (const attempt of attempts) {
         const keys = typeof llmKeysFor === "function" ? llmKeysFor(llmConfig, attempt.provider) : [];
+        // Name the route BEFORE the call, so a wrong model is visible in the log next to the field it
+        // answered rather than inferred from the answer's quality. Never the key itself — only how many
+        // are available to rotate through, which is what you need when a call fails.
+        console.log(`[LLM] ${attempt.provider} ${attempt.model}` +
+          (attempt.thinking ? ` thinking:${attempt.thinking}${attempt.effort ? "/" + attempt.effort : ""}` : "") +
+          ` for "${action || "fill"}"` +
+          (keys.length ? ` (${keys.length} key${keys.length > 1 ? "s" : ""})` : " (single key)") +
+          (attempts.length > 1 ? ` [attempt ${attempts.indexOf(attempt) + 1}/${attempts.length}]` : ""));
         const res = await callLLM({
           provider: attempt.provider,
           model: attempt.model,
@@ -4029,6 +4037,10 @@ function makeCdpActuation(llmConfig) {
           system, user, maxTokens
         });
         if (res.ok) return res;
+        // A FAILED attempt names itself too — with several models configured as fallbacks, silence
+        // here makes it impossible to tell whether the answer came from your first choice or the
+        // third one down the list.
+        console.log(`[LLM] ${attempt.provider} ${attempt.model} FAILED — ${String((res && res.error) || "no reply").slice(0, 160)}`);
         last = res;
       }
       return last || { ok: false, error: "no AI attempt made" };
