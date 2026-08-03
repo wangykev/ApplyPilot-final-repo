@@ -6,7 +6,8 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { SelectField, FieldLabel } from "@/components/form/fields";
 import {
   LLM_MODELS, LLM_DEFAULT_MODELS, LLM_PROVIDER_LABELS, GEMINI_FREE_TIER, LLM_PRICING, LLM_PRICING_URLS,
-  LLM_MODEL_META, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_EFFORT_LEVELS, type LlmProvider,
+  LLM_MODEL_META, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_EFFORT_LEVELS, GEMINI_STARTER_CHAIN,
+  type LlmProvider,
 } from "@/lib/llm";
 import { LLM_ACTIONS, type LlmAction } from "@/lib/llm-keys";
 import { PROVIDERS, keysForProvider, totalUsableKeys, type AiConfig, type LlmKeyEntry } from "@/lib/ai-config";
@@ -254,16 +255,28 @@ function ProviderKeys({
   const add = () => {
     const secret = newKey.trim();
     if (!secret || keys.some((k) => k.key === secret)) return;
-    setKeys([
-      ...keys,
-      {
-        id: `k${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`,
-        label: newLabel.trim(),
-        key: secret,
-        tier: hasFreeTier ? newTier : "paid",
-        enabled: true,
-      },
-    ]);
+    const entry: LlmKeyEntry = {
+      id: `k${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`,
+      label: newLabel.trim(),
+      key: secret,
+      tier: hasFreeTier ? newTier : "paid",
+      enabled: true,
+    };
+    edit((c) => {
+      const next: AiConfig = { ...c, keys: { ...c.keys, [provider]: [...keys, entry] } };
+      // A FIRST Gemini key gets a working chain out of the box instead of a bare default:
+      // 3.5-flash-lite with 3.1-flash-lite behind it. Requests-per-day is metered per
+      // MODEL, so the fallback doubles the day's headroom on the same key.
+      // Guarded so it can only ever seed a fresh setup, never overwrite a chain the
+      // operator built: first key for this provider, gemini already the default, and no
+      // fallbacks configured yet.
+      const isFirstKeyHere = keys.filter((k) => k.key).length === 0;
+      if (provider === "gemini" && isFirstKeyHere && c.provider === "gemini" && (c.fallbacks?.length ?? 0) === 0) {
+        next.model = GEMINI_STARTER_CHAIN.model;
+        next.fallbacks = [{ provider: "gemini", model: GEMINI_STARTER_CHAIN.fallback, thinking: "off", effort: "" }];
+      }
+      return next;
+    });
     setNewKey("");
     setNewLabel("");
   };

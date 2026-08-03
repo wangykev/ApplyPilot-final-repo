@@ -361,7 +361,7 @@ export async function callLLMForAction(
 // The ONLY place model ids live (matches llm.js). First entry = provider default.
 export const LLM_MODELS: Record<LlmProvider, string[]> = {
   anthropic: ["claude-sonnet-5", "claude-opus-5", "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
-  gemini: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  gemini: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"],
 };
 
@@ -457,6 +457,17 @@ export const LLM_DEFAULT_MODELS: Record<LlmProvider, string> = {
   gemini: LLM_MODELS.gemini[0],
   openai: LLM_MODELS.openai[0],
 };
+
+/**
+ * The chain a fresh Gemini key gets seeded with (lockstep with llm.js). Both are free-tier
+ * with identical allowances (15/min, 500/day), and requests-per-day is metered PER MODEL —
+ * so when the primary's daily 500 is spent the same key still has the fallback's own 500.
+ * That's why the fallback is a sibling MODEL rather than a second key.
+ */
+export const GEMINI_STARTER_CHAIN = {
+  model: "gemini-3.5-flash-lite",
+  fallback: "gemini-3.1-flash-lite",
+} as const;
 
 export const LLM_PROVIDER_LABELS: Record<LlmProvider, string> = {
   gemini: "Google Gemini",

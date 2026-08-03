@@ -7,7 +7,7 @@ import {
 } from "../lib/llm-keys";
 import {
   LLM_DEFAULT_MODELS, LLM_MODELS, GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING,
-  LLM_MODEL_META,
+  LLM_MODEL_META, GEMINI_STARTER_CHAIN,
 } from "../lib/llm";
 
 // The extension's copies. llm-keys.ts is a LOCKSTEP dup of llm-keys.js and llm.ts of
@@ -109,6 +109,7 @@ test("LOCKSTEP — the model catalog, free tier, and pricing match the extension
   assert.deepEqual(GEMINI_FREE_TIER, extLlm.GEMINI_FREE_TIER);
   assert.deepEqual(LLM_PRICING, extLlm.LLM_PRICING);
   assert.deepEqual(LLM_MODEL_META, extLlm.LLM_MODEL_META);
+  assert.deepEqual({ ...GEMINI_STARTER_CHAIN }, extLlm.GEMINI_STARTER_CHAIN);
   assert.deepEqual(geminiFreeTierModels(), extLlm.geminiFreeTierModels());
   assert.deepEqual(LLM_KEY_COOLDOWN, extKeys.LLM_KEY_COOLDOWN);
   assert.deepEqual([...LLM_ACTIONS], extKeys.LLM_ACTIONS);
@@ -155,6 +156,22 @@ test("every offerable model has a human label and a role — no raw ids in the p
       assert.ok(meta.role, `${m} needs a role so the option reads as a decision`);
     }
   }
+});
+
+test("the seeded Gemini chain is two free-tier models, primary first", () => {
+  // A fresh Gemini key gets 3.5-flash-lite with 3.1-flash-lite behind it. Both must be
+  // FREE-TIER (a free key can't reach anything else) and DISTINCT (a fallback to the same
+  // model shares the same per-model daily allowance, so it would buy nothing).
+  const { model, fallback } = GEMINI_STARTER_CHAIN;
+  assert.notEqual(model, fallback);
+  for (const m of [model, fallback]) {
+    assert.ok(isFreeTierModel("gemini", m), m + " must be reachable by a free key");
+    assert.ok(LLM_MODELS.gemini.includes(m), m + " must be offerable");
+  }
+  // The primary is also the provider default, so picking Gemini anywhere lands on it.
+  assert.equal(LLM_DEFAULT_MODELS.gemini, model);
+  // Both carry the same generous free allowance — the point is two separate 500/day pots.
+  assert.equal(GEMINI_FREE_TIER[model].rpd, GEMINI_FREE_TIER[fallback].rpd);
 });
 
 test("every free-tier model is offerable and carries real limits", () => {

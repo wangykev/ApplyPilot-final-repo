@@ -373,11 +373,18 @@ function llmRetryAfterMsFromBody(res) {
 // free RPD) is the high-volume alternative; 3.5-flash = quality.
 const LLM_MODELS = {
   anthropic: ["claude-sonnet-5", "claude-opus-5", "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
-  gemini: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  gemini: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
   openai: ["gpt-4o", "gpt-4o-mini"]
 };
 // Default = the first listed model per provider (single source of truth — can't drift from the list).
 const LLM_DEFAULT_MODELS = { anthropic: LLM_MODELS.anthropic[0], gemini: LLM_MODELS.gemini[0], openai: LLM_MODELS.openai[0] };
+
+// The chain a fresh Gemini key gets seeded with. Both are free-tier with identical
+// allowances (15/min, 500/day), and requests-per-day is metered PER MODEL — so when the
+// primary's daily 500 is gone the same key still has the fallback's own 500. That is the
+// whole reason the fallback is a sibling MODEL rather than a second key.
+const GEMINI_STARTER_CHAIN = { model: "gemini-3.5-flash-lite", fallback: "gemini-3.1-flash-lite" };
+
 
 
 // ─── Human labels for the model pickers ─────────────────────────────────────
@@ -460,7 +467,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
-    LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
+    GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
     ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor, ANTHROPIC_EFFORT_LEVELS,
     ANTHROPIC_EFFORT_MIN_TOKENS, anthropicEffortFor, anthropicMaxTokens };
 }
