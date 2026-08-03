@@ -24,6 +24,7 @@ export function ProfilePanel({
   disabled,
   selectMode,
   onSelectPath,
+  onSelectRemembered,
   onCancelSelect,
   buckets,
   onOpenRemembered,
@@ -49,6 +50,8 @@ export function ProfilePanel({
    *  this is on. */
   selectMode?: boolean;
   onSelectPath?: (path: string, label: string) => void;
+  /** Pick a remembered answer as the target for the current card — its wordings get the question. */
+  onSelectRemembered?: (bucketIndex: number) => void;
   onCancelSelect?: () => void;
 }) {
   const rows = flattenProfileFields(profile);
@@ -94,7 +97,7 @@ export function ProfilePanel({
   const rememberedIn = (sectionKey: string) =>
     remembered.filter((r) => MERGED_CATEGORY_SECTION[r.category] === sectionKey).map((r) => r.row);
   const ownBoxCats = Array.from(new Set(remembered.filter((r) => !MERGED_CATEGORY_SECTION[r.category]).map((r) => r.category)));
-  const common = { onOpenBucket, onOpenAnswer, disabled, highlightPath, selectMode: !!selectMode, onSelectPath };
+  const common = { onOpenBucket, onOpenAnswer, disabled, highlightPath, selectMode: !!selectMode, onSelectPath, onSelectRemembered };
   const anyContent = sections.length > 0 || websiteRows.length > 0 || skills || employers || remembered.length > 0;
 
   // Auto-scroll the recommended (highlighted) row into view within this panel, so the teach card on
@@ -127,7 +130,7 @@ export function ProfilePanel({
       {selectMode ? (
         <div className="mt-2 flex items-center justify-between gap-3 rounded-lg border border-amber/40 bg-amber/10 px-3 py-2">
           <p className="text-xs text-ink">
-            Pick the field this answer belongs to — <span className="text-ink-dim">click any field below</span>.
+            Pick where this answer belongs — <span className="text-ink-dim">click any field or saved answer below</span>.
           </p>
           {onCancelSelect && (
             <button type="button" onClick={onCancelSelect} className="btn-ghost px-2 py-1 text-xs">
@@ -197,6 +200,7 @@ function FieldBox({
   selectMode,
   onSelectPath,
   onOpenRemembered,
+  onSelectRemembered,
 }: {
   label: string;
   rows: FieldRowData[];
@@ -207,6 +211,7 @@ function FieldBox({
   selectMode?: boolean;
   onSelectPath?: (path: string, label: string) => void;
   onOpenRemembered?: (bucketIndex: number) => void;
+  onSelectRemembered?: (bucketIndex: number) => void;
 }) {
   return (
     <div>
@@ -218,13 +223,24 @@ function FieldBox({
           const meta = profileFieldMeta(r.path, undefined);
           const remIdx = rememberedIndexOf(r.path); // >= 0 ⇒ a remembered answer, not a profile field
           if (selectMode && remIdx >= 0) {
-            // Not a retarget target: "pick the field this answer belongs to" has no meaning for
-            // another remembered answer. Shown, but inert, so the list stays complete.
+            // A saved answer IS a valid target: a form asking the same thing in different words
+            // should join that answer's wordings rather than spawn a duplicate (operator
+            // 2026-08-02). It files as kind:"existing" — the wording goes to this bucket.
             return (
-              <div key={r.path} className="flex items-baseline justify-between gap-3 px-3 py-1.5 opacity-40">
+              <button
+                key={r.path}
+                type="button"
+                disabled={disabled}
+                onClick={() => onSelectRemembered && onSelectRemembered(remIdx)}
+                title={`Add this question to "${r.label}"`}
+                className={clsx(
+                  "flex w-full items-baseline justify-between gap-3 px-3 py-1.5 text-left transition-colors",
+                  "hover:bg-amber/15 focus:bg-amber/15 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60",
+                )}
+              >
                 <span className="truncate text-sm text-ink-dim">{r.label}</span>
                 <span className="block max-w-[55%] truncate font-mono text-xs text-ink-faint">{r.value || "—"}</span>
-              </div>
+              </button>
             );
           }
           if (selectMode) {

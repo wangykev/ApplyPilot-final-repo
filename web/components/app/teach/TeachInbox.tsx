@@ -410,12 +410,20 @@ export function TeachInbox({
               <div className="mt-4 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
                 <p className="text-xs text-ink-dim">
                   This looks like a <span className="font-medium text-ink">new answer</span> — no existing field matched.
-                  Save it below, or click a field on the right to attach it there.
+                  Save it as its own answer, or file it under something you already have.
                 </p>
+                {/* "No match" is the AI's guess, and it is wrong often enough to be worth doubting —
+                    live it offered "Carnegie Mellon University" as a NEW answer while
+                    education.0.school_or_university sat right there (operator 2026-08-02). This card
+                    used to have no route into select mode at all, so the only move it offered was the
+                    wrong one. */}
                 <div className="mt-2.5 flex flex-wrap gap-2">
                   <button onClick={() => setNewOpen(true)} className="btn-primary" disabled={saving}>
                     <Plus className="h-4 w-4" />
                     Save as a new answer
+                  </button>
+                  <button onClick={() => setRetarget(true)} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving || retarget}>
+                    {retarget ? "Pick one on the right →" : "Use an existing field"}
                   </button>
                 </div>
               </div>
@@ -436,6 +444,7 @@ export function TeachInbox({
         selectMode={retarget}
         onCancelSelect={() => setRetarget(false)}
         onSelectPath={(path) => { setRetarget(false); setConfirm({ target: { kind: "field", path, label: humanize(path) } }); }}
+        onSelectRemembered={(i) => { const b = buckets[i]; if (!b) return; setRetarget(false); setConfirm({ target: { kind: "existing", id: b.id } }); }}
       />
 
       {/* question bucket — the question wordings that map to a field's answer (the ANSWER LADDER is a
