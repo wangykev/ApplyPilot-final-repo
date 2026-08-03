@@ -212,6 +212,9 @@ export function explainFill(e: ReviewEntry): string | null {
     return `A legally-loaded question your profile doesn’t answer directly — AI reasoned from your profile and answered “${chose}”. Verify carefully.`;
   if (flag === "ai-eeo-guess")
     return `You didn’t state this in your profile — AI guessed “${chose}” from what it knows about you. Verify or clear it.`;
+  // A market-rate ESTIMATE, not something your profile said — the reviewer needs to know which.
+  if (flag === "ai-estimate")
+    return `Your profile states no figure, so AI estimated the market rate for this role — “${chose}”. This is a guess at YOUR ask: check it before you submit.`;
   if (flag === "ai-text-needs-answer" || needsAnswer(e))
     return `AI couldn’t answer this from your profile — please fill it in.`;
   if (flag === "ai-choice-other")

@@ -532,6 +532,19 @@ function reviewValuesOf(entry) {
   const v = entry && entry.current_value;
   return v == null || String(v).trim() === "" ? [] : [String(v)];
 }
+// A COMPENSATION question — the one required free-text field the profile routinely cannot answer
+// (live: Copart "What is your desired compensation?", clearesult "What is your salary expectation").
+// Recognised by wording so the AI can be asked for a market-rate ESTIMATE instead of declining and
+// stranding the page. Requires a money word AND an asking word, so "salary history" or a benefits
+// blurb does not match — a wrong hit here would put a number in a box that wanted something else.
+const COMP_MONEY_RE = /\b(salary|compensation|pay|wage|rate|remuneration)\b/i;
+const COMP_ASK_RE = /\b(expect\w*|desired|desire|require\w*|request\w*|seeking|sought|target|preferred|asking|minimum|range|what is your|how much)\b/i;
+function isCompensationQuestion(label) {
+  const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  if (/\bhistory\b/i.test(t)) return false;          // "salary history" is a different (often illegal) ask
+  return COMP_MONEY_RE.test(t) && COMP_ASK_RE.test(t);
+}
 function errorSetUnchanged(a, b) {
   const norm = (arr) => (Array.isArray(arr) ? arr : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean).sort();
   const x = norm(a), y = norm(b);
@@ -1685,7 +1698,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

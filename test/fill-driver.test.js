@@ -8706,3 +8706,39 @@ test("AI-2 placeholder: a field that ACCEPTS N/A still reports it, flagged", asy
   assert.strictEqual(String(rec.after).trim(), "N/A");
   assert.strictEqual(rec.flag, "ai-text-needs-answer");
 });
+
+// ── a required COMPENSATION box gets a market-rate ESTIMATE (operator 2026-08-03) ──
+// The profile states no figure, so the essay prompt correctly refuses to invent one — and the page
+// then strands (live: Copart, clearesult; the "0" placeholder did not survive validation either).
+// "Make the AI guess a salary expectation that is the salary that job will probably pay."
+test("compensation: a required salary box gets an AI estimate, flagged for review", async () => {
+  const f = aiText({ isRequired: true, label: "What is your salary expectation*", textRejects: true });
+  const act = makeFakeAct([f], { aiEnabled: true, ai: "78000" });
+  const rec = (await drivePageFill(act, GEN_ON, {}, { company: "Acme", title: "Energy Engineer III" }, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", "an estimate is never silently trusted");
+  assert.strictEqual(rec.after, "78000");
+  assert.strictEqual(rec.flag, "ai-estimate");
+  assert.match(rec.detail, /ESTIMATED the market rate/);
+});
+
+test("compensation: only a digits figure reaches the form, and prose falls through", async () => {
+  // the model wraps the number in words — take the number, never the sentence
+  const chatty = makeFakeAct([aiText({ isRequired: true, label: "Desired salary*", textRejects: true })],
+    { aiEnabled: true, ai: "Around $82,500 per year" });
+  const r1 = (await drivePageFill(chatty, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(r1.after, "82500", "digits only — a currency symbol or comma is refused by these boxes");
+  // UNKNOWN → no figure invented; falls through to the honest placeholder path
+  const dunno = makeFakeAct([aiText({ isRequired: true, label: "Desired salary*", textRejects: true })],
+    { aiEnabled: true, ai: "UNKNOWN" });
+  const r2 = (await drivePageFill(dunno, GEN_ON, {}, {}, T_BUDGETS)).results[0];
+  assert.notStrictEqual(r2.flag, "ai-estimate");
+});
+
+test("compensation: the recognizer needs BOTH a money word and an asking word", () => {
+  const yes = ["What is your desired compensation?", "What is your salary expectation", "Desired salary",
+    "What pay rate are you seeking?", "Minimum salary required"];
+  const no = ["Please provide your salary history", "Salary and benefits are competitive",
+    "What is your desired start date?", "Why do you want to work here?"];
+  for (const t of yes) assert.ok(apMatchLib.isCompensationQuestion(t), t);
+  for (const t of no) assert.ok(!apMatchLib.isCompensationQuestion(t), t);
+});

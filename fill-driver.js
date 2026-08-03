@@ -33,7 +33,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       sessionLooksDead: sessionLooksDead, isWorkdayMaintenance: isWorkdayMaintenance, unreplacedPlaceholders: unreplacedPlaceholders,
       tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
       // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
-      parseYearMonthDay: parseYearMonthDay,
+      parseYearMonthDay: parseYearMonthDay, isCompensationQuestion: isCompensationQuestion,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // The AI's option list must never include a menu's prompt row ("Select One").
@@ -1170,6 +1170,40 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     return { status: "filled_review", after: r.after != null ? r.after : ph, verified: r.verified === true, flag: "ai-text-needs-answer",
       detail: "REQUIRED, and the AI had no basis for it (" + reason + ") — entered \"N/A\" so the page can advance; replace it or approve the N/A", auditLoc: loc.wrapperSel };
   };
+  // COMPENSATION: the profile almost never states a figure, so the general essay prompt correctly
+  // refuses to invent one — and a required money box then strands the whole page (live: Copart,
+  // clearesult; the "0" placeholder did not survive validation either). Operator 2026-08-03: "make the
+  // AI guess a salary expectation that is the salary that job will probably pay."
+  //
+  // That is a different question from the one the essay prompt refuses. It is not a fact ABOUT the
+  // applicant to be fabricated — it is a market rate for a named role and location, which the model
+  // can reason about, and which a reviewer can sanity-check at a glance. Still a guess at the
+  // applicant's own ask, so it is ALWAYS filled_review and flagged: it reaches review, and the flagged-
+  // field approval gate stands between it and any submit.
+  if (required && apMatch.isCompensationQuestion(f.label)) {
+    const compSys = "You estimate a realistic salary expectation for a job applicant. Given the job (title, company, location, description) and the applicant's profile, reply with the figure a well-informed candidate would put in this box: a MARKET RATE for that role, in that location, at that seniority. Match the PERIOD the question asks for — an hourly rate for an hourly role, otherwise annual. Reply with DIGITS ONLY, no currency symbol, no commas, no range, no words: these boxes commonly reject anything else. If the question clearly wants an hourly figure give hourly; if you truly cannot judge the role, reply UNKNOWN.";
+    const compUser = "Question: " + String(f.label || "")
+      + "\nJob context: " + JSON.stringify(jobContext || {})
+      + "\nApplicant profile (for seniority and location): " + JSON.stringify(profile)
+      + "\n\nReply with digits only, or UNKNOWN.";
+    const cres = await act.llm({ system: compSys, user: compUser, maxTokens: 64, action: "fill" });
+    const raw = cres && cres.ok ? String(cres.text || "").trim() : "";
+    // Take the number the model gave, and nothing else — a stray sentence must never reach the form.
+    const digits = (raw.match(/\d[\d,.]*/) || [""])[0].replace(/[^0-9]/g, "");
+    if (digits && Number(digits) > 0) {
+      const cr = await fillTextCdp(act, loc, digits, budgets, tag);
+      if (cr && cr.status === "filled") {
+        return { status: "filled_review", after: cr.after != null ? cr.after : digits, verified: cr.verified === true,
+          flag: "ai-estimate", confidence: "low", matchTier: "ai_inference",
+          detail: "Your profile states no salary expectation, so AI ESTIMATED the market rate for this role — \""
+            + (cr.after != null ? cr.after : digits) + "\". This is a guess about YOUR ask, not a fact from your"
+            + " profile: check the figure before you submit.", auditLoc: loc.wrapperSel };
+      }
+    }
+    // No usable figure (or it would not commit) → fall through to the placeholder path below, which
+    // reports honestly rather than pretending.
+  }
+
   // Generation master-switch: the operator's autofill_rules allowlist. ABSENT ≠ OFF (2026-08-03).
   //
   // An allowlist that was never written is UNCONFIGURED, not opted out. That distinction is
