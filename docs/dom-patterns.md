@@ -3228,3 +3228,54 @@ pre-Save re-verify now prevents by healing the page — the trace hit its limit 
 past step 4 by hand requires ticking "I have read and accept the Terms and Conditions", which the bot
 must not do on the operator's behalf. Give `AP_DEV_WD_PROBE` a way to reach step 5 itself (it already
 does the check-a-box-and-re-read experiment) and the question closes.
+
+## 2026-08-04 (b) — the self-ID checkbox group: Workday REBUILDS it after a verified fill
+
+Correcting the entry above, which blamed the Language dropdown, and correcting two further guesses of
+mine along the way. The operator settled the first one by hand: with the box already checked, switching
+Language English↔Spanish does NOT uncheck it (the probe agreed — the box stayed checked while every
+label turned Spanish). Then: "I saw the fill click it and immediately after uncheck it."
+
+**Measured, four instrumented runs** (`debugInputTrace` for the click log, `skipPreSaveReverify` so the
+backstop could not hide the failure):
+
+    run  settle  flat fill  group clicked ≈  in initial scan  fill verify  audit             outcome
+    A    2.6s    3.8s       ~6.4s            no               ok           could not re-read HALT
+    B    6.1s    10.9s      ~17s             no               ok           matched           review
+    C    1.3s    7.8s       ~9.1s            YES              ok           matched           review
+    D    2.3s    18.5s      ~20.8s           no               ok           could not re-read HALT
+
+**Timing is not the variable.** D clicked the group ~20.8s after the page arrived and FAILED; B clicked
+at ~17s and passed. So this is not "we click it before it is ready", and no settle-before-clicking gate
+fixes it. Both of those were my hypotheses; both are wrong.
+
+**We do not double-click it either.** The trusted-input log shows exactly ONE click on the group per run,
+then nothing until Save & Continue. The uncheck is not ours.
+
+What the record says on a failing run — the smoking gun, because `currently:` is a LIVE read:
+
+    ⚠ [needs_review] disabilityStatus (checkbox_group) — "Please check one of the boxes below:*"
+       → "No, I do not have a disability and have not had one in the past"
+       | AUDIT: could not re-read to verify
+       | currently: "No, I do not have a disability and have not had one in the past"
+
+So the click LANDED and verified. Then the M40 audit could not read the group at all
+(`readCheckboxGroup` → null when the wrapper is gone, `[]` when it holds no boxes), and by Save time the
+field read `""`. **Workday rebuilds the widget after we fill it, and it comes back empty.** The operator
+watched exactly that: checked, then instantly unchecked. Predictor across all four runs: failure ⟺ "audit
+could not re-read" (2/2 failures, 2/2 passes read fine).
+
+**Fix — the same guard the dropdown commit has always had** ("a momentary pick discarded on
+render-complete is never reported filled"), which the checkbox group never had: after a verified commit,
+re-read on real wall-clock (`delayFull`, since we are waiting on Workday's rebuild); unreadable ⇒
+mid-rebuild, wait and judge when it returns; returned empty ⇒ re-fill and keep confirming; bounded, and
+judged on a FRESH read, never a re-fill's own read-back. A rebuild that keeps eating the value ends
+`needs_review` + `checkbox-group-rebuilt` instead of a false `filled`. Ids are matched by LABEL too — a
+rebuild can re-issue them.
+
+**Verified:** 4 consecutive passes with `skipPreSaveReverify` ARMED, i.e. the pre-Save re-verify could not
+have masked a failed first fill. Against a pre-fix rate of 2 failures in 4, that is ~6% by chance — good
+evidence, not proof; this is a flake and it deserves re-checking whenever page 5 is touched.
+
+**Still open:** what triggers the rebuild. It is asynchronous relative to our fill and to the audit
+(2 of 4 runs), which is why the fix confirms persistence rather than trying to schedule around it.
