@@ -1798,14 +1798,67 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
     await pollCheckedIs(act, target.id, true, budgets);
     now = await readBack();
   }
-  const on = now.filter((o) => o.checked);
-  const after = (on[0] || {}).labelText || null;
+  let on = now.filter((o) => o.checked);
+  let after = (on[0] || {}).labelText || null;
   if (!isOn(target.id)) return { status: "needs_review", detail: `checkbox-group selection did not commit for "${target.labelText}"`, after, options: optionLabels };
   if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
     detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
+
+  // ── 3. PERSISTENCE RE-READ (2026-08-04) ──────────────────────────────────────────────────────────
+  // The dropdown commit has done this for a long time, for exactly this failure: "a momentary pick
+  // discarded on render-complete is never reported filled". The checkbox group never did, so it
+  // reported `filled` off a read taken microseconds after the click.
+  //
+  // Live on waystar.wd1 (2 of 4 runs), traced: the click LANDS and verifies — the record's own live
+  // `currently:` read showed the right box checked — and then Workday REBUILDS the self-ID widget and it
+  // comes back EMPTY. The M40 audit saw the rebuild ("could not re-read to verify": readCheckboxGroup
+  // returns null when the wrapper is gone and [] when it holds no boxes) and by Save time the group read
+  // "". The walk had already banked `filled`, so it clicked Save & Continue and Workday refused the page.
+  // Timing is NOT the variable — a run that clicked the group ~21s after arriving failed while one that
+  // clicked at ~17s passed — so this cannot be fixed by choosing a better moment to click. What is
+  // reliable is confirming the value SURVIVES, and re-filling when the widget was rebuilt under us.
+  //
+  // Wall-clock on purpose (delayFull, never delayRender): we are waiting on Workday's own rebuild, which
+  // takes real time no matter how fast our pacing is — the same rule the M40 audit settle follows.
+  const beat = () => (act.delayFull ? act.delayFull(budgets.groupPersistMs || 700) : act.delay(budgets.groupPersistMs || 700));
+  const rounds = budgets.groupPersistRounds == null ? 3 : budgets.groupPersistRounds;
+  let rebuilt = 0, refills = 0;
+  for (let i = 0; i < rounds; i++) {
+    await beat();
+    const live = await act.readCheckboxGroup(loc);
+    // Unreadable = the widget is mid-rebuild (wrapper gone, or present with no boxes). Not a failure on
+    // its own — wait for it to come back and judge it then.
+    if (!live || !live.length) { rebuilt++; continue; }
+    const hit = live.find((o) => o.id === target.id);
+    // A rebuild can also re-issue the ids, in which case match by LABEL — the label is the stable identity.
+    const byLabel = live.find((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
+    const stillOn = !!((hit || byLabel) || {}).checked;
+    if (stillOn) { now = live; on = live.filter((o) => o.checked); after = (on[0] || {}).labelText || null; continue; }
+    // It came back and our value is GONE — re-fill it, then keep confirming.
+    const again = byLabel || hit;
+    if (!again) break;                                   // the option itself no longer exists — let review own it
+    rebuilt++; refills++;
+    await act.clickRadioLabel(loc, again.id);
+    await pollCheckedIs(act, again.id, true, budgets);
+    now = await readBack();
+    on = now.filter((o) => o.checked);
+    after = (on[0] || {}).labelText || null;
+  }
+  // Final judgement on a FRESH read, never a cached one — the claim being made is about the state the
+  // page is in NOW, and a re-fill's own read-back is exactly the stale snapshot that started this bug.
+  const finalLive = await act.readCheckboxGroup(loc);
+  const finalOn = (finalLive || []).filter((o) => o.checked);
+  const heldTarget = finalOn.some((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
+  if (!finalLive || !finalLive.length) return { status: "needs_review", flag: "checkbox-group-rebuilt", after: null, options: optionLabels,
+    detail: `the widget was rebuilt ${rebuilt}x and never became readable again — cannot confirm "${target.labelText}" stuck` };
+  if (!heldTarget) return { status: "needs_review", flag: "checkbox-group-rebuilt", after: (finalOn[0] || {}).labelText || null, options: optionLabels,
+    detail: `"${target.labelText}" was checked and verified, then the widget was rebuilt ${rebuilt}x and lost it (${refills} re-fill(s) attempted)` };
   return { status: "filled", after, verified: true, matchTier: "label-exact", options: optionLabels,
-    selected_options: on.map((o) => o.labelText),
-    detail: before && before !== after ? `label-click (replaced "${before}")` : "label-click" };
+    selected_options: finalOn.map((o) => o.labelText),
+    ...(refills ? { flag: "checkbox-group-refilled" } : {}),
+    detail: (before && before !== after ? `label-click (replaced "${before}")` : "label-click")
+      + (rebuilt ? `; survived ${rebuilt} widget rebuild(s)${refills ? ` after ${refills} re-fill(s)` : ""}` : "")
+      + `; persistence-confirmed` };
 };
 
 // Radio: label-text exact match (case-insensitive, candidates in order — M22

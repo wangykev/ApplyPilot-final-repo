@@ -514,7 +514,20 @@ function makeFakeAct(fields, opts) {
     // radio / checkbox
     readRadioState: async (loc) => byLoc(loc).options.map((o) => ({ ...o })),
     // checkbox GROUP (pick-one checkbox set — the OFCCP self-ID). Same shape as readRadioState.
-    readCheckboxGroup: async (loc) => { const f = byLoc(loc); return f.options ? f.options.map((o) => ({ ...o })) : null; },
+    // `rebuildScript` models Workday REBUILDING the widget under us (live on waystar 2026-08-04): a queue
+    // consumed one entry per read — "gone" = wrapper missing (null), "empty" = present with no boxes ([]),
+    // "cleared" = comes back with every box UNCHECKED (our value discarded), anything else = read normally.
+    readCheckboxGroup: async (loc) => {
+      const f = byLoc(loc);
+      if (Array.isArray(f.rebuildScript) && f.rebuildScript.length) {
+        const step = f.rebuildScript.shift();
+        log.push(["readCheckboxGroup", step]);
+        if (step === "gone") return null;
+        if (step === "empty") return [];
+        if (step === "cleared") { f.options.forEach((o) => { o.checked = false; }); }
+      }
+      return f.options ? f.options.map((o) => ({ ...o })) : null;
+    },
     clickRadioLabel: async (loc, id) => {
       log.push(["clickRadioLabel", id]);
       const f = byLoc(loc);
@@ -2725,6 +2738,66 @@ test("checkbox group: a MAPPED value checks the matching option (label-exact) an
   assert.strictEqual(rec.after, "Male");
   assert.strictEqual(rec.matchTier, "label-exact");
   assert.strictEqual(field.options.filter((o) => o.checked).length, 1, "exactly ONE option ends checked");
+});
+
+// ── PERSISTENCE RE-READ: Workday REBUILDS the widget after a verified fill (live waystar 2026-08-04) ──
+// The click lands and verifies, then the widget is rebuilt and comes back EMPTY. The dropdown commit has
+// always guarded this ("a momentary pick discarded on render-complete is never reported filled"); the
+// checkbox group reported `filled` off a read taken microseconds after the click, so the walk banked a
+// success and clicked Save & Continue into a page Workday then refused.
+const PRE_LOOP_READS = [null, null, null]; // initial opts + pre-click readBack + post-click readBack
+const genderGroup = (rebuildScript) => {
+  const field = selfIdField({ fieldName: "gender" });
+  field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: false }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  if (rebuildScript) field.rebuildScript = rebuildScript;
+  return field;
+};
+
+test("checkbox group persistence: a rebuild that comes back UNCHECKED is re-filled, not reported filled", async () => {
+  // read #1 = the post-click verify (normal), then the widget is rebuilt with everything cleared.
+  const field = genderGroup([...PRE_LOOP_READS, "cleared"]);
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "re-filled and confirmed: " + rec.detail);
+  assert.strictEqual(rec.after, "Male");
+  assert.strictEqual(rec.flag, "checkbox-group-refilled");
+  assert.match(rec.detail, /rebuild/i);
+  assert.strictEqual(field.options.filter((o) => o.checked).length, 1, "exactly ONE ends checked on the form");
+});
+
+test("checkbox group persistence: a rebuild that KEEPS losing it ends needs_review, never a false filled", async () => {
+  const field = genderGroup([...PRE_LOOP_READS, ...Array(9).fill("cleared")]);
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review", "a value that will not stick must reach review");
+  assert.strictEqual(rec.flag, "checkbox-group-rebuilt");
+  assert.match(rec.detail, /rebuilt/i);
+});
+
+test("checkbox group persistence: unreadable to the end (wrapper gone) is needs_review, not filled", async () => {
+  // The exact live signature: readCheckboxGroup returns null (wrapper missing) — "could not re-read".
+  const field = genderGroup([...PRE_LOOP_READS, ...Array(9).fill("gone")]);
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "checkbox-group-rebuilt");
+  assert.match(rec.detail, /never became readable/i);
+});
+
+test("checkbox group persistence: a transient unreadable beat that comes back CHECKED still passes clean", async () => {
+  // A rebuild we merely observed mid-flight must not be punished — the value survived it.
+  const field = genderGroup([...PRE_LOOP_READS, "empty"]);
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Male");
+  assert.notStrictEqual(rec.flag, "checkbox-group-rebuilt");
+  assert.match(rec.detail, /persistence-confirmed/);
 });
 
 test("checkbox group: replacing a checked option UNCHECKS the current one first (the tenant refuses a second check)", async () => {
