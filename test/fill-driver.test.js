@@ -8830,18 +8830,56 @@ test("review reconcile: a zero-padded date AGREES on the KEYED path, not just th
 // Operator 2026-08-04: with "Electrical Engineering" already committed it typed "Electrical and
 // Computer Engineering" first, found nothing, then moved on — a search the complete scrape had already
 // ruled out. The short-circuit's no-match branch was gated to normal fills only.
+// Reaching that branch needs THREE things the first version of this test had none of: opts.onCapture
+// (without it the whole pre-scrape block is skipped and capturedFull stays null), a capture that
+// carries the non-enumerable `scrapeComplete` the real onCapture stamps on, and the log name the
+// typeahead actually writes (`typeInHier` — not `typeInSourceSearch`/`typeText`, which no fake emits,
+// so the old assertion read an always-empty array and passed with the fix reverted.)
+const completeCapture = (act, loc) => async () => {
+  const sc = await act.scrapeTaOptions(loc);
+  if (!sc.ok) return null;
+  const opts = sc.options.slice();
+  // mirrors captureChoiceOptions: complete = reached the bottom AND not capped
+  Object.defineProperty(opts, "scrapeComplete", { value: !!sc.atBottom && !sc.cappedOut, enumerable: false });
+  return opts;
+};
+
 test("typeahead pre-filled: a provably-absent higher tier is never typed", async () => {
-  const OPTS = ["Electrical Engineering", "Mechanical Engineering", "Computer Science"];
-  const f = srcField({
-    wrapperSel: "[w-fos]",
-    chips: ["Electrical Engineering"],                       // already committed
-    startOptions: OPTS, startAtBottom: true,                 // a COMPLETE scrape
+  const LOC = { wrapperSel: "[w-ta]" };
+  const f = taField({
+    fieldName: "fieldOfStudy",
+    chips: ["Electrical Engineering"],                        // already committed → tier 1 of the list below
+    scrapeOptions: ["Electrical Engineering", "Mechanical Engineering", "Computer Science"], // COMPLETE (atBottom)
   });
   const act = makeFakeAct([f], {});
-  const r = await fillTypeaheadCdp(act, { wrapperSel: "[w-fos]" },
-    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS);
-  const typed = act.log.filter(([m]) => m === "typeInSourceSearch" || m === "typeText").map(([, v]) => String(v));
-  assert.ok(!typed.some((t) => /Computer/.test(t)),
+  const r = await fillTypeaheadCdp(act, LOC,
+    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS,
+    { onCapture: completeCapture(act, LOC) });
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, v]) => String(v));
+  assert.deepStrictEqual(typed, [],
     "the absent higher tier must not be typed — the complete scrape already ruled it out: " + JSON.stringify(typed));
-  assert.match(String(r.after || ""), /Electrical Engineering/, "the prefill is kept, which is the same verdict as before");
+  assert.match(String(r.after || ""), /^Electrical Engineering$/,
+    "the prefill is kept, which is the same verdict the type/Enter walk would have reached");
+});
+
+// The guard on the above: absence must be proven, not assumed. An INCOMPLETE scrape of the same
+// widget must still type the higher tier, because the server may filter to a value the partial
+// list never showed.
+test("typeahead pre-filled: an INCOMPLETE scrape still types the higher tier (absence unproven)", async () => {
+  const LOC = { wrapperSel: "[w-ta]" };
+  const f = taField({
+    fieldName: "fieldOfStudy",
+    chips: ["Electrical Engineering"],
+    scrapeNotAtBottom: true,                                  // partial → cannot prove absence
+    scrapeOptions: ["Electrical Engineering", "Mechanical Engineering"],
+    filterMap: { "Electrical and Computer Engineering": { autoCommit: "Electrical and Computer Engineering" } },
+  });
+  const act = makeFakeAct([f], {});
+  const r = await fillTypeaheadCdp(act, LOC,
+    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS,
+    { onCapture: completeCapture(act, LOC) });
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, v]) => String(v));
+  assert.deepStrictEqual(typed, ["Electrical and Computer Engineering"],
+    "a partial list cannot rule the tier out — it must still be typed");
+  assert.strictEqual(r.after, "Electrical and Computer Engineering", "and the upgrade committed");
 });
