@@ -545,6 +545,26 @@ function isCompensationQuestion(label) {
   if (/\bhistory\b/i.test(t)) return false;          // "salary history" is a different (often illegal) ask
   return COMP_MONEY_RE.test(t) && COMP_ASK_RE.test(t);
 }
+// A SIGNATURE / completion date — the day the form is being filled in, which is always TODAY.
+//
+// Workday's voluntary self-identification pages (disability, veteran) carry a bare "Date" beside the
+// attestation, and a few tenants spell it out ("Today's Date", "Date Signed"). It is not a fact to
+// look up or a preference to guess: the applicant is completing the form now. Live on Asuep the AI
+// guessed 8/10/2026 — a FUTURE date on a form being attested to today (operator 2026-08-04).
+//
+// Deliberately narrow. A bare "date" matches, and the explicit signature wordings match, but anything
+// that names a DIFFERENT event does not — start date, birth date, graduation, expiry, from/to. Those
+// are real questions with real answers, and quietly stamping today on one would be a wrong answer
+// rather than a missing one.
+const SIG_DATE_RE = /^(?:today'?s?\s+)?date(?:\s*(?:signed|of\s+signature|completed|of\s+completion))?$/i;
+const SIG_DATE_EXPLICIT_RE = /\b(date\s+signed|signature\s+date|date\s+of\s+signature|today'?s\s+date|date\s+completed|date\s+of\s+completion)\b/i;
+const SIG_DATE_OTHER_EVENT_RE = /\b(start|begin|available|birth|dob|graduat|expir|issue|hire|end|from|to|employ|last|next)\b/i;
+function isSignatureDateQuestion(label) {
+  const t = String(label == null ? "" : label).replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  if (SIG_DATE_OTHER_EVENT_RE.test(t)) return false;   // names a different event — never today
+  return SIG_DATE_RE.test(t) || SIG_DATE_EXPLICIT_RE.test(t);
+}
 function errorSetUnchanged(a, b) {
   const norm = (arr) => (Array.isArray(arr) ? arr : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean).sort();
   const x = norm(a), y = norm(b);
@@ -1698,7 +1718,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

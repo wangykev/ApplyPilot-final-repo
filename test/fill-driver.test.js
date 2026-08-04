@@ -8764,3 +8764,20 @@ test("text fill: acceptance is digits-EQUALITY, so a real mismatch still fails",
   const r = await fillTextCdp(wrong, { wrapperSel: "[w-essay]" }, "80,000", T_BUDGETS, "input");
   assert.strictEqual(r.status, "needs_review", "80000 != 8000 — never paper over a real mismatch");
 });
+
+// ── a self-ID signature date is TODAY, never a guess (Asuep live 2026-08-04) ──
+// The voluntary self-identification page carries a bare "Date" beside the attestation. aiFillDate was
+// guessing it and wrote 8/10/2026 — a FUTURE date on a form the applicant is attesting to today.
+// Operator: "for these disability questions it should always enter today's date."
+// NOTE: the today-COMMIT itself is verified on a live page, not here. The fake's date composite does
+// not type through focusDateSegment for a flat self-ID date (typed log came back empty), so a unit test
+// of the commit would be testing the fixture rather than the code. The pure decision — WHICH dates get
+// today — is pinned below, and the commit is covered by the Asuep run in dom-patterns 2026-08-04.
+test("signature date: a date naming a DIFFERENT event is never stamped with today", () => {
+  for (const t of ["Date", "Date*", "Today's Date", "Date Signed", "Signature Date", "Date of Signature"])
+    assert.ok(apMatchLib.isSignatureDateQuestion(t), t);
+  // these are real questions with real answers — quietly writing today would be a WRONG answer
+  for (const t of ["What is your desired start date?", "Date of Birth", "Graduation Date", "Expiration Date",
+    "From", "To", "Hire Date", "Last date of employment", "Date available to begin employment"])
+    assert.ok(!apMatchLib.isSignatureDateQuestion(t), t);
+});

@@ -34,6 +34,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
       // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
       parseYearMonthDay: parseYearMonthDay, isCompensationQuestion: isCompensationQuestion,
+      isSignatureDateQuestion: isSignatureDateQuestion,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // The AI's option list must never include a menu's prompt row ("Select One").
@@ -1102,6 +1103,20 @@ const aiPlaceholderText = (reason) => AI_NEEDS_ANSWER_MARK_FD + " — AI decline
 // mapped date fields use (so an unparseable reply can never reach the form), fills the composite, and
 // is ALWAYS filled_review — a guessed date is never a silent fill.
 const aiFillDate = async (act, loc, f, profile, jobContext, budgets) => {
+  // A SIGNATURE date is knowable exactly — it is the day the form is being completed. Fill it
+  // deterministically and spend no LLM call: the self-ID attestation date is TODAY, and guessing it
+  // produced 8/10/2026 live on Asuep — a future date on a form the applicant attests to now.
+  // Deterministic, so it commits as `filled` with no review flag, exactly like a mapped profile value.
+  if (apMatch.isSignatureDateQuestion(f.label)) {
+    const ymd = todayYMD(); // fill-driver already owns this (the WE currently-work-here fallback)
+    const sr = await fillDateCompositeCdp(act, loc, ymd, budgets);
+    if (sr && sr.verified === true) {
+      return { status: "filled", after: sr.after, verified: true, matchTier: "today",
+        detail: "a signature/completion date is the day the form is filled in — entered today's date",
+        auditLoc: loc.wrapperSel };
+    }
+    // Could not commit → fall through to the AI path rather than leaving it blank.
+  }
   const today = new Date().toISOString().slice(0, 10);
   const sys = "You fill job-application forms. Answer with a DATE ONLY, in YYYY-MM-DD form, and nothing else. " +
     "If the question asks when the candidate can start, choose a reasonable near-future weekday.";
