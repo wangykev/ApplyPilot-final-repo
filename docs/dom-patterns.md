@@ -3162,3 +3162,69 @@ form holding the values, and only the second one is worth anything.
 The ethnicity set lands in MISSING on the review-page reconcile, which is correct and non-blocking:
 Workday's own summary page does not render the self-identification section at all, so absence there
 is not evidence the value was lost (the 2026-07-28 rule).
+
+## 2026-08-04 — waystar.wd1: what Workday does NOT persist when you re-enter a saved application
+
+Two tenants (waystar.wd1, radiancetech.wd12) halted on the SAME page with the same error —
+`Error-Please check one of the boxes below:The field Please check one of the boxes below: is
+required and must have a value` — after the fill had committed the disability self-ID group and
+logged the value. The audit could not re-read the group (`audit-unverifiable`), and by Save time
+`disabilityStatus ""*`. The standing suspicion was that the self-ID form's own Language dropdown
+(`disabilityForm`) re-renders the form and wipes the box. Traced it instead of guessing further.
+
+**Page map (waystar, 6 steps).** The apply flow names its steps, and the disability group lives on
+step 5, NOT with the other EEO questions on step 4:
+
+    step 1 My Information        step 4 Voluntary Disclosures
+    step 2 My Experience         step 5 Self Identify      <- disabilityStatus, disabilityForm,
+    step 3 Application Questions step 6 Review                name, dateSignedOn, employeeId
+
+The progress bar is a `<li>` list and is NOT clickable — you cannot jump to a step; only Save and
+Continue advances.
+
+**The finding.** Re-entered the completed (unsubmitted) application through Candidate Home ->
+`actionMenuTarget` -> "Continue Application", which restarts at step 1, and read step 4's DOM. The
+extension had filled and saved that page minutes earlier and the review page had agreed. On
+re-entry:
+
+    ethnicity                 dropdown  "Asian (United States of America)"   PERSISTED
+    gender                    dropdown  "Male"                              PERSISTED
+    veteranStatus             dropdown  "I AM NOT A VETERAN"                 PERSISTED
+    hispanicOrLatino          dropdown  "Select One"                         ** NOT persisted **
+    acceptTermsAndAgreements  checkbox  false                                ** NOT persisted **
+
+and Workday demanded both again:
+
+    Error-Please indicate if you are Hispanic or Latino?
+    Error-I have read and accept the Terms and Conditions for submitting an application with Waystar
+
+So **Workday does not persist every answer on these pages across a re-entry of the flow** — three
+sibling dropdowns on the SAME page came back filled while a fourth dropdown and the checkbox came
+back empty. Nothing about the fill explains that; the server simply did not keep them.
+
+**Why this reframes the disability bug.** The wiped field here is a CHECKBOX, and `disabilityStatus`
+is a `checkbox_group`. The likelier mechanism is therefore not "the Language dropdown re-renders the
+form" but "**Workday re-initialises checkbox-family widgets on the self-ID / voluntary-disclosure
+pages to unchecked whenever the page is (re)entered or re-rendered, so the value only holds if it is
+set and saved within the same visit**". That fits every observation: the commit read back fine, the
+audit hit the group mid-re-init and could not read it (`audit-unverifiable`), and Save saw nothing.
+It is also intermittent, because it depends on a re-render landing after the commit.
+
+**Consequence for the walks.** A value being on the form when we set it is not the same claim as
+Workday having kept it, so the only reliable check is a fresh read immediately before Save — which is
+what the pre-Save re-verify does, now on BOTH walks (2026-08-04). Verified live on this exact field:
+
+    page 5: 1 REQUIRED field(s) were filled but read BLANK now — re-filling before Save & Continue:
+      "Please check one of the boxes below:*" (filled "No, I do not have a disability and have not had one in the past")
+       ✓ re-filled — the page holds the filled values again.
+    ✓ page 5 → advanced.   ✓✓ reached the REVIEW page after 5 page(s)
+
+waystar had halted on that page twice before; it then went fill -> approve -> rehearse ->
+AGREE 53 · DISAGREE 0 -> SUBMIT GATE PASSED.
+
+**Not settled.** Whether the re-initialisation is triggered by the Language dropdown specifically, by
+any re-render, or purely by page (re)entry. Answering it needs a tab PARKED on step 5, which the
+pre-Save re-verify now prevents by healing the page — the trace hit its limit here because advancing
+past step 4 by hand requires ticking "I have read and accept the Terms and Conditions", which the bot
+must not do on the operator's behalf. Give `AP_DEV_WD_PROBE` a way to reach step 5 itself (it already
+does the check-a-box-and-re-read experiment) and the question closes.
