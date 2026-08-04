@@ -5470,7 +5470,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       emitRunProgress(`Filling page ${page}`);
-      const { out, pageKey } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
+      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
       //    field does NOT reload (those go to review as usual). Each page accumulate-replaces, so the
@@ -5512,6 +5512,35 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       if (!navAfter || !navAfter.nextButtonPresent) {
         LOG(`no Save & Continue on page ${page} — terminal page (not the review marker). Stop.`);
         return { ok: true, stopped: "no-next-button", pages_filled: pagesFilled.length, pages: pagesFilled };
+      }
+
+      // ── (d.1) PRE-SAVE RE-VERIFY: did every value we filled STICK? (2026-08-04) ──────────────────
+      // Symmetry with the replay walk, which got exactly this in 2026-07-28 for the same class and the
+      // same widget. The M40 audit is NOT a substitute: it runs inside the fill and REPORTS, but a field
+      // it could not re-read (`audit-unverifiable`) still goes to Save & Continue unretried — reporting
+      // a doubt is not the same as resolving it.
+      //
+      // Live on waystar.wd1 AND radiancetech.wd12, the same page 5, the same field: the disability
+      // self-ID checkbox group was committed ("No, I do not have a disability…"), the audit could not
+      // re-read the group (audit-unverifiable), and by Save time it held nothing — Workday refused with
+      // "The field Please check one of the boxes below: is required and must have a value", AI-4 rightly
+      // declined (no error text to anchor a safe action on), and the walk halted on a page it believed
+      // complete. One fresh scan turns that into a self-healing retry.
+      //
+      // Same helper, same blank/carve-out rules as the replay walk, so the two agree. Re-fills ONLY what
+      // actually reads blank, so a page where everything stuck costs one read-only scan.
+      try {
+        const preSaveScan = await cdpEval(cdpPageScan);
+        const lost = requiredBlankOnPage((preSaveScan && preSaveScan.fields) || [], (bundle && bundle.entries) || []);
+        if (lost.length) {
+          LOG(`page ${page}: ${lost.length} REQUIRED field(s) were filled but read BLANK now — re-filling before Save & Continue: ${lost.map((l) => `"${l.field.label || l.field.fieldName}" (filled "${l.approved}")`).join(", ")}`);
+          const again = await replayFlatFields(act, lost.map((l) => l.entry), new Set(lost.map((l) => l.field.fieldName)), DEFAULT_BUDGETS);
+          const stillBad = again.filter((r) => r.status === "needs_review" || r.status === "error");
+          if (stillBad.length) LOG(`   ⚠ ${stillBad.length} did not take on the retry (${stillBad.map((r) => r.field || r.fieldName).join(", ")}) — Save & Continue will surface it as a validation error.`);
+          else LOG(`   ✓ re-filled; the page holds the filled values again.`);
+        }
+      } catch (e) {
+        LOG(`(pre-save re-verify skipped: ${String((e && e.message) || e)})`);
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──

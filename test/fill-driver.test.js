@@ -6189,8 +6189,11 @@ test("cascadeEntryFor: produces an EMPTY, UNAPPROVED review question — never a
 
 // ── requiredBlankOnPage — "filled + verified, then lost it" (live 2026-07-28) ───────────────────────
 // The disability checkbox group replayed and VERIFIED checked, then Save & Continue reported it empty.
-// The fill walk catches this with its M40 audit; the replay had nothing, so it saved a page it believed
-// was complete. This is the mirror of newlyRequiredGaps: the bundle HAS an answer, the page lost it.
+// This is the mirror of newlyRequiredGaps: the bundle HAS an answer, the page lost it.
+// This comment used to add "the fill walk catches this with its M40 audit", and that was the reason the
+// fill walk was left without the guard. 2026-08-04 refuted it live on waystar.wd1 and radiancetech.wd12:
+// the audit REPORTED the doubt (audit-unverifiable — it could not re-read the group) and the walk saved
+// anyway. Reporting a doubt is not resolving it, so BOTH walks now run this check before Save & Continue.
 test("requiredBlankOnPage: a required field the bundle answered but the page shows blank is reported", () => {
   const live = [{ fieldName: "disabilityStatus", label: "Please check one of the boxes below:", widgetType: "checkbox_group", isRequired: true, value: null }];
   const entries = [{ field_id: "P5::formField-disabilityStatus", current_value: "I don't wish to answer" }];
