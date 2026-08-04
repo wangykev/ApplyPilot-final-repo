@@ -200,15 +200,61 @@ before retrying the FAILING form; a fresh account on a fresh form works immediat
 
 Prefer tenants where the account already exists: no email verification, so no Gmail dependency.
 
-## Finding postings
+## Finding postings to test with
 
-```bash
-curl -s -X POST "https://<tenant>.<dc>.myworkdayjobs.com/wday/cxs/<tenant>/<board>/jobs" \
-  -H "content-type: application/json" \
-  -d '{"appliedFacets":{},"limit":20,"offset":0,"searchText":"engineer intern"}'
+NOT the same thing as the product's Discover feature — that sweeps LinkedIn / Handshake / Simplify for
+the user's real queue and is documented in the `job-discovery` skill. What you want here is test
+FIXTURES: live postings on tenants you can sign into, which is a different job with different
+constraints (you want variety of DOM, not the best match).
+
+**Start from tenants that already work.** An existing account means no email verification, which is the
+single biggest time sink. The tracker knows which ones you have:
+
+```js
+const r = await fetch("/api/applications").then(x => x.json());
+// Two host shapes: <tenant>.wdN.myworkdayjobs.com, and wdN.myworkdaysite.com/…/recruiting/<tenant>/
+// Handle both or you will never see the myworkdaysite tenants (e.g. magna), which are the ones worth
+// testing deliberately — see the DOM-variety note below.
+[...new Set((r.applications || r).map((a) => {
+  const u = a.url || "";
+  const sub = u.match(/\/\/([^.]+)\.(wd\d+)\./);              // tenant in the SUBDOMAIN
+  if (sub) return sub[1] + "." + sub[2];
+  const path = u.match(/\/\/(wd\d+)\.myworkdaysite\.com\/[^/]+\/recruiting\/([^/]+)/); // tenant in the PATH
+  return path ? path[2] + "." + path[1] : null;
+}))].filter(Boolean);   // e.g. ["aptiv.wd5", "copart.wd12", "clearesult.wd1", "magna.wd3", ...]
 ```
 
-`externalPath` + `https://<tenant>.<dc>.myworkdayjobs.com/en-US/<board>` is the job URL.
+**Then query that tenant's own job API.** Every Workday tenant exposes an unauthenticated search:
+
+```bash
+curl -s -X POST "https://<tenant>.<dc>.myworkdayjobs.com/wday/cxs/<tenant>/<board>/jobs"   -H "content-type: application/json" -H "accept: application/json"   -d '{"appliedFacets":{},"limit":20,"offset":0,"searchText":"firmware"}'
+```
+
+- `<tenant>` and `<dc>` come from the host (`copart.wd12.…` -> `copart`, `wd12`).
+- `<board>` is the path segment after the locale in any posting URL
+  (`/en-US/CareerDepotCanada/job/…` -> `CareerDepotCanada`). Case-sensitive.
+- Response: `total` plus `jobPostings[]`, each with `title` and `externalPath`.
+- Job URL = `https://<tenant>.<dc>.myworkdayjobs.com/en-US/<board>` + `externalPath`.
+
+**Search terms that surface relevant roles.** `searchText` is a plain keyword match over the posting,
+so query the SKILL rather than the level — "intern" alone returns mostly unrelated reqs. Run several
+and pool: `firmware`, `embedded`, `hardware engineer`, `software engineer intern`, `electrical
+engineer`, `ASIC`, `FPGA`, `verification`, `co-op`.
+
+**Pick for DOM variety, not just relevance.** The point of ten tenants is ten different form shapes.
+Prefer a spread of data centers (`wd1`, `wd3`, `wd5`, `wd12`) and note that `wd3.myworkdaysite.com`
+hosts tenants in the PATH instead of the subdomain — that host is worth including deliberately, since
+it exercises a different URL/job-key path.
+
+**Confirm a posting is ALIVE before blaming the code.** A dead req still returns HTTP 200 with a
+generic "Careers" page, which reads exactly like an onboarding failure:
+
+```bash
+curl -s "https://<tenant>.<dc>.myworkdayjobs.com/wday/cxs/<tenant>/<board>/job/<externalPath>"   -H "accept: application/json" | head -c 200      # 403 "permission denied" => unpublished
+```
+
+**One posting per tenant per sitting.** Re-running the same form repeatedly is what triggers Workday's
+phantom state (see above). If you need a second run on one tenant, bump the login first.
 
 ## When a live run contradicts a passing test
 
