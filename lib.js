@@ -656,6 +656,39 @@ function expandErrorSamples(samples) {
   return out;
 }
 
+// ── EXTERNAL GATES: a page Workday refuses for a reason no fill can satisfy (2026-08-04) ──────────
+// Live on copart.wd12 (Software Engineering Intern): five pages filled and verified, then Save &
+// Continue came back "You must complete the assessment test to continue with your job application.
+// Take Assessment". Nothing was wrong with the fill — Workday wants a step that happens OUTSIDE the
+// application form, and a human has to take it. The walk halted, but it halted as a generic
+// nav-timeout: it warned "PAGE 5 MAY NOW BE DIRTY — eyeball it" (the page is not dirty) and named
+// `employeeId — no mapping` as "the likely validation cause" (it is unrelated — the error text names
+// no field at all). That reads as an ApplyPilot bug and sends the operator hunting a mapping gap.
+//
+// DELIBERATELY NARROW. A loose matcher here is the DANGEROUS direction: labelling a genuine fill
+// failure "the operator's problem" would hide a real bug behind a needs_operator halt. So each entry
+// requires wording that can only mean an out-of-band step, and anything unrecognized keeps the
+// existing nav-timeout path byte-for-byte.
+const EXTERNAL_GATES = [
+  { reason: "assessment-required",
+    rx: /\b(?:complete|take|finish)\b[^.]{0,40}\bassessment\b|\bassessment\b[^.]{0,30}\b(?:required|must be completed)\b/i,
+    detail: "Workday requires an assessment/test to be completed before this page will advance. That happens outside the application form — a human has to take it; the bot never will." },
+];
+// Returns {reason, detail, evidence} for the FIRST recognized gate, else null. Reads the split error
+// samples AND the whole error-page text, because the wording has been seen in both.
+function externalGateHalt(errorTexts, errorPageText) {
+  const texts = (Array.isArray(errorTexts) ? errorTexts : [errorTexts])
+    .concat([errorPageText])
+    .map((t) => String(t == null ? "" : t))
+    .filter((t) => t.trim() !== "");
+  for (const t of texts) {
+    for (const g of EXTERNAL_GATES) {
+      if (g.rx.test(t)) return { reason: g.reason, detail: g.detail, evidence: t.slice(0, 300) };
+    }
+  }
+  return null;
+}
+
 // AI-4 Tier-0 trigger: the known Magna/Workday phantom "Duplicate language entries are not allowed"
 // bug. Scoped to LANGUAGES only (operator-confirmed) — other sections' duplicate errors may be real.
 function isDuplicateLanguageError(errorTexts) {
@@ -1758,5 +1791,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

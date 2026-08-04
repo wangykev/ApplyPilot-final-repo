@@ -5982,7 +5982,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
+const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples, externalGateHalt } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -6295,6 +6295,31 @@ test("duplicateErrorSection: a non-duplicate error, or a duplicate about nothing
   assert.strictEqual(duplicateErrorSection(["The field School is required"]), null, "a plain required-field error must not trigger a section delete");
   assert.strictEqual(duplicateErrorSection(["Duplicate entries are not allowed"]), null, "names no section → no guess");
   assert.strictEqual(duplicateErrorSection([]), null);
+});
+
+// ── EXTERNAL GATES (2026-08-04) ────────────────────────────────────────────────────────────────
+// The LIVE copart text, verbatim from the error page the walk dumped.
+const COPART_ASSESSMENT = "Error-Page ErrorYou must complete the assessment test to continue with your job application.";
+test("externalGateHalt: the live copart assessment wording is recognized as an external gate", () => {
+  const g = externalGateHalt([COPART_ASSESSMENT], null);
+  assert.ok(g, "must be recognized — otherwise the halt blames the fill for a step no fill can do");
+  assert.strictEqual(g.reason, "assessment-required");
+  assert.match(g.evidence, /assessment test/i, "the halt quotes Workday's own words");
+});
+test("externalGateHalt: found in the error-PAGE text too, not just the split samples", () => {
+  const g = externalGateHalt([], "Page Error You must complete the assessment test to continue. Take Assessment Back Save and Continue");
+  assert.ok(g && g.reason === "assessment-required");
+});
+test("externalGateHalt: an ORDINARY validation error is NEVER called an external gate", () => {
+  // The dangerous direction: mislabelling a real fill failure as the operator's problem would hide a bug.
+  assert.strictEqual(externalGateHalt(["Error-URLThe field URL is required and must have a value."], null), null);
+  assert.strictEqual(externalGateHalt(["Error-Page ErrorThe field Date is required"], null), null);
+  assert.strictEqual(externalGateHalt(["You can't add duplicate website URLs."], null), null);
+  assert.strictEqual(externalGateHalt(["Please check one of the boxes below"], null), null);
+  assert.strictEqual(externalGateHalt([], null), null);
+  assert.strictEqual(externalGateHalt([""], ""), null);
+  // "assessment" as a passing noun, with no requirement wording, is not a gate either
+  assert.strictEqual(externalGateHalt(["Your assessment scores will be shared with the hiring team."], null), null);
 });
 
 test("sectionEntriesFromResults: builds one entry per row with a composite signature over ALL its fields", () => {

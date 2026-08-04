@@ -5389,12 +5389,19 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     if (_visLabel === "hidden" && !samples.length && !(st && st.errorPageText)) {
       LOG("⚠ the tab is HIDDEN and the page shows no errors but won't advance — the rAF-override fix did not unblock the transition this time. Bring the tab to the FOREGROUND (visible) and re-run; the fill itself works hidden, but page-to-page advancement may still need a visible tab as a fallback.");
     }
+    // An EXTERNAL GATE (e.g. "you must complete the assessment test") is not a fill problem, so the
+    // empty-field list must NOT be offered as its cause — live on copart the halt blamed
+    // `employeeId — no mapping` for an assessment requirement. Still list them (a real gap is worth
+    // knowing) but drop the causal claim.
+    const gate = externalGateHalt(samples, st ? st.errorPageText : null);
     const empties = (pageOut && pageOut.results || []).filter((r) => r.status === "skipped");
     if (empties.length) {
-      LOG("fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
+      LOG(gate
+        ? "fields left EMPTY (listed for completeness — NOT the cause here; the page is gated externally):"
+        : "fields left EMPTY (no value in the profile/JSON — the likely validation cause):");
       empties.forEach((r) => LOG(`    • ${r.fieldName} — ${r.detail}`));
     }
-    lastDiag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })) };
+    lastDiag = { page_errors: samples, error_page_text: st ? (st.errorPageText || null) : null, empty_fields: empties.map((r) => ({ field: r.fieldName, reason: r.detail })), external_gate: gate || null };
     return lastDiag;
   };
 
@@ -5579,8 +5586,17 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // The page kept our value out; say so in the bundle before halting, so review asks the human
         // for an answer the form accepts instead of showing one it already threw away.
         if (reclick.errorsPresent && Array.isArray(reclick.errorSamples)) await syncRejectedValues(reclick.errorSamples, LOG);
-        LOG(`⚠ nav-timeout on page ${page} — ${act.aiEnabled ? `AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason})` : "AI fill OFF (no re-fill — operator halt-on-error rule)"} ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
+        // Read the diagnostics FIRST so an EXTERNAL GATE can be named before we accuse the fill.
         const diag = await reportPageErrors(out);
+        if (diag && diag.external_gate) {
+          // Not a fill failure and not a dirty page: our values were accepted, Workday wants a step
+          // that happens outside the form. Halt self-explaining (needs_operator), per the standing
+          // rule that every human-needed stop says so.
+          LOG(`⚠ page ${page} is gated EXTERNALLY (${diag.external_gate.reason}) — the fill is not at fault and the page is NOT dirty. ${diag.external_gate.detail} Workday said: "${diag.external_gate.evidence}"`);
+          return { ok: true, needs_operator: true, stopped: diag.external_gate.reason, nav_timeout_page: page,
+            detail: diag.external_gate.detail, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
+        }
+        LOG(`⚠ nav-timeout on page ${page} — ${act.aiEnabled ? `AI-4 remediation (${rem.attempts} attempt(s), ${rem.reason})` : "AI fill OFF (no re-fill — operator halt-on-error rule)"} ${reclick.errorsPresent ? "+ a real error blocks re-click" : "+ re-click fallback (" + (reclick.attempts || 0) + "x)"} did NOT clear it. PAGE ${page} MAY NOW BE DIRTY — eyeball it; do NOT re-run as if fresh. Errors + empty fields:`);
         return { ok: true, stopped: "nav-timeout-dirty", nav_timeout_page: page, remediation: { attempts: rem.attempts, reason: rem.reason, actions: rem.actions }, pages_filled: pagesFilled.length, pages: pagesFilled, ...diag };
       }
       LOG(`✓ page ${page} → advanced.`);
