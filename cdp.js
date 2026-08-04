@@ -4050,7 +4050,14 @@ function makeCdpActuation(llmConfig) {
       if (!attempts.length) return { ok: false, error: "no AI model configured (set one on the website's AI page)" };
 
       let last = null;
+      const t0All = Date.now();
       for (const attempt of attempts) {
+        const tAttempt = Date.now();
+        // A LATER model is a cheaper remedy than waiting on this one. Fail fast on every attempt but
+        // the last so the fallback is reached in ms, not after the full retry ladder; the final
+        // attempt keeps the ladder, because then waiting really is all that is left. Mirrors what
+        // callLLM already does across multiple KEYS.
+        const isLast = attempts.indexOf(attempt) === attempts.length - 1;
         const keys = typeof llmKeysFor === "function" ? llmKeysFor(llmConfig, attempt.provider) : [];
         // Name the route BEFORE the call, so a wrong model is visible in the log next to the field it
         // answered rather than inferred from the answer's quality. Never the key itself — only how many
@@ -4074,6 +4081,7 @@ function makeCdpActuation(llmConfig) {
           // field is skipped for the rest of the form instead of being re-probed 60 times.
           keyState: cdpLlmKeyState,
           onKeyState: (s) => { cdpLlmKeyState = s; },
+          noRetry: !isLast,
           system, user, maxTokens
         });
         // Every attempt is recorded — successes for spend/quota, failures because a run of
@@ -4081,13 +4089,20 @@ function makeCdpActuation(llmConfig) {
         if (typeof recordLlmUsage === "function" && typeof llmUsageEntry === "function") {
           recordLlmUsage(llmUsageEntry(action || "fill", res));
         }
-        if (res.ok) return res;
+        if (res.ok) {
+          const ms = Date.now() - tAttempt;
+          console.log(`[LLM] ok in ${ms}ms` + (attempts.length > 1 ? ` (${Date.now() - t0All}ms total across ${attempts.indexOf(attempt) + 1} attempt(s))` : ""));
+          return res;
+        }
         // A FAILED attempt names itself too — with several models configured as fallbacks, silence
         // here makes it impossible to tell whether the answer came from your first choice or the
         // third one down the list.
-        console.log(`[LLM] ${attempt.provider} ${attempt.model} FAILED — ${String((res && res.error) || "no reply").slice(0, 160)}`);
+        console.log(`[LLM] ${attempt.provider} ${attempt.model} FAILED after ${Date.now() - tAttempt}ms` +
+          (isLast ? " (full retry ladder — no fallback left)" : " (failing fast to the next model)") +
+          ` — ${String((res && res.error) || "no reply").slice(0, 140)}`);
         last = res;
       }
+      if (attempts.length > 1) console.log(`[LLM] all ${attempts.length} attempt(s) failed in ${Date.now() - t0All}ms total`);
       return last || { ok: false, error: "no AI attempt made" };
     }
   };
