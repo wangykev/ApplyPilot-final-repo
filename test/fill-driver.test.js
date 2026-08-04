@@ -8781,3 +8781,28 @@ test("signature date: a date naming a DIFFERENT event is never stamped with toda
     "From", "To", "Hire Date", "Last date of employment", "Date available to begin employment"])
     assert.ok(!apMatchLib.isSignatureDateQuestion(t), t);
 });
+
+// ── a date the FORM re-formatted is the same date (Home Depot live 2026-08-04) ──
+// Approved "5/1/2028"; Workday's review page displays "05/01/2028". Identical calendar date, zero-
+// padded by the form — and the submit gate blocked on it as a DISAGREE. Same shape as 80,000/80000:
+// the form normalized our value and the comparison has to accept that.
+test("sameCalendarDate: accepts re-formatting, never a different day", () => {
+  for (const [a, b] of [["5/1/2028", "05/01/2028"], ["2028-05-01", "5/1/2028"], ["5/2028", "05/2028"]])
+    assert.ok(apMatchLib.sameCalendarDate(a, b), `${a} == ${b}`);
+  for (const [a, b] of [["5/1/2028", "5/2/2028"], ["5/1/2028", "6/1/2028"], ["5/1/2028", "5/1/2029"],
+    // month-precision vs day-precision is NOT a confirmation of our answer
+    ["5/1/2028", "5/2028"], ["Yes", "No"], ["13/1/2028", "13/01/2028"]])
+    assert.ok(!apMatchLib.sameCalendarDate(a, b), `${a} != ${b}`);
+});
+
+test("review reconcile: a zero-padded date AGREES instead of blocking submit", () => {
+  const entry = { field_id: "p2::formField-gradDate", question_label: "What is your anticipated graduation month and year (MM/YYYY)",
+    widget_type: "date", current_value: "5/1/2028", is_required: true };
+  const page = [{ section: "Education", label: "What is your anticipated graduation month and year (MM/YYYY)", value: "05/01/2028" }];
+  const r = reconcileReviewPage(page, [entry]);
+  assert.strictEqual(r.disagree.length, 0, "zero-padding is not a contradiction: " + JSON.stringify(r.disagree));
+  assert.strictEqual(r.agree.length, 1);
+  // a genuinely different day still DISAGREES — the gate must keep its teeth
+  const wrong = reconcileReviewPage([{ section: "Education", label: entry.question_label, value: "05/02/2028" }], [entry]);
+  assert.strictEqual(wrong.agree.length, 0, "a different day is a real disagreement");
+});

@@ -565,6 +565,35 @@ function isSignatureDateQuestion(label) {
   if (SIG_DATE_OTHER_EVENT_RE.test(t)) return false;   // names a different event — never today
   return SIG_DATE_RE.test(t) || SIG_DATE_EXPLICIT_RE.test(t);
 }
+// Do two strings name the SAME calendar date? Workday re-formats what we typed — it displays
+// "05/01/2028" for an approved "5/1/2028" — and a plain string compare calls that a contradiction,
+// which BLOCKS submit over pure zero-padding (live, Home Depot 2026-08-04).
+//
+// Numeric comparison on the three parts, so it accepts only re-formatting and never a different day:
+// 5/1/2028 == 05/01/2028, and 5/1/2028 != 5/2/2028. Both sides must parse as a complete, plausible
+// date or it returns false and the caller stays strict — an unparseable value is not evidence of
+// agreement. Deliberately does NOT reorder: 1/5 and 5/1 are different dates in the same locale, and
+// guessing which convention a tenant used would be exactly the kind of silent wrong answer this
+// codebase refuses elsewhere.
+function sameCalendarDate(a, b) {
+  const parse = (v) => {
+    const s = String(v == null ? "" : v).trim();
+    let m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);          // M/D/YYYY
+    if (m) return [+m[3], +m[1], +m[2]];
+    m = s.match(/^(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})$/);              // YYYY-MM-DD
+    if (m) return [+m[1], +m[2], +m[3]];
+    m = s.match(/^(\d{1,2})[\/.-](\d{4})$/);                            // M/YYYY (month precision)
+    if (m) return [+m[2], +m[1], null];
+    return null;
+  };
+  const x = parse(a), y = parse(b);
+  if (!x || !y) return false;
+  if (x[1] < 1 || x[1] > 12 || y[1] < 1 || y[1] > 12) return false;
+  if (x[0] !== y[0] || x[1] !== y[1]) return false;
+  // One side month-precision and the other day-precision are NOT the same answer — a form showing
+  // 05/2028 has not confirmed our 05/01/2028.
+  return x[2] === y[2];
+}
 function errorSetUnchanged(a, b) {
   const norm = (arr) => (Array.isArray(arr) ? arr : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean).sort();
   const x = norm(a), y = norm(b);
@@ -911,6 +940,9 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     if (!a || !b) return null;
     const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
     if (short.length >= 4 && long.includes(short)) return "containment";
+    // A re-formatted DATE is the same answer — checked before fuzzy, which would rate 5/1/2028 against
+    // 05/01/2028 on character overlap rather than on meaning.
+    if (sameCalendarDate(a, b)) return "date";
     if (a.length >= 3 && b.length >= 3 && fuzzyRatio(a, b) >= 90) return "fuzzy";
     return null;
   };
@@ -1718,7 +1750,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

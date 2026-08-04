@@ -3556,6 +3556,16 @@ async function cdpReadAuditRaw(specs) {
 // Module scope, not per-actuation, so a key parked while filling field 3 stays parked for
 // fields 4..60 rather than being re-probed on every one.
 let cdpLlmKeyState = null;
+// Primary-model failures this SW lifetime — surfaced at the end of a run so a degraded model is never
+// something the operator has to infer from a slow fill (operator 2026-08-04).
+let cdpLlmDemotions = [];
+function cdpLlmDemotionSummary() {
+  if (!cdpLlmDemotions.length) return null;
+  const byModel = {};
+  for (const d of cdpLlmDemotions) byModel[d.model] = (byModel[d.model] || 0) + 1;
+  const worst = cdpLlmDemotions[0];
+  return { count: cdpLlmDemotions.length, byModel, firstError: worst.error, model: worst.model };
+}
 
 function makeCdpActuation(llmConfig) {
   return {
@@ -4097,6 +4107,15 @@ function makeCdpActuation(llmConfig) {
         // A FAILED attempt names itself too — with several models configured as fallbacks, silence
         // here makes it impossible to tell whether the answer came from your first choice or the
         // third one down the list.
+        // A run that quietly spends every call on the fallback looks like "the AI is slow" and stays a
+        // mystery. Count it and say so ONCE, loudly, the first time — the operator should learn their
+        // primary model is down from the log, not from wondering why a fill dragged.
+        cdpLlmDemotions.push({ model: attempt.model, error: String((res && res.error) || "").slice(0, 80) });
+        if (cdpLlmDemotions.length === 1 && !isLast) {
+          console.log(`[ApplyPilot] ⚠ YOUR PRIMARY AI MODEL IS FAILING — ${attempt.provider} ${attempt.model} did not answer,` +
+            ` so this run is using the fallback instead. Every AI field pays a wasted request first.` +
+            ` If this keeps happening, reorder the models on the AI page so a working one is first.`);
+        }
         console.log(`[LLM] ${attempt.provider} ${attempt.model} FAILED after ${Date.now() - tAttempt}ms` +
           (isLast ? " (full retry ladder — no fallback left)" : " (failing fast to the next model)") +
           ` — ${String((res && res.error) || "no reply").slice(0, 140)}`);
