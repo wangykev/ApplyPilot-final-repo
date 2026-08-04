@@ -543,7 +543,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -2932,9 +2932,49 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       optionCache = (optionStore && typeof optionStore[tenantKey] === "object" && optionStore[tenantKey]) || {};
     } catch (e) { optionStore = {}; optionCache = {}; }
   }
+  // ── TEMPORARY DIAGNOSTIC: 10ms watch on a checkbox GROUP (chrome.storage.local.debugGroupWatch) ──
+  // Settles the one question three rounds of reasoning could not: when the group loses its check, was the
+  // DOM REBUILT or was `checked` toggled in place? `checked` is a property, so a toggle leaves the
+  // MutationObserver count unmoved while a re-render shows childList mutations. Records transitions +
+  // scoped events (with isTrusted) only. Read-only, opt-in, and drained straight into the log below.
+  let _gwSel = null;
+  try {
+    const { debugGroupWatch } = await new Promise((r) => chrome.storage.local.get("debugGroupWatch", r));
+    if (debugGroupWatch) {
+      const gf = ((preScan && preScan.fields) || []).find((f) => f.widgetType === "checkbox_group");
+      if (gf && gf.wrapperSel) {
+        _gwSel = gf.wrapperSel;
+        LOG(`[GROUP-WATCH] installing 10ms watch on ${gf.fieldName} (${gf.wrapperSel}):`,
+          JSON.stringify(await cdpEval(cdpInstallGroupWatch, gf.wrapperSel)));
+      } else {
+        LOG("[GROUP-WATCH] armed but this page has no checkbox_group in the settled scan — nothing to watch.");
+      }
+    }
+  } catch (e) { LOG("[GROUP-WATCH] install skipped:", String((e && e.message) || e)); }
+
   const _fillT0 = Date.now();
   const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets, optionCache });
   const fillMs = Date.now() - _fillT0;
+  if (_gwSel) {
+    try {
+      const gw = await cdpEval(cdpDrainGroupWatch);
+      if (gw && gw.ok) {
+        LOG(`[GROUP-WATCH] ${gw.samples} samples over ${gw.spanMs}ms · ${gw.muts} mutation(s) on the wrapper's parent subtree`);
+        LOG(`[GROUP-WATCH] STATE TRANSITIONS (t=ms since install · mutsSoFar tells you whether the DOM moved):`);
+        (gw.transitions || []).forEach((x) => LOG(`    t+${x.t}ms  muts=${x.mutsSoFar}  ${x.s}`));
+        LOG(`[GROUP-WATCH] EVENTS on this group (trusted=true ⇒ a real browser-level click):`);
+        (gw.events || []).forEach((e) => LOG(`    t+${e.t}ms  ${e.type}${e.trusted ? " TRUSTED" : " untrusted"}  ${e.target}${e.checkedNow === undefined ? "" : "  checked=" + e.checkedNow}`));
+        if ((gw.mutLog || []).length) {
+          LOG(`[GROUP-WATCH] first ${gw.mutLog.length} mutation(s) — childList with added/removed ⇒ the subtree was REPLACED:`);
+          // Only the ones INSIDE the group matter for "did our value get reset by a DOM change?"
+          const inG = gw.mutLog.filter((m) => m.inGroup);
+          LOG(`    (${inG.length} of them landed INSIDE the group's own subtree)`);
+          inG.slice(0, 60).forEach((m) => LOG(`    IN-GROUP t+${m.t}ms  ${m.type} +${m.added}/-${m.removed} ${m.attr ? "attr=" + m.attr + " " : ""}${m.target}`));
+          gw.mutLog.filter((m) => !m.inGroup).slice(0, 25).forEach((m) => LOG(`    outside  t+${m.t}ms  ${m.type} +${m.added}/-${m.removed} ${m.attr ? "attr=" + m.attr + " " : ""}${m.target}`));
+        }
+      } else LOG("[GROUP-WATCH] drain failed:", JSON.stringify(gw));
+    } catch (e) { LOG("[GROUP-WATCH] drain error:", String((e && e.message) || e)); }
+  }
   // Persist the (possibly grown) option cache — best-effort, TTL-pruned + bounded so storage stays small.
   if (tenantKey) {
     try {

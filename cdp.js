@@ -2631,6 +2631,86 @@ function cdpDevBoxGeom(wrapperSel) {
     }),
   };
 }
+// ── TEMPORARY DIAGNOSTIC (2026-08-04): watch a checkbox group at 10ms and say WHY it changed ────────
+// The question this settles: when the group loses its check, is the DOM being REBUILT (a re-render) or is
+// the input's `checked` being toggled in place (a click / property write)? Those need opposite fixes and
+// three rounds of reasoning failed to separate them.
+//
+// The discriminator is that `checked` is a PROPERTY, not an attribute: flipping it produces NO
+// MutationRecord. So a state change with a mutation count that did not move = something toggled the input;
+// a state change accompanied by childList mutations = the subtree was replaced. `isTrusted` on the
+// recorded events separates our CDP clicks (trusted) from any page-side/synthetic dispatch.
+//
+// Records TRANSITIONS only, never raw samples — 10ms over a 30s page would be 3000 rows.
+// Gated behind chrome.storage.local.debugGroupWatch; install → fill → drain.
+function cdpInstallGroupWatch(wrapperSel) {
+  try {
+    if (window.__apGW) { try { clearInterval(window.__apGW.timer); window.__apGW.mo && window.__apGW.mo.disconnect(); } catch (e) {} }
+    const st = { sel: wrapperSel, t0: Date.now(), samples: 0, muts: 0, transitions: [], events: [], mutLog: [] };
+    const snap = () => {
+      const w = document.querySelector(wrapperSel);
+      if (!w) return "WRAPPER-ABSENT";
+      const cbs = Array.from(w.querySelectorAll('input[type="checkbox"]'));
+      if (!cbs.length) return "NO-BOXES";
+      return cbs.map((c) => String(c.id || "?").slice(0, 6) + (c.checked ? "=ON" : "=off")).join(" ");
+    };
+    const ids = () => {
+      const w = document.querySelector(wrapperSel);
+      return w ? Array.from(w.querySelectorAll('input[type="checkbox"]')).map((c) => c.id) : [];
+    };
+    // MutationObserver on the wrapper's PARENT so a wholesale replacement of the wrapper is visible too.
+    const w0 = document.querySelector(wrapperSel);
+    const root = (w0 && w0.parentNode) || document.body;
+    st.mo = new MutationObserver((recs) => {
+      st.muts += recs.length;
+      for (const r of recs) {
+        if (st.mutLog.length >= 400) break;
+        st.mutLog.push({ t: Date.now() - st.t0, type: r.type,
+          added: r.addedNodes ? r.addedNodes.length : 0, removed: r.removedNodes ? r.removedNodes.length : 0,
+          attr: r.attributeName || null,
+          inGroup: !!(w0 && r.target && (w0 === r.target || w0.contains(r.target))),
+          target: (r.target && r.target.nodeName) + ((r.target && r.target.getAttribute && r.target.getAttribute("data-automation-id")) ? "[" + r.target.getAttribute("data-automation-id") + "]" : "") });
+      }
+    });
+    try { st.mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["checked", "class", "aria-checked", "data-automation-id"] }); } catch (e) { /* best effort */ }
+    // Capture-phase event log, scoped to this group (its own nodes, or a label pointing at one of its ids).
+    const myIds = ids();
+    st.onEv = (e) => {
+      try {
+        if (st.events.length >= 80) return;
+        const t = e.target;
+        if (!t || !t.nodeName) return;
+        const w = document.querySelector(wrapperSel);
+        const forAttr = (t.getAttribute && t.getAttribute("for")) || "";
+        const mine = (w && w.contains(t)) || (forAttr && myIds.indexOf(forAttr) >= 0);
+        if (!mine) return;
+        st.events.push({ t: Date.now() - st.t0, type: e.type, trusted: !!e.isTrusted,
+          target: t.nodeName + (t.id ? "#" + String(t.id).slice(0, 6) : "") + (forAttr ? "[for=" + String(forAttr).slice(0, 6) + "]" : ""),
+          checkedNow: (t.type === "checkbox") ? !!t.checked : undefined });
+      } catch (err) { /* never let the probe break the page */ }
+    };
+    st.evTypes = ["pointerdown", "mousedown", "mouseup", "click", "change", "input", "focusin", "focusout"];
+    for (const ty of st.evTypes) document.addEventListener(ty, st.onEv, true);
+    let last = null;
+    st.timer = setInterval(() => {
+      st.samples++;
+      const s = snap();
+      if (s !== last) { st.transitions.push({ t: Date.now() - st.t0, s, mutsSoFar: st.muts }); last = s; }
+    }, 10);
+    window.__apGW = st;
+    return { ok: true, sel: wrapperSel, first: snap(), boxes: myIds.length, observing: root.nodeName };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+function cdpDrainGroupWatch() {
+  const st = window.__apGW;
+  if (!st) return { ok: false, error: "not installed" };
+  try { clearInterval(st.timer); st.mo && st.mo.disconnect(); for (const ty of st.evTypes) document.removeEventListener(ty, st.onEv, true); } catch (e) {}
+  const out = { ok: true, samples: st.samples, muts: st.muts, transitions: st.transitions, events: st.events, mutLog: st.mutLog,
+    spanMs: Date.now() - st.t0 };
+  try { delete window.__apGW; } catch (e) { window.__apGW = null; }
+  return out;
+}
+
 // READ-ONLY inventory of EVERY formField wrapper on the page with its widget kind and current value.
 // cdpDevGroups only reports checkbox GROUPS, so it cannot answer "is this field even mounted yet?" —
 // which is the question when a widget appears mid-fill and the settled pre-fill scan never saw it.
