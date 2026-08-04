@@ -538,6 +538,33 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     return true;
   }
 
+  // DEV: read/write the debug KILL-SWITCHES. They live in chrome.storage.local and, until now, could
+  // only be set from the service-worker console — so from the localhost bridge they were effectively
+  // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
+  // the review bundle and the session all live in the same store). Omit `value` to read them all.
+  if (type === "AP_DEV_FLAG") {
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff"];
+    (async () => {
+      if (message.key === undefined) {
+        const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
+        sendResponse({ ok: true, flags: all, allowed: ALLOWED });
+        return;
+      }
+      const key = String(message.key);
+      if (!ALLOWED.includes(key)) { sendResponse({ ok: false, error: "not a debug flag: " + key, allowed: ALLOWED }); return; }
+      if (message.value === undefined) {
+        const got = await new Promise((r) => chrome.storage.local.get(key, r));
+        sendResponse({ ok: true, key, value: got[key] ?? null });
+        return;
+      }
+      const value = !!message.value;
+      await new Promise((r) => chrome.storage.local.set({ [key]: value }, r));
+      console.log(`[ApplyPilot][DEV] flag ${key} = ${value}`);
+      sendResponse({ ok: true, key, value });
+    })();
+    return true;
+  }
+
   // DEV: read-only ATS form scan of a NAMED tab (the fill run returns its tabId) — the
   // "go to the tab and see what actually happened" verification, machine-readable. CDP
   // attach → atsInjScan (fixed function, no arbitrary code) → detach. Refused mid-run
