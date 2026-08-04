@@ -187,7 +187,7 @@ test("every free-tier model is offerable and carries real limits", () => {
 // The website's own callers (resume parse, cover letter, teach) go through
 // callLLMForAction, so these cover the path they actually take.
 
-import { callLLM, callLLMForAction } from "../lib/llm";
+import { callLLM, callLLMForAction, llmCostUsd } from "../lib/llm";
 
 type Canned = { status: number; json?: unknown; body?: string };
 function fakeFetch(responses: Canned[]) {
@@ -364,4 +364,40 @@ test("a route for an id that stopped being routable is dropped, not fatal", () =
   // Cast: the type no longer admits "teach" as a route key — which is the point.
   assert.equal((cfg.routes as Record<string, unknown>).teach, undefined, "the stale row is dropped");
   assert.equal(cfg.routes.essay?.model, "claude-opus-5", "the valid one survives");
+});
+
+// ─── Usage + cost, lockstep with the extension ──────────────────────────────
+
+test("LOCKSTEP — llmCostUsd agrees with the extension copy", () => {
+  const u = { input: 1_000_000, output: 500_000 };
+  const cases: Array<[string, "free" | "paid"]> = [
+    ["claude-opus-5", "paid"],
+    ["claude-sonnet-5", "paid"],
+    ["claude-haiku-4-5-20251001", "paid"],
+    ["gemini-3.5-flash-lite", "free"],
+    ["gemini-3.5-flash-lite", "paid"],
+    ["gemini-2.5-pro", "paid"],
+    ["gpt-4o", "paid"],
+  ];
+  for (const [model, tier] of cases) {
+    assert.equal(llmCostUsd(model, u, tier), extLlm.llmCostUsd(model, u, tier), model + "/" + tier);
+  }
+});
+
+test("server-side calls report usage, so the tracker has something to record", async () => {
+  const f = fakeFetch([
+    { status: 200, json: { candidates: [{ content: { parts: [{ text: "hi" }] } }], usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, thoughtsTokenCount: 6 } } },
+  ]);
+  const res = await callLLM(
+    { provider: "gemini", model: "gemini-3.5-flash-lite", apiKey: "", user: "hi", keys: [{ id: "g1", label: "", key: "AIza-1", tier: "free", enabled: true }] },
+    f.impl
+  );
+  assert.equal(res.ok, true);
+  if (res.ok) {
+    // thinking tokens fold into output, so a thinking call is not under-counted
+    assert.deepEqual(res.usage, { input: 12, output: 10 });
+    assert.equal(res.keyId, "g1");
+    assert.equal(res.keyTier, "free");
+    assert.equal(llmCostUsd(res.model!, res.usage, res.keyTier), 0, "a free-tier call costs nothing");
+  }
 });

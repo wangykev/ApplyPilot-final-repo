@@ -4,7 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
 import { coerceAiConfig, totalUsableKeys } from "@/lib/ai-config";
-import { callLLMForAction } from "@/lib/llm";
+import { callLLMTracked } from "@/lib/llm-server";
 import { buildCoverLetterPrompt, type JobInput } from "@/lib/cover-letter";
 
 export type GenResult = { ok: true; text: string } | { ok: false; error: string };
@@ -33,7 +33,7 @@ export async function generateCoverLetter(job: JobInput): Promise<GenResult> {
 
     const profile = coerceProfile(data?.profile_json);
     const { system, user: prompt } = buildCoverLetterPrompt(profile, job);
-    const res = await callLLMForAction(ai, "cover_letter", { system, user: prompt, maxTokens: 900 });
+    const res = await callLLMTracked(ai, "cover_letter", { system, user: prompt, maxTokens: 900 });
     if (!res.ok) return { ok: false, error: "AI request failed: " + res.error };
     return { ok: true, text: res.text };
   } catch (err) {

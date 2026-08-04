@@ -89,15 +89,33 @@ export type LlmRequest = {
   onKeyState?: (s: LlmKeyState) => void;
 };
 
+export type LlmUsage = { input: number; output: number };
+
 export type LlmResult =
-  | { ok: true; text: string }
+  | {
+      ok: true;
+      text: string;
+      /** Read from the raw response — the only place it exists. Without it there is nothing
+       *  for a spend/quota tracker to record. */
+      usage: LlmUsage;
+      provider?: LlmProvider;
+      model?: string;
+      /** Which key served it, and on which tier — a call can't be attributed (or known to
+       *  be free) without both. Present only on the rotation path. */
+      keyId?: string;
+      keyTier?: "free" | "paid";
+    }
   | { ok: false; error: string; status?: number; body?: string; networkError?: string };
 
 type Built = { url: string; opts: RequestInit };
 
 const PROVIDERS: Record<
   LlmProvider,
-  { build: (req: LlmRequest) => Built; parse: (data: unknown) => string | null }
+  {
+    build: (req: LlmRequest) => Built;
+    parse: (data: unknown) => string | null;
+    usage: (data: unknown) => LlmUsage;
+  }
 > = {
   anthropic: {
     build: ({ model, apiKey, system, user, maxTokens, thinking, effort }) => ({
@@ -139,6 +157,12 @@ const PROVIDERS: Record<
         : null;
       return block?.text ?? null;
     },
+    // Cache-read/creation tokens are reported separately and priced differently; not folded
+    // in, so a cached call reads as slightly cheaper than it was. Flagged, not guessed.
+    usage: (d) => {
+      const u = (d as { usage?: { input_tokens?: number; output_tokens?: number } })?.usage ?? {};
+      return { input: u.input_tokens ?? 0, output: u.output_tokens ?? 0 };
+    },
   },
 
   gemini: {
@@ -169,6 +193,17 @@ const PROVIDERS: Record<
         : null;
       return part?.text ?? null;
     },
+    // thoughtsTokenCount bills as output but is reported apart from candidates — omitting it
+    // would make a thinking call look cheaper than it was.
+    usage: (d) => {
+      const u =
+        (d as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number } })
+          ?.usageMetadata ?? {};
+      return {
+        input: u.promptTokenCount ?? 0,
+        output: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0),
+      };
+    },
   },
 
   openai: {
@@ -191,6 +226,10 @@ const PROVIDERS: Record<
       const data = d as { choices?: Array<{ message?: { content?: string } }> };
       const ch = Array.isArray(data?.choices) ? data.choices[0] : null;
       return ch?.message?.content ?? null;
+    },
+    usage: (d) => {
+      const u = (d as { usage?: { prompt_tokens?: number; completion_tokens?: number } })?.usage ?? {};
+      return { input: u.prompt_tokens ?? 0, output: u.completion_tokens ?? 0 };
     },
   },
 };
@@ -260,7 +299,13 @@ export async function callLLMOnce(
   if (text == null || String(text).trim() === "") {
     return { ok: false, error: "no text in response: " + JSON.stringify(data).slice(0, 300) };
   }
-  return { ok: true, text: String(text).trim() };
+  let usage: LlmUsage = { input: 0, output: 0 };
+  try {
+    usage = prov.usage(data);
+  } catch {
+    /* never fail a good answer over accounting */
+  }
+  return { ok: true, text: String(text).trim(), usage, provider: req.provider, model: req.model };
 }
 
 function msg(e: unknown): string {
@@ -297,7 +342,7 @@ export async function callLLM(req: LlmRequest, fetchImpl: typeof fetch = fetch):
     if (res.ok) {
       state = applyLlmKeyOutcome(state, req.provider, k.id, "ok", Date.now());
       commit();
-      return res;
+      return { ...res, keyId: k.id, keyTier: k.tier };
     }
     const verdict = classifyLlmFailure({ status: res.status, body: res.body, networkError: res.networkError });
     last = res;
@@ -445,6 +490,20 @@ export const LLM_PRICING: Record<string, { in: number; out: number }> = {
   "claude-sonnet-4-6": { in: 3, out: 15 },
   "claude-haiku-4-5-20251001": { in: 1, out: 5 },
 };
+
+/**
+ * Cost of one call in USD, or NULL when it cannot be known — an unpriced model must read as
+ * "unknown", never as free, or a spend chart would quietly under-report. A free-tier Gemini
+ * call is a real 0, which is why the tier has to be passed in: the model id alone can't say.
+ * Lockstep with llm.js.
+ */
+export function llmCostUsd(model: string, usage: LlmUsage | undefined, tier?: "free" | "paid"): number | null {
+  if (tier === "free" && isFreeTierModel("gemini", model)) return 0;
+  const rate = LLM_PRICING[model];
+  if (!rate) return null;
+  const u = usage ?? { input: 0, output: 0 };
+  return (u.input * rate.in + u.output * rate.out) / 1e6;
+}
 
 export const LLM_PRICING_URLS: Record<LlmProvider, string> = {
   anthropic: "https://platform.claude.com/docs/en/pricing",

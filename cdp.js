@@ -4076,6 +4076,11 @@ function makeCdpActuation(llmConfig) {
           onKeyState: (s) => { cdpLlmKeyState = s; },
           system, user, maxTokens
         });
+        // Every attempt is recorded — successes for spend/quota, failures because a run of
+        // quota errors is the clearest sign a key is spent.
+        if (typeof recordLlmUsage === "function" && typeof llmUsageEntry === "function") {
+          recordLlmUsage(llmUsageEntry(action || "fill", res));
+        }
         if (res.ok) return res;
         // A FAILED attempt names itself too — with several models configured as fallbacks, silence
         // here makes it impossible to tell whether the answer came from your first choice or the

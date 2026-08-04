@@ -103,6 +103,13 @@ const LLM_PROVIDERS = {
     parse: (d) => {
       const block = d && Array.isArray(d.content) ? d.content.find((b) => b && b.type === "text") : null;
       return block ? block.text : null;
+    },
+    // Cache-read/creation tokens are reported separately and priced differently; they are
+    // NOT folded in here, so a cached call reads as slightly cheaper than it was. Flagged
+    // rather than guessed at — the tracker can add them when the rates are pinned down.
+    usage: (d) => {
+      const u = (d && d.usage) || {};
+      return { input: u.input_tokens || 0, output: u.output_tokens || 0 };
     }
   },
 
@@ -126,6 +133,12 @@ const LLM_PROVIDERS = {
       const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : null;
       const part = parts ? parts.find((p) => p && typeof p.text === "string") : null;
       return part ? part.text : null;
+    },
+    // thoughtsTokenCount is billed as output but reported apart from candidates, so it has
+    // to be added in or a thinking call looks cheaper than it was.
+    usage: (d) => {
+      const u = (d && d.usageMetadata) || {};
+      return { input: u.promptTokenCount || 0, output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0) };
     }
   },
 
@@ -149,6 +162,10 @@ const LLM_PROVIDERS = {
     parse: (d) => {
       const ch = d && Array.isArray(d.choices) ? d.choices[0] : null;
       return ch && ch.message ? ch.message.content : null;
+    },
+    usage: (d) => {
+      const u = (d && d.usage) || {};
+      return { input: u.prompt_tokens || 0, output: u.completion_tokens || 0 };
     }
   }
 };
@@ -265,7 +282,11 @@ async function callLLMOnce(req, fetchImpl, sleepImpl) {
   let text;
   try { text = prov.parse(data); } catch (e) { return { ok: false, error: "parse failed: " + String((e && e.message) || e) }; }
   if (text == null || String(text).trim() === "") return { ok: false, error: "no text in response: " + JSON.stringify(data).slice(0, 300) };
-  return { ok: true, text: String(text).trim() };
+  // Usage is read HERE because it is the only place the raw response body exists. Without
+  // it there is nothing for a spend/quota tracker to record — the body is discarded.
+  let usage = { input: 0, output: 0 };
+  try { if (typeof prov.usage === "function") usage = prov.usage(data); } catch (e) { /* never fail a good answer over accounting */ }
+  return { ok: true, text: String(text).trim(), usage, model: cfg.model, provider: cfg.provider };
 }
 
 // ─── Key rotation ───────────────────────────────────────────────────────────
@@ -322,9 +343,11 @@ async function callLLM(req, fetchImpl, sleepImpl) {
   if (ordered.keys.length === 1) {
     // One key → give it the full ladder rather than a bare probe; there is nothing to
     // rotate to, so waiting IS the remedy.
-    const res = await callLLMOnce({ ...cfg, apiKey: ordered.keys[0].key }, fetchImpl, sleepImpl);
+    const one = ordered.keys[0];
+    const res0 = await callLLMOnce({ ...cfg, apiKey: one.key }, fetchImpl, sleepImpl);
+    const res = res0.ok ? { ...res0, keyId: one.id, keyTier: one.tier } : res0;
     const verdict = res.ok ? null : api.classifyLlmFailure({ status: res.status, body: res.body, networkError: res.networkError });
-    state = api.applyLlmKeyOutcome(state, cfg.provider, ordered.keys[0].id, res.ok ? "ok" : verdict.code, now(), llmRetryAfterMsFromBody(res));
+    state = api.applyLlmKeyOutcome(state, cfg.provider, one.id, res.ok ? "ok" : verdict.code, now(), llmRetryAfterMsFromBody(res));
     commit();
     return res;
   }
@@ -336,7 +359,9 @@ async function callLLM(req, fetchImpl, sleepImpl) {
     if (res.ok) {
       state = api.applyLlmKeyOutcome(state, cfg.provider, k.id, "ok", now());
       commit();
-      return res;
+      // Which key served it, and on which tier — a spend tracker cannot attribute a call
+      // (or know it was free) without both.
+      return { ...res, keyId: k.id, keyTier: k.tier };
     }
     const verdict = api.classifyLlmFailure({ status: res.status, body: res.body, networkError: res.networkError });
     last = res;
@@ -455,6 +480,18 @@ const LLM_PRICING = {
   "claude-sonnet-4-6": { in: 3, out: 15 },
   "claude-haiku-4-5-20251001": { in: 1, out: 5 }
 };
+// Cost of one call, USD. Returns NULL when it cannot be known rather than 0 — an unpriced
+// model must read as "unknown", never as free, or a spend chart would quietly under-report.
+// A FREE-TIER Gemini call is a real 0: that is the whole point of the free/paid distinction,
+// and it is why the tier has to be passed in (the model id alone cannot tell you).
+function llmCostUsd(model, usage, tier) {
+  if (tier === "free" && isFreeTierModel("gemini", model)) return 0;
+  const rate = LLM_PRICING[model];
+  if (!rate) return null;
+  const u = usage || {};
+  return ((u.input || 0) * rate.in + (u.output || 0) * rate.out) / 1e6;
+}
+
 const LLM_PRICING_URLS = {
   anthropic: "https://platform.claude.com/docs/en/pricing",
   gemini: "https://ai.google.dev/gemini-api/docs/pricing",
@@ -467,7 +504,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
-    GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
+    llmCostUsd, GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
     ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor, ANTHROPIC_EFFORT_LEVELS,
     ANTHROPIC_EFFORT_MIN_TOKENS, anthropicEffortFor, anthropicMaxTokens };
 }
