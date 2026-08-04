@@ -587,8 +587,16 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         const attached = await cdpAttach(tabId);
         if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
         const steps = [];
+        // `reload` re-enters the page fresh, which is how you observe what Workday renders BEFORE any
+        // fill touches it — the pre-state a settled scan sees. Every step reports the FULL wrapper
+        // inventory so "is this field mounted at all?" is answerable, not just "what is checked".
+        if (message.reload) {
+          await cdpSend("Page.reload", { ignoreCache: false });
+          await cdpDelay(Number(message.reloadWaitMs) || 12000);
+          steps.push({ step: "after reload", wrappers: await cdpEval(cdpDevWrappers) });
+        }
         let groups = await cdpEval(cdpDevGroups);
-        steps.push({ step: "initial", groups });
+        steps.push({ step: "initial", groups, wrappers: await cdpEval(cdpDevWrappers) });
         const target = (groups || []).find((g) => !message.fieldName || g.fieldName === message.fieldName);
         // Geometry: what actually sits under the point the FILLER clicks (see cdpDevBoxGeom).
         if (target && message.geom) steps.push({ step: "geometry", geom: await cdpEval(cdpDevBoxGeom, target.wrapperSel) });

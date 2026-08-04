@@ -2631,6 +2631,25 @@ function cdpDevBoxGeom(wrapperSel) {
     }),
   };
 }
+// READ-ONLY inventory of EVERY formField wrapper on the page with its widget kind and current value.
+// cdpDevGroups only reports checkbox GROUPS, so it cannot answer "is this field even mounted yet?" —
+// which is the question when a widget appears mid-fill and the settled pre-fill scan never saw it.
+function cdpDevWrappers() {
+  return Array.from(document.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
+    const aid = (w.getAttribute("data-automation-id") || "").replace(/^formField-/, "");
+    const btn = w.querySelector('button[aria-haspopup="listbox"]');
+    const cbs = w.querySelectorAll('input[type="checkbox"]');
+    const txt = w.querySelector('input[type="text"], textarea');
+    return {
+      field: aid,
+      widget: btn ? "dropdown" : cbs.length > 1 ? "checkbox_group(" + cbs.length + ")" : cbs.length === 1 ? "checkbox" : txt ? "text" : "other",
+      value: btn ? btn.textContent.trim().slice(0, 46)
+        : cbs.length ? Array.from(cbs).map((c) => c.checked).join(",")
+        : txt ? (txt.value || "") : null,
+      required: !!(w.querySelector("abbr") || w.querySelector('[aria-required="true"]')),
+    };
+  });
+}
 function cdpReadCheckboxGroupState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;
