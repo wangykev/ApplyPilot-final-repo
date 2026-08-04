@@ -5529,7 +5529,14 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       //
       // Same helper, same blank/carve-out rules as the replay walk, so the two agree. Re-fills ONLY what
       // actually reads blank, so a page where everything stuck costs one read-only scan.
+      //
+      // Kill-switch: `chrome.storage.local.skipPreSaveReverify` (same pattern as forceTrustedInput /
+      // forceWorkerTimersOff). Set it to REPRODUCE the raw failure on demand — with the re-verify off,
+      // the walk halts on the self-ID page instead of healing it, which parks a tab there for a DOM
+      // trace. Without a knob the fix hides the very bug you want to look at.
       try {
+        const { skipPreSaveReverify } = await new Promise((r) => chrome.storage.local.get("skipPreSaveReverify", r));
+        if (skipPreSaveReverify) throw new Error("skipPreSaveReverify — DELIBERATELY OFF (reproduction mode)");
         const preSaveScan = await cdpEval(cdpPageScan);
         const lost = requiredBlankOnPage((preSaveScan && preSaveScan.fields) || [], (bundle && bundle.entries) || []);
         if (lost.length) {
