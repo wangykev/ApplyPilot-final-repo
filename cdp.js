@@ -2597,6 +2597,40 @@ function cdpDevClickBox(args) {
   lab.click();
   return { ok: true };
 }
+
+// READ-ONLY geometry of a checkbox group, to answer whether the FILLER'S actuation and a page-side
+// `label.click()` can differ. The filler clicks the LABEL'S CENTRE COORDINATE
+// (clickRadioLabel → cdpRectReady('label[for=…]') → cdpClickAt). If the input sits AT that centre, one
+// physical click can be seen by both the input and its label, and a checkbox toggles TWICE — checked
+// then instantly unchecked, which is exactly what was observed live. So report, per box: the label and
+// input rects, the label's centre, and what elementFromPoint() actually resolves to there.
+function cdpDevBoxGeom(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, error: "wrapper not found" };
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
+  const r2 = (r) => (r ? { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } : null);
+  return {
+    ok: true,
+    boxes: Array.from(w.querySelectorAll('input[type="checkbox"]')).map((inp) => {
+      const lab = inp.id ? document.querySelector('label[for="' + esc(inp.id) + '"]') : null;
+      const lr = lab ? lab.getBoundingClientRect() : null;
+      const cx = lr ? Math.round(lr.x + lr.width / 2) : null;
+      const cy = lr ? Math.round(lr.y + lr.height / 2) : null;
+      const at = cx != null ? document.elementFromPoint(cx, cy) : null;
+      return {
+        id: inp.id, checked: !!inp.checked,
+        label: (lab && lab.textContent || "").trim().slice(0, 60),
+        inputRect: r2(inp.getBoundingClientRect()), labelRect: r2(lr),
+        labelCentre: cx != null ? [cx, cy] : null,
+        // the whole question: what is under the point the filler clicks?
+        atCentre: at ? (at.tagName + (at.id ? "#" + at.id : "") + (at.getAttribute && at.getAttribute("for") ? "[for=" + at.getAttribute("for") + "]" : "")) : null,
+        atCentreIsThisInput: !!(at && at === inp),
+        atCentreIsThisLabel: !!(at && at === lab),
+        inputInsideLabel: !!(lab && lab.contains(inp)),
+      };
+    }),
+  };
+}
 function cdpReadCheckboxGroupState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;

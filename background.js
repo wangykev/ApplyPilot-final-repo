@@ -543,7 +543,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -590,6 +590,8 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         let groups = await cdpEval(cdpDevGroups);
         steps.push({ step: "initial", groups });
         const target = (groups || []).find((g) => !message.fieldName || g.fieldName === message.fieldName);
+        // Geometry: what actually sits under the point the FILLER clicks (see cdpDevBoxGeom).
+        if (target && message.geom) steps.push({ step: "geometry", geom: await cdpEval(cdpDevBoxGeom, target.wrapperSel) });
         if (target && Array.isArray(message.checkIds)) {
           for (const id of message.checkIds) {
             const r = await cdpEval(cdpDevClickBox, { wrapperSel: target.wrapperSel, id });
@@ -597,6 +599,21 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             groups = await cdpEval(cdpDevGroups);
             const g = (groups || []).find((x) => x.fieldName === target.fieldName);
             steps.push({ step: "clicked " + id, click: r, checked: g ? g.boxes.filter((b) => b.checked).map((b) => b.label) : null });
+          }
+        }
+        // COORDINATE click — byte-identical to what the filler does (clickRadioLabel: resolve the
+        // label's rect, then cdpClickAt its centre). Compared against the page-side `label.click()`
+        // above, this isolates the actuation as the variable: same box, same page, different primitive.
+        if (target && Array.isArray(message.coordClickIds)) {
+          for (const id of message.coordClickIds) {
+            const rect = await cdpRectReady('label[for="' + id + '"]', true);
+            if (!rect) { steps.push({ step: "coordClick " + id, error: "no label rect" }); continue; }
+            await cdpClickAt(rect.cx, rect.cy);
+            await cdpDelay(900);
+            groups = await cdpEval(cdpDevGroups);
+            const g = (groups || []).find((x) => x.fieldName === target.fieldName);
+            steps.push({ step: "coordClick " + id, at: [Math.round(rect.cx), Math.round(rect.cy)],
+              checked: g ? g.boxes.filter((b) => b.checked).map((b) => b.label) : null });
           }
         }
         sendResponse({ ok: true, url: (await new Promise((r) => chrome.tabs.get(tabId, r))).url, steps });
