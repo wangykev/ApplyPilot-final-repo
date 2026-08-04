@@ -513,6 +513,13 @@ function makeFakeAct(fields, opts) {
 
     // radio / checkbox
     readRadioState: async (loc) => byLoc(loc).options.map((o) => ({ ...o })),
+    // Quiescence gate: `quietDelayMs`/`quietNever` on a field model a page that is still reacting.
+    awaitQuiet: async (loc, opts) => {
+      const f = byLoc(loc);
+      log.push(["awaitQuiet", loc.wrapperSel]);
+      if (f.quietNever) return { quiet: false, waitedMs: (opts && opts.ceilingMs) || 3000 };
+      return { quiet: true, waitedMs: f.quietDelayMs || 0 };
+    },
     // checkbox GROUP (pick-one checkbox set — the OFCCP self-ID). Same shape as readRadioState.
     // `rebuildScript` models Workday REBUILDING the widget under us (live on waystar 2026-08-04): a queue
     // consumed one entry per read — "gone" = wrapper missing (null), "empty" = present with no boxes ([]),
@@ -2753,6 +2760,37 @@ const genderGroup = (rebuildScript) => {
   if (rebuildScript) field.rebuildScript = rebuildScript;
   return field;
 };
+
+test("checkbox group quiescence: the DOM is waited on BEFORE the first click, never after", async () => {
+  // Ordering is the whole point: a gate checked after the click guards nothing.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const seq = act.log.map(([m]) => m);
+  const q = seq.indexOf("awaitQuiet"), c = seq.indexOf("clickRadioLabel");
+  assert.ok(q >= 0, "the quiescence gate ran: " + JSON.stringify(seq.slice(0, 8)));
+  assert.ok(q < c, `awaitQuiet must precede the click (got awaitQuiet@${q}, click@${c})`);
+});
+
+test("checkbox group quiescence: a page that never goes quiet still gets clicked (never hangs)", async () => {
+  const field = genderGroup();
+  field.quietNever = true;
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "the ceiling must not block the fill");
+  assert.strictEqual(rec.after, "Male");
+  assert.match(rec.detail, /CEILING — clicked while still busy/, "and it says it went ahead un-quiet: " + rec.detail);
+});
+
+test("checkbox group quiescence: a substrate without awaitQuiet still fills (older/other substrates)", async () => {
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  delete act.awaitQuiet;
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Male");
+});
 
 test("checkbox group persistence: a rebuild that comes back UNCHECKED is re-filled, not reported filled", async () => {
   // read #1 = the post-click verify (normal), then the widget is rebuilt with everything cleared.

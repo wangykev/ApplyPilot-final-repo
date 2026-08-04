@@ -2631,6 +2631,36 @@ function cdpDevBoxGeom(wrapperSel) {
     }),
   };
 }
+// ── QUIESCENCE (2026-08-04): "is the page still busy?", which no other wait here can answer ─────────
+// Every settle in this file waits for a COUNT to stop changing (field set, options, entries). None can
+// tell you the DOM is mid-reaction, and that is what actually breaks the self-ID checkbox group: the
+// 10ms watch caught our verified check being wiped 281ms later by 29 MutationRecords, with NO click
+// behind it. A human never hits that window because by the time they click, the page has gone quiet.
+//
+// Page side does nothing but STAMP the last mutation. The WAITING happens in the service worker on real
+// wall-clock — a page-side timer would be throttled on a hidden tab, the rule this file already learned
+// three times over.
+function cdpInstallQuietWatch(sel) {
+  try {
+    window.__apQuiet = window.__apQuiet || {};
+    window.__apQuietMo = window.__apQuietMo || {};
+    if (window.__apQuietMo[sel]) return { ok: true, already: true };
+    const w = document.querySelector(sel);
+    // The wrapper's PARENT: a reaction can replace the wrapper itself, and a sibling churning is just as
+    // good a signal that the form is busy. The whole document would never be quiet.
+    const root = (w && w.parentNode) || document.body;
+    window.__apQuiet[sel] = Date.now();
+    const mo = new MutationObserver(() => { window.__apQuiet[sel] = Date.now(); });
+    mo.observe(root, { childList: true, subtree: true, attributes: true });
+    window.__apQuietMo[sel] = mo;
+    return { ok: true, root: root.nodeName };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+function cdpReadQuiet(sel) {
+  const at = (window.__apQuiet || {})[sel];
+  return at ? { ok: true, idleMs: Date.now() - at } : { ok: false };
+}
+
 // ── TEMPORARY DIAGNOSTIC (2026-08-04): watch a checkbox group at 10ms and say WHY it changed ────────
 // The question this settles: when the group loses its check, is the DOM being REBUILT (a re-render) or is
 // the input's `checked` being toggled in place (a click / property write)? Those need opposite fixes and
@@ -3969,6 +3999,27 @@ function makeCdpActuation(llmConfig) {
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
     readCheckboxGroup: (loc) => cdpEval(cdpReadCheckboxGroupState, loc.wrapperSel), // pick-one checkbox set (self-ID); clickRadioLabel commits by label id
+    // Wait until the DOM around `loc` has stopped mutating for `quietMs`. NEVER hangs: on the ceiling it
+    // reports quiet:false and the caller proceeds anyway — a gate that can block a fill forever is worse
+    // than the bug it guards. Polls SW-side on wall-clock; the page only stamps.
+    awaitQuiet: async (loc, opts) => {
+      const quietMs = (opts && opts.quietMs) || 400;
+      const ceilingMs = (opts && opts.ceilingMs) || 3000;
+      const t0 = Date.now();
+      try {
+        const ins = await cdpEval(cdpInstallQuietWatch, loc.wrapperSel);
+        if (!ins || !ins.ok) return { quiet: false, waitedMs: 0, error: (ins && ins.error) || "install failed" };
+        // A fresh install stamps NOW, so the first pass always waits one full quiet window — which is the
+        // conservative direction and costs quietMs once per widget.
+        for (;;) {
+          const q = await cdpEval(cdpReadQuiet, loc.wrapperSel);
+          const waited = Date.now() - t0;
+          if (q && q.ok && q.idleMs >= quietMs) return { quiet: true, waitedMs: waited, idleMs: q.idleMs };
+          if (waited >= ceilingMs) return { quiet: false, waitedMs: waited, idleMs: (q && q.idleMs) || null };
+          await cdpDelay(Math.min(80, quietMs));   // real wall-clock, never the adaptive delay
+        }
+      } catch (e) { return { quiet: false, waitedMs: Date.now() - t0, error: String((e && e.message) || e) }; }
+    },
     scanOrphanCheckboxes: () => cdpEval(cdpScanOrphanCheckboxes), // consents rendered OUTSIDE any formField wrapper (read-only inventory for review)
     // Blur whatever the fill last focused (2026-07-25, operator): some tenants only COMMIT a text field —
     // and fire the cascade it triggers — on BLUR, and the fill leaves focus INSIDE the last field it typed

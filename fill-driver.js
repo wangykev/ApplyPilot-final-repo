@@ -1793,7 +1793,20 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   // 2. check the target (skip when it already is)
   let now = await readBack();
   const isOn = (id) => !!(now.find((o) => o.id === id) || {}).checked;
+  let quiet = null;
   if (!isOn(target.id)) {
+    // ── QUIESCENCE GATE (2026-08-04) — don't click into a page that is still reacting ───────────────
+    // The 10ms watch showed our verified check being wiped 281ms later by 29 MutationRecords with NO
+    // click behind it: the page was still digesting the fields filled just before this one (a language
+    // change, a name, three date segments), and the reaction rebuilt these inputs. A human never hits
+    // that window, which is the whole reason this fails for the bot and not by hand.
+    //
+    // Every other wait here tracks a COUNT settling and so cannot see "busy". This waits for the DOM
+    // around the widget to fall silent. It NEVER blocks the fill: on the ceiling it proceeds and says so,
+    // and the persistence re-read below still backstops whatever lands later than any gate.
+    if (typeof act.awaitQuiet === "function") {
+      quiet = await act.awaitQuiet(loc, { quietMs: budgets.groupQuietMs || 400, ceilingMs: budgets.groupQuietCeilingMs || 3000 });
+    }
     await act.clickRadioLabel(loc, target.id);
     await pollCheckedIs(act, target.id, true, budgets);
     now = await readBack();
@@ -1857,6 +1870,7 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
     selected_options: finalOn.map((o) => o.labelText),
     ...(refills ? { flag: "checkbox-group-refilled" } : {}),
     detail: (before && before !== after ? `label-click (replaced "${before}")` : "label-click")
+      + (quiet ? `; waited ${quiet.waitedMs}ms for the DOM to go quiet${quiet.quiet ? "" : " (CEILING — clicked while still busy)"}` : "")
       + (rebuilt ? `; survived ${rebuilt} widget rebuild(s)${refills ? ` after ${refills} re-fill(s)` : ""}` : "")
       + `; persistence-confirmed` };
 };
