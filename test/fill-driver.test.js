@@ -8806,3 +8806,42 @@ test("review reconcile: a zero-padded date AGREES instead of blocking submit", (
   const wrong = reconcileReviewPage([{ section: "Education", label: entry.question_label, value: "05/02/2028" }], [entry]);
   assert.strictEqual(wrong.agree.length, 0, "a different day is a real disagreement");
 });
+
+// ── the KEYED review-page path must accept a re-formatted date too ──
+// My first pass added the date tier only to valueTier (the label-anchored path), so the test passed
+// while the live run still blocked: real page items carry a `key` and go through verdictFor/valuesAgree.
+// Testing the path the code actually takes is the whole point.
+test("review reconcile: a zero-padded date AGREES on the KEYED path, not just the label path", () => {
+  const entry = { field_id: "p2::formField-gradDate", question_label: "What is your anticipated graduation month and year (MM/YYYY)",
+    widget_type: "date", current_value: "5/1/2028", is_required: true };
+  // The FLAT keyed lookup requires entryOrdinal == null and key === the field_id's form-field name.
+  // My first fixture set entryOrdinal:0, so the lookup missed and it silently took the label-anchored
+  // path — which is why the test passed with the fix reverted.
+  const keyed = [{ section: "Education", label: entry.question_label, value: "05/01/2028",
+    key: "gradDate", entryOrdinal: null }];
+  const r = reconcileReviewPage(keyed, [entry]);
+  assert.strictEqual(r.disagree.length, 0, "zero-padding must not block submit: " + JSON.stringify(r.disagree));
+  // and a genuinely different day is still a contradiction on the same path
+  const wrong = reconcileReviewPage([{ ...keyed[0], value: "05/02/2028" }], [entry]);
+  assert.strictEqual(wrong.agree.length, 0, "a different day is a real disagreement");
+});
+
+// ── a PRE-FILLED typeahead skips higher tiers the form does not offer ──
+// Operator 2026-08-04: with "Electrical Engineering" already committed it typed "Electrical and
+// Computer Engineering" first, found nothing, then moved on — a search the complete scrape had already
+// ruled out. The short-circuit's no-match branch was gated to normal fills only.
+test("typeahead pre-filled: a provably-absent higher tier is never typed", async () => {
+  const OPTS = ["Electrical Engineering", "Mechanical Engineering", "Computer Science"];
+  const f = srcField({
+    wrapperSel: "[w-fos]",
+    chips: ["Electrical Engineering"],                       // already committed
+    startOptions: OPTS, startAtBottom: true,                 // a COMPLETE scrape
+  });
+  const act = makeFakeAct([f], {});
+  const r = await fillTypeaheadCdp(act, { wrapperSel: "[w-fos]" },
+    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS);
+  const typed = act.log.filter(([m]) => m === "typeInSourceSearch" || m === "typeText").map(([, v]) => String(v));
+  assert.ok(!typed.some((t) => /Computer/.test(t)),
+    "the absent higher tier must not be typed — the complete scrape already ruled it out: " + JSON.stringify(typed));
+  assert.match(String(r.after || ""), /Electrical Engineering/, "the prefill is kept, which is the same verdict as before");
+});

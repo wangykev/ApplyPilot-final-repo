@@ -964,6 +964,11 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     if (!a || !b) return false;
     const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
     if (short.length >= 4 && long.includes(short)) return true;
+    // A date the FORM re-formatted is the same answer: approved "5/1/2028" vs a displayed
+    // "05/01/2028" is zero-padding, not a contradiction, and blocking submit over it refuses a
+    // correct application (live, Home Depot 2026-08-04). This is the KEYED path verdictFor uses —
+    // the digit-strip below cannot serve here, because it would also equate 5/1/2028 with 51/2028.
+    if (sameCalendarDate(recRaw, revRaw)) return true;
     const ad = String(recRaw).replace(/\D+/g, ""), bd = String(revRaw).replace(/\D+/g, "");
     if (ad.length >= 4 && bd.length >= 4 && (ad === bd || bd.includes(ad) || ad.includes(bd))) return true;
     const ab = REGION_ABBREV[a]; if (ab && new RegExp("(^|[ ,])" + ab + "([ ,]|$)").test(b)) return true;

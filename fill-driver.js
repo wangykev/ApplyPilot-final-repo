@@ -2204,9 +2204,20 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
             note: `skipped ${at} candidate(s) absent from the scraped ${capturedFull.length}-option list` });
           overwriteCandidates = overwriteCandidates.slice(at);
         }
-      } else if (preTierIndex === -1) { // normal fill only — a tier-UPGRADE walk keeps its keep-the-prefill semantics
+      } else {
+        // NO higher-tier candidate exists on this form. This used to be gated to a normal fill only,
+        // on the reasoning that "a tier-UPGRADE walk keeps its keep-the-prefill semantics" — but for an
+        // upgrade, an empty higher-tier list IS keep-the-prefill. Operator 2026-08-04: with
+        // "Electrical Engineering" already committed it typed "Electrical and Computer Engineering"
+        // first, found nothing, and only then moved on — a search the COMPLETE scrape had already
+        // ruled out (~540ms measured earlier for exactly this). Skipping reaches the identical
+        // verdict without the round-trip.
+        //
+        // The two exits stay DISTINCT: a normal fill flows to the genuine-no-match end (where the AI
+        // rescue picks from this very list), while an upgrade flows to keep-the-prefill. Conflating
+        // them would either lose the prefill or spend an LLM call on a field that is already answered.
         trace.push({ candidate: "(pre-scrape match)", outcome: "short-circuit",
-          note: `no candidate appears in the scraped ${capturedFull.length}-option list (complete) — skipped the type/Enter walk` });
+          note: `no ${preTierIndex === -1 ? "" : "higher-tier "}candidate appears in the scraped ${capturedFull.length}-option list (complete) — skipped the type/Enter walk` });
         overwriteCandidates = [];
       }
     }
