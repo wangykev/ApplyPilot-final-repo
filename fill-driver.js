@@ -1998,9 +1998,13 @@ const aiFillCheckboxGroup = async (act, loc, f, profile, jobContext, budgets) =>
     flag: "ai-commit-failed", confidence: conf, ...hint,
     detail: "AI chose \"" + target + "\" but the checkbox group did not commit (" + ((cr && cr.detail) || "no result") + ")",
     options: optionLabels, auditLoc: loc.wrapperSel };
+  // Carry the filler's own note through when it has something to say beyond a plain commit — a widget
+  // REBUILD it had to survive or re-fill is exactly what the operator (and the next debugging session)
+  // needs to see, and composing a fresh detail here used to drop it silently.
+  const persistNote = /rebuild|persistence-confirmed/.test(String(cr.detail || "")) ? " [" + cr.detail + "]" : "";
   return { status: "filled_review", after: cr.after, verified: true, matchTier: m.matchTier,
     flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf, ...hint,
-    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + cr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
+    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + cr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : "") + persistNote,
     options: optionLabels, auditLoc: loc.wrapperSel };
 };
 
