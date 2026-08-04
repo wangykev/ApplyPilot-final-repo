@@ -8742,3 +8742,25 @@ test("compensation: the recognizer needs BOTH a money word and an asking word", 
   for (const t of yes) assert.ok(apMatchLib.isCompensationQuestion(t), t);
   for (const t of no) assert.ok(!apMatchLib.isCompensationQuestion(t), t);
 });
+
+// ── a digits-only field that FILTERS keystrokes has already given the right answer ──
+// Operator 2026-08-03: "the 80,000 is fine since if it only takes numbers then the , will be omitted
+// and it is still correct." Right — and the coercion I first added guarded the wrong case. Such a
+// field can fail two ways: it FILTERS (box ends up "80000" — correct) or it REJECTS (box ends up
+// empty). Only the second was handled, so the first returned needs_review over a CORRECT field, which
+// on a replay is a halt on a value that landed.
+test("text fill: a field that strips the comma to 80000 is ACCEPTED, not a mismatch", async () => {
+  const f = aiText({ isRequired: true, mangle: (t) => t.replace(/[^0-9]/g, "") }); // filters as you type
+  const act = makeFakeAct([f]);
+  const r = await fillTextCdp(act, { wrapperSel: f.wrapperSel }, "80,000", T_BUDGETS, "input");
+  assert.strictEqual(r.status, "filled", r.detail);
+  assert.strictEqual(r.after, "80000", "reports what LANDED — a bundle holding 80,000 would DISAGREE on the review page");
+  assert.strictEqual(r.numericCoerced, true);
+});
+
+test("text fill: acceptance is digits-EQUALITY, so a real mismatch still fails", async () => {
+  // the field mangles the value into a DIFFERENT number — that is not normalization, it is wrong
+  const wrong = makeFakeAct([aiText({ isRequired: true, mangle: () => "8000" })]);
+  const r = await fillTextCdp(wrong, { wrapperSel: "[w-essay]" }, "80,000", T_BUDGETS, "input");
+  assert.strictEqual(r.status, "needs_review", "80000 != 8000 — never paper over a real mismatch");
+});

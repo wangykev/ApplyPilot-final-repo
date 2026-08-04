@@ -800,6 +800,22 @@ const fillTextCdp = async (act, loc, value, budgets, tag, opts) => {
   //     review page reconcile compares against the form, so a bundle claiming "80,000" over a field
   //     holding "80000" would read as a DISAGREE and block submit.
   const digitsOnly = String(value == null ? "" : value).replace(/[^0-9]/g, "");
+
+  // THE FIELD NORMALIZED OUR VALUE — accept it. A digits-only input that filters keystrokes turns
+  // "80,000" into "80000" as you type: the number the human meant is on the form, and only the
+  // formatting was dropped. Reporting needs_review there would fail a field that is CORRECT, and on a
+  // replay that is a halt over a value that actually landed (operator 2026-08-03).
+  //
+  // Strictly equality on the DIGITS, so this can never paper over a real mismatch: "80000" is accepted
+  // for "80,000", while "8000" or "180000" still fails. The record reports what LANDED, because the
+  // review-page reconcile compares against the form and a bundle holding "80,000" over a field showing
+  // "80000" would read as a DISAGREE.
+  const landed = after == null ? "" : String(after).trim();
+  if (landed && digitsOnly && landed.replace(/[^0-9]/g, "") === digitsOnly && landed !== String(value).trim()) {
+    return { status: "filled", after: landed, verified: true, numericCoerced: true,
+      detail: `the field keeps digits only — it holds ${JSON.stringify(landed)} for ${JSON.stringify(String(value))}` };
+  }
+
   const refused = after == null || String(after).trim() === "";
   if (!(opts && opts.noNumericRetry) && refused && digitsOnly && digitsOnly !== String(value).trim()) {
     const retry = await fillTextCdp(act, loc, digitsOnly, budgets, tag, { noNumericRetry: true });
