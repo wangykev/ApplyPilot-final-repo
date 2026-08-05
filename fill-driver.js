@@ -1793,7 +1793,7 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   // 2. check the target (skip when it already is)
   let now = await readBack();
   const isOn = (id) => !!(now.find((o) => o.id === id) || {}).checked;
-  let quiet = null;
+  let quiet = null, clickInfo = null;
   if (!isOn(target.id)) {
     // ── QUIESCENCE GATE (2026-08-04) — don't click into a page that is still reacting ───────────────
     // The 10ms watch showed our verified check being wiped 281ms later by 29 MutationRecords with NO
@@ -1819,7 +1819,7 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
       }
       if (isOn(target.id)) { /* the wait was enough on its own — fall through to the verify below */ }
     }
-    if (!isOn(target.id)) await act.clickRadioLabel(loc, target.id);
+    if (!isOn(target.id)) clickInfo = await act.clickRadioLabel(loc, target.id);
     await pollCheckedIs(act, target.id, true, budgets);
     now = await readBack();
   }
@@ -1827,7 +1827,13 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   let after = (on[0] || {}).labelText || null;
   if (!isOn(target.id)) return { status: "needs_review", options: optionLabels, after,
     detail: `checkbox-group selection did not commit for "${target.labelText}"`
-      + (quiet ? ` (quiescence: waited ${quiet.waitedMs}ms${quiet.quiet ? "" : " — CEILING, still busy"}${quiet.reissuedIds ? "; the rebuild RE-ISSUED the box ids and they were re-resolved" : ""})` : "") };
+      + (quiet ? ` (quiescence: waited ${quiet.waitedMs}ms${quiet.quiet ? "" : " — CEILING, still busy"}${quiet.reissuedIds ? "; the rebuild RE-ISSUED the box ids and they were re-resolved" : ""})` : "")
+      // WHICH failure is this? "no click dispatched" and "clicked and it didn't take" need opposite
+      // fixes, and until now they were indistinguishable because the click's return value was discarded.
+      + (clickInfo === false ? " — NO CLICK WAS DISPATCHED: the label had no layout rect"
+         : clickInfo && clickInfo.hit
+           ? ` — clicked (${clickInfo.cx},${clickInfo.cy}); under that point was ${clickInfo.hit.hit}${clickInfo.hit.mine ? " (the right label)" : " — NOT our label, the rect went stale"}${clickInfo.hit.text ? ` "${clickInfo.hit.text}"` : ""}`
+           : clickInfo ? ` — clicked (${clickInfo.cx},${clickInfo.cy}), hit-test unavailable` : "") };
   if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
     detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
 

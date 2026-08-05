@@ -2794,6 +2794,28 @@ test("checkbox group quiescence: ids RE-ISSUED during the wait are re-resolved, 
   assert.ok(clicked.includes("m-v2"), "clicked the RE-ISSUED id, not the stale one: " + JSON.stringify(clicked));
 });
 
+test("checkbox group: a commit failure says whether a click was even DISPATCHED", async () => {
+  // Live run 8: "did not commit" with no way to tell whether we clicked and it was ignored, or never
+  // clicked at all — because clickRadioLabel's return value was thrown away. Those need opposite fixes.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  act.clickRadioLabel = async () => false;            // no layout rect ⇒ nothing dispatched
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.match(out.results[0].detail, /NO CLICK WAS DISPATCHED/, out.results[0].detail);
+});
+
+test("checkbox group: a commit failure names what the click actually landed on", async () => {
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  act.clickRadioLabel = async () => ({ ok: true, cx: 524, cy: 299,
+    hit: { hit: "DIV#overlay", text: "", mine: false } });   // landed somewhere else
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.match(out.results[0].detail, /NOT our label, the rect went stale/, out.results[0].detail);
+  assert.match(out.results[0].detail, /DIV#overlay/);
+});
+
 test("checkbox group quiescence: a page that never goes quiet still gets clicked (never hangs)", async () => {
   const field = genderGroup();
   field.quietNever = true;

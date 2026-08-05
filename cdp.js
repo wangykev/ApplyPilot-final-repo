@@ -2631,6 +2631,25 @@ function cdpDevBoxGeom(wrapperSel) {
     }),
   };
 }
+// What is ACTUALLY at (x,y), and is it the label/input we think we are clicking? The rect is measured in
+// one CDP round trip and the click is dispatched in another, so a scroll or reflow in between silently
+// sends the click somewhere else — the same staleness clickPageNext learned to re-measure for. Without
+// this, "the click didn't register" and "the click landed on something else" are indistinguishable.
+function cdpHitAt(x, y, wantId) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return { hit: null, mine: false };
+  const forAttr = (el.getAttribute && el.getAttribute("for")) || "";
+  const lab = wantId ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(wantId) : wantId) + '"]') : null;
+  const mine = !!(wantId && (forAttr === wantId || el.id === wantId || (lab && (el === lab || lab.contains(el)))));
+  return {
+    hit: el.nodeName + (el.id ? "#" + String(el.id).slice(0, 8) : "") + (forAttr ? "[for=" + String(forAttr).slice(0, 8) + "]" : ""),
+    text: (el.textContent || "").trim().slice(0, 40),
+    mine,
+    // if the label exists but is NOT under the point, the rect we measured has gone stale
+    labelRectNow: lab ? (() => { const r = lab.getBoundingClientRect(); return { y: Math.round(r.y), h: Math.round(r.height), w: Math.round(r.width) }; })() : null,
+  };
+}
+
 // ── QUIESCENCE (2026-08-04): "is the page still busy?", which no other wait here can answer ─────────
 // Every settle in this file waits for a COUNT to stop changing (field set, options, entries). None can
 // tell you the DOM is mid-reaction, and that is what actually breaks the self-ID checkbox group: the
@@ -4032,11 +4051,16 @@ function makeCdpActuation(llmConfig) {
       a.blur();
       return true;
     }),
+    // Returns a TRUTHY object (existing `&&` callers are unaffected) carrying WHERE it clicked and what
+    // was under that point — so a caller reporting "did not commit" can say whether a click was even
+    // dispatched, and whether it landed on the intended label. `false` still means no click happened.
     clickRadioLabel: async (loc, id) => {
       const rect = await cdpRectReady('label[for="' + id + '"]', true); // M29: retry the label rect
-      if (!rect) return false;
+      if (!rect) return false;                                          // no rect ⇒ NOTHING was dispatched
+      let hit = null;
+      try { hit = await cdpEval(cdpHitAt, rect.cx, rect.cy, id); } catch (e) { /* diagnostic only */ }
       await cdpClickAt(rect.cx, rect.cy);
-      return true;
+      return { ok: true, cx: Math.round(rect.cx), cy: Math.round(rect.cy), hit };
     },
     focusInput: (id) => cdpEval(cdpFocusInputById, id),
     readChecked: (id) => cdpEval(cdpReadCheckedById, id),
