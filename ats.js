@@ -1383,7 +1383,52 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
 }
 
 // The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder.
+// AI free-text answers are the DOMINANT cost on a form full of custom questions, and the cost is
+// serialization rather than any single slow call. Measured live 2026-08-05 on Shield AI (Lever): 7
+// calls of 1630/3241/3005/3098/5215/5227/4799ms = 26.2s of a 32.6s fill — 80%. Compare Ashby's 2
+// calls (1.4s, 7%): same code, different question count.
+//
+// The DECISION for a free-text field needs the label, the profile and the JD — no DOM at all — so
+// those calls can run CONCURRENTLY before the loop touches the page, and the loop then actuates with
+// answers already in hand. CHOICE fields are deliberately NOT prefetched: their prompt must carry the
+// widget's LIVE options, which means opening it first.
+//
+// Bounded concurrency, because a burst of N is how a free-tier key earns a 429 (which would be slower
+// than serial, not faster). Every safety property is untouched: the same answer goes through the same
+// commit + read-back + ALWAYS-flagged path; only the moment the call is issued changes. A prefetch
+// miss simply leaves the loop to make its own call.
+const ATS_AI_PREFETCH_CONCURRENCY = 4;
+async function atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex) {
+  const out = new Map();
+  if (!act || !act.aiEnabled || !Array.isArray(fields)) return out;
+  const eligible = fields.filter((f) => {
+    if (!f || !f.isRequired) return false;
+    if (f.widgetType !== "text" && f.widgetType !== "textarea") return false;
+    if (f.value != null && String(f.value).trim() !== "") return false; // already answered on the form
+    let route = null;
+    try { route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex); } catch (e) { return false; }
+    if (!route) return true;                       // nothing deterministic → the loop will ask the AI
+    if (route.kind) return false;                  // resume/skip/dial/location/employment — not AI text
+    const hasValue = route.value != null || route.raw !== undefined || (route.candidates && route.candidates.length);
+    return !hasValue;
+  });
+  if (!eligible.length) return out;
+  try { console.log(`[ApplyPilot][ATS-FILL] prefetching ${eligible.length} AI free-text answer(s) concurrently (${ATS_AI_PREFETCH_CONCURRENCY} at a time)`); } catch (e) { /* log only */ }
+  let i = 0;
+  const worker = async () => {
+    for (;;) {
+      const f = eligible[i++];
+      if (!f) return;
+      try { const ai = await atsAiWriteText(act, f, profile, jc); if (ai) out.set(f.fieldName, ai); } catch (e) { /* the loop falls back to its own call */ }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(ATS_AI_PREFETCH_CONCURRENCY, eligible.length) }, worker));
+  return out;
+}
+
 async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {
+  // fire the free-text AI calls now, concurrently, while the page is untouched (see atsPrefetchAiText)
+  const aiPre = o && o.valueFor ? new Map() : await atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex);
   for (const f of fields) {
     const rec = {
       fieldName: f.fieldName, label: f.label, widgetType: ATS_REVIEW_WIDGET[f.widgetType] || f.widgetType,
@@ -1509,7 +1554,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         // Deterministic tiers produced nothing. AI fallback — REQUIRED fields only (the
         // operator rule: an optional blank costs nothing; a required blank blocks submit).
         if (f.isRequired && act.aiEnabled && ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "textarea", "text", "location", "date"].includes(f.widgetType)) {
-          await atsAiFallback(act, ats, f, ref, rec, jc, profile);
+          await atsAiFallback(act, ats, f, ref, rec, jc, profile, aiPre.get(f.fieldName) || null);
         } else if (rec.status == null) {
           // A STATED value that the form couldn't take is NOT "blank is fine" (live 2026-07-31,
           // Discord: the profile says "Bachelor of Science", the form offers "Bachelor's Degree",
@@ -2140,11 +2185,12 @@ function atsInjSelectNative(inputSel, optionText) {
 
 // AI fallback for a REQUIRED field the deterministic tiers left empty. Same safety contract
 // as AI-1/AI-2: the choice must clear the match ladder vs live options; ALWAYS flagged.
-async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
+async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetched) {
   const wt = f.widgetType;
   try {
     if (wt === "textarea" || wt === "text" || wt === "date") {
-      const ai = await atsAiWriteText(act, f, profile, jobContext);
+      // use the concurrently-prefetched answer when there is one (atsPrefetchAiText); otherwise ask now
+      const ai = prefetched || await atsAiWriteText(act, f, profile, jobContext);
       if (!ai.ok || !ai.answer) {
         // REQUIRED text the AI can't ground: write "N/A" — a real, submittable answer that reads
         // correctly on the form (operator 2026-07-31: "never answer with AI declined, N/A would be

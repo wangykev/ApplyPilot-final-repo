@@ -1051,6 +1051,44 @@ test("radio: the bundle stores the option we chose, not a label that carries its
   assert.notStrictEqual(out2.results[0].status, "needs_review", "the approved value must replay: " + out2.results[0].detail);
 });
 
+test("AI free-text: the calls run CONCURRENTLY, and each answer still lands on its own field", async () => {
+  // Live 2026-08-05, Shield AI (Lever): 7 serial calls of 1.6-5.2s were 26.2s of a 32.6s fill (80%).
+  // A free-text decision needs no DOM, so the calls overlap; the safety path is unchanged.
+  const CALL_MS = 120;
+  let inFlight = 0, peak = 0;
+  const values = {};
+  const fields = Array.from({ length: 6 }, (_, i) => ({
+    fieldName: "cards[u" + i + "][field0]", inputSel: "#c" + i, widgetType: "textarea",
+    label: "Why do you want to work here? (" + i + ")", isRequired: true, value: null, domIndex: i,
+  }));
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, CALL_MS));
+      inFlight--;
+      return { ok: true, text: JSON.stringify({ answer: "ANSWER-" + peak, justification: "j", confidence: "High" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+  });
+  const t0 = Date.now();
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const elapsed = Date.now() - t0;
+
+  assert.ok(peak > 1, "the calls must overlap — peak concurrency was " + peak);
+  assert.ok(elapsed < 6 * CALL_MS, `serial would cost >= ${6 * CALL_MS}ms; took ${elapsed}ms`);
+  // …and every field still got ITS OWN answer, flagged, through the normal path
+  assert.strictEqual(out.results.length, 6);
+  for (const r of out.results) {
+    assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+    assert.strictEqual(r.flag, "ai-text", "an AI answer is ALWAYS flagged");
+    assert.ok(String(r.after || "").startsWith("ANSWER-"), r.fieldName + " got " + JSON.stringify(r.after));
+  }
+  assert.strictEqual(new Set(Object.keys(values)).size, 6, "each field written once, to its own selector");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
