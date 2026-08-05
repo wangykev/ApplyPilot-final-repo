@@ -1421,6 +1421,87 @@ const aiDd = (flags) => Object.assign({
   triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }]
 }, flags || {});
 
+// ── BATCHED AI: one call per PAGE instead of one per question (2026-08-05) ──
+// The win is N round trips → 1, with the call fired before the deterministic fill so it overlaps. The
+// safety requirement is that batching changes the TRANSPORT ONLY: every answer still clears the match
+// ladder against the LIVE options and still commits through the same verified path.
+const AI_BATCH_BUDGETS = { ...T_BUDGETS, enableAiBatch: true };
+const aiDd2 = (id, label, opts) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown",
+  isRequired: true, label, triggerText: "Select One",
+  options: [{ text: "Select One", disabled: true }].concat((opts || ["Yes", "No"]).map((t) => ({ text: t }))) });
+
+test("AI batch: TWO AI questions on a page cost ONE llm call, and both commit", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Are you legally authorized to work in the US?*"),
+                           aiDd2("q2", "Do you require sponsorship?*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [
+      { id: "q1", choice: "Yes", justification: "profile says authorized", confidence: "High" },
+      { id: "q2", choice: "No", justification: "no sponsorship needed", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const calls = act.log.filter(([m]) => m === "llm").length;
+  assert.strictEqual(calls, 1, `one batched call for the whole page, not one per question (saw ${calls})`);
+  const q1 = out.results.find((r) => r.fieldName === "q1"), q2 = out.results.find((r) => r.fieldName === "q2");
+  assert.strictEqual(q1.status, "filled_review", q1.detail);
+  assert.strictEqual(q1.after, "Yes");
+  assert.strictEqual(q2.status, "filled_review", q2.detail);
+  assert.strictEqual(q2.after, "No");
+  assert.match(q1.detail, /profile says authorized/, "the per-question justification survives the batch");
+  assert.strictEqual(q1.confidence, "high", "and so does its confidence");
+});
+
+test("AI batch: a batched answer STILL clears the match ladder — an off-list choice never blind-commits", async () => {
+  // The whole safety contract in one test: batching must not become a way to skip the ladder.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [
+      { id: "q1", choice: "Maybe", confidence: "High" },      // NOT an option
+      { id: "q2", choice: "No", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const q1 = out.results.find((r) => r.fieldName === "q1");
+  assert.strictEqual(q1.status, "needs_review", "an off-list batched answer is refused exactly like a per-field one");
+  assert.strictEqual(q1.flag, "ai-nomatch");
+  assert.notStrictEqual(q1.after, "Maybe", "and nothing was committed");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No", "its sibling still commits");
+});
+
+test("AI batch is a CACHE, not a gate: a question the batch missed makes its OWN call", async () => {
+  // Misprediction, a dropped id, a partial parse — none of these may cost an ANSWER, only speed.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: [JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }] }), // q2 absent
+                            '{"choice":"No","justification":"per-field fallback","confidence":"Medium"}'] });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 2, "the batch + ONE per-field call for the miss");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+  const q2 = out.results.find((r) => r.fieldName === "q2");
+  assert.strictEqual(q2.status, "filled_review", q2.detail);
+  assert.strictEqual(q2.after, "No", "the missed question was still answered, by its own call");
+});
+
+test("AI batch: OFF by default → one call PER question (batching is opt-in until live-verified)", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS); // batching NOT enabled
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 2, "one call per question, exactly as before batching");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+});
+
+test("AI batch: a batch that FAILS entirely still answers every question per-field", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: [{ ok: false, error: "429 exhausted" },      // the batched call fails
+                            '{"choice":"Yes","confidence":"High"}', '{"choice":"No","confidence":"High"}'] });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes", "a dead batch costs speed, never an answer");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No");
+});
+
+test("AI batch: the option scan leaves every candidate dropdown BLANK (read-only pre-pass)", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  // Exactly one commit per field: the pre-pass must never have armed or committed an option itself.
+  const clicks = act.log.filter(([m]) => m === "clickDropdownOptionByText");
+  assert.strictEqual(clicks.length, 2, "one commit per field — the read-only scan committed nothing: " + JSON.stringify(clicks));
+});
+
 test("AI fallback: a matched JSON answer → filled_review + ai-choice-sensitive + the AI's confidence + justification (NEVER silent)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","justification":"the applicant is an enrolled student, so under 18 is implausible","confidence":"High"}' });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);

@@ -1004,7 +1004,138 @@ const parseAiReply = (text) => {
 // sensitive flag — the legally-loaded "reasoning-from-absence" answers (criminal→No, eligibility→No)
 // are surfaced ai-choice-sensitive and the viewer keys PROMINENCE off that flag, NOT off confidence
 // (a High-confidence sensitive answer must not be the easiest to scroll past). Provider-agnostic.
-const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
+// ============================================================================
+// BATCHED AI — one call for a whole page's AI questions (operator 2026-08-05)
+// ============================================================================
+// A screening page can hold many AI-answered questions, and each one used to be its OWN act.llm round
+// trip, fired serially from inside the field loop: N latencies, and N copies of the profile blob in
+// tokens. This batches the TRANSPORT only — every per-question semantic is untouched, because the answer
+// is handed back to the SAME per-field function that would have called the LLM itself (see `preAnswer`),
+// so the match ladder against LIVE options, the read-back, the persistence re-read, `filled_review`, the
+// EEO re-tag and the teach-flow hints all still happen exactly where they did.
+//
+// ⚠ OPT-IN (`budgets.enableAiBatch`) UNTIL ONE LIVE RUN CONFIRMS THE PRE-PASS IS INERT. The pre-pass
+// opens and closes each candidate dropdown to read its options. That is the same read-only open/close
+// `captureChoiceOptions` and `reconDropdownDump` already do — but theirs are live-verified value-preserving
+// and this one is not yet, and a unit test caught the exact hazard: on the stray-on-close class, OUR close
+// can commit a value, which both disturbs the page and robs the fill's own `closeAndVerifyBlank` of a
+// truthful `before` (it reported `ai-nomatch` where the un-batched path correctly reports
+// `ai-nomatch-stray`). Turning this on by default would trade a real safety signal for speed. Enable it,
+// watch one page's [CDP-TIME] + records, then flip the default.
+//
+// THE BATCH IS A CACHE, NOT A GATE. If a question is in it, the per-field path uses the cached answer and
+// makes no call; if it is missing — misprediction, a parse failure, a field the pre-pass never saw — that
+// path calls the LLM by itself exactly as today. So a batch that is wrong or empty costs speed, never
+// correctness, and the whole feature can be switched off with one flag.
+//
+// Both AI kinds share the call, because both are "ask the model about this question + these options":
+//   • infer      — no stated value; the model CHOOSES (required fields only, the existing rule)
+//   • canonicalize — a STATED value that matched no option; the model MAPS vocabulary, never infers
+// They keep separate instructions in the prompt so canonicalize can still answer UNKNOWN, which is a
+// meaningful answer for it and a forbidden one for infer.
+const AI_BATCH_MAX = 24; // beyond this the prompt stops being reliable; the overflow just falls back to per-field calls
+
+function buildBatchAiPrompt(items, profile, jobContext) {
+  const system = "You help an applicant fill out a job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n"
+    + "Each question has a \"kind\":\n"
+    + "  • \"infer\" — the applicant did NOT state an answer. Choose the SINGLE best option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record). These are REQUIRED: always choose the most likely option, NEVER refuse and never answer UNKNOWN.\n"
+    + "  • \"canonicalize\" — the applicant ALREADY STATED a value (given as \"stated\"). Your ONLY job is to pick the option that means the SAME thing (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything. If NO option means the same, answer \"UNKNOWN\". Never pick an option that differs in meaning.\n"
+    + "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. "
+    + "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
+  const qs = items.map((it) => {
+    const o = { id: it.key, kind: it.kind, question: String(it.label || ""), options: it.options || [] };
+    if (it.kind === "canonicalize") o.stated = Array.isArray(it.stated) ? it.stated.join(" / ") : String(it.stated == null ? "" : it.stated);
+    return o;
+  });
+  const user = "Questions: " + JSON.stringify(qs)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n"
+    + "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<exact option text, or UNKNOWN for a canonicalize with no equivalent>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
+  return { system, user };
+}
+
+// Tolerant of ```-fences, embedded JSON, and an object-keyed-by-id shape instead of the asked-for array —
+// the same latitude parseAiReply gives a single answer. Returns a Map key → answer; anything unparseable
+// simply yields no entry, and the caller then makes that question's own call.
+function parseBatchAiReply(text, items) {
+  const out = new Map();
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const m = t.match(/\{[\s\S]*\}/);
+    if (m) { try { obj = JSON.parse(m[0]); } catch (e2) { return out; } }
+  }
+  if (!obj || typeof obj !== "object") return out;
+  const known = new Set((items || []).map((i) => i.key));
+  const take = (id, a) => {
+    if (!a || typeof a !== "object") return;
+    const key = String(id == null ? "" : id);
+    if (!known.has(key) || out.has(key)) return;           // ignore ids we never asked about
+    const choice = a.choice == null ? "" : String(a.choice);
+    if (!choice) return;
+    out.set(key, { choice, justification: a.justification == null ? "" : String(a.justification),
+      confidence: _aiConf(a.confidence),   // SAME normalization as parseAiReply — the record/bundle expect it lowercased
+
+      maps_to: a.maps_to == null ? "" : String(a.maps_to),
+      suggested_category: a.suggested_category == null ? "" : String(a.suggested_category) });
+  };
+  if (Array.isArray(obj.answers)) obj.answers.forEach((a) => take(a && a.id, a));
+  else if (Array.isArray(obj)) obj.forEach((a) => take(a && a.id, a));
+  else for (const k of Object.keys(obj)) take(k, obj[k]);   // {id: {...}} shape
+  return out;
+}
+
+// Which of this page's questions go into the batched call, and what options do they offer? Runs BEFORE
+// any value is written, so it is READ-ONLY: each dropdown is opened, its options read, and closed through
+// the same verified-blank close the recon path uses — a candidate that ends up holding a value would be a
+// bug, so the close is checked rather than assumed.
+//
+// Prediction is deliberately OVER-INCLUSIVE for `infer` and PRECISE for `canonicalize`:
+//  • infer — required + aiEligible + no value from FIELD_MAP. Buckets and the deterministic recognizers
+//    run later and may well answer it, in which case the batched answer is simply never used. Wasted
+//    prompt tokens are the entire cost of a misprediction; under-including would cost a serial call.
+//  • canonicalize — a MAPPED dropdown whose stated value we can prove does not match any live option, run
+//    through the SAME match ladder the fill will use ({containment:false}: a canonicalize exists precisely
+//    because ApplyPilot will not guess). Proving it here costs nothing extra since the options are open.
+async function collectAiBatchItems(act, fields, profile, budgets) {
+  const items = [];
+  for (const f of fields || []) {
+    if (items.length >= AI_BATCH_MAX) break;
+    if (f.widgetType !== "dropdown") continue;          // choice questions only for now; text/essay keeps its own call
+    const mappedPath = FIELD_MAP[f.fieldName] || null;
+    const raw = mappedPath ? getByPath(profile, mappedPath) : undefined;
+    const stated = mappedPath ? resolve(raw, f.widgetType) : null;
+    const hasStated = stated != null && !(Array.isArray(stated) && !stated.length);
+    const wantInfer = !hasStated && f.isRequired && aiEligible(f);
+    if (!wantInfer && !hasStated) continue;             // optional + unmapped ⇒ never an AI field
+    if (hasStated && !mappedPath) continue;             // only a MAPPED stated value can canonicalize
+    const loc = { wrapperSel: f.wrapperSel };
+    let state = null, before = null;
+    try {
+      const r = await openAndReadDropdown(act, loc, budgets);
+      state = r.state; before = r.before;
+      if (!r.expanded || !state || !state.optionCount) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
+      const enabled = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
+      if (!enabled.length) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
+      if (hasStated) {
+        // Only a PROVEN no-match needs the model. containment:false mirrors the fill's own dropdown policy.
+        const cands = Array.isArray(stated) ? stated : [stated];
+        const m = apMatch.matchCandidates(cands, enabled, { containment: false });
+        if (m.targetIndex !== -1) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
+        items.push({ key: f.fieldName, kind: "canonicalize", label: f.label, options: enabled, stated: cands });
+      } else {
+        items.push({ key: f.fieldName, kind: "infer", label: f.label, options: enabled });
+      }
+      await closeAndVerifyBlank(act, loc, before, budgets);
+    } catch (e) {
+      try { await closeAndVerifyBlank(act, loc, before, budgets); } catch (e2) { /* best effort */ }
+    }
+  }
+  return items;
+}
+
+const aiFillField = async (act, loc, f, profile, jobContext, budgets, preAnswer) => {
   const norm = apMatch.normalize;
   const sensitive = legallyLoaded(f.label);
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
@@ -1024,13 +1155,20 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}";
-  const res = await act.llm({ system, user, maxTokens: 512 });
-  if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
-    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
-      detail: "AI call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+  // preAnswer = this question's entry from the page's ONE batched call. Transport only: the answer takes
+  // exactly the path a per-field reply would from here down (match ladder vs the LIVE options, commit,
+  // read-back, persistence re-read, flags). Absent ⇒ make the call, i.e. today's behaviour unchanged.
+  let ai;
+  if (preAnswer) ai = preAnswer;
+  else {
+    const res = await act.llm({ system, user, maxTokens: 512 });
+    if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
+      const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+      return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
+        detail: "AI call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+    }
+    ai = parseAiReply(res.text);
   }
-  const ai = parseAiReply(res.text);
   const conf = ai.confidence; // the AI's self-reported inference confidence (high/medium/low)
   const hint = { maps_to: ai.maps_to || "", suggested_category: ai.suggested_category || "" }; // piggyback for the teach flow
   // The choice is a CANDIDATE — clear the match ladder vs the LIVE options. A paraphrase / refusal /
@@ -1284,7 +1422,7 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
 // EEO: the demographic comes from the profile, the AI just maps "Male"→"Man"). The pick must clear
 // the match ladder vs the LIVE options (never blind-commit); always filled_review; UNKNOWN/no-match
 // → needs_review. `stated` = the profile candidate(s) that failed to match.
-const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
+const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
   const norm = apMatch.normalize;
   const statedStr = Array.isArray(stated) ? stated.join(" / ") : String(stated);
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
@@ -1299,13 +1437,17 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
     + "\nThe applicant's STATED value: " + JSON.stringify(statedStr)
     + "\nOptions (reply with the EXACT text of the matching one): " + JSON.stringify(enabledTexts)
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
-  const res = await act.llm({ system, user, maxTokens: 128 });
-  if (!res || !res.ok) {
-    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-failed",
-      detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+  let ai; // preAnswer = this question's entry from the page's ONE batched call (transport only — see aiFillField)
+  if (preAnswer) ai = preAnswer;
+  else {
+    const res = await act.llm({ system, user, maxTokens: 128 });
+    if (!res || !res.ok) {
+      const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+      return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-failed",
+        detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+    }
+    ai = parseAiReply(res.text);
   }
-  const ai = parseAiReply(res.text);
   const conf = ai.confidence;
   const m = ai.choice ? apMatch.matchCandidates([ai.choice], enabledTexts) : { targetIndex: -1, matchTier: null };
   if (m.targetIndex === -1) { // UNKNOWN / not a real option — never blind-commit a demographic
@@ -3178,9 +3320,38 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // employer list. (2026-07-25.)
   const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
+  // ── BATCHED AI PRE-PASS + OVERLAP (2026-08-05) ────────────────────────────────────────────────────
+  // Identify the page's AI questions and read their options BEFORE filling anything, fire ONE call, and
+  // let it fly while the deterministic fields fill. By the time the loop reaches an AI question the reply
+  // is usually already in hand, so the page pays ~0 for it instead of one serial round trip per question.
+  // The result is a CACHE consulted by the normal per-field AI path — never a gate (see buildBatchAiPrompt).
+  const aiBatch = { answers: new Map(), promise: null, items: [], awaited: false, error: null };
+  let aiBatchScanMs = 0;
+  if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
+    const t0Batch = Date.now();
+    try {
+      aiBatch.items = await collectAiBatchItems(act, scan.fields, profile, budgets);
+      if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
+        const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
+        // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
+        // model works. Errors are captured, never thrown — a failed batch just means per-field calls.
+        aiBatch.promise = act.llm({ system, user, maxTokens: 256 + 192 * aiBatch.items.length })
+          .then((res) => { if (res && res.ok) aiBatch.answers = parseBatchAiReply(res.text, aiBatch.items); else aiBatch.error = (res && res.error) || "no reply"; })
+          .catch((e) => { aiBatch.error = String((e && e.message) || e); });
+      }
+    } catch (e) { aiBatch.error = String((e && e.message) || e); }
+    aiBatchScanMs = Date.now() - t0Batch;
+  }
+  // Consulted at each AI site: await the in-flight call ONCE, then serve from the map.
+  const aiBatchAnswer = async (key) => {
+    if (!aiBatch.promise) return null;
+    if (!aiBatch.awaited) { aiBatch.awaited = true; await aiBatch.promise; }
+    return aiBatch.answers.get(key) || null;
+  };
   // [CDP-TIME] phase accounting (2026-07-25): where a page's wall-clock actually goes — logged by the
   // SW per page so pacing is retuned on EVIDENCE, not guesses. Zero behavior change; log-only.
   const timings = {};
+  if (aiBatchScanMs) timings.aiBatchScan = aiBatchScanMs; // read-only option scan for the batched call
   const markPhase = (k, t0) => { timings[k] = (timings[k] || 0) + (Date.now() - t0); };
   let _phaseT0 = Date.now();
 
@@ -3513,10 +3684,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const canonicalize = !!mappedPath && record.resolved != null && record.genuineNoMatch === true && f.widgetType === "dropdown";
       try {
         let aiRes = null;
-        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
+        // The page's ONE batched call, if it covered this question. Kind must agree: an `infer` answer
+        // must never be spent on a canonicalize (or the reverse) — they are answering different prompts.
+        const batched = await aiBatchAnswer(f.fieldName);
+        const batchedItem = batched ? aiBatch.items.find((i) => i.key === f.fieldName) : null;
+        const preInfer = batched && batchedItem && batchedItem.kind === "infer" ? batched : null;
+        const preCanon = batched && batchedItem && batchedItem.kind === "canonicalize" ? batched : null;
+        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
         else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
-            ? await aiFillField(act, loc, f, profile, jobContext, budgets)
+            ? await aiFillField(act, loc, f, profile, jobContext, budgets, preInfer)
             : (f.widgetType === "date")
               ? await aiFillDate(act, loc, f, profile, jobContext, budgets)
               : await aiFillText(act, loc, f, profile, jobContext, budgets);
@@ -6804,5 +6981,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
