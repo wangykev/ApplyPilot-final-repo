@@ -913,7 +913,8 @@ const ATS_POLL = {
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
   mountGrace: 1200,                 // extra wait for a menu that has NEVER mounted (see pollFor)
-  responsiveReadMs: 400,            // a read slower than this means the PAGE is the problem, not the menu
+  responsiveReadMs: 400,            // fallback signal when the quiet watch is unavailable (see pollFor)
+  busyIdleMs: 300,                  // DOM mutated this recently ⇒ the page is still reacting, keep waiting
 };
 // A location question whose widget already shows this few options is a pick-one, not a places
 // autocomplete (see the location branch in atsActuateField).
@@ -1674,12 +1675,18 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
       // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
       const startedAt = Date.now();
-      let last = null, lastSeen = null, sawLoading = false, ticks = 0, sawEmptyMounted = false, sawMounted = false, lastReadMs = 0; let stopReason = "none";
+      let last = null, lastSeen = null, sawLoading = false, ticks = 0, sawEmptyMounted = false, sawMounted = false, lastReadMs = 0, quietIdleMs = null; let stopReason = "none";
       for (;;) {
         const readAt = Date.now();
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
         lastReadMs = Date.now() - readAt;
         ticks++;
+        // How long has this widget's subtree been still? Only asked once the soft deadline has
+        // passed with nothing rendered — the one place the answer changes what we do.
+        if (act.quietRead && Date.now() >= deadline && !sawMounted) {
+          try { const q = await act.quietRead(ref.inputSel); quietIdleMs = q && q.ok ? q.idleMs : null; }
+          catch (e) { quietIdleMs = null; }
+        }
         if (r && Array.isArray(r.options)) { lastSeen = r; if (r.options.length) last = r; }
         if (r && r.loading) sawLoading = true;
         if (r && want(optsOf(r))) { r.waitedMs = Date.now() - startedAt; r.ticks = ticks; return r; }
@@ -1713,7 +1720,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
             // thread is jammed and the widget cannot paint a menu OR answer us (live 2026-08-05:
             // two reads spanning 2761ms declared three healthy dropdowns "never mounted" and
             // skipped values that had filled fine minutes earlier). Slow reads ⇒ keep waiting.
-            if (lastReadMs > ATS_POLL.responsiveReadMs) { why = "page-jammed"; return now >= hardDeadline; }
+            // `quietIdleMs` is the operator's quiescence watch from the Workday branch
+            // (cdpInstallQuietWatch): the page stamps its last mutation and the SW does the
+            // waiting on real wall-clock. Read latency stays only as the fallback for when the
+            // watch is unavailable (a fake actuation, or an install that failed).
+            const busy = quietIdleMs != null
+              ? quietIdleMs < ATS_POLL.busyIdleMs
+              : lastReadMs > ATS_POLL.responsiveReadMs;
+            if (busy) { why = quietIdleMs != null ? "page-busy" : "page-jammed"; return now >= hardDeadline; }
             why = "never-mounted";
             return now >= Math.min(deadline + ATS_POLL.mountGrace, hardDeadline);
           }
@@ -1751,6 +1765,10 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     let nearMatches = []; // what a by-name search turned up — the operator's real choices
     let didSearch = false; // a typed query leaves the menu FILTERED — see the commit below
     let listPending = false; // the widget was STILL fetching when we ran out of budget
+    // Start the quiescence watch BEFORE the open click, so "has this subtree gone quiet?" has a
+    // baseline by the time the poll needs it. Best effort: without it the poll falls back to
+    // read latency.
+    if (act.quietInstall) { try { await act.quietInstall(ref.inputSel); } catch (e) { /* fallback */ } }
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
     let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open

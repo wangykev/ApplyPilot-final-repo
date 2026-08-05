@@ -4011,7 +4011,11 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const fillMs = Date.now() - fillT0;
     const perField = out.results.length ? Math.round(fillMs / out.results.length) : 0;
     let visNow = null; try { visNow = await cdpVisible(); } catch (e) {}
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"})`);
+    // MEASURED paint state next to Chrome's visibility (the Workday branch's rule): "visible but
+    // not painting" is the state that used to be invisible in the logs, and it is exactly when a
+    // widget's own renders crawl — which this pipeline reads as an empty menu.
+    let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) {}
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})`);
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };

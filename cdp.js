@@ -89,6 +89,7 @@ function cdpAttach(tabId) {
         // trusted Input.* path (slow-but-battle-tested) — the escape hatch if a tenant's widgets
         // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
         try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
+        cdpInvalidatePaint(); // a fresh attach says nothing about the previous tab's paint state
         _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
         console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
         resolve({ ok: true });
@@ -271,6 +272,11 @@ function buildOverrideSrc(opts) {
     ${workerBlock}
     // rAF→setTimeout — installs regardless of the worker outcome (a paused-forever
     // rAF becomes an eventually-firing timer; worker-backed = fast, native = ~1fps).
+    // The paint probe needs the REAL rAF: the polyfill below is setTimeout-backed, so it fires happily
+    // on a tab that is producing no frames at all — measuring it would report "painting" always.
+    if (!window.__apNativeRaf && window.requestAnimationFrame) {
+      window.__apNativeRaf = window.requestAnimationFrame.bind(window);
+    }
     var last = 0;
     window.requestAnimationFrame = function (cb) {
       var now = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -3567,6 +3573,108 @@ function cdpLlmDemotionSummary() {
   return { count: cdpLlmDemotions.length, byModel, firstError: worst.error, model: worst.model };
 }
 
+
+// ── PORTED VERBATIM from the multi-ats branch (77abbdf, operator's) so the two paths share ONE
+// implementation rather than two variants that drift. Workday uses these to choose synthetic vs
+// trusted input; the multi-ATS combobox poll uses QUIESCENCE to tell "the menu isn't coming" from
+// "the page is still busy" — a question its own read latency could only approximate. ────────────
+
+// ── IS THE TAB PAINTING? (2026-08-05) ───────────────────────────────────────────────────────────────
+// The input-mode decision has always asked "is the tab HIDDEN?" (cdpVisible = tab.active &&
+// !minimized). What actually determines whether trusted Input.* is fast is whether the tab is
+// PAINTING: those events are drained in step with frame production. A window sitting BEHIND another
+// app satisfies tab.active && !minimized while compositing nothing — the documented occlusion blind
+// spot — so we keep using trusted input and pay ~1.1-1.5s per event.
+//
+// Measured live: the SAME page 2 of the same posting took 11.1s hidden (synthetic input, no frames
+// needed) and 39s on a "visible" run whose window was actually behind another app — with
+// firstYearAttended at 16.8s and fieldOfStudy at 16.2s, i.e. ~1.1s per input event. Every other page in
+// that run was normal, because page 2 is the one dominated by input events.
+//
+// rAF is the honest signal: its callback is driven by frame production, so it simply does not arrive
+// when nothing is being composited. Same philosophy as cdpTimersFast — measure, never assume.
+function cdpPaintProbeSrc() {
+  // Uses the NATIVE rAF stashed by buildOverrideSrc; without it, our own setTimeout-backed polyfill
+  // would answer "painting" on a frameless tab. No native reference ⇒ report unknown, never a guess.
+  return new Promise(function (res) {
+    var raf = window.__apNativeRaf || (window.__apOverridesInstalled ? null : window.requestAnimationFrame);
+    if (!raf) { res({ ok: false, reason: "no native rAF available" }); return; }
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var done = false;
+    try {
+      raf(function () {
+        if (done) return; done = true;
+        var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
+        res({ ok: true, ms: Math.round(t1 - t0) });
+      });
+    } catch (e) { res({ ok: false, reason: String(e && e.message || e) }); }
+  });
+}
+
+// Cached, because cdpSynthInput() is consulted on EVERY click and a probe is a page round trip (a
+// visibility read is not). The TTL is short on purpose: the operator alt-tabbing mid-run is exactly the
+// case this exists for, so the answer has to be allowed to change during a page.
+let _paintCache = { at: 0, painting: null };
+const PAINT_PROBE_DEADLINE_MS = 150;   // 60fps = 16ms, 30fps = 33ms — generous, and only paid when NOT painting
+const PAINT_CACHE_TTL_MS = 2000;
+function cdpInvalidatePaint() { _paintCache = { at: 0, painting: null }; }
+// For diagnostics: what the probe last measured, and what Chrome thinks — the pair is the whole point,
+// because "visible but not painting" is the state that used to be invisible in the logs.
+async function cdpPaintLabel() {
+  const painting = await cdpPainting();
+  let vis = "?"; try { vis = (await cdpVisible()) ? "visible" : "hidden"; } catch (e) { /* ignore */ }
+  return painting ? `painting (${vis})` : `NOT painting (chrome says ${vis})`;
+}
+async function cdpPainting() {
+  if (_paintCache.painting !== null && (Date.now() - _paintCache.at) < PAINT_CACHE_TTL_MS) return _paintCache.painting;
+  let painting;
+  try {
+    const r = await Promise.race([
+      cdpEval(cdpPaintProbeSrc),
+      cdpDelay(PAINT_PROBE_DEADLINE_MS).then(() => ({ ok: true, ms: -1, timedOut: true })),
+    ]);
+    // A probe that cannot answer (no native rAF, eval failure) FALLS BACK to Chrome's visibility, so the
+    // worst case is exactly today's behaviour rather than a new failure mode.
+    if (!r || r.ok !== true) painting = await cdpVisible();
+    else painting = !r.timedOut;
+  } catch (e) {
+    try { painting = await cdpVisible(); } catch (e2) { painting = true; }
+  }
+  _paintCache = { at: Date.now(), painting };
+  return painting;
+}
+
+// ── QUIESCENCE (2026-08-04): "is the page still busy?", which no other wait here can answer ─────────
+// Every settle in this file waits for a COUNT to stop changing (field set, options, entries). None can
+// tell you the DOM is mid-reaction, and that is what actually breaks the self-ID checkbox group: the
+// 10ms watch caught our verified check being wiped 281ms later by 29 MutationRecords, with NO click
+// behind it. A human never hits that window because by the time they click, the page has gone quiet.
+//
+// Page side does nothing but STAMP the last mutation. The WAITING happens in the service worker on real
+// wall-clock — a page-side timer would be throttled on a hidden tab, the rule this file already learned
+// three times over.
+function cdpInstallQuietWatch(sel) {
+  try {
+    window.__apQuiet = window.__apQuiet || {};
+    window.__apQuietMo = window.__apQuietMo || {};
+    if (window.__apQuietMo[sel]) return { ok: true, already: true };
+    const w = document.querySelector(sel);
+    // The wrapper's PARENT: a reaction can replace the wrapper itself, and a sibling churning is just as
+    // good a signal that the form is busy. The whole document would never be quiet.
+    const root = (w && w.parentNode) || document.body;
+    window.__apQuiet[sel] = Date.now();
+    const mo = new MutationObserver(() => { window.__apQuiet[sel] = Date.now(); });
+    mo.observe(root, { childList: true, subtree: true, attributes: true });
+    window.__apQuietMo[sel] = mo;
+    return { ok: true, root: root.nodeName };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+function cdpReadQuiet(sel) {
+  const at = (window.__apQuiet || {})[sel];
+  return at ? { ok: true, idleMs: Date.now() - at } : { ok: false };
+}
+
+
 function makeCdpActuation(llmConfig) {
   return {
     // AI-1: the brain gates the AI-fallback on this BEFORE opening a field (so a disabled
@@ -3609,6 +3717,13 @@ function makeCdpActuation(llmConfig) {
         attempt++;
       }
     },
+    // Shared page-state probes (ported from the Workday branch): "is the tab producing frames?"
+    // and "has this subtree stopped mutating?". The multi-ATS poll needs the second to tell an
+    // absent menu from a page that is still reacting.
+    painting: () => cdpPainting(),
+    paintLabel: () => cdpPaintLabel(),
+    quietInstall: (sel) => cdpEval(cdpInstallQuietWatch, sel),
+    quietRead: (sel) => cdpEval(cdpReadQuiet, sel),
     clearText: () => cdpSelectAllDelete(),
     typeText: (text) => cdpInsertText(text), // recon (a): trusted beforeinput+input, survives blur
     readTextValue: (loc, tag) => cdpEval(cdpReadTextState, loc.wrapperSel, tag),

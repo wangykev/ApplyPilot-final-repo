@@ -931,6 +931,39 @@ test("replay: a dial composite keeps its dial routing, so an approved code commi
   assert.strictEqual(committed, "United States +1", "the click uses the option's real text");
 });
 
+test("driver: a BUSY page is waited out; the quiet watch is what says the menu isn't coming", async () => {
+  // Ported from the Workday branch: the page stamps its last mutation, the SW does the waiting.
+  // While the subtree is still churning, an absent menu means "mid-reaction", not "no such menu" —
+  // the distinction my read-latency proxy could only guess at (live 2026-08-05).
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 1, openCeil: 3000, retry: 1, retryCeil: 1, search: 1, searchCeil: 1, restore: 1, restoreCeil: 1, showing: 1, showingCeil: 1, busyIdleMs: 300 });
+  try {
+    const MOUNT_AT = Date.now() + 900;     // the menu appears well after the soft deadline
+    let quietCalls = 0, committed = null;
+    const act = fakeAct({
+      atsInjScan: () => ({
+        ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+        fields: [{ fieldName: "gender", inputSel: "#gender", widgetType: "select", label: "Gender", isRequired: false, value: null, domIndex: 0 }],
+      }),
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjReadOptions: () => (Date.now() < MOUNT_AT
+        ? { ok: true, open: false, options: [] }
+        : { ok: true, open: true, options: [{ text: "Male" }, { text: "Female" }] }),
+      atsInjTypeInCombo: () => ({ ok: true }),
+      atsInjReadComboInput: () => ({ ok: true, value: "" }),
+      atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+      atsInjReadValue: () => ({ ok: true, value: committed }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    act.quietInstall = async () => ({ ok: true });
+    act.quietRead = async () => { quietCalls++; return { ok: true, idleMs: 40 }; };   // still mutating
+    const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+    assert.ok(quietCalls > 0, "the poll must consult the quiet watch before believing an empty menu");
+    assert.strictEqual(out.results[0].status, "filled", "a busy page is waited out: " + out.results[0].detail);
+    assert.strictEqual(committed, "Male");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
