@@ -3436,3 +3436,31 @@ first run. Extension 1063/1063; web 140/140; typecheck clean.
 Remaining: résumé attach (15.2s) and the location widgets (10.6s / 12.2s) are where ATS fill time now
 sits; Greenhouse's school service is still slow and erratic; the fetch-assisted tier for the education
 endpoint is the next obvious step.
+
+## 2026-08-05 (c) — hidden-tab parity: force the frames, and stop waiting on signals that cannot arrive
+
+Operator: the ATS fill must be fast, and visible/hidden should take similar time — "half a second to
+12 seconds resume attach is too big of a gap", then "there is definitely a way to get it to render".
+There was. Detail: dom-patterns 2026-08-05 (c).
+
+- **`Page.startScreencast` makes a hidden tab genuinely render** (frames, not a spoof — the paint probe
+  reports `painting (hidden)`), which is what no existing lever could do. Capture rate is load-bearing:
+  every-frame capture starved the renderer and a `gender` select went from ~1s to 33.4s with NO options;
+  at ~1 fps the same field is 72ms. Acked, torn down with the attach, `forceRenderOff` to opt out.
+- **The résumé attach was never the upload**: Greenhouse deletes its file input on completion, so the
+  confirmation poll could not succeed and always burned 15s. 15.2s → 0.3s in both modes.
+- **A places box with no places library** no longer costs the full budget: 10.6s → 6.5s.
+- **One field, one budget**: the option ceiling was per poll, so search+retry could spend it twice (44.6s
+  on one widget). Also: every record now logs its own elapsed — the résumé branch `continue`d before the
+  loop's log, so the most variable field in the run had no line at all.
+- Choice AI decisions whose options come from the SCAN (radio / yes-no / checkbox-group) now run
+  concurrently; comboboxes stay serial because their prompt needs the live list.
+
+Net on GitLab: no field burns a ceiling any more (was 16.1s / 29.4s / 44.6s outliers), résumé 0.3s, and
+review quality identical to a visible run. ⚠ Totals are NOT a clean A/B — that form had been run ~15
+times against a rate-limiting board while provider latency drifted 0.8-5.8s per call. A clean
+measurement needs a fresh posting per ATS, visible and hidden back-to-back, no reloads in between.
+
+⚠ Footgun recorded for the Workday synthetic-input work: `cdpSynthInput()` decides from
+`cdpPainting()`, so enabling render forcing there would flip hidden runs to TRUSTED input (~1.2-1.5s
+per event). That decision needs real visibility, not the paint probe.

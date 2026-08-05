@@ -3296,3 +3296,60 @@ fill → review → approve → rehearse, and each ended `WOULD CLICK SUBMIT`; n
 - Slowest fields per run, now that `[ATS-TIME]` names them: Coinbase `resume 15.2s`,
   `candidate-location 10.6s`; Ashby `ap-ats-combobox-3 12.2s` (the stamped, identity-less location
   combobox). Résumé attach and the location widgets are where the remaining time is — not matching.
+
+## 2026-08-05 (c) — making a HIDDEN tab render, and the two waits that were never about the page
+
+### Three different things get called "visible", and they need different levers
+
+| What is being changed | Lever | What it fixes |
+|---|---|---|
+| what the page BELIEVES | `document.visibilityState` spoof (the Workday walk's escalation path), `Emulation.setFocusEmulationEnabled` | page logic gated on visibility/focus |
+| whether LAYOUT happens | `Emulation.setDeviceMetricsOverride` | 0×0 `getBoundingClientRect` on a hidden tab (2026-08-01) |
+| whether FRAMES are produced | **`Page.startScreencast`** (capture), or real tab visibility | anything that must PAINT — e.g. a react-select menu |
+
+The first two were already in the arsenal, which is why the gap survived: worker timers replace TIMERS,
+focus emulation changes BELIEF, `setWebLifecycleState` only un-freezes. None makes the compositor draw,
+and cdp.js's own note had concluded a pure rAF-pause "only true tab visibility resumes". **A tab UNDER
+CAPTURE keeps producing frames**, and the paint probe proves it by measuring native rAF delivery:
+`render forcing ON (screencast) — paint: painting (hidden)` on a tab `chrome.tabs` calls hidden.
+
+**⚠ THE CAPTURE RATE IS LOAD-BEARING.** At `everyNthFrame:1` Chrome captures and JPEG-encodes every
+frame, and the encoding STARVES the renderer it was meant to free — the same starvation lesson as
+polling too hard (2026-07-31). Measured on one form, one field:
+
+| capture | `gender` select |
+|---|---|
+| every frame | **33452ms, no options rendered at all** |
+| ~1 fps (32×24, quality 1) | **72ms, filled exact-normalized** |
+
+Frames must be ACKed (Chrome stops after two un-acked), the stream must be torn down with the attach,
+and `chrome.storage.local.forceRenderOff` opts out.
+
+**⚠ FOOTGUN for the Workday side:** `cdpSynthInput()` chooses synthetic-vs-trusted from
+`cdpPainting()`. Forcing frames makes a hidden tab report PAINTING, so a Workday run with render
+forcing on would switch to TRUSTED input while hidden — ~1.2-1.5s per event, the exact cost the
+synthetic path exists to avoid. If render forcing is enabled there, the input-mode decision needs its
+own signal (real visibility) rather than the paint probe.
+
+### The résumé attach was never the upload
+
+`resume confirm gave up after 15s — fromInput null rendered null error "not-found:#resume"`.
+**Greenhouse REMOVES the `<input type=file>` once its upload completes**, so a poll watching
+`input.files[0].name` cannot ever succeed — it ran the full ceiling every time and recorded the attach
+`verified:false`, while the résumé sat attached on the form (by hand it is instant). An absent input is
+now read as the widget having replaced itself with its attachment row, and the filename rendered on the
+page is the confirmation. Waking the page between ticks matters too, since both signals need a
+re-render: **15.2s → 0.3s hidden, 0.3s visible.**
+
+### A places box with no places library
+
+Greenhouse's `candidate-location` needs `google.maps.places`, which never loads in this browser — a
+HUMAN gets no suggestions either (2026-07-31) — and the fill still paid the full budget proving it:
+10.6s. Ask the page whether the library exists before waiting on it. **10.6s → 6.5s.**
+
+### One field, one budget
+
+The option-poll ceiling was per POLL, so a by-name search plus its retry could each spend it: 44.6s on
+one widget whose menu never rendered. It is a per-FIELD allowance now, and the AI fallback no longer
+re-opens and re-polls a list the deterministic pass just proved unreadable (it paid that ceiling twice
+and reached the same `needs_review` either way).
