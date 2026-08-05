@@ -3215,3 +3215,52 @@ reproduced. What HAS changed is that the fill no longer force-toggles and re-typ
 open and still holding its query — i.e. the "two clicks = shut, then type into a closed widget"
 shape that entry named as its leading theory is now impossible. Treat it as removed-by-construction,
 not as diagnosed.
+
+## 2026-08-05 — multi-ATS end to end on GitLab: numbered options, a pick-one that reads like a places box, and the résumé slot
+
+The session that closed the loop (fill → review → approve → rehearse → `WOULD CLICK SUBMIT`) on
+`job-boards.greenhouse.io/gitlab/jobs/…`. Six defects, each caught by a live run and none visible
+from the unit suite.
+
+- **⚠ THE RÉSUMÉ WAS ATTACHED TO THE COVER-LETTER SLOT (replay only).** Greenhouse renders the cover
+  letter as a **file dropzone**, and the replay treated every `file_upload` field as the résumé. The
+  fill never did — its router maps `cover_letter` → skip — so this was invisible until a rehearsal,
+  where the operator SAW the same PDF in both slots. No gate can catch it: the strict verify only
+  re-checks approved VALUES, and the bundle carries no file for a field the fill skipped. Diagnostic
+  that settles it either way: `AP_DEV_ATS_SCAN` stops reporting a file field once it holds a file, so
+  **23 fields + no file fields = both slots filled; 24 fields + `cover_letter value:null` = correct**.
+- **⚠ NUMBERED OPTIONS DEFEAT EVERY TIER.** GitLab renders `"1. United States of America"` /
+  `"2. Canada"` / `"3. Located Elsewhere"`. Against the profile's exact `"United States of America"`:
+  exact fails, containment is deliberately off for dropdowns, and fuzzy scores **88.9%** against the
+  90 bar — so a REQUIRED field the profile answers perfectly was left for the operator. The
+  enumeration is display scaffolding (`atsEnumStrip`), stripped for MATCHING only. It must be stripped
+  on **BOTH** sides: a commit stores the option's REAL text, so on a replay the approved value arrives
+  carrying the numbering, and stripping only the options makes a field fail to match the very value it
+  produced minutes earlier.
+- **⚠ "Where are you currently based?" IS NOT ALWAYS A PLACES BOX.** The label recognizer routed it to
+  the places-autocomplete path, which typed a city and waited out a suggestion service that never
+  answers, reporting "places never loaded" — while the widget itself was a three-option pick-one whose
+  own list already held the answer. The live widget now wins over the label's guess (the Workday
+  widget-adaptive rule), and the location route's candidates are TIERED: city+state first, then
+  country. Note the profile stores ladders as ARRAYS, so `personal_info.country` may itself be a list —
+  handing it to the ladder as one candidate threw `s.toLowerCase is not a function` mid-fill.
+- **⚠ A SERVER-BACKED LIST SAYS "No options" WHILE IT IS STILL SEARCHING** (full trace: 2026-08-04).
+  Latency for the same class of query on ONE session: **390ms, 4.0s, 4.5s, >12s, >20s** — with a direct
+  fetch of the same query returning HTTP 200 in 2971ms and no rate limiting. No flat budget can work;
+  `loading` is the only honest signal.
+- **A menu that has not MOUNTED is not an empty menu.** react-select paints its list a beat after the
+  open click, and believing that beat is what mis-routed the pick-one above. But the converse bites
+  too: waiting indefinitely for a menu that will never appear cost 20s per field on the replay, where
+  Greenhouse's phone-dial composite reads as a plain select. The poll now separates the states —
+  LOADING (full ceiling), mounted-but-empty (one confirming read), never-mounted (brief grace) — and
+  asks the operator's **quiescence watch** whether the page is still mutating before believing any of
+  it. Read latency is a poor proxy for this: it measures the CDP round trip, not the page.
+- **A PAGED list cannot prove absence.** 100 of ~3300 schools were read, narrowed to their 20 nearest
+  matches, and then rendered as a pick-one `<select>` that did not contain the operator's school —
+  while the record claimed the answer "isn't one of this form's options". Narrowing must not launder a
+  partial list into a complete one.
+
+**Measured effect of the round on the same form:** fill 166.3s → **35.4s** (6650 → 1540 ms/field),
+because fields resolve instead of waiting out ceilings; and the rehearsal went `1 failure` → **0
+failures → WOULD CLICK SUBMIT**. `[ATS-TIME]` now prints the MEASURED paint state
+(`NOT painting (chrome says hidden)`), so "visible but not painting" is diagnosable in ATS logs too.

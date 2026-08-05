@@ -4015,7 +4015,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // not painting" is the state that used to be invisible in the logs, and it is exactly when a
     // widget's own renders crawl — which this pipeline reads as an empty menu.
     let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) {}
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})`);
+    // …and NAME the slowest fields. "1540ms/field" cannot tell you whether the cost is spread or
+    // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
+    const slow = out.results
+      .filter((r) => (r.elapsedMs || 0) >= 1500)
+      .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
+      .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${slow ? " | slowest: " + slow : ""}`);
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };

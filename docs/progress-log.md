@@ -3364,3 +3364,54 @@ searched option without clearing → the field reads "Bowdoin College". Nothing 
 Still not proven: the 2026-08-02 `#country` empty-list observation — a client-side widget, never
 reproduced. The force-toggle-and-re-type shape its entry named as the leading theory is now
 impossible, so it is removed-by-construction rather than diagnosed.
+
+## 2026-08-05 — multi-ATS end to end, and the résumé that was filed as a cover letter
+
+Branch `worktree-non-workday-debug`. Goal (operator): keep debugging non-Workday forms, end to end.
+Six defects, all found by running the whole human flow on live Greenhouse forms; DOM detail in
+dom-patterns 2026-08-04 / 2026-08-05.
+
+**The terminal line, on GitLab AI Engineer:**
+
+    fill      -> 23 fields, 5 to review, 35.4s (1540ms/field, tab HIDDEN, NOT painting)
+    review    -> the website tracker, 20 filled / 3 skipped
+    approve   -> 6 / 6 flagged approved, Ready to submit
+    rehearse  -> 23 field(s) replayed, 0 failure(s), 0 bundle blockers, no captcha
+    gate      -> ▶▶ WOULD CLICK SUBMIT ◀◀        (nothing submitted; no arm was ever sent)
+
+- **⚠ The résumé went into the COVER-LETTER slot on a replay** — the operator watched it. Greenhouse
+  renders the cover letter as a file dropzone and the replay treated every file field as the résumé;
+  the fill was innocent (its router maps `cover_letter` → skip), so nothing but a rehearsal could
+  surface it, and no gate could catch it (the strict verify only re-checks approved VALUES). Fixed by
+  routing replay file fields through the same router the fill uses. Verified live twice.
+- **Numbered option lists** (`"1. United States of America"`) beat exact, containment AND fuzzy (88.9%
+  vs the 90 bar), leaving a REQUIRED field the profile answers perfectly for the operator. Stripped for
+  matching on BOTH sides — a commit stores the option's real text, so a replay's approved value carries
+  the numbering too, and stripping one side made the replay fail to match its own value.
+- **A pick-one that reads like a places box.** "Where are you currently based?" was routed to the
+  places path, which typed a city and waited out a service that never answers; the widget was a
+  three-option list already showing the answer. The live widget now wins over the label's guess, and
+  the location route's candidates are tiered (city+state, then country) — which also exposed that a
+  profile ladder ARRAY handed to the match ladder throws `s.toLowerCase is not a function`.
+- **The option poll SETTLES** (operator: "is there any reason it is hardcoded and not a settle poll?").
+  It distinguishes LOADING (server-backed → full ceiling), mounted-but-empty (one confirming read) and
+  never-mounted (brief grace), and consults the **quiescence watch ported verbatim from the Workday
+  branch** (`77abbdf`) to tell "the menu isn't coming" from "the page is still reacting". My first cut
+  used our own read latency, which measures the CDP round trip rather than the page — and it skipped
+  three healthy dropdowns. `cdpPainting`/`cdpPaintLabel` came along in the same port, so both pipelines
+  now share one implementation instead of two variants.
+- **Honest reporting where absence can't be proven:** a paged list (100 of ~3300 schools, narrowed to
+  20 near-matches) no longer renders as a complete pick-one, and no longer claims the profile answer
+  "isn't one of this form's options" when the form's own search never answered.
+
+Also: the replay keeps the fill's `dial` routing (an approved dial value could never commit as a plain
+select), and `[ATS-TIME]` prints the measured paint state next to Chrome's visibility.
+
+Extension **1059/1059**. Every fix was reverted individually to confirm its test fails; two tests that
+passed both ways were rewritten until they discriminated (one needed a time-based fake rather than a
+read-count one, another an assertion on behaviour rather than outcome).
+
+**Still open:** Greenhouse's `school--0` service is genuinely slow and erratic (390ms → >20s for the
+same class of query), so a school field can still reach review honestly flagged; the candidate-location
+places service never loads in this browser; and the fetch-assisted tier for the education endpoint (the
+Lever-location pattern) is the obvious next step for both.

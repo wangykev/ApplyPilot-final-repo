@@ -1377,13 +1377,18 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
     };
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
+    // Per-field wall clock, so [ATS-TIME] can name what a slow fill actually spent its time on
+    // (the Workday [CDP-TIME] habit). A record is finalized at several `continue`s below, so the
+    // stamp is applied by `fin()` rather than at one exit.
+    const fieldT0 = Date.now();
+    const fin = () => { rec.elapsedMs = Date.now() - fieldT0; return rec; };
     try {
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
       let route = null;
       if (o.valueFor) {
         const v = o.valueFor(f);
-        if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(rec); continue; }
+        if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
         if (f.widgetType === "file_upload") {
           // ⚠ NOT EVERY FILE FIELD IS THE RÉSUMÉ. Greenhouse renders the COVER LETTER as a file
           // dropzone too, so attaching to every file field put the résumé in the cover-letter slot
@@ -1420,10 +1425,10 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         Object.assign(rec, att.ok
           ? { status: "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified }
           : { status: f.isRequired ? "needs_review" : "skipped", detail: "resume attach failed: " + (att.error || "unknown"), flag: "resume-attach-failed" });
-        results.push(rec); continue;
+        results.push(fin()); continue;
       }
-      if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(rec); continue; }
-      if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(rec); continue; }
+      if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(fin()); continue; }
+      if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(fin()); continue; }
       if (route && route.eeoUnstated) {
         // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
         // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
@@ -1447,13 +1452,13 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           rec.flag = "declined-no-basis";
           rec.detail = "this REQUIRED demographic isn't stated in your profile — chose the form's own " + JSON.stringify(dec) +
             " so it cannot block the submit; answer it here if you would rather" + (ok ? "" : " (commit failed)");
-          results.push(rec); continue;
+          results.push(fin()); continue;
         }
         rec.status = f.isRequired ? "needs_review" : "skipped";
         atsAttachOptions(rec, f.options || []);
         rec.detail = "demographic not stated in profile — left blank (never inferred)" +
           (f.isRequired ? ", and this form is REQUIRING it with no decline option — answer it here" : "");
-        rec.flag = "eeo_declined"; results.push(rec); continue;
+        rec.flag = "eeo_declined"; results.push(fin()); continue;
       }
 
       rec.mappedPath = (route && (route.path || null)) || null;
@@ -1522,7 +1527,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       rec.status = "error";
       rec.detail = String((e && e.message) || e);
     }
-    results.push(rec);
+    results.push(fin());
     try { console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName} (${rec.widgetType}${rec.isRequired ? ", req" : ""}) → ${rec.status}${rec.matchTier ? " · " + rec.matchTier : ""}${rec.flag ? " · " + rec.flag : ""}${rec.after != null ? " · after=" + JSON.stringify(String(rec.after).slice(0, 60)) : ""}${rec.detail ? " · " + rec.detail : ""}`); } catch (e) { /* log only */ }
   }
 }
