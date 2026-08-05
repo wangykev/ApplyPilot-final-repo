@@ -357,11 +357,26 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             const att = await cdpAttach(tabId);
             if (att.ok) {
               const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
-              const embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
-              const embAts = embUrl && detectAts(embUrl);
+              let embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
+              let embAts = embUrl && detectAts(embUrl);
+              // …and if it does not EMBED one, does it LINK to one? An employer careers page often
+              // renders its own UI with an Apply link straight to the ATS (live 2026-08-05:
+              // `www.coinbase.com/careers/positions/<id>?gh_jid=<id>` has no iframe, so the run fell
+              // into the WORKDAY onboarding and halted `auth-form-not-rendered` — a Greenhouse
+              // application one link away). Same finder + ambiguity-refusing picker the ATS pipeline
+              // already uses for its own landing hops, so nothing new can pick a wrong target: 2+
+              // distinct candidates refuse rather than guess. ⚠ The link must be READ from the page —
+              // a Greenhouse embed URL cannot be constructed from a job id (it 404s without `for` and
+              // a validityToken; dom-patterns 2026-08-01).
+              if (!embAts || embAts === "workday") {
+                const links = await cdpEval(atsInjFindApplyLinks).catch(() => null);
+                const linkUrl = links && atsPickApplyLink(links.links || [], detectAts);
+                const linkAts = linkUrl && detectAts(linkUrl);
+                if (linkAts && linkAts !== "workday") { embUrl = linkUrl; embAts = linkAts; }
+              }
               await cdpDetach();
               if (embAts && embAts !== "workday") {
-                console.log(`[ApplyPilot][RUN] this page embeds a ${embAts} application — driving it with that pipeline: ${embUrl}`);
+                console.log(`[ApplyPilot][RUN] this page ${emb && emb.srcs && emb.srcs.length ? "embeds" : "links to"} a ${embAts} application — driving it with that pipeline: ${embUrl}`);
                 const res = await runAtsApplicationRun(tabId, embAts, store, embUrl, { applyHops: 1, originUrl: startUrl });
                 sendResponse({ ...res, jd, tabId, startUrl });
                 return;

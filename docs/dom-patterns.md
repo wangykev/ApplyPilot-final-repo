@@ -3264,3 +3264,35 @@ from the unit suite.
 because fields resolve instead of waiting out ceilings; and the rehearsal went `1 failure` → **0
 failures → WOULD CLICK SUBMIT**. `[ATS-TIME]` now prints the MEASURED paint state
 (`NOT painting (chrome says hidden)`), so "visible but not painting" is diagnosable in ATS logs too.
+
+## 2026-08-05 (b) — four forms end to end, and an employer page that LINKS (not embeds) its ATS
+
+Breadth round (operator: "any greenhouse, any ashby, any lever form … all work end to end"). Each ran
+fill → review → approve → rehearse, and each ended `WOULD CLICK SUBMIT`; nothing was submitted.
+
+| ATS | Company | Fields replayed | Fill |
+|---|---|---|---|
+| Greenhouse | GitLab (AI Engineer) | 23 | 35.4s |
+| Lever | Shield AI (Electrical Engineer I) | 39 | 32.8s |
+| Ashby | Notion (AI Applications Engineer) | 19 | 19.4s |
+| Greenhouse, employer-hosted | Coinbase (`www.coinbase.com/careers/positions/<id>?gh_jid=<id>`) | 30 | 68.7s |
+
+- **⚠ AN EMPLOYER PAGE MAY LINK ITS ATS RATHER THAN EMBED IT.** The pre-onboard probe (2026-08-02)
+  only looked for an embedded FRAME, so Coinbase — its own careers UI with an Apply link to
+  `job-boards.greenhouse.io` — matched no ATS host, fell into the WORKDAY onboarding, and halted
+  `auth-form-not-rendered` on a page that has no sign-in at all. The probe now also asks
+  `atsInjFindApplyLinks` + the ambiguity-refusing `atsPickApplyLink` (the same pair the ATS pipeline
+  uses for its own landing hops), and hands the resolved URL to the right pipeline. ⚠ The link must be
+  READ from the page — a Greenhouse embed URL cannot be constructed from a `gh_jid` (2026-08-01).
+- **Lever's EEO block, two traps in one field set.** `eeo[disabilitySignatureDate]` reached the AI
+  free-text path and answered **"As soon as possible"** — an availability answer on a date field, after
+  a 19.2s LLM call. And `eeo[race]` renders each option's whole DESCRIPTION inside its label, so the
+  read-back is a paragraph while the option vocabulary is the answer alone; persisting the read-back
+  put a value in the bundle that no live option could match, and the replay of a verified fill came
+  back `stated-value-unmatched`.
+- **The one-page ATSs have NO review page**, so Workday's "stopped before the review page" / "on page
+  N" wording describes something that does not exist on them. `bundle.ats` (written since 2026-08-02)
+  now drives the halt-banner copy.
+- Slowest fields per run, now that `[ATS-TIME]` names them: Coinbase `resume 15.2s`,
+  `candidate-location 10.6s`; Ashby `ap-ats-combobox-3 12.2s` (the stamped, identity-less location
+  combobox). Résumé attach and the location widgets are where the remaining time is — not matching.

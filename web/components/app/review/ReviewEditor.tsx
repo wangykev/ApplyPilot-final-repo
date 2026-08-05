@@ -476,7 +476,7 @@ export function ReviewEditor({
   return (
     <div className="space-y-6">
       {/* halt banner — WHY the fill didn't reach the end (loud, top of page) */}
-      {bundle.walk_status && <WalkStatusBanner ws={bundle.walk_status} />}
+      {bundle.walk_status && <WalkStatusBanner ws={bundle.walk_status} onePage={!!bundle.ats && bundle.ats !== "workday"} />}
 
       {/* header */}
       <div className="bezel flex flex-wrap items-center justify-between gap-4 px-5 py-4">
@@ -1650,18 +1650,24 @@ function ApproveToggle({ e, onToggle }: { e: ReviewEntry; onToggle: (on: boolean
 
 // Loud halt banner — WHY a fill didn't reach the review page (error / empty-required / cancelled /
 // other) + the exact form errors + an edit-my-profile link. Only shows when the walk did NOT complete.
-function WalkStatusBanner({ ws }: { ws: WalkStatus }) {
+function WalkStatusBanner({ ws, onePage }: { ws: WalkStatus; onePage?: boolean }) {
   if (ws.completed) return null;
   const errors = (ws.page_errors || []).filter(Boolean);
   const empties = ws.empty_fields || [];
   const pg = ws.stopped_page ?? "?";
+  // Greenhouse / Lever / Ashby applications are a SINGLE page with no review step, so Workday's
+  // "before reaching the review page" and "on page N" describe things that do not exist there
+  // (operator, 2026-08-05). Same facts, wording that matches the form the operator is looking at.
+  const onPage = onePage ? "" : ` on page ${pg}`;
   const reason = ws.cancelled
-    ? "This fill was cancelled mid-run before reaching the review page."
+    ? `This fill was cancelled mid-run${onePage ? "" : " before reaching the review page"}.`
     : errors.length
-      ? `The form rejected a value on page ${pg}, so the fill couldn't continue.`
+      ? `The form rejected a value${onPage}, so the fill couldn't continue.`
       : empties.length
-        ? `Required fields on page ${pg} had no value in your profile, so the fill couldn't continue.`
-        : `The fill stopped on page ${pg} before reaching the review page.`;
+        ? `Required fields${onPage} had no value in your profile, so the fill couldn't continue.`
+        : onePage
+          ? "The fill didn't get through the whole form."
+          : `The fill stopped on page ${pg} before reaching the review page.`;
   // "Edit my profile" only makes sense when a PROFILE VALUE is the problem (the form rejected a value,
   // or a required field was empty). A cancellation — or any stop with no data problem detected — isn't a
   // profile issue, so it gets a re-run message instead of pointing the operator at their profile.
@@ -1736,7 +1742,7 @@ function ApprovalBar({
   const note = incomplete
     ? refillClicked
       ? "Approvals saved. On the Workday tab, open the extension and click “CDP REFILL” — your approved fields replay (the same commit as submit, so they won’t re-flag) and everything else re-fills fresh from your profile."
-      : "This fill stopped before the review page. Approve the fields that are already correct (optional), then Refill — approved fields replay and won’t re-flag; the rest re-fill fresh."
+      : "This fill didn’t finish. Approve the fields that are already correct (optional), then Refill — approved fields replay and won’t re-flag; the rest re-fill fresh."
     : approval.submit_ready
       ? "Ready to submit — run “Replay + SUBMIT” in the extension; it pulls these approved values. (Real submit stays behind the eyes-on, disposable-app gate.)"
       : approval.unreplaced_placeholders

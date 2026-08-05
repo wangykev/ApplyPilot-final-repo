@@ -3415,3 +3415,24 @@ read-count one, another an assertion on behaviour rather than outcome).
 same class of query), so a school field can still reach review honestly flagged; the candidate-location
 places service never loads in this browser; and the fetch-assisted tier for the education endpoint (the
 Lever-location pattern) is the obvious next step for both.
+
+## 2026-08-05 (b) — breadth: Greenhouse, Lever and Ashby all reach the gate
+
+Four forms, four shapes, each fill → review → approve → rehearse → `WOULD CLICK SUBMIT`, nothing
+submitted: GitLab (GH, 23 replayed), Shield AI (Lever, 39), Notion (Ashby, 19) and Coinbase
+(employer-hosted GH, 30). Detail: dom-patterns 2026-08-05 (b).
+
+Fixed in this round: a signature date is TODAY on the ATS path too (Lever's answered "As soon as
+possible" via the AI after a 19.2s call); a radio persists the option it CHOSE rather than a label
+carrying the option's whole description (which no live option could re-match, so the replay failed a
+field the fill had verified); the pre-onboard probe follows an employer page's apply LINK, not just an
+embedded frame (Coinbase halted in the Workday auth path on a page with no sign-in); and the halt
+banner stops telling one-page ATS users about a review page they do not have.
+
+Also: `ats.js` reaches lib.js/fill-driver.js through `atsLib`/`atsFd` — TWO objects, exactly like
+`apMatch` — and the SW-literal guard never covered them. It does now, and caught a missing key on its
+first run. Extension 1063/1063; web 140/140; typecheck clean.
+
+Remaining: résumé attach (15.2s) and the location widgets (10.6s / 12.2s) are where ATS fill time now
+sits; Greenhouse's school service is still slow and erratic; the fetch-assisted tier for the education
+endpoint is the next obvious step.

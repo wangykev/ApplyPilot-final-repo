@@ -130,6 +130,11 @@ export type WalkStatus = {
 
 export type ReviewBundle = {
   schema_version?: string;
+  /** Which pipeline filled this: "workday" | "greenhouse" | "lever" | "ashby". The extension has
+   *  written it since 2026-08-02 (a submit run cannot re-derive it from an employer URL). The UI
+   *  needs it because the one-page ATSs have NO review page, so Workday's "stopped before the review
+   *  page" wording describes something that does not exist on them. */
+  ats?: string | null;
   page?: string | null;
   page_number?: number | null;
   page_label?: string | null;
