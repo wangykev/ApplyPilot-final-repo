@@ -682,6 +682,75 @@ test("driver: the option a by-name search found is not cleared away before the c
   assert.strictEqual(committed, "Swarthmore College");
 });
 
+test("driver: a PAGED list never claims the profile answer is absent", async () => {
+  // Live 2026-08-04: the school field reported 'your profile answer isn't one of this form's
+  // options' after reading 100 of ~3300 schools whose search had timed out — sending the operator
+  // to look for a missing option that is really there, and hiding the real problem.
+  const page1 = Array.from({ length: 100 }, (_, i) => "University " + i);   // page-sized read
+  let query = "";
+  const act = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { query = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: page1.map((t) => ({ text: t })) }),
+    atsInjCommitOption: () => ({ ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "needs_review");
+  assert.doesNotMatch(r.detail, /isn't one of this form's options/, "a paged list cannot prove absence");
+  assert.match(r.detail, /never answered our search/);
+  // and review must get a TYPE-or-filter editor, not a pick-one <select> of the near-matches:
+  // narrowing 100 read options down to 20 must not launder a paged list into a complete one
+  assert.strictEqual(r.optionsPartial, true, "a narrowed page is still a partial list");
+  assert.strictEqual(r.options, null, "options[] would render as the whole truth");
+  assert.ok((r.captured_options || []).length, "the operator still sees what we did read");
+
+  // …but a SHORT, complete list CAN prove it, and must keep saying so plainly.
+  const act2 = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { query = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "MIT" }, { text: "Stanford University" }] }),
+    atsInjCommitOption: () => ({ ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out2 = await ats.driveAtsPageFill(act2, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  assert.match(out2.results[0].detail, /isn't one of this form's options/);
+});
+
+// ── the RÉSUMÉ goes in the résumé slot, and nowhere else (live 2026-08-04) ─────────────────
+test("replay: the résumé is attached ONLY to the résumé field, never the cover letter", async () => {
+  // Greenhouse renders the cover letter as a file dropzone too. The replay used to treat every
+  // file field as the résumé, which put Kevin's résumé in the cover-letter slot on a rehearsal —
+  // on a real submit that files the wrong document, and no gate can catch it (the strict verify
+  // only re-checks approved VALUES, and the bundle carries no file for a skipped field).
+  const attached = [];
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/discord/jobs/1", title: "t",
+      fields: [
+        { fieldName: "resume", inputSel: "#resume", widgetType: "file_upload", label: "Resume", isRequired: true, value: null, domIndex: 0 },
+        { fieldName: "cover_letter", inputSel: "#cover_letter", widgetType: "file_upload", label: "Cover Letter", isRequired: false, value: null, domIndex: 1 },
+      ],
+    }),
+    attachResume: async (ref) => { attached.push(ref.inputSel); return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+  // a submit/replay run: valueFor answers for BOTH entries (the cover letter was skipped, so it
+  // carries an empty value — which is NOT permission to attach something)
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "" });
+  assert.deepStrictEqual(attached, ["#resume"], "exactly one attach, to the résumé field");
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+  assert.strictEqual(by.resume.status, "filled");
+  assert.strictEqual(by.cover_letter.status, "skipped");
+  assert.match(by.cover_letter.detail, /cover letter|not the r/i);
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {

@@ -880,14 +880,33 @@ function atsNearOptions(texts, query, limit) {
 const ATS_POLL = {
   open: 1800, openCeil: 6000,       // the first page (itself a network fetch on a big list)
   retry: 1500, retryCeil: 4000,     // after a forced re-open
-  search: 2000, searchCeil: 8000,   // a typed by-name query
+  // A typed by-name query. The ceiling is paid ONLY while the widget still reports loading, so
+  // it is not a flat cost — and it has to be generous because the list behind it is a slow,
+  // highly variable third-party service: measured on ONE session, Greenhouse's school endpoint
+  // answered a fresh query in 390ms, 4049ms, 4459ms and then >12s (a direct fetch of the same
+  // query: HTTP 200 in 2971ms, no rate limiting). An 8s ceiling missed the bad end of that
+  // spread, which is a REQUIRED field going unanswered — much more expensive than the wait.
+  search: 2000, searchCeil: 20000,
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
+  loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
 };
 const ATS_OPTION_CAP = 60;
-function atsAttachOptions(rec, texts) {
+// `partial` FORCES the partial treatment for a list we have already narrowed. Live 2026-08-04: a
+// 100-option page read was narrowed to its 20 near-matches, which then looked like a COMPLETE
+// short list — so review offered the operator a pick-one <select> of 20 schools that did not
+// include theirs, with no way to type the real one. Narrowing must never launder a paged list into
+// a complete one; the caller knows which it is.
+function atsAttachOptions(rec, texts, partial) {
   const list = (texts || []).filter(Boolean);
   if (!list.length) return;
+  if (partial === true) {
+    rec.captured_options = list.slice(0, ATS_OPTION_CAP);
+    rec.options = null;
+    rec.widgetType = "typeahead"; // review renders a filter-or-type editor + an honest partial note
+    rec.optionsPartial = true;
+    return;
+  }
   // >= not >: a virtualized widget commonly returns EXACTLY one page (live: 60 of ~2000
   // schools), so an equality read is the partial case, not a complete list that happens to fit.
   // ALWAYS set both: a later call refines an earlier one (the raw list first, then the
@@ -1327,7 +1346,21 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       if (o.valueFor) {
         const v = o.valueFor(f);
         if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(rec); continue; }
-        route = f.widgetType === "file_upload" ? { kind: "resume", source: "replay" } : { value: v, source: "replay" };
+        if (f.widgetType === "file_upload") {
+          // ⚠ NOT EVERY FILE FIELD IS THE RÉSUMÉ. Greenhouse renders the COVER LETTER as a file
+          // dropzone too, so attaching to every file field put the résumé in the cover-letter slot
+          // (operator watched it happen on a Discord rehearsal, 2026-08-04). On a real submit that
+          // files the wrong document to the employer, and NO gate catches it: the strict verify
+          // only re-checks approved VALUES, and a bundle never carries a file for a field we
+          // deliberately skipped. Route it through the same router the fill uses — which maps
+          // exactly one field to the résumé — and leave any other file field alone.
+          const fr = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+          route = fr && fr.kind === "resume"
+            ? { kind: "resume", source: "replay" }
+            : { kind: "skip", detail: (fr && fr.detail) || "a file field that is not the résumé — left to the operator" };
+        } else {
+          route = { value: v, source: "replay" };
+        }
       } else {
         route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
       }
@@ -1420,7 +1453,11 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
             rec.flag = rec.flag || "stated-value-unmatched";
             // A human sentence for the review page — the raw match diagnostic is kept after it
             // (it names the options), and rec.options already feeds the editor's picker.
-            rec.detail = "your profile answer (" + JSON.stringify(String(candidates[0])) + ") isn't one of this form's options — pick the right one here" +
+            rec.detail = (rec.listUnproven
+              // the list is paged, or its search never answered — say what we actually know
+              ? "this form's own list never answered our search for " + JSON.stringify(String(candidates[0])) +
+                " (it serves one page at a time), so we can't tell whether it's there — pick it here, or answer it in the tab"
+              : "your profile answer (" + JSON.stringify(String(candidates[0])) + ") isn't one of this form's options — pick the right one here") +
               (rec.detail ? " · " + rec.detail : "");
           } else {
             rec.detail = rec.detail || "no profile mapping for this question";
@@ -1584,12 +1621,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // Hidden tabs re-render more raggedly, which is why this surfaced there.
       // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
       // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
-      let last = null, lastSeen = null, sawLoading = false;
+      const startedAt = Date.now();
+      let last = null, lastSeen = null, sawLoading = false, ticks = 0;
       for (;;) {
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
+        ticks++;
         if (r && Array.isArray(r.options)) { lastSeen = r; if (r.options.length) last = r; }
         if (r && r.loading) sawLoading = true;
-        if (r && want(optsOf(r))) return r;
+        if (r && want(optsOf(r))) { r.waitedMs = Date.now() - startedAt; r.ticks = ticks; return r; }
         const now = Date.now();
         const loading = !!(r && r.loading);
         if (now >= hardDeadline || (now >= deadline && !loading)) {
@@ -1597,9 +1636,18 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
           // Carry WHY we stopped, so a field that reaches review can name the real cause: a list
           // that never finished loading is a different report from one that answered "nothing" —
           // and so the recovery below knows whether a search was ever in flight to protect.
-          if (out) { out.stillLoading = loading; out.sawLoading = sawLoading; }
+          // waitedMs/ticks make the next occurrence self-diagnosing instead of a guess about
+          // whether the budget or the poll pressure was the problem.
+          if (out) { out.stillLoading = loading; out.sawLoading = sawLoading; out.waitedMs = now - startedAt; out.ticks = ticks; }
           return out;
         }
+        // BACK OFF WHILE IT IS FETCHING. Every tick is a Runtime.evaluate round trip, and this
+        // project has already measured that polling a react-select too hard STARVES the renderer
+        // so the menu never paints (2026-07-31: a 20ms interval took a GitLab fill from 4 review
+        // items to 11, all "listed no options"). While the widget says it is loading there is
+        // nothing to learn from a fast tick — the answer is bounded by its own fetch + render —
+        // so give the page room instead of hammering it.
+        if (loading) { await act.delayFull(ATS_POLL.loadingTick); continue; }
         // ⚠ REAL 150ms, not the adaptive delay. Adaptive collapses to ~20ms when timers measure
         // fast, and each poll tick is a Runtime.evaluate round trip — at that rate the polling
         // STARVES the renderer and the menu never paints. Live 2026-07-31: switching this one
@@ -1674,7 +1722,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         }
         const seen = optsOf(found);
         if (found && found.stillLoading) listPending = true;
-        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
+        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)} waited=${(found && found.waitedMs) || 0}ms/${(found && found.ticks) || 0} reads; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
         if (seen.length) nearMatches = seen;
         if (seen.length && hasHit(seen)) { read = found; break; }
       }
@@ -1746,7 +1794,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const near = client.length ? client : (nearMatches.length && nearMatches.length < texts.length ? nearMatches : texts);
       rec.detail = "no candidate matched " + texts.length + " option(s); candidates=" + JSON.stringify(candidates.slice(0, 4)) +
         (near !== texts ? "; closest on this form: " + JSON.stringify(near.slice(0, 4)) : " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)));
-      atsAttachOptions(rec, near);
+      // …and if what we READ was only a page (or the search never answered), say so even after
+      // narrowing — otherwise the 20 near-matches masquerade as the whole option set.
+      const unproven = listPending || texts.length >= ATS_OPTION_CAP;
+      atsAttachOptions(rec, near, unproven ? true : undefined);
+      // ABSENCE IS ONLY PROVABLE AGAINST A LIST THAT ANSWERED, IN FULL. This form serves 100 of
+      // ~3300 schools per page and its search service is slow and erratic (2026-08-04: 390ms,
+      // 4.0s, 4.5s, then >20s for the same kind of query), so "not in what we read" is not
+      // "not on the form" — claiming otherwise sends the operator looking for a missing option
+      // that is really there, and buries the actual problem (the list never came back).
+      if (unproven) rec.listUnproven = true;
       return false;
     }
     const commitText = texts[hit.index];
