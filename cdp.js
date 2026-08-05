@@ -547,13 +547,30 @@ function cdpSetSyntheticInput(on) {
   if (on) console.log("[ApplyPilot][CDP] synthetic input ENABLED for this run's fill — hidden-tab actuation dispatches page-side (trusted when visible; forceTrustedInput overrides).");
 }
 function cdpSyntheticInputEnabled() { return _synthInputEnabled; } // so a caller can SAVE/RESTORE around a deliberately-trusted step
-async function cdpSynthInput() {
+// The self-ID surface ignores synthetic native-setter WRITES (Workday reported Name and Date empty on a
+// page whose DOM held both) but accepts synthetic CLICKS — the disability checkbox committed and held
+// 2/2 under synthetic, while trusted clicks on it produced the intermittent "did not commit". So the
+// mode is per-KIND there, not per-page: text/date trusted, clicks synthetic.
+let _trustedText = false;
+function cdpSetTrustedText(b) { _trustedText = !!b; }
+function cdpTrustedTextEnabled() { return _trustedText; }
+
+// kind: "text" for value-writing paths (insertText / typeChars / keyTap / selectAllDelete / the date
+// triple-click), anything else = a plain click.
+async function cdpSynthInput(kind) {
   if (!_synthInputEnabled || _forceTrustedInput) return false;
-  // NOT PAINTING ⇒ synthetic page-side dispatch (needs no frames); painting ⇒ trusted Input.* (proven).
-  // This used to ask cdpVisible(), which cannot see an occluded window and so kept trusted input on a
-  // tab producing no frames — 39s vs 11s on the same page. cdpPainting falls back to cdpVisible when it
-  // cannot measure, so the worst case is today's behaviour.
-  return !(await cdpPainting());
+  if (_trustedText && kind === "text") return false;
+  // POLICY (2026-08-05): synthetic on form pages REGARDLESS of visibility. This used to ask "is the tab
+  // hidden?" (and briefly "is it painting?"), on the assumption trusted input was only expensive when
+  // frames were missing. Measured otherwise: the same page 2 took 11s hidden/synthetic and 14-38s
+  // visible/trusted, with the paint probe confirming the 38.3s run WAS painting. Trusted Input.* is
+  // simply dearer per event — it traverses the browser's input pipeline — and page 2 is event-bound.
+  // Synthetic is the repertoire this file already proves on form pages, and every verify gate
+  // (read-backs, chip/persistence re-reads, the M40 audit) is unchanged, so a synthetic no-op still
+  // ends needs_review rather than a wrong value. Trusted is kept exactly where it is REQUIRED: the auth
+  // form (own attach, never armed), the self-ID text/date fields (above), and the submit click
+  // (cdpSetSyntheticInput(false) immediately before it).
+  return true;
 }
 
 // In-page synthetic click (self-contained; evaluated via cdpEval). Dispatches the page-engine's
@@ -847,7 +864,7 @@ async function cdpTripleClickAt(x, y) {
   // triple-click default — the date path tolerates this because (a) focusDateSegment's ladder
   // falls to el.focus() when the click didn't focus, and (b) synthetic typing REPLACES the whole
   // segment value (cdpSynthSetValue), which is exactly what select+type achieved.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthClickAt, Math.round(x), Math.round(y), 3);
       if (r && r.ok) { inputLog("triple-click(synth)", "(" + Math.round(x) + "," + Math.round(y) + ") → " + r.hit); return; }
@@ -875,7 +892,7 @@ async function cdpTripleClickAt(x, y) {
 async function cdpInsertText(text) {
   // HIDDEN → native-setter REPLACE + input/change (the React fill technique). Every call site
   // inserts after a clear/select-all, where replace ≡ insert; the caller's read-back poll gates it.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, String(text), false);
       if (r && r.ok) { inputLog("insertText(synth)", JSON.stringify(String(text))); return; }
@@ -895,7 +912,7 @@ async function cdpKeyTap(def) {
   // HIDDEN → synthetic keydown+keyup on the focused element (Tab additionally blurs; Space
   // additionally activates — the two default actions the fill relies on). Enter/Escape are
   // page-handled (Workday listens for the key events themselves), so the dispatch suffices.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       await cdpEval(cdpSynthKeyTap, def.key, def.code, def.vk, def.modifiers || 0);
       inputLog("key(synth)", JSON.stringify(def.key) + (def.modifiers ? " +mod" + def.modifiers : ""));
@@ -946,7 +963,7 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
   // the big hidden win (a 35-char typeahead candidate = 70 frame-gated Input commands ≈ 40s → 1 eval).
   // REPLACE is correct at every call site: typing always follows a clear (typeInSearch) or a
   // select-all (dates — where replace ≡ what select+type achieved); the read-back/chip gates verify.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, String(text), true);
       if (r && r.ok) { inputLog("typeChars(synth)", JSON.stringify(String(text))); return; }
@@ -975,7 +992,7 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
 // HIDDEN → native-setter "" + input/change (the page engine's proven "clear before typing"
 // pattern) — synthetic Ctrl+A/Delete run no default actions, so the key path can't clear there.
 async function cdpSelectAllDelete() {
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, "", false);
       if (r && r.ok) { inputLog("selectAllDelete(synth)", '""'); return; }

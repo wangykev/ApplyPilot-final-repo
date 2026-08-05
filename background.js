@@ -2952,25 +2952,26 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   } catch (e) { LOG("[GROUP-WATCH] install skipped:", String((e && e.message) || e)); }
 
-  // ── A SELF-ID PAGE IS FILLED WITH TRUSTED INPUT, EVEN HIDDEN (2026-08-04) ──────────────────────
-  // Workday does not register synthetic (page-side native-setter) writes on this surface: hidden runs
-  // failed 2/2 with Name and Date reported empty on a page holding both, and the same run passed under
-  // forceTrustedInput. Repairing it afterwards is not reliable either — a trusted re-type cleared the
-  // date but not the name. So enter the values trusted from the start, exactly as onboarding does on the
-  // auth form for the same reason. Scoped to THIS page, so every other page keeps the hidden speed win;
-  // the cost is trusted input's ~1.2s/event on a handful of fields, and only when the tab is hidden.
+  // ── A SELF-ID PAGE: TRUSTED for TEXT/DATE, SYNTHETIC for CLICKS (2026-08-05) ────────────────────
+  // Workday ignores synthetic native-setter WRITES on this surface — hidden runs failed with Name and
+  // Date reported required-and-empty on a page whose DOM plainly held both, and forceTrustedInput fixed
+  // exactly that. But it ACCEPTS synthetic clicks, and prefers them: the disability checkbox committed
+  // and held 2/2 under synthetic, whereas trusted clicks on it produce the intermittent "did not commit"
+  // (quiet page, click dispatched, hit-test confirming the right label, no toggle). Forcing the WHOLE
+  // page trusted therefore fixed the text fields and re-exposed the checkbox.
+  //
+  // So the split is per-KIND, not per-page: value writes go trusted, the label click stays synthetic.
   const _selfId = isSelfIdPage((preScan && preScan.fields) || []);
-  const _synthWas = typeof cdpSyntheticInputEnabled === "function" ? cdpSyntheticInputEnabled() : false;
-  if (_selfId && _synthWas) {
-    LOG("this is a SELF-ID page — filling it with TRUSTED input (Workday ignores synthetic writes here; hidden runs failed 2/2 on it). Synthetic is restored for the next page.");
-    cdpSetSyntheticInput(false);
+  if (_selfId) {
+    LOG("this is a SELF-ID page — TRUSTED input for text/date (Workday ignores synthetic writes here), SYNTHETIC for the checkbox click (trusted clicks flake on it).");
+    cdpSetTrustedText(true);
   }
   const _fillT0 = Date.now();
   let out;
   try {
     out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets, optionCache });
   } finally {
-    if (_selfId && _synthWas) cdpSetSyntheticInput(true); // never leave the run slower than it needs to be
+    if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
   }
   const fillMs = Date.now() - _fillT0;
   if (_gwSel) {
