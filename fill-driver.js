@@ -1102,8 +1102,13 @@ function parseBatchAiReply(text, items) {
 //  • canonicalize — a MAPPED dropdown whose stated value we can prove does not match any live option, run
 //    through the SAME match ladder the fill will use ({containment:false}: a canonicalize exists precisely
 //    because ApplyPilot will not guess). Proving it here costs nothing extra since the options are open.
-async function collectAiBatchItems(act, fields, profile, budgets) {
+async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
   const items = [];
+  const oc = (optionCache && typeof optionCache === "object") ? optionCache : null;
+  const cached = (f) => {                       // options we ALREADY know, for free — no open, no page contact
+    const e = oc && oc["dd:" + f.fieldName];
+    return (e && Array.isArray(e.options) && e.options.length && (Date.now() - (e.at || 0)) < OPTION_CACHE_TTL_MS) ? e.options : null;
+  };
   for (const f of fields || []) {
     if (items.length >= AI_BATCH_MAX) break;
     if (f.widgetType !== "dropdown") continue;          // choice questions only for now; text/essay keeps its own call
@@ -1114,23 +1119,32 @@ async function collectAiBatchItems(act, fields, profile, budgets) {
     const wantInfer = !hasStated && f.isRequired && aiEligible(f);
     if (!wantInfer && !hasStated) continue;             // optional + unmapped ⇒ never an AI field
     if (hasStated && !mappedPath) continue;             // only a MAPPED stated value can canonicalize
+    // ── CANONICALIZE IS NEVER WORTH AN OPEN (2026-08-06, measured) ────────────────────────────────
+    // A canonicalize candidate only becomes real if the stated value matches NO live option, which is
+    // rare — so probing for it by opening the widget spends a round trip on the common case where it
+    // matches fine. Measured on waystar: page 1 (country/state/phone — all mapped, all matching, ZERO AI
+    // questions) went 2.7s → 4.1s purely on these probes, and that alone turned a 6-vs-12-call win into a
+    // slower page. So canonicalize joins the batch ONLY when the cross-run option cache already knows the
+    // options, which costs nothing. Otherwise it keeps its own per-field call — the batch is a cache, not
+    // a gate, so skipping it here forfeits speed, never an answer. INFER still opens, because it cannot
+    // be predicted from a cache and it is the case that actually appears in bulk on a questions page.
+    const cachedOpts = hasStated ? cached(f) : null;
+    if (hasStated && !cachedOpts) continue;
+    if (hasStated) {
+      const cands = Array.isArray(stated) ? stated : [stated];
+      // Only a PROVEN no-match needs the model. containment:false mirrors the fill's own dropdown policy.
+      if (apMatch.matchCandidates(cands, cachedOpts, { containment: false }).targetIndex !== -1) continue;
+      items.push({ key: f.fieldName, kind: "canonicalize", label: f.label, options: cachedOpts, stated: cands });
+      continue;
+    }
     const loc = { wrapperSel: f.wrapperSel };
-    let state = null, before = null;
+    let before = null;
     try {
       const r = await openAndReadDropdown(act, loc, budgets);
-      state = r.state; before = r.before;
-      if (!r.expanded || !state || !state.optionCount) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
-      const enabled = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
-      if (!enabled.length) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
-      if (hasStated) {
-        // Only a PROVEN no-match needs the model. containment:false mirrors the fill's own dropdown policy.
-        const cands = Array.isArray(stated) ? stated : [stated];
-        const m = apMatch.matchCandidates(cands, enabled, { containment: false });
-        if (m.targetIndex !== -1) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
-        items.push({ key: f.fieldName, kind: "canonicalize", label: f.label, options: enabled, stated: cands });
-      } else {
-        items.push({ key: f.fieldName, kind: "infer", label: f.label, options: enabled });
-      }
+      before = r.before;
+      if (!r.expanded || !r.state || !r.state.optionCount) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
+      const enabled = apMatch.withoutPlaceholderOptions(r.state.options.filter((o) => !o.disabled).map((o) => o.text));
+      if (enabled.length) items.push({ key: f.fieldName, kind: "infer", label: f.label, options: enabled });
       await closeAndVerifyBlank(act, loc, before, budgets);
     } catch (e) {
       try { await closeAndVerifyBlank(act, loc, before, budgets); } catch (e2) { /* best effort */ }
@@ -3334,7 +3348,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
     try {
-      aiBatch.items = await collectAiBatchItems(act, scan.fields, profile, budgets);
+      aiBatch.items = await collectAiBatchItems(act, scan.fields, profile, budgets, opts && opts.optionCache);
       if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
         // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
