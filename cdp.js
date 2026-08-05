@@ -2631,6 +2631,21 @@ function cdpDevBoxGeom(wrapperSel) {
     }),
   };
 }
+// The live values of a date composite's segments, read straight off the spinbuttons. Used to RE-TYPE a
+// date with the value it already shows — reading the segments avoids parsing the rendered string, whose
+// order is tenant-variable (MM/DD/YYYY vs DD/MM/YYYY), so no order can be assumed wrongly.
+function cdpReadDateSegValues(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  const out = {};
+  for (const seg of ["Month", "Day", "Year"]) {
+    const el = w.querySelector('[data-automation-id="dateSection' + seg + '-input"]');
+    const v = el && el.value != null ? String(el.value).trim() : "";
+    if (v !== "") out[seg.toLowerCase()] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // What is ACTUALLY at (x,y), and is it the label/input we think we are clicking? The rect is measured in
 // one CDP round trip and the click is dispatched in another, so a scroll or reflow in between silently
 // sends the click somewhere else — the same staleness clickPageNext learned to re-measure for. Without

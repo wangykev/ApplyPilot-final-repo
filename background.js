@@ -3407,12 +3407,12 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
     //    and the error set never changed. The nudge is kept because it is free and occasionally right,
     //    but it is no longer allowed to stand in front of the remedy that is actually proven.
     if (!didSomething) {
-      const nudge = await nudgePhantomRequired(prevErrors, (...a) => LOG("  attempt " + attempt + " (Tier 0.5)", ...a));
+      const nudge = await nudgePhantomRequired(act, prevErrors, (...a) => LOG("  attempt " + attempt + " (Tier 0.5)", ...a));
       if (nudge.ran) {
         mergeRemediationRecord(out, {
           fieldName: "phantom-required.commit", label: "Phantom required-field workaround", widgetType: "remediation",
           status: "needs_review", flag: "ai-remediation", after: null,
-          detail: `Workday reported ${nudge.fields.join(", ")} as required-and-empty while the page held the value (the blur race). Committed with a focus→blur nudge — no value was changed.`
+          detail: `Workday reported ${nudge.fields.join(", ")} as required-and-empty while the page held the value. Re-entered the SAME value with trusted input${(nudge.retyped && nudge.retyped.length) ? " (" + nudge.retyped.join(", ") + ")" : ""} and nudged focus→blur — no value was changed.`
         });
         actions.push({ tier: 0.5, action: "commit-phantom-required", fields: nudge.fields.join(", "), nudged: nudge.nudged });
         didSomething = true;
@@ -4511,7 +4511,7 @@ async function reloadAndSettle(LOG, ceilingMs = 12000) {
 // the page AND visibly HOLDS a value. A genuinely empty required field returns ran:false and the caller
 // halts exactly as before — this can never paper over a real gap, and it never invents or changes a value
 // (focus → change → blur only). Deterministic; no AI, which is why it's allowed on the replay path at all.
-async function nudgePhantomRequired(errorTexts, LOG) {
+async function nudgePhantomRequired(act, errorTexts, LOG) {
   const titles = (errorTexts || []).map((t) => parseErrorFieldName(t)).filter(Boolean);
   if (!titles.length) return { ran: false, reason: "the error text names no field" };
 
@@ -4522,9 +4522,45 @@ async function nudgePhantomRequired(errorTexts, LOG) {
   // phantomRequiredTargets — this function only does the I/O around it.
   const verdict = phantomRequiredTargets(titles, (scan && scan.fields) || []);
   if (!verdict.phantom) return { ran: false, reason: verdict.reason };
-  const matched = verdict.targets;
+  // phantomRequiredTargets is pure and reports identity + value; the widget type comes from the scan.
+  const byName = new Map((((scan && scan.fields) || [])).map((f) => [f.fieldName, f]));
+  const matched = verdict.targets.map((m) => Object.assign({}, m, { widgetType: (byName.get(m.fieldName) || {}).widgetType || null }));
 
   LOG(`  phantom-required: Workday says ${matched.map((m) => JSON.stringify(m.title)).join(" + ")} ${matched.length === 1 ? "is" : "are"} empty, but the page HOLDS ${matched.map((m) => JSON.stringify(String(m.value))).join(" + ")}. Committing ${matched.length === 1 ? "it" : "them"} with a focus→blur nudge (the manual fix) and re-saving.`);
+  // ── RE-TYPE WITH TRUSTED INPUT (2026-08-04) ──────────────────────────────────────────────────────
+  // The focus→blur nudge below is dispatched page-side, and on a HIDDEN run that is the very kind of
+  // interaction this surface ignores — which is why it has never cleared this error. Measured on
+  // waystar's Self Identify page: hidden+synthetic failed 2/2 with Workday calling Name and Date empty
+  // on a page that plainly held both, and the SAME run passed with forceTrustedInput. Same finding the
+  // auth form produced, which is why onboarding stays trusted.
+  //
+  // So re-enter the value the page ALREADY shows, through the trusted path. It changes no value, needs
+  // no FIELD_MAP entry (these fields are AI/recognizer-filled, which is exactly why Tier 1 skipped
+  // them), and trusted input is the one thing measured to work here. Synthetic is restored in a finally
+  // so the rest of the page keeps the hidden-tab speed win, as Tier 1 already does.
+  const wasSynthetic = typeof cdpSyntheticInputEnabled === "function" ? cdpSyntheticInputEnabled() : true;
+  const retyped = [];
+  if (act) {
+    try {
+      cdpSetSyntheticInput(false);
+      for (const m of matched) {
+        const loc = { wrapperSel: m.wrapperSel };
+        let res = null;
+        try {
+          if (m.widgetType === "text" || m.widgetType === "textarea") {
+            res = await fillTextCdp(act, loc, String(m.value), DEFAULT_BUDGETS, m.widgetType === "textarea" ? "textarea" : undefined);
+          } else if (m.widgetType === "date") {
+            // read the segments rather than parsing the rendered string, whose order is tenant-variable
+            const segs = await cdpEval(cdpReadDateSegValues, m.wrapperSel);
+            if (segs) res = await fillDateCompositeCdp(act, loc, segs, DEFAULT_BUDGETS);
+          }
+        } catch (e) { res = { status: "error", detail: String((e && e.message) || e) }; }
+        retyped.push(`${m.fieldName}=${res ? res.status : "unsupported(" + m.widgetType + ")"}`);
+      }
+    } finally { cdpSetSyntheticInput(wasSynthetic); }
+    if (retyped.length) LOG(`  phantom-required: re-typed with TRUSTED input — ${retyped.join(", ")}`);
+  }
+
   let nudged = null;
   try { nudged = await cdpEval(cdpNudgeFieldCommit, matched.map((m) => m.wrapperSel)); }
   catch (e) { return { ran: false, reason: "the nudge eval failed: " + String((e && e.message) || e) }; }
@@ -4532,7 +4568,7 @@ async function nudgePhantomRequired(errorTexts, LOG) {
   if (!total) return { ran: false, reason: `no input could be focused inside ${matched.map((m) => m.fieldName).join(", ")} — nothing to commit` };
   LOG(`  phantom-required: nudged ${total} input(s) across ${matched.length} field(s) — ${JSON.stringify(nudged)}`);
   await cdpDelay(700); // let Workday's blur validator run before the re-save (wall-clock; it is page-side work)
-  return { ran: true, fields: matched.map((m) => m.fieldName), nudged: total };
+  return { ran: true, fields: matched.map((m) => m.fieldName), nudged: total, retyped };
 }
 
 // Dump the decisive state for a "required" error on a field that looks filled (2026-07-28, round 2).
@@ -5191,7 +5227,7 @@ async function runCdpReplayWalk(tabId, opts) {
         // field is on the page AND holds a value, so a genuinely empty required field still falls through
         // to the halt below.
         if (phantomNudges < 2) {
-          const nudge = await nudgePhantomRequired(samples, LOG);
+          const nudge = await nudgePhantomRequired(act, samples, LOG);
           if (nudge.ran) {
             phantomNudges++;
             const sig3 = cdpPageSig(await cdpEval(cdpPageScan));
