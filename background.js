@@ -5674,7 +5674,29 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // 2026-07-28 rule), and a field holding some other value is left to review + the submit gate.
       try {
         const finalScan = await cdpEval(cdpPageScan);
+        // (i) we HAD an answer and the page lost it — requiredBlankOnPage's case.
         const stillLost = requiredBlankOnPage((finalScan && finalScan.fields) || [], (bundle && bundle.entries) || []);
+        // (ii) we TRIED and produced nothing at all. Live run 8 of the armed loop: the disability group's
+        // commit failed outright, so there was no value to put back, so (i) correctly skipped it ("nothing
+        // approved to restore") — and the walk clicked Save and halted as a nav-timeout blaming an
+        // unrelated unmapped field. Required-ness comes from the LIVE scan (authoritative) and "we tried
+        // and got nothing" from our own record, so this cannot fire on a field we never attempted.
+        const liveByName = new Map((((finalScan && finalScan.fields) || [])).map((f) => [f.fieldName, f]));
+        const blank = (v) => v == null || String(v).trim() === "";
+        const triedAndEmpty = ((out && out.results) || []).filter((r) => {
+          if (!r || r.widgetType === "file_upload" || r.widgetType === "checkbox") return false; // own paths / stores "false"
+          if (r.status !== "needs_review" && r.status !== "error") return false;
+          if (!blank(r.after)) return false;                                    // it holds something → review owns it
+          const live = liveByName.get(r.fieldName);
+          return !!(live && live.isRequired === true && blank(live.value));
+        }).filter((r) => !stillLost.some((l) => l.field.fieldName === r.fieldName)); // don't double-report
+        if (triedAndEmpty.length && !stillLost.length) {
+          LOG(`⚠ page ${page}: NOT clicking Save & Continue — ${triedAndEmpty.length} REQUIRED field(s) we TRIED to fill produced no value at all. Workday would refuse this page; halting here names the field instead of a nav-timeout that blames an unrelated one:`);
+          triedAndEmpty.forEach((r) => LOG(`    • "${r.label || r.fieldName}" [${r.flag || r.status}] — ${r.detail || "no detail"}`));
+          return { ok: true, stopped: "required-unfilled", nav_timeout_page: page,
+            fields: triedAndEmpty.map((r) => ({ field: r.fieldName, label: r.label || null, flag: r.flag || null, detail: r.detail || null })),
+            pages_filled: pagesFilled.length, pages: pagesFilled };
+        }
         if (stillLost.length) {
           const flaggedBy = (n) => {
             const r = (out.results || []).find((x) => x.fieldName === n);
