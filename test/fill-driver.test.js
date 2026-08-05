@@ -1483,6 +1483,42 @@ test("AI batch: OFF by default → one call PER question (batching is opt-in unt
   assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
 });
 
+test("AI batch: a NON-STRING profile value must not abort the page's whole batch", async () => {
+  // Live regression, found only because the [AI-BATCH] log line existed: the collector threw
+  // `s.toLowerCase is not a function` on a mapped dropdown whose profile value was a NUMBER, and because
+  // the guard only wrapped the open/close, collection aborted at field 1 — 0 candidates, batch never
+  // fired, every question fell back to a per-field call. Indistinguishable from "the feature does
+  // nothing", which is how the operator spotted it on the page.
+  // postalCode IS in FIELD_MAP, so a NUMERIC postal code reaches the match ladder directly.
+  const numeric = { wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: false,
+    label: "Postal Code", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "30301" }] };
+  const act = makeFakeAct([numeric, aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  // A warm option cache is what routes a stated value straight into the ladder with no open.
+  const out = await drivePageFill(act, { personal_info: { postal_code: 30301 } }, {}, {},
+    { ...AI_BATCH_BUDGETS }, { optionCache: { "dd:postalCode": { options: ["30301"], at: Date.now() } } });
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1,
+    "the two good questions still batch into ONE call despite the numeric field");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No");
+  assert.strictEqual(out.aiBatchInfo.candidates, 2, "the two AI questions were collected");
+  assert.strictEqual(out.aiBatchInfo.served, 2, "and both were served from the batch, not per-field");
+  assert.strictEqual(out.aiBatchInfo.error, null, "collection completed — no page-wide abort");
+});
+
+test("AI batch: aiBatchInfo reports what actually happened (the observability that found the bug)", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const ab = out.aiBatchInfo;
+  assert.strictEqual(ab.candidates, 2);
+  assert.strictEqual(ab.fired, true);
+  assert.strictEqual(ab.answers, 1, "only one answer came back");
+  assert.strictEqual(ab.served, 1);
+  assert.strictEqual(ab.fellBack, 1, "the uncovered question is COUNTED, so a silent no-op is visible");
+});
+
 test("AI batch: a batch that FAILS entirely still answers every question per-field", async () => {
   const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
     { aiEnabled: true, ai: [{ ok: false, error: "429 exhausted" },      // the batched call fails

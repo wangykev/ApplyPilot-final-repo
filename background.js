@@ -3084,6 +3084,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // rounds retune from (the fast/slow regime, cold option lists, server-bound typeahead filters…).
   {
     const attachMs = Date.now() - _attachT0;
+    // What the batched-AI pass actually DID, in one line. "Still calling AI per field" and "the batch
+    // collected nothing" look identical without this.
+    const ab = out.aiBatchInfo;
+    if (ab) LOG(`[AI-BATCH] ${ab.candidates} candidate(s)${ab.candidates ? " [" + ab.kinds.join(", ") + "]" : ""} · ${ab.fired ? "fired" : "NOT fired (needs 2+)"} · ${ab.answers} answer(s) back · served ${ab.served}, fell back to per-field ${ab.fellBack} · scan ${ab.scanMs || 0}ms${ab.error ? " · ERROR " + ab.error : ""}`);
     const ph = out.timings || {};
     const s = (ms) => (typeof ms === "number" ? (Math.round(ms / 100) / 10) + "s" : "–");
     const slow = (out.results || [])

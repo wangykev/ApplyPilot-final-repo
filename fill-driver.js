@@ -1112,6 +1112,13 @@ async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
   for (const f of fields || []) {
     if (items.length >= AI_BATCH_MAX) break;
     if (f.widgetType !== "dropdown") continue;          // choice questions only for now; text/essay keeps its own call
+    // ONE BAD FIELD MUST NOT COST THE WHOLE PAGE'S BATCH (2026-08-06). This loop is best-effort by
+    // definition — anything it fails to collect just falls back to a per-field call — but the guard used
+    // to sit only around the open/close, so a throw anywhere else (live: `s.toLowerCase is not a
+    // function`, from a non-string candidate reaching the match ladder) aborted collection at field 1 and
+    // silently disabled batching for the entire page. The symptom is indistinguishable from "the feature
+    // does nothing", which is exactly how it was found.
+    try {
     const mappedPath = FIELD_MAP[f.fieldName] || null;
     const raw = mappedPath ? getByPath(profile, mappedPath) : undefined;
     const stated = mappedPath ? resolve(raw, f.widgetType) : null;
@@ -1131,7 +1138,11 @@ async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
     const cachedOpts = hasStated ? cached(f) : null;
     if (hasStated && !cachedOpts) continue;
     if (hasStated) {
+      // STRINGS ONLY past this point: resolve() can hand back a number (a GPA, a years-of-experience)
+      // and the match ladder normalizes with toLowerCase. The fill's own call sites reach the ladder
+      // through the widget fillers, which already stringify; this one calls it directly.
       const cands = Array.isArray(stated) ? stated : [stated];
+      if (!cands.length) continue;
       // Only a PROVEN no-match needs the model. containment:false mirrors the fill's own dropdown policy.
       if (apMatch.matchCandidates(cands, cachedOpts, { containment: false }).targetIndex !== -1) continue;
       items.push({ key: f.fieldName, kind: "canonicalize", label: f.label, options: cachedOpts, stated: cands });
@@ -1149,6 +1160,7 @@ async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
     } catch (e) {
       try { await closeAndVerifyBlank(act, loc, before, budgets); } catch (e2) { /* best effort */ }
     }
+    } catch (eOuter) { /* this field simply isn't batched — it keeps its own per-field call */ }
   }
   return items;
 }
@@ -3360,11 +3372,17 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     } catch (e) { aiBatch.error = String((e && e.message) || e); }
     aiBatchScanMs = Date.now() - t0Batch;
   }
-  // Consulted at each AI site: await the in-flight call ONCE, then serve from the map.
+  // Consulted at each AI site: await the in-flight call ONCE, then serve from the map. Counts served vs
+  // fell-back, because "did the batch actually do anything" is otherwise invisible in the log — the first
+  // live run looked like it was still calling per-field and there was no way to tell collection from
+  // key-matching from a parse miss.
+  aiBatch.served = 0; aiBatch.fellBack = 0;
   const aiBatchAnswer = async (key) => {
-    if (!aiBatch.promise) return null;
+    if (!aiBatch.promise) { aiBatch.fellBack++; return null; }
     if (!aiBatch.awaited) { aiBatch.awaited = true; await aiBatch.promise; }
-    return aiBatch.answers.get(key) || null;
+    const hit = aiBatch.answers.get(key) || null;
+    if (hit) aiBatch.served++; else aiBatch.fellBack++;
+    return hit;
   };
   // [CDP-TIME] phase accounting (2026-07-25): where a page's wall-clock actually goes — logged by the
   // SW per page so pacing is retuned on EVIDENCE, not guesses. Zero behavior change; log-only.
@@ -4141,7 +4159,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const sessionWarning = (srcRec && srcRec.status === "needs_review" && srcRec.optionsLoaded === false)
     ? "Likely session expired — the \"How did you hear about us?\" options never loaded (server fetch failed). Refresh, log in, and reopen the form, then retry."
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings };
+  // aiBatchInfo: what the batch actually DID this page, so the log can say so. Without it a batch that
+  // collected nothing is indistinguishable from one that worked, which is exactly how the first live run
+  // read as "still calling AI on each field".
+  const aiBatchInfo = (act.aiEnabled && budgets.enableAiBatch)
+    ? { candidates: aiBatch.items.length, kinds: aiBatch.items.map((i) => i.kind + ":" + i.key),
+        fired: !!aiBatch.promise, answers: aiBatch.answers.size,
+        served: aiBatch.served || 0, fellBack: aiBatch.fellBack || 0,
+        scanMs: aiBatchScanMs, error: aiBatch.error || null }
+    : null;
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo };
 }
 
 // ============================================================================
