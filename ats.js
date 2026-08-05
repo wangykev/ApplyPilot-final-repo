@@ -818,22 +818,39 @@ function atsInjLeverLocCommit(name, id) {
 // Read both: the input while it still holds the file, and the FILENAME the form renders near the field
 // once the upload is done. Error text is reported, never fatal on its own — Workday's role="alert" is a
 // STATUS channel ("… loading"), and a false "upload failed" is worse than a slow one (2026-07-29).
-function atsInjReadFileState(inputSel) {
-  const el = document.querySelector(inputSel);
-  if (!el) return { ok: false, error: "not-found:" + inputSel };
+function atsInjReadFileState(inputSel, wantName) {
   const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  // Does the page SHOW the file we attached? Matched on the filename's stem, because a widget may
+  // render it truncated or re-quoted. >=4 chars so a short stem cannot match by coincidence.
+  const stem = String(wantName || "").replace(/\.[a-z0-9]+$/i, "").trim().toLowerCase();
+  const shownOnPage = () => {
+    if (stem.length < 4) return null;
+    const body = txt(document.body).toLowerCase();
+    return body.includes(stem) ? String(wantName) : null;
+  };
+  const el = document.querySelector(inputSel);
+  if (!el) {
+    // ⚠ AN ABSENT INPUT IS NOT A FAILURE. Greenhouse REPLACES the <input type=file> with its
+    // attachment row once the upload completes, so the element we were polling is GONE — and the
+    // poll spent its whole 15s ceiling on `not-found:#resume` while the résumé sat attached on the
+    // form (live 2026-08-05, GitLab + Coinbase; by hand the attach is instant). The filename
+    // rendered on the page is the confirmation.
+    const shown = shownOnPage();
+    return { ok: true, inputGone: true, fromInput: null, rendered: shown, error: null, progress: null };
+  }
   const fromInput = (el.files && el.files[0] && el.files[0].name) || null;
   // widen a few levels: the confirmation row is a sibling of the input's immediate wrapper
   let scope = el.parentElement;
   for (let i = 0; i < 3 && scope && scope.parentElement; i++) scope = scope.parentElement;
   const body = txt(scope);
   const m = /[\w()\-.,' ]+\.(pdf|docx?|rtf|txt)/i.exec(body);
-  const rendered = m ? m[0].trim() : null;
+  const rendered = (m ? m[0].trim() : null) || shownOnPage();
   const alerts = scope ? [...scope.querySelectorAll('[role="alert"],[class*="error"]')].map(txt).filter(Boolean) : [];
   const bad = alerts.find((t) => /(error|failed|unsupported|too large|invalid|not allowed|try again)/i.test(t)) || null;
   const progress = alerts.find((t) => /(loading|uploading|in progress|processing|\d+%)/i.test(t)) || null;
-  return { ok: true, fromInput, rendered, error: bad, progress };
+  return { ok: true, inputGone: false, fromInput, rendered, error: bad, progress };
 }
+
 
 // Greenhouse's location box is backed by google.maps places. In this browser that library never loads
 // — a HUMAN gets no suggestions either (2026-07-31) — and the fill still paid the full places budget
@@ -963,6 +980,7 @@ const ATS_POLL = {
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
+  fieldMaxMs: 20000,                // TOTAL option-polling allowance for ONE field (see pollFor)
   mountGrace: 1200,                 // extra wait for a menu that has NEVER mounted (see pollFor)
   responsiveReadMs: 400,            // fallback signal when the quiet watch is unavailable (see pollFor)
   busyIdleMs: 300,                  // DOM mutated this recently ⇒ the page is still reacting, keep waiting
@@ -1495,7 +1513,16 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     // (the Workday [CDP-TIME] habit). A record is finalized at several `continue`s below, so the
     // stamp is applied by `fin()` rather than at one exit.
     const fieldT0 = Date.now();
-    const fin = () => { rec.elapsedMs = Date.now() - fieldT0; return rec; };
+    const fin = () => {
+      rec.elapsedMs = Date.now() - fieldT0;
+      // LOG HERE, not at the end of the loop: several branches `continue` before that point, so the
+      // résumé attach — the single most variable field — produced no line at all and its cost could
+      // only be inferred from the [ATS-TIME] slowest list (which ignores anything under 1.5s).
+      try {
+        console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName} (${rec.widgetType}${rec.isRequired ? ", req" : ""}) → ${rec.status}${rec.matchTier ? " · " + rec.matchTier : ""}${rec.flag ? " · " + rec.flag : ""}${rec.after != null ? " · after=" + JSON.stringify(String(rec.after).slice(0, 60)) : ""} · ${rec.elapsedMs}ms${rec.detail ? " · " + rec.detail : ""}`);
+      } catch (e) { /* log only */ }
+      return rec;
+    };
     try {
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
@@ -1642,7 +1669,6 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       rec.detail = String((e && e.message) || e);
     }
     results.push(fin());
-    try { console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName} (${rec.widgetType}${rec.isRequired ? ", req" : ""}) → ${rec.status}${rec.matchTier ? " · " + rec.matchTier : ""}${rec.flag ? " · " + rec.flag : ""}${rec.after != null ? " · after=" + JSON.stringify(String(rec.after).slice(0, 60)) : ""}${rec.detail ? " · " + rec.detail : ""}`); } catch (e) { /* log only */ }
   }
 }
 
@@ -1787,6 +1813,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // gated by an interval-length-INDEPENDENT state check can shrink its interval safely, and
     // waiting BEFORE the first read charged every already-open menu a full beat. The DEADLINE
     // stays real wall-clock, so a genuinely slow widget still gets its full budget.
+    // ⚠ THE CEILING IS A PER-FIELD BUDGET, NOT PER POLL. Each poll used to get its own, so a
+    // by-name search plus its retry could spend it TWICE: live 2026-08-05 on a hidden tab,
+    // question_36707272002 took 44.6s of a 91.8s fill — one widget whose menu never renders, paying
+    // 20s + 20s + change. The widget still gets a real budget; it just cannot get it repeatedly.
+    const fieldPollT0 = Date.now();
     const pollFor = async (ms, want, ceilMs) => {   // want(texts) → done?
       const deadline = Date.now() + ms;
       // The CEILING is a loading allowance: while the widget itself reports that it is still
@@ -1795,7 +1826,10 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // "No options" at 4ms, "Loading..." at 24ms and answers at 4049ms, so NO flat budget
       // under ~4s could ever have worked, and the retry that re-typed only restarted the clock.
       // A widget that is not loading behaves exactly as it did before.
-      const hardDeadline = Date.now() + Math.max(ms, ceilMs || ms);
+      const hardDeadline = Math.min(
+        Date.now() + Math.max(ms, ceilMs || ms),
+        fieldPollT0 + ATS_POLL.fieldMaxMs,          // …and never past this field's whole allowance
+      );
       // Keep the most INFORMATIVE read, not merely the most recent. `r.options` is always an
       // array and [] is truthy, so `last` used to be overwritten by every sample INCLUDING empty
       // ones — and on a timeout we returned whatever the final sample happened to be. A widget
@@ -2012,6 +2046,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
             ? "the form's own option list was still loading when we ran out of time — answer it in the tab, or re-run"
             : "the dropdown opened but listed no options")
           : "could not open the dropdown (control not found)");
+      // Tell the AI fallback not to pay this budget again: it re-opens the widget and re-polls the
+      // SAME list from scratch, so an unreadable menu cost its ceiling TWICE (live 2026-08-05, hidden:
+      // question_36707272002 16.1s, question_36749076002 13.5s — the two together were most of a 44s
+      // fill, and both still ended needs_review either way).
+      rec.optionsUnreadable = true;
       await act.eval(atsInjCloseCombo, ref.inputSel);
       return true;
     }
@@ -2280,6 +2319,12 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     }
     // choice widgets: read live options (radio/yesno carry them on the scan; combobox opens).
     let texts = f.options || [];
+    if (rec.optionsUnreadable && !texts.length) {
+      // the deterministic pass just spent the full budget establishing there is nothing to read
+      rec.status = "needs_review";
+      rec.detail = rec.detail || "AI fallback: no live options to choose from";
+      return;
+    }
     if (wt === "select" || wt === "dial" || wt === "location" || wt === "dropdown_native") {
       if (wt !== "dropdown_native") {
         await act.eval(atsInjOpenAndReadOptions, ref.inputSel);

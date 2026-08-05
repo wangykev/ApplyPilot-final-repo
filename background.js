@@ -3836,11 +3836,22 @@ function makeAtsActuation(llmConfig) {
       const deadline = Date.now() + 15000;
       let last = null;
       while (Date.now() < deadline) {
-        last = await cdpEval(atsInjReadFileState, ref.inputSel);
+        // UNFREEZE between polls (the discovery rule, cdpWakePage → Page.setWebLifecycleState
+        // "active"). A hidden tab is not producing frames, and both of our success signals — the
+        // input vanishing, the filename rendering — are things the widget has to RE-RENDER to show.
+        // Measured on one form, same code: résumé 0.3s visible vs 7.8s hidden.
+        await cdpWakePage();
+        last = await cdpEval(atsInjReadFileState, ref.inputSel, stored.filename || "resume.pdf");
         const name = last && last.ok ? (last.fromInput || last.rendered) : null;
-        if (name) return { ok: true, name, verified: true };
+        if (name) return { ok: true, name, verified: true, detail: last.inputGone ? "the form replaced its upload control with the attachment" : null };
         await cdpDelay(250);
       }
+      // Say WHAT WE SAW on the last tick, or the next occurrence is another 15s guess: which signals
+      // were present tells you whether the upload never happened, or happened and we looked in the
+      // wrong place (the confirmation row can sit outside the input's few parent levels).
+      try {
+        console.log(`[ApplyPilot][ATS-RUN] resume confirm gave up after 15s — fromInput=${JSON.stringify((last && last.fromInput) || null)} rendered=${JSON.stringify((last && last.rendered) || null)} progress=${JSON.stringify((last && last.progress) || null)} error=${JSON.stringify((last && last.error) || null)}`);
+      } catch (e) { /* log only */ }
       const why = last && last.error ? " — the form said: " + String(last.error).slice(0, 80)
         : last && last.progress ? " — the form was still uploading" : "";
       return { ok: true, name: r.name, verified: false, detail: "attached (confirmation not read" + why + " — verify on the form)" };
@@ -4040,11 +4051,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) {}
     // …and NAME the slowest fields. "1540ms/field" cannot tell you whether the cost is spread or
     // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
+    // The résumé is ALWAYS named, whatever it cost: it is the field whose time varies most between a
+    // visible and a hidden run, so "it wasn't in the slowest list" is not the same as knowing.
+    const res = out.results.find((r) => /resume|cv/i.test(r.fieldName || "") || r.widgetType === "file_upload");
+    const resPart = res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
     const slow = out.results
       .filter((r) => (r.elapsedMs || 0) >= 1500)
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${slow ? " | slowest: " + slow : ""}`);
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
