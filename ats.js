@@ -811,6 +811,43 @@ function atsInjLeverLocCommit(name, id) {
   return { ok: true, v: el.value, selected: !!hid.value };
 }
 
+// WHY THE ATTACH LOOKED SLOW (2026-08-05): the confirmation poll read `input.files[0].name`, and these
+// ATSs CLEAR the input once their upload XHR completes — the same lesson Workday's attach learned as
+// "success is the confirmation ROW, not the input". So on Coinbase the poll ran its FULL 15s ceiling,
+// returned `verified:false`, and charged the run 15.2s for an upload the operator sees land instantly.
+// Read both: the input while it still holds the file, and the FILENAME the form renders near the field
+// once the upload is done. Error text is reported, never fatal on its own — Workday's role="alert" is a
+// STATUS channel ("… loading"), and a false "upload failed" is worse than a slow one (2026-07-29).
+function atsInjReadFileState(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  const fromInput = (el.files && el.files[0] && el.files[0].name) || null;
+  // widen a few levels: the confirmation row is a sibling of the input's immediate wrapper
+  let scope = el.parentElement;
+  for (let i = 0; i < 3 && scope && scope.parentElement; i++) scope = scope.parentElement;
+  const body = txt(scope);
+  const m = /[\w()\-.,' ]+\.(pdf|docx?|rtf|txt)/i.exec(body);
+  const rendered = m ? m[0].trim() : null;
+  const alerts = scope ? [...scope.querySelectorAll('[role="alert"],[class*="error"]')].map(txt).filter(Boolean) : [];
+  const bad = alerts.find((t) => /(error|failed|unsupported|too large|invalid|not allowed|try again)/i.test(t)) || null;
+  const progress = alerts.find((t) => /(loading|uploading|in progress|processing|\d+%)/i.test(t)) || null;
+  return { ok: true, fromInput, rendered, error: bad, progress };
+}
+
+// Greenhouse's location box is backed by google.maps places. In this browser that library never loads
+// — a HUMAN gets no suggestions either (2026-07-31) — and the fill still paid the full places budget
+// on every such form: 10.6s on Coinbase, for a service that cannot answer. Ask the page whether the
+// library is even there before waiting on it. Absent ⇒ go straight to the honest typed-unverified
+// path; present ⇒ wait exactly as before, because then the suggestions really are coming.
+function atsInjPlacesReady() {
+  try {
+    const g = window.google;
+    const has = !!(g && g.maps && g.maps.places);
+    return { ok: true, places: has };
+  } catch (e) { return { ok: true, places: false }; }
+}
+
 // Attach the resume: rebuild the File page-side (strings only across the boundary — the
 // attachResume lesson), set input.files via DataTransfer, dispatch change.
 function atsInjAttachFile(inputSel, base64, filename, mime) {
@@ -1398,12 +1435,24 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
 // commit + read-back + ALWAYS-flagged path; only the moment the call is issued changes. A prefetch
 // miss simply leaves the loop to make its own call.
 const ATS_AI_PREFETCH_CONCURRENCY = 4;
+// CHOICE questions can be prefetched too — when their options are already known WITHOUT touching the
+// page. Radio / yes-no / checkbox-group options come from the SCAN (only a combobox has to be opened
+// to be read), so their decisions need no DOM either. That is exactly the shape that dominated the
+// Lever measurement: all 7 slow calls were `cards[…]` RADIOS, and each waited for the one before it.
+// A combobox is deliberately left serial — its prompt must carry the widget's LIVE options.
+const ATS_PREFETCH_CHOICE_WIDGETS = ["radio", "yesno", "checkbox_group"];
+function atsPrefetchKind(f) {
+  if (!f) return null;
+  if (f.widgetType === "text" || f.widgetType === "textarea") return "text";
+  if (ATS_PREFETCH_CHOICE_WIDGETS.includes(f.widgetType) && (f.options || []).length) return "choice";
+  return null;
+}
 async function atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex) {
   const out = new Map();
   if (!act || !act.aiEnabled || !Array.isArray(fields)) return out;
   const eligible = fields.filter((f) => {
     if (!f || !f.isRequired) return false;
-    if (f.widgetType !== "text" && f.widgetType !== "textarea") return false;
+    if (!atsPrefetchKind(f)) return false;
     if (f.value != null && String(f.value).trim() !== "") return false; // already answered on the form
     let route = null;
     try { route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex); } catch (e) { return false; }
@@ -1413,13 +1462,19 @@ async function atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucket
     return !hasValue;
   });
   if (!eligible.length) return out;
-  try { console.log(`[ApplyPilot][ATS-FILL] prefetching ${eligible.length} AI free-text answer(s) concurrently (${ATS_AI_PREFETCH_CONCURRENCY} at a time)`); } catch (e) { /* log only */ }
+  const kinds = eligible.reduce((m, f) => { const k = atsPrefetchKind(f); m[k] = (m[k] || 0) + 1; return m; }, {});
+  try { console.log(`[ApplyPilot][ATS-FILL] prefetching ${eligible.length} AI answer(s) concurrently (${ATS_AI_PREFETCH_CONCURRENCY} at a time) — ${kinds.text || 0} text, ${kinds.choice || 0} choice`); } catch (e) { /* log only */ }
   let i = 0;
   const worker = async () => {
     for (;;) {
       const f = eligible[i++];
       if (!f) return;
-      try { const ai = await atsAiWriteText(act, f, profile, jc); if (ai) out.set(f.fieldName, ai); } catch (e) { /* the loop falls back to its own call */ }
+      try {
+        const ai = atsPrefetchKind(f) === "choice"
+          ? await atsAiChooseOption(act, f, f.options || [], profile, jc)
+          : await atsAiWriteText(act, f, profile, jc);
+        if (ai) out.set(f.fieldName, ai);
+      } catch (e) { /* the loop falls back to its own call */ }
     }
   };
   await Promise.all(Array.from({ length: Math.min(ATS_AI_PREFETCH_CONCURRENCY, eligible.length) }, worker));
@@ -1863,8 +1918,15 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const preOpts = optsOf(read);
     const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
     if (wt === "location" && !locIsPickOne) {
+      // A places widget with no places library will never answer — do not spend the budget proving it
+      // (Greenhouse `candidate-location`: 10.6s on Coinbase, and a human sees "Loading…" forever).
+      let placesReady = true;
+      if (ats === "greenhouse") {
+        try { const pr = await act.eval(atsInjPlacesReady); placesReady = !pr || pr.places !== false; } catch (e) { placesReady = true; }
+      }
       await typeInto(String(candidates[0]).split(",")[0]);
-      read = await pollFor(6000, (t) => t.length > 0); // places lookup — real network time
+      read = placesReady ? await pollFor(6000, (t) => t.length > 0) : null; // places lookup — real network time
+      if (!placesReady) { try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName}: this form's places library never loaded — not waiting on suggestions`); } catch (e) {} }
     } else if (!hasHit(optsOf(read))) {
       // SEARCH BY NAME: types each candidate (most-specific first) and polls FOR THE HIT.
       // ONE search attempt (the most-specific candidate). Two attempts doubled the worst-case
@@ -2261,7 +2323,11 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       rec.detail = why + " — chose this form's own " + JSON.stringify(dec) + " so it cannot block the submit; change it here if you would rather answer" + (ok ? "" : " (commit failed)");
       return ok;
     };
-    const ai = await atsAiChooseOption(act, f, texts, profile, jobContext);
+    // a prefetched decision (atsPrefetchAiText) was made against the SAME options the scan reported,
+    // so it is only reused when the live read agrees with that list — otherwise ask again, because the
+    // AI must always choose from what the form is actually showing.
+    const preUsable = prefetched && Array.isArray(f.options) && f.options.length === texts.length;
+    const ai = preUsable ? prefetched : await atsAiChooseOption(act, f, texts, profile, jobContext);
     if (!ai.ok) { await declineFallback("no grounded answer for this REQUIRED question (" + ai.error + ")"); return; }
     const m = atsLib.matchCandidates([ai.choice], texts, { containment: true });
     if (!m || m.targetIndex < 0) {
@@ -2311,6 +2377,6 @@ if (typeof module !== "undefined" && module.exports) {
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
-    atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
+    atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };
 }

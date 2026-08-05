@@ -3828,14 +3828,22 @@ function makeAtsActuation(llmConfig) {
       if (!r || !r.ok) return { ok: false, error: (r && r.error) || "attach failed" };
       // async-upload confirmation (GH uploads on change): poll for the filename to render
       // ANYWHERE near the input OR input.files to still hold it — bounded, wall-clock.
+      // Poll for EITHER signal (see atsInjReadFileState): the input while it still holds the file, or
+      // the filename the form renders once its upload finishes. Reading only the input meant the loop
+      // could not succeed at all on an ATS that clears it, so it always ran the full ceiling — 15.2s
+      // on Coinbase for an upload that lands instantly by hand. 250ms, because a confirmation that
+      // arrives in 400ms should not be charged 700.
       const deadline = Date.now() + 15000;
       let last = null;
       while (Date.now() < deadline) {
-        last = await cdpEval(atsInjReadValue, ref.ats || "greenhouse", ref.inputSel, "file_upload");
-        if (last && last.ok && last.value) return { ok: true, name: last.value, verified: true };
-        await cdpDelay(700);
+        last = await cdpEval(atsInjReadFileState, ref.inputSel);
+        const name = last && last.ok ? (last.fromInput || last.rendered) : null;
+        if (name) return { ok: true, name, verified: true };
+        await cdpDelay(250);
       }
-      return { ok: true, name: r.name, verified: false, detail: "attached (confirmation not read — verify on the form)" };
+      const why = last && last.error ? " — the form said: " + String(last.error).slice(0, 80)
+        : last && last.progress ? " — the form was still uploading" : "";
+      return { ok: true, name: r.name, verified: false, detail: "attached (confirmation not read" + why + " — verify on the form)" };
     },
   };
 }

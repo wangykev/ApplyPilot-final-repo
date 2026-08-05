@@ -1089,6 +1089,100 @@ test("AI free-text: the calls run CONCURRENTLY, and each answer still lands on i
   assert.strictEqual(new Set(Object.keys(values)).size, 6, "each field written once, to its own selector");
 });
 
+test("AI choice: scan-known options are decided CONCURRENTLY, each pick still cleared vs live options", async () => {
+  // The Lever measurement's 7 slow calls were all `cards[…]` RADIOS, whose options come from the scan
+  // — so no DOM is needed to decide them, and they no longer queue behind each other.
+  const CALL_MS = 120;
+  let inFlight = 0, peak = 0, checked = {};
+  const fields = Array.from({ length: 6 }, (_, i) => ({
+    fieldName: "cards[u" + i + "][field0]", inputSel: 'input[name="cards[u' + i + '][field0]"]',
+    widgetType: "radio", label: "Custom screening question " + i, isRequired: true, value: null, domIndex: i,
+    options: ["A United States Citizen", "A Permanent Resident", "Neither"],
+  }));
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, CALL_MS));
+      inFlight--;
+      return { ok: true, text: JSON.stringify({ choice: "A United States Citizen", justification: "profile", confidence: "High" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+  });
+  const t0 = Date.now();
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const elapsed = Date.now() - t0;
+
+  assert.ok(peak > 1, "radio decisions must overlap — peak concurrency was " + peak);
+  assert.ok(elapsed < 6 * CALL_MS, `serial would cost >= ${6 * CALL_MS}ms; took ${elapsed}ms`);
+  for (const r of out.results) {
+    assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+    assert.strictEqual(r.after, "A United States Citizen");
+    assert.ok(/ai-/.test(String(r.flag)), "an AI answer is ALWAYS flagged, got " + r.flag);
+  }
+  assert.strictEqual(Object.keys(checked).length, 6, "each field committed to its own group");
+});
+
+test("AI choice prefetch: a decision is DISCARDED when the live options differ from the scan's", async () => {
+  // The prompt must always reflect what the form is showing. If the live list has changed since the
+  // scan (a cascade, a re-render), the prefetched pick is thrown away and the question re-asked.
+  let calls = 0;
+  const fields = [{
+    fieldName: "q1", inputSel: "#q1", widgetType: "select", label: "Pick one", isRequired: true,
+    value: null, domIndex: 0, options: ["Stale A", "Stale B"],
+  }];
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => { calls++; return { ok: true, text: JSON.stringify({ choice: "Live One", justification: "j", confidence: "High" }) }; },
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "Live One" }, { text: "Live Two" }, { text: "Live Three" }] }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: "Live One" }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].after, "Live One");
+  assert.ok(calls >= 1, "the question is asked against the LIVE list");
+});
+
+test("location: no places library ⇒ no places wait, and the answer is still surfaced honestly", async () => {
+  // Greenhouse's candidate-location cost 10.6s on Coinbase waiting for google.maps.places, which never
+  // loads in this browser — a human gets no suggestions either. Absence is now detected, not timed out.
+  let polls = 0, probed = false;
+  const mk = (placesPresent) => fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjPlacesReady: () => { probed = true; return { ok: true, places: placesPresent }; },
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => { polls++; return { ok: true, open: true, options: [] }; },
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "Tallahassee" }),
+    atsInjCloseCombo: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: "Tallahassee, Florida" }),
+  });
+
+  const t0 = Date.now();
+  const out = await ats.driveAtsPageFill(mk(false), "greenhouse", PROFILE, {}, {}, {});
+  const withoutPlaces = Date.now() - t0;
+  assert.ok(probed, "the page must be asked whether the library is there");
+  // the field still reaches review with the profile's own value in the box — never silently blank
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.match(String(out.results[0].detail), /places/i);
+
+  polls = 0;
+  const t1 = Date.now();
+  await ats.driveAtsPageFill(mk(true), "greenhouse", PROFILE, {}, {}, {});
+  const withPlaces = Date.now() - t1;
+  assert.ok(withPlaces > withoutPlaces, `a REAL places widget still gets its budget (with ${withPlaces}ms vs without ${withoutPlaces}ms)`);
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
