@@ -275,7 +275,23 @@ function atsRouteLabel(label, f, profile, defaults) {
   // routes the driver to the type-then-scoped-read combobox flow.
   if (/where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i.test(L)) {
     const v = atsComposeValue("city_state", profile);
-    if (v) return { kind: "location", value: v, source: "map", path: "(city+state)" };
+    // TIERED, most specific first — because "where are you based?" is NOT always a places
+    // autocomplete. GitLab renders it as a three-option pick-one ("1. United States of America" /
+    // "2. Canada" / "3. Located Elsewhere"), where a city+state string can never match and the
+    // COUNTRY is the answer (live 2026-08-05: a REQUIRED field left empty while the profile held
+    // the exact country). The city is still tried first, so a real places widget is unaffected.
+    // country may itself be a TIERED LIST (the profile stores ladders as arrays, e.g.
+    // ["United States of America", "United States"]) — flatten it into candidates rather than
+    // handing an array to the match ladder, which normalizes strings and throws on anything else
+    // (live 2026-08-05: `s.toLowerCase is not a function` killed the field mid-fill).
+    const rawCountry = profile && profile.personal_info ? profile.personal_info.country : null;
+    const country = (Array.isArray(rawCountry) ? rawCountry : [rawCountry])
+      .filter((x) => typeof x === "string" && x.trim());
+    // `candidates` (not `value`) is how this router hands over a TIERED list — a bare array in
+    // `value` gets String()'d into one comma-joined string. `value` stays the city, which is what
+    // a real places box should be typed with.
+    const cands = [v].concat(country).filter(Boolean);
+    if (cands.length) return { kind: "location", value: cands[0], candidates: cands, source: "map", path: "(city+state)" };
   }
 
   // Compensation + availability (STATED only — an empty profile value falls through to AI/blank).
@@ -878,7 +894,13 @@ function atsNearOptions(texts, query, limit) {
 // sized from the live measurement that earned this: Discord's school list answered at 4049ms on
 // a hidden tab, so the old flat 2000ms could not have worked no matter how it retried.
 const ATS_POLL = {
-  open: 1800, openCeil: 6000,       // the first page (itself a network fetch on a big list)
+  // The first render after opening. The soft deadline only applies once the menu has actually
+  // SETTLED (see pollFor): an empty read while the menu node isn't even mounted is not an answer,
+  // any more than a half-mounted Workday page is. This matters beyond speed — an empty first read
+  // is what decides whether a location-routed field is a places box or a pick-one (live
+  // 2026-08-05: a REQUIRED 3-option question was read as empty at 1.8s, treated as a places
+  // lookup, and left unanswered while its own widget was about to show the answer).
+  open: 1800, openCeil: 6000,
   retry: 1500, retryCeil: 4000,     // after a forced re-open
   // A typed by-name query. The ceiling is paid ONLY while the widget still reports loading, so
   // it is not a flat cost — and it has to be generous because the list behind it is a slow,
@@ -890,7 +912,11 @@ const ATS_POLL = {
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
+  mountGrace: 1200,                 // extra wait for a menu that has NEVER mounted (see pollFor)
 };
+// A location question whose widget already shows this few options is a pick-one, not a places
+// autocomplete (see the location branch in atsActuateField).
+const ATS_LOC_PICKONE_MAX = 12;
 const ATS_OPTION_CAP = 60;
 // `partial` FORCES the partial treatment for a list we have already narrowed. Live 2026-08-04: a
 // 100-option page read was narrowed to its 20 near-matches, which then looked like a COMPLETE
@@ -953,6 +979,16 @@ async function atsReadBackSettled(act, ats, inputSel, widgetType, ms) {
 }
 
 function atsDialStrip(optText) { return String(optText || "").replace(/\s*\+\d[\d\s-]*$/, "").trim(); }
+
+// A NUMBERED option ("1. United States of America") carries display scaffolding, not a different
+// answer — and the numbering defeats every tier we have: exact fails, containment is deliberately
+// OFF for dropdowns (picking a substring match is a guess), and fuzzy lands at 88.9% against the
+// 90 bar. Live 2026-08-05, GitLab "Where are you currently based?*": the profile holds exactly
+// "United States of America" and the REQUIRED field was left empty. Stripped for MATCHING only —
+// the commit still clicks the option's real text, so the form gets what it rendered. Narrow on
+// purpose: 1–2 digits then a dot or paren then whitespace, so "1 - 3 years" and "401(k)" are
+// untouched (neither has the separator+space shape).
+function atsEnumStrip(optText) { return String(optText || "").replace(/^\s*\d{1,2}\s*[.)]\s+/, "").trim(); }
 
 // A dial composite's options read "<Country> +<code>", but the profile stores the phone country
 // as a LONG-FORM name with the code in parentheses — "United States of America (+1)". Stripping
@@ -1578,8 +1614,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     //     the stale A-list)
     //   • absence is only believable AFTER asking for the value BY NAME
     const optsOf = (r) => ((r && r.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+    // Option text as the MATCH LADDER should see it: dial codes and list numbering are both
+    // rendering artifacts (see atsDialStrip / atsEnumStrip). The commit always uses the raw text.
+    const forMatch = (arr) => (wt === "dial" ? arr.map(atsDialStrip) : arr.map(atsEnumStrip));
     const hasHit = (texts) => {
-      const mt = wt === "dial" ? texts.map(atsDialStrip) : texts;
+      const mt = forMatch(texts);
       const m0 = atsLib.matchCandidates(candidates, mt, { containment: allowContainment });
       return !!(m0 && m0.targetIndex >= 0);
     };
@@ -1622,7 +1661,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
       // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
       const startedAt = Date.now();
-      let last = null, lastSeen = null, sawLoading = false, ticks = 0;
+      let last = null, lastSeen = null, sawLoading = false, ticks = 0, sawEmptyMounted = false, sawMounted = false; let stopReason = "none";
       for (;;) {
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
         ticks++;
@@ -1631,14 +1670,40 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         if (r && want(optsOf(r))) { r.waitedMs = Date.now() - startedAt; r.ticks = ticks; return r; }
         const now = Date.now();
         const loading = !!(r && r.loading);
-        if (now >= hardDeadline || (now >= deadline && !loading)) {
+        // SETTLE, don't count clock. Two page states mean "not yet", not "nothing":
+        //   • the widget says it is LOADING (a server-backed list — see atsInjReadOptions)
+        //   • the menu node is not mounted at all, or it is mounted and reads empty for the FIRST
+        //     time — a react-select paints its list a beat after the open click, and treating that
+        //     beat as "no options" is what mis-routed a required field (2026-08-05). An empty read
+        //     is only believed once the SAME empty read repeats with the menu present.
+        const emptyNow = !!(r && Array.isArray(r.options) && !r.options.length);
+        const settledEmpty = emptyNow && !!(r && r.open) && sawEmptyMounted;
+        if (emptyNow && r && r.open) { sawEmptyMounted = true; sawMounted = true; }
+        else if (r && r.open) sawMounted = true;
+        // Not every kind of "nothing yet" is progress, and the difference is worth ms:
+        //   • LOADING — the widget says a fetch is in flight → the full ceiling is justified.
+        //   • MOUNTED but empty — one repeat read confirms it, then believe it.
+        //   • NEVER MOUNTED — we may not even be looking at the right widget (live 2026-08-05:
+        //     the replay reads Greenhouse's phone-dial composite as a plain select, whose menu
+        //     never appears, and a full-ceiling wait burned 20s to reach the same honest skip).
+        //     A brief grace, then stop: an absent menu is not evidence of anything to come.
+        let why = "soft";
+        const stop = (() => {
+          if (now < deadline) return false;
+          if (loading) { why = "loading-ceiling"; return now >= hardDeadline; }
+          if (emptyNow && r && r.open) { why = "empty-mounted"; return settledEmpty || now >= hardDeadline; }
+          if (emptyNow && !sawMounted) { why = "never-mounted"; return now >= Math.min(deadline + ATS_POLL.mountGrace, hardDeadline); }
+          return true;
+        })();
+        if (stop) {
+          stopReason = why;
           const out = last || lastSeen;
           // Carry WHY we stopped, so a field that reaches review can name the real cause: a list
           // that never finished loading is a different report from one that answered "nothing" —
           // and so the recovery below knows whether a search was ever in flight to protect.
           // waitedMs/ticks make the next occurrence self-diagnosing instead of a guess about
           // whether the budget or the poll pressure was the problem.
-          if (out) { out.stillLoading = loading; out.sawLoading = sawLoading; out.waitedMs = now - startedAt; out.ticks = ticks; }
+          if (out) { out.stillLoading = loading; out.sawLoading = sawLoading; out.waitedMs = now - startedAt; out.ticks = ticks; out.stopReason = stopReason; }
           return out;
         }
         // BACK OFF WHILE IT IS FETCHING. Every tick is a Runtime.evaluate round trip, and this
@@ -1671,7 +1736,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
       read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
     }
-    if (wt === "location") {
+    // THE LIVE WIDGET WINS OVER THE LABEL'S GUESS (the Workday widget-adaptive rule, earned again
+    // 2026-08-05). "Where are you currently based?" reads like a places question, but GitLab
+    // answers it with a THREE-option pick-one already rendered on open. Typing a city there waits
+    // out a suggestion service that will never respond and reports "places never loaded" on a
+    // field that was answerable all along. A short list that is already showing IS the option set.
+    const preOpts = optsOf(read);
+    const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
+    if (wt === "location" && !locIsPickOne) {
       await typeInto(String(candidates[0]).split(",")[0]);
       read = await pollFor(6000, (t) => t.length > 0); // places lookup — real network time
     } else if (!hasHit(optsOf(read))) {
@@ -1722,7 +1794,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         }
         const seen = optsOf(found);
         if (found && found.stillLoading) listPending = true;
-        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)} waited=${(found && found.waitedMs) || 0}ms/${(found && found.ticks) || 0} reads; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
+        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)} waited=${(found && found.waitedMs) || 0}ms/${(found && found.ticks) || 0} reads stop=${(found && found.stopReason) || "?"}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
         if (seen.length) nearMatches = seen;
         if (seen.length && hasHit(seen)) { read = found; break; }
       }
@@ -1763,11 +1835,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       return true;
     }
     const texts = options.filter((o) => !o.disabled).map((o) => o.text);
-    const matchTexts = wt === "dial" ? texts.map(atsDialStrip) : texts;
+    const matchTexts = forMatch(texts);
     let hit = null;
-    if (wt === "location") {
+    if (wt === "location" && !locIsPickOne) {
       // a places list: accept the first suggestion CONTAINING the city (they're all real
       // places for the typed query; flag anything that isn't an exact city+state read).
+      // A pick-one location widget skips this and goes through the ordinary match ladder, so its
+      // options are matched as options — not scanned for a city that was never going to be there.
       const city = String(candidates[0]).split(",")[0].trim().toLowerCase();
       const idx = texts.findIndex((t) => t.toLowerCase().includes(city));
       if (idx >= 0) hit = { index: idx, tier: texts[idx].toLowerCase().startsWith(city) ? "exact-normalized" : "containment" };
@@ -2098,7 +2172,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,

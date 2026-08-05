@@ -724,6 +724,162 @@ test("driver: a PAGED list never claims the profile answer is absent", async () 
   assert.match(out2.results[0].detail, /isn't one of this form's options/);
 });
 
+// ── a NUMBERED option list must not defeat an exact profile answer (live 2026-08-05) ──────
+test("atsEnumStrip: list numbering is display scaffolding, not part of the answer", () => {
+  assert.strictEqual(ats.atsEnumStrip("1. United States of America"), "United States of America");
+  assert.strictEqual(ats.atsEnumStrip("2) Canada"), "Canada");
+  assert.strictEqual(ats.atsEnumStrip("10. Located Elsewhere"), "Located Elsewhere");
+  // …and values that merely START with digits keep every character
+  assert.strictEqual(ats.atsEnumStrip("1 - 3 years"), "1 - 3 years");
+  assert.strictEqual(ats.atsEnumStrip("401(k) eligible"), "401(k) eligible");
+  assert.strictEqual(ats.atsEnumStrip("2026 graduate"), "2026 graduate");
+  assert.strictEqual(ats.atsEnumStrip(""), "");
+});
+
+test("driver: a numbered dropdown fills from the exact profile value, committing the REAL text", async () => {
+  // GitLab's "Where are you currently based?*" renders "1. United States of America" while the
+  // profile holds "United States of America": exact missed, containment is off for dropdowns by
+  // design, and fuzzy scored 88.9% against the 90 bar — so a REQUIRED field the profile answers
+  // perfectly was left empty for the operator.
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada", "3. Located Elsewhere"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Where are you currently based?"], profile_path: "personal_info.country" }];
+  const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: "United States of America" } };
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, { buckets });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "an exact profile answer must not be lost to list numbering: " + r.detail);
+  assert.strictEqual(r.matchTier, "exact-normalized");
+  assert.strictEqual(committed, "1. United States of America", "the click uses the option's REAL text");
+  assert.strictEqual(r.after, "1. United States of America");
+});
+
+test("driver: an unmounted menu is not an empty menu — the open poll SETTLES", async () => {
+  // A react-select paints its list a beat after the open click. Believing that beat ("0 options")
+  // is what read a required 3-option question as empty and mis-routed it (2026-08-05). The soft
+  // deadline is deliberately 1ms here: only a settle — not a bigger number — can pass this.
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 1, openCeil: 2000, retry: 1, retryCeil: 20, search: 1, searchCeil: 20, restore: 1, restoreCeil: 20, showing: 1, showingCeil: 200 });
+  try {
+    // Faithful widget: a click TOGGLES the menu (the documented rule), and after opening it needs
+    // a couple of reads before its list paints. So giving up on the first empty read and then
+    // force-clicking just shuts it again — the failure loop seen live.
+    let isOpen = false, openedAt = 0, committed = null; const opens = [];
+    const MOUNT_MS = 60;   // the menu paints 60ms after the click — a TIME, like the real widget
+    const act = fakeAct({
+      atsInjScan: () => ({
+        ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+        fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+      }),
+      atsInjOpenAndReadOptions: (sel, force) => { opens.push(!!force); isOpen = !isOpen; openedAt = Date.now(); return { ok: true, opened: isOpen }; },
+      atsInjReadOptions: () => {
+        if (!isOpen || Date.now() - openedAt < MOUNT_MS) return { ok: true, open: false, options: [] };  // mounting
+        return { ok: true, open: true, options: ["1. United States of America", "2. Canada"].map((t) => ({ text: t })) };
+      },
+      atsInjTypeInCombo: () => ({ ok: true }),
+      atsInjReadComboInput: () => ({ ok: true, value: "" }),
+      atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+      atsInjReadValue: () => ({ ok: true, value: committed }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: "United States of America" } };
+    const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {});
+    assert.strictEqual(out.results[0].status, "filled", "the poll must wait for the menu to mount: " + out.results[0].detail);
+    assert.strictEqual(committed, "1. United States of America");
+    // The load-bearing assertion, and the one that is independent of any clock: waiting for the
+    // menu to mount means the forced-toggle recovery never has to run. A clock-only poll gives up
+    // on the mounting beat and then force-clicks — which SHUTS the menu it was waiting for.
+    assert.deepStrictEqual(opens, [false], "one plain open, no forced toggles");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test('driver: "where are you based?" answered by a 3-option pick-one, not a places lookup', async () => {
+  // Live 2026-08-05, GitLab: the label reads like a places question, so the fill typed a city and
+  // waited out a suggestion service that never answers — reporting "places never loaded" on a
+  // REQUIRED field whose own widget was already showing the answer.
+  let committed = null; const typed = [];
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "location", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada", "3. Located Elsewhere"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed.push(t); return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: "United States of America" } };
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {});
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "the widget's own list answers it: " + r.detail);
+  assert.strictEqual(committed, "1. United States of America");
+  assert.deepStrictEqual(typed, [], "no city was typed at a widget that is not a places box");
+
+  // …and a REAL places widget (no options until you type) still types and waits.
+  let asked = null;
+  const act2 = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: asked ? [{ text: "Tallahassee, FL, USA" }] : [] }),
+    atsInjTypeInCombo: (sel, t) => { if (t) asked = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: asked || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out2 = await ats.driveAtsPageFill(act2, "greenhouse", profile, {}, {}, {});
+  assert.strictEqual(asked, "Tallahassee", "a places box is still asked by city");
+  assert.strictEqual(out2.results[0].status, "filled");
+});
+
+test("router: a location question survives a TIERED country list (no crash, every tier tried)", async () => {
+  // The profile stores ladders as arrays, and personal_info.country is one of them. Handing the
+  // array to the match ladder threw `s.toLowerCase is not a function` and killed the field
+  // mid-fill (live 2026-08-05). Every tier must arrive as its own candidate.
+  const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: ["Afghanistan", "United States of America"] } };
+  const r = ats.atsRouteLabel("Where are you currently based?", {}, profile, {});
+  assert.ok(Array.isArray(r.candidates), "tiered candidates, not one joined string");
+  assert.ok(r.candidates.every((c) => typeof c === "string"), "no nested arrays reach the ladder");
+  assert.ok(r.candidates.includes("United States of America"));
+  assert.strictEqual(typeof r.value, "string");
+
+  // and end to end: the later tier is the one that matches the form's numbered option
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {});
+  assert.strictEqual(out.results[0].status, "filled", out.results[0].detail);
+  assert.strictEqual(committed, "1. United States of America");
+});
+
 // ── the RÉSUMÉ goes in the résumé slot, and nowhere else (live 2026-08-04) ─────────────────
 test("replay: the résumé is attached ONLY to the résumé field, never the cover letter", async () => {
   // Greenhouse renders the cover letter as a file dropzone too. The replay used to treat every
