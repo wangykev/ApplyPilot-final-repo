@@ -3915,6 +3915,10 @@ function makeCdpActuation(llmConfig) {
     pressEnter: () => cdpKeyTap(CDP_KEYS.enter),
     pressEscape: () => cdpKeyTap(CDP_KEYS.escape),
     pressSpace: () => cdpKeyTap(CDP_KEYS.space),
+    // Segment-scoped clear for the DATE composite. Ctrl+A is forbidden there (it spans the whole
+    // composite and resets focus to Month), so Backspace on a triple-click-SELECTED segment is the
+    // only way to empty one — which is what makes a genuine empty→value transition possible.
+    pressBackspace: () => cdpKeyTap(CDP_KEYS.backspace),
     // The ONLY clean non-committing typeahead/source exit (recon 2026-06-26): Enter commits the armed
     // row; Escape hides the popup but KEEPS focus + the armed row → the next field's focus blur-commits
     // the stray; Tab blurs and ABANDONS the armed row without committing. cdpKeyTap is counter-gated so

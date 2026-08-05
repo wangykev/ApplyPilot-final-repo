@@ -5505,6 +5505,8 @@ function makeFakeDateAct(segs, opts) {
       return { value: segs[seg].value, focused: focused === seg };
     },
     clearText: async () => { log.push(["clearText", focused]); if (focused && segs[focused]) segs[focused].value = ""; },
+    // Segment-scoped clear (the triple-click selection): empties ONLY the focused segment.
+    pressBackspace: async () => { log.push(["pressBackspace", focused]); if (focused && segs[focused]) segs[focused].value = ""; },
     typeDigits: async (text) => {
       log.push(["typeDigits", focused, text]);
       if (!focused) return;
@@ -5520,10 +5522,54 @@ function makeFakeDateAct(segs, opts) {
   };
 }
 const seg0 = () => ({ value: "" });
-const runDate = (segs, parsed, opts) => {
+const runDate = (segs, parsed, opts, budgetOverrides) => {
   const act = makeFakeDateAct(segs, opts);
-  return fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, parsed, T_BUDGETS).then((rec) => ({ rec, act }));
+  return fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, parsed,
+    budgetOverrides ? { ...T_BUDGETS, ...budgetOverrides } : T_BUDGETS).then((rec) => ({ rec, act }));
 };
+
+// ── forceSegmentTransition (2026-08-05) ─────────────────────────────────────
+// Live on waystar's Self Identify page during a REPLAY: Workday reported "The field Date is required
+// and must have a value" on a composite whose DOM, React props AND React fiber all held 8/5/2026 with
+// ariaInvalid null. The phantom-required remedy re-typed the same digits over the triple-click
+// selection — a byte-identical write, so no value transition ever reached Workday's model, and the
+// page stayed blocked. These pin that the flag produces a real empty→value transition, and that an
+// ordinary fill is completely unaffected by its existence.
+test("date composite: forceSegmentTransition EMPTIES each segment before re-typing the SAME value", async () => {
+  const segs = { Month: { value: "8" }, Day: { value: "5" }, Year: { value: "2026" } };
+  const { rec, act } = await runDate(segs, { month: "8", day: "5", year: "2026" }, undefined,
+    { forceSegmentTransition: true });
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.after, "8/5/2026", "ends on the same value it started with");
+  // The point is the TRANSITION, so assert the ordering per segment: focus → backspace → type.
+  const seq = act.log.filter(([m]) => /focusDateSegment|pressBackspace|typeDigits/.test(m));
+  for (const seg of ["Month", "Day", "Year"]) {
+    const f = seq.findIndex(([m, s]) => m === "focusDateSegment" && s === seg);
+    const b = seq.findIndex(([m, s]) => m === "pressBackspace" && s === seg);
+    const t = seq.findIndex(([m, s]) => m === "typeDigits" && s === seg);
+    assert.ok(f >= 0 && b > f && t > b,
+      `${seg}: expected focus→backspace→type, got ${JSON.stringify(seq.map((x) => x.slice(0, 2)))}`);
+  }
+});
+
+test("date composite: WITHOUT the flag no Backspace is ever sent (ordinary fills unchanged)", async () => {
+  const segs = { Month: { value: "8" }, Day: { value: "5" }, Year: { value: "2026" } };
+  const { rec, act } = await runDate(segs, { month: "8", day: "5", year: "2026" });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(act.log.filter(([m]) => m === "pressBackspace").length, 0,
+    "the ordinary date path must not gain a keystroke: " + JSON.stringify(act.log.map((x) => x[0])));
+});
+
+test("date composite: forceSegmentTransition still fills when the substrate has no pressBackspace", async () => {
+  // Older/other substrates: the flag must degrade to today's behaviour, never throw.
+  const segs = { Month: seg0(), Year: seg0() };
+  const act = makeFakeDateAct(segs);
+  delete act.pressBackspace;
+  const rec = await fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, { month: "12", year: "2024" },
+    { ...T_BUDGETS, forceSegmentTransition: true });
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.after, "12/2024");
+});
 
 test("date composite: M/Y fills + verifies each segment", async () => {
   const segs = { Month: seg0(), Year: seg0() };

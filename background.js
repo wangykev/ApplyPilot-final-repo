@@ -4503,6 +4503,11 @@ async function replayAttachResume(LOG) {
 // tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
 const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
 const MAX_RELOAD_RETRIES = 2; // reload-retry cap per RUN (a reload returns Workday to page 1, so a transient render-flake RESTARTS the whole walk) — ≤2 restarts, then halts honestly.
+// Phantom-required RE-ENTRIES per replay run. Workday's form model has lost an answer its own DOM still
+// shows, and re-entering the form is the only thing that rebuilds it (operator-verified). 2 is enough: the
+// first re-entry is the fix, a second covers one flake, and a third would mean the answer never latched —
+// which is a real problem for a human, not something to keep reloading at.
+const MAX_REPLAY_PHANTOM_RELOADS = 2;
 const MAX_REPLAY_SOFT_RELOADS = 3; // Workday soft-error reloads per REPLAY run — mirrors the fill walk's MAX_SOFT_RELOADS (a soft error is transient; 3 strikes ⇒ hand it to the operator).
 
 // Reload the attached tab (Page.reload) and wait for it to be INTERACTIVE again — the transient-failure
@@ -4579,7 +4584,12 @@ async function nudgePhantomRequired(act, errorTexts, LOG) {
           } else if (m.widgetType === "date") {
             // read the segments rather than parsing the rendered string, whose order is tenant-variable
             const segs = await cdpEval(cdpReadDateSegValues, m.wrapperSel);
-            if (segs) res = await fillDateCompositeCdp(act, loc, segs, DEFAULT_BUDGETS);
+            // forceSegmentTransition: EMPTY each segment before re-typing it. Without this the re-type
+            // is a byte-identical write over a triple-click selection — no value transition at all —
+            // which is why this remedy failed live on a field whose DOM *and* React state already held
+            // the value Workday was calling empty. fillTextCdp already clears (Ctrl+A) and so already
+            // transitions; the date path is forbidden Ctrl+A, so it needs this explicitly.
+            if (segs) res = await fillDateCompositeCdp(act, loc, segs, Object.assign({}, DEFAULT_BUDGETS, { forceSegmentTransition: true, skipIfCorrect: false }));
           }
         } catch (e) { res = { status: "error", detail: String((e && e.message) || e) }; }
         retyped.push(`${m.fieldName}=${res ? res.status : "unsupported(" + m.widgetType + ")"}`);
@@ -4734,6 +4744,8 @@ async function runCdpReplayWalk(tabId, opts) {
     let phantomDeleted = [];
     let dupFixes = 0; // per-RUN budget — a duplicate error that survives the fix is a real problem, not a retry loop
     let phantomNudges = 0; // per-RUN budget for the blur-race fix (nudgePhantomRequired) — same reasoning: if a focus→blur commit doesn't clear it, it isn't the blur race
+    let phantomReloads = 0; // per-RUN budget for the RE-ENTRY remedy below (kept separate from softReloads so a phantom can't eat the soft-error budget or vice versa)
+    let sawPhantom = false; // did a phantom-required block actually happen (evidence-gated: every error-named field is ON the page AND holds a value)?
     let forcedRefills = 0; // per-RUN budget for the mechanism-agnostic force-re-actuate remedy (skip-if-correct OFF) — if re-WRITING the approved value doesn't clear it, re-writing it again won't either
 
     let findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
@@ -5257,6 +5269,7 @@ async function runCdpReplayWalk(tabId, opts) {
           const nudge = await nudgePhantomRequired(act, samples, LOG);
           if (nudge.ran) {
             phantomNudges++;
+            sawPhantom = true; // its evidence gate IS the phantom signature: named + present + holds a value
             const sig3 = cdpPageSig(await cdpEval(cdpPageScan));
             await cdpWakePage();
             const click3 = await act.clickPageNext();
@@ -5271,6 +5284,30 @@ async function runCdpReplayWalk(tabId, opts) {
           } else {
             LOG(`  (phantom-required check: not applicable — ${nudge.reason})`);
           }
+        }
+        // ── RE-ENTER THE PAGE — the operator-verified phantom remedy (2026-08-05) ─────────────────────
+        // Every in-page fix above tries to make Workday notice a value that is ALREADY there, and the live
+        // trace says that is unwinnable: on waystar's Self Identify page the DOM, React props AND React
+        // fiber all held 8/5/2026 with ariaInvalid null while Workday insisted "The field Date is
+        // required". Its form model — not the DOM, and not React — is what has lost the answer, and
+        // nothing we type into the page reaches that model.
+        //
+        // What DOES work, per the operator: leave the page and come back (a full refresh, or back-a-page
+        // and forward), then re-fill. Re-entry rebuilds Workday's model from what it actually saved, and
+        // the answers that latched on the first Save & Continue are still there — so this is not a re-fill
+        // from scratch: `skipIfCorrect` leaves every already-correct value untouched and only the fields
+        // that did NOT latch get re-written. That is exactly the machinery `restartWalk` already provides
+        // for soft errors, so the phantom case just needs to USE it.
+        //
+        // Evidence-gated on `sawPhantom` (error-named fields present AND holding values), so a genuinely
+        // empty required field still falls through to the cascade/review path below instead of spending a
+        // reload. Own budget, because a reload returns to page 1: cheap on the way back, but not free.
+        if (sawPhantom && phantomReloads < MAX_REPLAY_PHANTOM_RELOADS) {
+          phantomReloads++;
+          LOG(`⚠ page ${page}: Workday's model still calls [${samples.map((t) => parseErrorFieldName(t)).filter(Boolean).join(", ")}] empty on a page that HOLDS them — no in-page write can reach a model that lost the answer. RE-ENTERING the form (reload ${phantomReloads}/${MAX_REPLAY_PHANTOM_RELOADS}) and replaying from page 1; skip-if-correct means only the field(s) that did not latch get re-written.`);
+          const ready = await reloadAndSettle(LOG);
+          if (ready) { sawPhantom = false; continue restartWalk; }
+          LOG(`  (re-entry did not settle into a form — falling through to the halt below.)`);
         }
         // ── CASCADE-REVEALED REQUIRED FIELDS → back to REVIEW, not a blind halt (2026-07-27). ──
         // A field the form has since made REQUIRED, which the approved bundle can't answer (absent, or

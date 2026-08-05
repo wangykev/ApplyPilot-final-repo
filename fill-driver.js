@@ -5469,6 +5469,22 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
       // M/D/Y bug; mechanics probe proved it the sole culprit). focusDateSegment
       // triple-click-SELECTS the segment, so typing REPLACES it — no clear needed.
       // (Any future per-tenant clear must be segment-scoped Backspace, NEVER Ctrl+A.)
+      //
+      // ── FORCED TRANSITION (2026-08-05, budgets.forceSegmentTransition) ──────────────────────────
+      // Re-typing the SAME digits over a triple-click selection leaves the value BYTE-IDENTICAL, so no
+      // value transition occurs. That is fine for an ordinary fill and useless for the one case this
+      // flag exists for: Workday's model calling a date field empty while its own DOM — and React's
+      // props AND fiber — hold the value (traced live on waystar's Self Identify page: domValue "8",
+      // reactProps "8", reactFiber "8", ariaInvalid null, and still "The field Date is required").
+      // Writing the value it already has cannot re-answer the question. Emptying the segment first
+      // produces a real empty→value transition, which is the only lever left that does not depend on
+      // Workday agreeing with its own DOM. Backspace is segment-scoped (the selection), never Ctrl+A.
+      // Best-effort by construction: if the clear no-ops we still type the value, so the worst case is
+      // exactly today's behaviour, and the read-back below judges the result either way.
+      if (b.forceSegmentTransition && typeof act.pressBackspace === "function") {
+        await act.pressBackspace();
+        await act.delay(b.textReadIntervalMs);
+      }
       if (how === "insertText") await act.typeText(val); else await act.typeDigits(val);
       // Reactive read-back: POLL the segment until it equals the COMPLETE value (parseInt
       // exact — a half-typed "1" of "15" must NOT satisfy it), ceiling = give-up only. Never
