@@ -3352,3 +3352,59 @@ event-bound, the question is not "when are we not painting" but "why use trusted
 all, when synthetic is already proven there and hidden runs finish page 2 in 11s". That is a policy
 change, with trusted kept where it is REQUIRED: the auth form, the self-ID page's text/date fields, and
 the single irreversible submit click.
+
+## 2026-08-05 — waystar.wd1 Self Identify: Workday's MODEL loses the Date, and four remedies that do not fix it
+
+Observed during a REHEARSAL (replay) on `waystar.wd1`, page 5 ("Self Identify"), reproducibly across
+three arrivals in one run. Save & Continue is refused with:
+
+```
+Error-Date  The field Date is required and must have a value.
+```
+
+…on a `dateSignedOn` composite that plainly holds the value. The `[FIELD-DIAG]` dump is unambiguous —
+every layer we can read agrees the value is present:
+
+```
+INPUT[dateSectionMonth-input] domValue "8"    reactProps "8"    reactFiber "8"    ariaValueNow "8"    ariaInvalid null
+INPUT[dateSectionDay-input]   domValue "5"    reactProps "5"    reactFiber "5"    ariaValueNow "5"    ariaInvalid null
+INPUT[dateSectionYear-input]  domValue "2026" reactProps "2026" reactFiber "2026" ariaValueNow "2026" ariaInvalid null
+wrapper text: "Date*current value is 8/5/2026 08/05/2026 … Error: The field Date is required and must have a value."
+```
+
+So this is **not** the synthetic-input class (React would be empty) and **not** a value that reverted
+(the DOM would be empty). Per the diag's own legend: *both set ⇒ Workday's model disagrees with its own
+DOM.* The thing holding "unanswered" is Workday's **form model**, server-side of the React tree — and
+nothing typed into the page reaches it.
+
+**Four remedies tried, all refuted live:**
+
+1. **Trusted re-write of the field** (`fillDateCompositeCdp`, synthetic forced off). No effect.
+2. **focus→blur commit nudge** (`nudgePhantomRequired`). No effect — now failed live 3x total.
+3. **Byte-identical re-type is a no-op by construction.** Both of the above re-enter *the value the page
+   already shows*: `focusDateSegment` triple-click-SELECTS the segment and typing the same digits leaves
+   it identical, so no value transition ever occurs. `forceSegmentTransition` (2026-08-05) now empties
+   each segment with a **segment-scoped Backspace** first — never Ctrl+A, which spans the whole composite
+   and resets focus to Month — giving a real empty→value transition. Still did not clear the error, but
+   it is kept because writing a value over itself cannot re-answer a question even in principle.
+4. **Reload + replay from page 1.** Refuted: page 5 reached 3x, phantom fired 2x, both re-entries hit the
+   identical error. Removed from the code with a ⛔ marker so it is not re-added.
+
+**What #4 DID establish** (worth keeping, it is the operator's "only refill what didn't latch"): the
+return trip is cheap, because the answers that latched are still saved. Page 1 on re-entry:
+`15 field(s) — 0 changed, 13 already-correct, 2 not-actuated, 0 FAILED`. So `skipIfCorrect` behaves
+exactly as intended; the cost of re-entry is not the problem, the *remedy* is.
+
+**The untried remedy — implement this next (operator's, and the only one not yet refuted).** NOT a
+reload: click **Back** one page, confirm Workday's leave-page dialog, verify the previous page, then
+**Save & Continue forward** again. The mechanism differs in kind: it makes Workday re-POST the previous
+page and re-DERIVE this page's model server-side, rather than restoring the same broken model that a
+reload restores. Prerequisite: this repo has never touched Workday's Back control or its confirm dialog,
+so **trace both first** (footer/breadcrumb automation-ids, and whether the dialog is a real modal or a
+portaled overlay) before writing the handler.
+
+**Attribution note.** Do not reflexively blame phantom state from repeated runs. This form was run twice
+before the rehearsal, so stale server state is plausible — but the fill walk SAVED this same page
+successfully minutes earlier, and the failure is specific to re-entering a SAVED application, which is
+what a replay always does. It is consistent with the already-recorded finding that Workday drops some
+self-ID answers on re-entry while sibling dropdowns persist.
