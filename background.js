@@ -4549,7 +4549,7 @@ async function retreatAndReturn(act, LOG) {
     left = cdpPageSig(await cdpEval(cdpPageScan)) !== sigBefore;
   }
   if (!left) return { ok: false, stage: "verify-back", detail: "the Back click did not change the page signature — we never left the page" };
-  await awaitFieldSetSettled(LOG, "  retreat(prev page)");
+  await awaitFieldSetSettled(act);
   // Forward again via the SAME guarded Save & Continue the walk uses everywhere (it independently refuses
   // on the review page, so this can never become a submit).
   const sigPrev = cdpPageSig(await cdpEval(cdpPageScan));
@@ -4949,9 +4949,24 @@ async function runCdpReplayWalk(tabId, opts) {
       // Without it the replay scanned half-rendered pages, declared the unmounted fields absent, and
       // saved anyway; the extra fields then mounted and changed the page signature, which read as an
       // "advance", so the same physical page got processed twice.
+      cdpSetTrustedText(false); // scope the self-ID override below to the ONE page that asks for it
       const rSettleMs = await awaitFieldSetSettled(act);
       const scan = await cdpEval(cdpPageScan);
       LOG(`page ${page}: field set settled in ${rSettleMs}ms — ${((scan && scan.fields) || []).length} flat field(s) on the page.`);
+      // ── SELF-ID INPUT POLICY, ON THE REPLAY TOO (2026-08-06) ──────────────────────────────────────
+      // The per-KIND split (TRUSTED text/date, SYNTHETIC clicks) lived ONLY in fillAndPersistPage, which
+      // the replay calls just for the REFILL case — so a normal replay of the Self Identify page wrote
+      // text/date with the run-level mode, which for a submit run is SYNTHETIC: exactly the write this
+      // surface is documented to ignore. That is the same "it lived inside fillAndPersistPage and the
+      // replay never calls it" gap awaitFieldSetSettled had, and it fits the live symptom precisely —
+      // Workday reporting Date required on a composite whose DOM AND React both hold the value, which is
+      // the signature of a write that reached the page but not Workday's model.
+      // Scoped by the unconditional reset at the TOP of every iteration (see above the settle), rather
+      // than a try/finally around this ~700-line body — same guarantee, nothing restructured.
+      if (isSelfIdPage((scan && scan.fields) || [])) {
+        LOG(`page ${page}: SELF-ID page — forcing TRUSTED text/date input for the replay (synthetic writes are ignored on this surface); clicks are left alone.`);
+        cdpSetTrustedText(true);
+      }
       const fields = (scan && scan.fields) || [];
       const liveNames = fields.map((f) => f.fieldName);
       // A repeating page (My Experience) has NO flat fields — match it by its live SECTIONS too.
