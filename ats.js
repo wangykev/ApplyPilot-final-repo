@@ -1631,9 +1631,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // Option text as the MATCH LADDER should see it: dial codes and list numbering are both
     // rendering artifacts (see atsDialStrip / atsEnumStrip). The commit always uses the raw text.
     const forMatch = (arr) => (wt === "dial" ? arr.map(atsDialStrip) : arr.map(atsEnumStrip));
+    // BOTH SIDES get the same treatment, or the ladder compares unlike things. A committed value
+    // is stored as the option's REAL text, so on a replay the approved answer arrives carrying the
+    // form's own numbering ("1. United States of America") while the live options are stripped for
+    // matching — no tier can bridge that (live 2026-08-05: the replay of a field the fill had just
+    // filled exact-normalized reported "isn't one of this form's options").
     const hasHit = (texts) => {
       const mt = forMatch(texts);
-      const m0 = atsLib.matchCandidates(candidates, mt, { containment: allowContainment });
+      const m0 = atsLib.matchCandidates(forMatch(candidates), mt, { containment: allowContainment });
       return !!(m0 && m0.targetIndex >= 0);
     };
     // CLEAR BEFORE TYPING, SW-paced (the Workday typeahead rule, earned again 2026-07-31 on
@@ -1888,7 +1893,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const idx = texts.findIndex((t) => t.toLowerCase().includes(city));
       if (idx >= 0) hit = { index: idx, tier: texts[idx].toLowerCase().startsWith(city) ? "exact-normalized" : "containment" };
     } else {
-      const m = atsLib.matchCandidates(candidates, matchTexts, { containment: allowContainment });
+      const m = atsLib.matchCandidates(forMatch(candidates), matchTexts, { containment: allowContainment });
       if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
       // stated Yes/No-leading value → the unique same-polarity option (the contraction
       // bridge — see the radio path; select twin for GH's EEO dropdowns).

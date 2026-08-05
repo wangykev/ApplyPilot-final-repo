@@ -964,6 +964,29 @@ test("driver: a BUSY page is waited out; the quiet watch is what says the menu i
   } finally { Object.assign(ats.ATS_POLL, saved); }
 });
 
+test("replay: an approved value that carries the form's own numbering still matches", async () => {
+  // A commit stores the option's REAL text, so the bundle holds "1. United States of America".
+  // Stripping the numbering from the live options but not from the approved value made the replay
+  // of a field the fill had just filled report "isn't one of this form's options" (live 2026-08-05).
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "1. United States of America" });
+  assert.strictEqual(out.results[0].status, "filled", "the approved value must match the option it came from: " + out.results[0].detail);
+  assert.strictEqual(committed, "1. United States of America");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
