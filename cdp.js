@@ -61,7 +61,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // SW-side wall-clock delay — the ONLY pacing primitive CDP fill code may use.
 // (Page-side setTimeout is throttled to ~1Hz hidden, then frozen; this isn't.)
 const cdpDelay = (ms) => new Promise((r) => setTimeout(r, ms));
-const DELIBERATE_CLICK_GAP_MS = 60; // press→release gap for label activation (see cdpClickAt)
 
 // Attach to `tabId` and enable the domains we use (Runtime for evaluate, DOM for
 // the DOM.focus fallback, Page for addScriptToEvaluateOnNewDocument — the hidden-
@@ -90,6 +89,7 @@ function cdpAttach(tabId) {
         // trusted Input.* path (slow-but-battle-tested) — the escape hatch if a tenant's widgets
         // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
         try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
+        cdpInvalidatePaint(); // a fresh attach says nothing about the previous tab's paint state
         _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
         console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
         resolve({ ok: true });
@@ -272,6 +272,11 @@ function buildOverrideSrc(opts) {
     ${workerBlock}
     // rAF→setTimeout — installs regardless of the worker outcome (a paused-forever
     // rAF becomes an eventually-firing timer; worker-backed = fast, native = ~1fps).
+    // The paint probe needs the REAL rAF: the polyfill below is setTimeout-backed, so it fires happily
+    // on a tab that is producing no frames at all — measuring it would report "painting" always.
+    if (!window.__apNativeRaf && window.requestAnimationFrame) {
+      window.__apNativeRaf = window.requestAnimationFrame.bind(window);
+    }
     var last = 0;
     window.requestAnimationFrame = function (cb) {
       var now = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -544,7 +549,11 @@ function cdpSetSyntheticInput(on) {
 function cdpSyntheticInputEnabled() { return _synthInputEnabled; } // so a caller can SAVE/RESTORE around a deliberately-trusted step
 async function cdpSynthInput() {
   if (!_synthInputEnabled || _forceTrustedInput) return false;
-  return !(await cdpVisible()); // hidden ⇒ synthetic page-side dispatch (fast); visible ⇒ trusted Input.* (proven)
+  // NOT PAINTING ⇒ synthetic page-side dispatch (needs no frames); painting ⇒ trusted Input.* (proven).
+  // This used to ask cdpVisible(), which cannot see an occluded window and so kept trusted input on a
+  // tab producing no frames — 39s vs 11s on the same page. cdpPainting falls back to cdpVisible when it
+  // cannot measure, so the worst case is today's behaviour.
+  return !(await cdpPainting());
 }
 
 // In-page synthetic click (self-contained; evaluated via cdpEval). Dispatches the page-engine's
@@ -809,7 +818,7 @@ function inputLog(...a) { if (inputTraceEnabled) console.log("[ApplyPilot][INPUT
 // count across BOTH pacing regimes). chrome.debugger.sendCommand delivers in order per target, so we
 // ISSUE the sequence back-to-back and await the acks together — the renderer's input queue drains the
 // whole burst in one beat instead of paying one stall per event. Event order/semantics unchanged.
-async function cdpClickAt(x, y, opts) {
+async function cdpClickAt(x, y) {
   // HIDDEN → synthetic page-side dispatch (fast; see the synthetic-input block above). A miss
   // (no element at the point / eval hiccup) falls through to the trusted path below.
   if (await cdpSynthInput()) {
@@ -822,28 +831,11 @@ async function cdpClickAt(x, y, opts) {
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
-    // DELIBERATE (2026-08-05): press, a real beat, then release — instead of the batch below.
-    // Measured on waystar's self-ID checkbox: quiet page, TRUSTED click, hit-test confirmed the click
-    // landed on the correct label, and the box still did not toggle. Activation is synthesized from a
-    // press/release PAIR and the input pipeline rides compositor frames, which a hidden tab does not
-    // produce — a pair delivered with nothing in between can fail to activate at all. A human click has
-    // ~50-100ms of gap; this restores that.
-    //
-    // SCOPED to label activation (checkbox/radio) so speed is untouched everywhere else: text, dropdown,
-    // date and Save clicks keep the batched single-drain path below. That is 1-2 clicks per page, so the
-    // gap costs ~60-120ms — nothing against the ~1.2s/event a hidden trusted click already pays.
-    if (opts && opts.deliberate) {
-      await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 });
-      await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 });
-      await cdpDelay(DELIBERATE_CLICK_GAP_MS);
-      await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
-    } else {
     await Promise.all([
       cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 }),
       cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 }),
       cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 })
     ]);
-    }
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -2683,6 +2675,71 @@ function cdpHitAt(x, y, wantId) {
   };
 }
 
+// ── IS THE TAB PAINTING? (2026-08-05) ───────────────────────────────────────────────────────────────
+// The input-mode decision has always asked "is the tab HIDDEN?" (cdpVisible = tab.active &&
+// !minimized). What actually determines whether trusted Input.* is fast is whether the tab is
+// PAINTING: those events are drained in step with frame production. A window sitting BEHIND another
+// app satisfies tab.active && !minimized while compositing nothing — the documented occlusion blind
+// spot — so we keep using trusted input and pay ~1.1-1.5s per event.
+//
+// Measured live: the SAME page 2 of the same posting took 11.1s hidden (synthetic input, no frames
+// needed) and 39s on a "visible" run whose window was actually behind another app — with
+// firstYearAttended at 16.8s and fieldOfStudy at 16.2s, i.e. ~1.1s per input event. Every other page in
+// that run was normal, because page 2 is the one dominated by input events.
+//
+// rAF is the honest signal: its callback is driven by frame production, so it simply does not arrive
+// when nothing is being composited. Same philosophy as cdpTimersFast — measure, never assume.
+function cdpPaintProbeSrc() {
+  // Uses the NATIVE rAF stashed by buildOverrideSrc; without it, our own setTimeout-backed polyfill
+  // would answer "painting" on a frameless tab. No native reference ⇒ report unknown, never a guess.
+  return new Promise(function (res) {
+    var raf = window.__apNativeRaf || (window.__apOverridesInstalled ? null : window.requestAnimationFrame);
+    if (!raf) { res({ ok: false, reason: "no native rAF available" }); return; }
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var done = false;
+    try {
+      raf(function () {
+        if (done) return; done = true;
+        var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
+        res({ ok: true, ms: Math.round(t1 - t0) });
+      });
+    } catch (e) { res({ ok: false, reason: String(e && e.message || e) }); }
+  });
+}
+
+// Cached, because cdpSynthInput() is consulted on EVERY click and a probe is a page round trip (a
+// visibility read is not). The TTL is short on purpose: the operator alt-tabbing mid-run is exactly the
+// case this exists for, so the answer has to be allowed to change during a page.
+let _paintCache = { at: 0, painting: null };
+const PAINT_PROBE_DEADLINE_MS = 150;   // 60fps = 16ms, 30fps = 33ms — generous, and only paid when NOT painting
+const PAINT_CACHE_TTL_MS = 2000;
+function cdpInvalidatePaint() { _paintCache = { at: 0, painting: null }; }
+// For diagnostics: what the probe last measured, and what Chrome thinks — the pair is the whole point,
+// because "visible but not painting" is the state that used to be invisible in the logs.
+async function cdpPaintLabel() {
+  const painting = await cdpPainting();
+  let vis = "?"; try { vis = (await cdpVisible()) ? "visible" : "hidden"; } catch (e) { /* ignore */ }
+  return painting ? `painting (${vis})` : `NOT painting (chrome says ${vis})`;
+}
+async function cdpPainting() {
+  if (_paintCache.painting !== null && (Date.now() - _paintCache.at) < PAINT_CACHE_TTL_MS) return _paintCache.painting;
+  let painting;
+  try {
+    const r = await Promise.race([
+      cdpEval(cdpPaintProbeSrc),
+      cdpDelay(PAINT_PROBE_DEADLINE_MS).then(() => ({ ok: true, ms: -1, timedOut: true })),
+    ]);
+    // A probe that cannot answer (no native rAF, eval failure) FALLS BACK to Chrome's visibility, so the
+    // worst case is exactly today's behaviour rather than a new failure mode.
+    if (!r || r.ok !== true) painting = await cdpVisible();
+    else painting = !r.timedOut;
+  } catch (e) {
+    try { painting = await cdpVisible(); } catch (e2) { painting = true; }
+  }
+  _paintCache = { at: Date.now(), painting };
+  return painting;
+}
+
 // ── QUIESCENCE (2026-08-04): "is the page still busy?", which no other wait here can answer ─────────
 // Every settle in this file waits for a COUNT to stop changing (field set, options, entries). None can
 // tell you the DOM is mid-reaction, and that is what actually breaks the self-ID checkbox group: the
@@ -4092,7 +4149,7 @@ function makeCdpActuation(llmConfig) {
       if (!rect) return false;                                          // no rect ⇒ NOTHING was dispatched
       let hit = null;
       try { hit = await cdpEval(cdpHitAt, rect.cx, rect.cy, id); } catch (e) { /* diagnostic only */ }
-      await cdpClickAt(rect.cx, rect.cy, { deliberate: true }); // label activation needs a press→release beat
+      await cdpClickAt(rect.cx, rect.cy);
       return { ok: true, cx: Math.round(rect.cx), cy: Math.round(rect.cy), hit };
     },
     focusInput: (id) => cdpEval(cdpFocusInputById, id),
