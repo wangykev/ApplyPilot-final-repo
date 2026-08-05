@@ -907,6 +907,30 @@ test("replay: the résumé is attached ONLY to the résumé field, never the cov
   assert.match(by.cover_letter.detail, /cover letter|not the r/i);
 });
 
+test("replay: a dial composite keeps its dial routing, so an approved code commits", async () => {
+  // The replay used to route every non-file field as a plain value, actuating Greenhouse's
+  // phone-dial composite as an ordinary select. Live 2026-08-05 that ended `skipped` and blocked
+  // an otherwise-clean submit. The approved value here is the bare country: only the dial path
+  // (which strips the option's trailing "+<digits>" for matching) can land it.
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "country", inputSel: "#country", widgetType: "select", label: "Country", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "United States +1" }, { text: "Canada +1" }] }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "United States" });
+  assert.strictEqual(out.results[0].status, "filled", "the dial path must survive the replay: " + out.results[0].detail);
+  assert.strictEqual(committed, "United States +1", "the click uses the option's real text");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {

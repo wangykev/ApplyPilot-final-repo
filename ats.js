@@ -913,6 +913,7 @@ const ATS_POLL = {
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
   mountGrace: 1200,                 // extra wait for a menu that has NEVER mounted (see pollFor)
+  responsiveReadMs: 400,            // a read slower than this means the PAGE is the problem, not the menu
 };
 // A location question whose widget already shows this few options is a pick-one, not a places
 // autocomplete (see the location branch in atsActuateField).
@@ -1396,6 +1397,18 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
             : { kind: "skip", detail: (fr && fr.detail) || "a file field that is not the résumé — left to the operator" };
         } else {
           route = { value: v, source: "replay" };
+          // KEEP THE KIND THE FILL USED. The replay routed every non-file field as a plain value,
+          // so Greenhouse's phone-dial composite (#country) was actuated as an ordinary select —
+          // the wrong widget shape, whose menu never mounts — and an approved dial value could
+          // never commit (live 2026-08-05: `skipped · the dropdown opened but listed no options`,
+          // which the strict verify then rightly refuses, blocking an otherwise-clean submit).
+          // Same lesson as the résumé slot: a replay that drops the fill's routing is a replay
+          // that cannot reproduce the fill.
+          // Read the KIND straight from the static map: it describes the widget's SHAPE, which is
+          // true regardless of whether the profile happens to hold a value for it (atsRouteField
+          // returns nothing when the mapped value is empty, and the shape would be lost with it).
+          const shape = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+          if (shape && shape.kind === "dial") route.kind = "dial";
         }
       } else {
         route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
@@ -1661,9 +1674,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
       // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
       const startedAt = Date.now();
-      let last = null, lastSeen = null, sawLoading = false, ticks = 0, sawEmptyMounted = false, sawMounted = false; let stopReason = "none";
+      let last = null, lastSeen = null, sawLoading = false, ticks = 0, sawEmptyMounted = false, sawMounted = false, lastReadMs = 0; let stopReason = "none";
       for (;;) {
+        const readAt = Date.now();
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
+        lastReadMs = Date.now() - readAt;
         ticks++;
         if (r && Array.isArray(r.options)) { lastSeen = r; if (r.options.length) last = r; }
         if (r && r.loading) sawLoading = true;
@@ -1692,7 +1707,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
           if (now < deadline) return false;
           if (loading) { why = "loading-ceiling"; return now >= hardDeadline; }
           if (emptyNow && r && r.open) { why = "empty-mounted"; return settledEmpty || now >= hardDeadline; }
-          if (emptyNow && !sawMounted) { why = "never-mounted"; return now >= Math.min(deadline + ATS_POLL.mountGrace, hardDeadline); }
+          if (emptyNow && !sawMounted) {
+            // A menu that has never mounted is only believable when the page is actually
+            // RESPONSIVE: our own read is a Runtime.evaluate, so when it takes ~1.4s the main
+            // thread is jammed and the widget cannot paint a menu OR answer us (live 2026-08-05:
+            // two reads spanning 2761ms declared three healthy dropdowns "never mounted" and
+            // skipped values that had filled fine minutes earlier). Slow reads ⇒ keep waiting.
+            if (lastReadMs > ATS_POLL.responsiveReadMs) { why = "page-jammed"; return now >= hardDeadline; }
+            why = "never-mounted";
+            return now >= Math.min(deadline + ATS_POLL.mountGrace, hardDeadline);
+          }
           return true;
         })();
         if (stop) {
