@@ -107,3 +107,21 @@ test("apMatch: everything the SW literal lists is actually exported by lib.js", 
   const notExported = listed.filter((n) => typeof lib[n] !== "function").sort();
   assert.deepStrictEqual(notExported, [], "the SW literal maps these to lib.js globals, but lib.js does not export them — so the Node branch of apMatch would be missing what the SW branch has (the two branches must agree)");
 });
+
+// ── the SAME trap, in ats.js (2026-08-05) ────────────────────────────────────────────────────────────
+// ats.js reaches lib.js and fill-driver.js through `atsLib` / `atsFd`, which are ALSO two different
+// objects: everything under Node (require), a HAND-WRITTEN literal in the service worker. The apMatch
+// guard above never covered them, so `atsLib.foo(...)` could pass every test and throw in the browser —
+// found while wiring the signature-date recognizer, which lives in lib.js and was NOT in the literal.
+for (const [ns, from] of [["atsLib", "lib.js"], ["atsFd", "fill-driver.js"]]) {
+  test(`${ns}: every ${ns}.X used in ats.js is present in the SW object literal`, () => {
+    const src = fs.readFileSync(path.join(ROOT, "ats.js"), "utf8");
+    const used = new Set([...src.matchAll(new RegExp("\\b" + ns + "\\.([A-Za-z_$][\\w$]*)", "g"))].map((m) => m[1]));
+    assert.ok(used.size > 2, `expected several ${ns}.* uses, found ${used.size}`);
+    const decl = new RegExp("const " + ns + " = [\\s\\S]*?\\n\\s*: (\\{[\\s\\S]*?\\});").exec(src);
+    assert.ok(decl, `could not locate the ${ns} SW object literal`);
+    const listed = new Set([...decl[1].matchAll(/([A-Za-z_$][\w$]*)\s*:/g)].map((m) => m[1]));
+    const missing = [...used].filter((n) => !listed.has(n)).sort();
+    assert.deepStrictEqual(missing, [], `these names are called as ${ns}.X in ats.js but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass (they must also be globals from ${from})`);
+  });
+}

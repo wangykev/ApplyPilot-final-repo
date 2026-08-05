@@ -27,7 +27,8 @@ const atsLib = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, normalizeLabel: normalizeLabel,
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
-      AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV };
+      AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV,
+      isSignatureDateQuestion: isSignatureDateQuestion };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
@@ -292,6 +293,19 @@ function atsRouteLabel(label, f, profile, defaults) {
     // a real places box should be typed with.
     const cands = [v].concat(country).filter(Boolean);
     if (cands.length) return { kind: "location", value: cands[0], candidates: cands, source: "map", path: "(city+state)" };
+  }
+
+  // A SIGNATURE / COMPLETION DATE IS TODAY — never an AI guess. Live 2026-08-05 on Lever's EEO block:
+  // `eeo[disabilitySignatureDate]` fell through to the AI free-text path, which answered "As soon as
+  // possible" (an availability answer on a date field) after a 19.2s LLM call — the slowest field of
+  // the run. The applicant is completing the form now, so the answer is deterministic. Same recognizer
+  // the Workday path uses, and it is deliberately narrow: any label naming a DIFFERENT event (start,
+  // birth, graduation, expiry…) is refused rather than stamped with today.
+  if (atsLib.isSignatureDateQuestion(label)) {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return { value: `${mm}/${dd}/${d.getFullYear()}`, source: "signature-date", path: "(today)" };
   }
 
   // Compensation + availability (STATED only — an empty profile value falls through to AI/blank).
@@ -1550,7 +1564,15 @@ async function atsFinishFill(act, ats, scan, results) {
       // select renders "+1" for the committed "United States +1" — same accept rule as the
       // fill-time verify).
       const chipSubstring = liveV && recV.toLowerCase().includes(liveV.toLowerCase());
-      if (f.widgetType === "checkbox" ? String(!!live.value) !== String(rec.after === true || rec.after === "true") : !(atsFd.textValuesMatch(liveV, recV) || chipSubstring)) {
+      // …and the REVERSE, for a widget whose display is LONGER than the answer: Lever's EEO radios
+      // render the option's whole description inside the label, so the page reads
+      // "Asian (Not Hispanic or Latino)A person having origins in…" for a recorded
+      // "Asian (Not Hispanic or Latino)". That is the same value, more verbosely displayed — not a
+      // page that lost its value (live 2026-08-05). Anchored at the START and length-guarded, so a
+      // recorded value that merely appears somewhere inside an unrelated display is still a
+      // mismatch, and a 1-2 char recorded value can never "prefix-match" a paragraph.
+      const labelDescription = recV.length >= 3 && liveV.toLowerCase().startsWith(recV.toLowerCase());
+      if (f.widgetType === "checkbox" ? String(!!live.value) !== String(rec.after === true || rec.after === "true") : !(atsFd.textValuesMatch(liveV, recV) || chipSubstring || labelDescription)) {
         rec.status = "needs_review"; rec.flag = "audit-mismatch";
         rec.detail = (rec.detail ? rec.detail + "; " : "") + "audit: page now holds " + JSON.stringify(liveV);
         rec.after = liveV || null;
@@ -2052,6 +2074,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const readNorm = atsLib.normalize(String(rec.after || ""));
     const okv = readNorm === atsLib.normalize(pick) || (!!(r && r.ok) && readNorm.includes(atsLib.normalize(pick).slice(0, 40)));
     rec.status = okv ? (tier === "exact-normalized" || tier === "label-exact" ? "filled" : "filled_review") : "needs_review";
+    // RECORD THE OPTION WE CHOSE, not the read-back display — the dial-chip rule, earned again on a
+    // radio. Lever's EEO options render their whole DESCRIPTION inside the label ("Asian (Not
+    // Hispanic or Latino)A person having origins in any of the original peoples of the Far East…"),
+    // while the option vocabulary the scan reports is the answer alone. Storing the display put a
+    // paragraph in the bundle that no live option could ever match, so the replay of a field the
+    // fill had verified came back `stated-value-unmatched` (live 2026-08-05, Shield AI).
+    // The read-back stays the VERIFY (above, which already tolerates the description); only what we
+    // persist changes. Single-choice only: a checkbox GROUP can hold several answers, and the
+    // read-back is the one thing that reports all of them.
+    if (okv && wt === "radio") rec.after = pick;
     rec.matchTier = tier; rec.verified = okv;
     if (!okv) rec.detail = "radio commit not reflected (read " + JSON.stringify(rec.after) + ")";
     return true;

@@ -987,6 +987,70 @@ test("replay: an approved value that carries the form's own numbering still matc
   assert.strictEqual(committed, "1. United States of America");
 });
 
+test("router: a signature/completion date is TODAY, and only for that question", async () => {
+  // Live 2026-08-05, Lever: eeo[disabilitySignatureDate] reached the AI free-text path and came back
+  // "As soon as possible" — an availability answer on a date field, after a 19.2s LLM call.
+  const mmddyyyy = /^\d{2}\/\d{2}\/\d{4}$/;
+  for (const label of ["Date", "Today's Date", "Signature Date", "Date Signed"]) {
+    const r = ats.atsRouteLabel(label, {}, PROFILE, {});
+    assert.ok(r && mmddyyyy.test(String(r.value)), label + " should route to today's date, got " + JSON.stringify(r && r.value));
+    assert.strictEqual(r.source, "signature-date");
+  }
+  // …and NEVER a date that names a different event — stamping today on one of these is a wrong answer
+  for (const label of ["Start Date", "Earliest start date", "Date of Birth", "Graduation Date", "Expiration Date"]) {
+    const r = ats.atsRouteLabel(label, {}, PROFILE, {});
+    assert.notStrictEqual(r && r.source, "signature-date", label + " must not be answered with today");
+  }
+  // it fills deterministically, unflagged, through the ordinary text path
+  const values = {};
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "lever", url: "https://jobs.lever.co/shieldai/uuid/apply", title: "t",
+      fields: [{ fieldName: "eeo[disabilitySignatureDate]", inputSel: "#sig", widgetType: "text", label: "Date", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].status, "filled", "deterministic, so no review flag: " + out.results[0].detail);
+  assert.ok(mmddyyyy.test(String(values["#sig"])), "wrote today's date, got " + JSON.stringify(values["#sig"]));
+});
+
+test("radio: the bundle stores the option we chose, not a label that carries its description", async () => {
+  // Lever's EEO options render the whole description inside the label, so the read-back is a
+  // paragraph while the option vocabulary is the answer alone. Persisting the paragraph made the
+  // REPLAY of a verified fill come back stated-value-unmatched (live 2026-08-05, Shield AI).
+  const OPTION = "Asian (Not Hispanic or Latino)";
+  const DISPLAY = OPTION + "A person having origins in any of the original peoples of the Far East, Southeast Asia, or the Indian Subcontinent.";
+  const scan = {
+    ats: "lever", url: "https://jobs.lever.co/shieldai/uuid/apply", title: "t",
+    fields: [{ fieldName: "eeo[race]", inputSel: 'input[name="eeo[race]"]', widgetType: "radio",
+      label: "Race", isRequired: false, value: null, domIndex: 0,
+      options: [OPTION, "White (Not Hispanic or Latino)", "Decline to self identify"] }],
+  };
+  const act = fakeAct({
+    atsInjScan: () => scan,
+    atsInjCheckOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: DISPLAY }),   // the label, description and all
+  });
+  const profile = { ...PROFILE, self_identification: { ...PROFILE.self_identification, race_ethnicity: OPTION } };
+  const out = await ats.driveAtsPageFill(act, "lever", profile, {}, {}, {});
+  const r = out.results[0];
+  assert.ok(r.status === "filled" || r.status === "filled_review", "the click verified: " + r.detail);
+  assert.strictEqual(r.after, OPTION, "the persisted value must be in the form's own option vocabulary");
+
+  // and that value replays: it now matches the live option list
+  let checked = null;
+  const act2 = fakeAct({
+    atsInjScan: () => scan,
+    atsInjCheckOption: (sel, t) => { checked = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: checked ? checked + "some description" : null }),
+  });
+  const out2 = await ats.driveAtsPageFill(act2, "lever", profile, {}, {}, { valueFor: () => OPTION });
+  assert.strictEqual(checked, OPTION);
+  assert.notStrictEqual(out2.results[0].status, "needs_review", "the approved value must replay: " + out2.results[0].detail);
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
