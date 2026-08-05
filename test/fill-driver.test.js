@@ -2752,7 +2752,8 @@ test("checkbox group: a MAPPED value checks the matching option (label-exact) an
 // always guarded this ("a momentary pick discarded on render-complete is never reported filled"); the
 // checkbox group reported `filled` off a read taken microseconds after the click, so the walk banked a
 // success and clicked Save & Continue into a page Workday then refused.
-const PRE_LOOP_READS = [null, null, null]; // initial opts + pre-click readBack + post-click readBack
+// initial opts + pre-click readBack + the post-quiescence RE-RESOLVE read + post-click readBack
+const PRE_LOOP_READS = [null, null, null, null];
 const genderGroup = (rebuildScript) => {
   const field = selfIdField({ fieldName: "gender" });
   field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: false }];
@@ -2770,6 +2771,27 @@ test("checkbox group quiescence: the DOM is waited on BEFORE the first click, ne
   const q = seq.indexOf("awaitQuiet"), c = seq.indexOf("clickRadioLabel");
   assert.ok(q >= 0, "the quiescence gate ran: " + JSON.stringify(seq.slice(0, 8)));
   assert.ok(q < c, `awaitQuiet must precede the click (got awaitQuiet@${q}, click@${c})`);
+});
+
+test("checkbox group quiescence: ids RE-ISSUED during the wait are re-resolved, so the click still lands", async () => {
+  // The regression the gate itself introduced, live: ids are read, we wait up to 3s, then click by id —
+  // and a rebuild during that wait leaves label[for=<stale id>] absent, so NO click is dispatched at all
+  // and the commit "fails". The label is the stable identity, so re-resolve by text after waiting.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  const realQuiet = act.awaitQuiet;
+  act.awaitQuiet = async (loc, opts) => {
+    // rebuild DURING the wait: same labels, brand-new ids (what a React remount does)
+    field.options = field.options.map((o) => ({ ...o, id: o.id + "-v2" }));
+    field.groupOptions = field.options.map((o) => ({ ...o }));
+    return realQuiet(loc, opts);
+  };
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "must still commit after the ids changed: " + rec.detail);
+  assert.strictEqual(rec.after, "Male");
+  const clicked = act.log.filter(([m]) => m === "clickRadioLabel").map(([, id]) => id);
+  assert.ok(clicked.includes("m-v2"), "clicked the RE-ISSUED id, not the stale one: " + JSON.stringify(clicked));
 });
 
 test("checkbox group quiescence: a page that never goes quiet still gets clicked (never hangs)", async () => {

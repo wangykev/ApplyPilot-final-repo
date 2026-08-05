@@ -1806,14 +1806,28 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
     // and the persistence re-read below still backstops whatever lands later than any gate.
     if (typeof act.awaitQuiet === "function") {
       quiet = await act.awaitQuiet(loc, { quietMs: budgets.groupQuietMs || 400, ceilingMs: budgets.groupQuietCeilingMs || 3000 });
+      // RE-RESOLVE AFTER WAITING — waiting is precisely the window in which a rebuild re-issues the ids,
+      // so the id read before the wait can now point at a node that no longer exists. Live on the first
+      // gated run: clickRadioLabel found no `label[for=<stale id>]`, so NO click was dispatched at all and
+      // the commit "failed" having burned 17.5s. The gate created that window; this closes it.
+      // The LABEL is the stable identity across a rebuild, which is why the match is by text, not id.
+      const fresh = await readBack();
+      if (fresh.length) {
+        const again = fresh.find((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
+        if (again) { if (again.id !== target.id) quiet.reissuedIds = true; target = again; }
+        now = fresh;
+      }
+      if (isOn(target.id)) { /* the wait was enough on its own — fall through to the verify below */ }
     }
-    await act.clickRadioLabel(loc, target.id);
+    if (!isOn(target.id)) await act.clickRadioLabel(loc, target.id);
     await pollCheckedIs(act, target.id, true, budgets);
     now = await readBack();
   }
   let on = now.filter((o) => o.checked);
   let after = (on[0] || {}).labelText || null;
-  if (!isOn(target.id)) return { status: "needs_review", detail: `checkbox-group selection did not commit for "${target.labelText}"`, after, options: optionLabels };
+  if (!isOn(target.id)) return { status: "needs_review", options: optionLabels, after,
+    detail: `checkbox-group selection did not commit for "${target.labelText}"`
+      + (quiet ? ` (quiescence: waited ${quiet.waitedMs}ms${quiet.quiet ? "" : " — CEILING, still busy"}${quiet.reissuedIds ? "; the rebuild RE-ISSUED the box ids and they were re-resolved" : ""})` : "") };
   if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
     detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
 
