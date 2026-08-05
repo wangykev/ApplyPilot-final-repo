@@ -15,26 +15,25 @@ on a 3-read hold streak, and the quiet observer is armed at the top of `fillChec
 at the gate. Healthy group ~2.5s → ~750ms. Live evidence it did not break the commit: on waystar the FILL
 walk committed `disabilityStatus` (`filled_review`) and advanced under the new timing, twice.
 
-**The blocker to know about: Workday drops SELF-ID answers when you re-enter a saved application.** This
-is one class with two faces, and it is what stops waystar reaching the gate:
-- `dateSignedOn` — the page (DOM + React props + React fiber, `ariaInvalid` null) holds `8/5/2026` and
-  Workday still refuses Save with "The field Date is required". Its form MODEL lost the answer.
-- `disabilityStatus` — the checkbox group arrives EMPTY on a later replay and will not re-commit
-  (`asked for [No, I do not have a disability…] and it holds []`).
-The FILL walk fills both fine and reaches review; only the REPLAY (which by definition re-enters a saved
-application) hits it. So do not read it as a fill regression, and do not blame the checkbox timing.
+**SOLVED — the page-5 self-ID blocker was OUR bug, not Workday dropping answers.** Symptoms were
+`dateSignedOn` refused as "The field Date is required" on a composite whose DOM + React props + React
+fiber all held `8/5/2026`, and `disabilityStatus` arriving empty and refusing to re-commit. Root cause:
+the per-KIND self-ID input split (TRUSTED text/date, synthetic clicks) lived only in `fillAndPersistPage`,
+which **the replay walk calls only for the refill case** — so a normal replay wrote that page with the
+run-level mode, which on a submit run is SYNTHETIC, the one write this surface ignores. Exactly the gap
+`awaitFieldSetSettled` had. Fixed 2026-08-06; the very next rehearsal went `page 5 replay: 5 field(s) —
+3 changed, 0 FAILED` → gate passed.
 
-Remedies, with verdicts — **four are refuted, do not re-try them**: trusted re-write of the field ✗,
-focus→blur nudge ✗ (3 live failures), byte-identical re-type (a no-op by construction — `forceSegmentTransition`
-now empties each segment first) ✗, reload + replay from page 1 ✗ (page 5 reached 3x, both re-entries hit the
-identical error). Full FIELD-DIAG evidence: `docs/dom-patterns.md` 2026-08-05.
+Two lessons worth generalising: **when the replay behaves differently from the fill on the same page, look
+for policy that lives inside `fillAndPersistPage`** — the replay does not call it. And a value present in
+the DOM *and* React but rejected by Workday is the signature of a synthetic write, not of Workday losing
+data; the walk's own log already says this about the auth form.
 
-**Next thing to try, already built but NOT yet exercised live:** `retreatAndReturn` — step BACK one page,
-confirm Workday's leave-page dialog, Save & Continue forward, re-replay. Gated on the phantom signature,
-budget 2. It never fired in testing because that run halted on the checkbox group first. **If it runs and
-the page is STILL refused, that is the answer, not a dead end:** navigation is then proven not to be the
-variable, so the fault is in how the date digits are typed — they never reach Workday's backend — and the
-investigation moves to the date actuation.
+Remedies tried BEFORE finding the real cause, all refuted — don't re-try them on this symptom: trusted
+re-write of the field alone ✗, focus→blur nudge ✗, byte-identical re-type (a no-op by construction) ✗,
+reload + replay from page 1 ✗. `docs/dom-patterns.md` 2026-08-05 has the FIELD-DIAG evidence.
+`retreatAndReturn` (back a page → confirm dialog → Save & Continue forward) is built and gated on the
+phantom signature but **never fired**, since the real fix removed the symptom; treat it as unexercised.
 
 **Two workflow facts that cost me time:**
 - **The extension's site session expires every ~20 minutes.** `reportApplication` 401s (a completed fill's
@@ -446,7 +445,7 @@ age you checked.
 | Aptiv, PSECU, clearesult, Home Depot | **verified live** (earlier sessions) |
 | `cat.wd5` | **verified live** — REVIEW after 5 pages, 2 need review, ~16s total fill |
 | `magna.wd3` (path-hosted) | **verified live** — REVIEW after 4 pages, 0 need review, ~10s |
-| `waystar.wd1` | **fill + review + approve verified live 2026-08-06** (REVIEW after 5 pages, 64 fields, 11 flagged → 11/11 approved → "Ready to submit"). **Gate NOT reached**: the rehearsal halts on the self-ID re-entry blocker above, not on anything in the fill. |
+| `waystar.wd1` | **verified live 2026-08-06 — full loop.** Fill → REVIEW after 5 pages (64 fields, 11 flagged) → 11/11 approved → rehearse `AGREE 53 · DISAGREE 0` → `SUBMIT GATE PASSED / WOULD CLICK SUBMIT`. Needed the self-ID replay fix below. |
 | `copart` | externally blocked (operator gate) — not a code failure |
 | `radiancetech`, `clearwater` | unresolved; need postings |
 
