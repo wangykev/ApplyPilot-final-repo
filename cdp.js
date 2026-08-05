@@ -61,6 +61,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // SW-side wall-clock delay — the ONLY pacing primitive CDP fill code may use.
 // (Page-side setTimeout is throttled to ~1Hz hidden, then frozen; this isn't.)
 const cdpDelay = (ms) => new Promise((r) => setTimeout(r, ms));
+const DELIBERATE_CLICK_GAP_MS = 60; // press→release gap for label activation (see cdpClickAt)
 
 // Attach to `tabId` and enable the domains we use (Runtime for evaluate, DOM for
 // the DOM.focus fallback, Page for addScriptToEvaluateOnNewDocument — the hidden-
@@ -808,7 +809,7 @@ function inputLog(...a) { if (inputTraceEnabled) console.log("[ApplyPilot][INPUT
 // count across BOTH pacing regimes). chrome.debugger.sendCommand delivers in order per target, so we
 // ISSUE the sequence back-to-back and await the acks together — the renderer's input queue drains the
 // whole burst in one beat instead of paying one stall per event. Event order/semantics unchanged.
-async function cdpClickAt(x, y) {
+async function cdpClickAt(x, y, opts) {
   // HIDDEN → synthetic page-side dispatch (fast; see the synthetic-input block above). A miss
   // (no element at the point / eval hiccup) falls through to the trusted path below.
   if (await cdpSynthInput()) {
@@ -821,11 +822,28 @@ async function cdpClickAt(x, y) {
   if (inputLockActive) await actingDelta(+1);
   try {
     const base = { x: Math.round(x), y: Math.round(y), pointerType: "mouse" };
+    // DELIBERATE (2026-08-05): press, a real beat, then release — instead of the batch below.
+    // Measured on waystar's self-ID checkbox: quiet page, TRUSTED click, hit-test confirmed the click
+    // landed on the correct label, and the box still did not toggle. Activation is synthesized from a
+    // press/release PAIR and the input pipeline rides compositor frames, which a hidden tab does not
+    // produce — a pair delivered with nothing in between can fail to activate at all. A human click has
+    // ~50-100ms of gap; this restores that.
+    //
+    // SCOPED to label activation (checkbox/radio) so speed is untouched everywhere else: text, dropdown,
+    // date and Save clicks keep the batched single-drain path below. That is 1-2 clicks per page, so the
+    // gap costs ~60-120ms — nothing against the ~1.2s/event a hidden trusted click already pays.
+    if (opts && opts.deliberate) {
+      await cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 });
+      await cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 });
+      await cdpDelay(DELIBERATE_CLICK_GAP_MS);
+      await cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 });
+    } else {
     await Promise.all([
       cdpSend("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none", buttons: 0 }),
       cdpSend("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: "left", buttons: 1, clickCount: 1 }),
       cdpSend("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: "left", buttons: 0, clickCount: 1 })
     ]);
+    }
   } finally { if (inputLockActive) await actingDelta(-1); }
 }
 
@@ -4074,7 +4092,7 @@ function makeCdpActuation(llmConfig) {
       if (!rect) return false;                                          // no rect ⇒ NOTHING was dispatched
       let hit = null;
       try { hit = await cdpEval(cdpHitAt, rect.cx, rect.cy, id); } catch (e) { /* diagnostic only */ }
-      await cdpClickAt(rect.cx, rect.cy);
+      await cdpClickAt(rect.cx, rect.cy, { deliberate: true }); // label activation needs a press→release beat
       return { ok: true, cx: Math.round(rect.cx), cy: Math.round(rect.cy), hit };
     },
     focusInput: (id) => cdpEval(cdpFocusInputById, id),
