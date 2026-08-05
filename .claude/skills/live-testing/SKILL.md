@@ -8,6 +8,49 @@ description: How to live-test a real application end to end (fill -> review -> a
 Unit tests prove the logic; only a live run proves the product. This is how to do one without
 producing a false result — and most of it exists because a false result was produced that way.
 
+## START HERE — regressions the 2026-08-05 session may have introduced
+
+That session changed the input path substantially. Check these BEFORE trusting any new measurement, and
+before chasing any new bug — a new symptom is more likely to be one of these than a fresh discovery.
+
+1. **A checkbox group now costs ~2.5s even when nothing is wrong. (Confirmed, not yet fixed.)**
+   `fillCheckboxGroupCdp`'s persistence re-read loops `groupPersistRounds` (3) times at 700ms and
+   `continue`s on success instead of breaking, so it always burns the full ~2.1s; the quiescence gate
+   adds ~400ms on top because a fresh install stamps "now". Fix: break out once the value has held for
+   one or two beats, and/or shorten the beat. Pages with two groups (PSECU ethnicityMulti + disability)
+   pay it twice.
+
+2. **Synthetic input is now used on VISIBLE tabs too** (`cdpSynthInput` no longer consults visibility).
+   Two surfaces are known to IGNORE synthetic native-setter writes — the auth form and the self-ID
+   page's text/date — and both are excluded. **There may be more.** The tell is Workday reporting a
+   field "is required and must have a value" while the DOM plainly holds it. Previously visible runs
+   used trusted input everywhere and would not have hit this. If a tenant that used to pass starts
+   failing that way, add its surface to the exclusion (see `isSelfIdPage` for the pattern) rather than
+   reverting the policy — page 2 went 38.3s → 7s because of it.
+
+3. **The dropdown commit's beat ladder is still tuned for TRUSTED clicks** (`overwriteBeatLadder`, and
+   it branches on `act.visible`). Clicks are synthetic now, so its starting tier may be wrong and it may
+   be escalating — and re-opening — unnecessarily. Suspect this first if a dropdown-heavy page got
+   slower or if `[CDP-DD-REFILL]` shows commits landing on later tiers than before.
+
+4. **The two new pre-Save halts can stop a page that would have gone through.** `required-unverified`
+   and `required-unfilled` refuse to click Save when a required field reads blank. The argument is that
+   Workday refuses that page anyway — but both read the value via `cdpPageScan`, so a widget whose value
+   the scan reads as `null` even when filled would halt a good page. Watch for a halt naming a field the
+   operator can SEE filled, especially on a new tenant.
+
+5. **Every label click now pays an extra `cdpEval`** (the `cdpHitAt` hit-test in `clickRadioLabel`) plus
+   a 60ms press→release gap. Pure diagnostics, worth gating behind a flag if radio-heavy pages feel slow.
+
+6. **The paint probe decides nothing any more.** `cdpPainting` is correct and logged, but since synthetic
+   no longer depends on visibility it is diagnostic-only. Do not reason about behaviour from it, and
+   consider removing it if the log line is not earning its keep.
+
+Regression baseline from that session, all VISIBLE, for comparison:
+`cat.wd5` → REVIEW after 5 pages, 2 need review, ~16s total fill. `magna.wd3` → REVIEW after 4 pages,
+0 need review, ~10s. `waystar.wd1` → REVIEW, page 2 fill 7s. A tenant landing far off these wants
+explaining before anything else is believed.
+
 ## THE INVARIANT: nothing is ever submitted
 
 Every run in this doc is a FILL (stops at Workday's review page) or a REHEARSAL (`arm:false` — runs
@@ -104,24 +147,42 @@ Sanity-check before anything else: `await window.__apSend({type:"AP_PING"})` →
 
 ## The run loop
 
+**`javascript_tool` runs in an ISOLATED world.** Its `window` is not the page's, so a native-setter
+write does NOT reach React's state — the input shows the URL, React still holds `""`, and the Run
+button stays `disabled` forever. The old recipe (native set + `input` event, alone) does not work.
+What works is priming the value and then letting a REAL keystroke produce React's own event:
+
 ```js
-// Set the job URL. NEVER type a URL with the computer tool — it drops characters (a real run
-// died on "magna/Magna" -> "magnaMagna"). Use the native setter.
-const el = [...document.querySelectorAll("input")].find(i => /company\.wd5/.test(i.placeholder || ""));
+// 1. Prime the FULL url via the native setter (not a prefix — see below), then focus.
+const el = [...document.querySelectorAll("input")].find(i => /wd\d|myworkday/.test(i.placeholder||""));
 const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
 set.call(el, JOB_URL);
 el.dispatchEvent(new Event("input", { bubbles: true }));
-await new Promise(r => setTimeout(r, 1000));
-
-// VERIFY before clicking — the button is disabled until the URL validates, and a click on a
-// disabled button is a silent no-op that looks exactly like a run that produced nothing.
-const btn = [...document.querySelectorAll("button")].find(b => /^Run$/.test(b.textContent.trim()));
-if (el.value.length > 40 && !btn.disabled) btn.click();
+el.focus();
 ```
+Then **one real keystroke** with the computer tool — `x` then `BackSpace`. React's own handler fires,
+reads the full primed value out of the DOM, and enables the button. Verify, then click:
+```js
+const btn = [...document.querySelectorAll("button")].find(b => /^Run$/.test(b.textContent.trim()));
+({ len: el.value.length, disabled: btn.disabled });   // MUST be disabled:false before you click
+```
+
+**Click the button with JS `focus()` + a real `Return` keypress, not screenshot coordinates.**
+Coordinates drift: the screenshot is scaled, and the scale changes whenever the window resizes, so a
+`kx/ky` computed from an earlier screenshot lands somewhere else. Focus the button in JS, press
+`Return` with the computer tool, and the click is coordinate-independent:
+```js
+btn.focus(); document.activeElement.textContent;   // confirm it's the Run button, THEN press Return
+```
+If you must use coordinates, recompute the scale from the CURRENT screenshot's dimensions and
+confirm the target with `document.elementFromPoint(x, y)` before pressing.
 
 Then poll `__tail()` every ~40s. A fill is 1–4 minutes depending on page count and AI calls.
 
 For the rehearsal, same URL, but match `/Rehears/` instead of `/^Run$/`.
+
+**`Runtime.evaluate` has a ~45s ceiling.** Any in-page poll you write must finish in ≤30s slices and
+be called repeatedly, or the eval itself times out and you lose the read (not the run).
 
 ## Reading the logs — the rules that stop false conclusions
 
@@ -134,9 +195,28 @@ const last = (r.lines || []).slice(-1)[0];
 Math.round((Date.now() - last.t) / 1000);   // age in seconds — is this even your run?
 ```
 
+**Age is not enough — grade from a CURSOR.** An age check tells you the log is fresh, not that the
+line you're reading belongs to *this* run. Two runs a minute apart both look fresh. Stamp a cursor
+before you click, and only grade lines after it:
+
+```js
+window.__cur = async () => ((await window.__apSend({type:"AP_DEV_LOGS", limit:1})).lines||[]).slice(-1)[0]?.t || Date.now();
+const since = await window.__cur();          // BEFORE clicking Run
+// ...after the run...
+const r = await window.__apSend({ type:"AP_DEV_LOGS", limit:500, pattern:"REVIEW page" });
+(r.lines||[]).filter(l => l.t > since);      // only these are yours
+```
+I graded a run on the previous run's lines and reported a pass that wasn't real. The cursor is cheap;
+use it every time.
+
 **Silence can be the success signal.** The walk logs only FLAGGED records (`⚠`). A deterministic
 `filled` is not logged. So "no line for field X" often means X filled cleanly — do not read it as
 "X did not run".
+
+**Never assume whether a run was visible.** The operator may hide or alt-tab the tab mid-run, and an
+occluded tab still reports `tab.active && !minimized`. Read it from the log's own pacing line
+(`cdpPacingLabel`, plus the paint label) — that is ground truth. I labelled a hidden run "visible"
+and used it as no-regression evidence; the operator had to correct me.
 
 **Lines worth grepping**
 
@@ -175,6 +255,32 @@ whole flow and the easiest to get wrong.
 Then rehearse and confirm the log shows your value being written (`"Florida"→"Georgia"`) and the
 review page agreeing.
 
+## Debug levers — flags and probes
+
+`AP_DEV_FLAG` writes a whitelisted key into `chrome.storage.local`; the SW reads it per run, so no
+reload is needed. **Clear every flag when you're done** — several disable safety backstops, and a
+forgotten flag silently invalidates every later measurement.
+
+```js
+await window.__apSend({ type:"AP_DEV_FLAG", key:"forceTrustedInput", value:true });
+await window.__apSend({ type:"AP_DEV_FLAG", key:"forceTrustedInput", value:null }); // clear
+```
+
+| Flag | Effect |
+|---|---|
+| `forceTrustedInput` | reverts the whole run to trusted `Input.*` — the slow-but-proven path |
+| `forceWorkerTimersOff` | forces the ~1Hz throttled page-timer path (regression-test the slow path) |
+| `skipPreSaveReverify` | skips the pre-Save re-verify. **Disables a real backstop — clear it.** |
+| `debugInputTrace` | per-event input log; the keystroke-by-keystroke replay |
+| `debugGroupWatch` | ~10ms polling of a checkbox group's state, drained into the log |
+
+Read-only probes: `AP_DEV_WD_PROBE` inspects a live Workday tab without running a fill. The steps are
+opt-in **message keys**, not a mode string — `{type:"AP_DEV_WD_PROBE", urlContains:"waystar",
+fieldName:"disabilityStatus", geom:true, wrappers:true, checkIds:[...], coordClickIds:[...],
+reload:true}`. `reload:true` re-enters the page so you see what Workday renders BEFORE any fill.
+It returns `{ok:false, error:"busy"}` while a run or sweep is in flight — probe between runs, not
+during one. `AP_DEV_ATS_SCAN` is the equivalent for GH/Lever/Ashby.
+
 ## Traps that produce false results
 
 - **Don't close tabs mid-run.** `AP_DEV_CLOSE_TABS` while a run is tearing down produces
@@ -183,9 +289,24 @@ review page agreeing.
   blocks sign-in invisibly — the extension cannot see browser chrome. Symptom: sign-in submits with
   no outcome. Close stale tabs and retry.
 - **`npx next build` clobbers the dev server's `.next`.** Never build while the dev server serves.
-- **Multiple Chrome browsers connected** → you MUST ask the user which one; never pick.
+- **Never start a SECOND dev server against the same `web/`.** Two `next dev` processes share `.next`
+  and corrupt each other's build — the tell is the page loading unstyled with 404s on every CSS
+  chunk, which looks like a broken app. Fix: kill all node servers, `rm -rf web/.next`, start ONE.
+- **Multiple Chrome browsers connected** → you MUST ask the user which one; never pick. Browser names
+  can go stale mid-session; if a tool lands in the wrong browser, `switch_browser` and re-confirm by
+  opening a known page before doing anything else.
+- **The website session expires silently.** `reportApplication` starts 401ing and `/app/run`
+  redirects to `/login`; the extension log says nothing useful. Check with a `/api/applications`
+  fetch that returns `{"ok":false,"reason":"not-signed-in"}`. **Ask the operator to sign in — never
+  enter credentials yourself.**
+- **The LLM keys exhaust.** After ~25 runs: `no usable API key for gemini: every key is disabled,
+  rejected, or resting`. Every AI field then fails and the run looks like a fill regression. Check
+  `[LLM]` lines before blaming code; the fix is a new key from the operator.
 - **A dead posting returns HTTP 200** and a generic "Careers" page. Confirm with the CxS API before
   blaming the code: `GET /wday/cxs/<tenant>/<board>/job/<path>` → 403 means unpublished.
+- **Some gates are not ours to pass.** A tenant's Terms-and-Conditions checkbox, an SSO wall, or a
+  captcha is an operator step — `externalGateHalt` names these. Do not tick a legal agreement to get
+  a run further, and report the tenant as externally blocked rather than failed.
 
 ## Phantom errors — when to bump the login
 
@@ -275,3 +396,17 @@ State what was observed, with the log line. Distinguish:
 
 Never report a tenant as working end to end without the `SUBMIT GATE PASSED` line from a run whose
 age you checked.
+
+### Scoreboard as of 2026-08-05 — 6 of 10
+
+| Tenant | State |
+|---|---|
+| Aptiv, PSECU, clearesult, Home Depot | **verified live** (earlier sessions) |
+| `cat.wd5` | **verified live** — REVIEW after 5 pages, 2 need review, ~16s total fill |
+| `magna.wd3` (path-hosted) | **verified live** — REVIEW after 4 pages, 0 need review, ~10s |
+| `waystar.wd1` | reached REVIEW repeatedly; **the rehearse/gate was NOT re-run after the input fixes** — finish this one first, it is closest |
+| `copart` | externally blocked (operator gate) — not a code failure |
+| `radiancetech`, `clearwater` | unresolved; need postings |
+
+Four to go. Start with waystar's rehearsal (cheapest remaining verification), then pick new tenants
+for DOM variety per the guidance above.
