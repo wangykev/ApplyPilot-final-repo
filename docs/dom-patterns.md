@@ -2730,6 +2730,13 @@ handled in `ats.js`'s combobox path — all four are "the widget lied or wasn't 
    "some options": while the widget searches it keeps showing the PREVIOUS page, so an
    exit-on-non-empty reads a stale list and calls the value absent.
 
+**RESOLVED 2026-08-04 — see the entry at the end of this file.** The list was answering all along,
+just later than the poll waited (~4.4s on a hidden tab), and it renders "No options" while it
+searches. Two things had to change: an empty menu is no longer an answer while the widget reports
+`loading`, and the retry no longer re-types (which restarted the widget's debounce and discarded the
+in-flight search — so the old path could not have succeeded at any budget).
+
+Original write-up:
 ⚠ **Still unresolved (honest limitation):** Discord's `school--0` async list returns results for
 a hand-typed "Carnegie Mellon" in ~2s but returns NOTHING to the same query during a fill
 (`typed=true stuck=true got="Carnegie Mellon"` and `list(0)` across ~5s of polling, foreground
@@ -3162,3 +3169,49 @@ form holding the values, and only the second one is worth anything.
 The ethnicity set lands in MISSING on the review-page reconcile, which is correct and non-blocking:
 Workday's own summary page does not render the self-identification section at all, so absence there
 is not evidence the value was lost (the 2026-07-28 rule).
+
+## 2026-08-04 — a server-backed combobox says "No options" while it is still SEARCHING (Greenhouse `school--0`)
+
+Closes the 2026-07-31 (b) "still unresolved" limitation: Discord's school list answered a hand-typed
+query in ~2s but returned nothing to the identical query during a fill. Traced by running the
+shipped `atsInjReadOptions` **verbatim in the live page** on a HIDDEN tab, sampling on every DOM
+mutation from the instant the query was typed:
+
+| t | options | `loading` | menu text |
+|---|---|---|---|
+| 4–9ms | 0 | **false** | **"No options"** |
+| 23ms | 0 | **true** | "Loading..." |
+| 4049–4459ms | 1 | false | the real answer ("Swarthmore College" / "Bowdoin College") |
+
+- **The empty menu is a LIE, and it arrives before the loading state does.** The widget renders a
+  definitive "No options" for ~15ms before react-select's async `loadOptions` marks itself busy. So a
+  poll that treats "no options" as an answer can be wrong twice: during that window, and for the
+  whole 4s that follows.
+- **Nothing about this is fixable by tuning a flat budget.** Measured across four fresh queries on
+  one form: the search fires at **312–873ms** after typing (a ~300ms debounce, inflated by the hidden
+  tab's ~1Hz timer throttle) and renders at **390–4459ms**. The variance is why this looked
+  intermittent, and why it "did not reproduce" on some re-tests. `loading` is the only signal that
+  separates "no such option" from "not yet".
+- **Re-typing is the worst possible recovery.** The fill's retry cleared and re-typed the query,
+  which restarts the widget's own debounce and throws away the search already in flight — so the
+  second poll started from zero and gave up sooner. The old path could therefore never succeed on
+  this widget no matter how long it ran.
+- **The unfiltered first page is NOT a superset of the search result.** The list serves 100 rows
+  starting "Aalborg University"; the value being searched for is not on it at all (`page=1` is a real
+  network fetch, `?term=` is another). So clearing the query to "unfilter" the menu before clicking
+  DELETES the option we just matched — the commit then fails `option-not-found`. Read the menu
+  first; clear only when the option genuinely is not on screen (which is the case that rule was
+  written for — the 2026-08-02 polarity bridge, where the match came from the unfiltered list).
+- **Cache note for anyone re-tracing this:** react-select caches by query, so re-testing the SAME
+  query answers in ~9ms with no network and looks like a pass. Use a school you have not typed yet.
+
+Verified live on the fixed path, in one sequence on the real widget: type → wait through `loading`
+(4.4s) → click the searched option WITHOUT clearing → `.select__single-value` reads "Bowdoin
+College". Nothing was submitted.
+
+**Still not proven:** the 2026-08-02 (b) `#country` empty-list observation. That widget is
+client-side (244 local options, no `loading` state) so it is a different mechanism, and it has never
+reproduced. What HAS changed is that the fill no longer force-toggles and re-types a menu that is
+open and still holding its query — i.e. the "two clicks = shut, then type into a closed widget"
+shape that entry named as its leading theory is now impossible. Treat it as removed-by-construction,
+not as diagnosed.

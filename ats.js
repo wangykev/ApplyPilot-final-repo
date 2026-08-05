@@ -610,16 +610,28 @@ function atsInjReadOptions(inputSel) {
   // react-select-<name>-option-N; aria-controls / aria-owns carries the id when open.
   const listboxId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
   let scope = listboxId ? document.getElementById(listboxId) : null;
-  if (!scope) {
-    const container = el.closest(".select__container") || el.closest(".ashby-application-form-field-entry") || document;
-    scope = container.querySelector('.select__menu, [role="listbox"]') || null;
-  }
-  if (!scope) return { ok: true, open: false, options: [] };
+  const shell = el.closest(".select__container") || el.closest(".select") || el.closest(".ashby-application-form-field-entry") || el.parentElement;
+  if (!scope) scope = (shell || document).querySelector('.select__menu, [role="listbox"]') || null;
+  // LOADING is the ONLY thing that separates "the list has no such option" from "the list has
+  // not answered yet" — and a server-backed menu ANNOUNCES "No options" while its own search is
+  // still pending, so an empty read is not an answer. Traced live 2026-08-04 on Discord's
+  // school picker (a hidden tab), from the instant the query was typed:
+  //     t=4ms    0 options, "No options"      ← what a 2s poll used to believe
+  //     t=24ms   0 options, "Loading..."      ← the loading indicator appears
+  //     t=4049ms 1 option,  "Swarthmore College"
+  // react-select renders .select__loading-indicator / a "Loading..." menu message while its
+  // async loadOptions runs; aria-busy covers the same idea on other widgets.
+  const loading = !!(
+    (shell && shell.querySelector('[class*="loading"]')) ||
+    el.getAttribute("aria-busy") === "true" ||
+    (scope && /^\s*loading\b/i.test((scope.textContent || "").replace(/\s+/g, " ")))
+  );
+  if (!scope) return { ok: true, open: false, options: [], loading };
   const opts = [...scope.querySelectorAll('[role="option"], .select__option')].map((o) => ({
     text: (o.textContent || "").replace(/\s+/g, " ").trim(),
     disabled: o.getAttribute("aria-disabled") === "true",
   })).filter((o) => o.text);
-  return { ok: true, open: true, options: opts };
+  return { ok: true, open: true, options: opts, loading };
 }
 
 // Type into an open combobox's input (native setter + input) — react-select filters live.
@@ -860,6 +872,18 @@ function atsNearOptions(texts, query, limit) {
   return scored.slice(0, limit || 20).map((x) => x.t);
 }
 
+// Poll budgets for the combobox family, in ms: a SOFT deadline plus a hard CEILING that is only
+// ever reached by a widget still reporting `loading` when the soft deadline passes (see
+// atsInjReadOptions). A healthy widget exits on its first read and pays neither. `search` is
+// sized from the live measurement that earned this: Discord's school list answered at 4049ms on
+// a hidden tab, so the old flat 2000ms could not have worked no matter how it retried.
+const ATS_POLL = {
+  open: 1800, openCeil: 6000,       // the first page (itself a network fetch on a big list)
+  retry: 1500, retryCeil: 4000,     // after a forced re-open
+  search: 2000, searchCeil: 8000,   // a typed by-name query
+  restore: 1200, restoreCeil: 3000, // clearing the query to report real options
+  showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
+};
 const ATS_OPTION_CAP = 60;
 function atsAttachOptions(rec, texts) {
   const list = (texts || []).filter(Boolean);
@@ -1541,8 +1565,15 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // gated by an interval-length-INDEPENDENT state check can shrink its interval safely, and
     // waiting BEFORE the first read charged every already-open menu a full beat. The DEADLINE
     // stays real wall-clock, so a genuinely slow widget still gets its full budget.
-    const pollFor = async (ms, want) => {           // want(texts) → done?
+    const pollFor = async (ms, want, ceilMs) => {   // want(texts) → done?
       const deadline = Date.now() + ms;
+      // The CEILING is a loading allowance: while the widget itself reports that it is still
+      // fetching (atsInjReadOptions.loading), an empty menu is not an answer, so the soft
+      // deadline does not apply. Earned live 2026-08-04 — Discord's school list says
+      // "No options" at 4ms, "Loading..." at 24ms and answers at 4049ms, so NO flat budget
+      // under ~4s could ever have worked, and the retry that re-typed only restarted the clock.
+      // A widget that is not loading behaves exactly as it did before.
+      const hardDeadline = Date.now() + Math.max(ms, ceilMs || ms);
       // Keep the most INFORMATIVE read, not merely the most recent. `r.options` is always an
       // array and [] is truthy, so `last` used to be overwritten by every sample INCLUDING empty
       // ones — and on a timeout we returned whatever the final sample happened to be. A widget
@@ -1553,12 +1584,22 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // Hidden tabs re-render more raggedly, which is why this surfaced there.
       // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
       // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
-      let last = null, lastSeen = null;
+      let last = null, lastSeen = null, sawLoading = false;
       for (;;) {
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
         if (r && Array.isArray(r.options)) { lastSeen = r; if (r.options.length) last = r; }
+        if (r && r.loading) sawLoading = true;
         if (r && want(optsOf(r))) return r;
-        if (Date.now() >= deadline) return last || lastSeen;
+        const now = Date.now();
+        const loading = !!(r && r.loading);
+        if (now >= hardDeadline || (now >= deadline && !loading)) {
+          const out = last || lastSeen;
+          // Carry WHY we stopped, so a field that reaches review can name the real cause: a list
+          // that never finished loading is a different report from one that answered "nothing" —
+          // and so the recovery below knows whether a search was ever in flight to protect.
+          if (out) { out.stillLoading = loading; out.sawLoading = sawLoading; }
+          return out;
+        }
         // ⚠ REAL 150ms, not the adaptive delay. Adaptive collapses to ~20ms when timers measure
         // fast, and each poll tick is a Runtime.evaluate round trip — at that rate the polling
         // STARVES the renderer and the menu never paints. Live 2026-07-31: switching this one
@@ -1572,14 +1613,15 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
 
     let nearMatches = []; // what a by-name search turned up — the operator's real choices
     let didSearch = false; // a typed query leaves the menu FILTERED — see the commit below
+    let listPending = false; // the widget was STILL fetching when we ran out of budget
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
-    let read = await pollFor(1800, (t) => t.length > 0);
+    let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
     for (let attempt = 0; attempt < 2 && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-      read = await pollFor(1500, (t) => t.length > 0);
+      read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
     }
     if (wt === "location") {
       await typeInto(String(candidates[0]).split(",")[0]);
@@ -1596,29 +1638,49 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // exact against whatever the widget returns — a looser query never loosens the answer.
         const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
         const typed = await typeInto(query); didSearch = true;
-        let found = await pollFor(2000, (t) => t.length > 0 && hasHit(t));
+        const wantHit = (t) => t.length > 0 && hasHit(t);
+        let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
         // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
         // shows nothing — live 2026-07-31 this read as "the value isn't in the list" with
         // stuck=true, got="Carnegie Mellon University", list(0). Re-open (no-op if already
         // open) and poll again before believing a query found nothing.
         if (!optsOf(found).length) {
-          // FORCE the click: aria-expanded lies (see atsInjOpenAndReadOptions), so a
-          // non-forced re-open no-ops on a phantom-expanded widget and the menu stays shut
-          // forever. Re-type afterwards — opening can reset the query the widget just took.
-          await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-          await act.delay(250);
-          await typeInto(query);
-          found = await pollFor(1500, (t) => t.length > 0 && hasHit(t));
+          // ⚠ RECOVER ONLY FROM AN ACTUAL FAULT — a CLOSED menu, or a query the widget dropped.
+          // Re-typing restarts the widget's own debounce and DISCARDS the search already in
+          // flight, and force-clicking an OPEN menu SHUTS it (two clicks = closed), after which
+          // the text sits in a widget that shows nothing. Doing both unconditionally is how a
+          // healthy-but-slow list produced "the menu produced nothing across three polls"
+          // (#country, 2026-08-02) — the recovery was the thing breaking it. A widget that is
+          // open, still holding our query and merely slow is now simply waited out above.
+          const st = await act.eval(atsInjReadComboInput, ref.inputSel);
+          const closed = !(found && found.open);
+          const lostQuery = !(st && st.ok && String(st.value) === query);
+          const pending = !!(found && (found.sawLoading || found.stillLoading));
+          if (closed || lostQuery) {
+            // FORCE the click: aria-expanded lies (see atsInjOpenAndReadOptions), so a
+            // non-forced re-open no-ops on a phantom-expanded widget and the menu stays shut.
+            if (closed) { await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true); await act.delay(250); }
+            await typeInto(query);   // opening can reset the query the widget just took
+            found = await pollFor(ATS_POLL.retry, wantHit, ATS_POLL.searchCeil);
+          } else if (!pending) {
+            // Open, still holding our query, and it never reported a fetch: nothing is in flight,
+            // so ONE re-type is a free nudge for a local list that rendered raggedly. When the
+            // widget HAS been loading, this is exactly the wrong move — it would restart the
+            // debounce and discard the search — so that case is only ever waited out.
+            await typeInto(query);
+            found = await pollFor(ATS_POLL.retry, wantHit, ATS_POLL.retryCeil);
+          }
         }
         const seen = optsOf(found);
-        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
+        if (found && found.stillLoading) listPending = true;
+        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
         if (seen.length) nearMatches = seen;
         if (seen.length && hasHit(seen)) { read = found; break; }
       }
       if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
         await act.eval(atsInjTypeInCombo, ref.inputSel, "");
-        const restored = await pollFor(1200, (t) => t.length > 0);
+        const restored = await pollFor(ATS_POLL.restore, (t) => t.length > 0, ATS_POLL.restoreCeil);
         if (optsOf(restored).length) read = restored;
       }
     }
@@ -1641,8 +1703,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         ? ("location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser)"
            + (rec.after ? ' — the box now holds "' + rec.after + '" from your profile; confirm it, or answer it in the tab.' : " — answer it in the tab before submitting."))
         // distinguish "the control never opened" from "it opened but listed nothing" — they
-        // have different causes (an unrecognized widget vs an empty/server-backed list)
-        : ((opened && opened.ok) ? "the dropdown opened but listed no options" : "could not open the dropdown (control not found)");
+        // have different causes (an unrecognized widget vs an empty/server-backed list) — and
+        // from "its own search never came back", which is neither of those and is the operator's
+        // cue that the FORM is slow rather than the answer missing (2026-08-04).
+        : ((opened && opened.ok)
+          ? (listPending || (read && read.stillLoading)
+            ? "the form's own option list was still loading when we ran out of time — answer it in the tab, or re-run"
+            : "the dropdown opened but listed no options")
+          : "could not open the dropdown (control not found)");
       await act.eval(atsInjCloseCombo, ref.inputSel);
       return true;
     }
@@ -1691,15 +1759,25 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (didSearch) {
       const norm1 = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase();
       const showing = (t) => t.some((o) => norm1(o) === norm1(commitText));
-      await act.eval(atsInjTypeInCombo, ref.inputSel, "");
-      let back = await pollFor(900, showing);
-      // A query that matches NOTHING closes the menu outright, and clearing the text does not
-      // bring it back — so re-open before giving up (live 2026-08-02: "could not click No —
-      // no-open-listbox"). Forcing is safe here: we have just established the menu is not
-      // showing our option, so a click can only improve matters.
+      // LOOK BEFORE CLEARING. On a long server-backed list the option we matched exists ONLY in
+      // the search result — Discord's 3300-school picker does not carry "Swarthmore College" on
+      // the unfiltered first page at all — so clearing the query throws away the very option we
+      // are about to click, and the commit then fails `option-not-found`. Clear only when the
+      // option genuinely is not on screen, which is the case the clear was written for (the
+      // 2026-08-02 polarity bridge: the match came from the unfiltered list while the query had
+      // filtered the menu to zero).
+      let back = await act.eval(atsInjReadOptions, ref.inputSel);
       if (!showing(optsOf(back))) {
-        await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-        back = await pollFor(1200, showing);
+        await act.eval(atsInjTypeInCombo, ref.inputSel, "");
+        back = await pollFor(ATS_POLL.showing, showing, ATS_POLL.showingCeil);
+        // A query that matches NOTHING closes the menu outright, and clearing the text does not
+        // bring it back — so re-open before giving up (live 2026-08-02: "could not click No —
+        // no-open-listbox"). Forcing is safe here: we have just established the menu is not
+        // showing our option, so a click can only improve matters.
+        if (!showing(optsOf(back))) {
+          await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
+          back = await pollFor(ATS_POLL.retry, showing, ATS_POLL.showingCeil);
+        }
       }
     }
     const c = await act.eval(atsInjCommitOption, ref.inputSel, commitText);
@@ -1884,11 +1962,15 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
         await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
         // read-first, then poll adaptively (same rule as the deterministic path) — a one-shot
         // read after a flat wait both over-waits an open menu and under-waits a slow one
-        const optDeadline = Date.now() + 1800;
+        const optDeadline = Date.now() + ATS_POLL.open;
+        const optCeiling = Date.now() + ATS_POLL.openCeil;
         for (;;) {
           const read = await act.eval(atsInjReadOptions, ref.inputSel);
           texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
-          if (texts.length || Date.now() >= optDeadline) break;
+          const now = Date.now();
+          // …and an empty menu is not an answer while the widget is still FETCHING (2026-08-04);
+          // giving up here is what strands a required field with "no live options to choose from".
+          if (texts.length || now >= optCeiling || (now >= optDeadline && !(read && read.loading))) break;
           await act.delayFull(150); // real interval — see pollFor's note on starving the renderer
         }
       }
@@ -1959,7 +2041,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,

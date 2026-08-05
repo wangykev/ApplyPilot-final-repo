@@ -3326,3 +3326,41 @@ PSECU then ran the whole flow clean: fill -> approve 8 -> change the AI demograp
 re-approve -> rehearse -> AGREE 49 · DISAGREE 0 -> would-submit. Nothing submitted.
 
 Extension 972/972; web 117/117; typecheck green.
+
+## 2026-08-04 — the async combobox: "No options" is not an answer while the widget is still searching
+
+Closed the oldest open multi-ATS bug (the 2026-07-31 Discord `school--0` limitation) by tracing it
+instead of theorising about it. Full DOM detail + measurements: dom-patterns 2026-08-04.
+
+The diagnosis, from running the shipped reader verbatim in the live page: the widget renders **"No
+options" at 4ms**, marks itself **"Loading..." at 23ms**, and answers at **4049ms** on a hidden tab
+(the search fires 312–873ms after typing — a ~300ms debounce inflated by the ~1Hz timer throttle —
+and renders 390–4459ms in). The fill polled a flat 2000ms, then **re-typed** the query, which
+restarts that debounce and discards the in-flight search, then gave up 1500ms later. So the old path
+could not have filled this widget at any budget, and the variance is what made it look intermittent.
+
+Four changes, each pinned by a test that fails when it is reverted:
+- **`atsInjReadOptions` reports `loading`** (react-select's `.select__loading-indicator` /
+  "Loading..." menu message / `aria-busy`) — the only signal separating "no such option" from "not
+  yet". Verified live: true for the whole pending window, false the moment it answers.
+- **Poll budgets gained a loading CEILING** (`ATS_POLL`): the soft deadline no longer applies while
+  the widget says it is fetching. A widget that is not loading behaves exactly as before, and a
+  healthy one still exits on its first read, so nothing fast got slower.
+- **The retry recovers from a FAULT, not from slowness.** Force-open + re-type now fires only when
+  the menu is genuinely CLOSED or the widget dropped our query; an open widget still holding the
+  query that never reported loading gets one re-type nudge (the client-side recovery, kept and
+  pinned); one that HAS been loading is only ever waited out.
+- **Look before clearing.** A long server-backed list does not carry the searched value on its
+  unfiltered first page, so the pre-commit clear was deleting the option it was about to click
+  (`option-not-found`). It now reads the menu first and clears only if the option is not on screen.
+- Plus: a field that runs out of budget mid-fetch now says *"the form's own option list was still
+  loading"* instead of "listed no options", and the AI fallback's own option read got the same gate
+  (it was stranding required fields with "no live options to choose from").
+
+Verified live on the real widget, one sequence: type → wait through `loading` (4.4s) → click the
+searched option without clearing → the field reads "Bowdoin College". Nothing submitted. Extension
+1049/1049; web 140/140; typecheck green.
+
+Still not proven: the 2026-08-02 `#country` empty-list observation — a client-side widget, never
+reproduced. The force-toggle-and-re-type shape its entry named as the leading theory is now
+impossible, so it is removed-by-construction rather than diagnosed.

@@ -560,6 +560,128 @@ test("driver: on a LONG list the review options narrow to the near-matches; a sh
   assert.ok(shown.length <= 20, "a 302-option list is narrowed to the relevant neighbourhood");
 });
 
+// ── a SERVER-BACKED list that answers LATE (live 2026-08-04, Discord's school picker) ────────
+// Traced on a hidden tab, from the instant the query was typed: 0 options + "No options" at 4ms,
+// "Loading..." at 24ms, "Swarthmore College" at 4049ms. So the fill's flat 2s budget could never
+// have worked — and its retry made it worse by RE-TYPING, which restarts the widget's own
+// debounce and discards the search already in flight.
+const SCHOOL_BUCKETS = [{ questions: ["School"], profile_path: "education.0.school_or_university" }];
+const SCHOOL_PROFILE = Object.assign({}, PROFILE, { education: [{ school_or_university: "Swarthmore College" }] });
+const SCHOOL_SCAN = {
+  ...GH_SCAN,
+  fields: [{ fieldName: "school--0", inputSel: "#school--0", widgetType: "select", label: "School", isRequired: true, value: null, domIndex: 0 }],
+};
+
+test("driver: a list still LOADING is waited out, and the search is never restarted", async () => {
+  // The fake answers LATER than the soft search budget — the shape that used to end needs_review.
+  const ANSWER_MS = 2600;
+  let query = "", typedAt = null, committed = null;
+  const typeCalls = [];
+  const act = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { typeCalls.push(t); query = t; typedAt = Date.now(); return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => {
+      // page 1 of a 3300-school list: the value we want is NOT on it
+      if (!query) return { ok: true, open: true, options: [{ text: "Aalborg University" }], loading: false };
+      const answered = typedAt != null && Date.now() - typedAt >= ANSWER_MS;
+      // …and while the server search runs, the widget shows an EMPTY menu ("No options")
+      return { ok: true, open: true, options: answered ? [{ text: "Swarthmore College" }] : [], loading: !answered };
+    },
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "a slow list is not an absent option: " + r.detail);
+  assert.strictEqual(r.after, "Swarthmore College");
+  assert.strictEqual(typeCalls.filter((t) => t === "Swarthmore College").length, 1, "the query is typed once");
+});
+
+test("driver: a list that never finishes loading says SO, instead of 'listed no options'", async () => {
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 20, openCeil: 120, retry: 20, retryCeil: 120, search: 20, searchCeil: 200, restore: 20, restoreCeil: 60, showing: 20, showingCeil: 60 });
+  try {
+    let query = "";
+    const typeCalls = [];
+    const act = fakeAct({
+      atsInjScan: () => SCHOOL_SCAN,
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjTypeInCombo: (sel, t) => { typeCalls.push(t); query = t; return { ok: true }; },
+      atsInjReadComboInput: () => ({ ok: true, value: query }),
+      atsInjReadOptions: () => ({ ok: true, open: true, options: [], loading: true }), // never answers
+      atsInjCommitOption: () => ({ ok: true }),
+      atsInjReadValue: () => ({ ok: true, value: null }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+    const r = out.results[0];
+    assert.strictEqual(r.status, "needs_review");
+    assert.match(r.detail, /still loading/, "the operator must learn the FORM was slow, not that the answer is missing");
+    // and it must never have restarted that search: re-typing throws away what is in flight
+    assert.strictEqual(typeCalls.filter((t) => t === "Swarthmore College").length, 1,
+      "a widget that reported LOADING is waited out, never re-typed");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test("driver: a LOCAL list that rendered raggedly still gets its one re-type nudge", async () => {
+  // The counterpart to the rule above, pinned so protecting async searches does not quietly
+  // remove the recovery that a client-side widget (no loading state, e.g. Greenhouse's #country)
+  // does need: nothing is in flight, so one re-type can only help.
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 20, openCeil: 40, retry: 200, retryCeil: 200, search: 20, searchCeil: 20, restore: 20, restoreCeil: 20, showing: 20, showingCeil: 20 });
+  try {
+    let query = "", committed = null;
+    const typeCalls = [];
+    const act = fakeAct({
+      atsInjScan: () => SCHOOL_SCAN,
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjTypeInCombo: (sel, t) => { typeCalls.push(t); query = t; return { ok: true }; },
+      atsInjReadComboInput: () => ({ ok: true, value: query }),
+      // empty until the query has been typed TWICE — a widget that needed the nudge. `loading` is
+      // never set: a client-side list has no fetch to report.
+      atsInjReadOptions: () => {
+        const nudged = typeCalls.filter((t) => t === "Swarthmore College").length >= 2;
+        if (!query) return { ok: true, open: true, options: [{ text: "Aalborg University" }] };
+        return { ok: true, open: true, options: nudged ? [{ text: "Swarthmore College" }] : [] };
+      },
+      atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+      atsInjReadValue: () => ({ ok: true, value: committed }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+    assert.strictEqual(out.results[0].status, "filled", "the nudge must still exist for a local widget");
+    assert.strictEqual(committed, "Swarthmore College");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test("driver: the option a by-name search found is not cleared away before the click", async () => {
+  // A long server-backed list does not carry the value on its unfiltered first page at all, so
+  // clearing the query to 'unfilter' the menu throws away the very option we matched, and the
+  // commit then fails option-not-found. Modelled exactly: the menu shows what the query matches,
+  // and a click only lands on an option that is currently VISIBLE (as in the real DOM).
+  const PAGE1 = ["Aalborg University", "Abilene Christian University"];
+  const ALL = PAGE1.concat(["Swarthmore College"]);
+  let query = "", committed = null;
+  const visible = () => (query ? ALL.filter((s) => s.toLowerCase().startsWith(query.toLowerCase())) : PAGE1);
+  const act = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { query = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: visible().map((t) => ({ text: t })), loading: false }),
+    atsInjCommitOption: (sel, t) => (visible().includes(t) ? ((committed = t), { ok: true }) : { ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "the searched option must still be on screen when we click it: " + r.detail);
+  assert.strictEqual(committed, "Swarthmore College");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
