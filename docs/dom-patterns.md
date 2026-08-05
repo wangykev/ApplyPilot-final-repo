@@ -3325,3 +3325,30 @@ trusted re-write for exactly this reason. It still fails here because:
 already holds using TRUSTED input, rather than nudging it page-side. It changes no value, needs no
 FIELD_MAP entry, and trusted input is the one thing measured to work here. Restoring synthetic afterwards
 keeps the hidden-tab speed win for the rest of the page, exactly as Tier 1 already does.
+
+## 2026-08-05 — page 2 is slow because of TRUSTED INPUT, not occlusion (correcting the entry above)
+
+I attributed a 39s page 2 to the occlusion blind spot: window behind another app, so trusted input
+stalls on missing frames. Then a run on a tab the new paint probe CONFIRMED was painting took 38.3s.
+So occlusion was not the cause.
+
+    hidden  + synthetic    11.1s, 10.9s
+    visible + trusted      14s, 39s, 38.3s      (the 38.3s one: probe says "painting (visible)")
+
+Trusted `Input.*` is simply more expensive per event than a page-side synthetic dispatch — it goes
+through the browser's whole input pipeline, while synthetic is one Runtime.evaluate. Page 2 is the page
+dominated by input events (work experience + education text, dates, a typeahead, websites), so that is
+where the difference shows; every other page sits at 6-11s in both modes. The 14s-vs-38s spread tracks
+how much SECTION work a run had — the 38.3s run spent 14.5s on `website[0].url` alone, a field the 14s
+run never touched.
+
+What the paint probe is actually worth, stated honestly: it measures the right thing and it logs it, so
+"visible but not painting" is no longer invisible. But the new case it enables — visible AND not
+painting — has not been shown to exist or to matter, and it is NOT what made page 2 slow. It is a
+diagnostic win, not the speed win the previous entry implied.
+
+The speed lever the data does point at: if synthetic is ~3x cheaper per event and page 2 is
+event-bound, the question is not "when are we not painting" but "why use trusted input on form pages at
+all, when synthetic is already proven there and hidden runs finish page 2 in 11s". That is a policy
+change, with trusted kept where it is REQUIRED: the auth form, the self-ID page's text/date fields, and
+the single irreversible submit click.
