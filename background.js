@@ -543,7 +543,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "enableAiBatch"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -2969,7 +2969,11 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   const _fillT0 = Date.now();
   let out;
   try {
-    out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets, optionCache });
+    // enableAiBatch: opt-in until the batched-AI pre-pass is confirmed inert on a live page (see
+    // buildBatchAiPrompt). Read per run, so no reload is needed to flip it.
+    const _aiBatch = await new Promise((r) => chrome.storage.local.get("enableAiBatch", (v) => r(!!(v && v.enableAiBatch))));
+    if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch }, { cachedShapes, headingToBase, buckets, optionCache });
   } finally {
     if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
   }

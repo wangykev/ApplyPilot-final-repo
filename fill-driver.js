@@ -1022,6 +1022,10 @@ const parseAiReply = (text) => {
 // truthful `before` (it reported `ai-nomatch` where the un-batched path correctly reports
 // `ai-nomatch-stray`). Turning this on by default would trade a real safety signal for speed. Enable it,
 // watch one page's [CDP-TIME] + records, then flip the default.
+// FIRST LIVE RUN, 2026-08-06 (waystar.wd1 R3051, 5 pages, flag ON): 11 AI-filled records on 6 LLM calls
+// instead of 11, reached REVIEW, and the pre-pass was INERT — zero strays, zero ai-nomatch/commit-failed,
+// and all five pages' M40 audits "all matched the report". One tenant is not every tenant (the hazard is
+// tenant-specific), so it stays opt-in until a second shape confirms it.
 //
 // THE BATCH IS A CACHE, NOT A GATE. If a question is in it, the per-field path uses the cached answer and
 // makes no call; if it is missing — misprediction, a parse failure, a field the pre-pass never saw — that
