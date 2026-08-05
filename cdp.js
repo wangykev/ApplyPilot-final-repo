@@ -4128,6 +4128,9 @@ function makeCdpActuation(llmConfig) {
     // Wait until the DOM around `loc` has stopped mutating for `quietMs`. NEVER hangs: on the ceiling it
     // reports quiet:false and the caller proceeds anyway — a gate that can block a fill forever is worse
     // than the bug it guards. Polls SW-side on wall-clock; the page only stamps.
+    // Arm the observer EARLY (idempotent — a second call is `already:true` and does NOT re-stamp), so idle
+    // time accrues during work the caller is doing anyway and the gate below can return immediately.
+    installQuietWatch: (loc) => cdpEval(cdpInstallQuietWatch, loc.wrapperSel),
     awaitQuiet: async (loc, opts) => {
       const quietMs = (opts && opts.quietMs) || 400;
       const ceilingMs = (opts && opts.ceilingMs) || 3000;

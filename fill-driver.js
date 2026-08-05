@@ -1770,6 +1770,12 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
 // never a silent wrong answer. Zero actuation when the target is already the only one checked.
 const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   if (!act.readCheckboxGroup) return { status: "needs_review", detail: "substrate cannot read a checkbox group" };
+  // START THE QUIESCENCE CLOCK BEFORE THE WORK, not at the gate (2026-08-05). The observer install is
+  // idempotent and only STAMPS on mutation, so installing it here means the several round-trips below
+  // (the option read, and the uncheck-others loop when there is nothing to uncheck) accrue real idle
+  // time. The gate then usually finds the DOM already quiet and returns at once, instead of paying a
+  // full quietMs window per widget purely because a fresh install stamps `now`.
+  if (typeof act.installQuietWatch === "function") { try { await act.installQuietWatch(loc); } catch { /* best effort — the gate re-installs */ } }
   const opts = await act.readCheckboxGroup(loc);
   if (!opts || !opts.length) return { status: "error", detail: "no checkboxes in wrapper" };
   const optionLabels = opts.map((o) => o.labelText);
@@ -1853,20 +1859,33 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   //
   // Wall-clock on purpose (delayFull, never delayRender): we are waiting on Workday's own rebuild, which
   // takes real time no matter how fast our pacing is — the same rule the M40 audit settle follows.
-  const beat = () => (act.delayFull ? act.delayFull(budgets.groupPersistMs || 700) : act.delay(budgets.groupPersistMs || 700));
-  const rounds = budgets.groupPersistRounds == null ? 3 : budgets.groupPersistRounds;
-  let rebuilt = 0, refills = 0;
-  for (let i = 0; i < rounds; i++) {
+  //
+  // BEAT SHORT, EXIT ON A STREAK (2026-08-05). This used to be 3 fixed rounds of 700ms that `continue`d
+  // on success, so a perfectly healthy group ALWAYS paid the full ~2.1s — twice on a page with two groups.
+  // Exiting as soon as the value has held for `groupPersistHolds` consecutive reads makes the healthy
+  // case ~750ms. The beat also drops 700→250ms, which is not merely cheaper but STRICTER: the observed
+  // wipe landed ~281ms after the click, which the old 700/1400/2100 sampling could straddle entirely,
+  // whereas 250/500/750 brackets it three times. The ceiling stays ~2s of polling for a group that keeps
+  // being rebuilt, and a broken streak (unreadable, or came back cleared) restarts the count — so the
+  // early exit can only ever fire on evidence, never on a timer running out.
+  const beatMs = budgets.groupPersistMs == null ? 250 : budgets.groupPersistMs;
+  const beat = () => (act.delayFull ? act.delayFull(beatMs) : act.delay(beatMs));
+  const rounds = budgets.groupPersistRounds == null ? 8 : budgets.groupPersistRounds;
+  const holdsNeeded = budgets.groupPersistHolds == null ? 3 : budgets.groupPersistHolds;
+  let rebuilt = 0, refills = 0, holds = 0;
+  for (let i = 0; i < rounds && holds < holdsNeeded; i++) {
     await beat();
     const live = await act.readCheckboxGroup(loc);
     // Unreadable = the widget is mid-rebuild (wrapper gone, or present with no boxes). Not a failure on
-    // its own — wait for it to come back and judge it then.
-    if (!live || !live.length) { rebuilt++; continue; }
+    // its own — wait for it to come back and judge it then. The streak restarts: an unreadable beat is
+    // not evidence the value survived.
+    if (!live || !live.length) { rebuilt++; holds = 0; continue; }
     const hit = live.find((o) => o.id === target.id);
     // A rebuild can also re-issue the ids, in which case match by LABEL — the label is the stable identity.
     const byLabel = live.find((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
     const stillOn = !!((hit || byLabel) || {}).checked;
-    if (stillOn) { now = live; on = live.filter((o) => o.checked); after = (on[0] || {}).labelText || null; continue; }
+    if (stillOn) { holds++; now = live; on = live.filter((o) => o.checked); after = (on[0] || {}).labelText || null; continue; }
+    holds = 0;
     // It came back and our value is GONE — re-fill it, then keep confirming.
     const again = byLabel || hit;
     if (!again) break;                                   // the option itself no longer exists — let review own it
@@ -1892,7 +1911,10 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
     detail: (before && before !== after ? `label-click (replaced "${before}")` : "label-click")
       + (quiet ? `; waited ${quiet.waitedMs}ms for the DOM to go quiet${quiet.quiet ? "" : " (CEILING — clicked while still busy)"}` : "")
       + (rebuilt ? `; survived ${rebuilt} widget rebuild(s)${refills ? ` after ${refills} re-fill(s)` : ""}` : "")
-      + `; persistence-confirmed` };
+      // Say WHICH evidence the pass rests on: a clean streak, or a ceiling where the last fresh read
+      // happened to hold it. The second is weaker and should not read identically to the first.
+      + (holds >= holdsNeeded ? `; persistence-confirmed (held ${holds} consecutive reads)`
+         : `; persistence-confirmed on the FINAL read only — the ${holdsNeeded}-read streak was never reached in ${rounds} rounds`) };
 };
 
 // Radio: label-text exact match (case-insensitive, candidates in order — M22

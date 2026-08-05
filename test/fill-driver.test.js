@@ -526,7 +526,19 @@ function makeFakeAct(fields, opts) {
     // "cleared" = comes back with every box UNCHECKED (our value discarded), anything else = read normally.
     readCheckboxGroup: async (loc) => {
       const f = byLoc(loc);
-      if (Array.isArray(f.rebuildScript) && f.rebuildScript.length) {
+      // `rebuildAlways` takes over once the script is exhausted and then applies to EVERY later read.
+      // A fixed-length script cannot express "this never sticks" without hardcoding how many rounds the
+      // loop happens to run, so a script running dry silently turned a never-sticks fixture into a
+      // recovers-eventually one. Compose them: the script covers the pre-loop reads, this covers the rest.
+      const scripted = Array.isArray(f.rebuildScript) && f.rebuildScript.length;
+      if (!scripted && f.rebuildAlways) {
+        log.push(["readCheckboxGroup", f.rebuildAlways]);
+        if (f.rebuildAlways === "gone") return null;
+        if (f.rebuildAlways === "empty") return [];
+        if (f.rebuildAlways === "cleared") f.options.forEach((o) => { o.checked = false; });
+        return f.options ? f.options.map((o) => ({ ...o })) : null;
+      }
+      if (scripted) {
         const step = f.rebuildScript.shift();
         log.push(["readCheckboxGroup", step]);
         if (step === "gone") return null;
@@ -2850,7 +2862,8 @@ test("checkbox group persistence: a rebuild that comes back UNCHECKED is re-fill
 });
 
 test("checkbox group persistence: a rebuild that KEEPS losing it ends needs_review, never a false filled", async () => {
-  const field = genderGroup([...PRE_LOOP_READS, ...Array(9).fill("cleared")]);
+  const field = genderGroup([...PRE_LOOP_READS]);
+  field.rebuildAlways = "cleared";          // never sticks, however many rounds the loop runs
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
   const rec = out.results[0];
@@ -2861,13 +2874,55 @@ test("checkbox group persistence: a rebuild that KEEPS losing it ends needs_revi
 
 test("checkbox group persistence: unreadable to the end (wrapper gone) is needs_review, not filled", async () => {
   // The exact live signature: readCheckboxGroup returns null (wrapper missing) — "could not re-read".
-  const field = genderGroup([...PRE_LOOP_READS, ...Array(9).fill("gone")]);
+  const field = genderGroup([...PRE_LOOP_READS]);
+  field.rebuildAlways = "gone";
   const act = makeFakeAct([field]);
   const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
   const rec = out.results[0];
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.flag, "checkbox-group-rebuilt");
   assert.match(rec.detail, /never became readable/i);
+});
+
+test("checkbox group persistence: a healthy group EXITS on the hold streak, it does not burn every round", async () => {
+  // The cost bug (2026-08-05): the loop `continue`d on success instead of breaking, so a group with
+  // nothing wrong with it always paid every round — ~2.1s at the old 3x700ms, twice on a two-group page.
+  // Pinned via the READ COUNT rather than wall-clock so it cannot pass by the beat merely being shorter:
+  // with a ceiling of 8 rounds and a 2-read streak, a healthy group must read the group exactly twice
+  // inside the loop. The pre-fix code ignores the streak entirely and reads 8 times.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  let loopReads = 0;
+  const real = act.readCheckboxGroup;
+  act.readCheckboxGroup = async (loc) => { loopReads++; return real(loc); };
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {},
+    { ...T_BUDGETS, groupPersistMs: 1, groupPersistRounds: 8, groupPersistHolds: 2 });
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.after, "Male");
+  // 4 pre-loop reads (options, pre-click, post-quiescence re-resolve, post-click verify)
+  // + 2 loop reads (the streak) + 1 final fresh read + 1 M40 audit re-read = 8.
+  // Burning all 8 rounds instead of stopping at the streak would be 14.
+  assert.strictEqual(loopReads, 8, `must stop at the streak, not the ceiling (saw ${loopReads} reads)`);
+  assert.match(rec.detail, /held 2 consecutive reads/, rec.detail);
+});
+
+test("checkbox group persistence: a BROKEN streak restarts, so the early exit can never fire on a timer", async () => {
+  // The early exit is only safe because it rests on consecutive evidence. A beat that comes back cleared
+  // (re-filled) or unreadable must reset the count, or "held N reads" would be a claim about elapsed time.
+  const field = genderGroup([...PRE_LOOP_READS, null, "cleared"]); // hold, then LOSE it, then hold again
+  const act = makeFakeAct([field]);
+  let loopReads = 0;
+  const real = act.readCheckboxGroup;
+  act.readCheckboxGroup = async (loc) => { loopReads++; return real(loc); };
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {},
+    { ...T_BUDGETS, groupPersistMs: 1, groupPersistRounds: 8, groupPersistHolds: 2 });
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.flag, "checkbox-group-refilled", "the loss was seen and re-filled");
+  // The one hold before the loss must NOT count toward the streak that ends the loop.
+  assert.ok(loopReads > 7, `the broken streak must have restarted the count (saw ${loopReads} reads)`);
+  assert.match(rec.detail, /held 2 consecutive reads/, rec.detail);
 });
 
 test("checkbox group persistence: a transient unreadable beat that comes back CHECKED still passes clean", async () => {
