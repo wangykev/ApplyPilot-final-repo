@@ -6115,7 +6115,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples, externalGateHalt } = require("../lib.js");
+const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, canonicalJobUrl, expandErrorSamples, externalGateHalt } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -6333,6 +6333,33 @@ test("requiredBlankOnPage: a required field the bundle answered but the page sho
   const lost = requiredBlankOnPage(live, entries);
   assert.strictEqual(lost.length, 1);
   assert.strictEqual(lost[0].approved, "I don't wish to answer", "carries the value to put back");
+});
+
+// ── requiredEntriesAbsentFromScan — the hole requiredBlankOnPage left (2026-08-04) ─────────────────
+// A required field whose wrapper is MISSING from the live scan is not merely un-refilled by
+// requiredBlankOnPage — it is invisible to it. "Missing from the scan" is exactly what the M40 audit
+// reports as audit-unverifiable, which is how the disability self-ID group walked past that guard.
+test("requiredEntriesAbsentFromScan: a required answered entry the scan never reported is surfaced", () => {
+  const entries = [{ field_id: "P5::formField-disabilityStatus", widget_type: "checkbox_group",
+    is_required: true, current_value: "No, I do not have a disability and have not had one in the past" }];
+  const live = [{ fieldName: "disabilityForm", isRequired: true, value: "English" }]; // group absent
+  const got = requiredEntriesAbsentFromScan(live, entries);
+  assert.strictEqual(got.length, 1);
+  assert.strictEqual(got[0].name, "disabilityStatus");
+  assert.match(got[0].approved, /^No, I do not have a disability/);
+});
+test("requiredEntriesAbsentFromScan: silent when the field IS in the scan, or there is nothing to restore", () => {
+  const e = (o) => Object.assign({ field_id: "P5::formField-x", is_required: true, current_value: "v" }, o);
+  // present in the scan → requiredBlankOnPage's job, not this one
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([{ fieldName: "x", value: null }], [e({})]), []);
+  // optional → never
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ is_required: false })]), []);
+  // no answer to put back → newlyRequiredGaps owns it
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ current_value: "" })]), []);
+  // the résumé has its own re-attach step
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ widget_type: "file_upload" })]), []);
+  // a soft-deleted row is not restored
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ is_deleted: true })]), []);
 });
 
 test("requiredBlankOnPage: does NOT claim fields it can't fix, or fields that are fine", () => {

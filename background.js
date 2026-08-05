@@ -5638,8 +5638,56 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           if (stillBad.length) LOG(`   ⚠ ${stillBad.length} did not take on the retry (${stillBad.map((r) => r.field || r.fieldName).join(", ")}) — Save & Continue will surface it as a validation error.`);
           else LOG(`   ✓ re-filled; the page holds the filled values again.`);
         }
+        // The HOLE: requiredBlankOnPage only sees fields the scan reported, and a field the M40 audit
+        // could not verify is very often one the scan could not see — which is how the disability self-ID
+        // group walked straight past this guard. Probe the DOM for those directly (the scan filters
+        // repeating containers, so its silence is not proof of absence) and re-fill what really is there.
+        const absent = requiredEntriesAbsentFromScan((preSaveScan && preSaveScan.fields) || [], (bundle && bundle.entries) || []);
+        if (absent.length) {
+          const onPage = [];
+          for (const a of absent) {
+            const sel = deriveFlatWrapperSel(a.entry);
+            let exists = false;
+            try { exists = !!(sel && await act.selExists(sel)); } catch (e) { /* probe failed → treat as absent */ }
+            (exists ? onPage : null) && onPage.push(a);
+            if (!exists) LOG(`page ${page}: required "${a.name}" is in the bundle but NOT on the page (scan and DOM probe agree) — left alone, not fatal.`);
+          }
+          if (onPage.length) {
+            LOG(`page ${page}: ${onPage.length} REQUIRED field(s) the scan never reported but the DOM HAS — re-filling: ${onPage.map((a) => `"${a.name}" (filled "${a.approved}")`).join(", ")}`);
+            await replayFlatFields(act, onPage.map((a) => a.entry), new Set(onPage.map((a) => a.name)), DEFAULT_BUDGETS);
+          }
+        }
       } catch (e) {
         LOG(`(pre-save re-verify skipped: ${String((e && e.message) || e)})`);
+      }
+
+      // ── (d.2) A REQUIRED field we could not verify is NOT gambled on (2026-08-04) ──────────────────
+      // The M40 audit already caught this class every time — both live disability failures were flagged
+      // `audit-unverifiable`. The audit was never the gap: NOTHING acted on it. The only pre-Save guards
+      // were the résumé upload, the soft-error check and "is there a next button", so a required field we
+      // knew we could not verify still got a Save click, and Workday's rejection was what told us —
+      // arriving as a nav-timeout that blamed an unrelated unmapped field on a now-dirty page.
+      //
+      // This cannot cost a passing run: the ONLY halt condition is required + present on the page + empty
+      // + we hold an answer, which is exactly what Workday refuses anyway. It fails earlier, deliberately,
+      // and says which field. A field that is genuinely ABSENT is reported and NOT fatal (the replay walk's
+      // 2026-07-28 rule), and a field holding some other value is left to review + the submit gate.
+      try {
+        const finalScan = await cdpEval(cdpPageScan);
+        const stillLost = requiredBlankOnPage((finalScan && finalScan.fields) || [], (bundle && bundle.entries) || []);
+        if (stillLost.length) {
+          const flaggedBy = (n) => {
+            const r = (out.results || []).find((x) => x.fieldName === n);
+            return r && r.flag ? ` [${r.flag}]` : "";
+          };
+          LOG(`⚠ page ${page}: NOT clicking Save & Continue — ${stillLost.length} REQUIRED field(s) are on the page, hold NO value, and we do have an answer for them. Workday would refuse this page anyway; halting here says which field instead of leaving a dirty page and a nav-timeout:`);
+          stillLost.forEach((l) => LOG(`    • "${l.field.label || l.field.fieldName}"${flaggedBy(l.field.fieldName)} — we filled "${l.approved}", the page shows nothing`));
+          return { ok: true, stopped: "required-unverified", nav_timeout_page: page,
+            fields: stillLost.map((l) => ({ field: l.field.fieldName, label: l.field.label || null, intended: l.approved, flag: (((out.results || []).find((x) => x.fieldName === l.field.fieldName) || {}).flag) || null })),
+            pages_filled: pagesFilled.length, pages: pagesFilled };
+        }
+      } catch (e) {
+        LOG(`(required-unverified check skipped: ${String((e && e.message) || e)})`);
       }
 
       // ── (e) Guarded advance (clickPageNext re-checks the review marker — the 2nd guard). ──

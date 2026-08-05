@@ -1638,6 +1638,35 @@ function newlyRequiredGaps(liveFields, bundleEntries, pageKey, errorTitles) {
 //
 // Deliberately the same blank/carve-out rules as bundleSubmitBlockers so the three checks agree: a
 // checkbox stores "false" (never empty), file_upload has its own re-attach step.
+// The HOLE in requiredBlankOnPage (2026-08-04): it walks the live scan, so a required field whose
+// wrapper is MISSING from that scan is not merely un-refilled — it is invisible. And "missing from the
+// scan" is exactly what the M40 audit reports as `audit-unverifiable`, which is how the disability
+// self-ID group slipped past the one guard meant to catch it.
+//
+// So: required entries that HOLD an answer and are NOT in the live scan at all. The caller must probe the
+// DOM for each one before believing it (cdpPageScan filters out fields inside repeating containers, so
+// absence from that list is not proof of absence from the page — the same lesson replayFlatFields learned).
+function requiredEntriesAbsentFromScan(liveFields, bundleEntries) {
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
+  };
+  const blank = (v) => v == null || String(v).trim() === "";
+  const present = new Set((liveFields || []).map((f) => f && f.fieldName).filter(Boolean));
+  const out = [];
+  for (const e of bundleEntries || []) {
+    if (!e || e.is_required !== true) continue;
+    if (e.widget_type === "file_upload" || e.widget_type === "section") continue; // own re-attach / display-only
+    if (e.is_deleted) continue;
+    const name = nameOf(e);
+    if (!name || present.has(name)) continue;
+    if (blank(e.current_value)) continue;                 // nothing to put back → newlyRequiredGaps owns it
+    out.push({ name, entry: e, approved: String(e.current_value) });
+  }
+  return out;
+}
+
 function requiredBlankOnPage(liveFields, bundleEntries) {
   const nameOf = (e) => {
     const id = String((e && e.field_id) || "");
@@ -1791,5 +1820,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }
