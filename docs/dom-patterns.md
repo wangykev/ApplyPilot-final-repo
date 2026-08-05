@@ -3279,3 +3279,49 @@ evidence, not proof; this is a flake and it deserves re-checking whenever page 5
 
 **Still open:** what triggers the rebuild. It is asynchronous relative to our fill and to the audit
 (2 of 4 runs), which is why the fix confirms persistence rather than trying to schedule around it.
+
+## 2026-08-04 (c) — HIDDEN runs: Workday rejects synthetic text/date on the Self Identify page
+
+Operator's instinct, and it found a bug the visible runs never could: "test it on hidden too". Hidden is
+a different actuation path — `cdpSynthInput()` returns true only when the tab is hidden, so a background
+fill dispatches page-side synthetic events instead of trusted `Input.*`.
+
+    hidden + SYNTHETIC   2 / 2 FAILED
+    hidden + TRUSTED     1 / 1 passed      (chrome.storage.local.forceTrustedInput)
+    visible (trusted)    11 / 12 passed
+
+The two hidden failures are identical, and the shape is new:
+
+    page errors (2):
+      • Error-NameThe field Name is required and must have a value.
+      • Error-DateThe field Date is required and must have a value.
+    [FIELD-DIAG] name="Kevin Wang"* · dateSignedOn="08/04/2026"* · disabilityStatus="No, I do not have…"*
+
+**Workday says the fields are empty while the DOM plainly holds the values.** So the synthetic
+native-setter write lands in the DOM and the application never registers it. That is the SAME failure
+this repo already recorded for the AUTH form ("fields read back OK but the Sign In submit never fired;
+the auth app doesn't register native-setter values"), which is why onboarding stays trusted. The Self
+Identify page is a second such surface, and `forceTrustedInput` clears it outright.
+
+Two useful side-findings:
+
+* **The checkbox-group fixes hold under synthetic.** `disabilityStatus` committed and kept its value on
+  both hidden runs (quiescence gate waited 440ms / 425ms). The group was never the hidden problem.
+* **No DOM-based guard can catch this.** The pre-Save re-verify, `requiredBlankOnPage` and the new
+  required-unverified/unfilled halts all read the DOM — which agrees with us. Only Workday disagrees.
+
+**Why the existing remediation does not save it.** The ladder already has both a Tier-1 trusted re-fill
+and a Tier-0.5 phantom-required nudge, and the 2026-08-02 entry already demoted the nudge below the
+trusted re-write for exactly this reason. It still fails here because:
+
+  1. Tier 1 selects fields via `mappedFieldsFromErrors`, which only considers fields present in
+     `FIELD_MAP` (`if (!f || !fm[f.fieldName]) continue`). `name` and `dateSignedOn` on this page are
+     AI/recognizer-filled and are NOT in FIELD_MAP, so `refill` comes back empty and Tier 1 is skipped.
+  2. Tier 0.5 then runs, correctly identifies the phantom ("Workday says Name + Date are empty, but the
+     page HOLDS …"), and applies a focus→blur nudge via `cdpEval` — page-side again, i.e. the very kind
+     of interaction this surface ignores. `remediation made NO PROGRESS` and the walk halts.
+
+**The fix this points at** (not yet built): the phantom-required remedy should RE-TYPE the value the page
+already holds using TRUSTED input, rather than nudging it page-side. It changes no value, needs no
+FIELD_MAP entry, and trusted input is the one thing measured to work here. Restoring synthetic afterwards
+keeps the hidden-tab speed win for the rest of the page, exactly as Tier 1 already does.
