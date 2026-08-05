@@ -3874,7 +3874,14 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
-    await cdpSetFocusEmulation(true).catch(() => {}); // hidden tab keeps repainting (the discover lever)
+    await cdpSetFocusEmulation(true).catch(() => {});
+    { const forced = await cdpForceRender(true).catch(() => false);
+      try { console.log(`[ApplyPilot][CDP] render forcing ${forced ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ } } // hidden tab keeps repainting (the discover lever)
+    // …and actually MAKE it render: focus emulation only changes what the page believes, while a
+    // screencast puts the tab under capture, which is what keeps Chrome's compositor producing the
+    // frames rAF (and therefore every menu paint) waits on. Proven by the paint probe below.
+    const forced = await cdpForceRender(true).catch(() => false);
+    try { console.log(`[ApplyPilot][CDP] render forcing ${forced ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ }
 
     // JD scrape on the POSTING page (we may still be on it) before navigating away.
     emitRunProgress("Reading the job description");
