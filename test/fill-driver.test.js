@@ -6137,7 +6137,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, canonicalJobUrl, expandErrorSamples, externalGateHalt } = require("../lib.js");
+const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, canonicalJobUrl, expandErrorSamples, externalGateHalt, isSelfIdPage } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -6480,6 +6480,32 @@ test("duplicateErrorSection: a non-duplicate error, or a duplicate about nothing
   assert.strictEqual(duplicateErrorSection(["The field School is required"]), null, "a plain required-field error must not trigger a section delete");
   assert.strictEqual(duplicateErrorSection(["Duplicate entries are not allowed"]), null, "names no section → no guess");
   assert.strictEqual(duplicateErrorSection([]), null);
+});
+
+// ── isSelfIdPage — the surface that ignores synthetic writes (2026-08-04) ───────────────────────
+test("isSelfIdPage: recognized by its own fields, not by tenant", () => {
+  const f = (...n) => n.map((x) => ({ fieldName: x }));
+  assert.strictEqual(isSelfIdPage(f("disabilityForm", "name", "employeeId", "dateSignedOn", "disabilityStatus")), true, "the live waystar page 5 field set");
+  assert.strictEqual(isSelfIdPage(f("disabilityStatus")), true, "the OFCCP group alone is enough");
+  assert.strictEqual(isSelfIdPage(f("name", "dateSignedOn")), true, "the signature pair is enough");
+  // and it must NOT claim ordinary pages, or every page would lose the hidden-tab speed win
+  assert.strictEqual(isSelfIdPage(f("legalName--firstName", "addressLine1", "phoneNumber")), false, "page 1");
+  assert.strictEqual(isSelfIdPage(f("ethnicity", "gender", "hispanicOrLatino", "veteranStatus")), false, "voluntary disclosures");
+  assert.strictEqual(isSelfIdPage(f("name")), false, "a bare name field is not a signature block");
+  assert.strictEqual(isSelfIdPage([]), false);
+});
+
+// ── sectionsFromErrorNames must not route a FLAT field's own name to a section (2026-08-04) ──────
+test("sectionsFromErrorNames: a bare \"Name\" that IS a flat field on this page routes nowhere", () => {
+  // Live: the one remaining error on Self Identify was "Name" — the signature field, right there as a
+  // flat field — and it re-ran workExperience AND education because containment matches schoolName.
+  const flat = [{ fieldName: "name", label: "Name" }, { fieldName: "dateSignedOn", label: "Date" }];
+  assert.deepStrictEqual(sectionsFromErrorNames(["Name"], flat), [], "must not drag sections in");
+  // …while a genuine section field still routes, with the same flat list present
+  assert.ok(sectionsFromErrorNames(["Degree"], flat).length > 0, "a real section field still routes with the same flat list present");
+});
+test("sectionsFromErrorNames: with no flat list it behaves exactly as before (back-compat)", () => {
+  assert.ok(sectionsFromErrorNames(["Name"]).length > 0, "the old loose behaviour is unchanged when no page context is given");
 });
 
 // ── EXTERNAL GATES (2026-08-04) ────────────────────────────────────────────────────────────────

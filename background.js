@@ -2952,8 +2952,26 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   } catch (e) { LOG("[GROUP-WATCH] install skipped:", String((e && e.message) || e)); }
 
+  // ── A SELF-ID PAGE IS FILLED WITH TRUSTED INPUT, EVEN HIDDEN (2026-08-04) ──────────────────────
+  // Workday does not register synthetic (page-side native-setter) writes on this surface: hidden runs
+  // failed 2/2 with Name and Date reported empty on a page holding both, and the same run passed under
+  // forceTrustedInput. Repairing it afterwards is not reliable either — a trusted re-type cleared the
+  // date but not the name. So enter the values trusted from the start, exactly as onboarding does on the
+  // auth form for the same reason. Scoped to THIS page, so every other page keeps the hidden speed win;
+  // the cost is trusted input's ~1.2s/event on a handful of fields, and only when the tab is hidden.
+  const _selfId = isSelfIdPage((preScan && preScan.fields) || []);
+  const _synthWas = typeof cdpSyntheticInputEnabled === "function" ? cdpSyntheticInputEnabled() : false;
+  if (_selfId && _synthWas) {
+    LOG("this is a SELF-ID page — filling it with TRUSTED input (Workday ignores synthetic writes here; hidden runs failed 2/2 on it). Synthetic is restored for the next page.");
+    cdpSetSyntheticInput(false);
+  }
   const _fillT0 = Date.now();
-  const out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets, optionCache });
+  let out;
+  try {
+    out = await drivePageFill(act, prepared, defaults, jobContext, {}, { cachedShapes, headingToBase, buckets, optionCache });
+  } finally {
+    if (_selfId && _synthWas) cdpSetSyntheticInput(true); // never leave the run slower than it needs to be
+  }
   const fillMs = Date.now() - _fillT0;
   if (_gwSel) {
     try {
@@ -3453,7 +3471,11 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
     //    drivePageFill({onlySections}) — reconcile-UP + re-fill. preserveExtras: the re-run NEVER
     //    reconciles DOWN (entries beyond profile-N may be the operator's manual additions). ──
     if (!didSomething) {
-      const secNames = sectionsFromErrorNames(named);
+      // Pass this page's FLAT records so a flat field's own name cannot route the error to a section
+      // (records keyed `section[i].field` are the repeating ones — excluded by the bracket).
+      const flatHere = ((out && out.results) || []).filter((r) => r && r.fieldName && !r.fieldName.includes("["))
+        .map((r) => ({ fieldName: r.fieldName, label: r.label }));
+      const secNames = sectionsFromErrorNames(named, flatHere);
       if (secNames.length) {
         LOG(`  attempt ${attempt} (Tier 1.6, deterministic): error names section field(s) [${named.join(", ")}] → re-run section(s) [${secNames.join(", ")}] (no AI, manual entries preserved).`);
         const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames), preserveExtras: true });

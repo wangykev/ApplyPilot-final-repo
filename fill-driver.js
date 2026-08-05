@@ -4078,9 +4078,25 @@ const normTitle = (s) => String(s == null ? "" : s).toLowerCase()
   .replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
 const camelWords = (s) => normTitle(String(s || "").replace(/([a-z])([A-Z])/g, "$1 $2"));
 const titleContains = (a, b) => !!(a && b && (a === b || a.includes(b) || b.includes(a)));
-function sectionsFromErrorNames(names) {
+function sectionsFromErrorNames(names, flatFields) {
   const norm = normTitle, words = camelWords, contains = titleContains;
-  const nList = (Array.isArray(names) ? names : []).map(norm).filter((n) => n && n.length >= 3); // <3 chars = too generic to anchor a section re-run
+  let nList = (Array.isArray(names) ? names : []).map(norm).filter((n) => n && n.length >= 3); // <3 chars = too generic to anchor a section re-run
+  // A name that IS a FLAT field on this page is not a section field (2026-08-04). The match below is
+  // bidirectional containment, so a bare "Name" matches schoolName / companyName and drags whole
+  // sections into a re-run: live on waystar's Self Identify page, the one remaining error "Name" — the
+  // signature field, sitting right there as a flat field — re-ran workExperience AND education, which
+  // cleared nothing and burned the attempt that halt-on-no-progress then spent. EXACT match only, so
+  // this can never suppress a genuine section field that merely resembles a flat one.
+  const flat = Array.isArray(flatFields) ? flatFields : [];
+  if (flat.length && nList.length) {
+    const owned = new Set();
+    for (const f of flat) {
+      if (!f) continue;
+      const l = norm(f.label); if (l) owned.add(l);
+      const w = words(f.fieldName); if (w) owned.add(w);
+    }
+    nList = nList.filter((n) => !owned.has(n));
+  }
   if (!nList.length) return [];
   const out = [];
   for (const sec of PAGE_SECTIONS) {

@@ -656,6 +656,23 @@ function expandErrorSamples(samples) {
   return out;
 }
 
+// ── SURFACES THAT IGNORE SYNTHETIC INPUT (2026-08-04) ───────────────────────────────────────────────
+// Measured on waystar's Self Identify page: a HIDDEN run (which dispatches page-side synthetic events)
+// failed 2/2 with Workday reporting Name and Date as required-and-empty on a page whose DOM plainly held
+// both, and the SAME run passed with forceTrustedInput. A trusted re-type afterwards cleared the date but
+// not the name, so patching it up after the fact is not reliable — the values have to be entered trusted
+// in the first place. This is the second such surface: the AUTH form behaves identically, which is why
+// onboarding has always run trusted.
+//
+// Detected by its OWN FIELDS, not by tenant, because the reason we care is a property of the surface
+// rather than of the company. The signature block is the tell: the OFCCP disability self-ID group, its
+// language selector, or the name+date signature pair.
+function isSelfIdPage(scanFields) {
+  const names = new Set((Array.isArray(scanFields) ? scanFields : []).map((f) => f && f.fieldName).filter(Boolean));
+  if (names.has("disabilityStatus") || names.has("disabilityForm")) return true;
+  return names.has("dateSignedOn") && names.has("name");
+}
+
 // ── EXTERNAL GATES: a page Workday refuses for a reason no fill can satisfy (2026-08-04) ──────────
 // Live on copart.wd12 (Software Engineering Intern): five pages filled and verified, then Save &
 // Continue came back "You must complete the assessment test to continue with your job application.
@@ -1820,5 +1837,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }
