@@ -4503,7 +4503,64 @@ async function replayAttachResume(LOG) {
 // tab VISIBLE (eyes-on) for the first walks. [CDP-REPLAY-WALK] in the SW console.
 const REPLAY_MAX_PAGES = 8; // mirror WALK_MAX_PAGES — the review/session checks are the real stops; this only backstops a detection-bug loop.
 const MAX_RELOAD_RETRIES = 2; // reload-retry cap per RUN (a reload returns Workday to page 1, so a transient render-flake RESTARTS the whole walk) — ≤2 restarts, then halts honestly.
+// Phantom-required RETREATS per replay run (back one page + Save & Continue forward). 2: the first is the
+// remedy, the second covers one flake. A third would mean navigation is not the variable at all — at which
+// point the fault is in how the value is typed, and more retreats cannot find it.
+const MAX_REPLAY_PHANTOM_RETREATS = 2;
 const MAX_REPLAY_SOFT_RELOADS = 3; // Workday soft-error reloads per REPLAY run — mirrors the fill walk's MAX_SOFT_RELOADS (a soft error is transient; 3 strikes ⇒ hand it to the operator).
+
+// ── RETREAT ONE PAGE AND COME BACK (2026-08-05) ─────────────────────────────────────────────────────
+// The phantom-required remedy for "Workday's model lost an answer its own DOM still shows". A RELOAD does
+// not fix it (live-refuted, dom-patterns 2026-08-05) because it restores the same broken model. Stepping
+// BACK and pressing Save & Continue forward is different in kind: Workday re-POSTs the previous page and
+// re-DERIVES this one's model. This is the operator's own manual fix.
+//
+// Every step is VERIFIED by the page signature actually changing, because a tolerant text-based control
+// finder can always be wrong on a new tenant, and "the click did nothing" must never read as "we retreated".
+// Returns { ok, stage, detail } — on !ok the caller falls through to its normal halt, no worse off.
+async function retreatAndReturn(act, LOG) {
+  const sigBefore = cdpPageSig(await cdpEval(cdpPageScan));
+  const back = await cdpEval(cdpFindPageBackControl);
+  if (!back || !back.found) return { ok: false, stage: "find-back", detail: `no Back control found${back && back.sampled ? ` (buttons seen: ${back.sampled.slice(0, 10).join(" | ")})` : ""}` };
+  LOG(`  retreat: clicking ${JSON.stringify(back.label)}${back.automationId ? ` [${back.automationId}]` : ""} at (${back.cx},${back.cy}).`);
+  await cdpWakePage();
+  await cdpClickAt(back.cx, back.cy);
+  // Workday may interpose a "you have unsaved changes / leave this page?" dialog. Poll briefly: it renders
+  // a beat after the click, and its absence is equally normal (nothing unsaved).
+  let dlg = null;
+  for (let i = 0; i < 6; i++) {
+    await cdpDelay(400);
+    dlg = await cdpEval(cdpFindLeaveDialogConfirm);
+    if (dlg && dlg.found) break;
+    if (dlg && dlg.reason && /agreement/.test(dlg.reason)) return { ok: false, stage: "leave-dialog", detail: dlg.reason + (dlg.text ? ` — "${dlg.text}"` : "") };
+    const sigNow = cdpPageSig(await cdpEval(cdpPageScan));
+    if (sigNow !== sigBefore) { dlg = null; break; }   // went back with no dialog at all
+  }
+  if (dlg && dlg.found) {
+    LOG(`  retreat: confirming the leave-page dialog via ${JSON.stringify(dlg.label)}.`);
+    await cdpClickAt(dlg.cx, dlg.cy);
+    await cdpDelay(800);
+  }
+  // Did we actually LEAVE? Poll the signature — never assume the click worked.
+  let left = false;
+  for (let i = 0; i < 12 && !left; i++) {
+    await cdpDelay(500);
+    await cdpWakePage();
+    left = cdpPageSig(await cdpEval(cdpPageScan)) !== sigBefore;
+  }
+  if (!left) return { ok: false, stage: "verify-back", detail: "the Back click did not change the page signature — we never left the page" };
+  await awaitFieldSetSettled(LOG, "  retreat(prev page)");
+  // Forward again via the SAME guarded Save & Continue the walk uses everywhere (it independently refuses
+  // on the review page, so this can never become a submit).
+  const sigPrev = cdpPageSig(await cdpEval(cdpPageScan));
+  const click = await act.clickPageNext();
+  if (!click || !click.clicked) return { ok: false, stage: "forward", detail: `Save & Continue on the previous page was not clicked: ${JSON.stringify(click)}` };
+  const res = await cdpWaitNextPage(sigPrev);
+  if (res.maintenance) return { ok: false, stage: "forward", detail: "Workday maintenance page after the retreat" };
+  if (res.sessionDead) return { ok: false, stage: "forward", detail: "session died during the retreat" };
+  if (res.timeout) return { ok: false, stage: "forward", detail: "the previous page would not advance forward again" };
+  return { ok: true, stage: "returned", detail: `stepped back${dlg && dlg.found ? " (confirmed the leave dialog)" : ""} and came forward again` };
+}
 
 // Reload the attached tab (Page.reload) and wait for it to be INTERACTIVE again — the transient-failure
 // retry for both walks (operator ask 2026-07-11). Polls document.readyState==="complete" + a live form
@@ -4738,6 +4795,8 @@ async function runCdpReplayWalk(tabId, opts) {
     // Save & Continue, so the review page can be checked for those exact values coming back.
     let phantomDeleted = [];
     let dupFixes = 0; // per-RUN budget — a duplicate error that survives the fix is a real problem, not a retry loop
+    let phantomRetreats = 0; // per-RUN budget for the back-a-page remedy (own budget: a retreat is not a soft-error reload)
+    let sawPhantom = false;  // did a phantom-required block happen? (evidence-gated: every error-named field is ON the page AND holds a value)
     let phantomNudges = 0; // per-RUN budget for the blur-race fix (nudgePhantomRequired) — same reasoning: if a focus→blur commit doesn't clear it, it isn't the blur race
     let forcedRefills = 0; // per-RUN budget for the mechanism-agnostic force-re-actuate remedy (skip-if-correct OFF) — if re-WRITING the approved value doesn't clear it, re-writing it again won't either
 
@@ -5262,6 +5321,7 @@ async function runCdpReplayWalk(tabId, opts) {
           const nudge = await nudgePhantomRequired(act, samples, LOG);
           if (nudge.ran) {
             phantomNudges++;
+            sawPhantom = true; // nudgePhantomRequired's evidence gate IS the phantom signature: named + present + holding a value
             const sig3 = cdpPageSig(await cdpEval(cdpPageScan));
             await cdpWakePage();
             const click3 = await act.clickPageNext();
@@ -5290,12 +5350,30 @@ async function runCdpReplayWalk(tabId, opts) {
         // page 1 replayed "15 field(s) — 0 changed, 13 already-correct" — so skip-if-correct does behave
         // as the operator described; it is the REMEDY that is wrong, not the cost.
         //
-        // The untried remedy (operator, and the one to implement next) is NOT a reload: click BACK one
-        // page, confirm Workday's leave-page dialog, then Save & Continue FORWARD again — which makes
-        // Workday re-POST the previous page and re-derive this page's model server-side, instead of
-        // restoring the same broken one. That needs a DOM trace of the Back control + the confirm dialog
-        // first (this repo has never touched either), per "trace the real DOM before writing a handler".
-        // See docs/dom-patterns.md 2026-08-05.
+        // So the remedy is NOT a reload: step BACK one page, confirm Workday's leave-page dialog, then
+        // Save & Continue FORWARD — Workday re-POSTs the previous page and re-DERIVES this page's model
+        // rather than restoring the same broken one. That is the operator's own manual fix, and it is the
+        // only one not yet refuted. See docs/dom-patterns.md 2026-08-05.
+        //
+        // On the way back the page is re-replayed by the normal loop, and skip-if-correct means only the
+        // field(s) that did not latch get re-written (measured: 13 of 15 already-correct on a re-entry).
+        // If this ALSO fails, the conclusion is forced and worth stating: the navigation is then proven
+        // not to be the variable, so the fault is in HOW WE TYPE THE DATE — the digits never reach
+        // Workday's backend — and the next investigation belongs in the date actuation, not here.
+        if (sawPhantom && phantomRetreats < MAX_REPLAY_PHANTOM_RETREATS) {
+          phantomRetreats++;
+          LOG(`⚠ page ${page}: Workday's model still calls [${samples.map((t) => parseErrorFieldName(t)).filter(Boolean).join(", ")}] empty on a page that HOLDS them — no in-page write reaches a model that lost the answer. STEPPING BACK one page and coming forward again (retreat ${phantomRetreats}/${MAX_REPLAY_PHANTOM_RETREATS}).`);
+          const ret = await retreatAndReturn(act, LOG);
+          if (ret.ok) {
+            LOG(`  retreat: ${ret.detail} — re-replaying this page (only the field(s) that did not latch will change).`);
+            sawPhantom = false;
+            // We are back on the SAME physical page, so re-run the body with the SAME ordinal — the
+            // loop's own page++ would otherwise renumber it and mis-key the bundle selection.
+            page--;
+            continue;
+          }
+          LOG(`  ⚠ retreat FAILED at "${ret.stage}": ${ret.detail} — falling through to the halt below.`);
+        }
         // ── CASCADE-REVEALED REQUIRED FIELDS → back to REVIEW, not a blind halt (2026-07-27). ──
         // A field the form has since made REQUIRED, which the approved bundle can't answer (absent, or
         // present-but-BLANK because it was optional at fill time), is a question for the human — so
