@@ -8,6 +8,48 @@ description: How to live-test a real application end to end (fill -> review -> a
 Unit tests prove the logic; only a live run proves the product. This is how to do one without
 producing a false result — and most of it exists because a false result was produced that way.
 
+## START HERE — 2026-08-06 session notes (read before the older list below)
+
+**The checkbox-group cost bug (item 1 below) is FIXED and live-exercised.** Beat 700→250ms with an exit
+on a 3-read hold streak, and the quiet observer is armed at the top of `fillCheckboxGroupCdp` instead of
+at the gate. Healthy group ~2.5s → ~750ms. Live evidence it did not break the commit: on waystar the FILL
+walk committed `disabilityStatus` (`filled_review`) and advanced under the new timing, twice.
+
+**The blocker to know about: Workday drops SELF-ID answers when you re-enter a saved application.** This
+is one class with two faces, and it is what stops waystar reaching the gate:
+- `dateSignedOn` — the page (DOM + React props + React fiber, `ariaInvalid` null) holds `8/5/2026` and
+  Workday still refuses Save with "The field Date is required". Its form MODEL lost the answer.
+- `disabilityStatus` — the checkbox group arrives EMPTY on a later replay and will not re-commit
+  (`asked for [No, I do not have a disability…] and it holds []`).
+The FILL walk fills both fine and reaches review; only the REPLAY (which by definition re-enters a saved
+application) hits it. So do not read it as a fill regression, and do not blame the checkbox timing.
+
+Remedies, with verdicts — **four are refuted, do not re-try them**: trusted re-write of the field ✗,
+focus→blur nudge ✗ (3 live failures), byte-identical re-type (a no-op by construction — `forceSegmentTransition`
+now empties each segment first) ✗, reload + replay from page 1 ✗ (page 5 reached 3x, both re-entries hit the
+identical error). Full FIELD-DIAG evidence: `docs/dom-patterns.md` 2026-08-05.
+
+**Next thing to try, already built but NOT yet exercised live:** `retreatAndReturn` — step BACK one page,
+confirm Workday's leave-page dialog, Save & Continue forward, re-replay. Gated on the phantom signature,
+budget 2. It never fired in testing because that run halted on the checkbox group first. **If it runs and
+the page is STILL refused, that is the answer, not a dead end:** navigation is then proven not to be the
+variable, so the fault is in how the date digits are typed — they never reach Workday's backend — and the
+investigation moves to the date actuation.
+
+**Two workflow facts that cost me time:**
+- **The extension's site session expires every ~20 minutes.** `reportApplication` 401s (a completed fill's
+  bundle never reaches the website — and there is NO re-push message, so the whole fill has to be re-run)
+  and the review pull 401s (the submit run then correctly REFUSES rather than replaying another
+  application's values). Re-link with `/app/connect` → **"Link for tracking only"** (NOT "Sync everything",
+  which overwrites the extension's profile/resume). Re-link right before a rehearsal.
+- **Driving the UI: use JS `.click()`, not MCP ref-clicks or focus+Return.** MCP `left_click` by ref and a
+  real `Return` on a focused button both failed to reach React's handler on `/app/run` — the run simply
+  never started, with no error anywhere. `[...document.querySelectorAll("button")].find(b=>/^Run$/.test(b.textContent.trim())).click()`
+  works (a dispatched click bubbles to React's delegated listener; only *value* setting is blocked from the
+  isolated world). Firing the extension message directly (`AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`)
+  is equivalent to the button and is what I ended up using.
+- Keep every in-page `setTimeout` poll **≤30s** — `Runtime.evaluate` dies at ~45s and you lose the read.
+
 ## START HERE — regressions the 2026-08-05 session may have introduced
 
 That session changed the input path substantially. Check these BEFORE trusting any new measurement, and
@@ -404,7 +446,7 @@ age you checked.
 | Aptiv, PSECU, clearesult, Home Depot | **verified live** (earlier sessions) |
 | `cat.wd5` | **verified live** — REVIEW after 5 pages, 2 need review, ~16s total fill |
 | `magna.wd3` (path-hosted) | **verified live** — REVIEW after 4 pages, 0 need review, ~10s |
-| `waystar.wd1` | reached REVIEW repeatedly; **the rehearse/gate was NOT re-run after the input fixes** — finish this one first, it is closest |
+| `waystar.wd1` | **fill + review + approve verified live 2026-08-06** (REVIEW after 5 pages, 64 fields, 11 flagged → 11/11 approved → "Ready to submit"). **Gate NOT reached**: the rehearsal halts on the self-ID re-entry blocker above, not on anything in the fill. |
 | `copart` | externally blocked (operator gate) — not a code failure |
 | `radiancetech`, `clearwater` | unresolved; need postings |
 
