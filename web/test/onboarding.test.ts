@@ -27,8 +27,11 @@ const ALL_DONE = facts({ hasResume: true, profileApprovedAt: "2026-08-06T00:00:0
 
 /* ── the step order the flow is built on ─────────────────────────────────── */
 
-test("the steps are resume → profile → AI, in that order", () => {
-  assert.deepEqual([...ONBOARDING_STEPS], ["resume", "profile", "ai"]);
+test("the steps are AI key → resume → profile: a DEPENDENCY chain, not a preference", () => {
+  // The key must come first because parsing a resume is a model call, and the parse is what
+  // fills the profile the last step approves. Reorder this and a new user reaches the
+  // profile step with an empty form.
+  assert.deepEqual([...ONBOARDING_STEPS], ["ai", "resume", "profile"]);
 });
 
 test("each step reads its own fact", () => {
@@ -41,19 +44,20 @@ test("each step reads its own fact", () => {
 });
 
 test("currentStep is the FIRST unfinished step, so the flow opens where you left off", () => {
-  assert.equal(onboardingStatus(facts()).currentStep, "resume");
-  assert.equal(onboardingStatus(facts({ hasResume: true })).currentStep, "profile");
+  assert.equal(onboardingStatus(facts()).currentStep, "ai");
+  assert.equal(onboardingStatus(facts({ usableKeys: 1 })).currentStep, "resume");
   assert.equal(
-    onboardingStatus(facts({ hasResume: true, profileApprovedAt: "x" })).currentStep,
-    "ai"
+    onboardingStatus(facts({ usableKeys: 1, hasResume: true })).currentStep,
+    "profile"
   );
   assert.equal(onboardingStatus(ALL_DONE).currentStep, null);
 });
 
 test("a LATER step being done does not skip an earlier one", () => {
-  // Keys added first (via the step-1 detour) must not let the resume step be passed over.
-  const s = onboardingStatus(facts({ usableKeys: 1 }));
-  assert.equal(s.currentStep, "resume");
+  // An existing account can arrive with a resume already stored and no key; that must not
+  // let the key step be passed over, because the resume step's parse depends on it.
+  const s = onboardingStatus(facts({ hasResume: true }));
+  assert.equal(s.currentStep, "ai");
   assert.equal(s.complete, false);
   assert.equal(s.doneCount, 1);
 });
@@ -71,7 +75,8 @@ test("a finished flow STAYS finished after the underlying data changes", () => {
   // mid-task. The pages that genuinely need a resume check for themselves.
   const afterRemoval = facts({ completedAt: "2026-08-06T00:00:00Z" });
   assert.equal(onboardingStatus(afterRemoval).complete, true);
-  assert.equal(onboardingStatus(afterRemoval).currentStep, "resume");
+  // currentStep still points at real unfinished work — `complete` is what the gate reads.
+  assert.equal(onboardingStatus(afterRemoval).currentStep, ONBOARDING_STEPS[0]);
 });
 
 /* ── the stored record ───────────────────────────────────────────────────── */

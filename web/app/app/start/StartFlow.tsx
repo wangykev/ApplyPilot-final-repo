@@ -39,9 +39,9 @@ import { clsx } from "@/lib/clsx";
 type View = OnboardingStepId | "done";
 
 const STEP_META: Record<OnboardingStepId, { title: string; rail: string; icon: typeof FileText }> = {
+  ai: { title: "Add your AI key", rail: "AI key", icon: Sparkles },
   resume: { title: "Attach your resume", rail: "Resume", icon: FileText },
   profile: { title: "Approve your profile", rail: "Profile", icon: IdCard },
-  ai: { title: "Add your AI key", rail: "AI key", icon: Sparkles },
 };
 
 export function StartFlow({
@@ -68,15 +68,7 @@ export function StartFlow({
   const [savedProfile, setSavedProfile] = useState<Profile>(profile);
 
   const status = useMemo(() => onboardingStatus(facts), [facts]);
-  const [view, setView] = useState<View>(status.complete ? "done" : (status.currentStep ?? "resume"));
-  /**
-   * Parsing a resume needs a key, but the key is step 3 — so step 1 can send you ahead to
-   * fetch one and this remembers to send you back. The ORDER is unchanged: the flow still
-   * refuses to finish until all three are done. Without the detour a brand-new user would
-   * have to type their whole profile by hand in step 2, because the one thing that fills it
-   * lives behind a step they haven't reached.
-   */
-  const [returnTo, setReturnTo] = useState<OnboardingStepId | null>(null);
+  const [view, setView] = useState<View>(status.complete ? "done" : (status.currentStep ?? ONBOARDING_STEPS[0]));
 
   const doneOf = (id: OnboardingStepId) => status.steps.find((s) => s.id === id)?.done ?? false;
 
@@ -90,12 +82,6 @@ export function StartFlow({
   };
 
   const finishStep = (id: OnboardingStepId) => {
-    if (returnTo && id === "ai") {
-      const back = returnTo;
-      setReturnTo(null);
-      goto(back);
-      return;
-    }
     const i = ONBOARDING_STEPS.indexOf(id);
     goto(i + 1 < ONBOARDING_STEPS.length ? ONBOARDING_STEPS[i + 1] : "done");
   };
@@ -108,9 +94,9 @@ export function StartFlow({
           {status.complete ? "You're set up" : "Get ApplyPilot ready"}
         </h1>
         <p className="mt-2 max-w-2xl text-sm leading-relaxed text-ink-dim">
-          Three things before the extension can apply for you: a resume to attach, a profile you&apos;ve
-          checked, and a key so it can answer the questions your profile doesn&apos;t cover. Takes a few
-          minutes, once.
+          Three things before the extension can apply for you, in this order because each one feeds the
+          next: an AI key, a resume for it to read, and the profile that comes out — checked by you. Takes a
+          few minutes, once.
         </p>
       </header>
 
@@ -130,40 +116,52 @@ export function StartFlow({
         reachable={reachable}
       />
 
+      {view === "ai" && (
+        <StepShell
+          id="ai"
+          blurb="This comes first because the next step needs it: reading your resume into a profile is a model call. It also answers the questions your profile doesn't hold — screening questions, short essays, odd dropdowns — and every AI answer is flagged for you to check, never filed silently."
+        >
+          <AiKeyStep
+            initial={aiConfig}
+            onSaved={(usableKeys) => setFacts((f) => ({ ...f, usableKeys }))}
+          />
+          <StepNav
+            backTo={null}
+            onBack={() => {}}
+            canContinue={doneOf("ai")}
+            hint="Add and save at least one key to continue."
+            onContinue={() => finishStep("ai")}
+          />
+        </StepShell>
+      )}
+
       {view === "resume" && (
         <StepShell
           id="resume"
-          blurb="One PDF, stored once. The extension attaches it to every application — you'll never pick a file per job."
+          blurb="One PDF, stored once — the extension attaches it to every application, so you'll never pick a file per job. Then parse it: that's what fills the profile you approve next, instead of typing it all out."
         >
           <ResumePanel
             initialStored={resume}
             onStored={(s) => setFacts((f) => ({ ...f, hasResume: !!s }))}
-            onNeedsAiKey={() => {
-              setReturnTo("resume");
-              goto("ai");
-            }}
+            onNeedsAiKey={() => goto("ai")}
             onOpenProfile={() => goto("profile")}
           />
           {facts.usableKeys === 0 && (
-            <p className="text-sm leading-relaxed text-ink-dim">
-              Parsing needs an AI key, which is step 3.{" "}
+            <p className="text-sm leading-relaxed text-amber">
+              There&apos;s no usable AI key on your account, so parsing will fail.{" "}
               <button
                 type="button"
-                onClick={() => {
-                  setReturnTo("resume");
-                  goto("ai");
-                }}
-                className="text-amber underline decoration-amber/40 underline-offset-2 hover:decoration-amber"
+                onClick={() => goto("ai")}
+                className="underline decoration-amber/40 underline-offset-2 hover:decoration-amber"
               >
-                Add one now
-              </button>{" "}
-              and you&apos;ll come straight back — it fills most of your profile for you, so it&apos;s worth
-              the detour.
+                Go back and add one
+              </button>
+              — you can still upload the PDF without it.
             </p>
           )}
           <StepNav
-            backTo={null}
-            onBack={() => {}}
+            backTo="AI key"
+            onBack={() => goto("ai")}
             canContinue={doneOf("resume")}
             hint="Upload a PDF to continue."
             onContinue={() => finishStep("resume")}
@@ -174,7 +172,7 @@ export function StartFlow({
       {view === "profile" && (
         <StepShell
           id="profile"
-          blurb="This is what every application gets filled from. Read it, fix anything wrong, then approve it — the extension trusts these values, so they're worth two minutes now."
+          blurb="Whatever the parse found is below. This is what every application gets filled from, so read it, fix anything it got wrong or missed, then approve it — the extension trusts these values."
         >
           <ProfileApproval
             savedProfile={savedProfile}
@@ -192,32 +190,12 @@ export function StartFlow({
         </StepShell>
       )}
 
-      {view === "ai" && (
-        <StepShell
-          id="ai"
-          blurb="Applications ask things your profile doesn't hold — screening questions, short essays, odd dropdowns. A key lets the extension answer them; every AI answer is flagged for you to check, never filed silently."
-        >
-          <AiKeyStep
-            initial={aiConfig}
-            onSaved={(usableKeys) => setFacts((f) => ({ ...f, usableKeys }))}
-          />
-          <StepNav
-            backTo="Profile"
-            onBack={() => goto("profile")}
-            canContinue={doneOf("ai")}
-            hint="Add and save at least one key to continue."
-            continueLabel={returnTo ? "Back to your resume" : undefined}
-            onContinue={() => finishStep("ai")}
-          />
-        </StepShell>
-      )}
-
       {view === "done" && (
         <DoneStep
           complete={status.complete}
           next={next}
           onFinish={() => router.push(next)}
-          onBack={() => goto("ai")}
+          onBack={() => goto("profile")}
         />
       )}
     </div>

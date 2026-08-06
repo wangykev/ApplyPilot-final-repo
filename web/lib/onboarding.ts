@@ -20,7 +20,20 @@
 /** Bumped only if the step SET changes — a stored record from an older set is re-derived. */
 export const ONBOARDING_VERSION = 1;
 
-export const ONBOARDING_STEPS = ["resume", "profile", "ai"] as const;
+/**
+ * ORDER IS A DEPENDENCY CHAIN, not a preference. Each step is what makes the next one
+ * work:
+ *
+ *   ai      → a key, because parsing a resume is a model call
+ *   resume  → upload + PARSE, which is what fills the profile
+ *   profile → review and approve what the parse produced
+ *
+ * Put the key last and a new user reaches the profile step with an empty form and types
+ * their whole history by hand — the one feature that avoids that sits behind a step they
+ * haven't reached yet. The key is also the highest-friction step (an external signup, and
+ * the under-18 block), so it is the right thing to hit while patience is highest.
+ */
+export const ONBOARDING_STEPS = ["ai", "resume", "profile"] as const;
 export type OnboardingStepId = (typeof ONBOARDING_STEPS)[number];
 
 /** What `profiles.onboarding_json` holds. Timestamps are ISO strings; null = not yet. */
