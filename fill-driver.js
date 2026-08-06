@@ -4050,12 +4050,38 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // something did. A tenant that reveals even later still surfaces the honest way: the field blocks Save
   // & Continue → nav-timeout diagnostics + AI-4 remediation.
   const cascadeSeen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+  // ── TEMPORARY RECON (2026-08-06) — remove once the page-3 remount question is settled. ─────────────
+  // Operator: answering the relocation question CLEARS the dependent basecamp answer, the page then
+  // half-refills, re-answers relocation, clears basecamp again, and finally cannot Save because basecamp
+  // is required and empty. The suspicion this exists to prove or kill: Workday is not clearing the value,
+  // it is REMOUNTING the dependent question under a NEW automation-id (two different ids for that same
+  // question have already shown up across runs). If so, our filled record points at a dead wrapper while
+  // the live widget is blank and required — which is exactly the observed ending.
+  // A remount is invisible to `cascadeSeen`, which keys on fieldName, so it reads as "a brand-new field".
+  // Matching on the LABEL across a scan boundary is what makes it visible.
+  const normLbl = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
+  const labelOfSeen = new Map(scan.fields.map((f) => [f.fieldName, f.label]));
+  const cascadeRecon = [];
   const cascadePass = async () => {
     if (targeted) return;
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
       let reFields;
       try { reFields = (await act.scanPage()).fields || []; } catch (e) { break; } // re-scan blip → stop (non-fatal)
+      const liveNames = new Set(reFields.map((f) => f.fieldName));
       const revealed = reFields.filter((f) => !cascadeSeen.has(f.fieldName));
+      // VANISHED: a field we already processed that is no longer in the DOM. On its own that is the
+      // documented cascade-REMOVED case; paired with a revealed field carrying the SAME label it is a
+      // REMOUNT, and that pairing is the whole point of this log.
+      const vanished = [...cascadeSeen].filter((n) => !liveNames.has(n));
+      for (const f of revealed) {
+        const twin = vanished.find((n) => normLbl(labelOfSeen.get(n)) && normLbl(labelOfSeen.get(n)) === normLbl(f.label));
+        if (twin) cascadeRecon.push(`REMOUNT r${round}: "${String(f.label || "").slice(0, 60)}" changed id ${twin} → ${f.fieldName} (its earlier record now points at a DEAD wrapper)`);
+        else cascadeRecon.push(`revealed r${round}: ${f.fieldName} "${String(f.label || "").slice(0, 60)}"`);
+        labelOfSeen.set(f.fieldName, f.label);
+      }
+      for (const n of vanished) {
+        if (!revealed.some((f) => normLbl(f.label) === normLbl(labelOfSeen.get(n)))) cascadeRecon.push(`vanished r${round}: ${n} "${String(labelOfSeen.get(n) || "").slice(0, 40)}" (no same-label replacement — a genuine cascade-REMOVE)`);
+      }
       if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
       revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
@@ -4186,7 +4212,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         served: aiBatch.served || 0, fellBack: aiBatch.fellBack || 0,
         scanMs: aiBatchScanMs, error: aiBatch.error || null, recon: aiBatch.recon || null }
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo };
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo, cascadeRecon };
 }
 
 // ============================================================================

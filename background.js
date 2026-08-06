@@ -3073,6 +3073,11 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
         + ((rc.openFailed || []).length ? ` · open problems: ${rc.openFailed.join(", ")}` : "")
         + ((rc.dropped || []).length ? ` · ${rc.dropped.join("; ")}` : ""));
     }
+    // ── TEMPORARY RECON (2026-08-06): cascade reveals/vanishes/REMOUNTS, see fill-driver cascadeRecon. ──
+    // A "REMOUNT" line means a dependent question came back under a NEW automation-id: its earlier record
+    // now points at a dead wrapper while the LIVE widget is blank — and if it is required, that is a Save
+    // & Continue that can never succeed no matter how many times the page is re-filled.
+    for (const line of (out.cascadeRecon || [])) LOG(`  [CASCADE-RECON] ${line}`);
     const ph = out.timings || {};
     const s = (ms) => (typeof ms === "number" ? (Math.round(ms / 100) / 10) + "s" : "–");
     const slow = (out.results || [])
