@@ -274,7 +274,7 @@ function atsRouteLabel(label, f, profile, defaults) {
   // Location questions on a combobox widget (Ashby's "Where are you currently located?"
   // has NO field identity at all — the label is the only durable key). kind:"location"
   // routes the driver to the type-then-scoped-read combobox flow.
-  if (/where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i.test(L)) {
+  if (ATS_LOCATION_LABEL_RE.test(L)) {
     const v = atsComposeValue("city_state", profile);
     // TIERED, most specific first — because "where are you based?" is NOT always a places
     // autocomplete. GitLab renders it as a three-option pick-one ("1. United States of America" /
@@ -987,6 +987,12 @@ const ATS_POLL = {
 };
 // A location question whose widget already shows this few options is a pick-one, not a places
 // autocomplete (see the location branch in atsActuateField).
+// A location QUESTION, by wording. Shared, because the bucket rung has to ask it too: a taught
+// bucket answers before the label ladder runs, so a location field whose value came from a bucket used
+// to be matched as an ordinary dropdown — and "Pittsburgh, PA" cannot match the suggestion
+// "Pittsburgh, Pennsylvania, United States" under the strict ladder, even though the widget offered it
+// (live 2026-08-06, Ashby/Cohere: five real suggestions, no hit, 17.5s spent).
+const ATS_LOCATION_LABEL_RE = /where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i;
 const ATS_LOC_PICKONE_MAX = 12;
 const ATS_OPTION_CAP = 60;
 // `partial` FORCES the partial treatment for a list we have already narrowed. Live 2026-08-04: a
@@ -1383,10 +1389,16 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
     if (b) {
       if (b.profile_path) {
         const raw = String(b.profile_path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
-        if (raw !== undefined && raw !== null && String(raw).trim() !== "") return { raw, path: b.profile_path, source: "bucket" };
+        if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
+          // KEEP THE WIDGET SEMANTICS even though the VALUE came from a bucket: a location box wants
+          // the city typed and its suggestions matched by city, not an exact-string pick from a list
+          // it builds per keystroke.
+          const kind = ATS_LOCATION_LABEL_RE.test(String(f.label || "")) ? "location" : undefined;
+          return { raw, path: b.profile_path, source: "bucket", kind };
+        }
       }
       const vals = Array.isArray(b.value) ? b.value.filter((x) => typeof x === "string" && x.trim()) : (typeof b.value === "string" && b.value.trim() ? [b.value] : []);
-      if (vals.length) return { candidates: vals, source: "bucket" };
+      if (vals.length) return { candidates: vals, source: "bucket", kind: ATS_LOCATION_LABEL_RE.test(String(f.label || "")) ? "location" : undefined };
     }
   }
   const routed = atsRouteLabel(f.label, f, profile, defaults);
@@ -2019,7 +2031,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         if (optsOf(restored).length) read = restored;
       }
     }
-    const options = (read && read.options) || [];
+    let options = (read && read.options) || [];
+    // DON'T THROW AWAY WHAT WE SAW. A by-name search can surface real suggestions and then lose them
+    // when the query is cleared (the widget rebuilds its list per keystroke), leaving this branch to
+    // report "listed no options" about a widget that had just offered five — and to hand review a field
+    // with NOTHING to pick (live 2026-08-06, Ashby/Cohere: the box offered "Pittsburgh, Pennsylvania,
+    // United States" and the record said it listed nothing). What the search saw IS the option set.
+    if (!options.length && nearMatches.length) {
+      options = nearMatches.map((t) => ({ text: t, disabled: false }));
+      read = Object.assign({}, read || {}, { options });
+    }
     if (!options.length) {
       rec.status = f.isRequired ? "needs_review" : "skipped";
       // A LOCATION box whose places service never answered still HOLDS what we typed, and that

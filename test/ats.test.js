@@ -1183,6 +1183,62 @@ test("location: no places library ⇒ no places wait, and the answer is still su
   assert.ok(withPlaces > withoutPlaces, `a REAL places widget still gets its budget (with ${withPlaces}ms vs without ${withoutPlaces}ms)`);
 });
 
+test("location: a bucket-supplied city still matches the widget's own suggestion, and nothing is discarded", async () => {
+  // Live 2026-08-06, Ashby/Cohere: the box offered "Pittsburgh, Pennsylvania, United States", the
+  // bucket value was "Pittsburgh, PA", and because a bucket routes BEFORE the label ladder the field
+  // was matched as a strict dropdown → no hit, 17.5s spent, and the record then claimed the widget
+  // "listed no options" while handing review nothing to pick.
+  const SUGGESTIONS = ["Pittsburgh, Pennsylvania, United States", "Pittsburgh, Kansas, United States"];
+  let typed = null, committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "ashby", url: "https://jobs.ashbyhq.com/cohere/uuid/application", title: "t",
+      fields: [{ fieldName: "ap-ats-combobox-3", inputSel: "#ap-ats-combobox-3", widgetType: "select", label: "Location", isRequired: false, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // suggestions appear only once the city has been typed — a places-style widget
+    atsInjReadOptions: () => ({ ok: true, open: true, options: (typed ? SUGGESTIONS : []).map((t) => ({ text: t })), loading: false }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Location"], value: ["Pittsburgh, PA"] }];
+  const out = await ats.driveAtsPageFill(act, "ashby", PROFILE, {}, {}, { buckets });
+  const r = out.results[0];
+  assert.strictEqual(typed, "Pittsburgh", "a location box is asked by CITY, not by the whole string");
+  assert.notStrictEqual(r.status, "skipped", "the widget offered a real match: " + r.detail);
+  assert.strictEqual(committed, "Pittsburgh, Pennsylvania, United States");
+});
+
+test("a search that saw options never reports 'listed no options'", async () => {
+  // The same run's second defect: the suggestions vanish when the query is cleared, and the record
+  // then described a widget that had just offered five as having offered none — with nothing attached
+  // for review to pick from.
+  let typed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      fields: [{ fieldName: "q1", inputSel: "#q1", widgetType: "select", label: "Pick one", isRequired: true, value: null, domIndex: 0, options: [] }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // options exist ONLY while the query is present; clearing loses them (the live shape)
+    atsInjReadOptions: () => ({ ok: true, open: true, options: (typed ? [{ text: "Something Else" }, { text: "Another Thing" }] : []), loading: false }),
+    atsInjTypeInCombo: (sel, t) => { typed = t || null; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+    atsInjCommitOption: () => ({ ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Pick one"], value: ["Not On The List"] }];
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { buckets });
+  const r = out.results[0];
+  assert.doesNotMatch(String(r.detail), /listed no options/, "it saw options — say so: " + r.detail);
+  const shown = r.options || r.captured_options || [];
+  assert.ok(shown.includes("Something Else"), "review must get the options the search surfaced");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
