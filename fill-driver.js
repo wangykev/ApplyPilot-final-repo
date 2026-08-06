@@ -1051,6 +1051,10 @@ function aiLabelKey(label) {
   return String(label == null ? "" : label).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
 }
 const AI_BATCH_MAX = 24; // beyond this the prompt stops being reliable; the overflow just falls back to per-field calls
+// Room for the batched reply. 400/question is ~5x a well-formed answer (choice + short justification +
+// confidence + maps_to + suggested_category ≈ 70-80 tokens), plus a fixed allowance for the JSON envelope.
+// A cap is not a spend — it only bounds what the model MAY produce.
+function aiBatchMaxTokens(n) { return 512 + 400 * Math.max(1, n | 0); }
 
 function buildBatchAiPrompt(items, profile, jobContext) {
   const system = "You help an applicant fill out a job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n"
@@ -3414,7 +3418,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
         // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
         // model works. Errors are captured, never thrown — a failed batch just means per-field calls.
-        aiBatch.promise = act.llm({ system, user, maxTokens: 256 + 192 * aiBatch.items.length })
+        // OUTPUT BUDGET SCALES WITH THE BATCH (2026-08-06, operator). Every answer carries a choice, a
+        // ~12-word justification, a confidence, maps_to and suggested_category, so N questions need
+        // roughly N times the room — a single flat cap would truncate the very pages this exists for.
+        // Generosity is FREE: max_tokens is a CAP, not a reservation, and billing follows the tokens
+        // actually generated. Truncation is not a shorter answer, it is a BROKEN one: the reply is JSON,
+        // so a cut-off reply fails to parse and the whole page falls back to per-field calls — losing
+        // exactly the saving the batch exists for. So the per-question allowance is set well above what a
+        // well-formed answer needs rather than tuned to the average.
+        aiBatch.promise = act.llm({ system, user, maxTokens: aiBatchMaxTokens(aiBatch.items.length) })
           .then((res) => {
             if (!res || !res.ok) { aiBatch.error = (res && res.error) || "no reply"; return; }
             aiBatch.answers = parseBatchAiReply(res.text, aiBatch.items);

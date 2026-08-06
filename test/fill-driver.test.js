@@ -1569,6 +1569,29 @@ test("AI memory: a page REFILL reuses every answer and calls the model ZERO time
   assert.strictEqual(r2.results.find((r) => r.fieldName === "b").after, "Yes");
 });
 
+test("AI batch: the output cap SCALES with the number of questions", async () => {
+  // A flat cap truncates exactly the pages the batch exists for: 6 questions each needing a choice, a
+  // justification, a confidence, maps_to and suggested_category do not fit in one question's worth of
+  // room, and a truncated JSON reply is not a shorter answer -- it fails to parse, so the whole page
+  // falls back to per-field calls. Generosity is free: max_tokens is a CAP, not a reservation.
+  const caps = [];
+  const mk = (n) => {
+    const fields = [];
+    for (let i = 0; i < n; i++) fields.push(aiDd2("q" + i, "Question " + i + "?*"));
+    const act = makeFakeAct(fields, { aiEnabled: true,
+      ai: JSON.stringify({ answers: fields.map((f) => ({ id: f.fieldName, choice: "Yes", confidence: "High" })) }) });
+    const realLlm = act.llm;
+    act.llm = async (req) => { caps.push(req.maxTokens); return realLlm(req); };
+    return act;
+  };
+  await drivePageFill(mk(2), {}, {}, {}, AI_BATCH_BUDGETS);
+  await drivePageFill(mk(6), {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(caps.length, 2, "one batched call each: " + JSON.stringify(caps));
+  assert.ok(caps[1] > caps[0], `6 questions must get a bigger budget than 2 (got ${caps[0]} then ${caps[1]})`);
+  // Enough room for a well-formed answer per question, with real headroom.
+  assert.ok(caps[1] >= 6 * 200, `and enough room per question (got ${caps[1]} for 6)`);
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable
