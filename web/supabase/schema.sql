@@ -356,3 +356,102 @@ alter table public.applications
 -- "Which applications went through this account?" — the lookup this column exists to answer.
 create index if not exists applications_user_login_email_idx
   on public.applications (user_id, login_email);
+
+
+-- ============================================================================
+-- 0012_queue_job_details.sql
+-- ============================================================================
+-- The details worth seeing in the queue BEFORE opening a posting (pay, term dates,
+-- apply-by, workplace, applicant count, match score + reasons). Discovery already reads all
+-- of it out of each board's own job record — it was thrown away at the queue boundary.
+-- ONE jsonb rather than eight scalars because the set is board-dependent and still
+-- settling: Handshake publishes pay and a term, LinkedIn publishes neither. Nothing here is
+-- required; a pasted row leaves it NULL and the queue renders exactly as before.
+-- Shape: see web/lib/discover.ts → toQueueRow.
+alter table public.queue_items
+  add column if not exists details jsonb;
+
+comment on column public.queue_items.details is
+  'Optional per-posting extras from discovery: pay, term dates, apply-by deadline, workplace, applicant count, match score + reasons, and the ORIGINAL posted date when the board was showing a repost. Null for pasted rows.';
+
+
+-- ============================================================================
+-- 0013_llm_calls.sql
+-- ============================================================================
+-- One row per model call, for the AI usage tracker (/app/ai/usage).
+--
+-- WHY A LEDGER AND NOT A COUNTER: "what am I spending?" is a sum over paid calls, while
+-- "how much of my free Gemini allowance is left today?" is a COUNT per model per day
+-- against a 500/day cap — and that cap is per MODEL, which is why the fallback chain
+-- exists. A pair of running totals can answer neither once you slice by day/model/action.
+--
+-- cost_usd is NULLABLE ON PURPOSE, and null does not mean free:
+--   0     a free-tier Gemini call — genuinely costs nothing
+--   n     a priced model, computed from LLM_PRICING at call time
+--   null  the rate is not known (Gemini paid, OpenAI). Storing 0 there would silently
+--         under-report spend, so the page shows those as "unpriced".
+create table if not exists public.llm_calls (
+  id            bigserial primary key,
+  user_id       uuid not null references auth.users (id) on delete cascade,
+
+  -- What ran. `action` is the routable id (fill / essay / resume_parse / cover_letter), kept
+  -- as text rather than an enum: the action list evolves (teach is an alias of fill).
+  provider      text not null,
+  model         text not null,
+  action        text not null,
+
+  -- Which key served it, and on which tier — after a rotation the key that answered is not
+  -- the one first tried. `key_id` is the operator's own key id, never the secret.
+  key_id        text,
+  key_tier      text,
+
+  tokens_in     integer not null default 0,
+  tokens_out    integer not null default 0,
+  cost_usd      numeric(12, 6),
+
+  -- ok=false rows are kept deliberately: a run of rate_limit/quota failures is the signal a
+  -- key is spent, and dropping them would hide the pattern the tracker exists to surface.
+  ok            boolean not null default true,
+  error_code    text,
+
+  -- 'extension' (the form fill) or 'web' (resume parse, cover letter).
+  source        text not null default 'web',
+
+  created_at    timestamptz not null default now()
+);
+
+alter table public.llm_calls enable row level security;
+
+create policy "llm_calls owner" on public.llm_calls
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- The tracker's own query: this user's calls, newest first, windowed by day.
+create index if not exists llm_calls_user_created_idx
+  on public.llm_calls (user_id, created_at desc);
+
+-- The free-tier quota question: how many calls has THIS model made today? Per-model because
+-- requests-per-day is metered per model, not per key.
+create index if not exists llm_calls_user_model_created_idx
+  on public.llm_calls (user_id, model, created_at desc);
+
+
+-- ============================================================================
+-- 0014_onboarding.sql
+-- ============================================================================
+-- New-user setup flow (/app/start) — progress that cannot be derived from live data.
+--
+-- Almost every step IS derivable and so is NOT stored: "has a resume" is a resumes row,
+-- "has an AI key" is a usable key in ai_config. Deriving them means a step can never claim
+-- to be done after the thing it describes was deleted.
+--
+-- Two facts have no such source, and are all this column holds:
+--   profile_approved_at  the human pressed "This is right" on their profile. An ACT, not a
+--                        readable fact — a filled-in profile is not a reviewed one.
+--   completed_at         the flow was finished. Sticky, so swapping your resume later never
+--                        drops you back into a setup wizard mid-task.
+--
+-- Shape (lib/onboarding.ts, coerceOnboarding tolerates anything else):
+--   { "version": 1, "profile_approved_at": "…Z"|null, "completed_at": "…Z"|null }
+-- NULL / absent = never started, which is what a brand-new row means.
+alter table public.profiles
+  add column if not exists onboarding_json jsonb;

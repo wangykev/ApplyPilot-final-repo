@@ -230,7 +230,12 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
 
 /* ─── One provider's key list ───────────────────────────────────────────── */
 
-function ProviderKeys({
+/**
+ * Exported so the new-user setup flow (/app/start) adds keys through the SAME control the
+ * AI page uses — including the first-Gemini-key starter chain below, which a second copy
+ * would have to duplicate and would then drift from.
+ */
+export function ProviderKeys({
   provider,
   cfg,
   edit,

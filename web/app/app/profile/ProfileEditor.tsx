@@ -99,7 +99,20 @@ const RACE_ETHNICITY = opt(RACE_ETHNICITY_OPTIONS);
 const VETERAN_STATUS = opt(VETERAN_STATUS_OPTIONS);
 const DISABILITY_STATUS = opt(DISABILITY_STATUS_OPTIONS);
 
-export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
+export function ProfileEditor({
+  initial,
+  initialBuckets,
+  onSaved,
+}: {
+  initial: Profile;
+  initialBuckets: Bucket[];
+  /**
+   * Fired with the profile that was just persisted. The setup flow (/app/start) gates its
+   * "approve" button on the SAVED profile, so it needs the new baseline — unsaved typing
+   * must not count as a reviewed profile. Absent everywhere else.
+   */
+  onSaved?: (profile: Profile) => void;
+}) {
   // The seeded baseline (initial + default website/source rows). Used for BOTH the live
   // profile state and the "last saved" snapshot the dirty check compares against, so applying
   // those defaults on load never counts as an unsaved change.
@@ -149,6 +162,7 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         setSavedBuckets(buckets);
         setStatus({ kind: "ok", msg: "Saved" });
         liveSync("profile"); // push profile + buckets to a connected extension (no-op if not connected)
+        onSaved?.(profile);
       } else setStatus({ kind: "err", msg: (!pr.ok && pr.error) || (!br.ok && br.error) || "Save failed" });
     });
 

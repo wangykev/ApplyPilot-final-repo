@@ -29,7 +29,30 @@ function summarize(p: Profile): { label: string; n: number }[] {
   ].filter((x) => x.n > 0);
 }
 
-export function ResumePanel({ initialStored }: { initialStored: Stored }) {
+export function ResumePanel({
+  initialStored,
+  onStored,
+  onNeedsAiKey,
+  onOpenProfile,
+}: {
+  initialStored: Stored;
+  /**
+   * Fired whenever the stored resume changes (uploaded, replaced, removed). The setup flow
+   * (/app/start) marks its resume step done off this instead of re-reading the backend.
+   */
+  onStored?: (stored: Stored) => void;
+  /**
+   * Parsing needs an AI key. On the Resume page a missing key is a LINK to /app/ai; inside
+   * the setup flow that link would be bounced straight back by the gate, so the flow passes
+   * a handler and gets a button that moves to its own key step instead.
+   */
+  onNeedsAiKey?: () => void;
+  /**
+   * Same reason as `onNeedsAiKey`: in the setup flow the profile is the NEXT STEP, not
+   * another page, so "Open profile" advances the wizard rather than navigating away.
+   */
+  onOpenProfile?: () => void;
+}) {
   const [stored, setStored] = useState<Stored>(initialStored);
   const [file, setFile] = useState<File | null>(null);
   const [parsed, setParsed] = useState<Profile | null>(null);
@@ -57,6 +80,7 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
       const j = await r.json();
       if (j.ok) {
         setStored({ filename: f.name, size: f.size });
+        onStored?.({ filename: f.name, size: f.size });
         setMsg({ kind: "ok", text: "Stored — ready to attach during applications." });
         liveSync("resume"); // push the new resume bytes to a connected extension
       } else {
@@ -114,6 +138,7 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
       const res = await removeResume();
       if (res.ok) {
         setStored(null);
+        onStored?.(null);
         setFile(null);
         setParsed(null);
         setMsg({ kind: "info", text: "Removed." });
@@ -200,14 +225,22 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
             )}
           >
             {msg.text}
-            {msg.aiLink && (
-              <>
-                {" "}
-                <Link href="/app/ai" className="underline hover:text-amber">
-                  Configure AI →
-                </Link>
-              </>
-            )}
+            {msg.aiLink &&
+              (onNeedsAiKey ? (
+                <>
+                  {" "}
+                  <button type="button" onClick={onNeedsAiKey} className="underline hover:text-amber">
+                    Add your AI key →
+                  </button>
+                </>
+              ) : (
+                <>
+                  {" "}
+                  <Link href="/app/ai" className="underline hover:text-amber">
+                    Configure AI →
+                  </Link>
+                </>
+              ))}
           </p>
         )}
       </SectionCard>
@@ -263,10 +296,21 @@ export function ResumePanel({ initialStored }: { initialStored: Stored }) {
               <button onClick={apply} disabled={applying} className="btn-primary">
                 {applying ? "Applying…" : "Apply to my profile"}
               </button>
-              <Link href="/app/profile" className="inline-flex items-center gap-1.5 text-sm text-ink-dim hover:text-amber">
-                Open profile
-                <ArrowRight className="h-3.5 w-3.5" />
-              </Link>
+              {onOpenProfile ? (
+                <button
+                  type="button"
+                  onClick={onOpenProfile}
+                  className="inline-flex items-center gap-1.5 text-sm text-ink-dim hover:text-amber"
+                >
+                  Open profile
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <Link href="/app/profile" className="inline-flex items-center gap-1.5 text-sm text-ink-dim hover:text-amber">
+                  Open profile
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
+              )}
               <span className="font-mono text-[11px] text-ink-faint">fills blank fields only — won&apos;t overwrite</span>
             </div>
           </div>

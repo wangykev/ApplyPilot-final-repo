@@ -39,6 +39,12 @@ const SOON: { label: string; icon: typeof BarChart3 }[] = [];
 
 export function Sidebar({ email }: { email: string }) {
   const pathname = usePathname();
+  /**
+   * The setup flow is the one route that stands alone. Until it's finished the gate sends
+   * every other /app page straight back here, so a full nav would be a wall of links that
+   * silently bounce — worse than no links at all. The logo and sign-out stay.
+   */
+  const focused = pathname === "/app/start";
   return (
     <aside className="sticky top-0 flex h-screen w-16 shrink-0 flex-col border-r border-hairline bg-panel md:w-60">
       <div className="flex h-16 items-center gap-2.5 border-b border-hairline px-3 md:px-5">
@@ -49,33 +55,42 @@ export function Sidebar({ email }: { email: string }) {
       </div>
 
       <nav className="flex-1 space-y-1 overflow-y-auto p-2 md:p-3">
-        {PRIMARY.map((item) => {
-          const active = item.exact
-            ? pathname === item.href
-            : pathname.startsWith(item.href);
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={clsx(
-                "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors",
-                active
-                  ? "bg-panel-raised text-ink"
-                  : "text-ink-dim hover:bg-panel-raised/60 hover:text-ink"
-              )}
-              title={item.label}
-            >
-              <item.icon
-                className={clsx("h-[18px] w-[18px] shrink-0", active && "text-amber")}
-                strokeWidth={1.75}
-              />
-              <span className="hidden md:inline">{item.label}</span>
-              {active && (
-                <span className="ml-auto hidden h-1.5 w-1.5 rounded-full bg-amber md:block" />
-              )}
-            </Link>
-          );
-        })}
+        {focused && (
+          <div className="hidden px-3 py-2 md:block">
+            <span className="font-mono text-[10px] uppercase tracking-label text-amber">Setting up</span>
+            <p className="mt-2 text-xs leading-relaxed text-ink-dim">
+              The rest of the deck opens once these three steps are done.
+            </p>
+          </div>
+        )}
+        {!focused &&
+          PRIMARY.map((item) => {
+            const active = item.exact
+              ? pathname === item.href
+              : pathname.startsWith(item.href);
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={clsx(
+                  "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors",
+                  active
+                    ? "bg-panel-raised text-ink"
+                    : "text-ink-dim hover:bg-panel-raised/60 hover:text-ink"
+                )}
+                title={item.label}
+              >
+                <item.icon
+                  className={clsx("h-[18px] w-[18px] shrink-0", active && "text-amber")}
+                  strokeWidth={1.75}
+                />
+                <span className="hidden md:inline">{item.label}</span>
+                {active && (
+                  <span className="ml-auto hidden h-1.5 w-1.5 rounded-full bg-amber md:block" />
+                )}
+              </Link>
+            );
+          })}
 
         {SOON.length > 0 && (
           <div className="hidden px-3 pb-1 pt-5 md:block">
