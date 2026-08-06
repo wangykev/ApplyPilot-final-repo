@@ -40,3 +40,14 @@ test("requiredBlankByLabel: an entry with NO value is not an answer (review owns
   assert.deepStrictEqual(requiredBlankByLabel(live,
     [{ field_id: "pg::formField-idA", question_label: "Q*", current_value: "" }]), []);
 });
+
+test("requiredBlankByLabel: a dropdown on its PLACEHOLDER counts as blank", () => {
+  // Live: the remounted basecamp field read "Select One", so a plain empty-string test saw it as FILLED
+  // and the whole recovery silently did nothing — while Workday refused the page for that very field
+  // being required. A placeholder is not an answer.
+  const live = [{ fieldName: "idB", label: "Which basecamp location?*", isRequired: true, widgetType: "dropdown", value: "Select One" }];
+  const entries = [{ field_id: "pg::formField-idA", question_label: "Which basecamp location?*", current_value: "Atlanta, GA" }];
+  const out = requiredBlankByLabel(live, entries);
+  assert.strictEqual(out.length, 1, "\"Select One\" is a placeholder, not a value");
+  assert.strictEqual(out[0].approved, "Atlanta, GA");
+});

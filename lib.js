@@ -1725,7 +1725,10 @@ function requiredBlankByLabel(liveFields, bundleEntries) {
     const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
     return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
   };
-  const blank = (v) => v == null || String(v).trim() === "";
+  // A dropdown sitting on its PLACEHOLDER is empty, whatever the scan calls it. Live: the remounted
+  // basecamp field read "Select One", so a plain empty-string test saw it as filled and this whole
+  // recovery silently did nothing while Workday refused the page for that exact field being required.
+  const blank = (v) => v == null || String(v).trim() === "" || isPlaceholderOption(String(v));
   const key = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
   const live = new Set((liveFields || []).map((f) => f && f.fieldName));
   const byLabel = new Map();
