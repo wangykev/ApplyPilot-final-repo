@@ -543,7 +543,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "enableAiBatch"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "enableAiBatch", "debugAiPrompts", "debugClobber"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -2964,8 +2964,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     // enableAiBatch: opt-in until the batched-AI pre-pass is confirmed inert on a live page (see
     // buildBatchAiPrompt). Read per run, so no reload is needed to flip it.
     const _aiBatch = await new Promise((r) => chrome.storage.local.get("enableAiBatch", (v) => r(!!(v && v.enableAiBatch))));
+    const _dbgClobber = await new Promise((r) => chrome.storage.local.get("debugClobber", (v) => r(!!(v && v.debugClobber))));
+    if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch }, { cachedShapes, headingToBase, buckets });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber }, { cachedShapes, headingToBase, buckets });
   } finally {
     if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
   }
@@ -3078,6 +3080,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     // now points at a dead wrapper while the LIVE widget is blank — and if it is required, that is a Save
     // & Continue that can never succeed no matter how many times the page is re-filled.
     for (const line of (out.cascadeRecon || [])) LOG(`  [CASCADE-RECON] ${line}`);
+    for (const line of (out.clobberLog || [])) LOG(`  [CLOBBER] ${line}`);
     const ph = out.timings || {};
     const s = (ms) => (typeof ms === "number" ? (Math.round(ms / 100) / 10) + "s" : "–");
     const slow = (out.results || [])

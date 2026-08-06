@@ -1483,6 +1483,41 @@ test("AI batch: OFF by default → one call PER question (batching is opt-in unt
   assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
 });
 
+test("debugClobber: names the field that was wiped and the write that did it", async () => {
+  // Live on waystar page 3: filling the relocation question CLEARS the dependent basecamp answer, and
+  // the page then cannot Save because basecamp is required and empty. The end state was visible in the
+  // FIELD-DIAG dump; the CAUSE was not. This flag re-scans after every field and attributes the change
+  // to the write that caused it (a REMOUNT shows as a vanish + an appear).
+  const a = { wrapperSel: "[w-a]", fieldName: "trigger", widgetType: "text", isRequired: true, label: "Trigger" };
+  const b = { wrapperSel: "[w-b]", fieldName: "dependent", widgetType: "text", isRequired: true, label: "Dependent" };
+  const act = makeFakeAct([a, b]);
+  // The up-front scan sees the dependent answer present; every scan AFTER it sees the tenant's wipe.
+  let scans = 0;
+  act.scanPage = async () => {
+    const first = scans++ === 0;
+    return { fields: [
+      { fieldName: "trigger", label: "Trigger", currentValue: "", wrapperSel: "[w-a]", widgetType: "text" },
+      { fieldName: "dependent", label: "Dependent", currentValue: first ? "Atlanta, GA" : "", wrapperSel: "[w-b]", widgetType: "text" }] };
+  };
+  const out = await drivePageFill(act, { personal_info: {} }, {}, {},
+    { ...T_BUDGETS, debugClobber: true, maxCascadeRounds: 0 });
+  const hit = (out.clobberLog || []).find((l) => /dependent/.test(l) && /WITHOUT being touched/.test(l));
+  assert.ok(hit, "the wipe must be attributed to the write that caused it: " + JSON.stringify(out.clobberLog));
+  assert.match(hit, /Atlanta, GA/, "and it names the value that was lost");
+  assert.match(hit, /after filling trigger/, "and the write that caused it");
+});
+
+test("debugClobber: OFF by default → no extra page scans (it is a diagnostic, not a cost)", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-a]", fieldName: "trigger", widgetType: "text", isRequired: true, label: "Trigger" }]);
+  let scans = 0;
+  const real = act.scanPage;
+  act.scanPage = async () => { scans++; return real(); };
+  await drivePageFill(act, { personal_info: {} }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0 });
+  const withFlag = scans; scans = 0;
+  await drivePageFill(act, { personal_info: {} }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0, debugClobber: true });
+  assert.ok(scans > withFlag, `the flag adds the per-field scans (off=${withFlag}, on=${scans})`);
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable

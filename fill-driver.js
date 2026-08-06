@@ -3371,6 +3371,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // employer list. (2026-07-25.)
   const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
+  const clobberLog = [];   // TEMPORARY (budgets.debugClobber): fields changed by ANOTHER field's write
+  // Seed the baseline from the UP-FRONT scan, or the very first field's write has nothing to be compared
+  // against — which is exactly the write most likely to knock out a dependent question.
+  let clobberPrev = budgetsIn && budgetsIn.debugClobber
+    ? new Map((scan.fields || []).map((x) => [x.fieldName, x])) : null;
   // ── BATCHED AI PRE-PASS + OVERLAP (2026-08-05) ────────────────────────────────────────────────────
   // Identify the page's AI questions and read their options BEFORE filling anything, fire ONE call, and
   // let it fly while the deterministic fields fill. By the time the loop reaches an AI question the reply
@@ -3835,6 +3840,32 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
     results.push(record);
 
+    // ── TEMPORARY RECON (2026-08-06, budgets.debugClobber) — WHO WIPED THAT FIELD? ─────────────────
+    // Operator, waystar page 3: filling the relocation question CLEARS the dependent basecamp answer,
+    // and the page then cannot Save because basecamp is required and empty. The end state is visible in
+    // the FIELD-DIAG dump, but the CAUSE is not: by then we only know the value is gone, not which of
+    // our own writes removed it. This re-scans after EVERY field and names any OTHER field that changed
+    // underneath it — value changed, or the wrapper appeared/vanished (a REMOUNT shows as both).
+    // Opt-in, because it costs one read-only scanPage per field; off, this whole block is one boolean.
+    if (budgets.debugClobber) {
+      try {
+        const after = ((await act.scanPage()) || {}).fields || [];
+        const now = new Map(after.map((x) => [x.fieldName, x]));
+        if (clobberPrev) {
+          for (const [name, was] of clobberPrev) {
+            if (name === f.fieldName) continue;                       // the field we just wrote
+            const is = now.get(name);
+            if (!is) { clobberLog.push(`after filling ${f.fieldName}: field ${name} "${String(was.label || "").slice(0, 40)}" VANISHED from the page`); continue; }
+            const a = was.currentValue == null ? "" : String(was.currentValue);
+            const b = is.currentValue == null ? "" : String(is.currentValue);
+            if (a !== b) clobberLog.push(`after filling ${f.fieldName}: field ${name} "${String(is.label || "").slice(0, 40)}" changed "${a}" → "${b}" WITHOUT being touched`);
+          }
+          for (const [name, is] of now) if (!clobberPrev.has(name)) clobberLog.push(`after filling ${f.fieldName}: field ${name} "${String(is.label || "").slice(0, 40)}" APPEARED`);
+        }
+        clobberPrev = now;
+      } catch (e) { /* diagnostic only — never disturb the fill */ }
+    }
+
     // Let one field's transient UI settle before the next opens (also the
     // natural blur of the prior field — the sequential-cleanup rule).
     await act.delay(budgets.interFieldMs);
@@ -4212,7 +4243,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         served: aiBatch.served || 0, fellBack: aiBatch.fellBack || 0,
         scanMs: aiBatchScanMs, error: aiBatch.error || null, recon: aiBatch.recon || null }
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo, cascadeRecon };
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo, cascadeRecon, clobberLog };
 }
 
 // ============================================================================

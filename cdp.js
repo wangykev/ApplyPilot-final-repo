@@ -4507,6 +4507,17 @@ function makeCdpActuation(llmConfig) {
     // path is byte-identical for anyone who hasn't added a second key.
     llm: async ({ system, user, maxTokens, action }) => {
       if (!llmConfig || !llmConfig.enabled) return { ok: false, error: "AI fill OFF (enable it in the popup)" };
+      // ── TEMPORARY RECON (2026-08-06, chrome.storage.local.debugAiPrompts) ─────────────────────────
+      // Operator ask: "what exactly was the prompt sent to AI, and each time AI actually is called on
+      // this page". Every AI call funnels through here — per-field AND batched — so this is the one
+      // place that cannot miss one. Prompt and reply are truncated: the point is WHICH questions and
+      // WHICH options went out (and what came back), not a verbatim transcript of the profile blob.
+      const _dbgPrompts = await new Promise((r) => { try { chrome.storage.local.get("debugAiPrompts", (v) => r(!!(v && v.debugAiPrompts))); } catch (e) { r(false); } });
+      if (_dbgPrompts) {
+        const qOnly = String(user || "").split("\nApplicant profile:")[0];   // drop the profile blob — same every call
+        console.log(`[ApplyPilot][AI-CALL] action=${action || "fill"} maxTokens=${maxTokens || "?"} — QUESTIONS/OPTIONS: `
+          + qOnly.slice(0, 1400) + (qOnly.length > 1400 ? " …[cut]" : ""));
+      }
       const attempts = typeof resolveLlmRoute === "function"
         ? resolveLlmRoute(llmConfig, action || "fill", LLM_DEFAULT_MODELS)
         : [{ provider: llmConfig.provider, model: llmConfig.model }];
