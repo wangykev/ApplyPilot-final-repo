@@ -1344,7 +1344,13 @@ function atsAssertionLead(candidate, texts) {
 // containment — so "Asian" missed Zoox's "Asian (Not Hispanic or Latino)" even though the
 // stated-EEO relief exists. The relief keys off the LABEL, whatever tier produced the value.
 function atsIsEeoLabel(label) {
-  return /hispanic|latino|race|ethnicit|veteran|disabilit|gender|\bsex\b/i.test(String(label || ""));
+  // Widened 2026-08-06 to the wordings live boards actually use: Reddit asks about "military service"
+  // and about being transgender; gopuff's diversity survey asks pronouns, LGBTQ+ and an age RANGE.
+  // Every one is a protected-characteristic question, so an AI answer to any of them must carry the
+  // loud demographic badge — an ordinary "AI" badge under-warns on a field where a wrong answer is a
+  // legal misstatement. Deliberately NOT bare "age": an "are you over 18" question is a different,
+  // non-protected thing that legallyLoaded already covers.
+  return /hispanic|latino|race|ethnicit|veteran|military service|disabilit|gender|\bsex\b|sexual orientation|transgender|lgbt|pronoun|age range/i.test(String(label || ""));
 }
 
 async function atsAiChooseOption(act, f, options, profile, jobContext) {
@@ -2454,7 +2460,14 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     rec.status = okv ? "filled_review" : "needs_review"; // AI is NEVER a silent fill
     rec.resolved = [ai.choice];
     rec.confidence = String(ai.confidence || "low").toLowerCase();
-    rec.flag = atsFd.legallyLoaded(f.label) ? "ai-choice-sensitive" : "ai-choice";
+    // A GUESSED DEMOGRAPHIC IS ITS OWN CATEGORY. The Workday path has flagged these `ai-eeo-guess`
+    // since AI-3 — "AI-GUESSED DEMOGRAPHIC — VERIFY", which the review editor renders loudest — but
+    // this path only had ai-choice / ai-choice-sensitive, so a model-inferred veteran or gender answer
+    // wore an ordinary AI badge (live 2026-08-06, Reddit: "No military service", and a transgender
+    // question answered from the profile's GENDER — a related but different fact).
+    rec.flag = atsIsEeoLabel(f.label)
+      ? "ai-eeo-guess"
+      : (atsFd.legallyLoaded(f.label) ? "ai-choice-sensitive" : "ai-choice");
     rec.detail = "AI: " + (ai.justification || "inferred") + (okv ? "" : " — commit failed");
     rec.maps_to = ai.maps_to || ""; rec.suggested_category = ai.suggested_category || "";
   } catch (e) {

@@ -1275,6 +1275,40 @@ test("driver: a stated veteran status fills through the assertion bridge, flagge
   assert.strictEqual(r.status, "filled_review", "a non-exact tier is always flagged, never silent");
 });
 
+test("an AI-GUESSED demographic wears the loud badge, and ordinary questions do not", async () => {
+  // Live 2026-08-06, Reddit: a veteran question ("No military service") and a transgender question
+  // answered from the profile's GENDER both wore an ordinary `ai-choice` badge. The Workday path has
+  // used `ai-eeo-guess` — the review editor's loudest — since AI-3; this path never set it.
+  const mk = (label, options) => fakeAct({
+    aiEnabled: true,
+    llm: async () => ({ ok: true, text: JSON.stringify({ choice: options[0], justification: "j", confidence: "High" }) }),
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+      fields: [{ fieldName: "q", inputSel: "#q", widgetType: "select", label, isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: options.map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: options[0] }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  // the wordings that were missed
+  for (const label of ["Military service", "Do you identify as transgender?", "What are your pronouns?", "Do you identify as LGBTQ+?", "What is your age range?"]) {
+    const out = await ats.driveAtsPageFill(mk(label, ["No military service", "I am a veteran"]), "greenhouse", PROFILE, {}, {}, {});
+    assert.strictEqual(out.results[0].flag, "ai-eeo-guess", label + " must carry the demographic badge");
+  }
+  // …and a normal screening question must NOT be mislabelled as a demographic
+  // (deliberately a question no recogniser owns — "how did you hear" has its own deterministic ladder
+  // and would never reach the AI at all)
+  const out = await ats.driveAtsPageFill(mk("Which internal team interests you most?", ["Platform", "Ads"]), "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].flag, "ai-choice", "an ordinary question keeps the ordinary badge");
+  // an over-18 question is legally loaded but NOT a protected characteristic
+  const age = await ats.driveAtsPageFill(mk("Are you over the age of 18?", ["Yes", "No"]), "greenhouse", PROFILE, {}, {}, {});
+  assert.notStrictEqual(age.results[0].flag, "ai-eeo-guess");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
