@@ -1651,6 +1651,38 @@ test("debugPageTrace: tracing changes NOTHING about the fill (it wraps the act p
   assert.deepStrictEqual(shape(traced), shape(plain), "tracing must be observationally inert");
 });
 
+test("AI batch: an INELIGIBLE field never waits on the in-flight call", async () => {
+  // Live on waystar page 3, caught by the trace: an OPTIONAL textarea with no mapping ("What is your
+  // desired salary?") reached the AI site, AWAITED the batch, blocked the walk 3.56s, and was then
+  // skipped -- and it blocked EARLY, cutting short the overlap the batch exists to create. The batch may
+  // only be consulted by a field that would actually use an AI answer.
+  const optionalText = { wrapperSel: "[w-txt]", fieldName: "salary_q", widgetType: "textarea",
+    isRequired: false, label: "What is your desired salary?" };
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*"), optionalText],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  let awaited = 0;
+  const realLlm = act.llm;
+  act.llm = async (r) => { awaited++; return realLlm(r); };
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(awaited, 1, "still exactly one batched call");
+  const txt = out.results.find((r) => r.fieldName === "salary_q");
+  assert.strictEqual(txt.status, "skipped", "the optional unmapped textarea stays blank, no AI");
+  // The batch bookkeeping must not count it either — it never consulted the batch at all.
+  assert.strictEqual(out.aiBatchInfo.served, 2, "only the two eligible dropdowns were served");
+});
+
+test("debugPageTrace: the action timer is applied ONCE, even across recursive fills", async () => {
+  // `act` is reused across pages and the cascade recurses into drivePageFill, so in-place wrapping
+  // stacked: one call printed several times under different page clocks, and the overhead grew per page.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*")], { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const B = { ...T_BUDGETS, debugPageTrace: true, maxCascadeRounds: 0 };
+  await drivePageFill(act, {}, {}, {}, B);
+  const once = act.readDropdownState;
+  await drivePageFill(act, {}, {}, {}, B);
+  assert.strictEqual(act.readDropdownState, once, "a second fill must not re-wrap an already-timed primitive");
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable

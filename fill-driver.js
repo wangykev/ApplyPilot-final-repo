@@ -1198,7 +1198,11 @@ function deterministicTierFor(f, profile, bucketIndex, empCompany) {
     // resolve()'s CONTRACT is { candidates } | { skip } — NOT a bare value. Reading it as a scalar is what
     // produced the live `s.toLowerCase is not a function`.
     const rs = resolve(getByPath(profile, mappedPath), f.widgetType);
-    if (rs && Array.isArray(rs.candidates) && rs.candidates.length) return "field-map";
+    // resolve() hands back { candidates } for a choice widget and { value } for a text one — checking only
+    // `candidates` reported every mapped TEXT field as "AI or blank", which is exactly the sort of wrong
+    // explanation this trace exists to avoid.
+    if (rs && !rs.skip && ((Array.isArray(rs.candidates) && rs.candidates.length)
+        || (rs.value !== undefined && rs.value !== null && String(rs.value) !== ""))) return "field-map";
   }
   // The employer-match question is decided by decidePreviousWorker, never by the AI — it is answered (or
   // deliberately left blank + flagged) on its own path.
@@ -3475,8 +3479,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     };
     for (const name of timed) {
       const fn = act[name];
-      if (typeof fn !== "function") continue;
-      act[name] = async (...args) => {
+      if (typeof fn !== "function" || fn.__apTimed) continue;   // act is reused across pages AND the
+      // cascade recurses into drivePageFill, so without this guard each pass wrapped the wrapper: one
+      // call printed several times under different page clocks, and the overhead grew every page.
+      const wrapped = async (...args) => {
         const s0 = Date.now();
         try { return await fn.apply(act, args); }
         finally {
@@ -3484,6 +3490,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           if (ms >= TRACE_ACTION_MS) trace(`    · ${name}(${args.map(shown).filter(Boolean).slice(0, 2).join(", ")})`, ms);
         }
       };
+      wrapped.__apTimed = true;
+      act[name] = wrapped;
     }
   }
   const clobberLog = [];   // TEMPORARY (budgets.debugClobber): fields changed by ANOTHER field's write
@@ -3915,7 +3923,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // the reverse) — they answer different prompts. A cached answer has no batch item behind it, so
         // the kind travels with the answer rather than being looked up in aiBatch.items.
         const wantKind = canonicalize ? "canonicalize" : "infer";
-        const batched = await aiBatchAnswer(f, wantKind);
+        // ONLY CONSULT THE BATCH IF THIS FIELD WOULD USE AN AI ANSWER (2026-08-06). aiBatchAnswer AWAITS
+        // the in-flight call, so asking it about a field that is not AI-eligible blocks the walk for the
+        // model's full latency and then throws the answer away. Live on waystar page 3: an OPTIONAL
+        // textarea with no mapping ("What is your desired salary?") hit this and stalled the page 3.56s
+        // before being skipped — and it stalled it EARLY, cutting short the very overlap the batch exists
+        // to create. The eligibility test is the same one the branches below use.
+        const willUseAi = canonicalize || (f.isRequired && aiEligible(f));
+        const batched = willUseAi ? await aiBatchAnswer(f, wantKind) : null;
         const preInfer = !canonicalize ? batched : null;
         const preCanon = canonicalize ? batched : null;
         if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
