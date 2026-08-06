@@ -3226,7 +3226,9 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // does 1 frame then the deadline, provably no-slower than the old code. i<200 is a spin-guard only.
   const pickSel = () => OPT_SELECTORS.find((sel) => optsFor(sel).length) || null;
   let optSel = pickSel();
+  const _fr0 = Date.now();
   for (let t0 = Date.now(), i = 0; Date.now() - t0 < 768 && i < 200 && !optSel && !bannerUp(); i++) { await frame(); optSel = pickSel(); }
+  const firstRenderMs = Date.now() - _fr0;   // 0 when the list was already mounted (the mid-fill case)
   optSel = optSel || '[role="option"]';
   const roleCount = optsFor('[role="option"]').length;                       // non-chip counts (diagnostic)
   const promptCount = optsFor('[data-automation-id="promptOption"]').length;
@@ -3297,7 +3299,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
   }
   const options = Array.from(seen.keys());
-  return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
+  return { ok: true, options, count: options.length, steps, atBottom, firstRenderMs, cappedOut: steps >= MAX_STEPS,
     roleCount, promptCount, usedSel: optSel,
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
@@ -4049,8 +4051,19 @@ function makeCdpActuation(llmConfig) {
     // for the summary searchable editor. NO commit (only scrollTop + reads). Logs the count so the
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
+      // TIMING + HOP COUNT (2026-08-06): this is one of the slowest single actions in a fill and the only
+      // way to tune it is to know where its time goes. `steps` is the number of scroll hops, `ms` the
+      // wall-clock, and `firstRenderMs` how much of that was spent waiting for the list to mount before a
+      // single hop happened — three different fixes depending on which dominates.
+      const _t0 = Date.now();
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]" : "FAILED");
+      const ms = Date.now() - _t0;
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok
+        ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " in " + ms + "ms"
+          + " [" + r.steps + " hop(s)" + (r.firstRenderMs != null ? ", first-render " + r.firstRenderMs + "ms" : "")
+          + (r.cappedOut ? ", CAPPED OUT" : "") + ", ~" + (r.steps ? Math.round((ms - (r.firstRenderMs || 0)) / r.steps) : 0) + "ms/hop]"
+          + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]"
+        : "FAILED in " + ms + "ms");
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
