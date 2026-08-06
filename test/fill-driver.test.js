@@ -1510,25 +1510,28 @@ test("AI batch: opens ONLY the candidates that need options, and reports the cou
   assert.deepStrictEqual(rc.openFailed, [], "and no read-only close left a value behind");
 });
 
-test("AI batch: a numeric profile value resolves through resolve()'s real contract, not as an object", async () => {
-  // resolve() returns { candidates: string[] } — NOT a bare value. Reading it as a scalar wrapped the
-  // object into [ {candidates:[…]} ], which is what threw `s.toLowerCase is not a function` live and
-  // silently disabled batching for the whole page. A matching numeric value must simply be SKIPPED.
-  const plan = planAiBatchCandidates(
-    [{ wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: false, label: "Postal Code" }],
-    { personal_info: { postal_code: 30301 } },
-    { "dd:postalCode": { options: ["30301"], at: Date.now() } });
-  assert.deepStrictEqual(plan, [], "30301 matches the cached option → not an AI question at all");
+test("AI batch: a STATED value is never a batch candidate (canonicalize is not batched)", async () => {
+  // Batching a canonicalize needs its option list, and the only sources are an extra open per mapped
+  // dropdown (measured a net loss) or a cross-run cache, which does not exist in the real fill-once flow.
+  // So a mapped field with a stated value must never enter the plan, whatever its value's type.
+  const fields = [{ wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: true, label: "Postal Code" }];
+  assert.deepStrictEqual(planAiBatchCandidates(fields, { personal_info: { postal_code: 30301 } }), [],
+    "a NUMERIC stated value is skipped — and resolve()'s {candidates} shape must not reach the ladder as an object");
+  assert.deepStrictEqual(planAiBatchCandidates(fields, { personal_info: { postal_code: "30301" } }), [],
+    "same for a string");
 });
 
-test("AI batch: a numeric value that does NOT match becomes a canonicalize candidate (no open)", async () => {
+test("AI batch: an unanswerable REQUIRED dropdown IS a candidate, and needs its options", async () => {
   const plan = planAiBatchCandidates(
-    [{ wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: false, label: "Postal Code" }],
-    { personal_info: { postal_code: 30301 } },
-    { "dd:postalCode": { options: ["90210"], at: Date.now() } });
+    [{ wrapperSel: "[w-q]", fieldName: "some_screening_q", widgetType: "dropdown", isRequired: true, label: "Do you consent?*" }], {});
   assert.strictEqual(plan.length, 1);
-  assert.strictEqual(plan[0].kind, "canonicalize");
-  assert.strictEqual(plan[0].needsOpen, false, "cache-only — a canonicalize never costs a page open");
+  assert.strictEqual(plan[0].kind, "infer");
+  assert.strictEqual(plan[0].needsOpen, true, "infer is the one kind that costs an open");
+});
+
+test("AI batch: an OPTIONAL unmapped dropdown is never a candidate (optional stays deterministic-or-blank)", async () => {
+  assert.deepStrictEqual(planAiBatchCandidates(
+    [{ wrapperSel: "[w-o]", fieldName: "opt_q", widgetType: "dropdown", isRequired: false, label: "Optional?" }], []), []);
 });
 
 test("AI batch: a NON-STRING profile value must not abort the page's whole batch", async () => {
@@ -1544,8 +1547,7 @@ test("AI batch: a NON-STRING profile value must not abort the page's whole batch
     { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
                                                       { id: "q2", choice: "No", confidence: "High" }] }) });
   // A warm option cache is what routes a stated value straight into the ladder with no open.
-  const out = await drivePageFill(act, { personal_info: { postal_code: 30301 } }, {}, {},
-    { ...AI_BATCH_BUDGETS }, { optionCache: { "dd:postalCode": { options: ["30301"], at: Date.now() } } });
+  const out = await drivePageFill(act, { personal_info: { postal_code: 30301 } }, {}, {}, AI_BATCH_BUDGETS);
   assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1,
     "the two good questions still batch into ONE call despite the numeric field");
   assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");

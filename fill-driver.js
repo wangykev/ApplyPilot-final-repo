@@ -1032,11 +1032,17 @@ const parseAiReply = (text) => {
 // path calls the LLM by itself exactly as today. So a batch that is wrong or empty costs speed, never
 // correctness, and the whole feature can be switched off with one flag.
 //
-// Both AI kinds share the call, because both are "ask the model about this question + these options":
-//   • infer      — no stated value; the model CHOOSES (required fields only, the existing rule)
-//   • canonicalize — a STATED value that matched no option; the model MAPS vocabulary, never infers
-// They keep separate instructions in the prompt so canonicalize can still answer UNKNOWN, which is a
-// meaningful answer for it and a forbidden one for infer.
+// SCOPE: unanswerable REQUIRED dropdowns (the `infer` kind) — the case that actually appears in bulk on a
+// screening page. Two kinds are deliberately NOT batched:
+//   • canonicalize (a STATED value that matched no option) — batching it needs the option list, and the
+//     only ways to get one are an extra open per mapped dropdown (MEASURED as a net loss: page 1, which
+//     has no AI questions at all, went 2.7s → 4.1s on those probes) or a cross-run cache. Per the
+//     operator 2026-08-06 there is no cross-run caching to rely on: in the real flow a form is filled
+//     ONCE, reviewed, then submitted, so any such cache is always cold. So canonicalize keeps its own
+//     per-field call — which is cheap in practice, since it only fires when a stated value matches
+//     nothing. The prompt still carries its instructions for when a caller supplies one.
+//   • text/textarea — aiFillText has a specialised compensation branch with its own prompt and
+//     placeholder semantics; folding it in is its own pass.
 const AI_BATCH_MAX = 24; // beyond this the prompt stops being reliable; the overflow just falls back to per-field calls
 
 function buildBatchAiPrompt(items, profile, jobContext) {
@@ -1144,12 +1150,7 @@ async function awaitDropdownCommit(act, loc, isTarget, budgets, delayRender, cei
 //                  answer it, and a wasted prompt entry is cheaper than a missed batch.
 //   canonicalize — a stated value we can PROVE matches no option, using the cross-run cache only. Never
 //                  opens (see the measured page-1 regression), so it is free to include.
-function planAiBatchCandidates(fields, profile, optionCache) {
-  const oc = (optionCache && typeof optionCache === "object") ? optionCache : null;
-  const cachedOptions = (name) => {
-    const e = oc && oc["dd:" + name];
-    return (e && Array.isArray(e.options) && e.options.length && (Date.now() - (e.at || 0)) < OPTION_CACHE_TTL_MS) ? e.options : null;
-  };
+function planAiBatchCandidates(fields, profile) {
   const out = [];
   for (const f of fields || []) {
     if (out.length >= AI_BATCH_MAX) break;
@@ -1158,19 +1159,13 @@ function planAiBatchCandidates(fields, profile, optionCache) {
       const mappedPath = FIELD_MAP[f.fieldName] || null;
       const raw = mappedPath ? getByPath(profile, mappedPath) : undefined;
       // resolve()'s CONTRACT is { candidates: string[] } or { skip: true } — NOT a bare value. Reading it
-      // as a scalar/array is what produced the live `s.toLowerCase is not a function`: the object got
-      // wrapped into [ {candidates:[…]} ] and handed to the match ladder. It already stringifies, so a
-      // numeric profile value arrives here as "30301" with no coercion needed on our side.
+      // as a scalar is what produced the live `s.toLowerCase is not a function`: the object got wrapped
+      // into [ {candidates:[…]} ] and handed to the match ladder.
       const rs = mappedPath ? resolve(raw, f.widgetType) : null;
-      const cands = (rs && Array.isArray(rs.candidates)) ? rs.candidates : [];
-      if (!cands.length) {
-        if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
-        continue;
-      }
-      const opts = cachedOptions(f.fieldName);
-      if (!opts) continue;                       // unknown options ⇒ not worth an open; its own call covers it
-      if (apMatch.matchCandidates(cands, opts, { containment: false }).targetIndex !== -1) continue; // matches fine
-      out.push({ key: f.fieldName, kind: "canonicalize", label: f.label, wrapperSel: f.wrapperSel, needsOpen: false, options: opts, stated: cands });
+      const hasStated = !!(rs && Array.isArray(rs.candidates) && rs.candidates.length);
+      // A STATED value is never batched — see the header. Only an unanswerable REQUIRED field is.
+      if (hasStated) continue;
+      if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
     } catch (e) { /* this field simply isn't batched — it keeps its own per-field call */ }
   }
   return out;
@@ -1179,9 +1174,9 @@ function planAiBatchCandidates(fields, profile, optionCache) {
 // PHASE 2 — only now touch the page, and only for candidates that need options, and only if a batch can
 // actually fire. Returns { items, recon } — recon is what the [AI-BATCH] log prints so a no-op batch is
 // never mistaken for a working one.
-async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
+async function collectAiBatchItems(act, fields, profile, budgets) {
   const t0 = Date.now();
-  const plan = planAiBatchCandidates(fields, profile, optionCache);
+  const plan = planAiBatchCandidates(fields, profile);
   const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
     needOpen: plan.filter((c) => c.needsOpen).length, opened: 0, openFailed: [], dropped: [], ms: 0 };
   // THE COUNT GATE: a batch needs 2+ questions to be worth anything, and that is knowable before any
@@ -3386,7 +3381,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
     try {
-      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, opts && opts.optionCache);
+      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets);
       aiBatch.items = collected.items; aiBatch.recon = collected.recon;
       if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
