@@ -3326,3 +3326,87 @@ PSECU then ran the whole flow clean: fill -> approve 8 -> change the AI demograp
 re-approve -> rehearse -> AGREE 49 · DISAGREE 0 -> would-submit. Nothing submitted.
 
 Extension 972/972; web 117/117; typecheck green.
+
+## 2026-08-06 — one AI call per page, and the stray click that was blamed on Workday
+
+Two threads: making the AI cheaper, and chasing a page-3 failure on waystar that had survived several
+rounds. The second one is the lesson.
+
+### The bug: "Workday keeps rewriting our answer"
+
+waystar page 3 filled, then Save was refused because a required dropdown ("Which basecamp location…")
+was blank. Traced repeatedly: relocation was committed `"Yes, I am open to relocating"` and later read
+`"No, but I live near one of these locations"`; that change remounted the dependent basecamp question
+under a NEW automation-id, blank; our record pointed at the dead one.
+
+It was written up as Workday rewriting the value on its own, and **two remedies were built on that
+premise** — a reload-and-replay re-entry (live-refuted, removed the same day) and a back-a-page retreat
+(never fired once, removed today). Both treated a symptom.
+
+The operator ended it with a rule: **Workday can rarely REMOVE a committed value, but NEVER rewrites one
+into a different option.** So a value that CHANGED is ours. That is now in CLAUDE.md as a triage rule,
+because it eliminates a whole class of wrong explanation in one line.
+
+The real cause, once we looked for our own write: **every portaled listbox renders at the same screen
+coordinates** (every commit on that page logged `rect=463,298`), and the options **linger a beat while
+unmounting and stay clickable**. So the next field's open-click landed on the previous field's list —
+on the option that happened to sit at that point. `fillDropdownCdp` has gated on options-GONE (not
+`aria-expanded`) since 2026-07-06 for exactly this cross-field stray; **the AI commit paths never called
+it**, and they are what fill screening questions. One `closeDropdownConfirmed` in three places.
+
+Result on the form that failed reliably: **4/4 clean runs, 2 hidden + 2 visible** — `remount 0 · stalls 0
+· drift 0`, page 3 **19.4s → 7.0s**. Not recovered from; absent.
+
+### Batched AI — one call per page
+
+The AI questions on a page are now identified, their options read, and sent as ONE call fired before the
+deterministic fill so it overlaps. **Transport only**: each answer goes back to the same per-field
+function that would have called the model itself, so the match ladder against LIVE options, the commit,
+the read-back, `filled_review` and the EEO re-tag all still happen where they did. The batch is a CACHE,
+NOT A GATE — a question it misses makes its own call, so a wrong or empty batch costs speed, never an
+answer. Default-on as of today (`disableAiBatch` is the kill-switch).
+
+Answers are cached **by QUESTION, not automation-id**, and shared with the cascade recursion and both
+AI-4 re-fill paths, so a page REFILL makes **zero** calls and cannot contradict the first pass —
+contradiction was what remounted dependent questions.
+
+Things that had to be fixed to get there, each found by instrumentation rather than reasoning:
+- The collector threw on a non-string profile value and **silently collected nothing** — a totally broken
+  batch and a working one produce identical output, differing only in speed.
+- `resolve()` returns `{candidates}` for a choice widget and `{value}` for text; reading it as a scalar
+  produced that throw and mislabelled every mapped text field.
+- The planner modelled only `FIELD_MAP`, so bucket- and recognizer-answerable questions were scouted and
+  prompted anyway. It now models every deterministic tier.
+- An OPTIONAL unmapped textarea **awaited the call and blocked the page 3.56s** before being skipped —
+  the batch was consulted before the eligibility gate.
+- An AI pick committed via two flat `delayFull(reopenSettleMs)` beats — **800ms/field**, never scaled,
+  no polling — while a deterministic pick used the adaptive poll. One shared `awaitDropdownCommit` now.
+
+### Also fixed
+
+- **The self-ID input policy never reached the REPLAY walk** (it lived in `fillAndPersistPage`, which the
+  replay only calls for refills), so the replay wrote text/date SYNTHETICALLY on the one surface that
+  ignores synthetic writes. Fixing it took **waystar to SUBMIT GATE PASSED** — 7 of 10 tenants.
+- **Sign In and Apply presses now escalate the MECHANISM** on retry (coordinate click → focus+Enter →
+  password-field Enter → in-page activation) instead of re-issuing the identical click. Confirmed live:
+  `sign-in fallback 1 … (the coordinate click did not register)`.
+- **A checkbox group cost ~2.5s when nothing was wrong** — the persistence loop never broke early. Now
+  exits on a 3-read hold streak at a 250ms beat, which is also *stricter*: the observed wipe lands ~281ms
+  after the click, which 700/1400/2100 could straddle and 250/500/750 brackets three times.
+- **The cross-run option cache is gone** (operator): a form is filled ONCE in the real flow, so it was
+  always cold when it mattered — and it made repeat test runs faster than a genuine first fill,
+  distorting every timing measured against it.
+
+### Diagnostics kept, because each one found a bug
+
+`debugPageTrace` (per-field plan-before-acting, every wait named, every action ≥120ms timed),
+`debugAiPrompts`, `debugClobber`, plus the always-on `[AI-BATCH]` line and a `⚠ REMOUNT` alarm — the
+last always-on deliberately, since a remount should now never happen and a regression you only see when
+a flag is enabled is one you find late.
+
+Measured and left alone: the typeahead scroll scrape is at its floor (249 options, 22 hops, 21 of them
+committing, ~86ms per commit — the widget's latency, not our pacing), and hidden runs are **within 6% of
+visible** on the same scrape, so the non-painting problem is already handled by the worker-timer override.
+Earlier page-level hidden/visible gaps were LLM latency variance (1.0s–10.0s across today's runs), not paint.
+
+Extension 1099/1099.
