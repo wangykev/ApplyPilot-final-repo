@@ -3261,7 +3261,19 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // the mount-wait REGIME-INDEPENDENT: fast regime (visible / hidden+worker) frame() ~16ms → up to ~6 polls;
   // rare hidden+CSP-blocked slow regime frame() ~1s (throttled fallback) → 1 poll then the deadline, provably
   // no-slower than the old code (an iteration count would have doubled the stable-2 tail there). i<60 spin-guard.
-  const awaitRender = async (beforeSig) => { for (let t0 = Date.now(), i = 0; Date.now() - t0 < 96 && i < 60; i++) { await frame(); if (curSig() !== beforeSig) return; } };
+  // TIMED-OUT vs BROKE-EARLY (2026-08-06 measurement): 85ms average against a 96ms cap suggests most hops
+  // TIME OUT — i.e. the virtualizer has not committed the new window when we give up, so each hop yields a
+  // PARTIAL window and we need more of them. If that is what is happening, hopping FASTER makes it worse
+  // and waiting LONGER per hop is faster overall. Counting settles it instead of guessing.
+  let hopTimeouts = 0, hopEarly = 0, hopWaitMs = 0;
+  const awaitRender = async (beforeSig) => {
+    const w0 = Date.now();
+    for (let t0 = Date.now(), i = 0; Date.now() - t0 < 96 && i < 60; i++) {
+      await frame();
+      if (curSig() !== beforeSig) { hopEarly++; hopWaitMs += Date.now() - w0; return; }
+    }
+    hopTimeouts++; hopWaitMs += Date.now() - w0;
+  };
   // Measure the CURRENTLY-mounted window's pixel span (viewport + the virtualizer's overscan, typically
   // 2–3× clientHeight). Stepping by a fraction of THIS (not the viewport) means far fewer hops to the bottom
   // — the big visible-scroll speedup — while self-adapting to the tenant's overscan. Falls back to clientHeight.
@@ -3299,7 +3311,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
   }
   const options = Array.from(seen.keys());
-  return { ok: true, options, count: options.length, steps, atBottom, firstRenderMs, cappedOut: steps >= MAX_STEPS,
+  return { ok: true, options, count: options.length, steps, atBottom, firstRenderMs, hopTimeouts, hopEarly, hopWaitMs, cappedOut: steps >= MAX_STEPS,
     roleCount, promptCount, usedSel: optSel,
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
@@ -4060,7 +4072,8 @@ function makeCdpActuation(llmConfig) {
       const ms = Date.now() - _t0;
       console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok
         ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " in " + ms + "ms"
-          + " [" + r.steps + " hop(s)" + (r.firstRenderMs != null ? ", first-render " + r.firstRenderMs + "ms" : "")
+          + " [" + r.steps + " hop(s): " + r.hopEarly + " committed / " + r.hopTimeouts + " TIMED OUT, " + r.hopWaitMs + "ms waiting"
+          + (r.firstRenderMs != null ? ", first-render " + r.firstRenderMs + "ms" : "")
           + (r.cappedOut ? ", CAPPED OUT" : "") + ", ~" + (r.steps ? Math.round((ms - (r.firstRenderMs || 0)) / r.steps) : 0) + "ms/hop]"
           + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]"
         : "FAILED in " + ms + "ms");
