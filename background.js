@@ -543,7 +543,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "enableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -2974,7 +2974,11 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   try {
     // enableAiBatch: opt-in until the batched-AI pre-pass is confirmed inert on a live page (see
     // buildBatchAiPrompt). Read per run, so no reload is needed to flip it.
-    const _aiBatch = await new Promise((r) => chrome.storage.local.get("enableAiBatch", (v) => r(!!(v && v.enableAiBatch))));
+    // ON BY DEFAULT (2026-08-06). It has run clean across many fills, visible AND hidden, and the failure
+    // it was gated behind — a read-only pre-pass close straying a value — never materialised: the
+    // [AI-BATCH-RECON] "open problems" field has stayed empty every run. `disableAiBatch` is the
+    // kill-switch if a tenant ever needs the old per-field path.
+    const _aiBatch = !(await new Promise((r) => chrome.storage.local.get("disableAiBatch", (v) => r(!!(v && v.disableAiBatch)))));
     const _dbgClobber = await new Promise((r) => chrome.storage.local.get("debugClobber", (v) => r(!!(v && v.debugClobber))));
     const _dbgTrace = await new Promise((r) => chrome.storage.local.get("debugPageTrace", (v) => r(!!(v && v.debugPageTrace))));
     if (_dbgTrace) LOG(`debugPageTrace ON — streaming a [TRACE] line for every field decision and every wait on page ${(opts && opts.pageNumber) || "?"}.`);

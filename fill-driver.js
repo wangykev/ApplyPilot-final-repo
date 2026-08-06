@@ -1014,7 +1014,10 @@ const parseAiReply = (text) => {
 // so the match ladder against LIVE options, the read-back, the persistence re-read, `filled_review`, the
 // EEO re-tag and the teach-flow hints all still happen exactly where they did.
 //
-// ⚠ OPT-IN (`budgets.enableAiBatch`) UNTIL ONE LIVE RUN CONFIRMS THE PRE-PASS IS INERT. The pre-pass
+// DEFAULT-ON since 2026-08-06 (`budgets.disableAiBatch` is the kill-switch). It was opt-in until the
+// read-only pre-pass was shown not to disturb the page; across many visible AND hidden fills the
+// [AI-BATCH-RECON] "open problems" field has stayed empty, which is the evidence that gate wanted.
+// The original reasoning, kept because it is why the recon line exists: The pre-pass
 // opens and closes each candidate dropdown to read its options. That is the same read-only open/close
 // `captureChoiceOptions` and `reconDropdownDump` already do — but theirs are live-verified value-preserving
 // and this one is not yet, and a unit test caught the exact hazard: on the stray-on-close class, OUR close

@@ -1425,7 +1425,7 @@ const aiDd = (flags) => Object.assign({
 // The win is N round trips → 1, with the call fired before the deterministic fill so it overlaps. The
 // safety requirement is that batching changes the TRANSPORT ONLY: every answer still clears the match
 // ladder against the LIVE options and still commits through the same verified path.
-const AI_BATCH_BUDGETS = { ...T_BUDGETS, enableAiBatch: true };
+const AI_BATCH_BUDGETS = { ...T_BUDGETS, enableAiBatch: true }; // batching is DEFAULT-ON in the SW; the driver still takes the flag
 const aiDd2 = (id, label, opts) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown",
   isRequired: true, label, triggerText: "Select One",
   options: [{ text: "Select One", disabled: true }].concat((opts || ["Yes", "No"]).map((t) => ({ text: t }))) });
@@ -1475,7 +1475,7 @@ test("AI batch is a CACHE, not a gate: a question the batch missed makes its OWN
   assert.strictEqual(q2.after, "No", "the missed question was still answered, by its own call");
 });
 
-test("AI batch: OFF by default → one call PER question (batching is opt-in until live-verified)", async () => {
+test("AI batch: the kill-switch falls back to one call PER question", async () => {
   const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
     { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS); // batching NOT enabled
