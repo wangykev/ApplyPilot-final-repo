@@ -2908,6 +2908,52 @@ function cdpReadCheckboxGroupState(wrapperSel) {
 // so these finders are deliberately TOLERANT about markup (no tenant automation-id is assumed) and STRICT
 // about identity — every caller additionally verifies the page signature actually changed, so a wrong
 // click cannot be mistaken for a successful retreat.
+// ── SIGN-IN ACTIVATION FALLBACKS (2026-08-06) ───────────────────────────────────────────────────────
+// The coordinate click on Sign In occasionally just does not take — the form stays up, Workday reports
+// neither an error nor the next page, and re-clicking the SAME way (which is all submitAndWait did) can
+// only reproduce it. Operator-confirmed: no browser dialog was involved, the press simply did not happen.
+// So each retry now escalates to a DIFFERENT activation mechanism. These only ever FOCUS a target; the
+// keystroke itself is dispatched trusted from the SW, because the auth form is the one surface where
+// synthetic input is known not to register.
+function cdpFocusSignInTarget(which) {
+  const vis = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden";
+  };
+  if (which === "password") {
+    const p = [...document.querySelectorAll('input[type="password"]')].filter(vis).pop();
+    if (!p) return { ok: false, reason: "no visible password input" };
+    p.focus();
+    return { ok: document.activeElement === p, what: "password input" };
+  }
+  const b = [document.querySelector('[data-automation-id="signInSubmitButton"]'),
+             document.querySelector('[data-automation-id="click_filter"][aria-label="Sign In"]'),
+             ...document.querySelectorAll('button[type="submit"],button,[role="button"]')]
+    .filter(Boolean).filter(vis)
+    .find((e) => e.getAttribute("data-automation-id") === "signInSubmitButton"
+      || /^\s*(sign[- ]?in|log[- ]?in|sign[- ]?on)\s*$/i.test((e.textContent || "").trim())
+      || /sign in/i.test(e.getAttribute("aria-label") || ""));
+  if (!b) return { ok: false, reason: "no visible Sign In button" };
+  b.focus();
+  return { ok: document.activeElement === b, what: "Sign In button" };
+}
+// LAST RESORT, page-side: a real .click() on the button, else the form's own submit. Used only after every
+// trusted mechanism has failed and the alternative is halting for the operator. Scoped hard to the sign-in
+// form — it resolves the button by its automation-id/label, so it cannot fire anything on an application
+// page even if this is somehow reached there.
+function cdpDomActivateSignIn() {
+  const b = document.querySelector('[data-automation-id="signInSubmitButton"]')
+    || [...document.querySelectorAll('button,[role="button"]')]
+      .find((e) => /^\s*(sign[- ]?in|log[- ]?in|sign[- ]?on)\s*$/i.test((e.textContent || "").trim()));
+  if (!b) return { ok: false, reason: "no Sign In button in the DOM" };
+  try { b.click(); return { ok: true, via: "el.click()" }; } catch (e) { /* fall through to the form */ }
+  const f = b.closest && b.closest("form");
+  if (f) { try { (f.requestSubmit ? f.requestSubmit(b) : f.submit()); return { ok: true, via: "form.requestSubmit()" }; } catch (e) { /* nothing left */ } }
+  return { ok: false, reason: "click() and form submit both threw" };
+}
 function cdpFindPageBackControl() {
   const vis = (el) => {
     if (!el || !el.getBoundingClientRect) return false;

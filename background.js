@@ -6886,12 +6886,35 @@ async function runCdpOnboard(tabId, opts) {
         // Canonical id first (present on observed tenants → no rectReady stall); the click_filter
         // handle + generic submit are fallbacks. A coordinate click on the button hits Workday's
         // click_filter overlay if present — cdpCoverCheck now allows that (it's the click surface).
+        // ESCALATE THE MECHANISM, don't just repeat the click (2026-08-06). Live: the coordinate click
+        // silently did not take, the form stayed up, and the old ladder re-clicked exactly the same way —
+        // which can only reproduce the failure. Operator confirmed no browser dialog was involved; the
+        // press simply did not happen. Each retry now activates the button a DIFFERENT way, cheapest and
+        // most-human first. All trusted: the keystroke comes from the SW, the page only moves focus.
+        let signInEsc = 0;
+        const signInEscalate = async () => {
+          const step = signInEsc++;
+          try {
+            if (step === 0) { // focus the button, activate with a real Enter
+              const f = await cdpEval(cdpFocusSignInTarget, "button");
+              if (f && f.ok) { LOG(`  sign-in fallback 1: focused the ${f.what} and pressing Enter (the coordinate click did not take).`); await cdpKeyTap(CDP_KEYS.enter); return; }
+              LOG(`  sign-in fallback 1 unavailable — ${(f && f.reason) || "focus failed"}.`);
+            } else if (step === 1) { // Enter in the password field — how a person actually submits this form
+              const f = await cdpEval(cdpFocusSignInTarget, "password");
+              if (f && f.ok) { LOG("  sign-in fallback 2: pressing Enter in the password field (native form submit)."); await cdpKeyTap(CDP_KEYS.enter); return; }
+              LOG(`  sign-in fallback 2 unavailable — ${(f && f.reason) || "focus failed"}.`);
+            }
+          } catch (e) { LOG(`  sign-in fallback ${step + 1} errored: ${String((e && e.message) || e)}`); }
+        };
         const r = await submitAndWait({
           selectors: ['[data-automation-id="signInSubmitButton"]', '[data-automation-id="click_filter"][aria-label="Sign In"]', 'button[type="submit"]'],
           label: "Sign In submit",
           done: (s) => classifyAuthOutcome(s) !== "unknown",
           formStillUp: (s) => !!s.markers.signInSubmit,
-          timeouts: [500, 6000] // fast re-click at 500ms, then a SHORT ceiling so we regain control in ~6s to check for Chrome's data-breach dialog (below) — instead of burning the full timeout with that dialog just sitting there blocking the form
+          // 3 attempts so BOTH escalations get a turn: click → (focus+Enter) → click → (password Enter) →
+          // click. The short first rung keeps the happy path fast; the last is the real ceiling.
+          timeouts: [500, 3000, 6000],
+          beforeRetry: signInEscalate
         });
         if (r.notFound) return haltNeedsOperator("signin-submit-not-found", r.blockedBy || "no Sign In button", st);
         st = r.scan || st;
@@ -6906,12 +6929,31 @@ async function runCdpOnboard(tabId, opts) {
         // never advance a page or submit an application. Fire ONCE the moment the stall is detected (~6s,
         // not the old ~20s), THEN wait the full time for the real outcome; the routing below handles it.
         if (out === "unknown" && st.markers.signInSubmit) {
-          LOG("sign-in stalled ~6s with the form present and no outcome — pressing Enter, which dismisses Chrome's data-breach warning if that is what is blocking it (safe either way: we are still on the sign-in form). This is a guess, not a diagnosis.");
-          emitRunProgress("Dismissing Chrome's data-breach password warning");
+          // Two DIFFERENT things can produce this state and the log used to assert the rarer one. Chrome's
+          // data-breach dialog does block the form (it is browser chrome, invisible to the DOM, and Enter
+          // dismisses it) — but the operator has now confirmed a case where there was NO dialog and the
+          // click simply never registered. Enter covers both, so send it; just don't claim to know which.
+          LOG("sign-in stalled with the form still up and no outcome — pressing Enter. That both dismisses Chrome's data-breach dialog (if that is what is blocking) and submits the form (if the click never registered). Safe either way: we are still on the SIGN-IN form, so at worst it re-submits sign-in.");
+          emitRunProgress("Retrying sign-in");
           try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
-          const wb = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-breach-dismiss outcome");
+          const wb = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-Enter outcome");
           st = wb.scan || st;
           out = classifyAuthOutcome(st);
+          // LAST RESORT before handing it to a human: activate the button from inside the page. Every
+          // trusted mechanism has now failed, so a synthetic activation is strictly better than halting —
+          // and it is scoped to the sign-in button by automation-id, so it cannot fire anything else.
+          if (out === "unknown" && st.markers.signInSubmit) {
+            let dom = null;
+            try { dom = await cdpEval(cdpDomActivateSignIn); } catch (e) { /* best-effort */ }
+            LOG(dom && dom.ok
+              ? `sign-in still not through — last resort: activated the button in-page via ${dom.via}.`
+              : `sign-in still not through and the in-page activation could not run (${(dom && dom.reason) || "eval failed"}).`);
+            if (dom && dom.ok) {
+              const wd = await waitFor((s) => classifyAuthOutcome(s) !== "unknown", 15000, "post-DOM-activate outcome");
+              st = wd.scan || st;
+              out = classifyAuthOutcome(st);
+            }
+          }
         }
         LOG(`sign-in outcome: ${out}.`);
         // ── EMPTY SHELL after the submit → RELOAD and retry (operator 2026-07-27: "the solution is to
