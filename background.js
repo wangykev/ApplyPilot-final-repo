@@ -7038,8 +7038,31 @@ async function runCdpOnboard(tabId, opts) {
       emitRunProgress("Starting the application", `clicking "${target.label}"`);
       const c = await clickTarget([target.sel], target.label);
       if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-click-blocked", detail: c.blockedBy || "Apply button not clickable" };
-      const w = await waitFor((s) => s.markers.applyManually || s.hasAuthEl || s.formFieldCount > 0, 20000, "post-apply");
+      // ESCALATE THE MECHANISM, like the Sign In press (2026-08-06). The coordinate click can report
+      // success and still not register — nothing moves, and the old flow then burned the FULL 20s before
+      // the applyStage loop re-issued the IDENTICAL click. So: wait SHORT first, and if nothing happened,
+      // activate the button a different way. Only the wait is split; the happy path still returns the
+      // instant the page advances, so this costs nothing when the first click works.
+      const applyLanded = (s) => s.markers.applyManually || s.hasAuthEl || s.formFieldCount > 0;
+      let w = await waitFor(applyLanded, 4000, "post-apply");
       st = w.scan || st;
+      if (!applyLanded(st)) {
+        const f = await cdpEval(cdpActivateBySelector, target.sel, "focus");
+        if (f && f.ok) {
+          LOG(`  apply fallback 1: the click did not register — focused "${f.label}" and pressing Enter.`);
+          try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
+          w = await waitFor(applyLanded, 6000, "post-apply(Enter)");
+          st = w.scan || st;
+        } else LOG(`  apply fallback 1 unavailable — ${(f && f.reason) || "focus failed"}.`);
+      }
+      if (!applyLanded(st)) {
+        const d = await cdpEval(cdpActivateBySelector, target.sel, "click");
+        if (d && d.ok) {
+          LOG(`  apply fallback 2: activating "${d.label}" in-page via ${d.via}.`);
+          w = await waitFor(applyLanded, 10000, "post-apply(in-page click)");
+          st = w.scan || st;
+        } else LOG(`  apply fallback 2 unavailable — ${(d && d.reason) || "eval failed"}.`);
+      }
     } else if (st.markers.useMyLastApplication && !st.markers.applyManually) {
       LOG('only "Use My Last Application" is offered on this page — refusing to reuse a prior application; waiting for a manual-apply/auth path…');
     }

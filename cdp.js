@@ -2908,6 +2908,27 @@ function cdpReadCheckboxGroupState(wrapperSel) {
 // so these finders are deliberately TOLERANT about markup (no tenant automation-id is assumed) and STRICT
 // about identity — every caller additionally verifies the page signature actually changed, so a wrong
 // click cannot be mistaken for a successful retreat.
+// Generic activation fallback for a control the EXTENSION picked (not one found in page content): focus
+// it, or click it from inside the page. Same lesson as the Sign In press — re-issuing the identical
+// coordinate click cannot recover a click that silently did not register, so a retry has to change the
+// MECHANISM. The caller passes a selector it derived itself (an apply-chain automation-id), never
+// anything scraped from the page, and this still refuses a control whose label reads like a submit or a
+// consent: a fallback that gets a run further must never be the thing that agrees to something.
+function cdpActivateBySelector(sel, mode) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "selector not found" };
+  const r = el.getBoundingClientRect();
+  const cs = window.getComputedStyle(el);
+  if (r.width <= 0 || r.height <= 0 || cs.display === "none" || cs.visibility === "hidden") return { ok: false, reason: "not visible" };
+  const label = ((el.textContent || "").replace(/\s+/g, " ").trim() || el.getAttribute("aria-label") || "").slice(0, 60);
+  if (/\bsubmit\b|\bagree\b|\baccept\b|\bconsent\b|\bi certify\b/i.test(label)) {
+    return { ok: false, reason: `refusing — the control reads like a submit/consent ("${label}")` };
+  }
+  if (mode === "focus") { el.focus(); return { ok: document.activeElement === el, label }; }
+  try { el.click(); return { ok: true, label, via: "el.click()" }; }
+  catch (e) { return { ok: false, reason: String((e && e.message) || e) }; }
+}
+
 // ── SIGN-IN ACTIVATION FALLBACKS (2026-08-06) ───────────────────────────────────────────────────────
 // The coordinate click on Sign In occasionally just does not take — the form stays up, Workday reports
 // neither an error nor the next page, and re-clicking the SAME way (which is all submitAndWait did) can
