@@ -4127,9 +4127,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Summary editability: scrape the full option list for choice fields that lack one (tagged FoS
   // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
-  // opts.optionCache: the SW-loaded cross-run option store (see captureChoiceOptions) — cosmetic only.
   _phaseT0 = Date.now();
-  if (!targeted) await captureChoiceOptions(act, results, budgets, opts && opts.optionCache);
+  if (!targeted) await captureChoiceOptions(act, results, budgets);
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
   markPhase("audit", _phaseT0); _phaseT0 = Date.now();
@@ -6414,26 +6413,15 @@ async function captureDropdownOptions(act, loc, budgets) {
 // dropdown in review, same as page-2 does). Dispatch by widget; cache per option-set key so
 // same-vocabulary fields (FoS across education entries; language/proficiency dropdowns across entries)
 // re-open ONCE, not N times. Non-fatal throughout.
-// optionCache (2026-07-25 speed round, OPTIONAL): a CROSS-RUN store the SW loads from
-// chrome.storage and persists back after the page (engine computes / SW does I/O — the driver
-// only reads/mutates the plain object handed in). key → { options, at }. It serves ONLY this
-// cosmetic surface (the review editor's <select>/combobox lists) — the fill/match ladder always
-// reads LIVE options, so a stale list can never cause a wrong fill (a stale pick at review just
-// no-matches on replay → needs_review). Fed for FREE from records that already carry options
-// (committed dropdowns / start-scraped typeaheads), so a re-run at the same tenant — where run 1's
-// committed value is now a tier-0 prefilled-keep — skips the cold re-open (~5.6s server lists)
-// entirely. TTL'd on read; entries the cache served are NOT re-stamped (so staleness still expires).
-const OPTION_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
-async function captureChoiceOptions(act, results, budgets, optionCache) {
+// The CROSS-RUN option cache was REMOVED 2026-08-06 (operator). It only ever helped a SECOND run against
+// the same tenant, and that is a testing artifact, not the product: in the real flow a form is filled
+// ONCE, reviewed, then submitted, so the store was always cold when it mattered. Worse, it made repeat
+// test runs measurably faster than a genuine first fill, which silently distorted timing comparisons.
+// The per-PAGE `cache` below stays — it dedupes same-vocabulary fields within one page (FoS across
+// education entries, proficiency dropdowns across language entries) and is real work avoided, now.
+async function captureChoiceOptions(act, results, budgets) {
   if (!act) return;
   const cache = new Map(); // key → options[] | null (already attempted THIS page)
-  const oc = (optionCache && typeof optionCache === "object") ? optionCache : null;
-  const ocGet = (key) => {
-    const e = oc && oc[key];
-    return (e && Array.isArray(e.options) && e.options.length && (Date.now() - (e.at || 0)) < OPTION_CACHE_TTL_MS) ? e.options : null;
-  };
-  const ocPut = (key, options) => { if (oc && Array.isArray(options) && options.length) oc[key] = { options: options.slice(), at: Date.now() }; };
-  let cacheHits = 0;
   for (const rec of results || []) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
@@ -6452,16 +6440,13 @@ async function captureChoiceOptions(act, results, budgets, optionCache) {
       key = "dd:" + String(rec.fieldName).split(".").pop(); // recName stem (degree/language/readingProficiency) — same stem ⇒ same option vocabulary
       scrape = () => captureDropdownOptions(act, { wrapperSel: rec.auditLoc }, budgets);
     } else continue;
-    if (Array.isArray(rec.options) && rec.options.length) { ocPut(key, rec.options); continue; } // committed dropdown / start-scraped typeahead already has them → FEED the store (free)
+    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown / start-scraped typeahead already carries them
     if (!cache.has(key)) {
-      const stored = ocGet(key);
-      if (stored) { cache.set(key, stored.slice()); cacheHits++; } // cross-run hit → ZERO actuation (no cold re-open); not re-stamped
-      else { const scraped = await scrape(); cache.set(key, scraped); ocPut(key, scraped); }
+      cache.set(key, await scrape());
     }
     const opts = cache.get(key);
     if (opts && opts.length) rec.options = opts.slice();
   }
-  if (cacheHits) console.log(`[ApplyPilot][CDP-TIME] option-capture: ${cacheHits} field(s) served from the cross-run option cache (no cold re-open).`);
 }
 
 // ============================================================================

@@ -2920,18 +2920,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // reads. Genuine value-triggered cascades still appear only AFTER a commit → they remain the cascade
   // re-scan's job; this settles the INITIAL load only.
   const settleMs = await awaitFieldSetSettled(act);
-  // Cross-run option-list cache (cosmetic — feeds the review editor's choice lists; see
-  // captureChoiceOptions in fill-driver.js). SW does the I/O (engine computes): load THIS tenant's
-  // slice, hand the plain object to the driver (mutated in place), persist the merged store after the
-  // fill. A stale list can never cause a wrong fill — the fill/match ladder always reads live options.
-  const tenantKey = (() => { try { return new URL(preScan.url).hostname; } catch (e) { return null; } })();
-  let optionStore = {}, optionCache = {};
-  if (tenantKey) {
-    try {
-      optionStore = await new Promise((r) => chrome.storage.local.get("optionListCache", (s) => r((s && s.optionListCache) || {})));
-      optionCache = (optionStore && typeof optionStore[tenantKey] === "object" && optionStore[tenantKey]) || {};
-    } catch (e) { optionStore = {}; optionCache = {}; }
-  }
+  // (The cross-run option-list cache was REMOVED 2026-08-06 — see captureChoiceOptions. In the real flow
+  // a form is filled ONCE, reviewed, then submitted, so a cross-run cache is always cold in production:
+  // it bought nothing real and it quietly made repeat test runs faster than a genuine first fill, which
+  // distorted every timing measured against it.)
   // ── TEMPORARY DIAGNOSTIC: 10ms watch on a checkbox GROUP (chrome.storage.local.debugGroupWatch) ──
   // Settles the one question three rounds of reasoning could not: when the group loses its check, was the
   // DOM REBUILT or was `checked` toggled in place? `checked` is a property, so a toggle leaves the
@@ -2973,7 +2965,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     // buildBatchAiPrompt). Read per run, so no reload is needed to flip it.
     const _aiBatch = await new Promise((r) => chrome.storage.local.get("enableAiBatch", (v) => r(!!(v && v.enableAiBatch))));
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch }, { cachedShapes, headingToBase, buckets, optionCache });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch }, { cachedShapes, headingToBase, buckets });
   } finally {
     if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
   }
@@ -2998,24 +2990,6 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
       } else LOG("[GROUP-WATCH] drain failed:", JSON.stringify(gw));
     } catch (e) { LOG("[GROUP-WATCH] drain error:", String((e && e.message) || e)); }
   }
-  // Persist the (possibly grown) option cache — best-effort, TTL-pruned + bounded so storage stays small.
-  if (tenantKey) {
-    try {
-      const TTL = 7 * 24 * 3600 * 1000;
-      const pruned = {};
-      Object.keys(optionCache)
-        .filter((k) => optionCache[k] && Array.isArray(optionCache[k].options) && (Date.now() - (optionCache[k].at || 0)) < TTL)
-        .sort((a, b) => (optionCache[b].at || 0) - (optionCache[a].at || 0))
-        .slice(0, 64)
-        .forEach((k) => { pruned[k] = optionCache[k]; });
-      optionStore[tenantKey] = pruned;
-      const newestAt = (t) => Object.keys(optionStore[t] || {}).reduce((m, k) => Math.max(m, (optionStore[t][k] && optionStore[t][k].at) || 0), 0);
-      const tenants = Object.keys(optionStore).sort((a, b) => newestAt(b) - newestAt(a));
-      for (const stale of tenants.slice(12)) delete optionStore[stale]; // cap tenants (newest 12)
-      await new Promise((r) => chrome.storage.local.set({ optionListCache: optionStore }, r));
-    } catch (e) { /* cache persist is best-effort — never fail the page over it */ }
-  }
-
   LOG("page:", out.url);
   if (out.sessionWarning) LOG(`⚠⚠ ${out.sessionWarning}`); // M30 early-warning, leads the report
   LOG(`════ NEEDS REVIEW (${out.needsReview.length}) ════`);
