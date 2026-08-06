@@ -1638,6 +1638,19 @@ test("planner: a FIELD_MAP-answerable question is not an AI candidate (unchanged
   assert.strictEqual(deterministicTierFor(f2, { personal_info: {} }, null, null), null, "…but an EMPTY mapped path is not an answer");
 });
 
+test("debugPageTrace: tracing changes NOTHING about the fill (it wraps the act primitives)", async () => {
+  // The per-action timer replaces act.* methods with timed wrappers. That is exactly the kind of
+  // instrumentation that can quietly alter behaviour -- a wrapper that drops a return value, or turns a
+  // sync member into a promise, would break the fill while looking like a logging change. So run the SAME
+  // page both ways and require identical records.
+  const mk = () => makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")], { aiEnabled: true,
+    ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }, { id: "q2", choice: "No", confidence: "High" }] }) });
+  const shape = (o) => o.results.map((r) => [r.fieldName, r.status, r.after, r.flag || null]);
+  const plain = await drivePageFill(mk(), {}, {}, {}, AI_BATCH_BUDGETS, { aiAnswers: new Map() });
+  const traced = await drivePageFill(mk(), {}, {}, {}, { ...AI_BATCH_BUDGETS, debugPageTrace: true }, { aiAnswers: new Map() });
+  assert.deepStrictEqual(shape(traced), shape(plain), "tracing must be observationally inert");
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable

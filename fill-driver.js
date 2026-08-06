@@ -3452,6 +3452,40 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     const took = ms == null ? "" : ` — ${ms >= 1000 ? "⏸ " : ""}${(ms / 1000).toFixed(2)}s`;
     console.log(`[ApplyPilot][TRACE +${at}s] ${msg}${took}`);
   };
+  // Per-ACTION timing (operator: "include the time it takes each action to run"). Wraps a CURATED list
+  // of async I/O primitives rather than proxying the whole object — some members are plain values or
+  // sync, and turning those into promises would break their callers. Only actions at or over the
+  // threshold print, so the poll loops (which fire constantly and finish in ms) stay out of the way and
+  // every real pause shows up. This is where the invisible time actually goes: opening a widget, waiting
+  // for options to settle, the commit beats, and the wall-clock delays.
+  const TRACE_ACTION_MS = 120;
+  if (_traceOn) {
+    const timed = ["scanPage", "openDropdown", "readDropdownState", "clickDropdownOptionByText", "closeDropdown",
+      "focusInput", "typeText", "typeDigits", "clearText", "pressEnter", "pressTab", "pressEscape", "pressSpace",
+      "clickRadioLabel", "readRadioState", "readCheckboxGroup", "awaitQuiet", "installQuietWatch", "selExists",
+      "readDateSegment", "focusDateSegment", "scrapeTaOptions", "openHier", "readHier", "typeInHier",
+      "clearHierSearch", "readTypeahead", "openTypeahead", "repeatingScan", "llm",
+      "delay", "delayFull", "delayRender"];
+    const shown = (a) => {
+      if (a == null) return "";
+      if (typeof a === "string") return a.length > 28 ? JSON.stringify(a.slice(0, 28) + "…") : JSON.stringify(a);
+      if (typeof a === "number" || typeof a === "boolean") return String(a);
+      if (a.wrapperSel) return String(a.wrapperSel).replace(/^\[data-automation-id="formField-/, "").replace(/"\]$/, "").slice(0, 34);
+      return "";
+    };
+    for (const name of timed) {
+      const fn = act[name];
+      if (typeof fn !== "function") continue;
+      act[name] = async (...args) => {
+        const s0 = Date.now();
+        try { return await fn.apply(act, args); }
+        finally {
+          const ms = Date.now() - s0;
+          if (ms >= TRACE_ACTION_MS) trace(`    · ${name}(${args.map(shown).filter(Boolean).slice(0, 2).join(", ")})`, ms);
+        }
+      };
+    }
+  }
   const clobberLog = [];   // TEMPORARY (budgets.debugClobber): fields changed by ANOTHER field's write
   // Seed the baseline from the UP-FRONT scan, or the very first field's write has nothing to be compared
   // against — which is exactly the write most likely to knock out a dependent question.
