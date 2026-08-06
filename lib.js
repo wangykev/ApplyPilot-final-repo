@@ -1753,9 +1753,32 @@ function devLogSelect(ring, opts) {
 
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
+
+// ── DID THE WEBSITE ACCEPT OUR REPORT? (2026-08-06) ──────────────────────────────────────────────────
+// The push was fire-and-forget: any non-2xx was logged once at a normal volume and swallowed, so a
+// rejected report meant the tracker silently stopped updating while fills looked perfectly healthy
+// (live 2026-08-05: three fills in a row never reached the site). 401 has a specific, fixable cause
+// worth naming rather than a generic failure: `syncEverything` MINTS a key and DELETES every prior one,
+// so a sync from any other tab, window or dev server invalidates the key this extension holds.
+// Pure so it can be tested; the caller does the logging and the storage marker.
+function reportOutcome(status) {
+  const code = Number(status);
+  if (code >= 200 && code < 300) return { ok: true, loud: false, reason: null, message: null };
+  if (code === 401 || code === 403) {
+    return {
+      ok: false, loud: true, reason: "stale-key",
+      message: "THE WEBSITE REJECTED THIS REPORT (" + code + ") — nothing reached the tracker. The extension's " +
+        "ingest key is stale: every \"Sync everything\" mints a NEW key and deletes the old one, so a sync from " +
+        "another tab, window or dev server invalidates this one. Re-sync on /app/connect from the site you use.",
+    };
+  }
+  if (!code) return { ok: false, loud: true, reason: "no-response", message: "THE REPORT NEVER GOT A RESPONSE — nothing reached the tracker (site down, or the wrong origin)." };
+  return { ok: false, loud: true, reason: "http-" + code, message: "THE WEBSITE REJECTED THIS REPORT (" + code + ") — nothing reached the tracker." };
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

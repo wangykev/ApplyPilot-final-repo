@@ -3685,7 +3685,19 @@ async function reportApplication(bundle, jobContext) {
       headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
       body: JSON.stringify(payload)
     });
+    // A rejected report USED to be one quiet line, so the tracker could stop updating while every
+    // fill looked healthy (live 2026-08-05: three in a row never landed). Say it loudly, name the
+    // cause when we know it, leave a marker the UI can read, and put it on the run's progress feed —
+    // the operator is watching that, not the service-worker console.
+    const outcome = reportOutcome(res && res.status);
     console.log("[ApplyPilot] application reported —", res && res.status, `(${payload.status}, ${needs} need review)`);
+    if (!outcome.ok) {
+      console.log("[ApplyPilot] ⛔⛔ " + outcome.message);
+      try { await chrome.storage.local.set({ apReportError: { at: Date.now(), status: (res && res.status) || 0, reason: outcome.reason } }); } catch (e) { /* best effort */ }
+      emitRunProgress("Report rejected", outcome.reason === "stale-key" ? "re-sync the extension on /app/connect (its key was rotated)" : outcome.message);
+    } else {
+      try { await chrome.storage.local.remove("apReportError"); } catch (e) { /* best effort */ }
+    }
   } catch (e) {
     console.log("[ApplyPilot] application report skipped:", String((e && e.message) || e));
   }
