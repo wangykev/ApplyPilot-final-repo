@@ -92,6 +92,40 @@ Regression baseline from that session, all VISIBLE, for comparison:
 0 need review, ~10s. `waystar.wd1` → REVIEW, page 2 fill 7s. A tenant landing far off these wants
 explaining before anything else is believed.
 
+## Diagnostic flags — turn these on before guessing (2026-08-06)
+
+All are `AP_DEV_FLAG` toggles, and they exist because guessing cost several rounds each. When a page
+misbehaves, turn one on and re-run rather than reasoning from the outcome.
+
+| Flag | What it shows |
+|---|---|
+| `debugPageTrace` | Per-field **plan before acting** (`plan: DETERMINISTIC (bucket)` / `AI (answer already known: …)`), the outcome after, every wait named (`SCOUT`, `AI CALL fired`, `WAITING on the AI reply`, `CAPTURE`), and **every action ≥120ms timed**. `⏸` marks anything over 1s. |
+| `debugAiPrompts` | The questions + options of every `act.llm` call, batched or per-field (the profile blob is stripped). |
+| `debugClobber` | Re-scans after EVERY field and names any OTHER field that changed underneath it — value changed, vanished, or appeared. Costs a scan per field. |
+| `enableAiBatch` | One AI call per page instead of one per question (opt-in). |
+
+Always-on, no flag needed: `[AI-BATCH]` + `[AI-BATCH-RECON]` (one line per page: candidates, opens, served
+vs fell-back) and **`⚠ REMOUNT`**, which is now an ALARM — see below.
+
+### The rule that ends a whole class of wrong theories
+
+**Workday can rarely REMOVE a committed value. It NEVER rewrites one into a different option.** (Operator,
+2026-08-06.) So a field that later holds a *different* valid option was changed by US. Do not go looking
+for an explanation on Workday's side.
+
+This cost a full round. On waystar page 3, relocation was committed `"Yes, I am open to relocating"` and
+later read `"No, but I live near one of these locations"`. It was written up as Workday rewriting the
+value, and two remedies were built on that premise. The real cause: **every portaled listbox renders at
+the same screen coordinates** (every commit logged `rect=463,298`), the options **linger while unmounting
+and stay clickable**, so the next field's open-click landed on the previous field's list. Changing
+relocation remounted the dependent basecamp question under a new id, blank and required → Save refused.
+
+Fix: the AI commit paths now call `closeDropdownConfirmed` (gate on options-GONE, not `aria-expanded`),
+which `fillDropdownCdp` has done since 2026-07-06. Result on the form that failed reliably: **4/4 clean
+runs, 2 hidden + 2 visible**, `remount 0 · stalls 0 · drift 0`, page 3 19.4s → 7.0s.
+
+Triage order when a value changes under you: lingering list → stale rect → a second write.
+
 ## THE INVARIANT: nothing is ever submitted
 
 Every run in this doc is a FILL (stops at Workday's review page) or a REHEARSAL (`arm:false` — runs

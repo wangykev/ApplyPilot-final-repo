@@ -1717,6 +1717,28 @@ test("AI commit waits for the option list to UNMOUNT before the next field (the 
     "the AI commit must confirm the list is GONE after committing, before the next field: " + JSON.stringify(seq));
 });
 
+test("a DETERMINISTIC field that cannot match the live options still reaches the AI", async () => {
+  // Operator's question: the batch planner EXCLUDES fields a deterministic tier owns, so they are never
+  // in the batched call. If such a field then opens and finds its value is not among the live options,
+  // does it still get AI help? It must -- otherwise excluding it from the batch would silently downgrade
+  // it to blank. The batch is a CACHE, not a GATE: the field simply makes its own per-field call.
+  const f = { wrapperSel: "[w-x]", fieldName: "country", widgetType: "dropdown", isRequired: true,
+    label: "Country*", triggerText: "Select One",
+    options: [{ text: "Select One", disabled: true }, { text: "United States of America (+1)" }, { text: "Canada" }] };
+  // FIELD_MAP maps `country` -> personal_info.country. A stated value that matches NO live option.
+  const profile = { personal_info: { country: "Freedonia" } };
+  // The planner says this field is deterministic, so it is NOT batched…
+  assert.strictEqual(deterministicTierFor(f, profile, null, null), "field-map");
+  assert.deepStrictEqual(planAiBatchCandidates([f], profile, null, null, null), []);
+  // …and yet the fill still gets AI help, via the CANONICALIZE path (a stated value, mapped to the vocab).
+  const act = makeFakeAct([f], { aiEnabled: true, ai: '{"choice":"United States of America (+1)","confidence":"High"}' });
+  const rec = (await drivePageFill(act, profile, {}, {}, AI_BATCH_BUDGETS)).results[0];
+  assert.ok(act.log.some(([m]) => m === "llm"), "it must call the model per-field: " + rec.detail);
+  assert.strictEqual(rec.status, "filled_review", rec.detail);
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "a STATED value maps vocabulary; it is never re-inferred");
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable

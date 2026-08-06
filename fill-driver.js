@@ -4327,12 +4327,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const vanished = [...cascadeSeen].filter((n) => !liveNames.has(n));
       for (const f of revealed) {
         const twin = vanished.find((n) => normLbl(labelOfSeen.get(n)) && normLbl(labelOfSeen.get(n)) === normLbl(f.label));
-        if (twin) cascadeRecon.push(`REMOUNT r${round}: "${String(f.label || "").slice(0, 60)}" changed id ${twin} → ${f.fieldName} (its earlier record now points at a DEAD wrapper)`);
-        else cascadeRecon.push(`revealed r${round}: ${f.fieldName} "${String(f.label || "").slice(0, 60)}"`);
+        // A REMOUNT is now an ALARM, not routine chatter: the stray-click fix (closeDropdownConfirmed on
+        // the AI commit paths) removed the thing that caused them, so one appearing again means either a
+        // new tenant behaviour or that gate regressing. Always logged. The ordinary reveal/vanish lines
+        // are diagnostics and ride the trace flag.
+        if (twin) cascadeRecon.push(`⚠ REMOUNT r${round}: "${String(f.label || "").slice(0, 60)}" changed id ${twin} → ${f.fieldName} — a dependent question was re-created. Expected to be GONE since the AI commit paths began confirming the option list unmounts; investigate that gate first.`);
+        else if (_traceOn) cascadeRecon.push(`revealed r${round}: ${f.fieldName} "${String(f.label || "").slice(0, 60)}"`);
         labelOfSeen.set(f.fieldName, f.label);
       }
       for (const n of vanished) {
-        if (!revealed.some((f) => normLbl(f.label) === normLbl(labelOfSeen.get(n)))) cascadeRecon.push(`vanished r${round}: ${n} "${String(labelOfSeen.get(n) || "").slice(0, 40)}" (no same-label replacement — a genuine cascade-REMOVE)`);
+        if (_traceOn && !revealed.some((f) => normLbl(f.label) === normLbl(labelOfSeen.get(n)))) cascadeRecon.push(`vanished r${round}: ${n} "${String(labelOfSeen.get(n) || "").slice(0, 40)}" (no same-label replacement — a genuine cascade-REMOVE)`);
       }
       if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));

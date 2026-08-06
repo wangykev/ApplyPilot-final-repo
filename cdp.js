@@ -2975,63 +2975,9 @@ function cdpDomActivateSignIn() {
   if (f) { try { (f.requestSubmit ? f.requestSubmit(b) : f.submit()); return { ok: true, via: "form.requestSubmit()" }; } catch (e) { /* nothing left */ } }
   return { ok: false, reason: "click() and form submit both threw" };
 }
-function cdpFindPageBackControl() {
-  const vis = (el) => {
-    if (!el || !el.getBoundingClientRect) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return false;
-    const cs = window.getComputedStyle(el);
-    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
-  };
-  // EXACT wording only. "Back" is the whole label on Workday's footer control; a substring match would
-  // happily find "Back to search"/"Go back to job" links that leave the application entirely.
-  const BACK = /^(back|previous)$/i;
-  // Anything that could SAVE, ADVANCE, SUBMIT or CONSENT is disqualified outright — this is the one
-  // remedy that clicks a navigation control, and clicking the wrong one here is expensive.
-  const NEVER = /save|submit|continue|next|agree|accept|consent|terms|apply|delete|remove|withdraw/i;
-  const cands = [...document.querySelectorAll('button,[role="button"],a[href]')];
-  for (const el of cands) {
-    const txt = String(el.textContent || "").replace(/\s+/g, " ").trim();
-    const aria = String((el.getAttribute && el.getAttribute("aria-label")) || "").trim();
-    const auto = String((el.getAttribute && el.getAttribute("data-automation-id")) || "");
-    const label = txt || aria;
-    const named = BACK.test(label) || BACK.test(aria) || /^backButton$/i.test(auto);
-    if (!named) continue;
-    if (NEVER.test(label) || NEVER.test(auto)) continue;
-    if (!vis(el)) continue;
-    const r = el.getBoundingClientRect();
-    return { found: true, cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2),
-      label, automationId: auto || null, tag: el.tagName };
-  }
-  return { found: false, sampled: cands.slice(0, 40).map((e) => String(e.textContent || "").replace(/\s+/g, " ").trim().slice(0, 24)).filter(Boolean) };
-}
-// The "you have unsaved changes / leave this page?" dialog. NAVIGATIONAL confirmations only: if the dialog
-// is actually asking for agreement to anything (terms, privacy, consent), we refuse and hand it to the
-// operator rather than clicking through a legal gate to get a run further.
-function cdpFindLeaveDialogConfirm() {
-  const vis = (el) => {
-    if (!el || !el.getBoundingClientRect) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return false;
-    const cs = window.getComputedStyle(el);
-    return cs.display !== "none" && cs.visibility !== "hidden" && cs.opacity !== "0";
-  };
-  const dlg = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].find(vis);
-  if (!dlg) return { found: false, reason: "no visible dialog" };
-  const body = String(dlg.textContent || "").replace(/\s+/g, " ").trim();
-  if (/\bterms\b|privacy|consent|agree to|authori[sz]e|certif/i.test(body)) {
-    return { found: false, reason: "the dialog asks for agreement, not navigation — operator gate", text: body.slice(0, 200) };
-  }
-  const OK = /^(ok|okay|yes|leave|leave page|discard|discard changes|yes, leave|continue)$/i;
-  for (const el of dlg.querySelectorAll('button,[role="button"]')) {
-    const label = String(el.textContent || "").replace(/\s+/g, " ").trim() || String((el.getAttribute && el.getAttribute("aria-label")) || "").trim();
-    if (!OK.test(label) || !vis(el)) continue;
-    const r = el.getBoundingClientRect();
-    return { found: true, cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2), label, text: body.slice(0, 200) };
-  }
-  return { found: false, reason: "a dialog is open but holds no navigational confirm",
-    text: body.slice(0, 200), buttons: [...dlg.querySelectorAll('button,[role="button"]')].map((b) => String(b.textContent || "").trim().slice(0, 24)) };
-}
+// (cdpFindPageBackControl / cdpFindLeaveDialogConfirm were removed 2026-08-06 with the back-a-page
+// retreat they served -- see the note in background.js's replay nav-timeout branch. cdpActivateBySelector
+// above is the survivor: it is generic and the Apply-press escalation uses it.)
 function cdpFindDismissControl(cx, cy) {
   const isVisible = (el) => {
     if (!el || !el.getBoundingClientRect) return false;
