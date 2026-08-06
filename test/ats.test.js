@@ -1309,6 +1309,37 @@ test("an AI-GUESSED demographic wears the loud badge, and ordinary questions do 
   assert.notStrictEqual(age.results[0].flag, "ai-eeo-guess");
 });
 
+test("replay: an APPROVED typed location counts as committed; a FILL still asks for review", async () => {
+  // Greenhouse's candidate-location needs google.maps.places, which never loads in this browser — a
+  // human gets no suggestions either. On a REPLAY the operator has already approved the exact text and
+  // the box holds it, so calling it needs_review fails the strict verify and blocks the gate forever
+  // (live 2026-08-06, Reddit: the only failure left in an otherwise clean rehearsal).
+  const mk = () => {
+    let typed = null;
+    return { act: fakeAct({
+      atsInjScan: () => ({
+        ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+        fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+      }),
+      atsInjPlacesReady: () => ({ ok: true, places: false }),   // the library never loaded
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjReadOptions: () => ({ ok: true, open: true, options: [] }),
+      atsInjTypeInCombo: (sel, t) => { if (t) typed = t; return { ok: true }; },
+      atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+      atsInjCloseCombo: () => ({ ok: true }),
+      atsInjReadValue: () => ({ ok: true, value: typed }),
+    }) };
+  };
+  // REPLAY: the approved value is in the box ⇒ committed (flagged), so the gate can pass
+  const rep = await ats.driveAtsPageFill(mk().act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "Tallahassee, Florida" });
+  assert.strictEqual(rep.results[0].status, "filled_review", "an approved typed location is committed: " + rep.results[0].detail);
+  assert.strictEqual(rep.results[0].flag, "location-typed-unverified", "…and it stays flagged, never silent");
+
+  // FILL: nobody has approved anything yet, so it must still reach review
+  const fill = await ats.driveAtsPageFill(mk().act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(fill.results[0].status, "needs_review", "a fresh fill still asks the human");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {

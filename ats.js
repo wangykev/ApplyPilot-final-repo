@@ -1672,7 +1672,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // containment relief for STATED values: the route may flag it (EEO rungs / static
       // maps), OR the label is demographic regardless of which tier produced the value
       // (a bucket routes before the EEO rung and carries no flag — the Zoox race miss).
-      const mopts = { containment: !!(route && route.containment) || (!!candidates && atsIsEeoLabel(f.label)) };
+      const mopts = { containment: !!(route && route.containment) || (!!candidates && atsIsEeoLabel(f.label)), replay: !!(o && o.valueFor) };
       const produced = await atsActuateField(act, ats, effF, ref, rec, candidates, textValue, jc, profile, mopts);
       if (!produced) {
         // Deterministic tiers produced nothing. AI fallback — REQUIRED fields only (the
@@ -2080,7 +2080,19 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // either). Still needs_review — the form may want a places selection we could not make.
       if (wt === "location" && candidates.length) {
         const typed = await typeInto(String(candidates[0]));
-        if (typed && typed.ok && typed.got) { rec.after = typed.got; rec.matchTier = "typed-unverified"; }
+        if (typed && typed.ok && typed.got) {
+          rec.after = typed.got; rec.matchTier = "typed-unverified";
+          // ON A REPLAY, THIS IS THE VALUE COMMITTED. The human already approved this exact text and
+          // the box now holds it, so grading it needs_review again fails the strict verify and blocks
+          // the gate forever on a places service that never loads in this browser — a field a HUMAN
+          // cannot fill either (2026-07-31). Refusing here would override an explicit approval.
+          // Still FLAGGED, never silent; and if the form insists on a places selection, its own
+          // validation rejects the submit and the post-click poll reports that honestly.
+          if (mopts && mopts.replay && atsLib.normalize(String(typed.got)) === atsLib.normalize(String(candidates[0]))) {
+            rec.status = "filled_review";
+            rec.flag = rec.flag || "location-typed-unverified";
+          }
+        }
       }
       // GH location note (2026-07-31, Figma): the places lookup can hang on "Loading…" with ZERO
       // network — google.maps never loads in some browsers, so even a HUMAN typing gets no options.
