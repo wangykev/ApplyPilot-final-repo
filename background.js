@@ -3087,7 +3087,18 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     // What the batched-AI pass actually DID, in one line. "Still calling AI per field" and "the batch
     // collected nothing" look identical without this.
     const ab = out.aiBatchInfo;
-    if (ab) LOG(`[AI-BATCH] ${ab.candidates} candidate(s)${ab.candidates ? " [" + ab.kinds.join(", ") + "]" : ""} · ${ab.fired ? "fired" : "NOT fired (needs 2+)"} · ${ab.answers} answer(s) back · served ${ab.served}, fell back to per-field ${ab.fellBack} · scan ${ab.scanMs || 0}ms${ab.error ? " · ERROR " + ab.error : ""}`);
+    if (ab) {
+      LOG(`[AI-BATCH] ${ab.candidates} candidate(s)${ab.candidates ? " [" + ab.kinds.join(", ") + "]" : ""} · ${ab.fired ? "fired" : "NOT fired (needs 2+)"} · ${ab.answers} answer(s) back · served ${ab.served}, fell back to per-field ${ab.fellBack} · scan ${ab.scanMs || 0}ms${ab.error ? " · ERROR " + ab.error : ""}`);
+      // ── TEMPORARY RECON (2026-08-06) — remove once the batch pre-pass is trusted. ────────────────
+      // It answers, per page and without guessing: how many candidates were decided WITHOUT touching the
+      // page, how many of those actually cost an open, and whether any read-only close left a value
+      // behind (the one hazard that keeps this feature opt-in). "needOpen 3 · opened 3" on an AI page and
+      // "opened 0" everywhere else is the shape to expect.
+      const rc = ab.recon;
+      if (rc) LOG(`  [AI-BATCH-RECON] planned ${rc.planned} [${(rc.plannedKeys || []).join(", ")}] · needed an open: ${rc.needOpen} · OPENED: ${rc.opened} · plan+open ${rc.ms}ms`
+        + ((rc.openFailed || []).length ? ` · open problems: ${rc.openFailed.join(", ")}` : "")
+        + ((rc.dropped || []).length ? ` · ${rc.dropped.join("; ")}` : ""));
+    }
     const ph = out.timings || {};
     const s = (ms) => (typeof ms === "number" ? (Math.round(ms / 100) / 10) + "s" : "–");
     const slow = (out.results || [])

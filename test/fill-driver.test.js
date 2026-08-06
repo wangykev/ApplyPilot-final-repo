@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { planAiBatchCandidates, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1481,6 +1481,54 @@ test("AI batch: OFF by default → one call PER question (batching is opt-in unt
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS); // batching NOT enabled
   assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 2, "one call per question, exactly as before batching");
   assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+});
+
+test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
+  // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
+  // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable
+  // without touching the page, so the count gate is checked FIRST.
+  const act = makeFakeAct([aiDd2("only", "Pick one*")], { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const rc = out.aiBatchInfo.recon;
+  assert.strictEqual(rc.planned, 1, "it is a candidate…");
+  assert.strictEqual(rc.opened, 0, "…but nothing was opened for a batch that cannot fire");
+  assert.match(rc.dropped.join(" "), /fewer than 2/);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "only").after, "Yes", "and it still fills, per-field");
+});
+
+test("AI batch: opens ONLY the candidates that need options, and reports the count", async () => {
+  // The recon line is the check the operator makes against what they see on screen: infer fields open
+  // (twice overall — once here read-only, once to commit), everything else opens zero extra times.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const rc = out.aiBatchInfo.recon;
+  assert.strictEqual(rc.planned, 2);
+  assert.strictEqual(rc.needOpen, 2, "both infer candidates need live options");
+  assert.strictEqual(rc.opened, 2, "and exactly those two were opened — no others");
+  assert.deepStrictEqual(rc.openFailed, [], "and no read-only close left a value behind");
+});
+
+test("AI batch: a numeric profile value resolves through resolve()'s real contract, not as an object", async () => {
+  // resolve() returns { candidates: string[] } — NOT a bare value. Reading it as a scalar wrapped the
+  // object into [ {candidates:[…]} ], which is what threw `s.toLowerCase is not a function` live and
+  // silently disabled batching for the whole page. A matching numeric value must simply be SKIPPED.
+  const plan = planAiBatchCandidates(
+    [{ wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: false, label: "Postal Code" }],
+    { personal_info: { postal_code: 30301 } },
+    { "dd:postalCode": { options: ["30301"], at: Date.now() } });
+  assert.deepStrictEqual(plan, [], "30301 matches the cached option → not an AI question at all");
+});
+
+test("AI batch: a numeric value that does NOT match becomes a canonicalize candidate (no open)", async () => {
+  const plan = planAiBatchCandidates(
+    [{ wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: false, label: "Postal Code" }],
+    { personal_info: { postal_code: 30301 } },
+    { "dd:postalCode": { options: ["90210"], at: Date.now() } });
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].kind, "canonicalize");
+  assert.strictEqual(plan[0].needsOpen, false, "cache-only — a canonicalize never costs a page open");
 });
 
 test("AI batch: a NON-STRING profile value must not abort the page's whole batch", async () => {

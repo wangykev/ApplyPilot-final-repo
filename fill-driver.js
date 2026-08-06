@@ -1135,67 +1135,80 @@ async function awaitDropdownCommit(act, loc, isTarget, budgets, delayRender, cei
 //  • canonicalize — a MAPPED dropdown whose stated value we can prove does not match any live option, run
 //    through the SAME match ladder the fill will use ({containment:false}: a canonicalize exists precisely
 //    because ApplyPilot will not guess). Proving it here costs nothing extra since the options are open.
-async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
-  const items = [];
+// PHASE 1 — decide the candidates WITHOUT touching the page (2026-08-06). Pure, so it is unit-testable
+// and, more importantly, so we can COUNT candidates before spending a single DOM round trip. Live: page 5
+// had exactly one candidate, and the old collector had already opened it (333ms) before discovering the
+// batch could not fire — a pure cost for a call that never happened.
+//   infer        — required + aiEligible + no value from FIELD_MAP. Needs the live options, so it is the
+//                  only kind that costs an open. Over-inclusive on purpose: buckets/recognizers may still
+//                  answer it, and a wasted prompt entry is cheaper than a missed batch.
+//   canonicalize — a stated value we can PROVE matches no option, using the cross-run cache only. Never
+//                  opens (see the measured page-1 regression), so it is free to include.
+function planAiBatchCandidates(fields, profile, optionCache) {
   const oc = (optionCache && typeof optionCache === "object") ? optionCache : null;
-  const cached = (f) => {                       // options we ALREADY know, for free — no open, no page contact
-    const e = oc && oc["dd:" + f.fieldName];
+  const cachedOptions = (name) => {
+    const e = oc && oc["dd:" + name];
     return (e && Array.isArray(e.options) && e.options.length && (Date.now() - (e.at || 0)) < OPTION_CACHE_TTL_MS) ? e.options : null;
   };
+  const out = [];
   for (const f of fields || []) {
-    if (items.length >= AI_BATCH_MAX) break;
-    if (f.widgetType !== "dropdown") continue;          // choice questions only for now; text/essay keeps its own call
-    // ONE BAD FIELD MUST NOT COST THE WHOLE PAGE'S BATCH (2026-08-06). This loop is best-effort by
-    // definition — anything it fails to collect just falls back to a per-field call — but the guard used
-    // to sit only around the open/close, so a throw anywhere else (live: `s.toLowerCase is not a
-    // function`, from a non-string candidate reaching the match ladder) aborted collection at field 1 and
-    // silently disabled batching for the entire page. The symptom is indistinguishable from "the feature
-    // does nothing", which is exactly how it was found.
+    if (out.length >= AI_BATCH_MAX) break;
+    if (f.widgetType !== "dropdown") continue;   // text/date/checkbox keep their own call — see the batch header
     try {
-    const mappedPath = FIELD_MAP[f.fieldName] || null;
-    const raw = mappedPath ? getByPath(profile, mappedPath) : undefined;
-    const stated = mappedPath ? resolve(raw, f.widgetType) : null;
-    const hasStated = stated != null && !(Array.isArray(stated) && !stated.length);
-    const wantInfer = !hasStated && f.isRequired && aiEligible(f);
-    if (!wantInfer && !hasStated) continue;             // optional + unmapped ⇒ never an AI field
-    if (hasStated && !mappedPath) continue;             // only a MAPPED stated value can canonicalize
-    // ── CANONICALIZE IS NEVER WORTH AN OPEN (2026-08-06, measured) ────────────────────────────────
-    // A canonicalize candidate only becomes real if the stated value matches NO live option, which is
-    // rare — so probing for it by opening the widget spends a round trip on the common case where it
-    // matches fine. Measured on waystar: page 1 (country/state/phone — all mapped, all matching, ZERO AI
-    // questions) went 2.7s → 4.1s purely on these probes, and that alone turned a 6-vs-12-call win into a
-    // slower page. So canonicalize joins the batch ONLY when the cross-run option cache already knows the
-    // options, which costs nothing. Otherwise it keeps its own per-field call — the batch is a cache, not
-    // a gate, so skipping it here forfeits speed, never an answer. INFER still opens, because it cannot
-    // be predicted from a cache and it is the case that actually appears in bulk on a questions page.
-    const cachedOpts = hasStated ? cached(f) : null;
-    if (hasStated && !cachedOpts) continue;
-    if (hasStated) {
-      // STRINGS ONLY past this point: resolve() can hand back a number (a GPA, a years-of-experience)
-      // and the match ladder normalizes with toLowerCase. The fill's own call sites reach the ladder
-      // through the widget fillers, which already stringify; this one calls it directly.
-      const cands = Array.isArray(stated) ? stated : [stated];
-      if (!cands.length) continue;
-      // Only a PROVEN no-match needs the model. containment:false mirrors the fill's own dropdown policy.
-      if (apMatch.matchCandidates(cands, cachedOpts, { containment: false }).targetIndex !== -1) continue;
-      items.push({ key: f.fieldName, kind: "canonicalize", label: f.label, options: cachedOpts, stated: cands });
-      continue;
-    }
-    const loc = { wrapperSel: f.wrapperSel };
+      const mappedPath = FIELD_MAP[f.fieldName] || null;
+      const raw = mappedPath ? getByPath(profile, mappedPath) : undefined;
+      // resolve()'s CONTRACT is { candidates: string[] } or { skip: true } — NOT a bare value. Reading it
+      // as a scalar/array is what produced the live `s.toLowerCase is not a function`: the object got
+      // wrapped into [ {candidates:[…]} ] and handed to the match ladder. It already stringifies, so a
+      // numeric profile value arrives here as "30301" with no coercion needed on our side.
+      const rs = mappedPath ? resolve(raw, f.widgetType) : null;
+      const cands = (rs && Array.isArray(rs.candidates)) ? rs.candidates : [];
+      if (!cands.length) {
+        if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
+        continue;
+      }
+      const opts = cachedOptions(f.fieldName);
+      if (!opts) continue;                       // unknown options ⇒ not worth an open; its own call covers it
+      if (apMatch.matchCandidates(cands, opts, { containment: false }).targetIndex !== -1) continue; // matches fine
+      out.push({ key: f.fieldName, kind: "canonicalize", label: f.label, wrapperSel: f.wrapperSel, needsOpen: false, options: opts, stated: cands });
+    } catch (e) { /* this field simply isn't batched — it keeps its own per-field call */ }
+  }
+  return out;
+}
+
+// PHASE 2 — only now touch the page, and only for candidates that need options, and only if a batch can
+// actually fire. Returns { items, recon } — recon is what the [AI-BATCH] log prints so a no-op batch is
+// never mistaken for a working one.
+async function collectAiBatchItems(act, fields, profile, budgets, optionCache) {
+  const t0 = Date.now();
+  const plan = planAiBatchCandidates(fields, profile, optionCache);
+  const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
+    needOpen: plan.filter((c) => c.needsOpen).length, opened: 0, openFailed: [], dropped: [], ms: 0 };
+  // THE COUNT GATE: a batch needs 2+ questions to be worth anything, and that is knowable before any
+  // page contact. One candidate ⇒ spend nothing and let it make its own call.
+  if (plan.length < 2) { recon.dropped.push("fewer than 2 candidates — no page contact"); recon.ms = Date.now() - t0; return { items: [], recon }; }
+  const items = [];
+  for (const c of plan) {
+    if (!c.needsOpen) { items.push({ key: c.key, kind: c.kind, label: c.label, options: c.options, stated: c.stated }); continue; }
+    const loc = { wrapperSel: c.wrapperSel };
     let before = null;
     try {
       const r = await openAndReadDropdown(act, loc, budgets);
+      recon.opened++;
       before = r.before;
-      if (!r.expanded || !r.state || !r.state.optionCount) { await closeAndVerifyBlank(act, loc, before, budgets); continue; }
+      if (!r.expanded || !r.state || !r.state.optionCount) { recon.openFailed.push(c.key + ":no-options"); await closeAndVerifyBlank(act, loc, before, budgets); continue; }
       const enabled = apMatch.withoutPlaceholderOptions(r.state.options.filter((o) => !o.disabled).map((o) => o.text));
-      if (enabled.length) items.push({ key: f.fieldName, kind: "infer", label: f.label, options: enabled });
-      await closeAndVerifyBlank(act, loc, before, budgets);
+      if (enabled.length) items.push({ key: c.key, kind: c.kind, label: c.label, options: enabled });
+      else recon.openFailed.push(c.key + ":all-disabled");
+      const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+      if (cz && cz.blank === false) recon.openFailed.push(c.key + ":CLOSE-STRAYED->" + cz.after); // the hazard the opt-in exists for
     } catch (e) {
+      recon.openFailed.push(c.key + ":" + String((e && e.message) || e).slice(0, 40));
       try { await closeAndVerifyBlank(act, loc, before, budgets); } catch (e2) { /* best effort */ }
     }
-    } catch (eOuter) { /* this field simply isn't batched — it keeps its own per-field call */ }
   }
-  return items;
+  recon.ms = Date.now() - t0;
+  return { items, recon };
 }
 
 const aiFillField = async (act, loc, f, profile, jobContext, budgets, preAnswer) => {
@@ -3368,12 +3381,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // let it fly while the deterministic fields fill. By the time the loop reaches an AI question the reply
   // is usually already in hand, so the page pays ~0 for it instead of one serial round trip per question.
   // The result is a CACHE consulted by the normal per-field AI path — never a gate (see buildBatchAiPrompt).
-  const aiBatch = { answers: new Map(), promise: null, items: [], awaited: false, error: null };
+  const aiBatch = { answers: new Map(), promise: null, items: [], awaited: false, error: null, recon: null };
   let aiBatchScanMs = 0;
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
     try {
-      aiBatch.items = await collectAiBatchItems(act, scan.fields, profile, budgets, opts && opts.optionCache);
+      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, opts && opts.optionCache);
+      aiBatch.items = collected.items; aiBatch.recon = collected.recon;
       if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
         // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
@@ -4176,7 +4190,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     ? { candidates: aiBatch.items.length, kinds: aiBatch.items.map((i) => i.kind + ":" + i.key),
         fired: !!aiBatch.promise, answers: aiBatch.answers.size,
         served: aiBatch.served || 0, fellBack: aiBatch.fellBack || 0,
-        scanMs: aiBatchScanMs, error: aiBatch.error || null }
+        scanMs: aiBatchScanMs, error: aiBatch.error || null, recon: aiBatch.recon || null }
     : null;
   return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo };
 }
@@ -7036,5 +7050,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
