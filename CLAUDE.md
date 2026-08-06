@@ -280,6 +280,29 @@ A hidden/minimized tab throttles page timers to ~1Hz then deep-freezes, so a pag
 5. Popup → **Load default profile** → **Fill current page** (page engine) or **CDP fill FULL PAGE**; **View last summary** for the review summary.
 6. Watch the service-worker console. `npm test` runs the unit suite (`node:test`).
 
+## Workday never rewrites a committed value into a DIFFERENT option (operator, 2026-08-06)
+
+**A committed value can, very rarely, be REMOVED by Workday. It is NEVER silently changed into another
+option.** So when a field you committed later holds a *different* valid option, that is **us**, not the
+tenant — stop looking for an explanation on Workday's side and go find our own stray write.
+
+This is a load-bearing diagnostic rule, and ignoring it cost a full debugging round. Live on waystar
+page 3: relocation was committed `"Yes, I am open to relocating"` and later read `"No, but I live near
+one of these locations"`. That was written up as "Workday rewrites the value on its own", and the
+remedies built on that premise (answer memory, a pre-Save recovery) treated a symptom. The real cause
+was ours: **every portaled listbox renders at the SAME screen coordinates** (every commit on that page
+logged `rect=463,298`), the options **linger a beat while unmounting and stay clickable**, and the next
+field's open-click therefore landed on the previous field's still-mounted list — selecting the option
+that happened to sit at that point. Changing relocation then remounted the dependent basecamp question
+under a new automation-id, blank and required, which is what blocked Save.
+
+`closeDropdownConfirmed` has gated the DETERMINISTIC path on options-GONE (not merely `aria-expanded`)
+since 2026-07-06; the **AI commit paths never called it**, and they are what fill screening questions.
+Now gated: `aiFillField`, `aiCanonicalizeField`, and the employment-status dropdown commit.
+
+Corollary for triage: value GONE ⇒ plausibly Workday (rare). Value CHANGED to another real option ⇒
+ours — look for a lingering list, a stale rect, or a second write, in that order.
+
 ## Working principles
 
 - **`apMatch` is TWO objects — Node gets all of lib.js, the SW gets a HAND-WRITTEN literal.** `fill-driver.js` reaches lib.js through `apMatch`, which is `require("./lib.js")` under Node but an explicit object literal in the service worker. So `apMatch.foo(...)` can pass every test and throw `apMatch.foo is not a function` in the browser — live 2026-07-28, the replay walk died mid-run on `apMatch.dateOrderOf` after the collision fix routed the call sites through it. **Adding a lib.js helper that fill-driver uses means updating BOTH: lib.js's `module.exports` AND the SW literal.** Guarded by `test/sw-globals.test.js` (every `apMatch.X` used must be in the literal, and every literal key must be exported by lib.js — both verified to FAIL when broken).

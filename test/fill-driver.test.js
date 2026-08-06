@@ -1683,6 +1683,40 @@ test("debugPageTrace: the action timer is applied ONCE, even across recursive fi
   assert.strictEqual(act.readDropdownState, once, "a second fill must not re-wrap an already-timed primitive");
 });
 
+test("AI commit waits for the option list to UNMOUNT before the next field (the stray-click race)", async () => {
+  // Operator's diagnosis, and the log backs it: every portaled listbox renders at the SAME screen
+  // position (every commit on waystar page 3 logged rect=463,298). Selecting an option closes the list,
+  // but the options linger a beat while unmounting and stay CLICKABLE — so the next field's open-click
+  // lands where the previous field's options still are. On page 3 that click hit "No, but I live near one
+  // of these locations", an option of the RELOCATION list, silently changing relocation and remounting
+  // the dependent basecamp question. It looked like Workday rewriting our answer; it was us mis-clicking.
+  // fillDropdownCdp has gated on options-GONE since 2026-07-06; the AI commit paths never did.
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  // closeDropdownConfirmed gates on the LISTBOX being gone, re-pressing Escape each round — so the
+  // observable signature is an Escape after the commit click.
+  // Model the hazard itself: after the commit the listbox LINGERS for one read, still holding clickable
+  // options (a few reads, since the commit poll consumes some). A fake that closes instantly would let a missing gate pass.
+  const seq = [];
+  let committed = false, lingered = 0;
+  const realRead = act.readDropdownState;
+  act.readDropdownState = async (l) => {
+    const st = await realRead(l);
+    if (committed && lingered < 4) { lingered++; return Object.assign({}, st, { listboxPresent: true, optionCount: 3 }); }
+    return st;
+  };
+  const realEsc = act.pressEscape;
+  act.pressEscape = async (...a) => { seq.push("escape"); return realEsc ? realEsc(...a) : undefined; };
+  const realClick = act.clickDropdownOptionByText;
+  act.clickDropdownOptionByText = async (...a) => { committed = true; seq.push("commit"); return realClick(...a); };
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", rec.detail);
+  assert.strictEqual(rec.after, "No");
+  const c = seq.indexOf("commit");
+  assert.ok(c >= 0, "it committed: " + JSON.stringify(seq));
+  assert.ok(seq.indexOf("escape", c) > c,
+    "the AI commit must confirm the list is GONE after committing, before the next field: " + JSON.stringify(seq));
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable

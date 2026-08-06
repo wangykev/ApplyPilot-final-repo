@@ -1340,6 +1340,17 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets, preAnswer)
   // ALWAYS filled_review — an AI guess is never silently trusted. If the dropdown held a REAL
   // prefilled value the AI's pick replaced, say so (provenance for the reviewer — the prior
   // answer is otherwise invisible once overwritten).
+  // ── WAIT FOR THE LIST TO UNMOUNT BEFORE THE NEXT FIELD (2026-08-06) ─────────────────────────────
+  // Selecting an option closes the list, but the options LINGER for a beat while they unmount — and they
+  // stay clickable. Every portaled listbox renders at the SAME screen position (live: every commit on
+  // waystar page 3 logged rect=463,298), so the next field's open-click lands exactly where the previous
+  // field's options still are. On page 3 that click hit "No, but I live near one of these locations" —
+  // an option of the RELOCATION list — which silently changed relocation and remounted the dependent
+  // basecamp question under a new id. It read like Workday rewriting our answer; it was us mis-clicking
+  // a list that had not finished unmounting.
+  // fillDropdownCdp has gated on options-GONE (not merely aria-expanded) since 2026-07-06. The AI commit
+  // paths never did, and they are the ones that fill these screening questions.
+  try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above already stands */ }
   const overwroteNote = hasLiveValue(before) && norm(before) !== norm(target)
     ? " (overwrote prefilled \"" + before + "\")" : "";
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier,
@@ -1605,6 +1616,17 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
   const committed = cr.ok, post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-canon-commit-failed",
     detail: "AI mapped \"" + statedStr + "\" → \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
+  // ── WAIT FOR THE LIST TO UNMOUNT BEFORE THE NEXT FIELD (2026-08-06) ─────────────────────────────
+  // Selecting an option closes the list, but the options LINGER for a beat while they unmount — and they
+  // stay clickable. Every portaled listbox renders at the SAME screen position (live: every commit on
+  // waystar page 3 logged rect=463,298), so the next field's open-click lands exactly where the previous
+  // field's options still are. On page 3 that click hit "No, but I live near one of these locations" —
+  // an option of the RELOCATION list — which silently changed relocation and remounted the dependent
+  // basecamp question under a new id. It read like Workday rewriting our answer; it was us mis-clicking
+  // a list that had not finished unmounting.
+  // fillDropdownCdp has gated on options-GONE (not merely aria-expanded) since 2026-07-06. The AI commit
+  // paths never did, and they are the ones that fill these screening questions.
+  try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above already stands */ }
   // ALWAYS filled_review — a canonicalized demographic still gets a human glance.
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier, flag: "ai-canonicalized", confidence: conf,
     detail: "AI canonicalized stated \"" + statedStr + "\" → \"" + target + "\" (vocab map, not inferred)", options: enabledTexts, auditLoc: loc.wrapperSel };
@@ -3833,6 +3855,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
               const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
                 (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
               const committed = cr.ok, post = { triggerText: cr.after };
+              // Options linger while unmounting and every listbox renders at the same coordinates, so the
+              // next field's open-click can land on THIS list. Gate on options-gone (see aiFillField).
+              try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort */ }
               record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
               record.resolved = [decision.fill];
               record.options = enabledTexts;
