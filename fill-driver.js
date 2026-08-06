@@ -1043,6 +1043,13 @@ const parseAiReply = (text) => {
 //     nothing. The prompt still carries its instructions for when a caller supplies one.
 //   • text/textarea — aiFillText has a specialised compensation branch with its own prompt and
 //     placeholder semantics; folding it in is its own pass.
+// The QUESTION is the stable identity, not the automation-id. Workday remounts a dependent question
+// under a NEW id whenever the field it depends on changes, so anything keyed on the id loses track of an
+// answer it already has. Normalized so casing, whitespace and the required "*" cannot split one question
+// into two cache entries.
+function aiLabelKey(label) {
+  return String(label == null ? "" : label).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
+}
 const AI_BATCH_MAX = 24; // beyond this the prompt stops being reliable; the overflow just falls back to per-field calls
 
 function buildBatchAiPrompt(items, profile, jobContext) {
@@ -3382,6 +3389,17 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // is usually already in hand, so the page pays ~0 for it instead of one serial round trip per question.
   // The result is a CACHE consulted by the normal per-field AI path — never a gate (see buildBatchAiPrompt).
   const aiBatch = { answers: new Map(), promise: null, items: [], awaited: false, error: null, recon: null };
+  // ── ONE ANSWER PER QUESTION, FOR THE WHOLE PAGE (2026-08-06) ─────────────────────────────────────
+  // Keyed by the QUESTION, not the automation-id, and SHARED with the recursive cascade fills through
+  // opts.aiAnswers. Two problems, one cause: the cascade re-fill calls drivePageFill again, which built a
+  // FRESH batch with no memory of the first, so a revealed field asked the model again — and the model is
+  // free to answer differently. Live on waystar page 3 that produced a flip-flop: relocation was filled
+  // "Yes, I am open to relocating", then re-answered "No, but I live near one of the locations", then
+  // "Yes" again. Each CHANGE remounts the dependent basecamp question under a new id, which is why the
+  // page could never settle and Save was refused on a required field that had been answered twice.
+  // With the answer cached by question: a remounted field is recognised as the SAME question and filled
+  // from the cache — no second call, and byte-identical to the first answer, so nothing remounts again.
+  const aiAnswerByLabel = (opts && opts.aiAnswers instanceof Map) ? opts.aiAnswers : new Map();
   let aiBatchScanMs = 0;
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
@@ -3393,7 +3411,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
         // model works. Errors are captured, never thrown — a failed batch just means per-field calls.
         aiBatch.promise = act.llm({ system, user, maxTokens: 256 + 192 * aiBatch.items.length })
-          .then((res) => { if (res && res.ok) aiBatch.answers = parseBatchAiReply(res.text, aiBatch.items); else aiBatch.error = (res && res.error) || "no reply"; })
+          .then((res) => {
+            if (!res || !res.ok) { aiBatch.error = (res && res.error) || "no reply"; return; }
+            aiBatch.answers = parseBatchAiReply(res.text, aiBatch.items);
+            // Re-key onto the QUESTION so a remount under a new id still finds its answer.
+            for (const it of aiBatch.items) { const a = aiBatch.answers.get(it.key); if (a) aiAnswerByLabel.set(aiLabelKey(it.label), Object.assign({ _kind: it.kind }, a)); }
+          })
           .catch((e) => { aiBatch.error = String((e && e.message) || e); });
       }
     } catch (e) { aiBatch.error = String((e && e.message) || e); }
@@ -3404,11 +3427,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // live run looked like it was still calling per-field and there was no way to tell collection from
   // key-matching from a parse miss.
   aiBatch.served = 0; aiBatch.fellBack = 0;
-  const aiBatchAnswer = async (key) => {
+  // Lookup is by QUESTION. A cached answer is reused even when the automation-id has changed underneath
+  // us, and even when it came from an earlier per-field call rather than the batch — one answer per
+  // question per page, always.
+  const aiBatchAnswer = async (f, wantKind) => {
+    const lk = aiLabelKey(f && f.label);
+    const usable = (a) => (a && (!a._kind || !wantKind || a._kind === wantKind)) ? a : null;
+    const cached = lk ? usable(aiAnswerByLabel.get(lk)) : null;
+    if (cached) { aiBatch.served++; return cached; }        // same QUESTION, whatever id it now carries
     if (!aiBatch.promise) { aiBatch.fellBack++; return null; }
     if (!aiBatch.awaited) { aiBatch.awaited = true; await aiBatch.promise; }
-    const hit = aiBatch.answers.get(key) || null;
-    if (hit) aiBatch.served++; else aiBatch.fellBack++;
+    const hit = usable((lk && aiAnswerByLabel.get(lk)) || aiBatch.answers.get(f && f.fieldName));
+    if (hit) { aiBatch.served++; if (lk) aiAnswerByLabel.set(lk, hit); } else aiBatch.fellBack++;
     return hit;
   };
   // [CDP-TIME] phase accounting (2026-07-25): where a page's wall-clock actually goes — logged by the
@@ -3746,10 +3776,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         let aiRes = null;
         // The page's ONE batched call, if it covered this question. Kind must agree: an `infer` answer
         // must never be spent on a canonicalize (or the reverse) — they are answering different prompts.
-        const batched = await aiBatchAnswer(f.fieldName);
-        const batchedItem = batched ? aiBatch.items.find((i) => i.key === f.fieldName) : null;
-        const preInfer = batched && batchedItem && batchedItem.kind === "infer" ? batched : null;
-        const preCanon = batched && batchedItem && batchedItem.kind === "canonicalize" ? batched : null;
+        // Ask for the kind THIS branch needs. An infer answer must never be spent on a canonicalize (or
+        // the reverse) — they answer different prompts. A cached answer has no batch item behind it, so
+        // the kind travels with the answer rather than being looked up in aiBatch.items.
+        const wantKind = canonicalize ? "canonicalize" : "infer";
+        const batched = await aiBatchAnswer(f, wantKind);
+        const preInfer = !canonicalize ? batched : null;
+        const preCanon = canonicalize ? batched : null;
         if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
         else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
@@ -3762,6 +3795,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess";
         }
         if (aiRes) Object.assign(record, aiRes);
+        // REMEMBER IT, keyed by the question: if this same question comes back under a different
+        // automation-id (a remount), it must get the IDENTICAL answer, from the cache, with no new call.
+        // Re-answering is what made the page oscillate.
+        if (aiRes && !batched && aiRes.after != null && String(aiRes.after) !== "") {
+          const lk = aiLabelKey(f.label);
+          if (lk) aiAnswerByLabel.set(lk, { _kind: wantKind, choice: String(aiRes.after), justification: "",
+            confidence: aiRes.confidence || "", maps_to: aiRes.maps_to || "", suggested_category: aiRes.suggested_category || "" });
+        }
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
     }
 
@@ -4117,7 +4158,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
       revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
       try {
-        const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames });
+        // Share the page's answer cache: a revealed/REMOUNTED field is usually a question we have
+        // already answered, and it must get the SAME answer rather than a fresh (possibly different) one.
+        const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames, aiAnswers: aiAnswerByLabel });
         for (const r of (sub && sub.results) || []) {
           r.cascadeRevealed = true; // provenance: appeared only AFTER a value committed → the submit gate forces a re-review
           r.detail = (r.detail ? r.detail + " | " : "") + "REVEALED by an earlier field's value (cascade re-scan)";

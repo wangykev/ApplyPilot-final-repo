@@ -1518,6 +1518,31 @@ test("debugClobber: OFF by default → no extra page scans (it is a diagnostic, 
   assert.ok(scans > withFlag, `the flag adds the per-field scans (off=${withFlag}, on=${scans})`);
 });
 
+test("AI answer STABILITY: the same question under a NEW automation-id reuses the answer, no second call", async () => {
+  // The waystar page-3 oscillation. Workday remounts a dependent question under a new id whenever the
+  // field it depends on CHANGES, and the cascade re-fill calls drivePageFill recursively — which used to
+  // build a fresh batch with no memory of the first, so the remounted question was asked again and the
+  // model was free to answer differently. Live that produced Yes -> No -> Yes on the relocation question,
+  // and every CHANGE remounted the dependent question again, so the page never settled and Save was
+  // refused on a required field that had been answered twice.
+  // The question is the stable identity, so the answer is cached by LABEL and shared with the recursion.
+  const q = (id) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown", isRequired: true,
+    label: "Would you be open to relocating?", triggerText: "Select One",
+    options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] });
+  const act = makeFakeAct([q("id_before")], { aiEnabled: true,
+    // If it ever asks twice it gets the OPPOSITE answer — so a second call cannot hide in a green test.
+    ai: ['{"choice":"Yes","confidence":"High"}', '{"choice":"No","confidence":"High"}'] });
+  const shared = new Map();
+  const r1 = await drivePageFill(act, {}, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: shared });
+  assert.strictEqual(r1.results[0].after, "Yes");
+  // Same question comes back under a DIFFERENT id — exactly what a remount looks like to us.
+  const act2 = makeFakeAct([q("id_after_remount")], { aiEnabled: true,
+    ai: ['{"choice":"No","confidence":"High"}'] });   // a fresh call here would answer "No"
+  const r2 = await drivePageFill(act2, {}, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: shared });
+  assert.strictEqual(r2.results[0].after, "Yes", "the remounted question must reuse the FIRST answer, not re-ask");
+  assert.strictEqual(act2.log.filter(([m]) => m === "llm").length, 0, "and it must not call the model at all");
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable
