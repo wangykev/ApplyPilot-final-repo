@@ -1338,6 +1338,28 @@ test("replay: an APPROVED typed location counts as committed; a FILL still asks 
   // FILL: nobody has approved anything yet, so it must still reach review
   const fill = await ats.driveAtsPageFill(mk().act, "greenhouse", PROFILE, {}, {}, {});
   assert.strictEqual(fill.results[0].status, "needs_review", "a fresh fill still asks the human");
+
+  // …AND THE AUDIT OVERRULES ALL OF IT. Live 2026-08-06 on Reddit the box did NOT keep the text, the
+  // M40 re-read found it empty, and the field was downgraded — so the gate refused a form whose
+  // required location really was blank. That is the safety property; without it this grade would let a
+  // submit through with an empty required field.
+  let typed2 = null;
+  const discards = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+      fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjPlacesReady: () => ({ ok: true, places: false }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [] }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed2 = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed2 || "" }),
+    atsInjCloseCombo: () => { typed2 = null; return { ok: true }; },   // the widget DISCARDS free text
+    atsInjReadValue: () => ({ ok: true, value: typed2 }),
+  });
+  const lost = await ats.driveAtsPageFill(discards, "greenhouse", PROFILE, {}, {}, { valueFor: () => "Tallahassee, Florida" });
+  assert.strictEqual(lost.results[0].status, "needs_review", "a box that discarded the value is NOT committed: " + lost.results[0].detail);
+  assert.match(String(lost.results[0].detail), /audit/i, "and the audit is what says so");
 });
 
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must

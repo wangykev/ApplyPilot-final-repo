@@ -2082,12 +2082,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         const typed = await typeInto(String(candidates[0]));
         if (typed && typed.ok && typed.got) {
           rec.after = typed.got; rec.matchTier = "typed-unverified";
-          // ON A REPLAY, THIS IS THE VALUE COMMITTED. The human already approved this exact text and
-          // the box now holds it, so grading it needs_review again fails the strict verify and blocks
-          // the gate forever on a places service that never loads in this browser — a field a HUMAN
-          // cannot fill either (2026-07-31). Refusing here would override an explicit approval.
-          // Still FLAGGED, never silent; and if the form insists on a places selection, its own
-          // validation rejects the submit and the post-click poll reports that honestly.
+          // ON A REPLAY, AN APPROVED VALUE THAT IS ACTUALLY IN THE BOX IS COMMITTED. The human already
+          // approved this exact text, so refusing it would override an explicit approval and block the
+          // gate forever on a places service that never loads in this browser (a field a HUMAN cannot
+          // fill either — 2026-07-31). Still FLAGGED, never silent.
+          //
+          // ⚠ AND THIS DEFERS TO THE AUDIT, which is the part that matters. Live 2026-08-06 on Reddit
+          // the box did NOT retain the text — the M40 re-read found `page now holds ""` and correctly
+          // downgraded the field to needs_review, so the gate still refused. That is the right outcome:
+          // the required field really is empty. This grade only survives on a form that KEEPS what we
+          // typed; where the widget discards it, the audit overrules us.
           if (mopts && mopts.replay && atsLib.normalize(String(typed.got)) === atsLib.normalize(String(candidates[0]))) {
             rec.status = "filled_review";
             rec.flag = rec.flag || "location-typed-unverified";
