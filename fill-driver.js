@@ -1157,8 +1157,11 @@ async function awaitDropdownCommit(act, loc, isTarget, budgets, delayRender, cei
 //                  answer it, and a wasted prompt entry is cheaper than a missed batch.
 //   canonicalize — a stated value we can PROVE matches no option, using the cross-run cache only. Never
 //                  opens (see the measured page-1 regression), so it is free to include.
-function planAiBatchCandidates(fields, profile) {
+function planAiBatchCandidates(fields, profile, known) {
   const out = [];
+  // A question we ALREADY have an answer for is not a candidate — this is what makes a page refill cost
+  // zero calls. Keyed by question, so it holds even when the automation-id changed underneath us.
+  const answered = (f) => !!(known instanceof Map && known.size && known.has(aiLabelKey(f && f.label)));
   for (const f of fields || []) {
     if (out.length >= AI_BATCH_MAX) break;
     if (f.widgetType !== "dropdown") continue;   // text/date/checkbox keep their own call — see the batch header
@@ -1172,6 +1175,7 @@ function planAiBatchCandidates(fields, profile) {
       const hasStated = !!(rs && Array.isArray(rs.candidates) && rs.candidates.length);
       // A STATED value is never batched — see the header. Only an unanswerable REQUIRED field is.
       if (hasStated) continue;
+      if (answered(f)) continue;                 // already decided this page — reuse, never re-ask
       if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
     } catch (e) { /* this field simply isn't batched — it keeps its own per-field call */ }
   }
@@ -1181,9 +1185,9 @@ function planAiBatchCandidates(fields, profile) {
 // PHASE 2 — only now touch the page, and only for candidates that need options, and only if a batch can
 // actually fire. Returns { items, recon } — recon is what the [AI-BATCH] log prints so a no-op batch is
 // never mistaken for a working one.
-async function collectAiBatchItems(act, fields, profile, budgets) {
+async function collectAiBatchItems(act, fields, profile, budgets, known) {
   const t0 = Date.now();
-  const plan = planAiBatchCandidates(fields, profile);
+  const plan = planAiBatchCandidates(fields, profile, known);
   const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
     needOpen: plan.filter((c) => c.needsOpen).length, opened: 0, openFailed: [], dropped: [], ms: 0 };
   // THE COUNT GATE: a batch needs 2+ questions to be worth anything, and that is knowable before any
@@ -3404,7 +3408,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
     try {
-      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets);
+      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel);
       aiBatch.items = collected.items; aiBatch.recon = collected.recon;
       if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);

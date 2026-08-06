@@ -1543,6 +1543,32 @@ test("AI answer STABILITY: the same question under a NEW automation-id reuses th
   assert.strictEqual(act2.log.filter(([m]) => m === "llm").length, 0, "and it must not call the model at all");
 });
 
+test("AI memory: a page REFILL reuses every answer and calls the model ZERO times", async () => {
+  // Operator's fix: "if this page needs to be refilled, it should remember the previous answers and not
+  // recall AI". The SW now holds one answer map per PAGE and hands it to every drivePageFill for that
+  // page — the initial fill, the cascade recursion, and AI-4's re-fills. Before this, each re-fill was a
+  // fresh invocation with an empty cache, so it asked again and could answer DIFFERENTLY; that
+  // contradiction is what remounted dependent questions and made the page unsaveable.
+  const q = (id, label) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown", isRequired: true,
+    label, triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] });
+  const fields = () => [q("a", "Would you relocate?"), q("b", "Available three days a week?")];
+  const memory = new Map();                                   // what the SW keeps per page
+  const first = makeFakeAct(fields(), { aiEnabled: true,
+    ai: JSON.stringify({ answers: [{ id: "a", choice: "Yes", confidence: "High" }, { id: "b", choice: "Yes", confidence: "High" }] }) });
+  const r1 = await drivePageFill(first, {}, {}, {}, { ...AI_BATCH_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: memory });
+  assert.strictEqual(r1.results.find((r) => r.fieldName === "a").after, "Yes");
+  assert.strictEqual(first.log.filter(([m]) => m === "llm").length, 1, "one batched call on the first pass");
+
+  // THE REFILL. Every canned reply now says "No", so any re-ask flips the answers and fails this test.
+  const again = makeFakeAct(fields(), { aiEnabled: true,
+    ai: ['{"choice":"No","confidence":"High"}', '{"choice":"No","confidence":"High"}',
+         JSON.stringify({ answers: [{ id: "a", choice: "No" }, { id: "b", choice: "No" }] })] });
+  const r2 = await drivePageFill(again, {}, {}, {}, { ...AI_BATCH_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: memory });
+  assert.strictEqual(again.log.filter(([m]) => m === "llm").length, 0, "a refill must not call the model at all");
+  assert.strictEqual(r2.results.find((r) => r.fieldName === "a").after, "Yes", "and must re-commit the SAME answer");
+  assert.strictEqual(r2.results.find((r) => r.fieldName === "b").after, "Yes");
+});
+
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
   // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
   // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable

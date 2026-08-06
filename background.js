@@ -2870,6 +2870,17 @@ async function awaitFieldSetSettled(act) {
   return Date.now() - t0;
 }
 
+// ── THE PAGE'S AI MEMORY (2026-08-06, operator) ─────────────────────────────────────────────────────
+// "If this page needs to be refilled, it should remember the previous answers and not recall AI."
+// Keyed by QUESTION (see aiLabelKey), reset at the top of every page, and handed to EVERY drivePageFill
+// for that page — the initial fill, its cascade recursion, and AI-4's re-fills. Without it each re-fill
+// was a fresh invocation with an empty cache, so it asked the model again and was free to get a
+// DIFFERENT answer: live on waystar page 3 the relocation question went "Yes, I am open to relocating"
+// -> "No, but I live near one of these locations" -> "Yes", and every CHANGE remounted the dependent
+// basecamp question under a new automation-id, blank and required, so the page could never be saved.
+// A refill that remembers changes no values, and nothing remounts.
+let _pageAiAnswers = new Map();
+
 async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts) {
   // Accumulation merge key — the PRE-fill cdpPageKey (url PATHNAME [drops the volatile
   // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
@@ -2967,7 +2978,8 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     const _dbgClobber = await new Promise((r) => chrome.storage.local.get("debugClobber", (v) => r(!!(v && v.debugClobber))));
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber }, { cachedShapes, headingToBase, buckets });
+    _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
   } finally {
     if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
   }
@@ -3408,7 +3420,9 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
         let rOut;
         try {
           cdpSetSyntheticInput(false);
-          rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlyFieldNames: refill });
+          // Same page ⇒ same answers. A remediation re-fill must never re-ask and never contradict the
+          // first pass; contradicting it is what remounts dependent questions.
+          rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlyFieldNames: refill, aiAnswers: _pageAiAnswers });
         } finally {
           cdpSetSyntheticInput(wasSynthetic);
         }
@@ -3484,7 +3498,7 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
       const secNames = sectionsFromErrorNames(named, flatHere);
       if (secNames.length) {
         LOG(`  attempt ${attempt} (Tier 1.6, deterministic): error names section field(s) [${named.join(", ")}] → re-run section(s) [${secNames.join(", ")}] (no AI, manual entries preserved).`);
-        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames), preserveExtras: true });
+        const rOut = await drivePageFill(act, profile, defaults, jobContext, {}, { onlySections: new Set(secNames), preserveExtras: true, aiAnswers: _pageAiAnswers });
         for (const r of (rOut.results || [])) {
           r.flag = "ai-remediation"; r.status = r.status === "filled" ? "filled_review" : r.status;
           r.detail = "AI-4 Tier-1.6 section re-fill — " + (r.detail || "");
