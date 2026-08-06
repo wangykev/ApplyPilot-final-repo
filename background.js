@@ -109,6 +109,8 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
+const AP_BUILD = "2026-08-06-submit-render-forcing";
+
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
   try { console.log(`[ApplyPilot][RUN] » ${phase}${detail ? " — " + detail : ""}`); } catch (e) { /* ignore */ }
@@ -129,6 +131,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           ok: true,
           app: "ApplyPilot",
           version: chrome.runtime.getManifest().version,
+          // BUILD MARKER (bump when verifying a specific change is live). The service worker only
+          // re-reads files when it RESTARTS, and chrome.runtime.reload() is unreliable under repeated
+          // use — during 2026-08-06 several runs silently executed pre-edit code while AP_PING answered
+          // happily from the old worker, and the staleness was only caught by noticing a log line's
+          // FORMAT. One field beats that guesswork.
+          build: AP_BUILD,
           hasProfile: !!profile,
           hasResume
         });
@@ -3887,8 +3895,6 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
     await cdpSetFocusEmulation(true).catch(() => {});
-    { const forced = await cdpForceRender(true).catch(() => false);
-      try { console.log(`[ApplyPilot][CDP] render forcing ${forced ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ } } // hidden tab keeps repainting (the discover lever)
     // …and actually MAKE it render: focus emulation only changes what the page believes, while a
     // screencast puts the tab under capture, which is what keeps Chrome's compositor producing the
     // frames rAF (and therefore every menu paint) waits on. Proven by the paint probe below.
@@ -4102,6 +4108,15 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides();
     await cdpSetFocusEmulation(true).catch(() => {});
+    // THE REPLAY NEEDS THE FRAMES JUST AS MUCH AS THE FILL DID — arguably more, because here a widget
+    // whose menu never paints means an APPROVED value cannot be committed and the gate refuses. This
+    // was missing while the fill had it, and the asymmetry showed up exactly as you would expect
+    // (live 2026-08-06, Reddit: every dropdown filled on the fill, then two of them reported "listed
+    // no options" on the rehearsal — 25.4s and 17.9s — with no render-forcing line in that run's log).
+    {
+      const forcedR = await cdpForceRender(true).catch(() => false);
+      try { LOG(`render forcing ${forcedR ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ }
+    }
 
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
