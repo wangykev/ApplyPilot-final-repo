@@ -1239,7 +1239,7 @@ function planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany) 
 // PHASE 2 — only now touch the page, and only for candidates that need options, and only if a batch can
 // actually fire. Returns { items, recon } — recon is what the [AI-BATCH] log prints so a no-op batch is
 // never mistaken for a working one.
-async function collectAiBatchItems(act, fields, profile, budgets, known, bucketIndex, empCompany) {
+async function collectAiBatchItems(act, fields, profile, budgets, known, bucketIndex, empCompany, trace) {
   const t0 = Date.now();
   const plan = planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany);
   const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
@@ -1252,9 +1252,11 @@ async function collectAiBatchItems(act, fields, profile, budgets, known, bucketI
     if (!c.needsOpen) { items.push({ key: c.key, kind: c.kind, label: c.label, options: c.options, stated: c.stated }); continue; }
     const loc = { wrapperSel: c.wrapperSel };
     let before = null;
+    const _o0 = Date.now();
     try {
       const r = await openAndReadDropdown(act, loc, budgets);
       recon.opened++;
+      if (trace) trace(`  scout: read options for "${String(c.label || "").slice(0, 45)}"`, Date.now() - _o0);
       before = r.before;
       if (!r.expanded || !r.state || !r.state.optionCount) { recon.openFailed.push(c.key + ":no-options"); await closeAndVerifyBlank(act, loc, before, budgets); continue; }
       const enabled = apMatch.withoutPlaceholderOptions(r.state.options.filter((o) => !o.disabled).map((o) => o.text));
@@ -3436,6 +3438,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // employer list. (2026-07-25.)
   const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
+  // ── TEMPORARY PAGE TRACE (2026-08-06, budgets.debugPageTrace) ───────────────────────────────────
+  // Operator: "I want logs to see what is going on every time it seems to pause." Emitted with
+  // console.log rather than collected and returned, so the lines STREAM into the SW console while the
+  // page is filling — a trace you can only read afterwards is no use for watching a pause happen.
+  // Every entry carries the elapsed ms of the step it closes, and anything over 1s is marked so the
+  // pauses stand out without reading timings.
+  const _traceOn = !!budgets.debugPageTrace;
+  const _t0page = Date.now();
+  const trace = (msg, ms) => {
+    if (!_traceOn) return;
+    const at = ((Date.now() - _t0page) / 1000).toFixed(1);
+    const took = ms == null ? "" : ` — ${ms >= 1000 ? "⏸ " : ""}${(ms / 1000).toFixed(2)}s`;
+    console.log(`[ApplyPilot][TRACE +${at}s] ${msg}${took}`);
+  };
   const clobberLog = [];   // TEMPORARY (budgets.debugClobber): fields changed by ANOTHER field's write
   // Seed the baseline from the UP-FRONT scan, or the very first field's write has nothing to be compared
   // against — which is exactly the write most likely to knock out a dependent question.
@@ -3462,7 +3478,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
     try {
-      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel, bucketIndex, empCompany);
+      trace(`SCOUT starting — ${scan.fields.length} field(s) on the page`);
+      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel, bucketIndex, empCompany, trace);
+      trace(`SCOUT done — ${collected.items.length} AI question(s), ${collected.recon.opened} dropdown(s) opened`, collected.recon.ms);
       aiBatch.items = collected.items; aiBatch.recon = collected.recon;
       if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
@@ -3476,6 +3494,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // so a cut-off reply fails to parse and the whole page falls back to per-field calls — losing
         // exactly the saving the batch exists for. So the per-question allowance is set well above what a
         // well-formed answer needs rather than tuned to the average.
+        trace(`AI CALL fired — ${aiBatch.items.length} question(s) in ONE call (cap ${aiBatchMaxTokens(aiBatch.items.length)}); the deterministic fill runs while it is in flight`);
         aiBatch.promise = act.llm({ system, user, maxTokens: aiBatchMaxTokens(aiBatch.items.length) })
           .then((res) => {
             if (!res || !res.ok) { aiBatch.error = (res && res.error) || "no reply"; return; }
@@ -3502,7 +3521,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     const cached = lk ? usable(aiAnswerByLabel.get(lk)) : null;
     if (cached) { aiBatch.served++; return cached; }        // same QUESTION, whatever id it now carries
     if (!aiBatch.promise) { aiBatch.fellBack++; return null; }
-    if (!aiBatch.awaited) { aiBatch.awaited = true; await aiBatch.promise; }
+    if (!aiBatch.awaited) {
+      aiBatch.awaited = true;
+      const w0 = Date.now();
+      trace(`WAITING on the AI reply (first AI field reached: "${String((f && f.label) || "").slice(0, 50)}")`);
+      await aiBatch.promise;
+      trace(`AI reply in hand — every AI answer for this page is now known`, Date.now() - w0);
+    }
     const hit = usable((lk && aiAnswerByLabel.get(lk)) || aiBatch.answers.get(f && f.fieldName));
     if (hit) { aiBatch.served++; if (lk) aiAnswerByLabel.set(lk, hit); } else aiBatch.fellBack++;
     return hit;
@@ -3519,6 +3544,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     const _fieldT0 = Date.now();
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
+    // WHAT IT IS ABOUT TO DO, and on what evidence. deterministicTierFor is the same predicate the
+    // planner uses, so this line states which tier OWNS the field before a single event is dispatched —
+    // "thinking", not just "doing".
+    if (_traceOn) {
+      const tier = deterministicTierFor(f, profile, bucketIndex, empCompany);
+      const cached = aiAnswerByLabel.get(aiLabelKey(f.label));
+      trace(`FIELD "${String(f.label || f.fieldName).slice(0, 60)}" [${f.fieldName}] ${f.widgetType}${f.isRequired ? " REQUIRED" : " optional"}`
+        + ` · holds ${JSON.stringify(f.currentValue == null ? "" : String(f.currentValue).slice(0, 30))}`
+        + ` · plan: ${tier ? "DETERMINISTIC (" + tier + ")" : (cached ? "AI (answer already known: \"" + String(cached.choice).slice(0, 30) + "\")" : "AI or blank")}`);
+    }
     const rawValue = mappedPath ? getByPath(profile, mappedPath) : undefined;
 
     const record = {
@@ -3945,6 +3980,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (ord.length) record.date_order = ord;
     }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
+    if (_traceOn) {
+      trace(`  ⤷ ${record.status}${record.after != null && record.after !== "" ? ' "' + String(record.after).slice(0, 40) + '"' : ""}`
+        + `${record.flag ? " [" + record.flag + "]" : ""}${record.matchTier ? " via " + record.matchTier : ""}`
+        + `${record.detail ? " — " + String(record.detail).slice(0, 110) : ""}`, Date.now() - _fieldT0);
+    }
     results.push(record);
 
     // ── TEMPORARY RECON (2026-08-06, budgets.debugClobber) — WHO WIPED THAT FIELD? ─────────────────
@@ -4294,7 +4334,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
   _phaseT0 = Date.now();
-  if (!targeted) await captureChoiceOptions(act, results, budgets);
+  { const _c0 = Date.now();
+    trace("CAPTURE options for the review editor (read-only re-opens)");
+    if (!targeted) await captureChoiceOptions(act, results, budgets);
+    trace("CAPTURE done", Date.now() - _c0); }
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
   markPhase("audit", _phaseT0); _phaseT0 = Date.now();
