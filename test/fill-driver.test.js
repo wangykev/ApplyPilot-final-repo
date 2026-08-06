@@ -1507,6 +1507,39 @@ test("AI batch: a NON-STRING profile value must not abort the page's whole batch
   assert.strictEqual(out.aiBatchInfo.error, null, "collection completed — no page-wide abort");
 });
 
+test("AI commit uses the ADAPTIVE beat, not the never-scaled delayFull (the slow-AI-fill bug)", async () => {
+  // Operator, watching a page: the pre-pass flew and then the AI fields filled visibly slower than the
+  // deterministic ones. Cause: aiFillField hand-rolled its commit as two flat delayFull(reopenSettleMs)
+  // beats — 800ms per field regardless of paint state, and no poll — while a deterministic pick used the
+  // adaptive, read-first, poll-to-ceiling path. An AI pick is a candidate like any other and must commit
+  // like one. delayFull is reserved for waits that must ALWAYS be real (the M40 settle); a commit poll
+  // is not one of them, because its persistence re-read is what makes it safe, not the beat length.
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const fullWaits = [];
+  const realFull = act.delayFull;
+  act.delayFull = async (ms) => { fullWaits.push(ms); return realFull ? realFull(ms) : undefined; };
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", rec.detail);
+  assert.strictEqual(rec.after, "No");
+  // The old commit spent reopenSettleMs on delayFull TWICE (click-beat + persistence-beat). The shared
+  // poll spends it ZERO times — it uses the adaptive delayRender instead. Counting is what distinguishes
+  // them, since other machinery legitimately uses delayFull elsewhere in the page.
+  const settleBeats = fullWaits.filter((ms) => ms === T_BUDGETS.reopenSettleMs).length;
+  assert.ok(settleBeats < 2,
+    `the AI commit must not spend the never-scaled reopenSettle beats (saw ${settleBeats}): ` + JSON.stringify(fullWaits));
+});
+
+test("AI commit still REFUSES a pick that does not persist (the shared poll keeps the safety gate)", async () => {
+  // The speed fix must not weaken the false-verify guard: a pick shown for one read and then discarded
+  // is NOT a commit, however fast the beats are.
+  const act = makeFakeAct([aiDd({ revertsAfterCommit: true, revertValue: "Select One" })],
+    { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review", "a momentary pick is never reported filled");
+  assert.strictEqual(rec.flag, "ai-commit-failed");
+  assert.notStrictEqual(rec.after, "No");
+});
+
 test("AI batch: aiBatchInfo reports what actually happened (the observability that found the bug)", async () => {
   const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
     { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }] }) });

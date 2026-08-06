@@ -1090,6 +1090,39 @@ function parseBatchAiReply(text, items) {
   return out;
 }
 
+// ── ONE dropdown-commit poll, shared by the deterministic and AI paths (2026-08-06) ─────────────────
+// These had diverged, and the AI side was much the worse for it. The deterministic commit reads FIRST
+// (the click's selection usually lands in its own event turn) and then polls on `delayRender`, which is
+// ADAPTIVE — ~10–40ms on a painting tab. The AI commit hand-rolled its own: two unconditional
+// `delayFull(reopenSettleMs)` beats, 800ms flat per field, never scaled by paint state, and NO polling.
+//
+// So an AI dropdown cost ~800ms where an identical deterministic one cost tens of ms — three EEO fields
+// on one page is ~2.4s of pure waiting, which is exactly what the operator saw: the pre-pass flew and the
+// fill crawled. It was also the more FRAGILE of the two: with no poll, a commit that landed at 450ms was
+// reported as failed and sent to review.
+//
+// The safety property is preserved exactly, because it never depended on the beat LENGTH: acceptance
+// requires the trigger to still show the target after a further beat (the persistence re-read), so a
+// momentary pick discarded on render-complete is still never reported filled. A shorter beat only
+// re-polls sooner.
+async function awaitDropdownCommit(act, loc, isTarget, budgets, delayRender, ceilingMs) {
+  let after = null;
+  const deadline = Date.now() + (ceilingMs || budgets.commitCeilingMs);
+  do {
+    const cs = await act.readDropdownState(loc);          // READ-FIRST — no beat before the first look
+    after = cs ? cs.triggerText : after;
+    if (isTarget(after)) {
+      await delayRender(budgets.commitIntervalMs);        // PERSISTENCE: must still hold after a real beat
+      const cs2 = await act.readDropdownState(loc);
+      const after2 = cs2 ? cs2.triggerText : null;
+      if (isTarget(after2)) return { ok: true, after: after2 };
+      after = after2;                                     // reverted — keep polling, never accept
+    }
+    await delayRender(budgets.commitIntervalMs);
+  } while (Date.now() < deadline);
+  return { ok: false, after };
+}
+
 // Which of this page's questions go into the batched call, and what options do they offer? Runs BEFORE
 // any value is written, so it is READ-ONLY: each dropdown is opened, its options read, and closed through
 // the same verified-blank close the recon path uses — a candidate that ends up holding a value would be a
@@ -1215,14 +1248,14 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets, preAnswer)
 
   const target = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, target);
-  await act.delayFull(budgets.reopenSettleMs);
-  let post = await act.readDropdownState(loc);
-  let committed = post && norm(post.triggerText) === norm(target);
-  if (committed) { // M39 persistence: re-read after a real beat — a momentary pick that reverts is NOT a commit
-    await act.delayFull(budgets.reopenSettleMs);
-    post = await act.readDropdownState(loc);
-    committed = post && norm(post.triggerText) === norm(target);
-  }
+  // SAME commit poll as a deterministic pick (2026-08-06): read-first, ADAPTIVE beats, persistence
+  // re-read, poll to the ceiling. This used to be two flat delayFull(reopenSettleMs) beats — 800ms per
+  // AI field no matter how fast the tab was painting, and no poll at all, so a commit landing a beat late
+  // was called a failure. An AI pick is a candidate like any other; it should commit like one.
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
+    (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  const committed = cr.ok;
+  const post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-commit-failed", confidence: conf, ...hint,
     detail: "AI chose \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   // ALWAYS filled_review — an AI guess is never silently trusted. If the dropdown held a REAL
@@ -1488,10 +1521,9 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
   }
   const target = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, target);
-  await act.delayFull(budgets.reopenSettleMs);
-  let post = await act.readDropdownState(loc);
-  let committed = post && norm(post.triggerText) === norm(target);
-  if (committed) { await act.delayFull(budgets.reopenSettleMs); post = await act.readDropdownState(loc); committed = post && norm(post.triggerText) === norm(target); }
+  // Shared commit poll (see awaitDropdownCommit) — adaptive, not two flat 800ms beats.
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets, (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  const committed = cr.ok, post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-canon-commit-failed",
     detail: "AI mapped \"" + statedStr + "\" → \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   // ALWAYS filled_review — a canonicalized demographic still gets a human glance.
@@ -1547,10 +1579,9 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
   }
   const opt = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, opt);
-  await act.delayFull(budgets.reopenSettleMs);
-  let post = await act.readDropdownState(loc);
-  let committed = post && norm(post.triggerText) === norm(opt);
-  if (committed) { await act.delayFull(budgets.reopenSettleMs); post = await act.readDropdownState(loc); committed = post && norm(post.triggerText) === norm(opt); }
+  // Shared commit poll (see awaitDropdownCommit) — adaptive, not two flat 800ms beats.
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(opt), budgets, (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  const committed = cr.ok, post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-eeo-commit-failed", detail: "AI EEO chose \"" + opt + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   if (declined) return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "eeo_declined", detail: "AI declined to guess a required demographic → neutral \"" + opt + "\"", options: enabledTexts, auditLoc: loc.wrapperSel };
   return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "ai-eeo-guess", confidence: ai.confidence, detail: "AI inferred a required demographic → \"" + opt + "\" (confident guess — VERIFY)", options: enabledTexts, auditLoc: loc.wrapperSel };
@@ -1827,28 +1858,10 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
       const cs = await act.readDropdownState(loc);
       return { ok: false, after: cs ? cs.triggerText : null };
     }
-    let after = null;
-    const deadline = Date.now() + (ceilingMs || budgets.commitCeilingMs); // ceilingMs: SHORT deadline for the fast overwrite attempt (fail quick → slow refill); full ceiling otherwise
-    do { // READ-FIRST (2026-07-25): the option click's selection usually lands in the click's own event turn — the old delay-then-read paid one commitIntervalMs per commit for nothing; a not-yet-committed read just re-polls. The PERSISTENCE beat below stays delay-first (it must be a real beat).
-      const cs = await act.readDropdownState(loc);
-      after = cs ? cs.triggerText : after;
-      if (committedText(after)) {
-        // PERSISTENCE (the false-verify guard): a pick made before the option list finished
-        // rendering shows for an instant, then is DISCARDED on render-complete — that momentary
-        // value is exactly what produced the false verified:true. Confirm the trigger STILL
-        // shows the target after another beat before accepting; a revert keeps polling (→ honest
-        // needs_review), never a silent wrong fill. This re-read is the interval-LENGTH-INDEPENDENT
-        // gate that makes the adaptive delayRender safe: shrinking the beat only re-polls sooner —
-        // acceptance still requires the target to PERSIST across the beat.
-        await delayRender(budgets.commitIntervalMs);
-        const cs2 = await act.readDropdownState(loc);
-        const after2 = cs2 ? cs2.triggerText : null;
-        if (committedText(after2)) return { ok: true, after: after2 };
-        after = after2; // reverted — not committed; keep polling until the deadline
-      }
-      await delayRender(budgets.commitIntervalMs); // the page commits the pick at its own pace — adaptive under the measured-fast gate (STAGE 2)
-    } while (Date.now() < deadline);
-    return { ok: false, after };
+    // READ-FIRST + adaptive beats + the persistence re-read all live in awaitDropdownCommit now, shared
+    // with the AI commit paths so the two can never drift again (ceilingMs: SHORT deadline for the fast
+    // overwrite attempt — fail quick → slow refill; full ceiling otherwise).
+    return awaitDropdownCommit(act, loc, committedText, budgets, delayRender, ceilingMs);
   };
 
   // Backstop/log: a fresh read must still show the target present + enabled before
@@ -3628,14 +3641,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
               record.detail = `${decision.detail}; already held "${before}" — kept (no actuation)`;
             } else {
               await act.clickDropdownOptionByText(loc, target);
-              await act.delayFull(budgets.reopenSettleMs);
-              let post = await act.readDropdownState(loc);
-              let committed = post && norm(post.triggerText) === norm(target);
-              if (committed) { // persistence re-read — a momentary pick that reverts is NOT a commit
-                await act.delayFull(budgets.reopenSettleMs);
-                post = await act.readDropdownState(loc);
-                committed = post && norm(post.triggerText) === norm(target);
-              }
+              // Shared commit poll (see awaitDropdownCommit): read-first, ADAPTIVE beats, persistence
+              // re-read, poll to the ceiling — instead of two flat delayFull beats that ignore paint state.
+              const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
+                (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+              const committed = cr.ok, post = { triggerText: cr.after };
               record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
               record.resolved = [decision.fill];
               record.options = enabledTexts;
