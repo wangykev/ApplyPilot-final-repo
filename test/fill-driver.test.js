@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { planAiBatchCandidates, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { planAiBatchCandidates, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1590,6 +1590,52 @@ test("AI batch: the output cap SCALES with the number of questions", async () =>
   assert.ok(caps[1] > caps[0], `6 questions must get a bigger budget than 2 (got ${caps[0]} then ${caps[1]})`);
   // Enough room for a well-formed answer per question, with real headroom.
   assert.ok(caps[1] >= 6 * 200, `and enough room per question (got ${caps[1]} for 6)`);
+});
+
+// ── The planner must model EVERY deterministic tier, not just FIELD_MAP ─────────────────────────────
+// The fill ladder is FIELD_MAP -> buckets -> employment recognizers -> AI. Modelling only the first meant
+// a question a later tier would answer was still scouted (its dropdown opened for options) and still took
+// a slot in the prompt, and the answer was then discarded. Live on waystar page 3: both sponsorship
+// questions carry hashed ids, so FIELD_MAP knew nothing, and BUCKETS answered them from the taught
+// wording -- after the planner had already opened them and paid for them.
+const plnField = (id, label) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown",
+  isRequired: true, label });
+
+test("planner: a BUCKET-answerable question is not an AI candidate", async () => {
+  const f = plnField("69dab8dbb3371001adc84c25b7120000", "Do you currently require sponsorship?*");
+  const profile = { work_authorization: { requires_sponsorship_now: false } };
+  const buckets = [{ profile_path: "work_authorization.requires_sponsorship_now",
+    questions: ["Do you currently require sponsorship?"] }];
+  const idx = buildBucketIndex(buckets);
+  assert.strictEqual(deterministicTierFor(f, profile, idx, null), "bucket");
+  assert.deepStrictEqual(planAiBatchCandidates([f], profile, null, idx, null), [],
+    "the bucket owns it — no scout, no prompt slot");
+  // …and with NO bucket it is still an AI candidate, so the skip is the bucket's doing and not a
+  // side effect of the hashed id.
+  assert.strictEqual(planAiBatchCandidates([f], profile, null, buildBucketIndex([]), null).length, 1);
+});
+
+test("planner: a bucket that resolves to NOTHING does not suppress the AI candidate", async () => {
+  // A bucket bound to an EMPTY profile path is not an answer. Suppressing on its mere existence would
+  // leave a required field to the blank path instead of the AI.
+  const f = plnField("hashed_q", "Do you currently require sponsorship?*");
+  const idx = buildBucketIndex([{ profile_path: "work_authorization.requires_sponsorship_now",
+    questions: ["Do you currently require sponsorship?"] }]);
+  assert.strictEqual(deterministicTierFor(f, { work_authorization: {} }, idx, null), null);
+  assert.strictEqual(planAiBatchCandidates([f], { work_authorization: {} }, null, idx, null).length, 1);
+});
+
+test("planner: the employer-match question is never an AI candidate", async () => {
+  const f = plnField("candidateIsPreviousWorker", "Have you previously been employed by Waystar?*");
+  assert.strictEqual(deterministicTierFor(f, {}, null, null), "employer-match");
+  assert.deepStrictEqual(planAiBatchCandidates([f], {}, null, null, null), []);
+});
+
+test("planner: a FIELD_MAP-answerable question is not an AI candidate (unchanged)", async () => {
+  const f = plnField("country", "Country*");
+  assert.strictEqual(deterministicTierFor(f, { personal_info: { country: "United States" } }, null, null), "field-map");
+  const f2 = plnField("country", "Country*");
+  assert.strictEqual(deterministicTierFor(f2, { personal_info: {} }, null, null), null, "…but an EMPTY mapped path is not an answer");
 });
 
 test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {

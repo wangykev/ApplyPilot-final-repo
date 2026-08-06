@@ -1161,7 +1161,65 @@ async function awaitDropdownCommit(act, loc, isTarget, budgets, delayRender, cei
 //                  answer it, and a wasted prompt entry is cheaper than a missed batch.
 //   canonicalize — a stated value we can PROVE matches no option, using the cross-run cache only. Never
 //                  opens (see the measured page-1 regression), so it is free to include.
-function planAiBatchCandidates(fields, profile, known) {
+// Would a bucket actually PRODUCE a value for this field? Mirrors fillFromBucket's own resolution, minus
+// the actuation: Mode A resolves a bound profile path, Mode B carries its own candidate list. A bucket
+// that resolves to nothing is not an answer, so it must not suppress the AI candidate.
+function bucketWouldAnswer(bucket, profile, widgetType) {
+  if (!bucket) return false;
+  if (bucket.profile_path) {
+    // resolve() REQUIRES the widget type — without it every value comes back { skip: true }, which would
+    // silently make this function always answer "no" and defeat the whole check.
+    const r = resolve(getByPath(profile, bucket.profile_path), widgetType || "dropdown");
+    if (!r || r.skip) return false;
+    const v = r.value !== undefined ? r.value : r.candidates;
+    return Array.isArray(v) ? v.length > 0 : (v != null && String(v).trim() !== "");
+  }
+  const cands = (Array.isArray(bucket.value) ? bucket.value : (bucket.value != null ? [bucket.value] : []))
+    .filter((x) => x != null && String(x).trim() !== "");
+  return cands.length > 0;
+}
+
+// EVERY deterministic tier, modelled (2026-08-06, operator: "the planner should model everything that
+// fills deterministically"). The fill ladder tries FIELD_MAP, then buckets, then the employment
+// recognizers, and only then the AI — but the planner used to model just the first, so a question any of
+// the later tiers would answer was still scouted (a dropdown opened for its options) and still took a
+// slot in the prompt, and its answer was then thrown away. Live on waystar page 3: both sponsorship
+// questions carry hashed ids, so FIELD_MAP knew nothing about them, and buckets answered them from the
+// taught wording — after the planner had already opened them and paid for them in the prompt.
+//
+// Returns the tier that would answer, or null. Order MIRRORS the fill loop, including its gates (buckets
+// only for UNMAPPED fields), so the two cannot disagree about who owns a field.
+//
+// Under-including is safe by construction: the batch is a cache, not a gate, so a field wrongly skipped
+// here simply makes its own per-field call exactly as it does today. Wrongly INCLUDING is what costs.
+function deterministicTierFor(f, profile, bucketIndex, empCompany) {
+  const mappedPath = FIELD_MAP[f.fieldName] || null;
+  if (mappedPath) {
+    // resolve()'s CONTRACT is { candidates } | { skip } — NOT a bare value. Reading it as a scalar is what
+    // produced the live `s.toLowerCase is not a function`.
+    const rs = resolve(getByPath(profile, mappedPath), f.widgetType);
+    if (rs && Array.isArray(rs.candidates) && rs.candidates.length) return "field-map";
+  }
+  // The employer-match question is decided by decidePreviousWorker, never by the AI — it is answered (or
+  // deliberately left blank + flagged) on its own path.
+  if (f.fieldName === "candidateIsPreviousWorker") return "employer-match";
+  // Buckets — same gate as the loop: UNMAPPED fields only.
+  if (!mappedPath && bucketIndex && bucketIndex.size) {
+    const b = bucketIndex.get(apMatch.normalizeLabel(f.label));
+    if (bucketWouldAnswer(b, profile, f.widgetType)) return "bucket";
+  }
+  // The tenant's own worded employment-status question ("Are you a former X employee?").
+  if (empCompany) {
+    try {
+      const emp = recognizeEmploymentQuestion(f.label, empCompany);
+      const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+      if (d && d.fill) return "employment-recognizer";
+    } catch (e) { /* recognizer threw → treat as not-answered; the AI path still covers it */ }
+  }
+  return null;
+}
+
+function planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany) {
   const out = [];
   // A question we ALREADY have an answer for is not a candidate — this is what makes a page refill cost
   // zero calls. Keyed by question, so it holds even when the automation-id changed underneath us.
@@ -1170,15 +1228,7 @@ function planAiBatchCandidates(fields, profile, known) {
     if (out.length >= AI_BATCH_MAX) break;
     if (f.widgetType !== "dropdown") continue;   // text/date/checkbox keep their own call — see the batch header
     try {
-      const mappedPath = FIELD_MAP[f.fieldName] || null;
-      const raw = mappedPath ? getByPath(profile, mappedPath) : undefined;
-      // resolve()'s CONTRACT is { candidates: string[] } or { skip: true } — NOT a bare value. Reading it
-      // as a scalar is what produced the live `s.toLowerCase is not a function`: the object got wrapped
-      // into [ {candidates:[…]} ] and handed to the match ladder.
-      const rs = mappedPath ? resolve(raw, f.widgetType) : null;
-      const hasStated = !!(rs && Array.isArray(rs.candidates) && rs.candidates.length);
-      // A STATED value is never batched — see the header. Only an unanswerable REQUIRED field is.
-      if (hasStated) continue;
+      if (deterministicTierFor(f, profile, bucketIndex, empCompany)) continue; // some tier owns it — not an AI question
       if (answered(f)) continue;                 // already decided this page — reuse, never re-ask
       if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
     } catch (e) { /* this field simply isn't batched — it keeps its own per-field call */ }
@@ -1189,9 +1239,9 @@ function planAiBatchCandidates(fields, profile, known) {
 // PHASE 2 — only now touch the page, and only for candidates that need options, and only if a batch can
 // actually fire. Returns { items, recon } — recon is what the [AI-BATCH] log prints so a no-op batch is
 // never mistaken for a working one.
-async function collectAiBatchItems(act, fields, profile, budgets, known) {
+async function collectAiBatchItems(act, fields, profile, budgets, known, bucketIndex, empCompany) {
   const t0 = Date.now();
-  const plan = planAiBatchCandidates(fields, profile, known);
+  const plan = planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany);
   const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
     needOpen: plan.filter((c) => c.needsOpen).length, opened: 0, openFailed: [], dropped: [], ms: 0 };
   // THE COUNT GATE: a batch needs 2+ questions to be worth anything, and that is knowable before any
@@ -3412,7 +3462,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
     const t0Batch = Date.now();
     try {
-      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel);
+      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel, bucketIndex, empCompany);
       aiBatch.items = collected.items; aiBatch.recon = collected.recon;
       if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
         const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
@@ -7146,5 +7196,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

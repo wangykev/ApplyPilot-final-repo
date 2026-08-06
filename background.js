@@ -5837,6 +5837,20 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // could not verify is very often one the scan could not see — which is how the disability self-ID
         // group walked straight past this guard. Probe the DOM for those directly (the scan filters
         // repeating containers, so its silence is not proof of absence) and re-fill what really is there.
+        // A REMOUNTED question: the page shows it BLANK and REQUIRED under a NEW automation-id, while the
+        // bundle holds the answer under the old one. Neither check above can see it — they key on the
+        // bundle's id — so this was a guaranteed Save rejection (live on waystar page 3, repeatedly).
+        // Match on the QUESTION and fill the id the page is using NOW.
+        const remounted = requiredBlankByLabel((preSaveScan && preSaveScan.fields) || [], (bundle && bundle.entries) || []);
+        if (remounted.length) {
+          LOG(`page ${page}: ${remounted.length} REQUIRED field(s) came back under a NEW automation-id, blank — re-filling at the LIVE id before Save & Continue: ${remounted.map((m) => `"${m.field.label || m.field.fieldName}" (${m.fromName} → ${m.field.fieldName}, "${m.approved}")`).join(", ")}`);
+          // Point the entry at the id that EXISTS, so the fill lands on the live widget, not the dead one.
+          const retarget = remounted.map((m) => Object.assign({}, m.entry, { field_id: "formField-" + m.field.fieldName }));
+          const rr = await replayFlatFields(act, retarget, new Set(remounted.map((m) => m.field.fieldName)), DEFAULT_BUDGETS);
+          const bad = rr.filter((r) => r.status === "needs_review" || r.status === "error");
+          if (bad.length) LOG(`   ⚠ ${bad.length} did not take (${bad.map((r) => r.field || r.fieldName).join(", ")}) — Save & Continue will surface it.`);
+          else LOG(`   ✓ re-filled at the live id(s).`);
+        }
         const absent = requiredEntriesAbsentFromScan((preSaveScan && preSaveScan.fields) || [], (bundle && bundle.entries) || []);
         if (absent.length) {
           const onPage = [];

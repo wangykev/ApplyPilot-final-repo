@@ -1704,6 +1704,50 @@ function requiredBlankOnPage(liveFields, bundleEntries) {
   return out;
 }
 
+// A LIVE required field that is BLANK, whose answer we already have under a DIFFERENT automation-id
+// (2026-08-06). Workday REMOUNTS a dependent question under a new id whenever the field it depends on
+// changes, so the bundle can hold "Which basecamp…" as filled under id A while the page shows the same
+// question, blank and required, under id B. Both existing pre-Save checks key on the BUNDLE's id, so
+// neither sees it: one reports "in the bundle but NOT on the page — left alone, not fatal", and Save is
+// then clicked into a rejection that cannot be anything else. Live on waystar page 3, repeatedly.
+//
+// The QUESTION is the stable identity, so match on the label and re-fill at the id the page is using NOW.
+// Deliberately narrow, because a label match is weaker evidence than an id match:
+//   - the live field must be REQUIRED and BLANK (nothing is ever overwritten by this),
+//   - the entry must actually hold a value (otherwise the cascade/review path owns it, not us),
+//   - and the entry's OWN field must be absent from the page — if it is still there, this is not a
+//     remount and requiredBlankOnPage owns it.
+// Returns { field, entry, approved, fromName } — `field` is the LIVE field, so the caller fills the id
+// that exists rather than the one that used to.
+function requiredBlankByLabel(liveFields, bundleEntries) {
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
+  };
+  const blank = (v) => v == null || String(v).trim() === "";
+  const key = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
+  const live = new Set((liveFields || []).map((f) => f && f.fieldName));
+  const byLabel = new Map();
+  for (const e of bundleEntries || []) {
+    if (!e || e.is_deleted) continue;
+    if (blank(e.current_value)) continue;
+    if (live.has(nameOf(e))) continue;               // its own field is still on the page → not a remount
+    const k = key(e.question_label);
+    if (k && !byLabel.has(k)) byLabel.set(k, e);
+  }
+  const out = [];
+  if (!byLabel.size) return out;
+  for (const f of liveFields || []) {
+    if (!f || f.isRequired !== true || f.widgetType === "file_upload") continue;
+    if (!blank(f.value)) continue;
+    const entry = byLabel.get(key(f.label));
+    if (!entry) continue;
+    out.push({ field: f, entry, approved: String(entry.current_value), fromName: nameOf(entry) });
+  }
+  return out;
+}
+
 // Build a review entry for a newly-required field. Empty + unapproved BY DESIGN — this asks the human a
 // question, it never answers it.
 function cascadeEntryFor(gap, pageKey, pageNumber, index) {
@@ -1837,5 +1881,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }
