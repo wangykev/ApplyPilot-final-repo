@@ -1239,6 +1239,42 @@ test("a search that saw options never reports 'listed no options'", async () => 
   assert.ok(shown.includes("Something Else"), "review must get the options the search surfaced");
 });
 
+test("assertion-lead: the same self-ID answer in different words, and it refuses when unsure", () => {
+  // Live 2026-08-06, Lever/gopuff diversity survey: the profile holds "I am not a protected veteran"
+  // (the Workday/Greenhouse wording), the form offers "I am not a U.S. veteran". Neither contains the
+  // other and fuzzy scores ~63%, so a STATED answer reached review.
+  const VET = ["I identify as a U.S. veteran", "I am not a U.S. veteran", "Prefer not to answer"];
+  assert.strictEqual(ats.atsAssertionLead("I am not a protected veteran", VET), "I am not a U.S. veteran");
+  assert.strictEqual(ats.atsAssertionLead("I identify as a veteran", VET), "I identify as a U.S. veteran");
+  // a POSITIVE assertion must never answer a NEGATIVE option — that would invert a legal self-ID
+  assert.strictEqual(ats.atsAssertionLead("I identify as a veteran", ["I am not a U.S. veteran", "Prefer not to answer"]), null);
+  // 2+ candidates of the same polarity ⇒ refuse rather than guess a demographic
+  assert.strictEqual(ats.atsAssertionLead("I am not a veteran", ["I am not a veteran A", "I am not a veteran B"]), null);
+  // a value that is not a first-person assertion is none of this bridge's business
+  assert.strictEqual(ats.atsAssertionLead("Asian", VET), null);
+  assert.strictEqual(ats.atsAssertionLead("", VET), null);
+  assert.strictEqual(ats.atsAssertionLead("I am not a veteran", []), null);
+});
+
+test("driver: a stated veteran status fills through the assertion bridge, flagged not silent", async () => {
+  let checked = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "lever", url: "https://jobs.lever.co/gopuff/uuid/apply", title: "t",
+      fields: [{ fieldName: "surveysResponses[u][responses][field5]", inputSel: 'input[name="vet"]', widgetType: "radio",
+        label: "Are you a veteran?", isRequired: false, value: null, domIndex: 0,
+        options: ["I identify as a U.S. veteran", "I am not a U.S. veteran", "Prefer not to answer"] }],
+    }),
+    atsInjCheckOption: (sel, t) => { checked = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: checked }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const r = out.results[0];
+  assert.strictEqual(checked, "I am not a U.S. veteran");
+  assert.strictEqual(r.matchTier, "assertion-lead");
+  assert.strictEqual(r.status, "filled_review", "a non-exact tier is always flagged, never silent");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {

@@ -843,7 +843,7 @@ function atsInjReadFileState(inputSel, wantName) {
   let scope = el.parentElement;
   for (let i = 0; i < 3 && scope && scope.parentElement; i++) scope = scope.parentElement;
   const body = txt(scope);
-  const m = /[\w()\-.,' ]+\.(pdf|docx?|rtf|txt)/i.exec(body);
+  const m = /[\w()\-.,' ]+\.(pdf|docx?|rtf|txt)/i.exec(body);
   const rendered = (m ? m[0].trim() : null) || shownOnPage();
   const alerts = scope ? [...scope.querySelectorAll('[role="alert"],[class*="error"]')].map(txt).filter(Boolean) : [];
   const bad = alerts.find((t) => /(error|failed|unsupported|too large|invalid|not allowed|try again)/i.test(t)) || null;
@@ -1313,6 +1313,30 @@ function atsPickApplyLink(links, isAts) {
   const labelled = list.filter((l) => l.kind === "text");
   if (uniq(labelled).length === 1) return labelled[0].href;
   return null;
+}
+
+// A STATED demographic and the form's option can be the same answer in different words: the profile
+// holds "I am not a protected veteran" (the Workday/Greenhouse wording) while Lever's diversity survey
+// offers "I am not a U.S. veteran". Neither contains the other and fuzzy scores ~63%, so nothing
+// matched and a stated answer reached review (live 2026-08-06, gopuff).
+//
+// Bridge on the SELF-ASSERTION, exactly like the Yes/No polarity bridge and with the same guard: the
+// candidate must lead with a first-person assertion, the option must lead with the SAME polarity, and
+// exactly ONE option may qualify — 2+ refuse rather than guess a demographic. Positive never matches a
+// negative ("I identify as a veteran" cannot answer "I am not a veteran"). Flagged like any non-exact
+// tier, and only ever reached for a value the operator STATED (allowContainment), never an AI guess.
+const ATS_NEG_LEAD_RE = /^\s*i\s+(?:am|do|have)\s+not\b/i;
+const ATS_POS_LEAD_RE = /^\s*i\s+(?:am|do|have|identify)\b/i;
+function atsAssertionLead(candidate, texts) {
+  const c = String(candidate == null ? "" : candidate);
+  const neg = ATS_NEG_LEAD_RE.test(c);
+  const pos = !neg && ATS_POS_LEAD_RE.test(c);
+  if (!neg && !pos) return null;
+  const list = (texts || []).map((t) => String(t == null ? "" : t));
+  const hits = neg
+    ? list.filter((t) => ATS_NEG_LEAD_RE.test(t))
+    : list.filter((t) => ATS_POS_LEAD_RE.test(t) && !ATS_NEG_LEAD_RE.test(t));
+  return hits.length === 1 ? hits[0] : null;   // ambiguous ⇒ refuse
 }
 
 // Is this label a demographic question? ORTHOGONAL to routing (2026-07-31, Zoox): a BUCKET
@@ -2095,6 +2119,10 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         const lead = /^(yes|no)\b/i.exec(String(candidates[0] || ""));
         const pol = lead ? atsFd.optionForPolarity(matchTexts, lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null;
         if (pol) hit = { index: matchTexts.indexOf(pol), tier: "polarity-lead" };
+        if (!hit) {
+          const asrt = atsAssertionLead(candidates[0], matchTexts);
+          if (asrt) hit = { index: matchTexts.indexOf(asrt), tier: "assertion-lead" };
+        }
       }
       // Dial composite: the ladder above compares NAMES that can never meet (see atsDialMatch).
       // Uses the RAW option texts — the codes are what it needs.
@@ -2229,6 +2257,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const polKey = candidates[0] === "Yes" || candidates[0] === "No" ? candidates[0] : (allowContainment && lead ? (lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null);
       const pol = polKey ? atsFd.optionForPolarity(texts, polKey) : null;
       if (pol) { pick = pol; tier = "polarity-lead"; }
+      // …and the same bridge for a first-person assertion (see atsAssertionLead)
+      if (!pick && allowContainment) {
+        const asrt = atsAssertionLead(candidates[0], texts);
+        if (asrt) { pick = asrt; tier = "assertion-lead"; }
+      }
     }
     if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
@@ -2439,7 +2472,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDialMatch, atsDialCode, atsDialName,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
