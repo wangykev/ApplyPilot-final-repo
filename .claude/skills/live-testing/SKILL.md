@@ -476,6 +476,31 @@ State what was observed, with the log line. Distinguish:
 Never report a tenant as working end to end without the `SUBMIT GATE PASSED` line from a run whose
 age you checked.
 
+### The sign-in "8-9s" — answered (2026-08-07)
+
+It was NOT Workday being slow, and not the retry ladder. **Success was not being recognised.**
+`classifyAuthOutcome` required `formFieldCount > 0`, so a sign-in that had plainly worked read as
+`unknown` until Workday mounted the fields — and the caller burned its whole budget, then re-submitted the
+auth form or reloaded the page. The live proof, jabil.wd5's SUCCESSFUL sign-in:
+
+```
+still waiting at 2.0s — title "Careers"      formFields 0 · hasAuthEl false · markers [none]
+timed out after 4000ms (52 reads)
+last state:  title "Principal Product Test Engineer…" · formFields 0 · markers [applyFlowPage]
+sign-in outcome: unknown
+```
+
+Three fixes, in order of how much they mattered:
+1. `applyFlowPage` + no auth chrome now counts as success (waiting for fields here is duplicated work —
+   both walks call `awaitFieldSetSettled` anyway).
+2. An EMPTY page after a submit must PERSIST across 3 consecutive reads before it earns a reload — an
+   empty page right after an auth POST is a navigation in progress, not a dead shell.
+3. The first retry rung 500ms → 4000ms; 500ms timed out on 3/3 sign-ins whose clicks had all worked.
+
+For reference: filling starts **~135ms** after success is detected, so there is nothing to win after
+sign-in itself. And you cannot force a sign-in by clicking Sign Out — Workday's session self-restores from
+a persistent cookie. Clearing site cookies is the only reliable way.
+
 ### Fresh-account findings (2026-08-07) — read before starting one
 
 A fresh alias exercises the ACCOUNT-CREATION path, which the tenants on the scoreboard below never did
@@ -533,6 +558,8 @@ compare. Always check WHICH path your fixture exercises, not just the verdict.
 |---|---|
 | `itron.wd5` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account created this run |
 | `nvidia.wd5` (NEW) | **verified live 2026-08-07** — `AGREE 47 · DISAGREE 0` → `SUBMIT GATE PASSED` on rehearsals #1 AND #2. Needed the required-dropdown backstop (its Phone Device Type offers only Home / Home Cellular, no "Mobile"). Page fills hidden: 11.7 · 17.1 · 2.9 · 3.4 · 6.8s |
+| `marvell.wd1` (NEW) | fill verified live 2026-08-07 — REVIEW after 5 pages, reported 200. Approve/rehearse not yet run |
+| `jabil.wd5` (NEW) | **blocked** — its `Type to Add Skills*` is REQUIRED, and skills is the deferred unmapped section. The AI forced `"No Items."` (the empty-list placeholder), the commit correctly did not persist, and the walk halted naming the field. This turns the deferred SKILLS work into a hard blocker for any tenant that makes it required |
 | `analogdevices.wd1` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED` on rehearsals #1, #3, #4; #2 is what caught the colon bug |
 | `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
 | `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
