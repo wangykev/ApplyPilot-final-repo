@@ -34,7 +34,9 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
       // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
       parseYearMonthDay: parseYearMonthDay, isCompensationQuestion: isCompensationQuestion,
-      isSignatureDateQuestion: isSignatureDateQuestion,
+      // replayField re-derives a SIGNATURE date to TODAY and uses this to skip the rewrite when the
+      // approved value already IS today (so a same-day replay stays a zero-actuation no-op).
+      isSignatureDateQuestion: isSignatureDateQuestion, sameCalendarDate: sameCalendarDate,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // The AI's option list must never include a menu's prompt row ("Select One").
@@ -6210,7 +6212,32 @@ async function replayField(act, entry, budgets) {
   const sel = deriveFlatWrapperSel(entry);
   if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
   const loc = { wrapperSel: sel };
-  const value = entry.current_value;
+  // ── A SIGNATURE DATE IS "NOW", NOT A STORED ANSWER (2026-08-07) ──────────────────────────────────
+  // The self-ID attestation date is the day the form is COMPLETED, and the fill path already stamps it
+  // deterministically (aiFillDate → isSignatureDateQuestion) rather than treating it as a fact to look
+  // up. The replay, though, wrote back whatever the bundle held — so an approved bundle SIGNED
+  // YESTERDAY replays yesterday's date, and Workday rejects the page outright:
+  //
+  //   Error-Date  "Enter today's date"          (live, waystar.wd1: bundle approved 08/06,
+  //                                              replayed 08/07 — and it names no field, so
+  //                                              parseErrorFieldName can't route it either)
+  //
+  // That is also why the same page passed on analogdevices: its bundle was filled the SAME day, so the
+  // stored value happened to be today. A one-day-old approval is enough to break it.
+  //
+  // Re-deriving TODAY here does not weaken the approval contract: for this one question the human
+  // approved "the date I am signing", not a specific literal, and the only value this can ever produce
+  // is today's date — never an arbitrary one. Narrow by construction: isSignatureDateQuestion rejects
+  // any label naming a DIFFERENT event (start/birth/graduation/expiry/from/to), so a real date question
+  // still replays exactly what was approved.
+  let value = entry.current_value;
+  if ((widget === "date" || widget === "text") && apMatch.isSignatureDateQuestion(entry.question_label)) {
+    const t = new Date();
+    const fresh = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
+    if (!apMatch.sameCalendarDate(String(value == null ? "" : value), fresh)) {
+      value = fresh;
+    }
+  }
   // A checkbox GROUP's answer is a SET. `groupSelection` prefers the authoritative array the review
   // editor writes and falls back to splitting the joined string for a bundle written before it
   // existed — so the replay never has to re-derive the human's choice from a display string when the

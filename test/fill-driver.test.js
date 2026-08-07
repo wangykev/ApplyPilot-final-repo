@@ -9634,3 +9634,49 @@ test("typeahead pre-filled: an INCOMPLETE scrape still types the higher tier (ab
     "a partial list cannot rule the tier out — it must still be typed");
   assert.strictEqual(r.after, "Electrical and Computer Engineering", "and the upgrade committed");
 });
+
+// ── A SIGNATURE DATE replays as TODAY, not as the stored answer (2026-08-07) ────────────────────────
+// The self-ID attestation date is the day the form is COMPLETED. The fill path already stamps it
+// deterministically; the replay wrote back whatever the bundle held, so an approved bundle signed
+// YESTERDAY replayed yesterday's date and Workday refused the page with "Error-Date Enter today's
+// date" (live, waystar.wd1: approved 08/06, replayed 08/07). That error names no field, so the
+// error-routing paths cannot rescue it either. analogdevices passed the same page only because its
+// bundle happened to be filled the SAME day -- a one-day-old approval is enough to break it.
+const _mmddyyyy = (d) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+const SIG_TODAY = _mmddyyyy(new Date());
+const SIG_YESTERDAY = _mmddyyyy(new Date(Date.now() - 86400000));
+const sigEntry = (label, value) => ({
+  field_id: "P5::formField-dateSignedOn", canonical_field: null,
+  question_label: label, widget_type: "text", current_value: value, edit_kind: null,
+});
+const sigField = () => ({ wrapperSel: '[data-automation-id="formField-dateSignedOn"]', fieldName: "dateSignedOn", widgetType: "text", value: "" });
+
+test("replayField: a STALE signature date is re-derived to TODAY", async () => {
+  const f = sigField();
+  const r = await replayField(makeFakeAct([f]), sigEntry("Date*", SIG_YESTERDAY), T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(f.value, SIG_TODAY, `expected today's date on the page, got ${JSON.stringify(f.value)}`);
+  assert.notStrictEqual(f.value, SIG_YESTERDAY, "yesterday's date is what Workday rejects");
+});
+
+test("replayField: the explicit signature wordings are re-derived too", async () => {
+  for (const label of ["Date Signed", "Today's Date", "Signature Date", "Date of Completion"]) {
+    const f = sigField();
+    await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
+    assert.strictEqual(f.value, SIG_TODAY, `${label} should stamp today`);
+  }
+});
+
+test("replayField: a signature date that is ALREADY today writes today (never yesterday)", async () => {
+  const f = sigField();
+  await replayField(makeFakeAct([f]), sigEntry("Date Signed", SIG_TODAY), T_BUDGETS);
+  assert.strictEqual(f.value, SIG_TODAY);
+});
+
+test("replayField: a date naming a DIFFERENT event still replays the APPROVED value", async () => {
+  for (const label of ["Start Date", "Date of Birth", "Graduation Date", "Expiration Date", "From", "To"]) {
+    const f = sigField();
+    await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
+    assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay what the human approved, not today`);
+  }
+});
