@@ -1829,3 +1829,24 @@ test("router: how-did-you-hear matches the real wordings boards use, adverb or n
     assert.ok(!r || r.path !== "how_did_you_hear.preferred", l + " should NOT route to the source ladder");
   }
 });
+
+// ── grouped controls belong to the grouping pass, in EVERY ATS branch (live 2026-08-07) ─────
+// Greenhouse's general element loop skipped only `hidden`, so each box of a checkbox group was
+// pushed twice: once as a REQUIRED "text" field keyed on the box's own id, then again as the real
+// checkbox_group. On Gusto's 12-box "How did you hear about this opportunity? (select all that
+// apply)", each phantom text field bought its own LLM call answering "N/A" with no basis — 12 of
+// that form's 21 review items were one question. And it is worse than noise: atsInjSetText on a
+// checkbox writes its .value, which is the string that option would SUBMIT. Lever and Ashby have
+// always skipped both. No DOM harness exists for the injected scanners, so this pins the invariant
+// at the source, the way the self-containment test above does.
+test("atsInjScan: no ATS branch treats a radio or checkbox as a plain input", () => {
+  const src = String(ats.atsInjScan);
+  const skips = [...src.matchAll(/el\.type === "hidden"[^\n]*/g)].map((m) => m[0]);
+  assert.ok(skips.length >= 3, `expected a general element loop per ATS branch, found ${skips.length}`);
+  skips.forEach((line, i) => {
+    assert.ok(/type === "radio"/.test(line) && /type === "checkbox"/.test(line),
+      `general element loop #${i + 1} skips only hidden — grouped controls are handled by the grouping ` +
+      `pass, and classifying them here creates phantom required text fields over the same boxes: ` +
+      line.trim());
+  });
+});

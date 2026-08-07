@@ -394,7 +394,16 @@ function atsInjScan(ats) {
     // React-select combobox inputs (role=combobox) — includes EEOC + question_* selects.
     // The phone dial-code "country" and the intl-tel-input search box are recognized here too.
     for (const el of form.querySelectorAll("input, textarea")) {
-      if (el.type === "hidden" || !vis(el.closest("div") || el)) continue;
+      // ⚠ RADIO AND CHECKBOX BELONG TO THE GROUPING PASS BELOW, not here (2026-08-07). This loop
+      // skipped only `hidden`, so every box in a Greenhouse group was pushed TWICE: once here as a
+      // required "text" field keyed on the box's own id, and again below as the real checkbox_group.
+      // Live on Gusto's "How did you hear about this opportunity? (select all that apply)" — 12
+      // boxes — each phantom text field was REQUIRED, so each one bought its own LLM call, which
+      // answered "N/A" with no basis, and 12 of that form's 21 review items were this one question.
+      // Worse than noise: atsInjSetText on a checkbox writes its .value, which is the string that
+      // would be SUBMITTED for that option. The Lever and Ashby branches have always skipped both.
+      if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
+      if (!vis(el.closest("div") || el)) continue;
       const id = el.id || "";
       if (!id || /^iti-|^g-recaptcha|^react-select/.test(id)) continue;
       if (/requiredInput/.test(String(el.className || ""))) continue; // the react-select native-validation mirror
