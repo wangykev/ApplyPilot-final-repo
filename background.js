@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-no-screencast";
+const AP_BUILD = "2026-08-07-honest-report";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -3566,7 +3566,7 @@ async function flushLlmUsage() {
   llmUsageBuffer = [];
   try {
     const apSession = await new Promise((r) => chrome.storage.local.get("apSession", (x) => r((x && x.apSession) || null)));
-    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return; // not connected — nothing to report to
+    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return { ok: false, reason: "not-connected", status: 0 }; // not connected — nothing to report to
     const url = String(apSession.usageUrl || apSession.ingestUrl.replace(/\/report\/?$/, "/usage"));
     const res = await fetch(url, {
       method: "POST",
@@ -3676,7 +3676,7 @@ async function getRunLoginFor(bundleUrl) {
 // writes that status when the operator authorizes a submit from its Run page).
 async function reportApplication(bundle, jobContext) {
   try {
-    if (!bundle) return;
+    if (!bundle) return { ok: false, reason: "no-bundle", status: 0 };
     const { apSession } = await new Promise((res) => chrome.storage.local.get("apSession", res));
     if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return;
     const needs = bundle.needs_review_count || 0;
@@ -3718,8 +3718,14 @@ async function reportApplication(bundle, jobContext) {
     } else {
       try { await chrome.storage.local.remove("apReportError"); } catch (e) { /* best effort */ }
     }
+    // …and TELL THE CALLER. It used to return nothing, so the ATS run announced "Reported to the
+    // website." unconditionally — printed one line under the ⛔ saying the tracker never got it
+    // (live 2026-08-07, after a key rotation). A run that reports its own failure as success is
+    // worse than one that stays quiet, because the contradiction reads as a logging glitch.
+    return { ok: !!outcome.ok, reason: outcome.reason || null, status: (res && res.status) || 0 };
   } catch (e) {
     console.log("[ApplyPilot] application report skipped:", String((e && e.message) || e));
+    return { ok: false, reason: "exception", status: 0 };
   }
 }
 
@@ -4119,7 +4125,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     bundle.ats = ats;
     bundle.jobKeyUrl = originUrl; // stable identity across landing hops (see the top of this fn)
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
-    await reportApplication(bundle, jobContext);
+    const reported = await reportApplication(bundle, jobContext);
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
     const fillMs = Date.now() - fillT0;
@@ -4140,9 +4146,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
     LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
-    LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
+    // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
+    // line claimed "Reported to the website." even when the line directly above it was the ⛔ saying
+    // the tracker had rejected it.
+    const landed = reported && reported.ok
+      ? "Reported to the website."
+      : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
+    LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
-    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
+    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
   } finally {
