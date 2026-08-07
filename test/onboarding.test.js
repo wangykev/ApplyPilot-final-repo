@@ -519,3 +519,34 @@ test("blankAuthPersists: tolerates junk / empty input, and honours an explicit m
   assert.strictEqual(blankAuthPersists([BLANK, null, BLANK]), false, "nulls are dropped, so 2 reads < 3");
   assert.strictEqual(blankAuthPersists([BLANK, BLANK], 2), true, "an explicit lower minimum is honoured");
 });
+
+// ── Past auth is past auth, even before the fields mount (2026-08-07) ───────────────────────────────
+// `success` required form FIELDS, so a sign-in that had plainly worked read as "unknown" until Workday
+// mounted them — and the caller burned its whole budget, then re-submitted the auth form or reloaded.
+// Measured on jabil.wd5's successful sign-in: formFields 0, hasAuthEl false, markers [applyFlowPage],
+// title already the job posting — and the outcome came back "unknown".
+test("classifyAuthOutcome: applyFlowPage with NO auth chrome is success even at formFields 0", () => {
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "Principal Product Test Engineer, Advance Compute",
+    formFieldCount: 0, hasAuthEl: false, markers: { applyFlowPage: true },
+  }), "success", "the application shell is up and auth chrome is gone — the fields are just a beat behind");
+});
+test("classifyAuthOutcome: applyFlowPage does NOT beat a verify or wrong-credentials message", () => {
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "A verification email has been sent to your inbox.",
+    formFieldCount: 0, hasAuthEl: false, markers: { applyFlowPage: true },
+  }), "verify", "the message is decisive — it is checked first");
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "The email or password you entered is incorrect.",
+    formFieldCount: 0, hasAuthEl: false, markers: { applyFlowPage: true },
+  }), "wrong_credentials");
+});
+test("classifyAuthOutcome: applyFlowPage with auth chrome STILL up is not success", () => {
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "Sign In", formFieldCount: 2, hasAuthEl: true,
+    markers: { applyFlowPage: true, signInSubmit: true },
+  }), "unknown", "the live jabil sign-in page carries applyFlowPage AND signInSubmit — never success");
+});
+test("classifyAuthOutcome: a bare loading page is still unknown (no applyFlowPage, no fields)", () => {
+  assert.strictEqual(classifyAuthOutcome({ bodyText: "loading…", formFieldCount: 0, hasAuthEl: false, markers: {} }), "unknown");
+});

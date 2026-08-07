@@ -1338,6 +1338,25 @@ function classifyAuthOutcome(state) {
   if (ONBOARD_VERIFY_RX.test(t)) return "verify";
   if (ONBOARD_WRONG_RX.test(t)) return "wrong_credentials";
   if ((s.formFieldCount || 0) > 0 && !s.hasAuthEl) return "success";
+  // ── PAST AUTH IS PAST AUTH, EVEN BEFORE THE FIELDS MOUNT (2026-08-07) ────────────────────────────
+  // Success used to require form FIELDS, so a sign-in that had plainly worked read as "unknown" until
+  // Workday finished mounting them — and the caller spent its whole budget waiting, then re-submitted
+  // the auth form or reloaded the page. Measured on jabil.wd5, the successful sign-in:
+  //
+  //   still waiting at 2.0s — title "Careers"      formFields 0 · hasAuthEl false · markers [none]
+  //   timed out after 4000ms (52 reads)
+  //   last state:  title "Principal Product Test Engineer…" · formFields 0 · markers [applyFlowPage]
+  //   sign-in outcome: unknown
+  //
+  // `applyFlowPage` is Workday's APPLICATION-FLOW container — you cannot be on it without being signed
+  // in — and `hasAuthEl` false means every piece of auth chrome is gone. That is success; the fields are
+  // simply a beat behind. Waiting for them HERE is duplicated work: both walks call
+  // awaitFieldSetSettled before touching a page, which waits for a non-zero, stable field count. So an
+  // early success costs nothing and saves the whole remainder of the auth budget.
+  //
+  // Deliberately narrow: it still requires NO auth element, and the verify / wrong-credentials text
+  // checks above run FIRST, so a page mid-auth or reporting an error can never reach here.
+  if (s.markers && s.markers.applyFlowPage && !s.hasAuthEl) return "success";
   return "unknown";
 }
 

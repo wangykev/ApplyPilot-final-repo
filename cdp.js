@@ -2033,6 +2033,7 @@ function cdpOnboardScan() {
     bodyText,
     formFieldCount: formFields.length,
     emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,
+    authBusy,
     markers
   };
 }
