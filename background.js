@@ -6345,14 +6345,34 @@ async function runCdpOnboard(tabId, opts) {
     return { ok: !!w.matched, scan: scan2 };
   };
 
+  // The account-creation consent. RE-MEASURE, VERIFY, ESCALATE — never a single blind coordinate click
+  // (2026-08-07). The old version measured once, clicked once, logged whatever it found and carried on;
+  // when the click missed, Create Account simply could not submit, and the auth loop then burned ~12
+  // MINUTES re-clicking a submit that was never going to fire. Live on itron.wd5 AND radiancetech.wd12.
+  //
+  // Two things were wrong, both already-learned lessons applied elsewhere in this file:
+  //   • STALE RECT — the rect was read one CDP round-trip before the click was dispatched (~1.2-1.5s on
+  //     a hidden tab), and the just-filled password fields' requirement list reflows the label out from
+  //     under it. clickPageNext re-measures on every cover round for exactly this reason.
+  //   • NO ESCALATION — re-issuing the identical coordinate click cannot recover a click that did not
+  //     register; the retry has to change the MECHANISM (the Stage-1 Apply lesson, 2026-08-06).
+  // So: re-measure before every attempt, re-read `checked` after every attempt, and escalate to in-page
+  // native label activation. Never halts — the caller proceeds either way, and the log states the truth.
   const checkConsent = async () => {
     let c = await cdpEval(cdpConsentRect);
     if (!c) { LOG("no consent checkbox detected — proceeding (some tenants have none)."); return; }
     if (c.checked) { LOG("consent already checked."); return; }
-    await cdpClickAt(c.cx, c.cy);
-    await pace(300);
-    c = await cdpEval(cdpConsentRect);
-    LOG(`consent checkbox — ${c && c.checked ? "checked" : "still unchecked (proceeding anyway)"}.`);
+    // 1-2: trusted coordinate click, re-measured each time so a reflow can't send it to a dead point.
+    for (let attempt = 1; attempt <= 2 && c && !c.checked; attempt++) {
+      await cdpClickAt(c.cx, c.cy);
+      await pace(300);
+      c = await cdpEval(cdpConsentRect);
+      if (c && c.checked) { LOG(`consent checkbox — checked (coordinate click, attempt ${attempt}).`); return; }
+    }
+    // 3: the coordinate click is not landing — change the mechanism.
+    const a = await cdpEval(cdpConsentRect, "activate");
+    if (a && a.checked) { LOG(`consent checkbox — checked via in-page label activation (the coordinate click was not registering).`); return; }
+    LOG(`consent checkbox — STILL UNCHECKED after a re-measured coordinate click and in-page activation${a && a.inputId ? ` (input ${a.inputId})` : ""}. Create Account will likely refuse; proceeding so the failure is reported by the submit, not guessed at here.`);
   };
 
   // Click a submit button and wait for the auth outcome — with a re-click FALLBACK. If the wait

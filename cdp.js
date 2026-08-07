@@ -2207,7 +2207,21 @@ function cdpCoverCheck(selector, cx, cy) {
 // consent/terms/agree/privacy (AssetMark). Returns the LABEL's click point (preferred —
 // native label-activation fires React's change, the radio/checkbox lesson) + the current
 // checked state + the input id, or null. Read-only; the caller coordinate-clicks + verifies.
-function cdpConsentRect() {
+// `mode:"activate"` ticks it FROM INSIDE THE PAGE via native label activation, instead of only
+// reporting a rect for a coordinate click (2026-08-07). Why both live in one function: the FINDER is the
+// hard part (the word-list fallback below), and a second copy of it would be a lockstep dup waiting to
+// drift. Read stays the default, so every existing caller is unchanged.
+//
+// The coordinate click alone was not enough, and the reason is a STALE RECT — the same lesson
+// clickPageNext learned in 2026-07-25. checkConsent measured the label, then dispatched cdpClickAt a
+// full round-trip later (~1.2-1.5s on a hidden tab, where trusted input rides compositor frames), and in
+// between React re-rendered the just-filled password fields' requirement list and REFLOWED the label out
+// from under the saved coordinates. Live on itron.wd5 and radiancetech.wd12: the input is opacity:0 with
+// a 56x20 "I agree" label, the point resolved correctly when measured, and the box still read unchecked
+// afterwards — so Create Account could never submit and onboarding retried for ~12 minutes.
+// This ONLY ever sets the account-creation consent the caller already decided to accept; it never
+// searches for other agreements and never submits anything.
+function cdpConsentRect(mode) {
   let checkbox = document.querySelector('[data-automation-id="agreementCheckbox"] input[type="checkbox"]');
   const bare = document.querySelector('[data-automation-id="agreementCheckbox"]');
   if (!checkbox && bare && bare.tagName === "INPUT") checkbox = bare;
@@ -2237,6 +2251,26 @@ function cdpConsentRect() {
   if (!checkbox) return null;
   const inputId = checkbox.id || null;
   const lab = inputId ? document.querySelector('label[for="' + inputId + '"]') : (checkbox.closest && checkbox.closest("label"));
+  if (mode === "activate") {
+    // Native LABEL activation first — the input is routinely CSS-clipped (opacity:0), and clicking its
+    // <label for> is what flips `checked` AND fires the change event React listens for. This is the same
+    // primitive the radio/checkbox fillers use. Verified in place: false -> true on itron.wd5.
+    const before = !!checkbox.checked;
+    if (!before) {
+      if (lab && lab.click) { try { lab.click(); } catch (e) { /* fall through */ } }
+      if (!checkbox.checked) { try { checkbox.click(); } catch (e) { /* fall through */ } }
+      if (!checkbox.checked) {
+        // Last resort: set the property and fire the events React needs. Never a silent lie — the
+        // caller re-reads `checked` and reports whatever actually stuck.
+        try {
+          checkbox.checked = true;
+          checkbox.dispatchEvent(new Event("input", { bubbles: true }));
+          checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+        } catch (e) { /* report below */ }
+      }
+    }
+    return { checked: !!checkbox.checked, inputId, was: before, via: "in-page" };
+  }
   let target = lab || checkbox;
   if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
   let r = target.getBoundingClientRect();
