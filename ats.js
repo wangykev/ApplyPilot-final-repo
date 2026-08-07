@@ -1339,6 +1339,42 @@ function atsAssertionLead(candidate, texts) {
   return hits.length === 1 ? hits[0] : null;   // ambiguous ⇒ refuse
 }
 
+// DEGREE LEVEL is a small closed vocabulary, and forms model it at a different granularity than a
+// person states it: the profile says "Bachelor of Science" (and its ladder "Bachelors",
+// "Bachelor of Science (BS)"), while Discord's list offers "Bachelor's Degree". The apostrophe and the
+// "Degree" suffix put that out of reach of exact, of containment (off for dropdowns by design) and of
+// fuzzy (~56%), so a reconned 10-option list produced no match at all (live 2026-08-06).
+//
+// Match on the LEVEL both sides name, with the usual guard: exactly ONE option may carry that level —
+// a form listing "Bachelor of Science" AND "Bachelor of Arts" is a real choice and must reach the
+// human. Ordered most-specific first so a doctorate is never read as something else.
+const ATS_DEGREE_LEVELS = [
+  // ⚠ PROFESSIONAL DOCTORATES ARE SEPARATE LEVELS, not one "doctorate" bucket. A first cut collapsed
+  // them, so a PhD candidate matched "Doctor of Medicine (M.D.)" — the only doctorate on the list, so
+  // the exactly-one guard cheerfully committed a credential the applicant does not hold. Caught in
+  // testing, and it is the worst failure class this project has: a confident wrong value.
+  // Most-specific first, so "Doctor of Medicine" reads as md rather than a generic doctorate.
+  ["md", /\b(m\.?\s?d\.?|doctor of medicine)\b/i],
+  ["jd", /\b(j\.?\s?d\.?|juris doctor)\b/i],
+  ["edd", /\b(ed\.?\s?d\.?|doctor of education)\b/i],
+  ["phd", /\b(ph\.?\s?d|d\.?phil|doctor of philosophy|doctorate|doctoral)\b/i],
+  ["master", /\b(master|masters|m\.?\s?s\.?|m\.?\s?a\.?|m\.?b\.?a|m\.?eng|m\.?phil)\b/i],
+  ["bachelor", /\b(bachelor|bachelors|b\.?\s?s\.?|b\.?\s?a\.?|b\.?eng|b\.?tech|undergraduate)\b/i],
+  ["associate", /\b(associate|associates|a\.?\s?a\.?|a\.?\s?s\.?)\b/i],
+  ["high-school", /\b(high\s?school|secondary|ged)\b/i],
+];
+function atsDegreeLevel(text) {
+  const t = String(text == null ? "" : text).replace(/[\u2018\u2019']/g, "");
+  for (const [level, re] of ATS_DEGREE_LEVELS) if (re.test(t)) return level;
+  return null;
+}
+function atsDegreeMatch(candidates, options) {
+  const wanted = (candidates || []).map(atsDegreeLevel).find(Boolean);
+  if (!wanted) return null;
+  const hits = (options || []).filter((o) => atsDegreeLevel(o) === wanted);
+  return hits.length === 1 ? hits[0] : null;   // 2+ of the same level is a real choice — ask the human
+}
+
 // Is this label a demographic question? ORTHOGONAL to routing (2026-07-31, Zoox): a BUCKET
 // can route an EEO field before the label ladder's EEO rung runs, and the bucket carries no
 // containment — so "Asian" missed Zoox's "Asian (Not Hispanic or Latino)" even though the
@@ -1749,7 +1785,16 @@ async function atsFinishFill(act, ats, scan, results) {
   }
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
-  return { url: scan.url, title: scan.title, results, counts, needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
+  // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
+  // server-backed comboboxes (school / degree / discipline / location) never return anything — the
+  // operator's own workaround is to refresh the page, and by hand the same widget then answers in ~1s
+  // (2026-08-06). We could not tell that state apart from a slow one, so a fill would sit through the
+  // full budget on each such field and hand them all to review. This flag lets the RUN decide to
+  // reload once and try again, which is the same remedy a human applies.
+  const deadAsync = results.filter((r) => r.listUnproven || /never answered our search|suggestions never loaded/i.test(String(r.detail || "")));
+  return { url: scan.url, title: scan.title, results, counts,
+    deadAsync: deadAsync.map((r) => r.fieldName),
+    needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
 }
 
 // Actuate one field with the resolved candidates. Returns true when it produced an outcome
@@ -2174,6 +2219,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
           if (asrt) hit = { index: matchTexts.indexOf(asrt), tier: "assertion-lead" };
         }
       }
+      // …and the degree-level bridge, for a field that ASKS about a degree (see atsDegreeMatch)
+      if (!hit && /degree|education level/i.test(String(f.label || ""))) {
+        const deg = atsDegreeMatch(candidates, matchTexts);
+        if (deg) hit = { index: matchTexts.indexOf(deg), tier: "degree-level" };
+      }
       // Dial composite: the ladder above compares NAMES that can never meet (see atsDialMatch).
       // Uses the RAW option texts — the codes are what it needs.
       if (!hit && wt === "dial") hit = atsDialMatch(candidates, texts);
@@ -2529,7 +2579,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,

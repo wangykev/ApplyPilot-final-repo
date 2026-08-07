@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-06-overrides-experiment";
+const AP_BUILD = "2026-08-06-degree-bridge";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -4075,7 +4075,34 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
-    const out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+
+    // RELOAD ONCE IF THIS PAGE'S ASYNC WIDGETS NEVER ANSWERED. Greenhouse forms sometimes load in a
+    // state where their server-backed comboboxes (school / degree / discipline / location) return
+    // nothing at all — the operator's own remedy is to refresh, and the same widget then answers in
+    // ~1s by hand (2026-08-06). Every other explanation was tested and ruled out first: the tab was
+    // VISIBLE and painting, the click was trusted, the keystrokes were trusted, and google.maps is not
+    // involved. Bounded to ONE retry, gated on the signal (a healthy page never pays it), and these
+    // forms are stateless — a refill from a blank form is exactly what a second visit does anyway.
+    if ((out.deadAsync || []).length && !opts0.__reloaded) {
+      LOG(`this form's async widgets never answered (${out.deadAsync.join(", ")}) — reloading once and refilling, the way a human would`);
+      emitRunProgress("Refreshing the form", "its dropdowns never loaded — reloading once");
+      try {
+        // A TRUE REFRESH (Page.reload), not a re-navigation: the operator's remedy is F5, and a
+        // navigate to the same URL can be served from a state that is already broken.
+        await cdpReload();
+        await cdpDelay(1200);                 // let the document start over before we look for fields
+        const ready = await waitAtsFormReady(ats, LOG);   // ⚠ it returns {ready}, not {ok}
+        if (ready && ready.ready) {
+          const retry = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+          const before = (out.deadAsync || []).length, after = (retry.deadAsync || []).length;
+          LOG(`refill after reload: ${after} async widget(s) still silent (was ${before})`);
+          if (after < before) out = retry;   // keep whichever visit actually got answers
+        } else {
+          LOG("reload did not bring the form back — keeping the first pass");
+        }
+      } catch (e) { LOG("reload attempt failed:", String((e && e.message) || e)); }
+    }
 
     // ONE page ⇒ one bundle write (the walk's clear-once + accumulate collapses to a set).
     const pageKey = (() => { try { return new URL(out.url).pathname; } catch (e) { return "application"; } })();

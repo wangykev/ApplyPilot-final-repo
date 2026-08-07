@@ -1356,6 +1356,58 @@ test("replay: an APPROVED typed location counts as committed; a FILL still asks 
   assert.match(String(lost.results[0].detail), /audit/i, "and the audit is what says so");
 });
 
+test("degree level: bridges the granularity gap, and NEVER invents a credential", () => {
+  // Live 2026-08-06, Discord: the reconned 10-option list offers "Bachelor's Degree" while the profile
+  // states "Bachelor of Science" (ladder: "Bachelors", "Bachelor of Science (BS)"). The apostrophe and
+  // the "Degree" suffix defeat exact, containment (off for dropdowns) and fuzzy (~56%).
+  const GENERIC = ["Associate's Degree", "Bachelor's Degree", "Master's Degree", "Doctor of Medicine (M.D.)", "High School"];
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Science", "Bachelors"], GENERIC), "Bachelor's Degree");
+  assert.strictEqual(ats.atsDegreeMatch(["Master of Science"], GENERIC), "Master's Degree");
+  assert.strictEqual(ats.atsDegreeMatch(["MBA"], GENERIC), "Master's Degree");
+
+  // ⚠ THE ONE THAT MATTERS: a PhD is not an MD. A first cut bucketed every doctorate together and
+  // matched "Doctor of Medicine (M.D.)" because it was the only doctorate on the list — a confident
+  // wrong credential, the worst failure this project has.
+  assert.strictEqual(ats.atsDegreeMatch(["Doctor of Philosophy"], GENERIC), null);
+  assert.strictEqual(ats.atsDegreeMatch(["PhD"], GENERIC), null);
+  assert.strictEqual(ats.atsDegreeMatch(["Doctor of Medicine"], GENERIC), "Doctor of Medicine (M.D.)");
+  assert.strictEqual(ats.atsDegreeMatch(["PhD"], ["Bachelor's Degree", "Doctorate"]), "Doctorate");
+  assert.strictEqual(ats.atsDegreeMatch(["Juris Doctor"], GENERIC), null, "a JD is not an MD either");
+
+  // two options at the SAME level is a real choice — the human makes it
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Science"], ["Bachelor of Science", "Bachelor of Arts"]), null);
+  // and a value that names no level is none of this bridge's business
+  assert.strictEqual(ats.atsDegreeMatch(["Yes"], GENERIC), null);
+  assert.strictEqual(ats.atsDegreeMatch([], GENERIC), null);
+});
+
+test("driver: a degree question fills through the level bridge, flagged; other dropdowns unaffected", async () => {
+  let committed = null;
+  const mk = (label) => fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/discord/jobs/1", title: "t",
+      fields: [{ fieldName: "degree--0", inputSel: "#degree--0", widgetType: "select", label, isRequired: false, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["Associate's Degree", "Bachelor's Degree", "Master's Degree"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Degree", "Highest level of education"], value: ["Bachelor of Science"] }];
+  const out = await ats.driveAtsPageFill(mk("Degree"), "greenhouse", PROFILE, {}, {}, { buckets });
+  assert.strictEqual(committed, "Bachelor's Degree");
+  assert.strictEqual(out.results[0].matchTier, "degree-level");
+  assert.strictEqual(out.results[0].status, "filled_review", "a non-exact tier is always flagged");
+
+  // the bridge is gated on the LABEL: an unrelated dropdown with degree-ish values must not use it
+  committed = null;
+  const other = await ats.driveAtsPageFill(mk("Which team?"), "greenhouse", PROFILE, {}, {}, { buckets });
+  assert.notStrictEqual(other.results[0].matchTier, "degree-level");
+});
+
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
 // be followed into the frame, and an ambiguous page must refuse rather than pick one.
 test("embedded form: a single ATS iframe is followed, ambiguity refuses", () => {
