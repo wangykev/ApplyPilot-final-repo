@@ -3571,3 +3571,44 @@ so the reliable open is the trusted coordinate click; it just has to be aimed co
 **nothing lost**, status `filled` — 15 of the profile's 24 skills on the form. The nine that stay off
 (`C++`, `HTML/CSS`, `CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`)
 have no exact-or-qualified row in Workday's taxonomy on this tenant, and are named in the record.
+
+## 2026-08-07 (c) — SKILLS: the CONTAINMENT tier, and exactly what Workday offers
+
+Operator decision: accept a containment match for skills so `Vivado` lands. Enabled as the LAST tier in
+`matchSkillOption`, and the guards below are not caution for its own sake — every one of them fired on the
+very run that verified the feature. **This is a skills-only exception; the rest of the codebase keeps
+"containment is a guess".**
+
+What Workday actually returned for the nine skills that had not matched (top rows, one live run):
+
+| typed | Workday's rows | outcome |
+|---|---|---|
+| `Vivado` | **Xilinx Vivado**, Vivado HLS | **CONTAINMENT → "Xilinx Vivado"** (2 rows contain it → tie broken on Workday's ranking; the alternative is named in the review) |
+| `PCB design` | PCB Design … | **matched** |
+| `rqt` | Retek, RFQ Responses, ReQlogic, Retesting | **free-text add** — zero real matches, so Workday added `rqt` verbatim |
+| `CAN` | CANopen, CANape, Canorus, **Can Openers** | **refused** — and note "Can Openers" IS a whole-word hit for "can". The **lone-token ≥5 chars** gate is the only thing standing between an embedded engineer and a "Can Openers" skill |
+| `C++` | C (Programming Language), C NMR, C/AL, C-Arm | refused (no row contains `c++`; committing "C (Programming Language)" would be a different skill) |
+| `HTML/CSS` | CSS HTML, XHTML CSS, Cshtml, CSS Framework | refused (the phrase never appears) |
+| `ODrive` | Top Drive, Optical Disk Drives, Driveline | refused |
+| `CubeMars motor drivers` | Motor Drives, Motor Controllers, Motor Driving | refused |
+| `VS Code` | ISM Code, CodeTwo, M-Code, Code V (Software) | refused |
+
+**The three guards:**
+1. **WHOLE-WORD, never raw substring.** Boundaries are non-alphanumeric. Plain `includes` would match
+   `Git` inside "Di**git**al" and `CAN` inside "**Can**adian" — a marketing skill on an embedded
+   engineer's application.
+2. **Distinctiveness:** multi-word, or a lone token ≥5 chars (`skillContainmentEligible`). Modelled on the
+   employer-match scan's rule. Blocks `CAN`, `C++`, `Git`, `rqt` from widening at all; passes `Vivado`.
+3. **Ranking tie-break:** several containing rows → Workday's own first result (the "pick the first" rule
+   the exact tier and `clickHierLeaf` already use), with the rejected rows carried into the review so a
+   human can switch. Refusing instead is what kept `Vivado` off the form on the previous run.
+
+**Every widened commit is `filled_review` + `skills-containment`**, and the detail spells out
+`Vivado → Xilinx Vivado (broader; Workday also offered Vivado HLS)`. `missingSkills` also treats a BROADER
+chip as covering the profile name, or the next pass would search `Vivado` again, find the selected row gone
+(Workday hides it) and widen onto `Vivado HLS` alongside.
+
+**Result: 18 of 24** — `Altium Designer`, `C (Programming Language)`, `Docker (Software)`, `Fusion 360`,
+`Git`, `Java (Programming Language)`, `JavaScript`, `Linux`, `Modbus`, `PCB design`,
+`Python (Programming Language)`, `Raspberry Pi`, `ROS 2`, `RViz`, `SystemVerilog`, `Yosys`, `rqt`,
+`Xilinx Vivado`. The remaining six are the refusals above, all correct.

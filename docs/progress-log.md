@@ -3657,7 +3657,32 @@ lost, `[filled]` — **15 of the profile's 24 skills on the form**. The nine tha
 `CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`) have no exact-or-
 qualified row on this tenant and are named in the record for the human.
 
-Extension **1139/1140** (`test/skills.test.js`, 28 pins; the one failure is `db.test.js` — `fake-indexeddb`
-is missing from this worktree's `node_modules`, unrelated and pre-existing). Two operator calls still open:
-whether a qualified commit should stay silent `filled` or be flagged, and whether a partial fill should nag
-review or just name the absent skills in the detail (current behaviour).
+### The CONTAINMENT tier (operator decision, same day)
+
+"Accept the containment match for skills so Vivado lands too." Added as the LAST tier in
+`matchSkillOption` — a **skills-only** exception to the standing "containment is a guess" rule, which
+CLAUDE.md's match-ladder section now records explicitly rather than leaving the code and the doc
+contradicting each other.
+
+The guards are not caution for its own sake; each one fired on the verifying run:
+
+- **Whole-word, never raw substring.** `includes` would match `Git` inside "Di**git**al" and `CAN` inside
+  "**Can**adian".
+- **Distinctiveness** (multi-word, or a lone token ≥5 chars). On that very run `CAN` was offered
+  **"Can Openers"** — a genuine whole-word hit. This gate is all that kept it off the application.
+- **Ranking tie-break.** The first attempt REFUSED `Vivado` (`containment match was ambiguous (2+ options)`)
+  because Workday offers both `Xilinx Vivado` and `Vivado HLS` — so the tie now breaks on Workday's own
+  first result, with the alternatives carried into the review so a human can switch.
+
+Every widened commit is `filled_review` + `skills-containment`, detail
+`Vivado → Xilinx Vivado (broader; Workday also offered Vivado HLS)`. `missingSkills` also treats a BROADER
+chip as covering the profile name, or the next pass would re-search `Vivado`, find the selected row hidden,
+and widen onto `Vivado HLS` alongside it.
+
+**18 of 24 now land** (`Xilinx Vivado` and `PCB design` via containment; `rqt` via Workday's free-text add).
+The six refusals — `C++`, `HTML/CSS`, `CAN`, `ODrive`, `CubeMars motor drivers`, `VS Code` — are all
+correct: the offered rows are different skills. Per-skill evidence table: dom-patterns 2026-08-07 (c).
+
+Extension **1147/1148** (`test/skills.test.js`, 36 pins; the one failure is `db.test.js` — `fake-indexeddb`
+is missing from this worktree's `node_modules`, unrelated and pre-existing). One operator call still open:
+whether a partial fill should nag review or just name the absent skills in the detail (current behaviour).

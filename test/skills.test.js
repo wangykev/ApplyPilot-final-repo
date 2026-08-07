@@ -112,6 +112,51 @@ test("matchSkillOption: Workday's FUZZY rows are never a match", () => {
   assert.equal(lib.matchSkillOption("Java", ["JavaScript", "Java Persistence API"]).index, -1);
 });
 
+test("matchSkillOption: CONTAINMENT lands a skill Workday only lists under a broader name", () => {
+  // Operator-authorized 2026-08-07, so "Vivado" lands against Workday's "Xilinx Vivado".
+  const m = lib.matchSkillOption("Vivado", ["Xilinx Vivado", "Cadence Virtuoso"]);
+  assert.deepEqual([m.index, m.tier], [0, "containment"]);
+  const p = lib.matchSkillOption("PCB design", ["PCB Design and Layout", "Mechanical Design"]);
+  assert.deepEqual([p.index, p.tier], [0, "containment"]);
+});
+
+test("matchSkillOption: containment is WHOLE-WORD — the two cases that make raw substring wrong", () => {
+  // "git" is inside "Digital" and "can" is inside "Canadian". A plain `includes` tier would put a
+  // marketing skill on an embedded engineer's application; these must not match.
+  assert.equal(lib.matchSkillOption("Git", ["Digital Marketing"]).index, -1);
+  assert.equal(lib.matchSkillOption("CAN", ["Canadian Payroll"]).index, -1);
+  // and a lone SHORT token is refused outright, even where it would be a whole word
+  assert.equal(lib.matchSkillOption("CAN", ["CAN Bus Diagnostics"]).index, -1,
+    "a 3-char lone token is not distinctive enough to widen on");
+  assert.ok(!lib.skillContainmentEligible("Git"));
+  assert.ok(lib.skillContainmentEligible("Vivado"));
+  assert.ok(lib.skillContainmentEligible("VS Code"), "multi-word is distinctive even when short");
+});
+
+test("matchSkillOption: an EXACT or QUALIFIED row still beats containment", () => {
+  // Widening is the last resort, so an offered exact row wins and the commit stays silent/high.
+  const m = lib.matchSkillOption("Vivado", ["Xilinx Vivado", "Vivado"]);
+  assert.deepEqual([m.index, m.tier], [1, "exact"]);
+  const q = lib.matchSkillOption("Vivado", ["Xilinx Vivado", "Vivado (Software)"]);
+  assert.deepEqual([q.index, q.tier], [1, "qualified"]);
+});
+
+test("matchSkillOption: several containing rows resolve on WORKDAY'S ranking, alternatives carried", () => {
+  // Refusing here is what kept "Vivado" off the form live — Workday offered more than one row
+  // containing it. The tie breaks on its own first result, and the rest ride along for the review.
+  const m = lib.matchSkillOption("Vivado", ["Xilinx Vivado", "Vivado HLS"]);
+  assert.deepEqual([m.index, m.tier], [0, "containment"]);
+  assert.deepEqual(m.alternatives, ["Vivado HLS"]);
+});
+
+test("missingSkills: a BROADER chip covers the skill, so a re-run can't add a second variant", () => {
+  // Containment opens an idempotency hole: base names differ, so without this the next pass searches
+  // "Vivado" again, finds the selected row gone, and widens onto "Vivado HLS" alongside it.
+  assert.deepEqual(lib.missingSkills(["Vivado", "Git"], ["Xilinx Vivado"]), ["Git"]);
+  // ...but the same guard must not let an unrelated chip swallow a short skill
+  assert.deepEqual(lib.missingSkills(["Git"], ["Digital Marketing"]), ["Git"]);
+});
+
 test("matchSkillOption: two rows sharing a base name are AMBIGUOUS, so nothing commits", () => {
   const m = lib.matchSkillOption("Python", ["Python (Programming Language)", "Python (Snake)"]);
   assert.equal(m.index, -1);
@@ -145,6 +190,32 @@ test("fillSkillsCdp: adds every matchable skill on ONE open, mapping through the
   assert.deepEqual(st.chips, ["Python (Programming Language)", "Docker", "Linux"]);
   assert.match(r.detail, /Python → Python \(Programming Language\)/);
   assert.equal(r.after, "Python (Programming Language); Docker; Linux");
+});
+
+test("fillSkillsCdp: a WIDENED commit lands but sends the field to review, naming the widening", async () => {
+  const { act, st } = makeSkillsAct({ catalog: ["Xilinx Vivado", "Linux"], fuzz: FUZZ });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Vivado", "Linux"], B);
+  assert.deepEqual(st.chips, ["Xilinx Vivado", "Linux"], "Vivado landed under Workday's broader name");
+  assert.equal(r.status, "filled_review", "a value we widened is not a silent fill");
+  assert.equal(r.flag, "skills-containment");
+  assert.deepEqual(r.skills_widened, ["Vivado → Xilinx Vivado"]);
+  assert.match(r.detail, /Vivado → Xilinx Vivado \(broader\)/);
+});
+
+test("fillSkillsCdp: a widening that had ALTERNATIVES names them, so review can switch", async () => {
+  const { act, st } = makeSkillsAct({ catalog: ["Xilinx Vivado", "Vivado HLS"] });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Vivado"], B);
+  assert.deepEqual(st.chips, ["Xilinx Vivado"]);
+  assert.equal(r.flag, "skills-containment");
+  assert.match(r.detail, /Workday also offered Vivado HLS/);
+});
+
+test("fillSkillsCdp: exact-only adds stay a SILENT filled — widening is what triggers review", async () => {
+  const { act } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Git"], B);
+  assert.equal(r.status, "filled");
+  assert.equal(r.flag, null);
+  assert.deepEqual(r.skills_widened, []);
 });
 
 test("fillSkillsCdp: a skill Workday does not know is left OFF the form and named", async () => {

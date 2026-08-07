@@ -564,7 +564,54 @@ function matchSkillOption(skill, optionTexts) {
   const qualified = hits((t) => skillBaseName(t) === wantBase);
   if (qualified.length === 1) return { index: qualified[0], tier: "qualified" };
   if (qualified.length > 1) return { index: -1, tier: null, ambiguous: "qualified" };
+  // TIER 3 — CONTAINMENT, an OPERATOR-AUTHORIZED exception to the standing "containment is a guess"
+  // rule (2026-08-07), so a skill Workday only lists under a broader name still lands: "Vivado" →
+  // "Xilinx Vivado". It is the LAST tier, it is ambiguity-guarded, and every commit through it is
+  // flagged for review — the operator sees exactly what was widened.
+  //
+  // WHOLE-WORD, not raw substring, and that is the load-bearing part. Plain `includes` on this
+  // vocabulary is actively wrong: "Git" is inside "Di**git**al" and "CAN" is inside "**Can**adian",
+  // so a raw substring tier would put a marketing skill on an embedded engineer's application.
+  if (!skillContainmentEligible(want)) return { index: -1, tier: null };
+  const contained = hits((t) => skillWholeWordIn(normalize(t), want));
+  if (contained.length === 1) return { index: contained[0], tier: "containment" };
+  if (contained.length > 1) {
+    // SEVERAL broader rows contain the skill. Refusing here is what kept "Vivado" off the form — live,
+    // Workday offered more than one row containing it. The tie is broken on WORKDAY'S OWN RANKING (its
+    // first result for that query), the same "pick the first" rule the exact tier and clickHierLeaf
+    // already use, rather than on a preference of ours about which product name is the "real" one. The
+    // alternatives ride along so the review names what else was on offer and the human can switch.
+    return { index: contained[0], tier: "containment",
+             alternatives: contained.slice(1).map((i) => opts[i]) };
+  }
   return { index: -1, tier: null };
+}
+
+// Split a normalized skill into tokens, keeping the characters real skill names carry (+ # .) so
+// "c++", "c#" and "node.js" stay single tokens instead of dissolving.
+function skillTokens(s) {
+  return String(s == null ? "" : s).split(/[^a-z0-9+#.]+/).filter(Boolean);
+}
+
+// May this skill be matched by CONTAINMENT at all? A DISTINCTIVENESS gate, modelled on the
+// employer-match scan's rule (multi-word, or a lone word long enough to be unambiguous). A short lone
+// token is exactly where containment goes wrong — "CAN" (the bus) against "Canadian Payroll", "rqt",
+// "C++" — so those stay exact/qualified-only. "Vivado" (6) and "PCB design" (2 words) pass.
+const SKILL_CONTAINMENT_MIN_LONE = 5;
+function skillContainmentEligible(skill) {
+  const t = skillTokens(normalize(String(skill == null ? "" : skill)));
+  if (!t.length) return false;
+  return t.length >= 2 || t[0].length >= SKILL_CONTAINMENT_MIN_LONE;
+}
+
+// Does `needle` appear in `haystack` as a whole word / contiguous word sequence? Both are expected
+// normalized. Boundaries are non-alphanumeric (or the string ends), which is what separates
+// "vivado" ⊂ "xilinx vivado" (a real match) from "git" ⊂ "digital" (not one).
+function skillWholeWordIn(haystack, needle) {
+  const h = String(haystack == null ? "" : haystack), n = String(needle == null ? "" : needle);
+  if (!h || !n) return false;
+  const esc = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("(^|[^a-z0-9])" + esc + "([^a-z0-9]|$)").test(h);
 }
 
 // The SHARED core of the skills detector. The fill path recognises a live SCAN field and the
@@ -595,13 +642,20 @@ function isSkillsEntry(entry) {
 // results — observed), and commit "Python IDLE" as a near-duplicate. Also dedupes `wanted` against
 // itself, so a profile listing a skill twice can't add it twice.
 function missingSkills(wanted, chips) {
-  const have = new Set((Array.isArray(chips) ? chips : []).map(skillBaseName).filter(Boolean));
+  const chipList = (Array.isArray(chips) ? chips : []).map((c) => normalize(String(c == null ? "" : c))).filter(Boolean);
+  const have = new Set(chipList.map(skillBaseName).filter(Boolean));
   const out = [];
   for (const raw of (Array.isArray(wanted) ? wanted : [])) {
     const s = String(raw == null ? "" : raw).trim();
     if (!s) continue;
     const base = skillBaseName(s);
     if (!base || have.has(base)) continue;
+    // A chip committed through the CONTAINMENT tier reads back BROADER than the profile name
+    // ("Vivado" landed as "Xilinx Vivado"), so a base-name comparison alone would call it missing and
+    // search again — and Workday drops the selected row from its own results, so the next containment
+    // hit would be a DIFFERENT variant ("Vivado HLS") added alongside. Same whole-word + eligibility
+    // rule as the matcher, so a "Digital Marketing" chip never counts as covering "Git".
+    if (skillContainmentEligible(base) && chipList.some((c) => skillWholeWordIn(c, base))) continue;
     have.add(base);
     out.push(s);
   }
@@ -2039,6 +2093,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   skillBaseName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
+  skillTokens, skillContainmentEligible, skillWholeWordIn,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

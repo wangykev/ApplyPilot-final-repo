@@ -3186,7 +3186,7 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
       continue;
     }
     const option = texts[m.index];
-    step.matched = { option, tier: m.tier };
+    step.matched = { option, tier: m.tier, alternatives: m.alternatives || null };
     let ok = false;
     if (await act.clickHierLeaf(loc, option)) {
       const tCommit = Date.now(); // NOT t0 — that one times the whole skill, and shadowing it here invites a later bug
@@ -3198,7 +3198,7 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
         if (chips.length > chipsBefore.length && chips.some((c) => norm(c) === norm(option))) { ok = true; break; }
       }
     }
-    if (ok) { added.push({ skill, option, tier: m.tier }); step.added = option; }
+    if (ok) { added.push({ skill, option, tier: m.tier, alternatives: m.alternatives || [] }); step.added = option; }
     else { failed.push(skill); step.note = `matched "${option}" but the chip never appeared`; }
   }
 
@@ -3212,9 +3212,14 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
 
   const dropped = todo.length - capped.length;
   const bits = [];
+  // Name the mapping whenever the committed option is not literally the profile's wording — a qualified
+  // hit ("Python → Python (Programming Language)") and, louder, a WIDENED containment hit
+  // ("Vivado → Xilinx Vivado (broader)"), which is the one a human should actually eyeball.
+  const widened = added.filter((a) => a.tier === "containment");
   if (added.length) bits.push(`added ${added.length}: ` + added.map((a) =>
-    apMatch.skillBaseName(a.option) === apMatch.skillBaseName(a.skill) && norm(a.option) !== norm(a.skill)
-      ? `${a.skill} → ${a.option}` : a.option).join(", "));
+    a.tier === "containment"
+      ? `${a.skill} → ${a.option} (broader${(a.alternatives && a.alternatives.length) ? "; Workday also offered " + a.alternatives.join(" / ") : ""})`
+      : (norm(a.option) !== norm(a.skill) ? `${a.skill} → ${a.option}` : a.option)).join(", "));
   if (priorChips.length) bits.push(`kept ${priorChips.length} already on the form`);
   if (notOffered.length) bits.push(`NOT in Workday's skill list (add by hand if you want them): ${notOffered.join(", ")}`);
   if (failed.length) bits.push(`could not be entered (typing/commit did not land — re-run): ${failed.join(", ")}`);
@@ -3229,7 +3234,8 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
   const after = finalChips.length ? finalChips.join("; ") : null;
   const base = { after, verified: !strays.length, matchTier: "skills-multi-add",
     detail: bits.join(" · ") || "nothing to add", skills_added: added.map((a) => a.option),
-    skills_not_offered: notOffered.slice(), skills_failed: failed.concat(unclearable), settle_trace: trace };
+    skills_not_offered: notOffered.slice(), skills_failed: failed.concat(unclearable),
+    skills_widened: widened.map((a) => `${a.skill} → ${a.option}`), settle_trace: trace };
   if (strays.length) return { ...base, status: "needs_review", flag: "skills-stray", confidence: "none" };
   // An INFRA bail (focus / an unclearable box) is not a clean outcome, even when the form already holds
   // chips: skills the profile asked for were never attempted. Reporting a silent `filled` there hid a
@@ -3243,6 +3249,12 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
     // The field is BLANK and the profile had values — that is the case the review gate exists for.
     return { ...base, status: finalChips.length ? "filled" : "needs_review",
       flag: finalChips.length ? null : "skills-none-matched", confidence: finalChips.length ? "high" : "none" };
+  }
+  // A WIDENED (containment) commit is a value the operator authorized us to infer, not one they wrote —
+  // so the field goes to review naming each widening, exactly as every other non-exact commit in this
+  // codebase does. Exact/qualified-only stays a silent `filled`.
+  if (widened.length) {
+    return { ...base, status: "filled_review", flag: "skills-containment", confidence: "medium" };
   }
   return { ...base, status: "filled", flag: null, confidence: "high" };
 };
