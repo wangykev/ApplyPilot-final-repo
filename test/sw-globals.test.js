@@ -125,3 +125,24 @@ for (const [ns, from] of [["atsLib", "lib.js"], ["atsFd", "fill-driver.js"]]) {
     assert.deepStrictEqual(missing, [], `these names are called as ${ns}.X in ats.js but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass (they must also be globals from ${from})`);
   });
 }
+
+// ── the ATS actuation must expose everything ats.js asks of it (2026-08-06) ──────────────────────────
+// makeAtsActuation is a HAND-BUILT object, so a capability added to makeCdpActuation is invisible to
+// the ATS driver. That silently disabled two fixes: the quiescence watch (the option poll quietly fell
+// back to the read-latency proxy it was meant to replace) and trustedFocus (the widget-wake produced no
+// log line at all, because `act.trustedFocus` was undefined). Node tests could not catch it — the fakes
+// provide these methods directly — so this checks the real wiring the way the apMatch guard does.
+test("ATS act: every act.X used in ats.js is provided by makeAtsActuation", () => {
+  const ats = fs.readFileSync(path.join(ROOT, "ats.js"), "utf8");
+  const bg = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  // Comments mention capabilities they do not call (ats.js's header cites Workday's act.clickSubmit),
+  // so scan CODE only — otherwise the guard fails on prose and gets muted, which is worse than absent.
+  const code = ats.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const used = new Set([...code.matchAll(/\bact\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));
+  assert.ok(used.size > 5, `expected several act.* uses, found ${used.size}`);
+  const decl = /function makeAtsActuation\([\s\S]*?return (\{[\s\S]*?\n  \});/.exec(bg);
+  assert.ok(decl, "could not locate the makeAtsActuation returned object");
+  const provided = new Set([...decl[1].matchAll(/^\s{4}([A-Za-z_$][\w$]*)\s*:/gm)].map((m) => m[1]));
+  const missing = [...used].filter((n) => !provided.has(n)).sort();
+  assert.deepStrictEqual(missing, [], "ats.js calls these on `act`, but makeAtsActuation does not provide them — they are undefined in the extension even though the test fakes supply them");
+});

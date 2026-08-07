@@ -3791,10 +3791,19 @@ function makeCdpActuation(llmConfig) {
     // trusted (synthetic mode is only armed for Workday fills), so this is a genuine
     // Input.dispatchMouseEvent, not another page-side dispatch.
     trustedFocus: async (sel) => {
-      const rect = await cdpRectReady(sel, true);
-      if (!rect || !(rect.w > 0)) return false;
-      await cdpClickAt(rect.cx, rect.cy);
-      return true;
+      // Two ways in, because a hidden tab can report a 0x0 rect and the coordinate path then silently
+      // does nothing (which is exactly how the first version of this looked like "the fix didn't
+      // work"). DOM.focus needs no geometry at all, so it is the fallback rather than a dead end.
+      let how = null;
+      try {
+        const rect = await cdpRectReady(sel, true);
+        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); how = "click"; }
+      } catch (e) { /* fall through to DOM.focus */ }
+      if (!how) {
+        try { await cdpDomFocus(sel); how = "dom-focus"; } catch (e) { how = null; }
+      }
+      try { console.log(`[ApplyPilot][CDP] trustedFocus ${JSON.stringify(sel)} → ${how || "FAILED"}`); } catch (e) { /* log only */ }
+      return how;
     },
     painting: () => cdpPainting(),
     paintLabel: () => cdpPaintLabel(),

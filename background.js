@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-06-location-trusted-click";
+const AP_BUILD = "2026-08-06-wake-async-combos";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -3841,6 +3841,15 @@ function makeAtsActuation(llmConfig) {
     delayFull: cdpDelay,
     eval: (fn, ...args) => cdpEval(fn, ...args),
     wakePage: () => cdpWakePage(), // hidden-tab unfreeze between polls (the discover rule)
+    // ⚠ FORWARD THE SHARED PROBES. This object is hand-built, so anything added to makeCdpActuation
+    // is invisible here — which silently disabled two fixes: the quiescence watch (the ATS poll fell
+    // back to read latency, the proxy it was meant to replace) and trustedFocus (the widget-wake that
+    // showed no log line at all because `act.trustedFocus` was undefined). Guarded by a test now.
+    trustedFocus: workday.trustedFocus,
+    painting: workday.painting,
+    paintLabel: workday.paintLabel,
+    quietInstall: workday.quietInstall,
+    quietRead: workday.quietRead,
     attachResume: async (ref) => {
       const stored = await getResume().catch(() => null);
       if (!stored || !stored.base64) return { ok: false, error: "no resume stored (upload one in the popup / website)" };

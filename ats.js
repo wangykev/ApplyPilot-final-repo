@@ -2020,6 +2020,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // where the full "Carnegie Mellon University" can come back empty). The MATCH is still
         // exact against whatever the widget returns — a looser query never loosens the answer.
         const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
+        // Wake the widget with a REAL interaction before searching. Greenhouse's async comboboxes
+        // (school, degree, discipline, location) leave their fetch asleep — or firing but never
+        // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
+        // `loading` for 19.2s and the location box showed nothing for 21.6s, while by hand each
+        // answered in about a second. Once woken, ordinary synthetic typing drives them.
+        if (act.trustedFocus) { try { await act.trustedFocus(ref.inputSel); await act.delay(120); } catch (e) { /* best effort */ } }
         const typed = await typeInto(query); didSearch = true;
         const wantHit = (t) => t.length > 0 && hasHit(t);
         let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
