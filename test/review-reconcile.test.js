@@ -473,3 +473,45 @@ test("STRUCTURED: a multi-field section stays strict — a cross-entry swap stil
   assert.ok(!r.agree.some((a) => a.tier === "entry-reordered"),
     "a multi-field section must never take the order-free re-pair path: " + JSON.stringify(r.agree.map((a) => a.tier)));
 });
+
+// ── A SIGNATURE date reconciles against TODAY, matching what the replay writes (2026-08-07) ─────────
+// replayField re-derives a signature date to today (Workday refuses the page with "Enter today's date"
+// otherwise). Without the matching change here the reconcile compared the page against the stale
+// APPROVED literal and reported the replay's own correct behaviour as a contradiction, blocking the
+// gate: `= "Date*": approved "8/6/2026" but the page shows "08/07/2026"` (live, waystar.wd1).
+// All four assertions go through the KEYED path (a `key` on the record) so they test the real compare,
+// not the value-presence fallback.
+const _mmddyyyy = (d) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+const SIG_TODAY = _mmddyyyy(new Date());
+const SIG_YESTERDAY = _mmddyyyy(new Date(Date.now() - 86400000));
+const _pad = (s) => { const [m, d, y] = s.split("/"); return `${String(m).padStart(2, "0")}/${String(d).padStart(2, "0")}/${y}`; };
+
+test("reconcile: an approved-YESTERDAY signature date AGREES with today shown on the page", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: _pad(SIG_TODAY) })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "the replay writes today on purpose — not a contradiction");
+  assert.strictEqual(r.agree[0].tier, "keyed", "must be the keyed compare, not value-presence");
+});
+
+test("reconcile: a signature date showing some OTHER day still DISAGREES", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: "01/02/2020" })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 1, "a page date that is not today is still a real contradiction");
+});
+
+test("reconcile: a NON-signature date is still held to the APPROVED value", () => {
+  const ok = reconcileReviewPage(
+    [rrec({ label: "Start Date", key: "startDate", value: _pad(SIG_YESTERDAY) })],
+    [entry({ question_label: "Start Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-startDate" })]
+  );
+  assert.strictEqual(ok.counts.disagree, 0, "a start date matching its approved value agrees");
+  const bad = reconcileReviewPage(
+    [rrec({ label: "Start Date", key: "startDate", value: _pad(SIG_TODAY) })],
+    [entry({ question_label: "Start Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-startDate" })]
+  );
+  assert.strictEqual(bad.counts.disagree, 1, "a start date silently changed to today IS a contradiction");
+});

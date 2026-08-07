@@ -1138,7 +1138,21 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     const cv = e.current_value;
     if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
     if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
-    const wt = e.widget_type, cvs = String(cv), nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
+    // A SIGNATURE date is compared against TODAY, because that is what the replay WRITES (2026-08-07).
+    // replayField re-derives it rather than replaying the stored literal — Workday rejects the page
+    // outright with "Enter today's date" otherwise — so an approved bundle signed yesterday would then
+    // reconcile its own correct behaviour as a contradiction and BLOCK the submit:
+    //   ≠ "Date*": approved "8/6/2026" but the page shows "08/07/2026"     (live, waystar.wd1)
+    // Comparing to today keeps the check strict: a page showing any date OTHER than today still
+    // disagrees. Narrow by construction (isSignatureDateQuestion rejects start/birth/graduation/
+    // expiry/from/to), so a real date question is still held to the approved value.
+    const wt = e.widget_type;
+    let cvs = String(cv);
+    if ((wt === "date" || wt === "text") && isSignatureDateQuestion(e.question_label)) {
+      const t = new Date();
+      cvs = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
+    }
+    const nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
     const base = { label: e.question_label != null ? e.question_label : null, value_bundle: cvs,
                    field_id: e.field_id != null ? e.field_id : null, widget_type: wt != null ? wt : null,
                    canonical_field: e.canonical_field != null ? e.canonical_field : null,
