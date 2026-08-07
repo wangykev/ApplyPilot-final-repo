@@ -8,6 +8,11 @@ description: How to live-test a real application end to end (fill -> review -> a
 Unit tests prove the logic; only a live run proves the product. This is how to do one without
 producing a false result — and most of it exists because a false result was produced that way.
 
+**This page describes the WORKDAY pipeline** (onboarding → the N-page walk → the replay). Greenhouse,
+Lever and Ashby are a different shape — one page, no login, no draft, a submit run that refills a
+blank form rather than resuming one — with their own dev loop and their own hard-won debugging rules.
+For those, read the **`ats-tenants`** skill. The never-submit invariant below is shared.
+
 ## THE INVARIANT: nothing is ever submitted
 
 Every run in this doc is a FILL (stops at Workday's review page) or a REHEARSAL (`arm:false` — runs
