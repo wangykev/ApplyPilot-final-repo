@@ -3410,3 +3410,57 @@ visible** on the same scrape, so the non-painting problem is already handled by 
 Earlier page-level hidden/visible gaps were LLM latency variance (1.0s–10.0s across today's runs), not paint.
 
 Extension 1099/1099.
+
+## 2026-08-07 — fresh-account regression + expansion sweep: two onboarding blockers fixed, 4 tenants to the gate
+
+A regression + expansion sweep on a **brand-new tester alias** (`tester+30@gmail.com`), chosen so no
+tenant would have a pre-existing account. That turned out to be the point: every failure this sweep was
+in the ACCOUNT-CREATION path, which the previous scoreboard had never exercised — its tenants all had
+accounts already. Two real blockers, both the same shape, both now fixed.
+
+**1. Stage 2 (Apply Manually) had no activation ladder.** Stage 1 (the Apply click) got one on
+2026-08-06 because "the coordinate click can report success and still not register". Stage 2 clicked
+once, waited the full render budget, and gave up. Live on `radiancetech.wd12` AND `magna.wd3`: the click
+reported success, the chooser never moved for 45s, and the applyStage loop re-issued the IDENTICAL click
+two more rounds before halting `backToApply` — ~135s to fail, on a page whose Apply Manually is a plain
+`<a href>` that navigates fine when activated in-page. The stuck page is diagnosable: every read logged
+`markers [adventureButton, applyManually, useMyLastApplication]`, and a cleanly-loaded chooser does NOT
+carry `adventureButton` — the two are mutually exclusive on any healthy page, so together they mean the
+SPA swapped views without tearing the old one down. Stage 2 now mirrors Stage 1 (4s → focus+Enter →
+in-page activation → render budget), plus a shortcut when the pure `applyChainStuckMixed` recognises that
+state. Unit-pinned, and verified to discriminate: the naive marker-only check fails the guard test.
+
+**2. The account-creation consent tick was a single blind coordinate click.** It measured the label, fired
+one click, logged whatever it then found, and carried on. When the click missed, the box stayed unchecked,
+Create Account could not submit, and the auth loop spent **~12 minutes** re-clicking a button that was
+never going to fire. Diagnosed on the live page rather than guessed: the input is `opacity:0` with a 56×20
+"I agree" `<label for>`, the finder resolves it correctly, and `elementFromPoint` at the computed centre
+returns that very label — so the rect was right when MEASURED and wrong when USED. **A stale rect**: read
+one CDP round-trip before the click was dispatched (~1.2–1.5s hidden), while the just-filled password
+fields' requirement list reflows the label out from under it. Exactly the lesson `clickPageNext` learned on
+2026-07-25. Now: re-measure before every attempt, re-read `checked` after every attempt, escalate to
+in-page native label activation. It NEVER halts (operator's call) — if everything fails it says so and lets
+the submit report the failure. Live log: `consent checkbox — checked via in-page label activation (the
+coordinate click was not registering)`.
+
+**3. Diagnostic — the auth page's own error is now logged.** "Create Account submit: no outcome after 20s
+and the form is still up" read identically whether the click never registered or Workday rejected the
+submission, which cost a round. `cdpOnboardScan` now collects up to 6 short RENDERED leaf-ish error nodes
+into `authErrors`, and `describeState` appends `pageErrors=[...]` to the dump it already prints.
+
+**Results.** `itron.wd5` (NEW) and `magna.wd3` (path-hosted) reached **SUBMIT GATE PASSED** hidden, on a
+fresh account, nothing submitted. `waystar.wd1`, `cat.wd5` and `radiancetech.wd12` (NEW) all reached the
+REVIEW page. Extension **1104/1104**.
+
+**The dominant remaining blocker is the self-ID disability checkbox group**, now reproduced on THREE
+tenants (waystar, radiancetech, and itron on a second pass into the saved application). Two distinct
+shapes: waystar's bundle HAS the entry and the replay cannot make it stick (`asked for [No, I do not have
+a disability…] and it holds []`), while radiancetech/itron报 `the approved bundle has no entry for [Please
+check one of the boxes below] on this page`. Consistent with the traced note that Workday does not persist
+some self-ID answers across re-entry.
+
+**Two testing facts worth keeping.** (a) Email auto-verify can never work with a `tester+NN@gmail.com`
+alias — the connected mailbox is `wangykev@gmail.com`, so `tester+NN` is a DIFFERENT inbox; an
+email-verify tenant needs `wangykev+NN@gmail.com`. This silently blocked `analogdevices.wd1` and
+`jabil.wd5`. (b) Polling the localhost tab with `javascript_tool` ACTIVATES it, so a run launched
+`background:false` logs `tab HIDDEN` — a "visible" run must be left alone while it works.
