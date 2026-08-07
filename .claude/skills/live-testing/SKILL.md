@@ -43,6 +43,15 @@ variance swamps most page-level timing comparisons, so never conclude from a sin
 the read, not the run). If the MCP tab group flips to a Chrome profile with no `applypilot.extensionId` in
 localStorage, run `switch_browser` and have the operator reconnect.
 
+**Two traps this session cost real time:**
+- **A 91-second LLM call.** `llm.js` had no request timeout, so one stalled fetch dragged a page fill from
+  ~10s to 100.1s. Now capped at 20s (`LLM_REQUEST_TIMEOUT_MS`). If a page suddenly takes ~100s, check the
+  `[LLM] ok in …ms` lines FIRST — every other call that run was 0.4–1.5s.
+- **Re-running one requisition.** Three runs on the same nvidia req produced a page-2 block naming four
+  required-and-empty work-experience fields that the DOM plainly showed filled. A FRESH req sailed through
+  with zero errors. Prefer a new requisition over re-running one; if you must re-run, expect Workday's
+  accumulated state and do not read it as a code failure.
+
 **Burned fixtures:** `waystar R3132` now returns ALREADY APPLIED (~8 runs). Many waystar drafts exist under
 `tester+12@gmail.com`. Start a fresh tester rather than adding to that pile.
 
@@ -523,7 +532,7 @@ compare. Always check WHICH path your fixture exercises, not just the verdict.
 | Tenant | State |
 |---|---|
 | `itron.wd5` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account created this run |
-| `nvidia.wd5` (NEW) | fill verified live 2026-08-07 — REVIEW after 5 pages, twice; needed the required-dropdown backstop. A 3rd run on the SAME application hit an orphan empty work-experience row (accumulated state, not a regression) |
+| `nvidia.wd5` (NEW) | **verified live 2026-08-07** — `AGREE 47 · DISAGREE 0` → `SUBMIT GATE PASSED` on rehearsals #1 AND #2. Needed the required-dropdown backstop (its Phone Device Type offers only Home / Home Cellular, no "Mobile"). Page fills hidden: 11.7 · 17.1 · 2.9 · 3.4 · 6.8s |
 | `analogdevices.wd1` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED` on rehearsals #1, #3, #4; #2 is what caught the colon bug |
 | `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
 | `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
