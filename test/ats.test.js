@@ -1150,37 +1150,31 @@ test("AI choice prefetch: a decision is DISCARDED when the live options differ f
   assert.ok(calls >= 1, "the question is asked against the LIVE list");
 });
 
-test("location: no places library ⇒ no places wait, and the answer is still surfaced honestly", async () => {
-  // Greenhouse's candidate-location cost 10.6s on Coinbase waiting for google.maps.places, which never
-  // loads in this browser — a human gets no suggestions either. Absence is now detected, not timed out.
-  let polls = 0, probed = false;
-  const mk = (placesPresent) => fakeAct({
+test("location: a Greenhouse suggestion list is waited for, whatever google.maps says", async () => {
+  // Traced live 2026-08-06 on Reddit: `google.maps` is absent and no maps script is ever requested,
+  // yet typing "Tallahassee" returns "Tallahassee, Florida, United States" from GREENHOUSE'S OWN
+  // service. A probe I added the day before skipped the wait whenever google.maps was missing, which
+  // was every Greenhouse form — manufacturing "suggestions never loaded" on a widget that works.
+  let typed = null, committed = null;
+  const act = fakeAct({
     atsInjScan: () => ({
-      ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
       fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
     }),
-    atsInjPlacesReady: () => { probed = true; return { ok: true, places: placesPresent }; },
+    atsInjPlacesReady: () => ({ ok: true, places: false }),   // no google.maps — must NOT matter
     atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
-    atsInjReadOptions: () => { polls++; return { ok: true, open: true, options: [] }; },
-    atsInjTypeInCombo: () => ({ ok: true }),
-    atsInjReadComboInput: () => ({ ok: true, value: "Tallahassee" }),
+    atsInjReadOptions: () => ({ ok: true, open: true, loading: false,
+      options: (typed ? ["Tallahassee, Florida, United States", "Tallahassee, Georgia, United States"] : []).map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
     atsInjCloseCombo: () => ({ ok: true }),
-    atsInjReadValue: () => ({ ok: true, value: "Tallahassee, Florida" }),
   });
-
-  const t0 = Date.now();
-  const out = await ats.driveAtsPageFill(mk(false), "greenhouse", PROFILE, {}, {}, {});
-  const withoutPlaces = Date.now() - t0;
-  assert.ok(probed, "the page must be asked whether the library is there");
-  // the field still reaches review with the profile's own value in the box — never silently blank
-  assert.strictEqual(out.results[0].status, "needs_review");
-  assert.match(String(out.results[0].detail), /places/i);
-
-  polls = 0;
-  const t1 = Date.now();
-  await ats.driveAtsPageFill(mk(true), "greenhouse", PROFILE, {}, {}, {});
-  const withPlaces = Date.now() - t1;
-  assert.ok(withPlaces > withoutPlaces, `a REAL places widget still gets its budget (with ${withPlaces}ms vs without ${withoutPlaces}ms)`);
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(typed, "Tallahassee", "asked by city");
+  assert.strictEqual(committed, "Tallahassee, Florida, United States", "the city+state suggestion is picked");
+  assert.notStrictEqual(out.results[0].status, "needs_review", "a working widget must not be reported broken: " + out.results[0].detail);
 });
 
 test("location: a bucket-supplied city still matches the widget's own suggestion, and nothing is discarded", async () => {

@@ -1994,15 +1994,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const preOpts = optsOf(read);
     const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
     if (wt === "location" && !locIsPickOne) {
-      // A places widget with no places library will never answer — do not spend the budget proving it
-      // (Greenhouse `candidate-location`: 10.6s on Coinbase, and a human sees "Loading…" forever).
-      let placesReady = true;
-      if (ats === "greenhouse") {
-        try { const pr = await act.eval(atsInjPlacesReady); placesReady = !pr || pr.places !== false; } catch (e) { placesReady = true; }
-      }
+      // ⚠ DO NOT GATE THIS ON google.maps. I added such a probe on 2026-08-05 ("don't wait for a
+      // service that cannot answer") on the strength of an older note calling this box places-backed.
+      // It is NOT: traced 2026-08-06 on Reddit, `google.maps` is absent and no maps script is ever
+      // requested, yet typing "Tallahassee" returns "Tallahassee, Florida, United States" from
+      // GREENHOUSE'S OWN service in react-select's normal listbox. The probe therefore skipped the wait
+      // on every Greenhouse location field and manufactured "suggestions never loaded" — a regression
+      // that read exactly like the environment problem the note described. The general poll already
+      // bounds this wait (loading gate + per-field budget), so it needs no special case.
       await typeInto(String(candidates[0]).split(",")[0]);
-      read = placesReady ? await pollFor(6000, (t) => t.length > 0) : null; // places lookup — real network time
-      if (!placesReady) { try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName}: this form's places library never loaded — not waiting on suggestions`); } catch (e) {} }
+      read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
     } else if (!hasHit(optsOf(read))) {
       // SEARCH BY NAME: types each candidate (most-specific first) and polls FOR THE HIT.
       // ONE search attempt (the most-specific candidate). Two attempts doubled the worst-case
