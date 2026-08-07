@@ -3546,3 +3546,66 @@ Lever: Shield AI, gopuff, Zoox, Spotify. Ashby: Notion, Cohere, Sierra, ElevenLa
 
 Suite 1088/1088. New skill: `.claude/skills/ats-tenants/` — the ATS dev loop and the debugging rules,
 each of which was paid for with a wrong conclusion.
+
+### 2026-08-07 (later) — a second sweep, and four more bugs
+
+Driven by the operator's question "are all the typeaheads reconned with every option?" — which was
+worth asking, because the answer was no, for a reason nobody had looked at.
+
+**Does the ATS path need a scroll accumulator? No — and now it is measured, not assumed.** Traced in
+the live DOM: Greenhouse's dial `country` holds all **244** entries ("Zimbabwe+263" last) and
+`discipline--0` all **72**, unchanged after scrolling to the bottom; `degree--0` 10, EEO selects 3
+and 8. Ashby's location combobox opens with **0** options and returns 5 after typing "Pitt" — purely
+server-backed, nothing below the fold. Lever renders 4 native `<select>`s and no combobox at all.
+Plain react-select puts every option in the menu DOM and CSS-clips it; none of these uses a windowed
+list. Workday's `cdpScrapeTaOptions` exists because ITS picker is genuinely virtualized — a real
+substrate difference, not a gap in the port.
+
+- **A partial option list is one we TYPED for, not one that is long.** `atsAttachOptions` called any
+  list of >= 60 partial, stored 60 and printed "not the full list" — so 244 countries reached review
+  as a truncated picker with a note denying what we held. Provenance replaces length: a menu read on
+  open is the whole list however long, anything reached by typing is a view of it. The flag is never
+  cleared, deliberately — clearing the query restores the whole list on a static widget but only page
+  one on a server-backed one, and those are indistinguishable from inside the code. That is what
+  keeps the paged-school guard intact (my first attempt cleared it and the regression test caught it).
+- **The WHY now travels with the list.** `optionsPartial` was set and never read, so the website
+  re-derived partialness from `captured_options.length > 2` — and a server-backed field whose search
+  returned one or two rows, the case that most needs explaining, got no explanation. It rides the
+  bundle as `options_partial`.
+- **A protected characteristic can be asked without naming the dimension.** Chime words its gender
+  question "I identify as:" — no "gender", no "sex" — so an AI-guessed protected characteristic wore
+  the ordinary `ai-choice` badge while the field directly below it ("I identify my sexual orientation
+  as:") got the loud one. The self-identification frame counts on its own now.
+- **The posting settle has to be asked over CDP.** Introduced by the install-before-navigate change:
+  it reused `waitJobPageSettled`, which reads through host-gated `chrome.scripting`, and the ATS hosts
+  are deliberately absent from `host_permissions`. Every ATS run failed on its first read
+  ("Cannot access contents of url") and logged a settle that never happened. Over CDP: Lever now
+  reports `posting settled after 1245ms — 5697 chars`.
+- **A closed posting says so.** Twilio and Binance both halted "form-not-rendered … open the tab and
+  check", sending the operator to debug a fill on a job that no longer exists. Lever answers a removed
+  posting with the title "Not found"; Greenhouse REDIRECTS to the board index, dropping the job id
+  from the URL. `atsPostingGone` reads both and the halt is now `posting-gone`.
+
+**Environment trap worth recording.** Two web-side fixes appeared not to work because **port 3000 was
+being served by a DIFFERENT worktree** (`multi-ats`), so this worktree's `web/` was never executing.
+The extension is loaded unpacked from here, which is why every extension change took effect and only
+the web ones seemed inert — a very confusing signature. This worktree now runs on **3200**
+(`NEXT_PUBLIC_SITE_URL` in its gitignored `.env.local`). Also: `AP_SET_SESSION` now logs the HOST it
+will report to, because a stale ingest credential is the most common way a healthy fill misses the
+tracker and it was completely silent.
+
+**Housekeeping:** the extension opens a tab per run and nothing closed them — 33 had accumulated and
+were wedging the browser. `AP_DEV_CLOSE_TABS {urlContains}` per ATS host, after each run, and never
+while one is in flight.
+
+**Measured latency, for the next pacing round:** Ashby's location combobox is the slowest field in the
+pipeline and it is the WIDGET, not our visibility handling — Speak filled it in 9.6s visible vs 11.8s
+hidden, so only ~2s is the trusted wake.
+
+### Verified end to end — 21 tenants
+
+Greenhouse: GitLab, Coinbase (employer-hosted), Reddit, Discord, Duolingo, Flexport, Gusto, Roblox,
+Chime. Lever: Shield AI, gopuff, Zoox, Spotify, Sonatype. Ashby: Notion, Cohere, Sierra, ElevenLabs,
+Linear, Speak, OpenEvidence.
+
+Also filled clean but not yet through the gate: Veeva, Runway, Mem0, Slingshot AI. Suite 1090/1090.

@@ -3385,3 +3385,40 @@ same ATS, two forms an hour apart: the full-state spelling HIT in 2203ms and com
 abbreviation returned nothing across a 17.5s budget. Neither spelling is canonical — the profile
 stores whichever the operator typed — so the query is the city alone and the state is enforced at the
 pick instead (`atsPlacePick`).
+
+## 2026-08-07 (later) — are ATS option menus virtualized? Measured: no
+
+Asked because Workday's picker is, and the ATS path has no scroll accumulator. Each menu was opened
+in the live DOM, its `[role=option]` counted, scrolled to the bottom with a dispatched `scroll` event,
+and counted again.
+
+| widget | on open | after scrolling to the bottom |
+|---|---|---|
+| GH `country` (phone dial composite) | **244**, last "Zimbabwe+263" | 244 |
+| GH `discipline--0` | **72**, last "Veterinary Medicine" | 72 |
+| GH `degree--0` | 10, last "Other" | 10 |
+| GH EEO gender / race | 3 / 8 | 3 / 8 |
+| Ashby location combobox | **0** | 5 after typing "Pitt" |
+| Lever | no combobox at all — 4 native `<select>` | n/a |
+
+Plain react-select renders every filtered option into the menu DOM and CSS-clips it; a windowed menu
+(`react-window` / `WindowedMenuList`) would mount only a slice, and none of these does. So a single
+`querySelectorAll` over the open menu already reads the whole list, and **no scroll accumulator is
+needed on this substrate** — the difference from Workday is real, not an oversight in the port.
+
+⚠ Two consequences worth keeping:
+- The long lists are COMPLETE, so treating >= 60 options as "one page" was throwing away options we
+  had already read (see progress-log).
+- Ashby's location box is genuinely server-backed: empty on open, answers only what you type. It can
+  never be enumerated by scrolling, which is why it carries a note in review instead.
+
+**Ashby "Location" can be a COUNTRY box.** ElevenLabs pairs the label with the description
+*"Country you're currently residing in"* and its service answers country queries only.
+
+**Chime words its GENDER question "I identify as:"** — no dimension word anywhere in the label, while
+the field directly below it reads "I identify my sexual orientation as:". A demographic detector keyed
+only on dimension names splits those two apart.
+
+**A removed posting is visible before you look for a form.** Lever serves the title `Not found`;
+Greenhouse 302s to the company board index (title `Current openings at <Company>`), dropping the job
+id from the URL.
