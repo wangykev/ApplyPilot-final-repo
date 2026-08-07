@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-eeo-selfid";
+const AP_BUILD = "2026-08-07-posting-settle";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -3918,6 +3918,39 @@ function makeAtsActuation(llmConfig) {
 // FILL run: posting → form → fill → review bundle → website. NEVER submits — there is no
 // page-advance click on these single-page forms at all; the only submit-capable click
 // lives in runAtsSubmitRun behind authorize+arm.
+// The posting-page settle for an ATS run, asked over CDP. waitJobPageSettled reads through
+// chrome.scripting, which is HOST-GATED — and greenhouse/lever/ashby are deliberately NOT in
+// host_permissions (this pipeline drives them through the debugger instead, which is the whole
+// reason it needs no new permissions). So on every ATS run it failed on its first read with
+// "read-failed: Cannot access contents of url", logged a settle that never happened, and left the JD
+// scrape reading whatever had rendered by then. We are already attached here, so ask that way.
+//
+// `hasPosting` is reported false on purpose: it keys off Workday's own automation-ids, so claiming it
+// here would be a lie that shortcuts the accept rule. Without it the shared, unit-pinned
+// jobPageSettleStep requires THREE equal non-zero reads instead — the honest path for a page whose
+// content we cannot positively identify.
+async function waitAtsPostingSettled(ceilingMs = 8000, intervalMs = 300) {
+  const t0 = Date.now();
+  const deadline = t0 + ceilingMs;
+  let state = null, last = null;
+  while (Date.now() < deadline) {
+    await cdpDelay(intervalMs);
+    let s = null;
+    try {
+      s = await cdpEval(function () {
+        return { len: ((document.body && document.body.innerText) || "").length, hasPosting: false, ready: document.readyState };
+      });
+    } catch (e) {
+      return { settled: false, reason: "read-failed:" + String((e && e.message) || e), chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
+    }
+    if (!s) continue;
+    last = s;
+    state = jobPageSettleStep(s, state);
+    if (state.accept) return { settled: true, chars: s.len, ready: s.ready, waitedMs: Date.now() - t0 };
+  }
+  return { settled: false, reason: "ceiling", chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
+}
+
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
   // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
@@ -3954,7 +3987,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         LOG(`opening the posting under our page overrides: ${startUrl}`);
         await cdpNavigate(startUrl);
         await waitTabComplete(tabId, 20000);
-        const settle = await waitJobPageSettled(tabId).catch(() => null);
+        const settle = await waitAtsPostingSettled().catch(() => null);
         if (settle) LOG(`posting ${settle.settled ? "settled" : "did NOT settle (" + settle.reason + ")"} after ${settle.waitedMs}ms — ${settle.chars} chars`);
       }
     }
