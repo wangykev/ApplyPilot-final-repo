@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "llmtimeout-1";
+const AP_BUILD_MARKER = "authwait-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6203,14 +6203,33 @@ async function runCdpOnboard(tabId, opts) {
     const start = Date.now();
     const ok0 = scanOk, fail0 = scanFail;
     let st = null, last = null; // `last` = the last SUCCESSFUL read (st can be null if the final read failed)
+    // ── A SLOW WAIT SELF-DIAGNOSES (2026-08-07) ──────────────────────────────────────────────────────
+    // The state dump only ever printed on TIMEOUT, so a wait that SUCCEEDED slowly was a black box:
+    // operator, on sign-in, "why does that take 8 seconds when the entire page probably loads in 4". The
+    // reads are fast (~62ms apart — `pace(500)` scales down when the tab is fast), so a long wait means
+    // the predicate genuinely stayed false, and the only question worth answering is WHICH PART of it.
+    // `describeState` already prints formFields + hasAuthEl + markers, which for the auth predicate IS
+    // both halves. So: dump progress once the wait passes PROGRESS_AFTER_MS, then every interval, and
+    // report the elapsed time when it finally matches. Silent on every fast wait, which is nearly all.
+    const PROGRESS_AFTER_MS = 2000, PROGRESS_EVERY_MS = 2000;
+    let lastProgressAt = 0;
     while (Date.now() - start < timeoutMs) {
       await pace(500);
       await cdpWakePage();
       st = await scan();
       if (st) last = st;
+      const waited = Date.now() - start;
+      if (st && waited >= PROGRESS_AFTER_MS && waited - lastProgressAt >= PROGRESS_EVERY_MS) {
+        lastProgressAt = waited;
+        LOG(`waitFor(${label}) still waiting at ${(waited / 1000).toFixed(1)}s — ${describeState(st)}`);
+      }
       if (!st) continue;
       if (await maybeRefresh(st)) { st = await scan(); if (st) last = st; if (!st) continue; }
-      if (pred(st)) return { matched: true, scan: st };
+      if (pred(st)) {
+        const took = Date.now() - start;
+        if (took >= PROGRESS_AFTER_MS) LOG(`waitFor(${label}) satisfied after ${(took / 1000).toFixed(1)}s.`);
+        return { matched: true, scan: st };
+      }
       // ── TERMINAL STATES: stop waiting for something that can NEVER arrive (audit, 2026-07-27). ──
       // Every predicate here waits for a page to BECOME something. On an already-applied page or a
       // maintenance page it never will, so each wait used to burn its full budget in turn — an
