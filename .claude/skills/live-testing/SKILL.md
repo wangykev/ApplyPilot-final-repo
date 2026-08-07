@@ -479,11 +479,22 @@ Workday-side ghost.
   RE-ENTRY. `analogdevices.wd1` passed rehearsal #1 and failed #2, deterministically — if you only ever
   rehearse once per tenant you will not see this. **Rehearse twice.**
 
-**Still open — a different shape on `waystar.wd1`.** There the INITIAL replay's own verify fails
-(`asked for [...] and it holds []`) and halts `replay-mismatch` before any error text exists, so the colon
-fix cannot reach it. That is an actuation failure on the checkbox group. Given that the Apply click and
-the consent tick both turned out to be coordinate clicks that silently did not register, try
-mechanism-escalation (in-page label activation) there first.
+**waystar's variant is also FIXED** — it was two more faults stacked on the same page:
+
+- **Synthetic CLICKS don't reach Workday's model on the self-ID page.** The tell is our read-back and
+  Workday disagreeing: `page 5 replay: … 0 FAILED` immediately followed by
+  `re-click fallback: error text present — a real validation block`. The whole page now goes TRUSTED on
+  the replay, clicks included. Result: force-re-fills 0, page 5 advances on the first Save.
+- **A signature date goes stale overnight.** `Error-Date "Enter today's date"` — the bundle was approved
+  08/06 and replayed 08/07. `replayField` now re-derives it, and `reconcileReviewPage` compares against
+  today to match (fixing only one half traded a nav-timeout for a submit block). **A one-day-old approval
+  is enough**, so any review not submitted the day it was filled hits this — test it deliberately by
+  approving one day and rehearsing the next.
+
+**A test-writing warning from this round.** The first draft of the reconcile tests passed for the WRONG
+reason: the fixture used the wrong argument shape, every row landed in `missing_on_review`, and "0
+disagreements" looked like success. They now assert `tier === "keyed"` to prove they reach the real
+compare. Always check WHICH path your fixture exercises, not just the verdict.
 
 ### Scoreboard as of 2026-08-07
 
@@ -493,7 +504,7 @@ mechanism-escalation (in-page label activation) there first.
 | `analogdevices.wd1` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED` on rehearsals #1, #3, #4; #2 is what caught the colon bug |
 | `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
 | `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
-| `waystar.wd1` | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
+| `waystar.wd1` | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, `AGREE 41 · DISAGREE 0`; needed all four self-ID fixes |
 | `cat.wd5` | fill verified live (REVIEW, 5 pages); rehearsal blocked page 1, no error text (stale draft) |
 | `analogdevices.wd1`, `jabil.wd5` | blocked on email verification — see the alias note above |
 | Aptiv, PSECU, clearesult, Home Depot | verified live (earlier sessions, pre-existing accounts) |
