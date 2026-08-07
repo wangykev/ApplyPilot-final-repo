@@ -1014,6 +1014,47 @@ const ATS_POLL = {
 // "Pittsburgh, Pennsylvania, United States" under the strict ladder, even though the widget offered it
 // (live 2026-08-06, Ashby/Cohere: five real suggestions, no hit, 17.5s spent).
 const ATS_LOCATION_LABEL_RE = /where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i;
+
+// A US STATE HAS TWO SPELLINGS AND A PLACES SERVICE KNOWS ONLY ONE (2026-08-07). Live on Ashby, the
+// same profile on two forms an hour apart: "Pittsburgh, Pennsylvania," HIT in 2.2s and committed,
+// while "Pittsburgh, PA" returned nothing for 17.5s and reached review as "the form's places service
+// didn't respond" — which is not what happened. The service answered fine; it had never heard of that
+// spelling. The profile stores whichever spelling the operator typed and a bucket can supply its own,
+// so neither can be canonical.
+//
+// So a places box is searched with the CITY ALONE, which every spelling agrees on. That is a looser
+// QUERY, and the comment on the search loop already notes a looser query never loosens the answer —
+// but only because the PICK stays strict, and picking "the first row containing the city" is not
+// strict when the city is Pittsburgh (PA, CA, TX) or Springfield. Filing against the wrong state at
+// the exact-normalized tier is precisely the silent-wrong-value failure this ladder exists to
+// prevent. Hence: prefer the row that also agrees on the STATE, in EITHER spelling; if we hold a
+// state and no row agrees, still answer, but at the flagged tier so a human sees it. Mirrors the
+// Lever location path, which has resolved city+state through REGION_ABBREV since 2026-08-02.
+function atsPlacePick(candidate, texts) {
+  const c = String(candidate == null ? "" : candidate);
+  const city = c.split(",")[0].trim().toLowerCase();
+  if (!city) return null;
+  const rows = (texts || []).map((t, i) => ({ t: String(t == null ? "" : t), i }))
+    .filter((r) => r.t.toLowerCase().includes(city));
+  if (!rows.length) return null;
+  const tierOf = (r) => (r.t.toLowerCase().startsWith(city) ? "exact-normalized" : "containment");
+
+  const abbrevOf = atsLib.REGION_ABBREV || {};                     // "pennsylvania" → "pa"
+  const nameOf = Object.create(null);
+  for (const k of Object.keys(abbrevOf)) nameOf[abbrevOf[k]] = k;  // "pa" → "pennsylvania"
+  const state = (c.split(",")[1] || "").trim().toLowerCase();
+  // whatever the profile gave us, plus its other spelling — deduped, empties dropped
+  const forms = [...new Set([state, abbrevOf[state], nameOf[state]].filter(Boolean))];
+  if (!forms.length) return { index: rows[0].i, tier: tierOf(rows[0]) };   // no state to check against
+
+  const agrees = (t) => forms.some((s) => (s.length === 2
+    ? new RegExp(",\\s*" + s + "\\b", "i").test(t)   // an abbrev must sit in its own segment
+    : t.toLowerCase().includes(s)));
+  const withState = rows.find((r) => agrees(r.t));
+  if (withState) return { index: withState.i, tier: tierOf(withState) };
+  // the city is offered, but never in the state we hold — a DIFFERENT place of the same name.
+  return { index: rows[0].i, tier: "containment", stateMismatch: true };
+}
 const ATS_LOC_PICKONE_MAX = 12;
 const ATS_OPTION_CAP = 60;
 // `partial` FORCES the partial treatment for a list we have already narrowed. Live 2026-08-04: a
@@ -2087,6 +2128,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // field that was answerable all along. A short list that is already showing IS the option set.
     const preOpts = optsOf(read);
     const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
+    // WHICH candidate the places list actually answered — the pick has to judge what we ASKED for.
+    // A country-shaped "Location" box answers the country tier, and judging those options against
+    // the city would find nothing and throw the answer away (see the fallback below).
+    let locCand = candidates && candidates.length ? String(candidates[0]) : "";
+    let locAlts = [];   // the non-city wordings offered to a country-shaped box (see below)
     if (wt === "location" && !locIsPickOne) {
       // ⚠ DO NOT GATE THIS ON google.maps. I added such a probe on 2026-08-05 ("don't wait for a
       // service that cannot answer") on the strength of an older note calling this box places-backed.
@@ -2103,6 +2149,31 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const city = String(candidates[0]).split(",")[0];
       if (!(await typeTrusted(city))) await typeInto(city);
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
+      // A BOX LABELLED "Location" IS NOT ALWAYS A CITY BOX (2026-08-07). ElevenLabs labels one
+      // "Location" and describes it "Country you're currently residing in" — a COUNTRY list, where
+      // "Pittsburgh" matches nothing. We typed the city, read an empty menu, and reported "the form's
+      // places service didn't respond" for 15s on a field that was answerable the whole time. Same
+      // shape as the GitLab pick-one lesson above: the label's guess loses to the live widget.
+      //
+      // So when the city finds nothing, walk the REMAINING candidates — the location rung already
+      // tiers the country behind the city for exactly this — and add the profile's country when a
+      // BUCKET routed here (buckets carry their own single value and know nothing of the ladder,
+      // which is how this field arrived with only "Pittsburgh, PA"). Costs nothing on a real places
+      // box: it found its city and never reaches this.
+      if (!optsOf(read).length) {
+        const alts = candidates.slice(1).map(String);
+        const pi = (profile && profile.personal_info) || {};
+        const rawCountry = Array.isArray(pi.country) ? pi.country : [pi.country];
+        for (const c of rawCountry) {
+          if (typeof c === "string" && c.trim() && !alts.some((a) => atsLib.normalize(a) === atsLib.normalize(c))) alts.push(c.trim());
+        }
+        locAlts = alts;
+        for (const alt of alts) {
+          await typeInto(alt);
+          read = await pollFor(ATS_POLL.search, (t) => t.length > 0, ATS_POLL.searchCeil);
+          if (optsOf(read).length) { locCand = alt; break; }   // the PICK must judge what we asked for
+        }
+      }
     } else if (!hasHit(optsOf(read)) && atsListIsComplete(read)) {
       // THE WHOLE LIST IS ALREADY ON SCREEN — do not type. Traced live 2026-08-06 on Discord's degree
       // box: opening it renders all 10 options, and typing the profile's own wording
@@ -2123,7 +2194,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // more broadly, and a long async list answers it faster ("Carnegie Mellon" resolves
         // where the full "Carnegie Mellon University" can come back empty). The MATCH is still
         // exact against whatever the widget returns — a looser query never loosens the answer.
-        const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
+        // A PLACES BOX IS SEARCHED WITH THE CITY, not the first two words: "Pittsburgh, PA" is a
+        // spelling a places service may never have heard of, while "Pittsburgh" is one they all
+        // know (see atsPlacePick, which keeps the PICK strict about the state). Everything else
+        // keeps the two-word prefix — it is what a human types, it matches more broadly, and a long
+        // async list answers it faster.
+        const query = (wt === "location" && !locIsPickOne && String(cand).includes(","))
+          ? String(cand).split(",")[0].trim()
+          : (String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand));
         // Wake the widget with a REAL interaction before searching. Greenhouse's async comboboxes
         // (school, degree, discipline, location) leave their fetch asleep — or firing but never
         // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
@@ -2244,9 +2322,27 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // places for the typed query; flag anything that isn't an exact city+state read).
       // A pick-one location widget skips this and goes through the ordinary match ladder, so its
       // options are matched as options — not scanned for a city that was never going to be there.
-      const city = String(candidates[0]).split(",")[0].trim().toLowerCase();
-      const idx = texts.findIndex((t) => t.toLowerCase().includes(city));
-      if (idx >= 0) hit = { index: idx, tier: texts[idx].toLowerCase().startsWith(city) ? "exact-normalized" : "containment" };
+      const pick = atsPlacePick(locCand || candidates[0], texts);
+      if (pick) {
+        hit = { index: pick.index, tier: pick.tier };
+        if (pick.stateMismatch) {
+          rec.flag = rec.flag || "location-state-mismatch";
+          rec.detail = (rec.detail ? rec.detail + "; " : "") +
+            "this form offers no " + JSON.stringify(String(locCand || candidates[0])) + " — picked " +
+            JSON.stringify(String(texts[pick.index])) + "; confirm the state";
+        }
+      }
+      // A COUNTRY-SHAPED BOX IS MATCHED AS A LIST, NOT AS A PLACE. Its answer comes from the country
+      // tier, whose profile wording is routinely LONGER than the option — live: candidates led with
+      // "United States of America" while the widget offered "United States", and the city-containment
+      // pick above cannot see that at all (it asks whether the option contains the city). The ordinary
+      // ladder normalizes and has the tiers for exactly this, and the profile stores the country as a
+      // LADDER for exactly this reason, so every wording we were willing to answer with is offered —
+      // not just the one that happened to make the menu render.
+      if (!hit && locAlts.length) {
+        const m = atsLib.matchCandidates(forMatch(locAlts), matchTexts, { containment: false });
+        if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
+      }
     } else {
       const m = atsLib.matchCandidates(forMatch(candidates), matchTexts, { containment: allowContainment });
       if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
@@ -2646,6 +2742,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
+    atsPlacePick, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,

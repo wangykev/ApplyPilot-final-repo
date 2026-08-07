@@ -1762,3 +1762,41 @@ test("checkbox: an ordinary consent is unchanged — required auto-checks, refus
   await ats.atsActuateField(act2, "ashby", f, { inputSel: "#c" }, rec2, ["No"], null, {}, {}, {});
   assert.strictEqual(rec2.status, "needs_review", "a required box the profile refuses is never auto-consented");
 });
+
+// ── a US state has two spellings, and a places service knows only one (live 2026-08-07) ────
+// Same profile, same ATS, two Ashby forms an hour apart: "Pittsburgh, Pennsylvania," committed in
+// 2.2s while "Pittsburgh, PA" returned nothing for 17.5s and reached review claiming the places
+// service hadn't responded. It had; it just didn't know that spelling. So the QUERY is now the city
+// alone — which every spelling agrees on — and the PICK carries the strictness instead.
+test("atsPlacePick: reaches past a same-named city to the state we actually hold, either spelling", () => {
+  const T = ["Pittsburgh, California, United States", "Pittsburgh, Pennsylvania, United States"];
+  assert.deepStrictEqual(ats.atsPlacePick("Pittsburgh, PA", T), { index: 1, tier: "exact-normalized" });
+  assert.deepStrictEqual(ats.atsPlacePick("Pittsburgh, Pennsylvania", T), { index: 1, tier: "exact-normalized" });
+  // REGION_ABBREV covers Canadian provinces, so they work identically — not an accident
+  assert.deepStrictEqual(ats.atsPlacePick("Toronto, ON", ["Toronto, Ontario, Canada"]), { index: 0, tier: "exact-normalized" });
+});
+
+test("atsPlacePick: a city offered ONLY in a state we do not hold is answered but FLAGGED", () => {
+  const T = ["Pittsburgh, California, United States", "Pittsburgh, Pennsylvania, United States"];
+  const r = ats.atsPlacePick("Pittsburgh, TX", T);
+  assert.strictEqual(r.tier, "containment", "a different place of the same name is never the exact tier");
+  assert.strictEqual(r.stateMismatch, true, "the human has to see this one");
+  // …and with no state to check against, the first city row stands as before
+  assert.deepStrictEqual(ats.atsPlacePick("Pittsburgh", T), { index: 0, tier: "exact-normalized" });
+  // a city that simply is not offered is NOT forced onto some other row
+  assert.strictEqual(ats.atsPlacePick("Austin, TX", T), null);
+  assert.strictEqual(ats.atsPlacePick("", T), null);
+});
+
+test("atsPlacePick: a state ABBREV must sit in its own segment, never match inside a word", () => {
+  // ", PA" must not be satisfied by "Palo Alto" or "Spain"; the guard is the segment boundary
+  const T = ["Springfield, Palo Alto County, United States", "Springfield, PA, United States"];
+  assert.deepStrictEqual(ats.atsPlacePick("Springfield, PA", T), { index: 1, tier: "exact-normalized" });
+});
+
+test("the location label is what gates the places path (a bucket routes before the map)", () => {
+  for (const l of ["Where are you currently located?", "Where are you currently based?", "Current location", "Location"]) {
+    assert.ok(ats.ATS_LOCATION_LABEL_RE.test(l), l + " should read as a location question");
+  }
+  assert.ok(!ats.ATS_LOCATION_LABEL_RE.test("Preferred work location policy"), "not every label with 'location' is a places box");
+});
