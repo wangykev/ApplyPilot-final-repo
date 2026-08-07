@@ -865,6 +865,23 @@ function atsInjPlacesReady() {
   } catch (e) { return { ok: true, places: false }; }
 }
 
+// Bring the field being filled into view. On a VISIBLE run the operator is watching, and a fill that
+// jumps around off-screen is impossible to follow or to trust (operator, 2026-08-06). It also gives a
+// hidden tab a reason to lay the element out, which is what the coordinate paths need — trustedFocus
+// already scrolls for exactly that reason, so this brings the ordinary path in line.
+// `block:"center"` rather than the default, so the field is not left tucked under a sticky header.
+function atsInjScrollIntoView(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, error: "not-found:" + sel };
+  try {
+    const target = el.closest("label, fieldset, .select__container, div") || el;
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+  } catch (e) {
+    try { el.scrollIntoView(); } catch (e2) { return { ok: false, error: String((e2 && e2.message) || e2) }; }
+  }
+  return { ok: true };
+}
+
 // Attach the resume: rebuild the File page-side (strings only across the boundary — the
 // attachResume lesson), set input.files via DataTransfer, dispatch change.
 function atsInjAttachFile(inputSel, base64, filename, mime) {
@@ -1600,6 +1617,8 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
     };
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
+    // show the operator what we are filling (see atsInjScrollIntoView) — best effort, never fatal
+    try { await act.eval(atsInjScrollIntoView, f.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
     // Per-field wall clock, so [ATS-TIME] can name what a slow fill actually spent its time on
     // (the Workday [CDP-TIME] habit). A record is finalized at several `continue`s below, so the
     // stamp is applied by `fin()` rather than at one exit.
@@ -2606,6 +2625,6 @@ if (typeof module !== "undefined" && module.exports) {
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
-    atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
+    atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };
 }
