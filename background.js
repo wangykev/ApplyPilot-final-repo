@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-scroll-into-view";
+const AP_BUILD = "2026-08-07-install-before-navigate";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -291,7 +291,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           try {
             const background = message.background === true;
             emitRunProgress("Opening the job posting", (background ? "in a background tab — " : "") + atsKind);
-            const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+            // BLANK on purpose: runAtsApplicationRun attaches, registers our page overrides, and only
+            // THEN navigates here to the posting — so the form's document starts with them rather than
+            // having them swapped in mid-life, which is what killed Greenhouse's async comboboxes.
+            const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: !background }, res));
             if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
             await waitTabComplete(tab.id, 20000);
             const res = await runAtsApplicationRun(tab.id, atsKind, store, startUrl);
@@ -774,7 +777,9 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           if (!detectAts(startUrl) && atsKind) LOG(`the URL names no ATS, but this application was filled by the ${atsKind} pipeline — using it`);
           if (atsKind && atsKind !== "workday") {
             emitRunProgress(arm ? "Submitting" : "Rehearsing", atsKind + " — " + (background ? "background tab" : "foreground tab"));
-            const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+            // BLANK for the same reason as the fill run: runAtsSubmitRun installs the overrides, then
+            // navigates to the form, so the replay drives a document that started with them.
+            const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: !background }, res));
             if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
             await waitTabComplete(tab.id, 20000);
             const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl });
@@ -3910,16 +3915,24 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
-    // ⚠ EXPERIMENT (2026-08-06): are OUR page overrides what stops Greenhouse's async comboboxes from
-    // ever resolving? By hand the school box answers in ~1s; under a fill it sits `loading` for 20s —
-    // and that holds with a VISIBLE, painting tab and with trusted click AND trusted keystrokes, so the
-    // remaining difference is what we do to the page at attach: setTimeout/rAF replaced by
-    // worker-backed timers, plus a CSP bypass. A react-select async debounce lives on setTimeout.
-    // chrome.storage.local.atsSkipOverrides skips them for ATS runs so the two can be compared.
+    // ⚠ OUR OVERRIDES BREAK A DOCUMENT THEY LAND ON MID-LIFE. Settled 2026-08-06: they replace
+    // setTimeout/setInterval/rAF (so a hidden tab's timers escape throttling), and Greenhouse's async
+    // react-selects schedule their search on exactly those. Installing them into an ALREADY-RUNNING
+    // document leaves the page half-native/half-ours, and those widgets never resolve again — the
+    // "dead form" whose only cure was a refresh. The operator spotted the shape of it first: opening
+    // the link from the website always broke location, copy-pasting the same link never did.
+    //
+    // The overrides still earn their place on a hidden tab, so the fix is not to drop them: it is to
+    // INSTALL THEM BEFORE THE DOCUMENT EXISTS. An ATS run opens its tab BLANK and navigates below, so
+    // the registration (Page.addScriptToEvaluateOnNewDocument) is in place before the posting is ever
+    // fetched and every document the run touches starts with it. That costs NOTHING — it is the same
+    // single navigation the run always made, just moved to after the install. A reload here would have
+    // worked too and was rejected for being a second page load. chrome.storage.local.atsSkipOverrides
+    // remains as a debug switch for comparing against no overrides at all.
     {
       const { atsSkipOverrides } = await new Promise((r) => chrome.storage.local.get("atsSkipOverrides", r));
       if (atsSkipOverrides) console.log("[ApplyPilot][CDP] page overrides SKIPPED for this ATS run (atsSkipOverrides)");
-      else await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
+      else await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
     }
     await cdpSetFocusEmulation(true).catch(() => {});
     // …and actually MAKE it render: focus emulation only changes what the page believes, while a
@@ -3927,6 +3940,20 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // frames rAF (and therefore every menu paint) waits on. Proven by the paint probe below.
     const forced = await cdpForceRender(true).catch(() => false);
     try { console.log(`[ApplyPilot][CDP] render forcing ${forced ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ }
+
+    // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
+    // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below
+    // re-enters this function on a tab it just navigated) skips this and keeps its own document.
+    {
+      const at = await cdpEval(function () { return location.href; }).catch(() => null);
+      if (!at || at === "about:blank" || at.startsWith("chrome://")) {
+        LOG(`opening the posting under our page overrides: ${startUrl}`);
+        await cdpNavigate(startUrl);
+        await waitTabComplete(tabId, 20000);
+        const settle = await waitJobPageSettled(tabId).catch(() => null);
+        if (settle) LOG(`posting ${settle.settled ? "settled" : "did NOT settle (" + settle.reason + ")"} after ${settle.waitedMs}ms — ${settle.chars} chars`);
+      }
+    }
 
     // JD scrape on the POSTING page (we may still be on it) before navigating away.
     emitRunProgress("Reading the job description");
