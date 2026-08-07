@@ -3464,3 +3464,51 @@ alias — the connected mailbox is `wangykev@gmail.com`, so `tester+NN` is a DIF
 email-verify tenant needs `wangykev+NN@gmail.com`. This silently blocked `analogdevices.wd1` and
 `jabil.wd5`. (b) Polling the localhost tab with `javascript_tool` ACTIVATES it, so a run launched
 `background:false` logs `tab HIDDEN` — a "visible" run must be left alone while it works.
+
+## 2026-08-07 (later) — the self-ID disability blocker was a COLON
+
+Same-day follow-up to the sweep above. The blocker that had been open across several sessions and was
+written up as *"the disability checkbox unchecks itself"* is a one-character string mismatch in OUR code.
+
+**What Workday does** (real, and not the bug): re-entering a SAVED application drops the disability
+answer, while its siblings on the same page keep theirs. The `[FIELD-DIAG]` dump says it plainly —
+`disabilityForm "English"* · name "Kevin Wang"* · employeeId "" · dateSignedOn "08/07/2026"* ·
+disabilityStatus ""*`. Consistent with the earlier `workday-selfid-not-persisted` trace.
+
+**What we did wrong**: `parseErrorFieldName` strips a trailing `:` off the name it extracts (its
+trailing-char class includes it); `normalizeLabel` strips only `*` and whitespace. So for a field whose
+visible label ENDS IN A COLON the two sides can never be equal:
+
+```
+error  "…The field Please check one of the boxes below is required" → "please check one of the boxes below"
+label  "Please check one of the boxes below:*"                      → "please check one of the boxes below:"
+```
+
+Every strict-equality error→field matcher therefore found nothing, on the one page where it mattered:
+the force-re-fill reported *"the approved bundle has no entry for [Please check one of the boxes below]"*
+and the phantom-required guard reported *"which match no field on this page"* — both while
+`disabilityStatus` sat right there, required, empty, with an approved value in the bundle. The walk
+halted having done nothing.
+
+**Reproduced deterministically, not inferred.** `analogdevices.wd1` passed rehearsal #1
+(`SUBMIT GATE PASSED`) and failed #2 with exactly this; `itron.wd5` did the same; `radiancetech.wd12`
+matches. That pass-then-fail pattern is the tell: the recovery path only runs once Workday has dropped
+the value, which only happens on a RE-ENTRY.
+
+**Fix**: `errorLabelKey` (lib.js, pure) — normalize, then strip any trailing run of `*`, `:`, `;`, `.`,
+`,` and dashes in any order — used by the three strict matchers (`phantomRequiredTargets`,
+`requiredBlankByLabel`, and the replay's force-re-fill site). Deliberately NOT folded into
+`normalizeLabel`, which is LOCKSTEP with the website's `normalizeQuestion` for answer-bucket matching;
+widening that would change which taught wordings match on both sides. Error→field matching is a
+different job, and a loose match there is already documented as safe.
+
+**Verified**: the identical rehearsal that failed twice now logs
+`page 5: FORCE-re-filling 1 error-named field(s) [disabilityStatus]` → `✅✅✅ SUBMIT GATE PASSED`, twice
+in a row. Unit-pinned on the VERBATIM live strings and verified to discriminate (reverting
+`errorLabelKey` to `normalizeLabel` fails 4 of the new tests). Extension **1110/1110**.
+
+**Still open — a DIFFERENT shape on waystar.wd1.** There the *initial* replay's own verify fails
+(`asked for [No, I do not have a disability…] and it holds []`) and halts `replay-mismatch` BEFORE any
+error text exists, so this fix cannot reach it. That is an actuation failure on the checkbox group, not
+an error-matching one, and it needs its own round — likely the same mechanism-escalation medicine the
+Apply and consent clicks just got.
