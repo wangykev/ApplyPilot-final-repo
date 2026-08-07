@@ -1890,3 +1890,33 @@ test("atsIsEeoLabel: the self-identification frame counts, dimension word or not
     "Identify the technologies you have used",
   ]) assert.ok(!ats.atsIsEeoLabel(l), l + " is NOT a demographic question");
 });
+
+// ── a closed posting is not a broken pipeline (live 2026-08-07) ──────────────────────────────
+// Twilio and Binance both halted "form-not-rendered ... open the tab and check", which sends the
+// operator to debug a fill on a job that no longer exists. Both said so before we looked for a form.
+test("atsPostingGone: names a dead posting, and stays silent on a healthy one", () => {
+  // Lever answers a removed posting with this exact title
+  assert.match(String(ats.atsPostingGone({ title: "Not found" },
+    "https://jobs.lever.co/binance/7deee48b-bc3a-454b-9224-953d3f65c244",
+    "https://jobs.lever.co/binance/7deee48b-bc3a-454b-9224-953d3f65c244/apply")), /Not found/);
+
+  // Greenhouse REDIRECTS a removed posting to the board index, dropping the job id
+  assert.ok(ats.atsPostingGone({ title: "Current openings at Twilio" },
+    "https://job-boards.greenhouse.io/twilio/jobs/7781659",
+    "https://job-boards.greenhouse.io/twilio"), "a board-index landing means the job is gone");
+
+  // …and the URL rule alone catches it even when the title is unhelpful
+  assert.match(String(ats.atsPostingGone({ title: "Careers" },
+    "https://job-boards.greenhouse.io/twilio/jobs/7781659", "https://job-boards.greenhouse.io/twilio")),
+    /7781659/);
+
+  // HEALTHY: the id survives the hop to /apply and /application, so nothing is claimed
+  for (const [req, land] of [
+    ["https://job-boards.greenhouse.io/discord/jobs/8649856002", "https://job-boards.greenhouse.io/discord/jobs/8649856002"],
+    ["https://jobs.lever.co/zoox/5fb23003-057f-4488-84c2-80ca98cc795d", "https://jobs.lever.co/zoox/5fb23003-057f-4488-84c2-80ca98cc795d/apply"],
+    ["https://jobs.ashbyhq.com/sierra/8152eaf6-012b-4154-95e2-7d6c52faba93", "https://jobs.ashbyhq.com/sierra/8152eaf6-012b-4154-95e2-7d6c52faba93/application"],
+  ]) assert.strictEqual(ats.atsPostingGone({ title: "Some Role" }, req, land), null, req);
+
+  // no evidence at all → no claim (a missing JD must not read as a dead posting)
+  assert.strictEqual(ats.atsPostingGone(null, "https://jobs.ashbyhq.com/x/abc", "https://jobs.ashbyhq.com/x/abc"), null);
+});

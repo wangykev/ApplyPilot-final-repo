@@ -1049,6 +1049,33 @@ const ATS_LOCATION_LABEL_RE = /where are you (currently )?(located|based)|curren
 // prevent. Hence: prefer the row that also agrees on the STATE, in EITHER spelling; if we hold a
 // state and no row agrees, still answer, but at the flagged tier so a human sees it. Mirrors the
 // Lever location path, which has resolved city+state through REGION_ABBREV since 2026-08-02.
+// A DEAD POSTING IS NOT A BROKEN PIPELINE (2026-08-07). Two runs in a row halted
+// "form-not-rendered ... open the tab and check", which sends the operator to debug the fill on a job
+// that simply no longer exists. Both said so plainly before we ever looked for a form: Lever answers
+// a removed posting with the title "Not found", and Greenhouse REDIRECTS to the company's board index
+// ("Current openings at Twilio"), dropping the job id from the URL on the way.
+//
+// The URL check is the general one and the title checks corroborate it — a posting we asked for by id
+// that we are no longer standing on is gone, whatever the page says. Returns a REASON to quote back,
+// or null when there is no evidence, because "I could not drive this form" and "this job is closed"
+// are different problems with different next steps.
+function atsPostingGone(jd, requestedUrl, landedUrl) {
+  const title = String((jd && jd.title) || "").trim();
+  if (/^(not found|404|page not found|job not found)$/i.test(title)) return 'the posting page reports "' + title + '"';
+  if (/^current openings at/i.test(title)) return 'it redirected to the board index ("' + title + '")';
+  const idOf = (u) => {
+    const t = String(u || "");
+    const m = /\/jobs?\/(\d{4,})/.exec(t) ||
+      /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(t);
+    return m ? m[1].toLowerCase() : null;
+  };
+  const want = idOf(requestedUrl);
+  if (want && landedUrl && !String(landedUrl).toLowerCase().includes(want)) {
+    return "the posting id " + want + " is no longer in the URL we landed on";
+  }
+  return null;
+}
+
 function atsPlacePick(candidate, texts) {
   const c = String(candidate == null ? "" : candidate);
   const city = c.split(",")[0].trim().toLowerCase();
@@ -2787,7 +2814,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
-    atsPlacePick, ATS_LOCATION_LABEL_RE,
+    atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,

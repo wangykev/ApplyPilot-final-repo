@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-posting-settle";
+const AP_BUILD = "2026-08-07-posting-gone";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -4121,6 +4121,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     }
     if (!ready.ready) {
       const hereX = await cdpEval(function () { return location.href; }).catch(() => null);
+      // CLOSED IS NOT BROKEN. Say which one it is — they have different next steps.
+      const gone = atsPostingGone(jd, originUrl || startUrl, hereX);
+      if (gone) {
+        LOG(`this posting is GONE — ${gone}`);
+        return { ok: true, needs_operator: true, stopped: "posting-gone", jd,
+          detail: "This job is no longer posted — " + gone + ". Nothing is wrong with the fill; pick another posting." };
+      }
       return { ok: true, needs_operator: true, stopped: "form-not-rendered",
         detail: "No " + ats + " application form rendered at " + (hereX || startUrl) + " and no apply link could be followed — open the tab and check, then re-run.", jd };
     }
