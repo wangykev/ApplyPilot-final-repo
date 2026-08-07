@@ -1090,30 +1090,34 @@ function atsListIsComplete(read) {
   return opts.length > 0 && opts.length < ATS_OPTION_CAP && !(read && read.loading);
 }
 
+// PARTIAL IS ABOUT PROVENANCE, NOT LENGTH (2026-08-07). This used to call any list of >= 60 partial,
+// which is the wrong test and threw away options we had already read: traced live on Discord, the
+// dial `country` menu holds all **244** entries in the DOM (…"Zimbabwe+263") and `discipline--0` all
+// **72**, unchanged after scrolling to the bottom — react-select renders every option and CSS-clips
+// it. We stored 60 of them and printed "not the full list", so review offered a truncated picker for
+// a field whose whole list was in hand. (Checked while confirming the ATS path needs no scroll
+// accumulator at all — unlike Workday's virtualized picker. Full survey: dom-patterns 2026-08-07.)
+//
+// The true rule: a list read on OPEN — nothing typed, not loading — IS the complete list, however
+// long. A list that only exists because we typed a query is a filtered view of it, and a
+// server-backed page (the 3300-school picker serving 100 at a time) is genuinely one page. Callers
+// pass that provenance; `undefined` means "read unfiltered", which is the common case.
+const ATS_OPTION_STORE_MAX = 400; // a complete list longer than this is stored truncated, and SAYS so
 function atsAttachOptions(rec, texts, partial) {
   const list = (texts || []).filter(Boolean);
   if (!list.length) return;
-  if (partial === true) {
-    rec.captured_options = list.slice(0, ATS_OPTION_CAP);
+  // ALWAYS set both: a later call refines an earlier one (the raw list first, then the
+  // neighbourhood of what we wanted), and a leftover from the first call would show the
+  // operator a STALE option set in review.
+  if (partial === true || list.length > ATS_OPTION_STORE_MAX) {
+    rec.captured_options = list.slice(0, ATS_OPTION_STORE_MAX);
     rec.options = null;
     rec.widgetType = "typeahead"; // review renders a filter-or-type editor + an honest partial note
     rec.optionsPartial = true;
     return;
   }
-  // >= not >: a virtualized widget commonly returns EXACTLY one page (live: 60 of ~2000
-  // schools), so an equality read is the partial case, not a complete list that happens to fit.
-  // ALWAYS set both: a later call refines an earlier one (the raw list first, then the
-  // neighbourhood of what we wanted), and a leftover from the first call would show the
-  // operator a STALE option set in review.
-  if (list.length >= ATS_OPTION_CAP) {
-    rec.captured_options = list.slice(0, ATS_OPTION_CAP);
-    rec.options = null;
-    rec.widgetType = "typeahead"; // review-rendering only; replay/audit read the LIVE widget
-    rec.optionsPartial = true;
-  } else {
-    rec.options = list;
-    rec.captured_options = null;
-  }
+  rec.options = list;
+  rec.captured_options = null;
 }
 
 const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_type vocabulary
@@ -2126,6 +2130,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
 
     let nearMatches = []; // what a by-name search turned up — the operator's real choices
     let didSearch = false; // a typed query leaves the menu FILTERED — see the commit below
+    // WHETHER WE EVER TYPED. That is the whole test for "is this the complete list": a menu read on
+    // OPEN is everything the widget has (244 countries, 72 disciplines — verified in the DOM), while
+    // anything we reached by typing is a view of it, and on a server-backed picker even the restored
+    // unfiltered list is just page one. Never cleared, deliberately — see the restore below.
+    let optionsFiltered = false;
     let listPending = false; // the widget was STILL fetching when we ran out of budget
     // Start the quiescence watch BEFORE the open click, so "has this subtree gone quiet?" has a
     // baseline by the time the poll needs it. Best effort: without it the poll falls back to
@@ -2226,7 +2235,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
         // `loading` for 19.2s and the location box showed nothing for 21.6s, while by hand each
         // answered in about a second. Once woken, ordinary synthetic typing drives them.
-        const typed = (await typeTrusted(query)) || (await typeInto(query)); didSearch = true;
+        const typed = (await typeTrusted(query)) || (await typeInto(query)); didSearch = true; optionsFiltered = true;
         const wantHit = (t) => t.length > 0 && hasHit(t);
         let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
@@ -2270,6 +2279,10 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
         await act.eval(atsInjTypeInCombo, ref.inputSel, "");
         const restored = await pollFor(ATS_POLL.restore, (t) => t.length > 0, ATS_POLL.restoreCeil);
+        // ⚠ this does NOT make the list complete again. Clearing the query restores the whole list on a
+        // STATIC widget, but only PAGE ONE on a server-backed one (100 of ~3300 schools), and the two
+        // are indistinguishable from here — no loading flag, no count that separates 244 countries
+        // from 100 schools. Once we have typed, the safe reading is "a view of the list", forever.
         if (optsOf(restored).length) read = restored;
       }
     }
@@ -2396,8 +2409,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         (near !== texts ? "; closest on this form: " + JSON.stringify(near.slice(0, 4)) : " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)));
       // …and if what we READ was only a page (or the search never answered), say so even after
       // narrowing — otherwise the 20 near-matches masquerade as the whole option set.
-      const unproven = listPending || texts.length >= ATS_OPTION_CAP;
-      atsAttachOptions(rec, near, unproven ? true : undefined);
+      // ABSENCE IS PROVABLE AGAINST A LIST WE READ IN FULL, however long it is. This used to treat
+      // any >= 60 read as one page, so a complete 244-option country menu was reported as a list that
+      // "serves one page at a time" — sending the operator to look for an option we had already
+      // proven absent. Now only a still-fetching widget, or a page-sized SEARCH result, is unproven.
+      const unproven = listPending || (optionsFiltered && texts.length >= ATS_OPTION_CAP);
+      // `near` is a narrowed neighbourhood when it differs from `texts` — partial by construction.
+      atsAttachOptions(rec, near, (unproven || optionsFiltered || near !== texts) ? true : undefined);
       // ABSENCE IS ONLY PROVABLE AGAINST A LIST THAT ANSWERED, IN FULL. This form serves 100 of
       // ~3300 schools per page and its search service is slow and erratic (2026-08-04: 390ms,
       // 4.0s, 4.5s, then >20s for the same kind of query), so "not in what we read" is not
@@ -2440,7 +2458,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const c = await act.eval(atsInjCommitOption, ref.inputSel, commitText);
     const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
-    atsAttachOptions(rec, texts);
+    atsAttachOptions(rec, texts, (optionsFiltered || listPending) ? true : undefined);
     const backNorm = atsLib.normalize(String(rec.after == null ? "" : rec.after));
     const wantNorm = atsLib.normalize(commitText);
     // the dial composite renders "+1" (flag+code), not the option text — value-based accept:

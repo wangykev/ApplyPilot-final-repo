@@ -503,24 +503,43 @@ test("driver: an AI pick that is not a live option still leaves the OPTIONS on t
 });
 
 // ── a TRUNCATED option list must not render as a pick-one <select> (live 2026-07-31) ─────
-test("atsAttachOptions: a complete list becomes options; a long one becomes captured_options + typeahead", () => {
+// PARTIAL IS PROVENANCE, NOT LENGTH (revised 2026-08-07). The caller says whether the list was
+// reached by TYPING; length alone was throwing away options we had already read — Discord's dial
+// `country` menu holds all 244 entries in the DOM and `discipline--0` all 72, so the old >= 60 rule
+// stored 60 of them and told the operator it was "not the full list".
+test("atsAttachOptions: a list read unfiltered is complete however long; a searched one is partial", () => {
   const short = { widgetType: "dropdown" };
   ats.atsAttachOptions(short, ["Yes", "No"]);
   assert.deepStrictEqual(short.options, ["Yes", "No"]);
   assert.strictEqual(short.widgetType, "dropdown", "a complete list stays a select");
   assert.ok(!short.captured_options);
 
-  const long = { widgetType: "dropdown" };
-  ats.atsAttachOptions(long, Array.from({ length: 2000 }, (_, i) => "School " + i));
-  assert.strictEqual(long.options, null, "a partial list must NOT masquerade as the full option set");
-  assert.strictEqual(long.captured_options.length, 60);
-  assert.strictEqual(long.widgetType, "typeahead", "review renders a type-to-filter editor + partial note");
-  assert.strictEqual(long.optionsPartial, true);
+  // 244 countries read on OPEN — the whole list, and review must get all of it
+  const countries = { widgetType: "dropdown" };
+  ats.atsAttachOptions(countries, Array.from({ length: 244 }, (_, i) => "Country " + i));
+  assert.strictEqual(countries.options.length, 244, "an unfiltered read is the complete list");
+  assert.strictEqual(countries.captured_options, null);
+  assert.strictEqual(countries.widgetType, "dropdown", "a complete list stays a pick-one");
+  assert.ok(!countries.optionsPartial);
 
-  // a widget that returns EXACTLY one page is the partial case too (live: 60 of ~2000 schools)
+  // the SAME length, reached by typing → a filtered view, and it must say so
+  const searched = { widgetType: "dropdown" };
+  ats.atsAttachOptions(searched, Array.from({ length: 244 }, (_, i) => "Country " + i), true);
+  assert.strictEqual(searched.options, null, "a partial list must NOT masquerade as the full option set");
+  assert.strictEqual(searched.widgetType, "typeahead", "review renders a type-to-filter editor + partial note");
+  assert.strictEqual(searched.optionsPartial, true);
+
+  // a page-sized read reached by typing is partial too (live: 100 of ~3300 schools)
   const exact = { widgetType: "dropdown" };
-  ats.atsAttachOptions(exact, Array.from({ length: 60 }, (_, i) => "S" + i));
-  assert.strictEqual(exact.widgetType, "typeahead", "a page-sized read is partial, not complete");
+  ats.atsAttachOptions(exact, Array.from({ length: 60 }, (_, i) => "S" + i), true);
+  assert.strictEqual(exact.widgetType, "typeahead", "a searched page is partial, not complete");
+
+  // …and a list too big to store is truncated, but SAYS it was — never silently
+  const huge = { widgetType: "dropdown" };
+  ats.atsAttachOptions(huge, Array.from({ length: 2000 }, (_, i) => "School " + i));
+  assert.strictEqual(huge.options, null);
+  assert.strictEqual(huge.captured_options.length, 400);
+  assert.strictEqual(huge.optionsPartial, true, "a truncated list must never claim to be complete");
 
   const none = { widgetType: "dropdown" };
   ats.atsAttachOptions(none, []);

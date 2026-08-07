@@ -69,6 +69,7 @@ export type ReviewEntry = {
   detail?: string | null;
   options?: string[] | null; // full list, plain dropdowns
   captured_options?: string[] | null; // partial filtered set, typeaheads
+  options_partial?: boolean | null;   // the FILL says these are a filtered view, not the whole list
   // checkbox_group: the AUTHORITATIVE selection, because a group can hold more than one (traced live
   // on PSECU's ethnicityMulti — two options checked, both saved). current_value stays the joined
   // display string so the blank tests / submit gate / review reconcile keep reading one value.

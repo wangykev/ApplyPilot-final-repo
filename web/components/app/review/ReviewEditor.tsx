@@ -1037,10 +1037,15 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
   const notes: ReactNode[] = [];
   const wt = e.widget_type;
   // partial-option note (typeahead/tree/radio-without-options)
+  // The FILL now says whether these options are a filtered view (options_partial). Older bundles
+  // don't carry it, so the length-based inference stays as the fallback — but its `> 2` threshold is
+  // gone: a server-backed search that came back with one or two rows is the case that most needs
+  // explaining, and it was the only one getting no explanation.
   const partial =
+    e.options_partial === true ||
     (e.tree_structure && Array.isArray(e.tree_structure.leaves) && e.tree_structure.leaves.length > 0) ||
     ((wt === "radio" || wt === "checkbox_group") && !(e.options && e.options.length)) ||
-    (wt === "typeahead" && !(e.options && e.options.length) && (e.captured_options?.length || 0) > 2);
+    (wt === "typeahead" && !(e.options && e.options.length) && (e.captured_options?.length || 0) > 0);
   const tier =
     (wt === "typeahead" && !(e.options && e.options.length) && (e.captured_options?.length || 0) <= 2) ||
     wt === "hierarchical";

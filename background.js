@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-grouped-controls";
+const AP_BUILD = "2026-08-07-credential-log";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -208,6 +208,14 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       },
       () => {
         const err = chrome.runtime.lastError;
+        // SAY WHEN THE CREDENTIAL CHANGES. Minting a key deletes the user's prior ones, so the
+        // extension's copy going stale is the single most common way a healthy fill fails to reach
+        // the tracker — and it was completely silent, which cost a lot of time this session working
+        // out whether a 401 meant "not synced", "synced elsewhere" or "rotated since". The HOST
+        // only: the key itself never goes near a log.
+        let host = "?";
+        try { host = new URL(message.ingestUrl || "").host || "?"; } catch (e) { /* keep "?" */ }
+        console.log(`[ApplyPilot] ingest credential set — reporting to ${host}${err ? " (STORE FAILED: " + err.message + ")" : ""}`);
         sendResponse(err ? { ok: false, error: err.message } : { ok: true });
       }
     );
