@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-06-trusted-typing";
+const AP_BUILD = "2026-08-06-overrides-experiment";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -540,6 +540,13 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // how a run is tailed without re-reading the whole buffer. `pattern` is a case-insensitive regex over
   // the line text (e.g. "CDP-TIME|HALT"), `limit` caps the reply (newest kept, `truncated` says so), and
   // `clear` empties the buffer after replying. Allowed DURING a run — watching a live walk is the point.
+  if (type === "AP_DEV_FLAG") {
+    // dev-only: flip a chrome.storage.local debug flag (atsSkipOverrides, forceWorkerTimersOff, …)
+    const key = String(message.key || "");
+    if (!/^(atsSkipOverrides|forceWorkerTimersOff|forceTrustedInput|forceRenderOff)$/.test(key)) { sendResponse({ ok: false, error: "unknown flag" }); return true; }
+    chrome.storage.local.set({ [key]: !!message.value }, () => sendResponse({ ok: true, key, value: !!message.value }));
+    return true;
+  }
   if (type === "AP_DEV_LOGS") {
     const sel = devLogSelect(apDevLog, { since: message.since, pattern: message.pattern, limit: message.limit });
     sendResponse({
@@ -3903,7 +3910,17 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
-    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
+    // ⚠ EXPERIMENT (2026-08-06): are OUR page overrides what stops Greenhouse's async comboboxes from
+    // ever resolving? By hand the school box answers in ~1s; under a fill it sits `loading` for 20s —
+    // and that holds with a VISIBLE, painting tab and with trusted click AND trusted keystrokes, so the
+    // remaining difference is what we do to the page at attach: setTimeout/rAF replaced by
+    // worker-backed timers, plus a CSP bypass. A react-select async debounce lives on setTimeout.
+    // chrome.storage.local.atsSkipOverrides skips them for ATS runs so the two can be compared.
+    {
+      const { atsSkipOverrides } = await new Promise((r) => chrome.storage.local.get("atsSkipOverrides", r));
+      if (atsSkipOverrides) console.log("[ApplyPilot][CDP] page overrides SKIPPED for this ATS run (atsSkipOverrides)");
+      else await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
+    }
     await cdpSetFocusEmulation(true).catch(() => {});
     // …and actually MAKE it render: focus emulation only changes what the page believes, while a
     // screencast puts the tab under capture, which is what keeps Chrome's compositor producing the
