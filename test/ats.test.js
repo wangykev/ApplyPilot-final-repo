@@ -1800,3 +1800,32 @@ test("the location label is what gates the places path (a bucket routes before t
   }
   assert.ok(!ats.ATS_LOCATION_LABEL_RE.test("Preferred work location policy"), "not every label with 'location' is a places box");
 });
+
+// ── the how-did-you-hear label tolerates an adverb (live 2026-08-07, Roblox) ─────────────────
+// "How did you FIRST hear about this role?" missed the rung, so a REQUIRED question the profile
+// answers exactly fell to the AI — which answered "LinkedIn", correctly, after an LLM call, then
+// flagged it ai-choice and parked it in review for a human to re-confirm what the profile said.
+test("router: how-did-you-hear matches the real wordings boards use, adverb or not", () => {
+  const hits = [
+    "How did you first hear about this role?",
+    "How did you hear about us?",
+    "How did you originally hear about this opportunity?",
+    "How did you find this job?",
+    "Where did you first hear about this position?",
+    "How do you hear about this role?",
+  ];
+  for (const l of hits) {
+    const r = ats.atsRouteLabel(l, {}, PROFILE, {});
+    assert.ok(r && r.path === "how_did_you_hear.preferred", l + " → " + JSON.stringify(r && r.path));
+    assert.deepStrictEqual(r.candidates, ["LinkedIn", "Handshake"], "the ladder is handed over in order");
+  }
+  // "How'd you hear about us?" too
+  assert.ok(ats.atsRouteLabel("How'd you hear about us?", {}, PROFILE, {}).path === "how_did_you_hear.preferred");
+  // …and it does not swallow unrelated questions that merely mention hearing or finding. The old
+  // wording ended at the verb, so the last one routed here and would have answered an interview
+  // question with "LinkedIn".
+  for (const l of ["What did you hear about our culture?", "How did you find working with your last team?"]) {
+    const r = ats.atsRouteLabel(l, {}, PROFILE, {});
+    assert.ok(!r || r.path !== "how_did_you_hear.preferred", l + " should NOT route to the source ladder");
+  }
+});

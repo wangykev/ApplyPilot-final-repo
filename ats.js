@@ -322,7 +322,17 @@ function atsRouteLabel(label, f, profile, defaults) {
   }
 
   // How-did-you-hear — the same ladder the Workday source picker uses.
-  if (/how did you (hear|find)|how'd you hear|where did you (hear|find)/i.test(L)) {
+  // ONE ADVERB IS ALLOWED IN THE MIDDLE (2026-08-07). Roblox asks "How did you FIRST hear about this
+  // role?" and the old wording missed it, so a REQUIRED question the profile answers exactly went to
+  // the AI, which answered "LinkedIn" — the right value, arrived at the expensive way, flagged
+  // ai-choice, and parked in review for a human to re-confirm something the profile already said.
+  // Same class as the boolean-ladder leak: a deterministic answer that the label match let slip.
+  // "how did you <word> hear/find" is idiomatic only for this question, so a single wildcard word is
+  // safe and generalizes past guessing at first/originally/initially one at a time.
+  // …and the verb must be followed by what the question is ABOUT. The old wording ended at the verb,
+  // so "How did you find working with your last team?" routed here too — it would have answered an
+  // interview question with "LinkedIn". Every real wording continues with about / of / this / us / our.
+  if (/(?:how|where)(?: did| do|'d) you (?:\w+ )?(?:hear|find)\s+(?:out\s+)?(?:about|of|this|us|our)\b/i.test(L)) {
     const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
     if (hdyh && Array.isArray(hdyh.preferred) && hdyh.preferred.length) return { candidates: [...hdyh.preferred], source: "map", path: "how_did_you_hear.preferred", detail: "how_did_you_hear.preferred" };
   }
