@@ -445,6 +445,42 @@ State what was observed, with the log line. Distinguish:
 Never report a tenant as working end to end without the `SUBMIT GATE PASSED` line from a run whose
 age you checked.
 
+### Fresh-account findings (2026-08-07) — read before starting one
+
+A fresh alias exercises the ACCOUNT-CREATION path, which the tenants on the scoreboard below never did
+(they all had accounts). Two blockers lived there and are now fixed; three facts remain:
+
+- **Email auto-verify CANNOT work with a `tester+NN@gmail.com` alias.** The connected mailbox is
+  `wangykev@gmail.com`, so `tester+NN` is a completely different inbox and the verification mail never
+  arrives. An email-verify tenant needs `wangykev+NN@gmail.com`. This silently cost two tenants
+  (`analogdevices.wd1`, `jabil.wd5`) — they sit in "polling Gmail… (up to 120s)" and then halt.
+- **Polling the localhost tab with `javascript_tool` ACTIVATES it**, so a run launched `background:false`
+  logs `tab HIDDEN` and you will mislabel it. To measure a genuinely visible run, fire it and then wait
+  WITHOUT touching Chrome (a backgrounded `sleep`), reading the log only afterwards.
+- **`window.__last` is as unreliable as the log ring.** An aborted run's promise resolves late and
+  overwrites it, so a result object can belong to a run you killed two tenants ago. Grade the TAIL against
+  a cursor, exactly as with log lines.
+
+**The dominant open blocker is the self-ID disability checkbox group** — reproduced on THREE tenants
+(waystar, radiancetech, and itron on a second pass into a saved application). Two shapes: the bundle HAS
+the entry and the replay can't make it stick (`asked for [...] and it holds []`), or `the approved bundle
+has no entry for [Please check one of the boxes below] on this page`. The fill passes; the REPLAY is where
+it bites, which fits the traced note that Workday doesn't persist some self-ID answers across re-entry.
+
+### Scoreboard as of 2026-08-07
+
+| Tenant | State |
+|---|---|
+| `itron.wd5` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account created this run |
+| `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
+| `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
+| `waystar.wd1` | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
+| `cat.wd5` | fill verified live (REVIEW, 5 pages); rehearsal blocked page 1, no error text (stale draft) |
+| `analogdevices.wd1`, `jabil.wd5` | blocked on email verification — see the alias note above |
+| Aptiv, PSECU, clearesult, Home Depot | verified live (earlier sessions, pre-existing accounts) |
+| `copart` | externally blocked (operator gate) |
+| `clearwater` | unresolved |
+
 ### Scoreboard as of 2026-08-06 — 7 of 10
 
 | Tenant | State |

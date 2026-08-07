@@ -3455,7 +3455,7 @@ REVIEW page. Extension **1104/1104**.
 **The dominant remaining blocker is the self-ID disability checkbox group**, now reproduced on THREE
 tenants (waystar, radiancetech, and itron on a second pass into the saved application). Two distinct
 shapes: waystar's bundle HAS the entry and the replay cannot make it stick (`asked for [No, I do not have
-a disability…] and it holds []`), while radiancetech/itron报 `the approved bundle has no entry for [Please
+a disability…] and it holds []`), while radiancetech/itron report `the approved bundle has no entry for [Please
 check one of the boxes below] on this page`. Consistent with the traced note that Workday does not persist
 some self-ID answers across re-entry.
 
