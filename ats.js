@@ -976,7 +976,11 @@ const ATS_POLL = {
   // answered a fresh query in 390ms, 4049ms, 4459ms and then >12s (a direct fetch of the same
   // query: HTTP 200 in 2971ms, no rate limiting). An 8s ceiling missed the bad end of that
   // spread, which is a REQUIRED field going unanswered — much more expensive than the wait.
-  search: 2000, searchCeil: 20000,
+  // A healthy search answers in ~1.3s (measured on Discord: "Loading..." → result, and
+  // "Loading..." → "No options" for a genuine miss). A widget still loading after this is the
+  // dead-form state, and the remedy is the page refresh the run now performs — so waiting longer only
+  // delays the fix. Was 20000, which cost ~20s per silent widget before the reload could help.
+  search: 2000, searchCeil: 6000,
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
@@ -1000,6 +1004,15 @@ const ATS_OPTION_CAP = 60;
 // short list — so review offered the operator a pick-one <select> of 20 schools that did not
 // include theirs, with no way to type the real one. Narrowing must never launder a paged list into
 // a complete one; the caller knows which it is.
+// Is what we read the WHOLE option set? A short, settled, non-loading list is complete: everything the
+// widget has is on screen, so a no-match is a real answer and typing could only filter it away. A
+// page-sized read (>= the cap) is a paged/server-backed list, where searching by name is the only way
+// to reach an option that was never rendered.
+function atsListIsComplete(read) {
+  const opts = ((read && read.options) || []).filter((o) => !o.disabled);
+  return opts.length > 0 && opts.length < ATS_OPTION_CAP && !(read && read.loading);
+}
+
 function atsAttachOptions(rec, texts, partial) {
   const list = (texts || []).filter(Boolean);
   if (!list.length) return;
@@ -2071,6 +2084,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const city = String(candidates[0]).split(",")[0];
       if (!(await typeTrusted(city))) await typeInto(city);
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
+    } else if (!hasHit(optsOf(read)) && atsListIsComplete(read)) {
+      // THE WHOLE LIST IS ALREADY ON SCREEN — do not type. Traced live 2026-08-06 on Discord's degree
+      // box: opening it renders all 10 options, and typing the profile's own wording
+      // ("Bachelor of Science") filters that list to "No options", because the widget matches the
+      // TYPED TEXT while the form's vocabulary is "Bachelor's Degree". Searching a complete list can
+      // only ever hide the answer — and the operator's rule for these forms is the same: recon the
+      // small typeaheads (degree, discipline), search only the ones too large to enumerate (school,
+      // location). The bridges below (degree level, assertion lead, polarity) then run against the
+      // FULL list rather than a filtered-to-nothing one.
+      try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName}: ${optsOf(read).length} option(s) read on open — matching the whole list, not searching it`); } catch (e) { /* log only */ }
     } else if (!hasHit(optsOf(read))) {
       // SEARCH BY NAME: types each candidate (most-specific first) and polls FOR THE HIT.
       // ONE search attempt (the most-specific candidate). Two attempts doubled the worst-case
@@ -2574,7 +2597,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,

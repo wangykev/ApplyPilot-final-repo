@@ -565,6 +565,11 @@ test("driver: on a LONG list the review options narrow to the near-matches; a sh
 // "Loading..." at 24ms, "Swarthmore College" at 4049ms. So the fill's flat 2s budget could never
 // have worked — and its retry made it worse by RE-TYPING, which restarts the widget's own
 // debounce and discards the search already in flight.
+// A PAGE of a long server-backed list — 100 rows, the way Greenhouse actually renders one. Fixtures
+// used to stand this in with a single row, which the driver now (correctly) reads as a COMPLETE list
+// and therefore does not search — so the stand-in has to look like the thing it stands for.
+const PAGE_OF_SCHOOLS = Array.from({ length: 100 }, (_, i) => "Aalborg University " + i);
+
 const SCHOOL_BUCKETS = [{ questions: ["School"], profile_path: "education.0.school_or_university" }];
 const SCHOOL_PROFILE = Object.assign({}, PROFILE, { education: [{ school_or_university: "Swarthmore College" }] });
 const SCHOOL_SCAN = {
@@ -584,7 +589,7 @@ test("driver: a list still LOADING is waited out, and the search is never restar
     atsInjReadComboInput: () => ({ ok: true, value: query }),
     atsInjReadOptions: () => {
       // page 1 of a 3300-school list: the value we want is NOT on it
-      if (!query) return { ok: true, open: true, options: [{ text: "Aalborg University" }], loading: false };
+      if (!query) return { ok: true, open: true, options: PAGE_OF_SCHOOLS.map((t) => ({ text: t })), loading: false };
       const answered = typedAt != null && Date.now() - typedAt >= ANSWER_MS;
       // …and while the server search runs, the widget shows an EMPTY menu ("No options")
       return { ok: true, open: true, options: answered ? [{ text: "Swarthmore College" }] : [], loading: !answered };
@@ -644,7 +649,7 @@ test("driver: a LOCAL list that rendered raggedly still gets its one re-type nud
       // never set: a client-side list has no fetch to report.
       atsInjReadOptions: () => {
         const nudged = typeCalls.filter((t) => t === "Swarthmore College").length >= 2;
-        if (!query) return { ok: true, open: true, options: [{ text: "Aalborg University" }] };
+        if (!query) return { ok: true, open: true, options: PAGE_OF_SCHOOLS.map((t) => ({ text: t })) };
         return { ok: true, open: true, options: nudged ? [{ text: "Swarthmore College" }] : [] };
       },
       atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
@@ -662,7 +667,7 @@ test("driver: the option a by-name search found is not cleared away before the c
   // clearing the query to 'unfilter' the menu throws away the very option we matched, and the
   // commit then fails option-not-found. Modelled exactly: the menu shows what the query matches,
   // and a click only lands on an option that is currently VISIBLE (as in the real DOM).
-  const PAGE1 = ["Aalborg University", "Abilene Christian University"];
+  const PAGE1 = PAGE_OF_SCHOOLS;
   const ALL = PAGE1.concat(["Swarthmore College"]);
   let query = "", committed = null;
   const visible = () => (query ? ALL.filter((s) => s.toLowerCase().startsWith(query.toLowerCase())) : PAGE1);
@@ -1406,6 +1411,49 @@ test("driver: a degree question fills through the level bridge, flagged; other d
   committed = null;
   const other = await ats.driveAtsPageFill(mk("Which team?"), "greenhouse", PROFILE, {}, {}, { buckets });
   assert.notStrictEqual(other.results[0].matchTier, "degree-level");
+});
+
+test("a COMPLETE list is matched whole, never searched — typing would filter the answer away", async () => {
+  // Traced live 2026-08-06 on Discord's degree box: opening it renders all 10 options, and typing the
+  // profile's own wording ("Bachelor of Science") filters that to "No options", because the widget
+  // matches TYPED TEXT while the form's vocabulary is "Bachelor's Degree". Searching a list you can
+  // already see in full can only hide the answer.
+  const typed = [];
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/discord/jobs/1", title: "t",
+      fields: [{ fieldName: "degree--0", inputSel: "#degree--0", widgetType: "select", label: "Degree", isRequired: false, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // the widget filters on the typed text, exactly like the live one
+    atsInjReadOptions: () => {
+      const all = ["Associate's Degree", "Bachelor's Degree", "Master's Degree"];
+      const q = typed[typed.length - 1] || "";
+      const shown = q ? all.filter((t) => t.toLowerCase().includes(q.toLowerCase())) : all;
+      return { ok: true, open: true, loading: false, options: shown.map((t) => ({ text: t })) };
+    },
+    atsInjTypeInCombo: (sel, t) => { typed.push(t || ""); return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed[typed.length - 1] || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Degree"], value: ["Bachelor of Science"] }];
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { buckets });
+  assert.strictEqual(committed, "Bachelor's Degree", "matched from the whole list: " + out.results[0].detail);
+  assert.deepStrictEqual(typed.filter(Boolean), [], "a complete list must never be searched");
+});
+
+test("atsListIsComplete: a short settled list is complete; a page or a loading one is not", () => {
+  const opts = (n) => ({ ok: true, open: true, options: Array.from({ length: n }, (_, i) => ({ text: "o" + i })) });
+  assert.strictEqual(ats.atsListIsComplete(opts(10)), true);
+  assert.strictEqual(ats.atsListIsComplete(opts(59)), true);
+  assert.strictEqual(ats.atsListIsComplete(opts(60)), false, "a page-sized read is a PAGE, not the whole list");
+  assert.strictEqual(ats.atsListIsComplete(opts(100)), false);
+  assert.strictEqual(ats.atsListIsComplete({ ok: true, open: true, options: [] }), false, "nothing rendered proves nothing");
+  assert.strictEqual(ats.atsListIsComplete({ ok: true, open: true, loading: true, options: [{ text: "a" }] }), false, "still fetching");
+  assert.strictEqual(ats.atsListIsComplete(null), false);
 });
 
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
