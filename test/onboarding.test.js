@@ -5,7 +5,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
-  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey } = require("../lib.js");
+  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, BLANK_AUTH_MIN_READS } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -485,4 +485,37 @@ test("phantomRequiredTargets: the same field HOLDING a value is the phantom (blu
   const r = phantomRequiredTargets([parseErrorFieldName(SELFID_ERR)], held);
   assert.strictEqual(r.phantom, true);
   assert.strictEqual(r.targets[0].fieldName, "disabilityStatus");
+});
+
+// ── A blank auth page must be PERSISTENT before it earns a reload (2026-08-07) ──────────────────────
+// Every isBlankAuthPage condition is also satisfied by an SPA mid-navigation (old view torn down, new one
+// not mounted, readyState already "complete"). Straight after an auth POST that is the EXPECTED
+// transient. Reloading there throws away a navigation about to finish and restarts the whole sign-in —
+// traced live as where the 8-9s went. The reload rule itself is right (cat.wd5: the shell really was
+// dead); what was missing is WHEN it may fire.
+const BLANK = { readyState: "complete", formFieldCount: 0, hasAuthEl: false, emailInput: false,
+  passwordInput: false, signInWithEmail: false, markers: {}, bodyText: "© 2026 Workday, Inc." };
+const AUTH_BACK = { ...BLANK, passwordInput: true, emailInput: true, formFieldCount: 2,
+  markers: { signInSubmit: true } };
+const FORM_BACK = { ...BLANK, formFieldCount: 14, markers: { formField: true } };
+
+test("blankAuthPersists: a run of blank reads (the dead cat.wd5 shell) → reload", () => {
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK, BLANK]), true);
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK, BLANK, BLANK]), true);
+});
+test("blankAuthPersists: ONE non-blank read anywhere ⇒ it was navigating, NOT a dead shell", () => {
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK, FORM_BACK]), false, "the form arrived — never reload");
+  assert.strictEqual(blankAuthPersists([BLANK, AUTH_BACK, BLANK]), false, "auth chrome came back mid-window");
+  assert.strictEqual(blankAuthPersists([FORM_BACK, BLANK, BLANK]), false);
+});
+test("blankAuthPersists: a SINGLE blank read is never enough — that was the bug", () => {
+  assert.strictEqual(blankAuthPersists([BLANK]), false, "one read is what used to trigger the reload");
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK]), false, "still under the minimum");
+  assert.strictEqual(BLANK_AUTH_MIN_READS >= 3, true, "the minimum must be more than a couple of reads");
+});
+test("blankAuthPersists: tolerates junk / empty input, and honours an explicit minReads", () => {
+  assert.strictEqual(blankAuthPersists([]), false);
+  assert.strictEqual(blankAuthPersists(null), false);
+  assert.strictEqual(blankAuthPersists([BLANK, null, BLANK]), false, "nulls are dropped, so 2 reads < 3");
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK], 2), true, "an explicit lower minimum is honoured");
 });

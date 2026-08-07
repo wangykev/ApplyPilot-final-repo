@@ -1984,6 +1984,24 @@ function cdpOnboardScan() {
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
   const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
+  // ── IS A SUBMIT IN FLIGHT? (2026-08-07, diagnostic) ──────────────────────────────────────────────
+  // The retry ladder concludes "my click did not register" from the auth form still being MOUNTED —
+  // which is also exactly what an in-flight submit looks like, so it re-submits a form that is already
+  // working and the double submit costs a page reload. The fix needs POSITIVE evidence of a no-op, i.e.
+  // some observable that flips while Workday is processing. Nobody has checked whether this form exposes
+  // one, so measure before building on it: report the submit button's disabled/busy state and whether
+  // the password field still holds a value. Read-only; no decision consumes this yet.
+  const submitBtn = document.querySelector('[data-automation-id="signInSubmitButton"]')
+    || document.querySelector('[data-automation-id="click_filter"][aria-label="Sign In"]')
+    || document.querySelector('button[type="submit"]');
+  const pwEl = document.querySelector('input[type="password"]');
+  const authBusy = submitBtn ? {
+    disabled: !!submitBtn.disabled || submitBtn.getAttribute("aria-disabled") === "true",
+    busy: submitBtn.getAttribute("aria-busy") === "true",
+    // A spinner/progress node anywhere in the auth widget is the other likely tell.
+    spinner: !!document.querySelector('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]'),
+    pwFilled: !!(pwEl && pwEl.value),
+  } : null;
   // ── WHY the auth form refused (2026-08-07) ───────────────────────────────────────────────────────
   // A Sign In / Create Account that submits to nothing looked identical in the log to one that never
   // registered the click: both printed "no outcome after 20s and the form is still up". Live on

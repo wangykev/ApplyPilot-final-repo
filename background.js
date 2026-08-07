@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "signin-1";
+const AP_BUILD_MARKER = "blankfix-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6125,6 +6125,9 @@ async function runCdpOnboard(tabId, opts) {
       // The page's OWN stated reason, when it has one — turns "the form is still up" from a dead end
       // into something actionable (2026-08-07).
       ...((s.authErrors && s.authErrors.length) ? [`pageErrors=${JSON.stringify(s.authErrors)}`] : []),
+      // Diagnostic (2026-08-07): does this form show a submit-in-flight signal at all? Only printed
+      // while auth chrome is up, so it never noises up a form-page dump.
+      ...((s.authBusy && s.hasAuthEl) ? [`submit=${JSON.stringify(s.authBusy)}`] : []),
     ].join(" · ");
   };
 
@@ -7017,6 +7020,30 @@ async function runCdpOnboard(tabId, opts) {
         //    we could otherwise drive. Runs BEFORE the breach-dialog branch (which needs signInSubmit
         //    present — mutually exclusive with a blank page) and before the auth-unknown halt. ──
         if (out === "unknown" && isBlankAuthPage(st)) {
+          // ── CONFIRM IT IS STUCK, DON'T TRUST ONE READ (2026-08-07) ──────────────────────────────────
+          // Every isBlankAuthPage condition is also true of an SPA mid-navigation, and straight after an
+          // auth POST that is the expected transient. Re-poll first: the instant the page shows anything
+          // actionable we carry on with THAT state and never pay the reload. Only a blank that HOLDS
+          // across BLANK_AUTH_MIN_READS consecutive reads earns the refresh (the cat.wd5 case, where the
+          // shell really was dead). Cheap by construction — the loop exits on the first page that moves.
+          const blankReads = [st];
+          const bDeadline = Date.now() + 8000;
+          while (Date.now() < bDeadline) {
+            await pace(400);
+            await cdpWakePage();
+            const s2 = await scan();
+            if (!s2) continue;
+            blankReads.push(s2);
+            if (!isBlankAuthPage(s2)) break;                    // it moved → not a dead shell
+          }
+          const lastRead = blankReads[blankReads.length - 1];
+          if (!blankAuthPersists(blankReads)) {
+            LOG(`the page looked EMPTY right after the sign-in submit but RECOVERED within ${blankReads.length} read(s) — it was mid-navigation, not a dead shell. Continuing without a reload.`);
+            st = lastRead || st;
+            continue; // re-enter the auth loop against the page it actually became
+          }
+          LOG(`the page stayed EMPTY across ${blankReads.length} consecutive read(s) — treating it as a genuinely dead shell.`);
+          st = lastRead || st;
           if (blankReloads < MAX_BLANK_RELOADS) {
             blankReloads++;
             LOG(`the page came back EMPTY after the sign-in submit (loaded, but no form / no auth controls / no markers — just boilerplate). Reloading (${blankReloads}/${MAX_BLANK_RELOADS}) and retrying — a known Workday hiccup, not an operator problem.`);

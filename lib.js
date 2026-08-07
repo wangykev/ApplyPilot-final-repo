@@ -1432,6 +1432,27 @@ function jobPageSettleStep(read, state) {
 // real content is NOT blank. `readyState` is optional so an older scan (which didn't report it) simply
 // never matches — fail-closed.
 const BLANK_PAGE_BOILERPLATE_MAX = 700; // a genuinely empty shell is just the cookie/skip-link text
+// ── IS THE BLANK PAGE PERSISTENT, OR JUST MID-NAVIGATION? (2026-08-07) ──────────────────────────────
+// `isBlankAuthPage` is a single-read test, and every condition it checks is ALSO satisfied by an SPA
+// mid-navigation: the old view torn down, the new one not yet mounted, `readyState` already "complete".
+// Straight after an auth POST that is the EXPECTED transient, not a failure — so reloading there throws
+// away a navigation that was about to finish and restarts the whole sign-in. Traced live: a false
+// re-click produced exactly this, and the reload is where the 8-9s went.
+//
+// The reload rule itself is right — it came from cat.wd5, where the empty shell was PERSISTENT and only
+// a refresh recovered it. What was missing is WHEN it may fire. So: require the blank state to HOLD
+// across several consecutive reads rather than trusting one. A single non-blank read anywhere in the
+// window means the page was moving, and moving pages are not reloaded.
+//
+// PURE so the decision is unit-testable; the caller does the polling.
+const BLANK_AUTH_MIN_READS = 3;
+function blankAuthPersists(reads, minReads) {
+  const rs = (Array.isArray(reads) ? reads : []).filter((r) => r != null);
+  const need = Number(minReads) > 0 ? Number(minReads) : BLANK_AUTH_MIN_READS;
+  if (rs.length < need) return false;              // not enough evidence to call it stuck
+  return rs.every((s) => isBlankAuthPage(s));      // ANY page that moved ⇒ it was navigating, not dead
+}
+
 function isBlankAuthPage(state) {
   const s = state || {};
   if (s.readyState !== "complete") return false;          // still loading ⇒ absence proves nothing
@@ -1949,5 +1970,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }
