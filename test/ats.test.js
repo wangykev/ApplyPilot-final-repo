@@ -1920,3 +1920,47 @@ test("atsPostingGone: names a dead posting, and stays silent on a healthy one", 
   // no evidence at all → no claim (a missing JD must not read as a dead posting)
   assert.strictEqual(ats.atsPostingGone(null, "https://jobs.ashbyhq.com/x/abc", "https://jobs.ashbyhq.com/x/abc"), null);
 });
+
+// ── a query can annihilate a COMPLETE list, and the answer survives anyway (live 2026-08-07) ──
+// Measured on Discord's `discipline--0`: 72 options on open; typing the profile's own wording
+// ("Electrical and Computer Engineering", which that form words differently) filters the menu to
+// ZERO; clearing brings all 72 back. Lists of >= 60 take the SEARCH branch, so this looked like a
+// correctness risk resting on the restore poll — it is NOT. A search that finds nothing never
+// overwrites `read`, so the on-open list survives even if the restore never returns. This pins that
+// structural guarantee, which is easy to break by "simplifying" the search loop into an
+// unconditional assignment; the fixture's restore deliberately never comes back.
+test("combobox: a query that wipes the menu does not lose the list we read on open", async () => {
+  // 72 options, exactly like the real discipline box: big enough to take the SEARCH branch
+  // (atsListIsComplete only skips typing under ATS_OPTION_CAP), which is the whole point.
+  const DEGREES = ["Associate's Degree", "Bachelor's Degree", "Master's Degree", "Doctorate", "Other"]
+    .concat(Array.from({ length: 67 }, (_, i) => "Field of Study " + i));
+  let typedEver = false;
+  const act = fakeAct({
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields: [
+      { fieldName: "degree--0", inputSel: "#degree--0", widgetType: "select", label: "Degree", isRequired: true, value: null, domIndex: 0 },
+    ] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // the widget never recovers its list once a query has touched it — the restore poll times out
+    atsInjReadOptions: () => ({ ok: true, open: true, loading: false,
+      options: (typedEver ? [] : DEGREES).map((t) => ({ text: t, disabled: false })) }),
+    atsInjTypeInCombo: () => { typedEver = true; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: "Bachelor of Science" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: "Bachelor's Degree" }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const profile = { ...PROFILE, education: [{ degree: "Bachelor of Science", school_or_university: "CMU" }] };
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {
+    buckets: [{ questions: ["Degree"], profile_path: "education.0.degree" }],
+  });
+  const r = out.results[0];
+  assert.ok(typedEver, "the test must actually exercise the search branch");
+  assert.notStrictEqual(r.status, "needs_review",
+    "the answer was in the list we read on open — detail was: " + r.detail);
+  assert.strictEqual(r.after, "Bachelor's Degree");
+  // …and review still gets every option we read. It lands in captured_options rather than options
+  // because we TYPED for this list, and once a query has touched a menu we cannot tell a restored
+  // static list from page one of a server-backed one — see atsAttachOptions.
+  assert.strictEqual((r.captured_options || []).length, DEGREES.length,
+    "review gets the list we read on open, not the wiped one");
+});

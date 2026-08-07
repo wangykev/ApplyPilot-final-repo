@@ -2308,6 +2308,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         if (found && found.stillLoading) listPending = true;
         try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)} waited=${(found && found.waitedMs) || 0}ms/${(found && found.ticks) || 0} reads stop=${(found && found.stopReason) || "?"}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
         if (seen.length) nearMatches = seen;
+        // ⚠ `read` IS ONLY REPLACED ON A HIT — and that is what makes a query safe to run against a
+        // COMPLETE list. Measured 2026-08-07 on Discord's `discipline--0`: 72 options on open, typing
+        // the profile's own wording ("Electrical and Computer Engineering", which that form words
+        // differently) filters the menu to ZERO, clearing it brings all 72 back. Because a search that
+        // found nothing never overwrites `read`, the on-open list survives regardless of whether the
+        // restore below comes back in time, and the bridges (degree-level, polarity, assertion-lead)
+        // run against the full list. Do not "simplify" this into an unconditional assignment.
         if (seen.length && hasHit(seen)) { read = found; break; }
       }
       if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
@@ -2318,6 +2325,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // are indistinguishable from here — no loading flag, no count that separates 244 countries
         // from 100 schools. Once we have typed, the safe reading is "a view of the list", forever.
         if (optsOf(restored).length) read = restored;
+
       }
     }
     let options = (read && read.options) || [];
