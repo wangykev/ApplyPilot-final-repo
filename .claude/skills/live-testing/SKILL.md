@@ -450,10 +450,14 @@ age you checked.
 A fresh alias exercises the ACCOUNT-CREATION path, which the tenants on the scoreboard below never did
 (they all had accounts). Two blockers lived there and are now fixed; three facts remain:
 
-- **Email auto-verify CANNOT work with a `tester+NN@gmail.com` alias.** The connected mailbox is
-  `wangykev@gmail.com`, so `tester+NN` is a completely different inbox and the verification mail never
-  arrives. An email-verify tenant needs `wangykev+NN@gmail.com`. This silently cost two tenants
-  (`analogdevices.wd1`, `jabil.wd5`) — they sit in "polling Gmail… (up to 120s)" and then halt.
+- **The login alias MUST be an alias of the CONNECTED mailbox.** Gmail auto-verify polls
+  `wangykev@gmail.com`, so a `tester+NN@gmail.com` login is a completely different inbox and the
+  verification mail never arrives — the run sits in "polling Gmail… (up to 120s)" and halts. Use
+  `wangykev+NN@gmail.com`. Switching to it turned `analogdevices.wd1` from blocked into a full
+  `SUBMIT GATE PASSED` on the next run (`verification link found — navigating the tab to it`).
+- **The post-verify sign-in can lose a race.** Straight after auto-verify, ADI halted `auth-unknown`
+  with the page at `readyState loading` — a 500ms first wait classifying a still-loading page. A plain
+  re-run signed straight in. Retry once before believing it.
 - **Polling the localhost tab with `javascript_tool` ACTIVATES it**, so a run launched `background:false`
   logs `tab HIDDEN` and you will mislabel it. To measure a genuinely visible run, fire it and then wait
   WITHOUT touching Chrome (a backgrounded `sleep`), reading the log only afterwards.
@@ -461,17 +465,32 @@ A fresh alias exercises the ACCOUNT-CREATION path, which the tenants on the scor
   overwrites it, so a result object can belong to a run you killed two tenants ago. Grade the TAIL against
   a cursor, exactly as with log lines.
 
-**The dominant open blocker is the self-ID disability checkbox group** — reproduced on THREE tenants
-(waystar, radiancetech, and itron on a second pass into a saved application). Two shapes: the bundle HAS
-the entry and the replay can't make it stick (`asked for [...] and it holds []`), or `the approved bundle
-has no entry for [Please check one of the boxes below] on this page`. The fill passes; the REPLAY is where
-it bites, which fits the traced note that Workday doesn't persist some self-ID answers across re-entry.
+**The self-ID disability blocker was a COLON, and is FIXED** (2026-08-07). Worth knowing because it was
+mis-described for several sessions as "the checkbox unchecks itself", which sent a whole round chasing a
+Workday-side ghost.
+
+- **Workday's part is real**: re-entering a SAVED application DROPS the disability answer while its
+  siblings on the same page keep theirs. So the replay always meets `disabilityStatus ""*`.
+- **Our part was the bug**: `parseErrorFieldName` strips a trailing `:`; `normalizeLabel` strips only `*`.
+  So `"Please check one of the boxes below"` (from the error) never equalled
+  `"Please check one of the boxes below:*"` (the live label), and both recovery paths reported "match no
+  field on this page" while the field sat there with an approved value. Fixed by `errorLabelKey`.
+- **The tell is pass-then-fail**: the recovery only runs after Workday has dropped the value, i.e. on a
+  RE-ENTRY. `analogdevices.wd1` passed rehearsal #1 and failed #2, deterministically — if you only ever
+  rehearse once per tenant you will not see this. **Rehearse twice.**
+
+**Still open — a different shape on `waystar.wd1`.** There the INITIAL replay's own verify fails
+(`asked for [...] and it holds []`) and halts `replay-mismatch` before any error text exists, so the colon
+fix cannot reach it. That is an actuation failure on the checkbox group. Given that the Apply click and
+the consent tick both turned out to be coordinate clicks that silently did not register, try
+mechanism-escalation (in-page label activation) there first.
 
 ### Scoreboard as of 2026-08-07
 
 | Tenant | State |
 |---|---|
 | `itron.wd5` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account created this run |
+| `analogdevices.wd1` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED` on rehearsals #1, #3, #4; #2 is what caught the colon bug |
 | `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
 | `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
 | `waystar.wd1` | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
