@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "authwait-1";
+const AP_BUILD_MARKER = "signin-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6944,8 +6944,27 @@ async function runCdpOnboard(tabId, opts) {
           done: (s) => classifyAuthOutcome(s) !== "unknown",
           formStillUp: (s) => !!s.markers.signInSubmit,
           // 3 attempts so BOTH escalations get a turn: click → (focus+Enter) → click → (password Enter) →
-          // click. The short first rung keeps the happy path fast; the last is the real ceiling.
-          timeouts: [500, 3000, 6000],
+          // click. The last rung is the real ceiling.
+          //
+          // ── WHY THE FIRST RUNG IS NO LONGER 500ms (2026-08-07) ────────────────────────────────────
+          // It was, on the theory that a short rung "keeps the happy path fast" if the click no-ops. The
+          // measurement says the opposite: 500ms timed out on 3 of 3 sign-ins, and every one of those
+          // clicks had actually WORKED — the form is still mounted at 500ms simply because Workday's auth
+          // POST has not committed yet, so `formStillUp` reads true and we re-click a submit that is
+          // already in flight. Traced end to end (operator asked whether the 8-9s was inherent):
+          //
+          //   0ms     clicked Sign In
+          //   516ms   timed out after 500ms — form still up (formFields 2, email+password present)
+          //   550ms   clicked Sign In (retry 1)          <- second submit, mid-flight
+          //   2579ms  page EMPTY: formFields 0, no auth controls, just boilerplate
+          //   3582ms  outcome: unknown -> "came back EMPTY ... Reloading (1/2) and retrying"
+          //
+          // The reload is the 8-9s. So the short rung did not make the happy path fast, it manufactured a
+          // double submit whose recovery costs a full page reload. A first rung that lets a normal auth
+          // round trip finish removes that entirely; a click that GENUINELY did not register (real, and
+          // why this ladder exists — 2026-08-06) is still caught, just 4s later instead of 0.5s, which is
+          // far cheaper than the reload it replaces.
+          timeouts: [4000, 6000, 6000],
           beforeRetry: signInEscalate
         });
         if (r.notFound) return haltNeedsOperator("signin-submit-not-found", r.blockedBy || "no Sign In button", st);
