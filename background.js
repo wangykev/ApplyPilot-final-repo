@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-06-wake-async-combos";
+const AP_BUILD = "2026-08-06-trusted-typing";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -3846,6 +3846,7 @@ function makeAtsActuation(llmConfig) {
     // back to read latency, the proxy it was meant to replace) and trustedFocus (the widget-wake that
     // showed no log line at all because `act.trustedFocus` was undefined). Guarded by a test now.
     trustedFocus: workday.trustedFocus,
+    trustedType: workday.trustedType,
     painting: workday.painting,
     paintLabel: workday.paintLabel,
     quietInstall: workday.quietInstall,

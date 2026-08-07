@@ -1841,6 +1841,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // value races the component's own render and React puts "" back — the query never reaches
     // the filter and the list looks empty. A clear + settle + type sticks ("Carnegie" → 1
     // option). The settle must be SW wall-clock; a page-side timer would be throttled hidden.
+    // Type with REAL keystrokes when the actuation offers them, falling back to the synthetic path.
+    // Greenhouse's async comboboxes (school / degree / discipline / location) only run their search
+    // for genuine key events: with a trusted CLICK alone the school box still sat `loading` for
+    // seconds and the location box showed nothing, while a real click + real typing answers in about
+    // a second (traced both ways, 2026-08-06). Everything else on these forms keeps filling
+    // synthetically, so this is the narrow exception, not a new default.
+    const typeTrusted = async (text) => {
+      if (!act.trustedType) return null;
+      try {
+        const ok = await act.trustedType(ref.inputSel, String(text));
+        if (!ok) return null;
+        await act.delay(120);
+        const st = await act.eval(atsInjReadComboInput, ref.inputSel);
+        const got = st && st.ok ? String(st.value || "") : "";
+        return { ok: true, got, stuck: atsLib.normalize(got) === atsLib.normalize(String(text)) };
+      } catch (e) { return null; }
+    };
     const typeInto = async (text) => {
       await act.eval(atsInjTypeInCombo, ref.inputSel, "");
       await act.delay(250);   // adaptive — the read-back below is the real gate
@@ -2006,8 +2023,8 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // synthetic open click: the fill typed "Tallahassee" and polled 22.7s for nothing, while by hand
       // the same query answers in ~1s — and after ONE trusted click, SYNTHETIC typing drives it fine
       // (traced both ways, 2026-08-06). So the trust is needed for the click, not the keystrokes.
-      if (act.trustedFocus) { try { await act.trustedFocus(ref.inputSel); await act.delay(150); } catch (e) { /* best effort */ } }
-      await typeInto(String(candidates[0]).split(",")[0]);
+      const city = String(candidates[0]).split(",")[0];
+      if (!(await typeTrusted(city))) await typeInto(city);
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
     } else if (!hasHit(optsOf(read))) {
       // SEARCH BY NAME: types each candidate (most-specific first) and polls FOR THE HIT.
@@ -2025,8 +2042,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
         // `loading` for 19.2s and the location box showed nothing for 21.6s, while by hand each
         // answered in about a second. Once woken, ordinary synthetic typing drives them.
-        if (act.trustedFocus) { try { await act.trustedFocus(ref.inputSel); await act.delay(120); } catch (e) { /* best effort */ } }
-        const typed = await typeInto(query); didSearch = true;
+        const typed = (await typeTrusted(query)) || (await typeInto(query)); didSearch = true;
         const wantHit = (t) => t.length > 0 && hasHit(t);
         let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave

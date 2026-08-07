@@ -3739,6 +3739,19 @@ function cdpReadQuiet(sel) {
 
 
 function makeCdpActuation(llmConfig) {
+  // Shared by act.trustedFocus and act.trustedType: a real click when we can measure the element,
+  // DOM.focus when we cannot (a hidden tab can report a 0x0 rect, and the coordinate path would then
+  // silently do nothing — which is exactly how the first version of this looked like a failed fix).
+  const this_trustedFocus = async (sel) => {
+    let how = null;
+    try {
+      const rect = await cdpRectReady(sel, true);
+      if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); how = "click"; }
+    } catch (e) { /* fall through */ }
+    if (!how) { try { await cdpDomFocus(sel); how = "dom-focus"; } catch (e) { how = null; } }
+    try { console.log(`[ApplyPilot][CDP] trustedFocus ${JSON.stringify(sel)} → ${how || "FAILED"}`); } catch (e) { /* log only */ }
+    return how;
+  };
   return {
     // AI-1: the brain gates the AI-fallback on this BEFORE opening a field (so a disabled
     // toggle never opens/actuates). Mirrors act.llm's own enabled check (both read llmConfig).
@@ -3790,21 +3803,21 @@ function makeCdpActuation(llmConfig) {
     // "Tallahassee, Florida, United States" in about a second. In an ATS run cdpClickAt is already
     // trusted (synthetic mode is only armed for Workday fills), so this is a genuine
     // Input.dispatchMouseEvent, not another page-side dispatch.
-    trustedFocus: async (sel) => {
-      // Two ways in, because a hidden tab can report a 0x0 rect and the coordinate path then silently
-      // does nothing (which is exactly how the first version of this looked like "the fix didn't
-      // work"). DOM.focus needs no geometry at all, so it is the fallback rather than a dead end.
-      let how = null;
+    // …and TRUSTED KEYSTROKES for the same widgets. A real click alone was not enough: with
+    // `trustedFocus → click` in the log, Greenhouse's school box still sat `loading` and its location
+    // box still showed nothing, while the manual test that worked used a real click AND real typing
+    // (2026-08-06). cdpTypeChars sends genuine key events, which is what these async loaders are
+    // watching for; ordinary synthetic typing keeps driving every other widget on the page.
+    trustedType: async (sel, text) => {
+      const how = await this_trustedFocus(sel);
+      if (!how) return false;
       try {
-        const rect = await cdpRectReady(sel, true);
-        if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); how = "click"; }
-      } catch (e) { /* fall through to DOM.focus */ }
-      if (!how) {
-        try { await cdpDomFocus(sel); how = "dom-focus"; } catch (e) { how = null; }
-      }
-      try { console.log(`[ApplyPilot][CDP] trustedFocus ${JSON.stringify(sel)} → ${how || "FAILED"}`); } catch (e) { /* log only */ }
-      return how;
+        await cdpSelectAllDelete();          // clear whatever is there, trusted
+        await cdpTypeChars(String(text));    // real keydown/keypress/keyup per character
+        return true;
+      } catch (e) { return false; }
     },
+    trustedFocus: (sel) => this_trustedFocus(sel),
     painting: () => cdpPainting(),
     paintLabel: () => cdpPaintLabel(),
     quietInstall: (sel) => cdpEval(cdpInstallQuietWatch, sel),
