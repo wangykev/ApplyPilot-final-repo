@@ -3464,3 +3464,85 @@ measurement needs a fresh posting per ATS, visible and hidden back-to-back, no r
 ⚠ Footgun recorded for the Workday synthetic-input work: `cdpSynthInput()` decides from
 `cdpPainting()`, so enabling render forcing there would flip hidden runs to TRUSTED input (~1.2-1.5s
 per event). That decision needs real visibility, not the paint probe.
+
+## 2026-08-07 — the dead first fill, and what it had been hiding
+
+The first fill on a Greenhouse form was dead: location, school and degree sat `loading` to their
+ceilings and reached review unanswered, and a refresh always cured it. Everything else was ruled out
+first — it held with a VISIBLE painting tab, with trusted clicks, and with trusted keystrokes.
+
+**Cause: our own page overrides, landing mid-life.** They replace `setTimeout`/`setInterval`/`rAF` so
+a hidden tab's timers escape throttling, and react-select schedules its search on exactly those.
+Installed into an ALREADY-RUNNING document, the page is left half-native/half-ours and those widgets
+never resolve again. Only Greenhouse showed it because only Greenhouse serves its form FROM the
+posting URL — Lever and Ashby navigate on to `/apply` and `/application`, get a fresh document, and
+were never affected. The operator saw the shape before the logs did: *opening the link from the
+website always broke location, copy-pasting the same link never did, and reloading always fixed it.*
+
+Fix: an ATS run opens its tab **blank**, attaches, registers the overrides, and only then navigates.
+Same single page load as before, just moved to after the install; the submit run gets it for free.
+Discord, hidden: a 4.9s dead pass + recovery reload + 53.0s refill became **one 17.2s fill**.
+
+**Then three workarounds could go.** Each existed to survive that bug.
+
+- **Screencast (`Page.startScreencast`)** put a hidden tab under capture so Chrome kept producing
+  frames. It worked, and it was treating the same disease less directly. Measured after the real fix,
+  tab verifiably dark: Discord **16.9s vs 17.2s** under capture, and Reddit's rehearsal — the run that
+  FAILED without forcing on 2026-08-06 — passed its whole gate dark, 23 fields, 0 failures. Removed,
+  with the lever documented where it lived. WARNING: you cannot measure this while your own automation
+  holds the tab under capture — the paint probe reads `painting (hidden)` with forcing off, and that
+  is your tooling, not the product. Confirm `NOT painting` before believing a dark-tab result.
+- **The reload-and-refill remedy** cost a second full fill to rediscover the same answer. What remains
+  of that signal is the honest kind — a places service that truly does not respond — so the widget is
+  NAMED in the log and left for review instead of retried.
+- **`atsSkipOverrides` / `forceRenderOff`** were diagnostic flags for this hunt.
+
+Regression, all hidden, no capture: Greenhouse/Discord 18.3s 25 fields, Lever/Zoox 5.5s 17 fields,
+Ashby/Sierra 13.8s 35 fields.
+
+### Bugs the tenant sweep then surfaced
+
+- **A stated answer carries its polarity in its leading words.** Ashby/Sierra renders its diversity
+  survey as SELECT ALL THAT APPLY — each identity its own checkbox, so the LABEL is an option. The
+  profile answers in whole sentences ("No, I do not have a disability"), which matched neither
+  `/^(yes|true)$/` nor `/^(no|false)$/`, so two questions the profile ALREADY ANSWERS came back as
+  "your profile answer isn't one of this form's options". Leaving the box unchecked IS that answer.
+  35 fields, 3 review items to 1.
+- **A box labelled "Location" is not always a city box.** ElevenLabs labels one "Location" and
+  describes it *"Country you're currently residing in"*. We typed "Pittsburgh", read an empty menu,
+  and blamed the places service for 15s. The city now falls through to the remaining candidates (the
+  location rung already tiers the country behind the city; a BUCKET routes first and carries one
+  value, which is how the field arrived holding only "Pittsburgh, PA"), and those are matched through
+  the ordinary ladder — the country tier's wording is routinely LONGER than the option
+  ("United States of America" vs "United States"), which the city-containment pick cannot see.
+  Same field: 15.5s "didn't respond" to `filled - exact-normalized - "United States"`.
+- **…and the places pick got strict about the state** (`atsPlacePick`). The query is the city alone,
+  because a service that never heard of "Pittsburgh, PA" answers "Pittsburgh" instantly — but "first
+  row containing the city" is not a safe pick when the city is Pittsburgh (PA, CA, TX). It prefers the
+  row agreeing on the state in EITHER spelling via `REGION_ABBREV` (Canadian provinces included), and
+  when we hold a state no row offers, it still answers but at the flagged tier.
+- **"How did you FIRST hear about this role?"** missed the rung's wording, so a REQUIRED question the
+  profile answers exactly went to the AI — which answered "LinkedIn" correctly, after an LLM call,
+  flagged `ai-choice`, parked in review. One wildcard word is allowed in the middle now. Pinning that
+  caught something the OLD wording did too: it ended at the verb, so "How did you find working with
+  your last team?" routed here and would have answered an interview question with "LinkedIn".
+- **Greenhouse scanned every checkbox twice.** Its general element loop skipped only `hidden`, so each
+  box of a group was pushed as a REQUIRED "text" field AND as the real `checkbox_group`. On Gusto's
+  12-box select-all, every phantom bought its own LLM call answering "N/A" — 12 of that form's 21
+  review items. Worse than noise: writing text to a checkbox sets the value that option would SUBMIT.
+  Lever and Ashby always skipped both. 35 fields to 24, 21 review items to 10.
+- **A run no longer claims it reported a fill the tracker rejected.** `reportApplication` returned
+  nothing, so the ATS run printed "Reported to the website." one line under the loud rejection saying
+  it hadn't.
+- **A run refreshes the extension's ingest credential before starting.** Minting a key DELETES the
+  previous ones, so a later sync silently invalidates what the extension holds — surfacing as a fill
+  that never reaches the tracker, or a submit run that 401s and REFUSES (correctly, but it reads as a
+  broken run).
+
+### Verified end to end (fill, approve, rehearse, `WOULD CLICK SUBMIT`) — 17 tenants
+
+Greenhouse: GitLab, Coinbase (employer-hosted), Reddit, Discord, Duolingo, Flexport, Gusto, Roblox.
+Lever: Shield AI, gopuff, Zoox, Spotify. Ashby: Notion, Cohere, Sierra, ElevenLabs, Linear.
+
+Suite 1088/1088. New skill: `.claude/skills/ats-tenants/` — the ATS dev loop and the debugging rules,
+each of which was paid for with a wrong conclusion.

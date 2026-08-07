@@ -3353,3 +3353,35 @@ The option-poll ceiling was per POLL, so a by-name search plus its retry could e
 one widget whose menu never rendered. It is a per-FIELD allowance now, and the AI fallback no longer
 re-opens and re-polls a list the deterministic pass just proved unreadable (it paid that ceiling twice
 and reached the same `needs_review` either way).
+
+## 2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings
+
+**Greenhouse serves its application form FROM the posting URL.** Lever and Ashby navigate on to
+`/apply` and `/application`. That single difference decided which ATS was broken by page overrides
+installed on an already-running document: the ones that navigate get a fresh document for free.
+
+**A Greenhouse checkbox group is `input[type=checkbox]` sharing `name="question_<id>[]"`,** with
+per-box ids `question_<id>[]_<optionId>` and a `<fieldset id="question_<id>[]">` around them. The
+legend carries the question ("How did you hear about this opportunity? (select all that apply) *")
+and each box's `<label for>` carries the option ("LinkedIn", "Glassdoor", "Indeed", …). Observed on
+Gusto with 12 boxes. Note the fieldset's id EQUALS the inputs' name, so a selector keyed on
+`[id*=…]` matches both the fieldset and every box.
+
+**Ashby renders a diversity survey as SELECT ALL THAT APPLY.** Each identity is its own checkbox —
+"Person with disability", "Veteran", "Neurodiverse", "Parent", "Refugee or immigrant" — so the label
+is an option VALUE, not a question. Observed on Sierra. Consequence: `atsIsEeoLabel` (which knows
+dimension NAMES: veteran, disability, race) matches some of these and not others ("Asian" is a value,
+not a dimension), so it cannot be the gate for deciding one.
+
+**An Ashby field labelled "Location" can be a COUNTRY box.** ElevenLabs pairs the label with the
+description *"Country you're currently residing in"*, and its suggestion service answers country
+queries only — "Pittsburgh" returns nothing, while the country returns
+`["United States", "American Samoa", "US Virgin Islands"]`. The label alone cannot tell you which
+kind of box you have; the live widget can. Third instance of that rule, after GitLab's three-option
+pick-one and Discord's already-rendered degree list.
+
+**Ashby's places service knows "Pittsburgh, Pennsylvania" and not "Pittsburgh, PA".** Same profile,
+same ATS, two forms an hour apart: the full-state spelling HIT in 2203ms and committed, the
+abbreviation returned nothing across a 17.5s budget. Neither spelling is canonical — the profile
+stores whichever the operator typed — so the query is the city alone and the state is enforced at the
+pick instead (`atsPlacePick`).
