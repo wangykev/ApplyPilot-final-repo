@@ -3512,3 +3512,46 @@ in a row. Unit-pinned on the VERBATIM live strings and verified to discriminate 
 error text exists, so this fix cannot reach it. That is an actuation failure on the checkbox group, not
 an error-matching one, and it needs its own round — likely the same mechanism-escalation medicine the
 Apply and consent clicks just got.
+
+## 2026-08-07 (later still) — waystar's self-ID variant: synthetic clicks, then a stale signature date
+
+Chasing the one shape the colon fix could not reach turned up TWO more faults, stacked on the same page.
+Both were found by reading the replay's own log rather than by theorising, and each was confirmed by a
+controlled change before being kept.
+
+**1. Synthetic CLICKS don't reach Workday's model on the self-ID page.** Text/date went trusted here on
+2026-08-06; clicks were left synthetic on the strength of a 2026-08-05 fill-path note ("committed and
+held 2/2 under synthetic; trusted clicks produce the intermittent did-not-commit"). Every ADI rehearsal
+refuted that, identically:
+
+```
+page 5 replay: 5 field(s) — 3 changed, 1 already-correct, 1 not-actuated, 0 FAILED
+page 5 Save & Continue: {"clicked":true}
+re-click fallback: error text present — NOT re-clicking (a real validation block)
+```
+
+Our read-back says the box IS checked; Workday says that field is required. The force-re-fill then
+re-wrote the SAME field with TRUSTED input and the page advanced — every time — which is a repeated
+demonstration that trusted clicks DO commit here. So the whole page now goes trusted on the replay,
+clicks included. Controlled result on the run that always hit the block: **force-re-fills 0, validation
+blocks 0, page 5 advances on the FIRST Save** — one Save cycle cheaper, and the only thing that can reach
+waystar's variant, where the synthetic click didn't even update the DOM (`asked for […] and it holds []`)
+and so failed the strict verify BEFORE any error text existed for the force-re-fill to key on.
+
+**2. A signature date goes stale overnight.** With page 5 finally advancing, waystar surfaced
+`Error-Date "Enter today's date"` — the bundle was approved 08/06 and replayed on 08/07. The fill path
+already stamps a signature date deterministically (`isSignatureDateQuestion`); the REPLAY wrote back the
+stored literal. This also explains why ADI passed the same page all along: its bundle was filled the SAME
+day. **A one-day-old approval is enough**, which makes it a guaranteed failure for any review not
+submitted the day it was filled — the normal case. `replayField` now re-derives it to today.
+
+**2b. And the reconcile had to move with it.** Fixing only the replay traded a nav-timeout for a submit
+block: `≠ "Date*": approved "8/6/2026" but the page shows "08/07/2026"`. `reconcileReviewPage` now
+compares a signature date against today too. Both stay narrow — `isSignatureDateQuestion` rejects any
+label naming a different event — and both stay strict: a page showing any date other than today still
+disagrees.
+
+**waystar.wd1 now passes**: `page 5 → advanced` · `AGREE 41 · DISAGREE 0` · `✅✅✅ SUBMIT GATE PASSED`.
+Extension **1117/1117**. One test-writing note worth keeping: the first draft of the reconcile tests
+passed for the WRONG reason — every row landed in `missing_on_review` because the fixture used the wrong
+argument shape — so they now assert `tier === "keyed"` to prove they exercise the real compare.
