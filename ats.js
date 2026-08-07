@@ -1480,7 +1480,14 @@ function atsIsEeoLabel(label) {
   // loud demographic badge — an ordinary "AI" badge under-warns on a field where a wrong answer is a
   // legal misstatement. Deliberately NOT bare "age": an "are you over 18" question is a different,
   // non-protected thing that legallyLoaded already covers.
-  return /hispanic|latino|race|ethnicit|veteran|military service|disabilit|gender|\bsex\b|sexual orientation|transgender|lgbt|pronoun|age range/i.test(String(label || ""));
+  // …and widened again 2026-08-07: a question can ask a protected characteristic WITHOUT naming the
+  // dimension. Chime words its gender question "I identify as:" — no "gender", no "sex" — so it read
+  // as an ordinary question, and an AI-guessed protected characteristic wore the ordinary `ai-choice`
+  // badge while the field right below it ("I identify my sexual orientation as:") got the loud one.
+  // The self-identification FRAME is the signal there. Over-flagging is the safe direction: the cost
+  // of a false positive is a louder badge on a question that did not need one.
+  return /hispanic|latino|race|ethnicit|veteran|military service|disabilit|gender|\bsex\b|sexual orientation|transgender|lgbt|pronoun|age range/i.test(String(label || "")) ||
+    /\bi identify (?:as|my)\b|how do you identify\b/i.test(String(label || ""));
 }
 
 async function atsAiChooseOption(act, f, options, profile, jobContext) {
@@ -2778,6 +2785,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
+    atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,

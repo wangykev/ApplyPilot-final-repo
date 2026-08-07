@@ -1869,3 +1869,24 @@ test("atsInjScan: no ATS branch treats a radio or checkbox as a plain input", ()
       line.trim());
   });
 });
+
+// ── a protected characteristic can be asked without naming the dimension (live 2026-08-07) ──
+// Chime words its GENDER question "I identify as:" — no "gender", no "sex" — so the detector missed
+// it and an AI-guessed protected characteristic wore the ordinary `ai-choice` badge, while the field
+// directly below it ("I identify my sexual orientation as:") got the loud demographic one.
+test("atsIsEeoLabel: the self-identification frame counts, dimension word or not", () => {
+  for (const l of [
+    "I identify as:",
+    "I identify my sexual orientation as:",
+    "I identify my race/ethnicity as (please mark all that apply):",
+    "How do you identify?",
+    "Gender", "Veteran Status:", "Do you have a disability?", "Are you Hispanic or Latino?",
+  ]) assert.ok(ats.atsIsEeoLabel(l), l + " should read as a demographic question");
+
+  // and it must not swallow ordinary questions that merely contain the word "identify"
+  for (const l of [
+    "How did you identify this opportunity?",
+    "Please identify your preferred start date",
+    "Identify the technologies you have used",
+  ]) assert.ok(!ats.atsIsEeoLabel(l), l + " is NOT a demographic question");
+});
