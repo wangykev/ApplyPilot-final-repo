@@ -65,7 +65,11 @@ try {
   });
 } catch (e) { /* ignore */ }
 
-console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()})`);
+// Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
+// the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
+// running, with nothing in the log able to say so (2026-08-07).
+const AP_BUILD_MARKER = "backstop-1";
+console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
 // service worker, so importScripts brings db.js's functions into the SW scope (the

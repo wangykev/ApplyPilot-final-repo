@@ -4140,7 +4140,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         const why = record.flag ? `${record.flag}: ${record.detail || "no answer"}` : (record.detail || "no answer available");
         const forced = await forceRequiredDropdownPick(act, loc, f, budgets, why);
         if (forced && forced.status === "filled_review") Object.assign(record, forced);
-      } catch (e) { /* leave the honest blank record — the walk's own halt explains it */ }
+        else if (forced) record.detail = `${record.detail || ""} · last-resort pick also failed (${forced.flag}: ${forced.detail || "?"})`;
+      } catch (e) {
+        // NEVER swallow this. A silent catch here cost a live round: the backstop appeared not to run at
+        // all, and there was nothing in the log to say whether it had thrown or been gated out.
+        record.detail = `${record.detail || ""} · last-resort pick ERRORED: ${String((e && e.message) || e)}`;
+      }
     }
 
     // ── Required CHECKBOX-GROUP AI fallback ── same reasoning as the radio pass above, for the
