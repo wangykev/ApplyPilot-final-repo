@@ -328,6 +328,22 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
       {/* Skills */}
       <SectionCard title="Skills">
         <TagListField label="Skills" value={profile.skills} onChange={(v) => update((p) => { p.skills = v; })} />
+        {/* Workday's "Autofill with Resume" already suggests skills from the résumé. Adding this whole
+            list on top costs one search round trip PER skill, so it is opt-in and the warning is not
+            decoration — it is the slowest field on the page by a wide margin. */}
+        <div className="mt-4">
+          <CheckboxField
+            label="Try to fill all of these skills, if possible"
+            checked={profile.fill_all_skills === true}
+            onChange={(v) => update((p) => { p.fill_all_skills = v; })}
+          />
+          <p className="mt-1.5 text-xs text-amber-400/90">
+            ⚠ This makes each application take noticeably longer — every skill is searched on the form
+            one at a time (roughly 1.5–3s each). Leave it off to keep just the skills Workday suggests
+            from your résumé; either way the list is shown on the review page, where you can add or
+            delete skills yourself.
+          </p>
+        </div>
       </SectionCard>
 
       {/* Languages */}

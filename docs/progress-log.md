@@ -3686,3 +3686,51 @@ correct: the offered rows are different skills. Per-skill evidence table: dom-pa
 Extension **1147/1148** (`test/skills.test.js`, 36 pins; the one failure is `db.test.js` — `fake-indexeddb`
 is missing from this worktree's `node_modules`, unrelated and pre-existing). One operator call still open:
 whether a partial fill should nag review or just name the absent skills in the detail (current behaviour).
+
+## 2026-08-07 (e) — the flow a first application should take: AUTOFILL WITH RESUME
+
+Operator's manual finding, which reframes the skills work: a first application should click **Autofill with
+Resume**, so Workday parses the résumé and seeds the form — including the Skills section — and the fill then
+refills it as if blank. Traced, built and live-verified the same day; DOM detail in dom-patterns 2026-08-07 (d).
+
+**Onboarding.** `runCdpOnboard` gained `preferResumeAutofill`, set only by `AP_RUN_APPLICATION`. Stage 2
+now chooses `autofillWithResume` over `applyManually` for a fill run; a REHEARSE/SUBMIT run deliberately
+keeps manual/continue so saved skills survive and the résumé is not re-parsed. The flow inserts a RÉSUMÉ
+page before My Information, which onboarding consumes with the existing `attachResume` (same ids) and a
+Continue click. Two things had to be got right:
+
+- **`isPastAuth` had to exclude it.** The page reports one bare `formField-` wrapper, so the past-auth test
+  called it "the form".
+- **The wait had to be generous.** At 6s the upload input had not mounted, so onboarding timed out and the
+  WALK adopted the page — attaching the résumé itself and writing a junk 1-field bundle page. Nothing
+  broke, but the résumé page is pre-form. Now render-budgeted, and the log reads
+  `résumé page done — Workday parsed it; the next page has 14 field(s)`.
+
+**The parse is a bonus layer, not a substitute.** Live it filled name/country/phone and left the entire
+address, `source`, and `candidateIsPreviousWorker` empty — Workday refused Save & Continue on the last one.
+A method note worth keeping: reading a radio group's `input.value` gives `"true"`/`"false"` as an
+ATTRIBUTE and a checkbox's gives `"on"`, regardless of selection. Reading those as state made the parse
+look like it had answered both fields when it had answered neither, and I reported that before catching it.
+Read `.checked`.
+
+**Skills policy, per the operator's spec.** New `profile.fill_all_skills` (a checkbox on the profile, with
+the warning that it makes each application noticeably longer). OFF (default) ⇒ keep Workday's suggestions,
+add nothing, record the list for the review page. ON ⇒ add every profile skill the taxonomy accepts on top.
+A replay always passes `fillAll:true` — it reproduces an approved list rather than re-deciding policy. The
+setting is excluded from teach's default-wording seeding (`NON_ANSWER_FIELDS`), since no form asks it.
+
+**And a fix that cascaded from a fix.** Parsed chips read back annotated (`Computer Hardware (Suggested)`),
+which Workday's review page does not print — so `skillChipName` strips it wherever a chip becomes a value.
+That immediately flagged a correctly-kept field `skills:audit-mismatch` on a live run, because the M40
+audit re-reads the RAW chips: cleaning one side is worse than cleaning neither. `auditActualFromRaw` now
+cleans too, and the next run read `audit: re-read 26 filled field(s) — all matched the report`.
+
+**Verified live** on three fresh cat.wd5 postings: `Stage 2 — clicking "Autofill with Resume"` → résumé
+page consumed by onboarding → 15 suggested skills kept (`kept the 15 skill(s) Workday suggested from the
+résumé — "try to fill all skills" is off`) → `✓✓ reached the REVIEW page after 5 page(s)`.
+
+Extension **1153/1154** (42 skills pins; `db.test.js` still fails on the missing `fake-indexeddb`). Web
+typecheck clean; the worktree's web VITEST cannot run at all (`Cannot find package '@/lib/job-key'` — the
+same broken `node_modules`), so the 4 web files are typecheck-verified only. NOT yet verified: the review
+page's rendering of the kept skills (the tracker push 401'd — the site session expired mid-session), and
+the rehearse path's manual/continue re-entry.

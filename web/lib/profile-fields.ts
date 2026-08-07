@@ -87,6 +87,10 @@ const META: Record<string, ProfileFieldMeta> = {
 
   // top-level free-text lists
   skills: { widget: "taglist", bucketWidget: "text" },
+  // A RUN SETTING, not an answer any form asks for — it decides whether the fill adds the whole skills
+  // list on top of Workday's résumé suggestions. Listed so the field walker knows its widget; it is
+  // rendered explicitly in the Skills card (with its slowness warning), not as a generic row.
+  fill_all_skills: { widget: "checkbox", bucketWidget: "checkbox" },
   employment_history_companies: { widget: "taglist", bucketWidget: "text" },
 
   // self_identification (EEO)

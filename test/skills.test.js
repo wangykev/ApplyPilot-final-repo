@@ -185,7 +185,7 @@ test("isSkillsField: narrow — the multiselect only, never a prose box or a lan
 
 test("fillSkillsCdp: adds every matchable skill on ONE open, mapping through the qualifier", async () => {
   const { act, st } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Docker", "Linux"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Docker", "Linux"], B, { fillAll: true });
   assert.equal(r.status, "filled");
   assert.deepEqual(st.chips, ["Python (Programming Language)", "Docker", "Linux"]);
   assert.match(r.detail, /Python → Python \(Programming Language\)/);
@@ -194,7 +194,7 @@ test("fillSkillsCdp: adds every matchable skill on ONE open, mapping through the
 
 test("fillSkillsCdp: a WIDENED commit lands but sends the field to review, naming the widening", async () => {
   const { act, st } = makeSkillsAct({ catalog: ["Xilinx Vivado", "Linux"], fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Vivado", "Linux"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Vivado", "Linux"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Xilinx Vivado", "Linux"], "Vivado landed under Workday's broader name");
   assert.equal(r.status, "filled_review", "a value we widened is not a silent fill");
   assert.equal(r.flag, "skills-containment");
@@ -204,7 +204,7 @@ test("fillSkillsCdp: a WIDENED commit lands but sends the field to review, namin
 
 test("fillSkillsCdp: a widening that had ALTERNATIVES names them, so review can switch", async () => {
   const { act, st } = makeSkillsAct({ catalog: ["Xilinx Vivado", "Vivado HLS"] });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Vivado"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Vivado"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Xilinx Vivado"]);
   assert.equal(r.flag, "skills-containment");
   assert.match(r.detail, /Workday also offered Vivado HLS/);
@@ -212,7 +212,7 @@ test("fillSkillsCdp: a widening that had ALTERNATIVES names them, so review can 
 
 test("fillSkillsCdp: exact-only adds stay a SILENT filled — widening is what triggers review", async () => {
   const { act } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Git"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Git"], B, { fillAll: true });
   assert.equal(r.status, "filled");
   assert.equal(r.flag, null);
   assert.deepEqual(r.skills_widened, []);
@@ -220,7 +220,7 @@ test("fillSkillsCdp: exact-only adds stay a SILENT filled — widening is what t
 
 test("fillSkillsCdp: a skill Workday does not know is left OFF the form and named", async () => {
   const { act, st } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Git", "Yosys", "ODrive"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Git", "Yosys", "ODrive"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Git"], "no fuzzy row was ever committed");
   assert.deepEqual(r.skills_not_offered, ["Yosys", "ODrive"]);
   assert.match(r.detail, /NOT in Workday's skill list.*Yosys, ODrive/);
@@ -231,12 +231,12 @@ test("fillSkillsCdp: NEVER touches skills already on the form, and re-running ad
   // The résumé parse / a previous run owns those chips. Idempotency is what stops a second pass
   // from committing "Docker (Software)" next to an existing "Docker".
   const { act, st } = makeSkillsAct({ catalog: CATALOG, chips: ["Docker"], fuzz: FUZZ });
-  const r1 = await fd.fillSkillsCdp(act, LOC, ["Docker", "Git"], B);
+  const r1 = await fd.fillSkillsCdp(act, LOC, ["Docker", "Git"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Docker", "Git"]);
   assert.equal(r1.status, "filled");
 
   const { act: a2, st: s2, log } = makeSkillsAct({ catalog: CATALOG, chips: st.chips.slice(), fuzz: FUZZ });
-  const r2 = await fd.fillSkillsCdp(a2, LOC, ["Docker", "Git"], B);
+  const r2 = await fd.fillSkillsCdp(a2, LOC, ["Docker", "Git"], B, { fillAll: true });
   assert.deepEqual(s2.chips, ["Docker", "Git"], "second pass is a no-op");
   assert.equal(r2.flag, "skills-already-present");
   assert.ok(!log.some((l) => l[0] === "enter"), "and it never even searched");
@@ -244,7 +244,7 @@ test("fillSkillsCdp: NEVER touches skills already on the form, and re-running ad
 
 test("fillSkillsCdp: a qualified chip from a prior run counts as present", async () => {
   const { act, log } = makeSkillsAct({ catalog: CATALOG, chips: ["Python (Programming Language)"], fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Python"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Python"], B, { fillAll: true });
   assert.equal(r.flag, "skills-already-present");
   assert.ok(!log.some((l) => l[0] === "enter"));
 });
@@ -253,7 +253,7 @@ test("fillSkillsCdp: a ZERO-result query free-text-adds, and that counts as fill
   // The one path by which an off-taxonomy skill actually lands. Accepted only because the new chip
   // IS what we typed — Workday completed it, we did not guess it.
   const { act, st } = makeSkillsAct({ catalog: CATALOG }); // no fuzz → unknown queries return zero
-  const r = await fd.fillSkillsCdp(act, LOC, ["CubeMars motor drivers"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["CubeMars motor drivers"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["CubeMars motor drivers"]);
   assert.equal(r.status, "filled");
 });
@@ -265,7 +265,7 @@ test("fillSkillsCdp: an unverifiable CLEAR never reaches Enter — a dirty box c
   // (never Enter on a concatenated query) and reported as an infra failure, not as absence.
   const fast = Object.assign({}, B, { taActionSettleCeilingMs: 120, taActionSettleIntervalMs: 20 });
   const { act, st, log } = makeSkillsAct({ catalog: CATALOG, clearBroken: true });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Git"], fast);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Git"], fast, { fillAll: true });
   assert.deepEqual(log.filter((l) => l[0] === "enter").map((l) => l[1]), ["Python"],
     "only the query whose box verified EMPTY reached Enter");
   assert.deepEqual(st.chips, ["Python (Programming Language)"], "no concatenated skill was fabricated");
@@ -278,7 +278,7 @@ test("fillSkillsCdp: a TRANSIENT clear failure retries — it must not abandon t
   // skills, silently giving up on Git/Docker/VS Code/Vivado. One failure is a transient (the clear is
   // focus-blind and a commit can move focus), so it retries; the list must still finish.
   const { act, st } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ, clearFailsFor: 1 });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Docker", "Linux", "Git"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Docker", "Linux", "Git"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Docker", "Linux", "Git"], "every skill still landed");
   assert.equal(r.status, "filled");
   assert.ok(!/stopped early/.test(r.detail), "and the field did not bail: " + r.detail);
@@ -287,7 +287,7 @@ test("fillSkillsCdp: a TRANSIENT clear failure retries — it must not abandon t
 test("fillSkillsCdp: a PERSISTENTLY stuck box stops after 2, and says so — it can't burn the budget", async () => {
   const fast = Object.assign({}, B, { taActionSettleCeilingMs: 120, taActionSettleIntervalMs: 20 });
   const { act, st, log } = makeSkillsAct({ catalog: CATALOG, clearBroken: true });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Docker", "Linux", "Git", "Python"], fast);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Docker", "Linux", "Git", "Python"], fast, { fillAll: true });
   assert.deepEqual(log.filter((l) => l[0] === "enter").map((l) => l[1]), ["Docker"],
     "only the first query, whose box was genuinely empty, reached Enter");
   assert.deepEqual(st.chips, ["Docker"], "nothing fabricated from a dirty box");
@@ -298,7 +298,7 @@ test("fillSkillsCdp: a commit that never lands is reported as FAILED, not as 'Wo
   // The distinction the human acts on: absent means add it by hand, failed means re-run.
   const { act } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
   act.clickHierLeaf = async () => true; // click dispatched, no chip ever appears
-  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Yosys"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Yosys"], B, { fillAll: true });
   assert.deepEqual(r.skills_failed, ["Linux"]);
   assert.deepEqual(r.skills_not_offered, ["Yosys"]);
   assert.match(r.detail, /could not be entered/);
@@ -313,7 +313,7 @@ test("fillSkillsCdp: opens by FOCUSING the input when the coordinate click can't
   const { act, st, log } = makeSkillsAct({ catalog: CATALOG });
   act.openHier = async () => { log.push(["open-FAILED"]); return false; };   // coordinate click lands nowhere
   act.openHierInput = async () => { log.push(["openInput"]); st.open = true; return { ok: true, focused: true }; };
-  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Git"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Git"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Linux", "Git"]);
   assert.equal(r.status, "filled");
   assert.ok(log.some((l) => l[0] === "openInput"), "used the input-focus/click route, not coordinates");
@@ -330,7 +330,7 @@ test("fillSkillsCdp: the opener RETRIES an open that lost the race, alternating 
     return { ok: true, focused: true, openedNow: st.open }; };
   act.openHier = async () => { log.push(["container-coords"]); return true; };
   act.clickHierInputRect = async () => { log.push(["input-coords"]); return true; };
-  const r = await fd.fillSkillsCdp(act, LOC, ["Linux"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux"], B, { fillAll: true });
   assert.deepEqual(st.chips, ["Linux"], "a first-attempt miss no longer costs the whole field");
   assert.equal(r.status, "filled");
   assert.ok(opens >= 2, "it retried the coordinate-free route");
@@ -341,21 +341,21 @@ test("fillSkillsCdp: the opener RETRIES an open that lost the race, alternating 
 
 test("fillSkillsCdp: nothing matched and the field is BLANK → needs_review", async () => {
   const { act } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Yosys", "ODrive"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Yosys", "ODrive"], B, { fillAll: true });
   assert.equal(r.status, "needs_review");
   assert.equal(r.flag, "skills-none-matched");
 });
 
 test("fillSkillsCdp: an empty profile list is a skip, not an error", async () => {
   const { act, log } = makeSkillsAct({ catalog: CATALOG });
-  const r = await fd.fillSkillsCdp(act, LOC, [], B);
+  const r = await fd.fillSkillsCdp(act, LOC, [], B, { fillAll: true });
   assert.equal(r.status, "skipped");
   assert.ok(!log.length, "the widget was never even opened");
 });
 
 test("fillSkillsCdp: the cap is reported, never silent", async () => {
   const { act, st } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
-  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Docker", "Linux"], B, { maxAdds: 2 });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Docker", "Linux"], B, { maxAdds: 2, fillAll: true });
   assert.equal(st.chips.length, 2);
   assert.match(r.detail, /1 skill\(s\) not attempted — the 2-skill cap/);
 });
@@ -364,10 +364,73 @@ test("fillSkillsCdp: an unexpected chip is surfaced, never accepted quietly", as
   const { act, st } = makeSkillsAct({ catalog: CATALOG });
   const orig = act.clickHierLeaf;
   act.clickHierLeaf = async (loc, label) => { const ok = await orig(loc, label); st.chips.push("Something Else"); return ok; };
-  const r = await fd.fillSkillsCdp(act, LOC, ["Linux"], B);
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux"], B, { fillAll: true });
   assert.equal(r.status, "needs_review");
   assert.equal(r.flag, "skills-stray");
   assert.match(r.detail, /UNEXPECTED chip\(s\): Something Else/);
+});
+
+// ── Workday's "(Suggested)" annotation on résumé-parsed chips ───────────────
+
+test("skillChipName strips Workday's (Suggested) provenance marker, not a real qualifier", () => {
+  // Live on the Autofill-with-Resume flow: the parse's chip reads "Digital Systems (Suggested)", while
+  // Workday's own review page prints the bare name — so recording the annotated form would store a value
+  // the review page never shows and the reconcile would call a filled skill missing.
+  assert.equal(lib.skillChipName("Digital Systems (Suggested)"), "Digital Systems");
+  assert.equal(lib.skillChipName("Python (Programming Language)"), "Python (Programming Language)",
+    "a real qualifier is part of the name");
+  assert.equal(lib.skillChipName("Linux"), "Linux");
+});
+
+test("fillSkillsCdp: records the BARE name for a suggested chip, and dedupes against it", async () => {
+  const { act, log } = makeSkillsAct({ catalog: CATALOG, chips: ["Digital Systems (Suggested)", "Linux (Suggested)"] });
+  const kept = await fd.fillSkillsCdp(act, LOC, ["Git"], B);
+  assert.equal(kept.after, "Digital Systems; Linux", "no annotation reaches the bundle");
+  // and with fill-all on, a suggested chip still counts as covering the profile's own wording
+  const { act: a2, log: l2 } = makeSkillsAct({ catalog: CATALOG, chips: ["Linux (Suggested)"] });
+  const r = await fd.fillSkillsCdp(a2, LOC, ["Linux"], B, { fillAll: true });
+  assert.equal(r.flag, "skills-already-present");
+  assert.ok(!l2.some((x) => x[0] === "enter"), "never re-searched a skill the parse already suggested");
+  assert.ok(!log.some((x) => x[0] === "enter"));
+});
+
+test("auditActualFromRaw: the audit strips (Suggested) too, or a kept field reads as a mismatch", () => {
+  // This regressed the instant the stripping was introduced: the fill recorded the bare names while the
+  // M40 audit re-read the annotated chips, so a correctly-kept skills field was flagged
+  // `skills:audit-mismatch` on a live run. Both sides must clean.
+  const got = fd.auditActualFromRaw("typeahead", { chips: ["Computer Hardware (Suggested)", "Linux"] });
+  assert.equal(got.actual, "Computer Hardware; Linux");
+  assert.equal(got.readable, true);
+});
+
+// ── the fill-all policy (the profile checkbox) ──────────────────────────────
+
+test("fillSkillsCdp: fill-all OFF keeps Workday's suggested skills and adds NOTHING", async () => {
+  // Autofill-with-Resume seeds this field with Workday's own suggestions. With the checkbox off we keep
+  // them, spend no search round trips, and record the list so the review page can edit it.
+  const { act, st, log } = makeSkillsAct({ catalog: CATALOG, chips: ["Python (Programming Language)", "Linux"] });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Git", "Docker", "Vivado"], B);
+  assert.deepEqual(st.chips, ["Python (Programming Language)", "Linux"], "suggestions untouched, nothing added");
+  assert.equal(r.status, "filled");
+  assert.equal(r.flag, "skills-suggested-kept");
+  assert.equal(r.after, "Python (Programming Language); Linux", "recorded, so review can add/delete");
+  assert.ok(!log.length, "and it never even opened the widget");
+});
+
+test("fillSkillsCdp: fill-all OFF with an EMPTY field says how to turn it on", async () => {
+  const { act } = makeSkillsAct({ catalog: CATALOG });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Git"], B);
+  assert.equal(r.status, "skipped");
+  assert.match(r.detail, /try to fill all skills.*is off/i);
+  assert.match(r.detail, /1\.5–3s per skill/, "the warning names the real cost");
+});
+
+test("fillSkillsCdp: fill-all ON adds on TOP of the suggestions, never replacing them", async () => {
+  const { act, st } = makeSkillsAct({ catalog: CATALOG, chips: ["Python (Programming Language)"] });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Git"], B, { fillAll: true });
+  assert.deepEqual(st.chips, ["Python (Programming Language)", "Git"],
+    "the suggestion is kept (and covers the profile's 'Python'), Git is added");
+  assert.equal(r.status, "filled");
 });
 
 // ── the reconcile against Workday's own review page ─────────────────────────

@@ -42,7 +42,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
       // search is already fuzzy, and wrong), and missingSkills is what keeps a re-fill idempotent.
       skillBaseName: skillBaseName, matchSkillOption: matchSkillOption, missingSkills: missingSkills,
-      isSkillsFieldName: isSkillsFieldName,
+      isSkillsFieldName: isSkillsFieldName, skillChipName: skillChipName,
       // The AI's option list must never include a menu's prompt row ("Select One").
       isPlaceholderOption: isPlaceholderOption, withoutPlaceholderOptions: withoutPlaceholderOptions };
 
@@ -2985,7 +2985,11 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
   const wanted = (Array.isArray(skills) ? skills : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean);
   const pre = await act.readHier(loc);
   if (!pre) return { status: "error", detail: "skills wrapper not found" };
-  const priorChips = pre.chips.slice();
+  // A résumé-parse chip reads back as "Digital Systems (Suggested)"; that annotation is Workday's own
+  // provenance marker and does NOT appear on its review page, so it is stripped everywhere a chip
+  // becomes a recorded/compared VALUE (see skillChipName).
+  const chipNames = (arr) => (Array.isArray(arr) ? arr : []).map(apMatch.skillChipName).filter(Boolean);
+  const priorChips = chipNames(pre.chips);
   if (!wanted.length) {
     return { status: "skipped", after: priorChips.length ? priorChips.join("; ") : null,
       detail: "no skills in the profile" };
@@ -2994,6 +2998,22 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
   // from its own results, so re-searching a committed "Docker" offers only "Docker (Software)" /
   // "Dockerfile". Without this the second pass would commit a near-duplicate of every skill it
   // already added. Base-name comparison, so a qualified chip covers the bare profile name.
+  // ── RECOMMENDED-ONLY (the default) ──────────────────────────────────────────────────────────────
+  // Workday's "Autofill with Resume" parse seeds this field with its OWN suggested skills, and adding
+  // the profile's list on top is slow — every skill is a separate search round trip. So unless the
+  // operator opted in (`profile.fill_all_skills`, the "try to fill all skills" checkbox), we KEEP what
+  // the parse suggested, add nothing, and record it so the review page shows the list for adding or
+  // deleting by hand. Nothing is ever removed here.
+  if (!opts.fillAll) {
+    if (priorChips.length) {
+      return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "skills-suggested",
+        flag: "skills-suggested-kept", confidence: "high", skills_added: [], skills_not_offered: [],
+        detail: `kept the ${priorChips.length} skill(s) Workday suggested from the résumé — "try to fill all skills" is off, so none of the profile's ${wanted.length} were added. Edit the list on the review page.` };
+    }
+    return { status: "skipped", after: null,
+      detail: `no skills on the form and "try to fill all skills" is off — turn it on in the profile to add the ${wanted.length} from your profile (it is slow: roughly 1.5–3s per skill).` };
+  }
+
   const todo = apMatch.missingSkills(wanted, priorChips);
   if (!todo.length) {
     return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled",
@@ -3089,8 +3109,10 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
     // Chips BEFORE this skill — the add is verified as a GROWTH from here, so a commit that
     // silently replaced instead of adding could never read as success.
     const before = await act.readHier(loc);
-    const chipsBefore = before && before.chips ? before.chips.slice() : [];
-    const chipSetIsNew = (chips) => chipSetChanged(chipsBefore, chips);
+    const chipsBefore = chipNames(before && before.chips);
+    // Compare CLEANED against CLEANED — mixing raw "X (Suggested)" with a cleaned "X" would read as a
+    // brand-new chip on every poll and report a phantom autocommit.
+    const chipSetIsNew = (chips) => chipSetChanged(chipsBefore, chipNames(chips));
 
     if (!(await ensureFocused())) {
       // WHY it missed, per attempt — without this the log says only "could not focus", which has at
@@ -3145,13 +3167,13 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
     step.count = s && s.pageWide ? s.pageWide.count : null;
     step.banner = !!(s && s.banner);
     step.open = !!(s && s.searchBox && s.searchBox.visible);
-    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null;
+    step.chips = chipNames(s && s.chips).join("; ") || null;
 
     if (outcome === "autocommit") {
       // Workday committed on its own. On THIS widget that means the query returned zero rows and it
       // added the typed text verbatim — the one path by which a skill outside the taxonomy actually
       // lands, so it is a success when the new chip is what we typed, and a stray when it is not.
-      const now = s && s.chips ? s.chips : [];
+      const now = chipNames(s && s.chips);
       const fresh = now.filter((c) => !chipsBefore.some((p) => norm(p) === norm(c)));
       const mine = fresh.filter((c) => apMatch.skillBaseName(c) === apMatch.skillBaseName(skill));
       if (mine.length) { added.push({ skill, option: mine[0], tier: "free-text" }); step.added = mine[0]; }
@@ -3193,7 +3215,7 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
       while (Date.now() - tCommit < budgets.commitCeilingMs) {
         await act.delay(budgets.commitIntervalMs);
         const after = await act.readHier(loc);
-        const chips = (after && after.chips) || [];
+        const chips = chipNames(after && after.chips);
         // GROWTH + identity: the set gained a chip AND that chip is the option we clicked.
         if (chips.length > chipsBefore.length && chips.some((c) => norm(c) === norm(option))) { ok = true; break; }
       }
@@ -3205,7 +3227,7 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
   // Tab is the only clean exit: it blurs, clears the query and closes the list without committing
   // (verified on this widget — the box read back empty with no stray chip).
   const endChips = await tabBlurExit(act, loc, (l) => act.readHier(l));
-  const finalChips = endChips == null ? priorChips : endChips;
+  const finalChips = endChips == null ? priorChips : chipNames(endChips);
   const unexpected = finalChips.filter((c) =>
     !priorChips.some((p) => norm(p) === norm(c)) && !added.some((a) => norm(a.option) === norm(c)));
   if (unexpected.length) strays.push(...unexpected);
@@ -4064,7 +4086,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         const list = (profile && Array.isArray(profile.skills)) ? profile.skills : [];
         record.rawValue = list.length ? list.slice() : null;
         record.resolved = list.slice();
-        Object.assign(record, await fillSkillsCdp(act, loc, list, budgets));
+        // OPT-IN, because the cost scales with the profile (~1.5–3s per skill) while Workday's résumé
+        // parse has usually already suggested a reasonable set. Off ⇒ keep the suggestions and record
+        // them for review; on ⇒ add every profile skill the taxonomy will accept.
+        Object.assign(record, await fillSkillsCdp(act, loc, list, budgets, { fillAll: !!(profile && profile.fill_all_skills) }));
       } else if (!mappedPath) {
         record.status = "skipped";
         record.detail = "no mapping";
@@ -6429,7 +6454,13 @@ function auditActualFromRaw(widgetType, raw) {
     // a GROUP can hold several — compare the whole set, or a two-answer field reads as a mismatch
     case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const on = ok ? raw.filter((o) => o.checked).map((o) => o.labelText) : [];
       return { actual: on.length ? apMatch.joinGroupValue(on) : null, readable: ok }; }
-    case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
+    // Chips go through skillChipName so Workday's "(Suggested)" provenance marker is stripped on BOTH
+    // sides of the comparison. The fill records the bare name (that is what the review page prints), so
+    // without this the audit re-read the annotated chip and flagged a correctly-kept skills field as an
+    // audit-mismatch — observed the moment the stripping was introduced. A no-op for every other
+    // typeahead, whose chips carry no such marker.
+    case "typeahead": case "hierarchical":
+      return { actual: raw && raw.chips ? raw.chips.map(apMatch.skillChipName).join("; ") : null, readable: !!raw };
     case "date": {
       if (!Array.isArray(raw)) return { actual: null, readable: false };
       const parts = [];
@@ -6602,8 +6633,11 @@ async function replayField(act, entry, budgets) {
   // second rehearsal actuates nothing) — that is also why this sits ABOVE skip-if-correct: an ordering
   // difference between the chips and the stored string must not read as a mismatch and trigger a re-add.
   if (isSkillsField({ widgetType: widget, fieldName: replayEntryFieldName(entry), label: entry.question_label })) {
+    // fillAll:true regardless of the profile toggle — a replay is not making the policy choice, it is
+    // reproducing the list a human APPROVED. (On a rehearse the form re-entered via Continue already
+    // holds those skills, so missingSkills makes this a no-op; the flag only matters if one is absent.)
     return Object.assign({ replay: "skills-multi" },
-      await fillSkillsCdp(act, loc, apMatch.splitGroupValue(value), b));
+      await fillSkillsCdp(act, loc, apMatch.splitGroupValue(value), b, { fillAll: true }));
   }
 
   // SKIP-IF-CORRECT (minimal-diff replay): read the field's LIVE value FIRST; if it already equals the
@@ -7688,5 +7722,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

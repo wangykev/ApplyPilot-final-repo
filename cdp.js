@@ -1959,6 +1959,15 @@ function cdpOnboardScan() {
     adventureButton: present('[data-automation-id="adventureButton"]'),
     continueButton: present('[data-automation-id="continueButton"]'),
     applyManually: present('[data-automation-id="applyManually"]'),
+    // "Autofill with Resume" — the chooser option that makes Workday PARSE the résumé and pre-populate
+    // the application, including the Skills section with its own suggested skills (traced 2026-08-07 on
+    // cat.wd5). Preferred for a FIRST application; never used by a rehearse/submit run, which must not
+    // re-parse (see runCdpOnboard's preferResumeAutofill).
+    autofillWithResume: present('[data-automation-id="autofillWithResume"]'),
+    // The résumé-upload page that Autofill-with-Resume lands on BEFORE My Information: a page with the
+    // upload input and effectively no form fields. Same automation-ids attachResume already drives.
+    resumeUploadInput: present('input[type="file"][data-automation-id="file-upload-input-ref"]'),
+    resumeUploadSuccess: present('[data-automation-id="file-upload-successful"]'),
     useMyLastApplication: present('[data-automation-id="useMyLastApplication"]'),
     signInLink: present('[data-automation-id="signInLink"]'),
     createAccountLink: present('[data-automation-id="createAccountLink"]'),

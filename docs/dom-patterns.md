@@ -3612,3 +3612,55 @@ chip as covering the profile name, or the next pass would search `Vivado` again,
 `Git`, `Java (Programming Language)`, `JavaScript`, `Linux`, `Modbus`, `PCB design`,
 `Python (Programming Language)`, `Raspberry Pi`, `ROS 2`, `RViz`, `SystemVerilog`, `Yosys`, `rqt`,
 `Xilinx Vivado`. The remaining six are the refusals above, all correct.
+
+## 2026-08-07 (d) — AUTOFILL WITH RESUME: the flow a first application should actually take
+
+Operator's manual finding: the first application on a tenant should click **Autofill with Resume**, not
+Apply Manually, because Workday then parses the résumé and pre-populates the form — including the Skills
+section with its own suggestions. Traced and implemented the same day.
+
+**The chooser** (after `adventureButton`) offers four options, all by automation-id:
+`autofillWithResume` ("Autofill with Resume") · `applyManually` · `useMyLastApplication` (already in
+APPLY_REJECT) · `applyWithLinkedIn`.
+
+**The page order changes.** Autofill-with-Resume lands on `/apply/autofillWithResume` — a RÉSUMÉ page
+that comes BEFORE My Information:
+
+| step | page | notes |
+|---|---|---|
+| 1 | résumé upload | `input[type=file][data-automation-id="file-upload-input-ref"]`, gate `file-upload-successful`, footer `pageFooterNextButton` reading **"Continue"** — every id `attachResume` already drives |
+| 2 | My Information | the same 14 `formField-*` wrappers as the manual flow |
+| 3+ | My Experience, … | unchanged |
+
+**⚠ The résumé page reports ONE bare `formField-` wrapper**, so `isPastAuth` (fieldCount > 0 && no auth
+chrome) called it "the form". Onboarding therefore excludes it explicitly and consumes it — upload +
+Continue — before any reached-form return. First cut waited only 6s for it to mount, timed out, and the
+WALK picked the page up instead: it attached the résumé itself and wrote a junk 1-field bundle page. The
+wait is now render-budgeted (15s visible / 30s hidden), and the log shows onboarding owning it:
+`résumé page done — Workday parsed it; the next page has 14 field(s)`.
+
+**What the parse actually gives you, and why the fill still refills everything.** Live it filled name,
+country, phone type/code/number — and left `addressLine1`, `city`, `countryRegion`, `postalCode` and
+`source` EMPTY, and `candidateIsPreviousWorker` unanswered (Workday blocked Save & Continue on it). So the
+autofill is a bonus layer, never a substitute: the walk treats the page as a blank form and refills it.
+(A caution for anyone reading state by hand: a radio group's `input.value` is `"true"`/`"false"` as an
+ATTRIBUTE regardless of selection, and a checkbox's is `"on"` — reading those as state made the parse look
+like it had answered both when it had answered neither. Read `.checked`.)
+
+**Skills after the parse — the payoff.** The Skills multiselect arrives pre-populated, and each parsed chip
+is annotated: `Computer Hardware (Suggested)`, `Digital Systems (Suggested)`. Counts vary by run (1 on one
+posting, **15** on another).
+
+- **The "(Suggested)" suffix is UI provenance, not part of the name.** Workday's own review page prints the
+  bare name (operator), so `skillChipName` strips it wherever a chip becomes a recorded, deduped or
+  replayed VALUE — otherwise the bundle stores a value the review page never shows and the reconcile
+  reports a correctly-filled skill as missing.
+- **It has to be stripped on BOTH sides.** The moment the fill recorded bare names, the M40 audit — which
+  re-reads the raw chips — flagged a correctly-kept field `skills:audit-mismatch` on a live run.
+  `auditActualFromRaw` now cleans chips too (a no-op for every other typeahead).
+- Also of note: the review page needs a **"more (+)"** click to reveal the full list, and drops the
+  "(Suggested)" annotation. Both expected; neither affects the fill.
+
+**REHEARSE/SUBMIT deliberately does NOT come here.** It applies manually / continues, so the saved skills
+survive and Workday does not re-parse the résumé over them — `preferResumeAutofill` is set only by the
+FILL run (`AP_RUN_APPLICATION`).

@@ -537,6 +537,16 @@ function splitGroupValue(v) {
 //     (bare or qualified) may be committed; anything else is left for the human to add by hand.
 const SKILL_QUALIFIER_RE = /\s*\([^()]*\)\s*$/; // ONE trailing "(...)" — never a mid-string paren
 
+// Workday annotates a chip the RÉSUMÉ PARSE contributed as "Digital Systems (Suggested)" (traced live
+// 2026-08-07 on the Autofill-with-Resume flow). That suffix is UI provenance, not part of the skill's
+// name — Workday's own review page prints the bare name — so it is stripped before a chip is recorded,
+// deduped or replayed. Without this the bundle stores a value the review page never shows, and the
+// reconcile reports a correctly-filled skill as missing. Only this exact marker is removed; a real
+// qualifier like "(Programming Language)" is part of the name and stays.
+function skillChipName(s) {
+  return String(s == null ? "" : s).replace(/\s*\((?:suggested|recommended)\)\s*$/i, "").trim();
+}
+
 // "Python (Programming Language)" → "python". A name that is NOTHING but a parenthetical is kept
 // whole, so a degenerate option can't collapse to "" and match everything.
 function skillBaseName(s) {
@@ -2092,7 +2102,7 @@ function devLogSelect(ring, opts) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
-  skillBaseName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
+  skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,

@@ -228,6 +228,11 @@ export const profileSchema = z.object({
   work_experience: z.array(workExperienceSchema).default([]),
   education: z.array(educationSchema).default([]),
   skills: z.array(z.string()).default([]),
+  // Workday's "Autofill with Resume" already suggests a set of skills, and adding the whole profile list
+  // on top costs a separate search round trip PER SKILL (~1.5–3s each — it is the slowest field on the
+  // page). So it is OPT-IN: off ⇒ keep Workday's suggestions and record them for review; on ⇒ also add
+  // every profile skill the taxonomy accepts. Default false, i.e. fast.
+  fill_all_skills: z.boolean().default(false),
   languages: z.array(languageSchema).default([]),
   certifications: z.array(certificationSchema).default([]),
   work_authorization: workAuthSchema,

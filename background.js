@@ -372,7 +372,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
         // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
         // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
-        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        // preferResumeAutofill: a FILL run takes "Autofill with Resume" so Workday parses the résumé and
+        // seeds the Skills section with its suggestions; the fill then refills the form as if blank. The
+        // SUBMIT/rehearse run below deliberately does NOT, so saved skills survive un-reparsed.
+        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null, preferResumeAutofill: true });
         // The page turned out to host a non-Workday ATS in an iframe — drive it with that
         // pipeline instead of reporting a page we could not read.
         if (onb && onb.embeddedAts && onb.embeddedUrl) {
@@ -6058,6 +6061,11 @@ async function runCdpOnboard(tabId, opts) {
   const creds = o.credentials || null;
   const gmailEnabled = !!o.gmailEnabled;
   const startUrl = o.startUrl || null;
+  // Prefer "Autofill with Resume" on the apply chooser (a FILL run). A REHEARSE/SUBMIT run leaves this
+  // OFF so it applies manually / continues — that keeps the already-saved skills and stops Workday
+  // re-parsing the résumé over them (operator, 2026-08-07).
+  const preferResumeAutofill = !!o.preferResumeAutofill;
+  let resumeAutofilled = false;
   let accountCreated = false, verified = false, softReloads = 0;
   // Workday sometimes returns an EMPTY shell after the sign-in submit — recoverable by a reload
   // (see isBlankAuthPage). RUN-level budget: if refreshing twice doesn't restore a real page, it's
@@ -6138,7 +6146,47 @@ async function runCdpOnboard(tabId, opts) {
   // made the flow conclude the fields would never arrive and halt on a WRONG reason. Visible keeps the
   // tuned, live-verified fast values; hidden gets room to actually finish rendering.
   const renderBudget = async (visibleMs, hiddenMs) => ((await cdpVisible()) ? visibleMs : hiddenMs);
-  const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
+  const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl && !onResumeUploadPage(s);
+
+  // ── The résumé-upload page (Autofill with Resume) ────────────────────────────────────────────────
+  // Traced 2026-08-07 on cat.wd5: "Autofill with Resume" lands on `/apply/autofillWithResume`, which
+  // carries the upload input and only reaches My Information after the upload — so Workday parses the
+  // résumé and pre-populates the application, INCLUDING the Skills section with its own suggestions.
+  // It reports ONE bare `formField-` wrapper, which is why isPastAuth excludes it above: otherwise
+  // onboarding would announce "reached the form" and hand the walk a page with no real fields.
+  // The automation-ids are the ones attachResume already drives, so the upload itself is reused as-is.
+  function onResumeUploadPage(s) {
+    return !!(s && s.markers && s.markers.resumeUploadInput) && (s.formFieldCount || 0) <= 1;
+  }
+  // Upload the stored résumé (if it isn't already up) and click Continue. Returns {scan} on success or
+  // {halt} with a self-explaining stop — never a bare false, since every failure here is operator-actionable.
+  const consumeResumeUploadPage = async (s) => {
+    let rec = null;
+    try { rec = await getResume(); } catch (e) { /* treated as none */ }
+    if (!rec || !rec.base64) {
+      LOG("⛔ on Workday's résumé-upload page but NO résumé is stored — upload one on the website first.");
+      return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-missing-for-autofill",
+        detail: "Autofill with Resume needs the stored résumé and none is saved in the extension." } };
+    }
+    if (s.markers && s.markers.resumeUploadSuccess) LOG("the résumé is already uploaded on this page — continuing.");
+    else {
+      LOG(`uploading the résumé for Workday's autofill parse (${rec.filename || "resume.pdf"})…`);
+      const ar = await cdpAttachResumeConfirmed(rec, LOG);
+      if (!ar || !ar.attached) {
+        return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-failed",
+          detail: "the résumé upload never confirmed on the Autofill page — " + ((ar && ar.detail) || "no detail") } };
+      }
+    }
+    const c = await clickTarget(['[data-automation-id="pageFooterNextButton"]'], "Continue (after the résumé upload)");
+    if (!c.clicked) {
+      return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-continue-blocked",
+        detail: c.blockedBy || "Continue was not clickable on the résumé-upload page" } };
+    }
+    // Workday PARSES the résumé on this transition, so it is slower than an ordinary page advance.
+    const w = await waitFor((sc) => (sc.formFieldCount || 0) > 1 || sc.hasAuthEl, await renderBudget(25000, 50000), "post-resume-upload(parse)");
+    LOG(`résumé page done — Workday parsed it; the next page has ${(w.scan && w.scan.formFieldCount) || 0} field(s).`);
+    return { scan: w.scan || s };
+  };
   // "We are on the JOB-DESCRIPTION page, not an auth screen" (2026-07-29). `signInButtonPresent` is a TEXT
   // match over every clickable, and a Workday posting carries "Sign In" in its own HEADER — so a JD page
   // satisfied the Stage-3 auth condition, and doAuth then waited its full budget for credential fields that
@@ -6766,7 +6814,19 @@ async function runCdpOnboard(tabId, opts) {
       if (await maybeRefresh(st)) st = await scan() || st;
 
       const oc = classifyAuthOutcome(st);
-      if (oc === "success" || isPastAuth(st)) { LOG("reached the application form."); return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified }; }
+      if (oc === "success" || isPastAuth(st) || onResumeUploadPage(st)) {
+        // Signing in can land on the RÉSUMÉ page rather than the form, when Autofill with Resume was
+        // chosen before the auth screen appeared. Consume it here too, or onboarding would report
+        // "reached the form" while sitting on a page that has no fields to fill.
+        if (onResumeUploadPage(st)) {
+          const r = await consumeResumeUploadPage(st);
+          if (r.halt) return r.halt;
+          st = r.scan || st;
+          resumeAutofilled = true;
+        }
+        LOG("reached the application form.");
+        return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified, resume_autofilled: resumeAutofilled };
+      }
       // ALREADY APPLIED inside the auth loop (audit, 2026-07-27). It was checked at the initial scan, at
       // the start of Stage 3, and after a successful sign-in — but NOT here, so an already-applied page
       // reached during the loop fell through to the race-guard and halted `auth-form-not-rendered`: a
@@ -7091,9 +7151,46 @@ async function runCdpOnboard(tabId, opts) {
       LOG('only "Use My Last Application" is offered on this page — refusing to reuse a prior application; waiting for a manual-apply/auth path…');
     }
 
-    // ── STAGE 2: Apply Manually ──
+    // ── STAGE 2: the chooser — Autofill with Resume (a FILL run) or Apply Manually ──
     st = await scan() || st;
-    if (st.markers.applyManually) {
+    // AUTOFILL WITH RESUME is preferred for a FILL run (operator, 2026-08-07): Workday parses the résumé
+    // and pre-populates the application, which is what puts its own SUGGESTED skills in the Skills
+    // section. The fill still treats the result as a blank form and refills it (the parse is unreliable —
+    // live it left the whole address blank and answered nothing for the previously-worked question), so
+    // this only ADDS Workday's parse on top; it never replaces our own fill.
+    // A REHEARSE/SUBMIT run deliberately does NOT come here — it applies manually / continues, so the
+    // saved skills survive and the résumé is not re-parsed.
+    if (preferResumeAutofill && st.markers.autofillWithResume) {
+      LOG('Stage 2 — clicking "Autofill with Resume" (first application: let Workday parse the résumé).');
+      emitRunProgress("Starting the application", "Autofill with Resume");
+      const AR_SEL = '[data-automation-id="autofillWithResume"]';
+      const c = await clickTarget([AR_SEL], "Autofill with Resume");
+      if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "autofill-resume-blocked", detail: c.blockedBy || "Autofill with Resume not clickable" };
+      // Either the résumé page appears (already signed in) or the auth screen does (Stage 3 then runs and
+      // consumes the résumé page after signing in) — the same escalation shape Stage 1 and 2 both use.
+      const autofillLanded = (s) => onResumeUploadPage(s) || s.hasAuthEl || (s.formFieldCount || 0) > 1;
+      // A GENEROUS first wait, unlike Stage 1/2's 4s fast-first. Live (cat.wd5, hidden): the résumé page
+      // had not mounted its upload input by 6s, so this timed out, the in-page fallback then reported
+      // "selector not found" (the chooser was already gone — we HAD navigated), and onboarding handed the
+      // page to the WALK, which attached the résumé itself and wrote a junk 1-field bundle page. Nothing
+      // failed, but the résumé page belongs to onboarding: it is pre-form.
+      let w = await waitFor(autofillLanded, await renderBudget(15000, 30000), "post-autofill-with-resume");
+      st = w.scan || st;
+      if (!autofillLanded(st)) {
+        const d = await cdpEval(cdpActivateBySelector, AR_SEL, "click");
+        if (d && d.ok) {
+          LOG(`  autofill fallback: activating "${d.label}" in-page via ${d.via}.`);
+          w = await waitFor(autofillLanded, 12000, "post-autofill-with-resume(in-page)");
+          st = w.scan || st;
+        } else LOG(`  autofill fallback unavailable — ${(d && d.reason) || "eval failed"}.`);
+      }
+      if (onResumeUploadPage(st)) {
+        const r = await consumeResumeUploadPage(st);
+        if (r.halt) return r.halt;
+        st = r.scan || st;
+        resumeAutofilled = true;
+      }
+    } else if (st.markers.applyManually) {
       LOG('Stage 2 — clicking "Apply Manually".');
       const AM_SEL = '[data-automation-id="applyManually"]';
       const c = await clickTarget([AM_SEL], "Apply Manually");
