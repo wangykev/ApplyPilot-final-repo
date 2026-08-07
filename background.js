@@ -4912,6 +4912,7 @@ async function runCdpReplayWalk(tabId, opts) {
       // saved anyway; the extra fields then mounted and changed the page signature, which read as an
       // "advance", so the same physical page got processed twice.
       cdpSetTrustedText(false); // scope the self-ID override below to the ONE page that asks for it
+      cdpSetSyntheticInput(true); // ditto for the CLICK override — restore the run-level mode each page
       const rSettleMs = await awaitFieldSetSettled(act);
       const scan = await cdpEval(cdpPageScan);
       LOG(`page ${page}: field set settled in ${rSettleMs}ms — ${((scan && scan.fields) || []).length} flat field(s) on the page.`);
@@ -4926,8 +4927,32 @@ async function runCdpReplayWalk(tabId, opts) {
       // Scoped by the unconditional reset at the TOP of every iteration (see above the settle), rather
       // than a try/finally around this ~700-line body — same guarantee, nothing restructured.
       if (isSelfIdPage((scan && scan.fields) || [])) {
-        LOG(`page ${page}: SELF-ID page — forcing TRUSTED text/date input for the replay (synthetic writes are ignored on this surface); clicks are left alone.`);
+        // ── TRUSTED for the WHOLE self-ID page on the replay, CLICKS INCLUDED (2026-08-07) ──────────
+        // Text/date went trusted here on 2026-08-06; clicks were deliberately left synthetic on the
+        // strength of a 2026-08-05 fill-path note ("the disability checkbox committed and held 2/2
+        // under synthetic, whereas trusted clicks on it produce the intermittent did-not-commit").
+        // The REPLAY evidence contradicts that, and it is the newer and more direct evidence:
+        //
+        //   analogdevices.wd1, page 5, every run — `page 5 replay: 5 field(s) — 3 changed,
+        //   1 already-correct, 1 not-actuated, 0 FAILED` (our read-back says the box IS checked),
+        //   then Save & Continue comes back `error text present — a real validation block`
+        //   naming that very field as required. The synthetic click updated the DOM and React and
+        //   NOT Workday's own form model — the exact mechanism the force-re-fill below already
+        //   asserts in its success log, and which its FOLLOW-UP note proposed fixing right here.
+        //
+        // The force-re-fill then re-writes the SAME field with TRUSTED input and the page advances,
+        // which is a direct, repeated demonstration that trusted clicks DO commit on this widget —
+        // so the 2026-08-05 concern does not hold on this surface. Doing it up front costs one Save
+        // cycle less per run and, on waystar.wd1, is the difference between replaying and halting:
+        // there the synthetic click does not even update the DOM (`asked for [...] and it holds []`),
+        // which fails the strict verify BEFORE any error text exists, so the force-re-fill — which is
+        // driven off Workday's error text — can never be reached.
+        //
+        // Verification is unchanged: fillCheckboxGroupCdp still re-reads and requires exactly one box
+        // on, and the force-re-fill remains as the net if a trusted click ever does flake.
+        LOG(`page ${page}: SELF-ID page — forcing TRUSTED input for the replay, CLICKS INCLUDED (Workday's model ignores synthetic writes AND synthetic clicks on this surface).`);
         cdpSetTrustedText(true);
+        cdpSetSyntheticInput(false);
       }
       const fields = (scan && scan.fields) || [];
       const liveNames = fields.map((f) => f.fieldName);
