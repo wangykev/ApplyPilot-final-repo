@@ -990,11 +990,15 @@ const parseAiReply = (text) => {
     const cat = pick("suggested_category", "category");
     return {
       choice: pick("choice", "answer"), justification: pick("justification", "reason"), confidence: _aiConf(obj.confidence),
+      // `approximate` — the CLOSEST option rather than a true synonym. A choice list must always be
+      // answered (a blank required field blocks the page), so the canonicalize prompt asks for the nearest
+      // option instead of UNKNOWN, and this flags that it is nearest-not-equal so review says so loudly.
+      approximate: obj.approximate === true || /^(true|yes)$/i.test(String(obj.approximate || "")),
       maps_to: (!mapsTo || /^none$/i.test(mapsTo)) ? "" : mapsTo,
       suggested_category: (!cat || /^none$/i.test(cat)) ? "" : cat,
     };
   }
-  return { choice: t, justification: "", confidence: "low", maps_to: "", suggested_category: "" }; // unparseable → best-effort
+  return { choice: t, justification: "", confidence: "low", approximate: false, maps_to: "", suggested_category: "" }; // unparseable → best-effort
 };
 
 // AI dropdown fill (AI-1, ALWAYS-GUESS): open + read the LIVE options → the LLM gets the profile +
@@ -1590,11 +1594,29 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
       detail: "AI canonicalize: options did not render (not actuated)" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
   }
   const enabledTexts = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
-  const system = "The applicant has ALREADY STATED a value for this field. Your ONLY job is to pick the option from the provided list that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything about the applicant. If NO option means the same, reply UNKNOWN. Never pick an option that differs in meaning.";
+  // ── ALWAYS PICK ONE. NEVER "UNKNOWN" (operator, 2026-08-07) ──────────────────────────────────────
+  // This is a CLOSED LIST, and the form will not accept a blank: "only the large text boxes can be
+  // unknown and choose N/A". So the prompt asks for the nearest option and a truthfulness bit
+  // (`approximate`) instead of letting the model refuse.
+  //
+  // The old prompt said "if NO option means the same, reply UNKNOWN", which is defensible in isolation
+  // and wrong in context: on nvidia.wd5, Phone Device Type offers only ["Home","Home Cellular"] and the
+  // profile says "Mobile", so the model correctly refused, the required field stayed blank, and Workday
+  // refused the whole page. Asking for the closest option answers it in ONE call — the previous shape
+  // needed a second LLM round trip and a second open/close of the same dropdown to recover.
+  //
+  // Honesty is preserved by `approximate`, not by refusing: an exact synonym still commits as
+  // `ai-canonicalized`, while a nearest-match commits as `ai-canon-approximate` and says in the detail
+  // that it is NOT the stated value — so review sees the difference at a glance.
+  const system = "The applicant has ALREADY STATED a value for this field, and you must choose from a CLOSED list of options. "
+    + "Prefer the option that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\") and set approximate=false. "
+    + "If NO option means exactly the same, choose the CLOSEST option in meaning and set approximate=true. "
+    + "You MUST always choose one of the provided options — never reply UNKNOWN, never invent text, and never leave it empty: "
+    + "the form rejects a blank answer, and a human reviews every approximate choice before anything is submitted.";
   const user = "Field: " + String(f.label || "")
     + "\nThe applicant's STATED value: " + JSON.stringify(statedStr)
-    + "\nOptions (reply with the EXACT text of the matching one): " + JSON.stringify(enabledTexts)
-    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
+    + "\nOptions (reply with the EXACT text of one of these): " + JSON.stringify(enabledTexts)
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"approximate\":true|false,\"confidence\":\"High|Medium|Low\"}";
   let ai; // preAnswer = this question's entry from the page's ONE batched call (transport only — see aiFillField)
   if (preAnswer) ai = preAnswer;
   else {
@@ -1633,6 +1655,13 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
   // paths never did, and they are the ones that fill these screening questions.
   try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above already stands */ }
   // ALWAYS filled_review — a canonicalized demographic still gets a human glance.
+  // An APPROXIMATE pick is a different claim from a vocabulary map, so it gets its own flag and a detail
+  // that states plainly it is NOT what the applicant said. Same commit, same verification, louder label.
+  if (ai.approximate) {
+    return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier, flag: "ai-canon-approximate", confidence: conf,
+      detail: "NOT your stated value — this form offers no option meaning \"" + statedStr + "\", so the CLOSEST one (\"" + target + "\") was selected so the application can proceed. VERIFY AND CORRECT IT.",
+      options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier, flag: "ai-canonicalized", confidence: conf,
     detail: "AI canonicalized stated \"" + statedStr + "\" → \"" + target + "\" (vocab map, not inferred)", options: enabledTexts, auditLoc: loc.wrapperSel };
 };
@@ -4022,33 +4051,13 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         const batched = willUseAi ? await aiBatchAnswer(f, wantKind) : null;
         const preInfer = !canonicalize ? batched : null;
         const preCanon = canonicalize ? batched : null;
-        if (canonicalize) {
-          aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
-          // ── A DECLINED canonicalize must not leave a REQUIRED field BLANK (2026-08-07) ──────────────
-          // Canonicalize is deliberately strict: "if NO option means the same, reply UNKNOWN", so it
-          // never bends a stated value into a different meaning. Right — but on a REQUIRED field the
-          // result is a blank, and a blank required field BLOCKS Save & Continue, so the walk halts
-          // having filled nothing. The typeahead path already refuses to end that way (`ai-closest-
-          // forced` — "NEVER declines, a blank required halts the walk"); dropdowns had no equivalent.
-          //
-          // Live on nvidia.wd5 page 1: Phone Device Type offers ONLY ["Home", "Home Cellular"] — there
-          // is no "Mobile" — so the stated value legitimately maps to nothing, canonicalize replied
-          // UNKNOWN, and Workday then refused page 1 with "The field Phone Device Type is required".
-          // The whole application was blocked on a field whose answer is obvious to a human.
-          //
-          // So fall through to the ALWAYS-GUESS required path, which is the same machinery AI-1 uses for
-          // an unmapped required dropdown: it re-opens the field, picks from the LIVE options, and the
-          // pick still has to clear the match ladder. The answer is `filled_review` and flagged, so it
-          // reaches the human exactly like any other guess — the difference is the operator gets a form
-          // they can correct instead of a run that stopped. Costs one extra LLM call, only on decline.
-          if (aiRes && aiRes.flag === "ai-canon-nomatch" && f.isRequired && f.widgetType === "dropdown") {
-            const forced = await aiFillField(act, loc, f, profile, jobContext, budgets, null);
-            if (forced && forced.status === "filled_review") {
-              forced.detail = `stated "${Array.isArray(record.resolved) ? record.resolved.join(" / ") : record.resolved}" matches no option here — ${forced.detail || "AI picked the closest"}`;
-              aiRes = forced;
-            }
-          }
-        }
+        // Canonicalize ALWAYS picks an option now (see aiCanonicalizeField) — a closed list must be
+        // answered, so there is no "declined" case left to recover from here. The previous shape added a
+        // SECOND llm call and a SECOND open/close of the same dropdown purely to undo the first call's
+        // refusal; asking once for the nearest option removes both. A reply that is still not a real
+        // option (hallucinated text) is refused by the match ladder inside canonicalize, and the
+        // deterministic last-resort backstop below is what guarantees the field is never left blank.
+        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // maps a STATED value — runs for required OR optional
         else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
             ? await aiFillField(act, loc, f, profile, jobContext, budgets, preInfer)

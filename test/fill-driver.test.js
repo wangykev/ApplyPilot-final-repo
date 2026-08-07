@@ -2024,7 +2024,11 @@ test("AI: sensitive-vs-not prominence DATA — both flags + distinct reasons per
 });
 
 test("parseAiReply: plain JSON, ```-fenced, embedded, bad-confidence, and a non-JSON fallback", () => {
-  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high", maps_to: "", suggested_category: "" });
+  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high", approximate: false, maps_to: "", suggested_category: "" });
+  // `approximate` — the model saying "this is the CLOSEST option, not a synonym" (see aiCanonicalizeField).
+  assert.strictEqual(parseAiReply('{"choice":"Home Cellular","approximate":true}').approximate, true);
+  assert.strictEqual(parseAiReply('{"choice":"Man","approximate":"yes"}').approximate, true, "tolerates a string");
+  assert.strictEqual(parseAiReply('{"choice":"Man"}').approximate, false, "absent → a true map, not an approximation");
   assert.strictEqual(parseAiReply('```json\n{"choice":"No","confidence":"Low"}\n```').choice, "No");
   assert.strictEqual(parseAiReply('Here is my answer: {"choice":"Maybe","confidence":"Medium"}').confidence, "medium");
   assert.strictEqual(parseAiReply('{"choice":"X","confidence":"bogus"}').confidence, "low", "unknown confidence → low");
@@ -9727,15 +9731,27 @@ const nvidiaPhoneType = (flags) => Object.assign({
 }, flags || {});
 const PHONE_PROFILE = { personal_info: { phone_device_type: "Mobile" } };
 
-test("canonicalize decline: a REQUIRED dropdown falls through to the always-guess pick instead of staying blank", async () => {
-  // Reply 1 = the canonicalize declining; reply 2 = the always-guess pick from the LIVE options.
-  const act = makeFakeAct([nvidiaPhoneType()], { aiEnabled: true,
-    ai: ['{"choice":"UNKNOWN"}', '{"choice":"Home Cellular","confidence":"Medium"}'] });
+test("canonicalize on a CLOSED list always picks — approximate:true commits with its own loud flag, in ONE call", async () => {
+  // Operator rule (2026-08-07): "only the large text boxes can be unknown and choose N/A" — a dropdown is
+  // a closed list and the form rejects a blank, so the prompt asks for the NEAREST option instead of
+  // UNKNOWN. That answers it in ONE llm call and ONE open of the dropdown; the previous shape needed a
+  // second call and a second open purely to undo the first call's refusal.
+  const act = makeFakeAct([nvidiaPhoneType()], { aiEnabled: true, ai: '{"choice":"Home Cellular","approximate":true,"confidence":"Medium"}' });
   const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
-  assert.strictEqual(rec.status, "filled_review", "a required field must not be left blank — it blocks Save & Continue");
+  assert.strictEqual(rec.status, "filled_review");
   assert.strictEqual(rec.after, "Home Cellular");
-  assert.notStrictEqual(rec.flag, "ai-canon-nomatch", "the decline must no longer be the final answer");
-  assert.match(rec.detail, /matches no option here/, "the record should say WHY it had to guess");
+  assert.strictEqual(rec.flag, "ai-canon-approximate", "an approximation is NOT the same claim as a vocab map");
+  assert.match(rec.detail, /NOT your stated value/, "review must be told it is not what the applicant said");
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1, "ONE llm call — no fallthrough round trip");
+});
+
+test("canonicalize: an EXACT vocab map keeps ai-canonicalized (approximate absent/false)", async () => {
+  const act = makeFakeAct([nvidiaPhoneType({ options: [{ text: "Select One", disabled: true }, { text: "Mobile Phone" }, { text: "Home" }] })],
+    { aiEnabled: true, ai: '{"choice":"Mobile Phone","approximate":false,"confidence":"High"}' });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "a true synonym is not flagged as an approximation");
+  assert.strictEqual(rec.after, "Mobile Phone");
+  assert.doesNotMatch(rec.detail || "", /NOT your stated value/);
 });
 
 test("canonicalize decline: an OPTIONAL dropdown still stays blank — never a forced guess", async () => {
