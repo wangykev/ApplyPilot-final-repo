@@ -2002,6 +2002,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // on every Greenhouse location field and manufactured "suggestions never loaded" — a regression
       // that read exactly like the environment problem the note described. The general poll already
       // bounds this wait (loading gate + per-field budget), so it needs no special case.
+      // ⚠ WAKE IT WITH A REAL CLICK FIRST. This widget's suggestion service stays asleep for a
+      // synthetic open click: the fill typed "Tallahassee" and polled 22.7s for nothing, while by hand
+      // the same query answers in ~1s — and after ONE trusted click, SYNTHETIC typing drives it fine
+      // (traced both ways, 2026-08-06). So the trust is needed for the click, not the keystrokes.
+      if (act.trustedFocus) { try { await act.trustedFocus(ref.inputSel); await act.delay(150); } catch (e) { /* best effort */ } }
       await typeInto(String(candidates[0]).split(",")[0]);
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
     } else if (!hasHit(optsOf(read))) {

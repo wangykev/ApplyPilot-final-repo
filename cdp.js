@@ -3783,6 +3783,19 @@ function makeCdpActuation(llmConfig) {
     // Shared page-state probes (ported from the Workday branch): "is the tab producing frames?"
     // and "has this subtree stopped mutating?". The multi-ATS poll needs the second to tell an
     // absent menu from a page that is still reacting.
+    // A TRUSTED click on an element, for the widgets that will not wake for a synthetic one.
+    // Greenhouse's location combobox is the case that earned this (2026-08-06): a synthetic open
+    // click leaves its suggestion service asleep — the fill typed "Tallahassee" and waited 22.7s for
+    // nothing — while ONE real click makes the very same synthetic typing return
+    // "Tallahassee, Florida, United States" in about a second. In an ATS run cdpClickAt is already
+    // trusted (synthetic mode is only armed for Workday fills), so this is a genuine
+    // Input.dispatchMouseEvent, not another page-side dispatch.
+    trustedFocus: async (sel) => {
+      const rect = await cdpRectReady(sel, true);
+      if (!rect || !(rect.w > 0)) return false;
+      await cdpClickAt(rect.cx, rect.cy);
+      return true;
+    },
     painting: () => cdpPainting(),
     paintLabel: () => cdpPaintLabel(),
     quietInstall: (sel) => cdpEval(cdpInstallQuietWatch, sel),
