@@ -8,89 +8,43 @@ description: How to live-test a real application end to end (fill -> review -> a
 Unit tests prove the logic; only a live run proves the product. This is how to do one without
 producing a false result — and most of it exists because a false result was produced that way.
 
-## START HERE — 2026-08-06 session notes (read before the older list below)
+## START HERE — state as of 2026-08-06
 
-**The checkbox-group cost bug (item 1 below) is FIXED and live-exercised.** Beat 700→250ms with an exit
-on a 3-read hold streak, and the quiet observer is armed at the top of `fillCheckboxGroupCdp` instead of
-at the gate. Healthy group ~2.5s → ~750ms. Live evidence it did not break the commit: on waystar the FILL
-walk committed `disabilityStatus` (`filled_review`) and advanced under the new timing, twice.
+Everything the 2026-08-05 list warned about is resolved; that list is gone. Current state:
 
-**SOLVED — the page-5 self-ID blocker was OUR bug, not Workday dropping answers.** Symptoms were
-`dateSignedOn` refused as "The field Date is required" on a composite whose DOM + React props + React
-fiber all held `8/5/2026`, and `disabilityStatus` arriving empty and refusing to re-commit. Root cause:
-the per-KIND self-ID input split (TRUSTED text/date, synthetic clicks) lived only in `fillAndPersistPage`,
-which **the replay walk calls only for the refill case** — so a normal replay wrote that page with the
-run-level mode, which on a submit run is SYNTHETIC, the one write this surface ignores. Exactly the gap
-`awaitFieldSetSettled` had. Fixed 2026-08-06; the very next rehearsal went `page 5 replay: 5 field(s) —
-3 changed, 0 FAILED` → gate passed.
+**The page-3 class of failure is FIXED and the fix is verified.** Symptom was a required dropdown ending
+blank after a sibling "changed itself". Cause was ours: every portaled listbox renders at the same screen
+coordinates, options linger while unmounting and stay clickable, and the AI commit paths never waited for
+the list to unmount — so the next field's open-click landed on the previous field's options. One
+`closeDropdownConfirmed` in three places. Result: 4/4 clean runs (2 hidden, 2 visible), page 3 19.4s → 7.0s.
+If a `⚠ REMOUNT` line ever appears again, that gate is the first suspect.
 
-Two lessons worth generalising: **when the replay behaves differently from the fill on the same page, look
-for policy that lives inside `fillAndPersistPage`** — the replay does not call it. And a value present in
-the DOM *and* React but rejected by Workday is the signature of a synthetic write, not of Workday losing
-data; the walk's own log already says this about the auth form.
+**AI batching is ON by default** (`disableAiBatch` is the kill-switch). A page's AI questions go out as ONE
+call fired before the deterministic fill. It is a CACHE, NOT A GATE — a question it misses makes its own
+per-field call, so a broken batch costs speed, never an answer. Answers are cached **by question, not
+automation-id**, so a page refill makes ZERO calls and cannot contradict the first pass.
 
-Remedies tried BEFORE finding the real cause, all refuted — don't re-try them on this symptom: trusted
-re-write of the field alone ✗, focus→blur nudge ✗, byte-identical re-type (a no-op by construction) ✗,
-reload + replay from page 1 ✗. `docs/dom-patterns.md` 2026-08-05 has the FIELD-DIAG evidence.
-`retreatAndReturn` (back a page → confirm dialog → Save & Continue forward) is built and gated on the
-phantom signature but **never fired**, since the real fix removed the symptom; treat it as unexercised.
+**Baselines to compare against** (waystar, page 3 = the screening page):
+`visible ~7–10s · hidden ~19s` per page-3 fill; the typeahead option scrape is ~2.3s (249 options, 22 hops)
+and **hidden is within 6% of visible** — the non-painting problem is handled by the worker-timer override,
+so do NOT attribute a slow hidden run to paint. LLM latency ranged **1.0s–10.0s** across one session; that
+variance swamps most page-level timing comparisons, so never conclude from a single run.
 
-**Two workflow facts that cost me time:**
-- **The extension's site session expires every ~20 minutes.** `reportApplication` 401s (a completed fill's
-  bundle never reaches the website — and there is NO re-push message, so the whole fill has to be re-run)
-  and the review pull 401s (the submit run then correctly REFUSES rather than replaying another
-  application's values). Re-link with `/app/connect` → **"Link for tracking only"** (NOT "Sync everything",
-  which overwrites the extension's profile/resume). Re-link right before a rehearsal.
-- **Driving the UI: use JS `.click()`, not MCP ref-clicks or focus+Return.** MCP `left_click` by ref and a
-  real `Return` on a focused button both failed to reach React's handler on `/app/run` — the run simply
-  never started, with no error anywhere. `[...document.querySelectorAll("button")].find(b=>/^Run$/.test(b.textContent.trim())).click()`
-  works (a dispatched click bubbles to React's delegated listener; only *value* setting is blocked from the
-  isolated world). Firing the extension message directly (`AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`)
-  is equivalent to the button and is what I ended up using.
-- Keep every in-page `setTimeout` poll **≤30s** — `Runtime.evaluate` dies at ~45s and you lose the read.
+**Two things that will bite you in the first ten minutes:**
+- **The site session expires every ~20 minutes.** `reportApplication` 401s and the completed fill's bundle
+  never reaches the tracker — there is no re-push, so the whole fill must be re-run. Re-link on
+  `/app/connect` → **"Link for tracking only"** (NOT "Sync everything", which overwrites the profile).
+  Do it right before any run whose review you intend to keep.
+- **Drive the UI with JS `.click()`.** MCP ref-clicks and focus+Return both fail to reach React on
+  `/app/run` — the run silently never starts. Firing the extension message directly
+  (`AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`) is equivalent and is what worked all session.
 
-## START HERE — regressions the 2026-08-05 session may have introduced
+**Other mechanics:** keep every in-page `setTimeout` poll ≤30s (`Runtime.evaluate` dies at ~45s and you lose
+the read, not the run). If the MCP tab group flips to a Chrome profile with no `applypilot.extensionId` in
+localStorage, run `switch_browser` and have the operator reconnect.
 
-That session changed the input path substantially. Check these BEFORE trusting any new measurement, and
-before chasing any new bug — a new symptom is more likely to be one of these than a fresh discovery.
-
-1. **A checkbox group now costs ~2.5s even when nothing is wrong. (Confirmed, not yet fixed.)**
-   `fillCheckboxGroupCdp`'s persistence re-read loops `groupPersistRounds` (3) times at 700ms and
-   `continue`s on success instead of breaking, so it always burns the full ~2.1s; the quiescence gate
-   adds ~400ms on top because a fresh install stamps "now". Fix: break out once the value has held for
-   one or two beats, and/or shorten the beat. Pages with two groups (PSECU ethnicityMulti + disability)
-   pay it twice.
-
-2. **Synthetic input is now used on VISIBLE tabs too** (`cdpSynthInput` no longer consults visibility).
-   Two surfaces are known to IGNORE synthetic native-setter writes — the auth form and the self-ID
-   page's text/date — and both are excluded. **There may be more.** The tell is Workday reporting a
-   field "is required and must have a value" while the DOM plainly holds it. Previously visible runs
-   used trusted input everywhere and would not have hit this. If a tenant that used to pass starts
-   failing that way, add its surface to the exclusion (see `isSelfIdPage` for the pattern) rather than
-   reverting the policy — page 2 went 38.3s → 7s because of it.
-
-3. **The dropdown commit's beat ladder is still tuned for TRUSTED clicks** (`overwriteBeatLadder`, and
-   it branches on `act.visible`). Clicks are synthetic now, so its starting tier may be wrong and it may
-   be escalating — and re-opening — unnecessarily. Suspect this first if a dropdown-heavy page got
-   slower or if `[CDP-DD-REFILL]` shows commits landing on later tiers than before.
-
-4. **The two new pre-Save halts can stop a page that would have gone through.** `required-unverified`
-   and `required-unfilled` refuse to click Save when a required field reads blank. The argument is that
-   Workday refuses that page anyway — but both read the value via `cdpPageScan`, so a widget whose value
-   the scan reads as `null` even when filled would halt a good page. Watch for a halt naming a field the
-   operator can SEE filled, especially on a new tenant.
-
-5. **Every label click now pays an extra `cdpEval`** (the `cdpHitAt` hit-test in `clickRadioLabel`) plus
-   a 60ms press→release gap. Pure diagnostics, worth gating behind a flag if radio-heavy pages feel slow.
-
-6. **The paint probe decides nothing any more.** `cdpPainting` is correct and logged, but since synthetic
-   no longer depends on visibility it is diagnostic-only. Do not reason about behaviour from it, and
-   consider removing it if the log line is not earning its keep.
-
-Regression baseline from that session, all VISIBLE, for comparison:
-`cat.wd5` → REVIEW after 5 pages, 2 need review, ~16s total fill. `magna.wd3` → REVIEW after 4 pages,
-0 need review, ~10s. `waystar.wd1` → REVIEW, page 2 fill 7s. A tenant landing far off these wants
-explaining before anything else is believed.
+**Burned fixtures:** `waystar R3132` now returns ALREADY APPLIED (~8 runs). Many waystar drafts exist under
+`tester+12@gmail.com`. Start a fresh tester rather than adding to that pile.
 
 ## Diagnostic flags — turn these on before guessing (2026-08-06)
 
@@ -396,6 +350,25 @@ before retrying the FAILING form; a fresh account on a fresh form works immediat
 
 Prefer tenants where the account already exists: no email verification, so no Gmail dependency.
 
+## Starting a FRESH tester account
+
+Repeated runs against one form give Workday stale server state (see Phantom errors) and eventually an
+ALREADY APPLIED page that ends the run before it starts. A fresh tester is the clean reset, and it is the
+right way to begin a regression sweep.
+
+1. `/app/credentials` — set the login email to the next unused alias (`tester+NN@gmail.com`). Use the
+   native setter + a real keystroke, then Save; look for `✓ Saved`.
+2. The account will NOT exist on any tenant, so **onboarding must create it and verify by email**. That
+   makes Gmail auto-verify a hard dependency for the first run on each tenant — check it is connected
+   before starting, or the run halts `verification-required-gmail-off`.
+3. Confirm it took: the run log prints `login recorded for this run — tester+NN@gmail.com @ <Tenant>`, and
+   the tracker row shows the same under "Signed in as".
+4. **First run on a fresh account is slower** (account creation + email round trip). Do not read that
+   run's timings as a baseline; use the second run on that tenant.
+
+A fresh tester also resets the "already applied" state, so a previously-burned req becomes usable again —
+but prefer a genuinely unused req so the two variables stay separated.
+
 ## Finding postings to test with
 
 NOT the same thing as the product's Discover feature — that sweeps LinkedIn / Handshake / Simplify for
@@ -472,16 +445,16 @@ State what was observed, with the log line. Distinguish:
 Never report a tenant as working end to end without the `SUBMIT GATE PASSED` line from a run whose
 age you checked.
 
-### Scoreboard as of 2026-08-05 — 6 of 10
+### Scoreboard as of 2026-08-06 — 7 of 10
 
 | Tenant | State |
 |---|---|
 | Aptiv, PSECU, clearesult, Home Depot | **verified live** (earlier sessions) |
-| `cat.wd5` | **verified live** — REVIEW after 5 pages, 2 need review, ~16s total fill |
-| `magna.wd3` (path-hosted) | **verified live** — REVIEW after 4 pages, 0 need review, ~10s |
-| `waystar.wd1` | **verified live 2026-08-06 — full loop.** Fill → REVIEW after 5 pages (64 fields, 11 flagged) → 11/11 approved → rehearse `AGREE 53 · DISAGREE 0` → `SUBMIT GATE PASSED / WOULD CLICK SUBMIT`. Needed the self-ID replay fix below. |
+| `cat.wd5` | **verified live** — REVIEW after 5 pages, ~16s total fill |
+| `magna.wd3` (path-hosted) | **verified live** — REVIEW after 4 pages, ~10s |
+| `waystar.wd1` | **verified live 2026-08-06** — full loop to `SUBMIT GATE PASSED`; needed the self-ID replay-input fix and the stray-click fix |
 | `copart` | externally blocked (operator gate) — not a code failure |
 | `radiancetech`, `clearwater` | unresolved; need postings |
 
-Four to go. Start with waystar's rehearsal (cheapest remaining verification), then pick new tenants
-for DOM variety per the guidance above.
+Three to go. Prefer tenants with an existing account (no email verification), and one
+`wdN.myworkdaysite.com` path-hosted tenant for URL/job-key variety.
