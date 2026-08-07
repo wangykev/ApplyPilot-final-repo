@@ -46,6 +46,28 @@ localStorage, run `switch_browser` and have the operator reconnect.
 **Burned fixtures:** `waystar R3132` now returns ALREADY APPLIED (~8 runs). Many waystar drafts exist under
 `tester+12@gmail.com`. Start a fresh tester rather than adding to that pile.
 
+## FIRST: prove the extension is running YOUR code (2026-08-07)
+
+The service-worker start line carries a build marker:
+
+```
+[ApplyPilot][DEV] service worker started (…) · build backstop-1
+```
+
+Bump `AP_BUILD_MARKER` (top of `background.js`) whenever a live run has to prove the reload picked up your
+edit, and check the marker after `AP_RELOAD` **before** reasoning about behaviour at all.
+
+This exists because a whole round was spent on a fix that was never running. Two commits' worth of changes
+were completely inert across three reload-and-rerun cycles; the log could not distinguish "gated out" from
+"threw" from "not loaded", so the time went into re-reading correct code. The cause was the **wrong Chrome
+browser** — a second profile had the same extension ID loaded from a stale copy, so `AP_PING` answered
+`{ok:true}`, `AP_RELOAD` restarted a worker, runs executed, and everything looked healthy while none of the
+edits were present.
+
+`AP_PING` succeeding does NOT mean you are on the right browser. The marker does. And note the operator has
+had to redirect the browser connection more than once in a session — re-check the marker after any
+`switch_browser`, not just at the start.
+
 ## Diagnostic flags — turn these on before guessing (2026-08-06)
 
 All are `AP_DEV_FLAG` toggles, and they exist because guessing cost several rounds each. When a page
@@ -501,6 +523,7 @@ compare. Always check WHICH path your fixture exercises, not just the verdict.
 | Tenant | State |
 |---|---|
 | `itron.wd5` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account created this run |
+| `nvidia.wd5` (NEW) | fill verified live 2026-08-07 — REVIEW after 5 pages, twice; needed the required-dropdown backstop. A 3rd run on the SAME application hit an orphan empty work-experience row (accumulated state, not a regression) |
 | `analogdevices.wd1` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED` on rehearsals #1, #3, #4; #2 is what caught the colon bug |
 | `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
 | `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
