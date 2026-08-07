@@ -3607,7 +3607,44 @@ skip-if-correct so chip order can't read as a mismatch). Each commit is verified
 identity of the new chip; `skillsMaxAdds`/`skillsBudgetMs` bound a cost that scales with the profile
 (~2–4s/skill), and whatever they drop is named rather than silently trimmed.
 
-Extension **1131/1132** (`test/skills.test.js`, 20 new pins; the one failure is `db.test.js` —
-`fake-indexeddb` is missing from this worktree's `node_modules`, unrelated). **Live-verify pending**, plus
-two operator calls left open: whether a qualified commit should stay silent `filled` or be flagged, and
-whether a partial fill should nag review or just name the absent skills in the detail (current behaviour).
+### Live verification, and the three things it changed
+
+Six runs on the same Solar Turbines draft. **Visible worked first time** — 7 of 24 added, with the
+qualified tier firing exactly as designed (`C → C (Programming Language)`, `Python → Python (Programming
+Language)`, `Java → Java (Programming Language)`) — and `slowest: skills 33s`, so this field dominates
+page 2 and always will. Then three defects the fake could never have shown:
+
+**1. A single transient clear failure abandoned the rest of the list.** The visible run added 7 and quit;
+Git, Docker, VS Code and Vivado were all still to come and all exist in the taxonomy. The clear is
+focus-blind (trusted Ctrl+A/Delete) and on this widget Ctrl+A does not even select the input's text. Now a
+React-safe native-setter clear goes first, a failure RETRIES, and only a SECOND consecutive failure ends
+the field — and a skipped skill is reported as an infra failure, never as "Workday doesn't have it".
+
+**2. The hidden failure was NOT what it looked like, and the wrong fix nearly shipped.** A hidden run added
+ZERO skills, logging `{focused:true, ok:true, openedNow:false}` three times per skill; the byte-identical
+run under `forceTrustedInput` opened and searched fine. That is the exact signature of the auth-form /
+Self-Identify class ("this surface needs trusted events"), so trusted input was scoped to the field — and
+it did NOT help (the log proved the switch ran: "synthetic input ENABLED" appeared twice, once at run start
+and once for the restore). The real cause was the OPENER: it fired BOTH routes in one attempt, so the
+coordinate click landed before the searchBox mounted and a second click TOGGLES a multiselect shut — the
+same toggle-shut invariant the unified typeahead filler already documents. One settle beat plus alternating
+routes across retries fixed it, and **an isolation probe with the trusted scoping removed then filled the
+field normally on a hidden synthetic tab**: 13 candidates processed, adding `JavaScript`,
+`Altium Designer`, `Git`, `Docker (Software)`, then `RViz`, `Fusion 360`, `Yosys`. The trusted path was
+deleted (it doubles the field's wall-clock for nothing) and the call site now says so, so nobody re-adds it
+off the back of the same misleading symptom.
+
+**3. A readable trace matters.** The step key was `skill`, but the walk's settle-trace printer reads
+`candidate`, so every line logged `cand "undefined"` — the diagnostic was there and useless. Renamed, and
+each step now carries the printer's fields (`settleMs`/`count`/`banner`/`open`/`chips`) plus the open
+diagnostic, which is how cause 2 was finally attributed instead of guessed at a fourth time.
+
+**Two honest limits.** Coverage varies RUN TO RUN because the result set is a ranked top-7 (`Yosys` matched
+on one run, not the previous). And strictness costs coverage: a skill whose only offered row is a
+differently-named relative (`Vivado` against `Xilinx Vivado`) is left OFF rather than guessed — named in
+the record for the human. That is the intended trade, not a gap.
+
+Extension **1139/1140** (`test/skills.test.js`, 28 pins; the one failure is `db.test.js` — `fake-indexeddb`
+is missing from this worktree's `node_modules`, unrelated and pre-existing). Two operator calls still open:
+whether a qualified commit should stay silent `filled` or be flagged, and whether a partial fill should nag
+review or just name the absent skills in the detail (current behaviour).

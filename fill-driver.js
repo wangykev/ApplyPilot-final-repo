@@ -42,6 +42,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
       // search is already fuzzy, and wrong), and missingSkills is what keeps a re-fill idempotent.
       skillBaseName: skillBaseName, matchSkillOption: matchSkillOption, missingSkills: missingSkills,
+      isSkillsFieldName: isSkillsFieldName,
       // The AI's option list must never include a menu's prompt row ("Select One").
       isPlaceholderOption: isPlaceholderOption, withoutPlaceholderOptions: withoutPlaceholderOptions };
 
@@ -2951,14 +2952,13 @@ const fillSourceCdp = fillTypeaheadCdp;
 // widget. A plain TEXT box labelled "Skills" is a different question with a different answer shape
 // (free prose), and a language-proficiency field must never match — hence the anchored patterns
 // rather than a bare /skill/ test.
+// (The name/label test itself lives in lib.js as isSkillsFieldName, shared with the reconcile's
+// entry-level isSkillsEntry — one predicate, so the fill and the verify cannot disagree.)
 function isSkillsField(f) {
   if (!f) return false;
   const w = String(f.widgetType || "");
   if (w !== "typeahead" && w !== "hierarchical") return false;
-  const name = String(f.fieldName || "");
-  if (/(^|[-_])skills$/i.test(name)) return true;
-  const label = String(f.label || "").replace(/\*+\s*$/, "").trim();
-  return /^(type to add\s+)?skills$/i.test(label);
+  return apMatch.isSkillsFieldName(f.fieldName, f.label);
 }
 
 // ── SKILLS ("Type to Add Skills") — the MULTI-VALUE typeahead ────────────────────────────────────
@@ -3005,19 +3005,46 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
   const deadline = Date.now() + Number(budgets.skillsBudgetMs || 180000);
 
   const added = [];      // [{ skill, option, tier }]
-  const notOffered = []; // skills Workday's taxonomy does not have (or answered ambiguously)
+  // notOffered vs failed is a REPORTING distinction that matters to the human: "Workday's taxonomy
+  // doesn't have this skill" is a fact they can act on (add it by hand / drop it), whereas "our typing
+  // or commit didn't land" means re-run. Lumping the second into the first would tell them a skill
+  // doesn't exist when it does.
+  const notOffered = []; // genuinely absent: a no-match banner, no exact/qualified row, or ambiguous
+  const failed = [];     // infra: could not type it, or the click never produced a chip
+  const unclearable = []; // skipped because the search box would not confirm empty (infra, NOT absence)
   const strays = [];     // a chip we did not ask for — always surfaced
   const trace = [];
+  const openDiags = [];  // why an open attempt missed — "could not focus" has several distinct causes
   let stoppedEarly = null;
 
   // Focus the search box, opening the widget if it is closed. The input only GAINS
   // data-automation-id="searchBox" once opened (traced), so readHier reports no searchBox until
   // the open click lands — same bounded open+focus retry the unified filler uses.
   const ensureFocused = async () => {
-    for (let attempt = 1; attempt <= budgets.taOpenRetries; attempt++) {
+    // MORE attempts than the shared budget, ALTERNATING the two opener routes. Evidence for both:
+    // under trusted input the widget opened on attempt 1 in ~1.3s, while the faster synthetic run
+    // failed all three attempts — the difference being how recently the PRECEDING field committed, so
+    // the open is racing Workday's re-render rather than needing a particular event kind. One settle
+    // beat before the first attempt, then input-route / coordinate-route in turn (never both in one
+    // attempt — a second click toggles an opening multiselect shut).
+    const attempts = Math.max(4, budgets.taOpenRetries);
+    await act.delay(budgets.reopenSettleMs); // let the previous field's re-render land before we click
+    for (let attempt = 1; attempt <= attempts; attempt++) {
       let st = await act.readHier(loc);
       if (!st || !st.searchBox.present || !st.searchBox.visible) {
-        if (!(await act.openHier(loc))) { await act.delay(budgets.reopenSettleMs); continue; }
+        // ONE opener action per attempt, then POLL. Two routes exist because while closed the input has
+        // no `searchBox` automation-id, so readHier cannot see it: the widget's own input (page-side
+        // focus + click — no coordinates, no paint) and the coordinate click on its container. The input
+        // route goes first; a later attempt falls back to coordinates.
+        //
+        // ⚠ NEVER both in one attempt. The first cut did exactly that and a HIDDEN run then reported
+        // `focused:true, ok:true, openedNow:false` three times over with ZERO skills added: the input
+        // click opened the widget, the immediate coordinate click landed before the searchBox had
+        // mounted, and a second click on a multiselect TOGGLES IT SHUT — so the poll always found it
+        // closed. This is the same toggle-shut invariant the unified typeahead filler documents.
+        const useInputRoute = (attempt % 2 === 1) && act.openHierInput;
+        if (useInputRoute) openDiags.push(await act.openHierInput(loc)); // NOT `step` — that is per-skill, out of scope
+        else if (!(await act.openHier(loc))) { await act.delay(budgets.reopenSettleMs); continue; }
         const t0 = Date.now();
         while (Date.now() - t0 < budgets.taOpenCeilingMs) {
           await act.delay(budgets.taOpenIntervalMs);
@@ -3035,10 +3062,20 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
     return null;
   };
 
+  // NOTE for anyone debugging a hidden run: forcing TRUSTED input here was tried and is NOT needed.
+  // The hidden failure looked like a trusted-input problem (a hidden synthetic run opened nothing while
+  // the same run under forceTrustedInput opened fine), but an isolation probe — the opener fix below with
+  // the trusted scoping REMOVED — filled the field normally on a hidden synthetic tab. The real cause was
+  // the opener racing Workday's re-render, not the event kind. Don't re-add trusted input here; it roughly
+  // doubles the field's wall-clock and buys nothing.
+  let clearFails = 0;
   for (const skill of capped) {
     if (Date.now() > deadline) { stoppedEarly = "time budget"; break; }
-    const step = { skill };
+    // `candidate` (not `skill`) because the walk's settle-trace printer reads that key — with the
+    // wrong name every line logged `cand "undefined"`, which is how a readable trace becomes useless.
+    const step = { candidate: skill };
     trace.push(step);
+    const t0 = Date.now();
     // Chips BEFORE this skill — the add is verified as a GROWTH from here, so a commit that
     // silently replaced instead of adding could never read as success.
     const before = await act.readHier(loc);
@@ -3046,29 +3083,59 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
     const chipSetIsNew = (chips) => chipSetChanged(chipsBefore, chips);
 
     if (!(await ensureFocused())) {
-      step.note = "could not focus the search box — not actuating blind";
+      // WHY it missed, per attempt — without this the log says only "could not focus", which has at
+      // least three causes (no wrapper / no input / opened but the searchBox id never appeared).
+      step.note = "could not focus the search box — not actuating blind"
+        + (openDiags.length ? " | open: " + JSON.stringify(openDiags.slice(-3)) : "");
       stoppedEarly = "focus";
       break;
     }
-    // HARD CLEAR GATE (this widget only): an unverified-empty box + Enter can CREATE a junk skill
-    // out of the leftover text, so a clear we cannot confirm ends the whole field rather than
-    // risking a fabricated answer.
-    await act.clearHierSearch();
-    if (!(await pollSearchValue(act, () => act.readHier(loc), "", budgets))) {
-      step.note = "search box did not read back EMPTY — refusing to press Enter (a dirty box can create a junk skill)";
-      stoppedEarly = "dirty box";
-      break;
+    // HARD CLEAR GATE (this widget only): an unverified-empty box + Enter can CREATE a junk skill out
+    // of the leftover text, so we never press Enter on a box we could not confirm empty.
+    //
+    // But a FAILED clear is not a reason to abandon the field. Live (cat.wd5, first run): the clear
+    // failed ONCE mid-list and the whole field stopped, adding 7 skills and silently giving up on the
+    // rest — Git, Docker, VS Code and Vivado were all still to come and all exist in the taxonomy.
+    // The clear is focus-blind (`cdpSelectAllDelete` types Ctrl+A/Delete at whatever holds focus) and a
+    // commit can move focus off the box, so a single failure is a transient. RETRY with a fresh focus
+    // assert; if it still won't empty, SKIP THIS SKILL (safe — skipping never presses Enter) and carry
+    // on. Only a SECOND consecutive failure ends the field, so a genuinely stuck box can't burn the
+    // whole budget one 6s poll at a time.
+    // The clear itself prefers the REACT-SAFE native-setter write (`clearHierInput`), which does not
+    // care where focus is. Trusted Ctrl+A/Delete is the fallback: on this widget Ctrl+A does not select
+    // the input's text (observed by hand, and live it cleared one skill then failed on the next two).
+    let boxEmpty = false;
+    for (let attempt = 1; attempt <= budgets.taOpenRetries && !boxEmpty; attempt++) {
+      if (attempt > 1 && !(await ensureFocused())) break;
+      if (act.clearHierInput) await act.clearHierInput(loc);
+      else await act.clearHierSearch();
+      boxEmpty = await pollSearchValue(act, () => act.readHier(loc), "", budgets);
+      if (!boxEmpty) { await act.clearHierSearch(); boxEmpty = await pollSearchValue(act, () => act.readHier(loc), "", budgets); }
     }
+    if (!boxEmpty) {
+      clearFails++;
+      step.note = "search box did not read back EMPTY — skill SKIPPED, no Enter (a dirty box can create a junk skill)";
+      unclearable.push(skill);
+      if (clearFails >= 2) { stoppedEarly = "the search box would not clear"; break; }
+      continue;
+    }
+    clearFails = 0;
     await act.typeInHier(skill);
     if (!(await pollSearchValue(act, () => act.readHier(loc), skill, budgets))) {
       step.note = "could not type the full skill into the box — skipped (no Enter on a partial query)";
-      notOffered.push(skill);
+      failed.push(skill);
       continue; // the NEXT skill re-clears + re-verifies, so a partial can't leak into it
     }
     await act.pressEnter(); // the ONLY filter trigger on this widget
     const outcome = await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
     step.outcome = outcome;
     const s = await act.readHier(loc);
+    // The fields the walk's settle-trace printer reads, so each skill logs one readable line.
+    step.settleMs = Date.now() - t0;
+    step.count = s && s.pageWide ? s.pageWide.count : null;
+    step.banner = !!(s && s.banner);
+    step.open = !!(s && s.searchBox && s.searchBox.visible);
+    step.chips = (s && s.chips && s.chips.length) ? s.chips.join("; ") : null;
 
     if (outcome === "autocommit") {
       // Workday committed on its own. On THIS widget that means the query returned zero rows and it
@@ -3078,12 +3145,22 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
       const fresh = now.filter((c) => !chipsBefore.some((p) => norm(p) === norm(c)));
       const mine = fresh.filter((c) => apMatch.skillBaseName(c) === apMatch.skillBaseName(skill));
       if (mine.length) { added.push({ skill, option: mine[0], tier: "free-text" }); step.added = mine[0]; }
-      else { strays.push(...fresh); step.stray = fresh.join("; "); }
+      else if (fresh.length) { strays.push(...fresh); step.stray = fresh.join("; "); }
+      else {
+        // "autocommit" without a NEW chip. awaitListTerminal reports it when the chip SET differs from
+        // the one we snapshotted, which a re-render/re-order can also produce (live: `cand "C++" →
+        // autocommit, 0 options` while no C++ chip existed afterwards). Nothing was added and nothing
+        // strayed, so this belongs in a bucket rather than vanishing from the report.
+        failed.push(skill);
+        step.note = "the chip set changed but no new chip matched this skill — nothing added";
+      }
       continue;
     }
-    if (outcome !== "results") { // "nomatch" banner, or a timeout we refuse to guess through
-      notOffered.push(skill);
-      step.note = outcome === "nomatch" ? "Workday reported no matches" : "no terminal list within budget";
+    if (outcome !== "results") {
+      // A "No matches found" banner is Workday ANSWERING (the skill is absent); a timeout is us not
+      // knowing, which is a different thing to tell the human.
+      if (outcome === "nomatch") { notOffered.push(skill); step.note = "Workday reported no matches"; }
+      else { failed.push(skill); step.note = "no terminal list within budget (" + outcome + ")"; }
       continue;
     }
     const texts = (s && s.pageWide && s.pageWide.texts) || [];
@@ -3102,8 +3179,8 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
     step.matched = { option, tier: m.tier };
     let ok = false;
     if (await act.clickHierLeaf(loc, option)) {
-      const t0 = Date.now();
-      while (Date.now() - t0 < budgets.commitCeilingMs) {
+      const tCommit = Date.now(); // NOT t0 — that one times the whole skill, and shadowing it here invites a later bug
+      while (Date.now() - tCommit < budgets.commitCeilingMs) {
         await act.delay(budgets.commitIntervalMs);
         const after = await act.readHier(loc);
         const chips = (after && after.chips) || [];
@@ -3112,7 +3189,7 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
       }
     }
     if (ok) { added.push({ skill, option, tier: m.tier }); step.added = option; }
-    else { notOffered.push(skill); step.note = "matched an option but the chip never appeared"; }
+    else { failed.push(skill); step.note = `matched "${option}" but the chip never appeared`; }
   }
 
   // Tab is the only clean exit: it blurs, clears the query and closes the list without committing
@@ -3130,15 +3207,28 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
       ? `${a.skill} → ${a.option}` : a.option).join(", "));
   if (priorChips.length) bits.push(`kept ${priorChips.length} already on the form`);
   if (notOffered.length) bits.push(`NOT in Workday's skill list (add by hand if you want them): ${notOffered.join(", ")}`);
+  if (failed.length) bits.push(`could not be entered (typing/commit did not land — re-run): ${failed.join(", ")}`);
+  if (unclearable.length) bits.push(`skipped — the search box would not clear (retry the page): ${unclearable.join(", ")}`);
   if (dropped > 0) bits.push(`${dropped} skill(s) not attempted — the ${cap}-skill cap`);
-  if (stoppedEarly) bits.push(`stopped early (${stoppedEarly}) with ${capped.length - added.length - notOffered.length} skill(s) unattempted`);
+  // Every skill lands in exactly one bucket, so what's left is genuinely untouched. Counting only
+  // added+notOffered here over-reported it as soon as a third bucket existed.
+  const untouched = capped.length - added.length - notOffered.length - failed.length - unclearable.length;
+  if (stoppedEarly) bits.push(`stopped early (${stoppedEarly}) with ${Math.max(0, untouched)} skill(s) unattempted`);
   if (strays.length) bits.push(`UNEXPECTED chip(s): ${strays.join(", ")}`);
 
   const after = finalChips.length ? finalChips.join("; ") : null;
   const base = { after, verified: !strays.length, matchTier: "skills-multi-add",
     detail: bits.join(" · ") || "nothing to add", skills_added: added.map((a) => a.option),
-    skills_not_offered: notOffered.slice(), settle_trace: trace };
+    skills_not_offered: notOffered.slice(), skills_failed: failed.concat(unclearable), settle_trace: trace };
   if (strays.length) return { ...base, status: "needs_review", flag: "skills-stray", confidence: "none" };
+  // An INFRA bail (focus / an unclearable box) is not a clean outcome, even when the form already holds
+  // chips: skills the profile asked for were never attempted. Reporting a silent `filled` there hid a
+  // hidden-tab run that added NOTHING behind seven chips a previous run had put on. So it is surfaced —
+  // flagged when something was added, needs_review when nothing was.
+  if (stoppedEarly && stoppedEarly !== "time budget") {
+    return { ...base, status: added.length ? "filled_review" : "needs_review",
+      flag: "skills-incomplete", confidence: added.length ? "medium" : "none" };
+  }
   if (!added.length) {
     // The field is BLANK and the profile had values — that is the case the review gate exists for.
     return { ...base, status: finalChips.length ? "filled" : "needs_review",

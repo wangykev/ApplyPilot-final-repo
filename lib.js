@@ -567,6 +567,27 @@ function matchSkillOption(skill, optionTexts) {
   return { index: -1, tier: null };
 }
 
+// The SHARED core of the skills detector. The fill path recognises a live SCAN field and the
+// reconcile recognises a bundle ENTRY; routing both through this one predicate is what stops them
+// drifting into disagreeing about which field this even is. Deliberately anchored, never a bare
+// /skill/ test — a language-proficiency field and a prose "Skills" box must not match.
+function isSkillsFieldName(name, label) {
+  if (/(^|[-_])skills$/i.test(String(name == null ? "" : name))) return true;
+  const l = String(label == null ? "" : label).replace(/\*+\s*$/, "").trim();
+  return /^(type to add\s+)?skills$/i.test(l);
+}
+
+// A review-bundle entry for the skills field. `field_id` is "<page>::formField-<name>".
+function isSkillsEntry(entry) {
+  if (!entry) return false;
+  const wt = String(entry.widget_type || "");
+  if (wt !== "typeahead" && wt !== "hierarchical") return false;
+  let s = String(entry.field_id == null ? "" : entry.field_id);
+  const i = s.lastIndexOf("formField-");
+  if (i !== -1) s = s.slice(i + "formField-".length);
+  return isSkillsFieldName(s, entry.question_label);
+}
+
 // Which of `wanted` are not already on the widget, in profile order. Compared on the BASE name in
 // both directions, because a chip Workday created reads back QUALIFIED: a "Python (Programming
 // Language)" chip already covers the profile's "Python". Without that, a second pass would search
@@ -1239,15 +1260,19 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     //    string would find nothing and call a correct two-answer field MISSING, so each selected
     //    option is checked on its own and the row AGREES only when every one of them is present.
     //    A group with a single selection falls through to the normal path unchanged. ──
+    //    SKILLS is the other multi-value field and prints the same way (one value per skill), so it
+    //    takes this path too — matching the joined "A; B; C" as one string would report a correctly
+    //    filled 20-skill field as MISSING on every rehearsal.
     const groupVals = wt === "checkbox_group" ? groupSelection(e) : [];
-    if (groupVals.length > 1) {
-      claimed++; claimedValues.push(...groupVals.map((g) => normalize(g)));
-      const absent = groupVals.filter((g) => {
+    const setVals = groupVals.length ? groupVals : (isSkillsEntry(e) ? splitGroupValue(cvs) : []);
+    if (setVals.length > 1) {
+      claimed++; claimedValues.push(...setVals.map((g) => normalize(g)));
+      const absent = setVals.filter((g) => {
         const n = normalize(g);
         if (n.length >= 4 || (n.length >= 3 && !AMBIGUOUS_SHORT.test(n))) return !presentTier(g);
         return !items.some((it) => it.nlabel && labelMatches(it.nlabel, nlabel) && valueTier(n, it.nval));
       });
-      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: "checkbox-group-set" });
+      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: groupVals.length ? "checkbox-group-set" : "skills-set" });
       else missing_on_review.push({ ...base, detail: "not shown on the review page: " + absent.join("; ") });
       continue;
     }
@@ -2013,7 +2038,7 @@ function devLogSelect(ring, opts) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
-  skillBaseName, matchSkillOption, missingSkills,
+  skillBaseName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

@@ -22,7 +22,8 @@ function makeSkillsAct(opts = {}) {
   const st = {
     chips: (opts.chips || []).slice(),
     value: "", open: false, texts: [], resultsBanner: false, banner: false,
-    clearBroken: !!opts.clearBroken             // the box refuses to empty (the dirty-box trap)
+    clearBroken: !!opts.clearBroken,            // the box refuses to empty (the dirty-box trap)
+    clearFailsFor: opts.clearFailsFor || 0      // the clear no-ops for the first N calls, then recovers
   };
   const log = [];
   const norm = (s) => String(s).toLowerCase().trim();
@@ -48,6 +49,7 @@ function makeSkillsAct(opts = {}) {
     focusHierSearch: async () => { st.open = true; return true; },
     clearHierSearch: async () => {
       log.push(["clear"]);
+      if (st.clearFailsFor > 0) { st.clearFailsFor--; return; } // transient: focus was elsewhere
       if (!st.clearBroken) { st.value = ""; st.texts = []; st.resultsBanner = false; st.banner = false; }
     },
     typeInHier: async (t) => { log.push(["type", t]); st.value += t; },
@@ -185,18 +187,81 @@ test("fillSkillsCdp: a ZERO-result query free-text-adds, and that counts as fill
   assert.equal(r.status, "filled");
 });
 
-test("fillSkillsCdp: an unverifiable CLEAR stops the field — a dirty box can fabricate a skill", async () => {
+test("fillSkillsCdp: an unverifiable CLEAR never reaches Enter — a dirty box can FABRICATE a skill", async () => {
   // The trap seen live: with "Docker" still in the box, typing the next skill appended to it and
   // Enter created the chip "DockerCubeMars motor drivers" — a skill nobody claimed. The box starts
-  // genuinely empty, so skill 1 proceeds normally; the broken clear only bites on skill 2, and the
-  // field must STOP there rather than press Enter on a concatenated query.
-  const fast = Object.assign({}, B, { taActionSettleCeilingMs: 200, taActionSettleIntervalMs: 20 });
+  // genuinely empty, so skill 1 proceeds; the broken clear bites on skill 2, which must be SKIPPED
+  // (never Enter on a concatenated query) and reported as an infra failure, not as absence.
+  const fast = Object.assign({}, B, { taActionSettleCeilingMs: 120, taActionSettleIntervalMs: 20 });
   const { act, st, log } = makeSkillsAct({ catalog: CATALOG, clearBroken: true });
   const r = await fd.fillSkillsCdp(act, LOC, ["Python", "Git"], fast);
   assert.deepEqual(log.filter((l) => l[0] === "enter").map((l) => l[1]), ["Python"],
     "only the query whose box verified EMPTY reached Enter");
   assert.deepEqual(st.chips, ["Python (Programming Language)"], "no concatenated skill was fabricated");
-  assert.match(r.detail, /stopped early \(dirty box\)/);
+  assert.deepEqual(r.skills_failed, ["Git"]);
+  assert.deepEqual(r.skills_not_offered, [], "an unclearable box is NOT evidence Workday lacks the skill");
+});
+
+test("fillSkillsCdp: a TRANSIENT clear failure retries — it must not abandon the rest of the list", async () => {
+  // Live regression (cat.wd5, first run): the clear failed ONCE mid-list and the field stopped at 7
+  // skills, silently giving up on Git/Docker/VS Code/Vivado. One failure is a transient (the clear is
+  // focus-blind and a commit can move focus), so it retries; the list must still finish.
+  const { act, st } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ, clearFailsFor: 1 });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Docker", "Linux", "Git"], B);
+  assert.deepEqual(st.chips, ["Docker", "Linux", "Git"], "every skill still landed");
+  assert.equal(r.status, "filled");
+  assert.ok(!/stopped early/.test(r.detail), "and the field did not bail: " + r.detail);
+});
+
+test("fillSkillsCdp: a PERSISTENTLY stuck box stops after 2, and says so — it can't burn the budget", async () => {
+  const fast = Object.assign({}, B, { taActionSettleCeilingMs: 120, taActionSettleIntervalMs: 20 });
+  const { act, st, log } = makeSkillsAct({ catalog: CATALOG, clearBroken: true });
+  const r = await fd.fillSkillsCdp(act, LOC, ["Docker", "Linux", "Git", "Python"], fast);
+  assert.deepEqual(log.filter((l) => l[0] === "enter").map((l) => l[1]), ["Docker"],
+    "only the first query, whose box was genuinely empty, reached Enter");
+  assert.deepEqual(st.chips, ["Docker"], "nothing fabricated from a dirty box");
+  assert.match(r.detail, /stopped early \(the search box would not clear\)/);
+});
+
+test("fillSkillsCdp: a commit that never lands is reported as FAILED, not as 'Workday lacks it'", async () => {
+  // The distinction the human acts on: absent means add it by hand, failed means re-run.
+  const { act } = makeSkillsAct({ catalog: CATALOG, fuzz: FUZZ });
+  act.clickHierLeaf = async () => true; // click dispatched, no chip ever appears
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Yosys"], B);
+  assert.deepEqual(r.skills_failed, ["Linux"]);
+  assert.deepEqual(r.skills_not_offered, ["Yosys"]);
+  assert.match(r.detail, /could not be entered/);
+  assert.match(r.detail, /NOT in Workday's skill list/);
+});
+
+test("fillSkillsCdp: opens by FOCUSING the input when the coordinate click can't (the hidden-tab failure)", async () => {
+  // Live: a HIDDEN run logged "could not focus the search box" and added ZERO skills, while the same
+  // job worked visible. While closed the input has no `searchBox` automation-id, so opening depended on
+  // a coordinate click — the step that a hidden, below-the-fold widget breaks. A page-side focus needs
+  // no coordinates and no paint.
+  const { act, st, log } = makeSkillsAct({ catalog: CATALOG });
+  act.openHier = async () => { log.push(["open-FAILED"]); return false; };   // coordinate click lands nowhere
+  act.openHierInput = async () => { log.push(["openInput"]); st.open = true; return { ok: true, focused: true }; };
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux", "Git"], B);
+  assert.deepEqual(st.chips, ["Linux", "Git"]);
+  assert.equal(r.status, "filled");
+  assert.ok(log.some((l) => l[0] === "openInput"), "used the input-focus/click route, not coordinates");
+});
+
+test("fillSkillsCdp: the opener RETRIES an open that lost the race, alternating both routes", async () => {
+  // The actual hidden-tab fix. A hidden run failed every attempt ("could not focus the search box",
+  // zero skills) because the open raced Workday's re-render right after the previous field committed —
+  // NOT because of the event kind (an isolation probe with trusted input removed filled the field fine).
+  // So the first opens are allowed to miss, and the routes alternate.
+  const { act, st, log } = makeSkillsAct({ catalog: CATALOG });
+  let opens = 0;
+  act.openHierInput = async () => { opens++; if (opens >= 2) st.open = true;   // route A lands on the retry
+    return { ok: true, focused: true, openedNow: st.open }; };
+  act.openHier = async () => { log.push(["coords"]); return true; };            // route B never opens it here
+  const r = await fd.fillSkillsCdp(act, LOC, ["Linux"], B);
+  assert.deepEqual(st.chips, ["Linux"], "a first-attempt miss no longer costs the whole field");
+  assert.equal(r.status, "filled");
+  assert.ok(opens >= 2, "it retried the coordinate-free route");
 });
 
 test("fillSkillsCdp: nothing matched and the field is BLANK → needs_review", async () => {
@@ -228,6 +293,42 @@ test("fillSkillsCdp: an unexpected chip is surfaced, never accepted quietly", as
   assert.equal(r.status, "needs_review");
   assert.equal(r.flag, "skills-stray");
   assert.match(r.detail, /UNEXPECTED chip\(s\): Something Else/);
+});
+
+// ── the reconcile against Workday's own review page ─────────────────────────
+
+test("reconcileReviewPage: a skills SET is checked value-by-value, not as one joined string", () => {
+  // Workday's review page prints one value per skill. Matching "A; B; C" as a single string would
+  // report a correctly filled 20-skill field as MISSING on every single rehearsal.
+  const entries = [{ field_id: "p2::formField-skills", widget_type: "typeahead",
+    question_label: "Type to Add Skills", current_value: "Python (Programming Language); Docker; Linux",
+    fill_status: "filled", is_approved: true }];
+  const items = [
+    { label: "Skills", value: "Python (Programming Language)", key: "skills" },
+    { label: "Skills", value: "Docker" },
+    { label: "Skills", value: "Linux" }
+  ];
+  const r = lib.reconcileReviewPage(items, entries, {});
+  assert.equal(r.agree.length, 1);
+  assert.equal(r.agree[0].tier, "skills-set", "took the multi-value path, not value-presence on the joined string");
+  assert.equal(r.missing_on_review.length, 0);
+});
+
+test("reconcileReviewPage: a skill missing from the review page is reported, and NAMED", () => {
+  const entries = [{ field_id: "p2::formField-skills", widget_type: "typeahead",
+    question_label: "Type to Add Skills", current_value: "Docker; Linux; Kubernetes",
+    fill_status: "filled", is_approved: true }];
+  const items = [{ label: "Skills", value: "Docker", key: "skills" }, { label: "Skills", value: "Linux" }];
+  const r = lib.reconcileReviewPage(items, entries, {});
+  assert.equal(r.agree.length, 0);
+  assert.equal(r.missing_on_review.length, 1);
+  assert.match(r.missing_on_review[0].detail, /Kubernetes/);
+});
+
+test("isSkillsEntry: entry-level detection matches the fill-side predicate", () => {
+  assert.ok(lib.isSkillsEntry({ field_id: "p2::formField-skills", widget_type: "typeahead", question_label: "Type to Add Skills" }));
+  assert.ok(!lib.isSkillsEntry({ field_id: "p2::formField-skills", widget_type: "text", question_label: "Skills" }));
+  assert.ok(!lib.isSkillsEntry({ field_id: "p2::formField-jobTitle", widget_type: "typeahead", question_label: "Job Title" }));
 });
 
 // ── the review → replay round trip ──────────────────────────────────────────

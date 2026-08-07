@@ -3497,3 +3497,56 @@ makes the rule safe rather than an optimisation.
 
 **Left on the page:** one legitimate chip, `Docker` (a real skill of the operator's) — deliberately kept
 as a pre-existing-chip fixture for verifying the never-touch rule on the next run.
+
+## 2026-08-07 (b) — SKILLS live: what actually breaks it, VISIBLE vs HIDDEN
+
+Six real runs on the same Solar Turbines draft (`cat.wd5`), fill walk, one operator profile of 24 skills.
+The widget works on both surfaces, but only after the OPEN was fixed — and the fix is not the one the
+symptom suggested.
+
+**VISIBLE (trusted input) — worked first time.** Added 7 of 24 and the qualified tier fired live:
+`C → C (Programming Language)`, `Python → Python (Programming Language)`,
+`Java → Java (Programming Language)`, plus exact hits `SystemVerilog`, `Modbus`, `Raspberry Pi`, `Linux`.
+`slowest: skills 33s` for the whole field — it dominates page 2 and always will.
+
+**HIDDEN (synthetic input) — failed with a misleading signature.** Three open attempts per skill, each
+reporting `{focused:true, ok:true, openedNow:false}`: the input was found and focused, but the searchBox
+automation-id never appeared, so ZERO skills were added while seven chips from an earlier run sat there
+looking like success. **The same run with `forceTrustedInput` opened and searched normally**
+(`cand "C++" → results (1314ms, 7 options, open:true)`), which reads exactly like "this widget needs
+trusted events" — the documented pattern for the auth form and the Self Identify page.
+
+**That conclusion was wrong, and an isolation probe is what showed it.** Scoping trusted input to the
+field did NOT fix it (verified from the log: "synthetic input ENABLED" appeared twice, so the switch and
+restore both ran). What fixed it was the OPENER:
+
+- **Never fire both opener routes in one attempt.** The first cut clicked the input page-side and then
+  immediately coordinate-clicked the container; the second click landed before the searchBox mounted, and
+  a second click on a multiselect **toggles it shut** — so the poll always found it closed. This is the
+  same toggle-shut invariant the unified typeahead filler already documents.
+- **Retry, alternating routes, after a settle beat.** The open races Workday's re-render right after the
+  preceding field commits — which is why the SLOWER trusted run opened on attempt 1 and the faster
+  synthetic run missed every time. With one settle beat and the two routes alternating, a hidden
+  *synthetic* run filled the field normally: 13 candidates processed, adding `JavaScript`,
+  `Altium Designer`, `Git`, `Docker (Software)`, then `RViz`, `Fusion 360`, `Yosys` on the next run.
+- **So do NOT re-add trusted input to this field.** It roughly doubles the field's wall-clock and buys
+  nothing; the note in `fillSkillsCdp` says so at the call site.
+
+**The clear is the other flaky primitive, and the reason matters.** `cdpSelectAllDelete` (trusted
+Ctrl+A + Delete) is focus-blind, and on THIS widget Ctrl+A does not select the input's text — by hand the
+select-all went to the page and the next keystrokes APPENDED. Live it cleared fine for seven skills, then
+failed, and the field (first cut) abandoned the rest of the list — losing Git, Docker, VS Code and Vivado,
+all of which the taxonomy has. Now: a React-safe native-setter clear (`clearHierInput`) is tried first,
+trusted Ctrl+A is the fallback, a failure RETRIES, and only a second consecutive failure ends the field —
+a skipped skill is reported as an infra failure, never as "Workday doesn't have it".
+
+**Coverage varies RUN TO RUN, because the result set is a ranked top-7.** `Yosys`, `RViz` and `Fusion 360`
+matched on one run and not the previous one. And strictness has a real cost worth stating plainly: a skill
+whose only offered row is a differently-named relative (e.g. `Vivado` against rows like `Xilinx Vivado`)
+is deliberately left OFF — accepting it would be the containment guess this project bans. Those skills are
+named in the record so the human can add them by hand.
+
+**An `autocommit` terminal can fire with NO new chip** (live: `cand "C++" → autocommit, 0 options`, and no
+C++ chip afterwards). `awaitListTerminal` reports autocommit whenever the chip SET differs from the
+snapshot, which a re-order/re-render also produces. Nothing added, nothing strayed — so it is bucketed as
+a failure rather than disappearing from the report.

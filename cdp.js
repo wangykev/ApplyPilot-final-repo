@@ -2489,6 +2489,45 @@ function cdpFocusBySel(sel) {
   return document.activeElement === el;
 }
 
+// Clear a multiselect's search input the REACT-SAFE, FOCUS-INDEPENDENT way: the native value setter
+// plus input/change (the standard React fill technique). The other typeaheads clear with trusted
+// Ctrl+A/Delete (cdpSelectAllDelete), but on the SKILLS widget Ctrl+A does NOT select the input's
+// text — observed by hand: the select-all went to the page, the next keystrokes APPENDED to the stale
+// query, and Enter turned "Docker" + "CubeMars motor drivers" into the chip
+// "DockerCubeMars motor drivers". On this widget a stale query can FABRICATE a skill, so the clear
+// must not depend on where focus happens to be. Live, a trusted-hidden run cleared fine for one skill
+// and then failed on the next two, which is exactly the flakiness a focus-blind primitive produces.
+function cdpClearInputNative(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "no input" };
+  const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+  try { if (d && d.set) d.set.call(el, ""); else el.value = ""; } catch (e) { return { ok: false, reason: "set threw" }; }
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: true, value: el.value };
+}
+
+// Open a multiselect by acting on its OWN input, page-side — no coordinates, no paint required.
+// Why this exists (skills, traced 2026-08-07): the input gains data-automation-id="searchBox" only
+// ONCE OPEN, so while closed every searchBox-keyed selector misses it and opening has to go through
+// a COORDINATE click on the container. That click is what failed on a HIDDEN run which worked fine
+// visible — the field logged "could not focus the search box" and added zero skills. By hand, what
+// reliably opened the widget was focus() + click() on the input itself, which is what this does.
+// Returns a diagnostic (not a bare bool) so a failure says WHICH step missed; the caller still polls
+// readHier, because the searchBox id appears on a later React tick.
+function cdpOpenMultiselectInput(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, reason: "no wrapper" };
+  const inp = w.querySelector("input");
+  if (!inp) return { ok: false, reason: "no input" };
+  if (inp.scrollIntoView) inp.scrollIntoView({ block: "center", behavior: "instant" });
+  try { inp.focus(); } catch (e) { /* keep going — the click may still open it */ }
+  const focused = document.activeElement === inp;
+  try { inp.click(); } catch (e) { return { ok: false, reason: "click threw", focused }; }
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  return { ok: true, focused, openedNow: !!sb };
+}
+
 // Same focus attempt, but it REPORTS what happened instead of a bare boolean — whether the node was
 // there, whether focus() took, and if not, what holds focus instead. "Could not focus" has at least
 // three causes with different fixes, and a boolean cannot tell them apart.
@@ -4190,6 +4229,14 @@ function makeCdpActuation(llmConfig) {
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     // Diagnostic twin — same attempt, but returns WHY it failed (see cdpFocusDiag).
     focusHierSearchDiag: (loc) => cdpEval(cdpFocusDiag, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    // The multiselect's input carries data-automation-id="searchBox" ONLY ONCE OPEN (skills, traced
+    // 2026-08-07), so every searchBox-keyed selector above is unreachable while the widget is closed and
+    // opening otherwise has to go through a COORDINATE click. focus() + click() on the widget's own input
+    // needs no coordinates and no paint — the skills opener alternates the two routes. Returns a
+    // diagnostic (not a bool); the caller polls readHier, since the searchBox id appears a tick later.
+    openHierInput: (loc) => cdpEval(cdpOpenMultiselectInput, loc.wrapperSel),
+    // React-safe, focus-independent clear of the widget's search input (see cdpClearInputNative).
+    clearHierInput: (loc) => cdpEval(cdpClearInputNative, loc.wrapperSel + " input"),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
     probeHierLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),
