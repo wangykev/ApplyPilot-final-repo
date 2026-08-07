@@ -90,7 +90,6 @@ function cdpAttach(tabId) {
         // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
         try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
         cdpInvalidatePaint(); // a fresh attach says nothing about the previous tab's paint state
-        _screencastOn = false; // a previous run's screencast does not survive a new attach
         _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
         console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
         resolve({ ok: true });
@@ -115,13 +114,6 @@ function cdpDetach() {
   return new Promise((resolve) => {
     if (cdpTabId === null) { resolve(); return; }
     const id = cdpTabId;
-    // Never leave a tab under capture: drop the screencast listener and stop the stream before the
-    // debugger goes away, so neither outlives the run it belonged to (see cdpForceRender).
-    if (_screencastOn) {
-      _screencastOn = false;
-      try { chrome.debugger.onEvent.removeListener(cdpScreencastFrameHandler); } catch (e) { /* ignore */ }
-      try { chrome.debugger.sendCommand({ tabId: id }, "Page.stopScreencast", {}, () => void chrome.runtime.lastError); } catch (e) { /* ignore */ }
-    }
     chrome.debugger.detach({ tabId: id }, () => {
       void chrome.runtime.lastError;
       console.log("[ApplyPilot][CDP] detached from tab", id);
@@ -195,60 +187,22 @@ async function cdpSetFocusEmulation(enabled) {
   catch (e) { return false; }
 }
 
-// ── FORCE A HIDDEN TAB TO PRODUCE FRAMES (2026-08-05) ────────────────────────────────────────────────
-// The note above says a pure rAF-pause is resumed only by true tab visibility. That is true of the
-// levers we had — worker timers replace TIMERS, focus emulation changes what the page BELIEVES, and
-// setWebLifecycleState only un-freezes — none of them make the compositor draw. But Chrome keeps
-// producing frames for a tab that something is CAPTURING, which is why headless screenshot tooling can
-// film a background page: Page.startScreencast puts the tab under capture, and its frames come from the
-// same pipeline rAF waits on.
+// ── WHY THERE IS NO SCREENCAST HERE ANY MORE (removed 2026-08-07) ────────────────────────────────────
+// There was one: Page.startScreencast put a hidden tab under capture, which makes Chrome keep producing
+// frames for it, and that genuinely worked. It was added because Greenhouse's server-backed comboboxes
+// "burn 16-31s hidden and then reach review unanswered".
 //
-// So this is not a spoof: it makes the hidden tab genuinely render. Measured need (2026-08-05): react
-// dropdown menus on Greenhouse that paint instantly when visible burn 16-31s hidden and then reach
-// review unanswered, because a menu we cannot see is a menu we cannot read.
+// That symptom had nothing to do with paint. It was OUR page overrides landing on a document that was
+// already running: the timers those widgets schedule their search on got swapped mid-flight and the
+// widgets never resolved again. Forcing frames let the half-broken page grind through often enough to
+// look like a fix. Installing the overrides before the document exists (see runAtsApplicationRun) fixed
+// the cause, and the workaround measured as pure cost afterwards — Discord hidden filled 16.9s dark vs
+// 17.2s under capture, and Reddit's rehearsal (the run that FAILED without forcing on 2026-08-06)
+// passed its whole gate dark: 23 fields replayed, 0 failures, 0 blockers.
 //
-// Cheap on purpose — 1-quality JPEG at 80x60 is a thumbnail nobody looks at; we ACK each frame only
-// because Chrome stops sending after two un-acked ones. Best-effort everywhere: an unsupported or
-// refused screencast leaves the run exactly as it was.
-let _screencastOn = false;
-function cdpScreencastFrameHandler(source, method, params) {
-  if (method !== "Page.screencastFrame") return;
-  if (!cdpTabId || !source || source.tabId !== cdpTabId) return;
-  // ACK, or the stream stops after ~2 frames (and with it the frame production we came for).
-  try { chrome.debugger.sendCommand({ tabId: cdpTabId }, "Page.screencastFrameAck", { sessionId: params && params.sessionId }, () => void chrome.runtime.lastError); } catch (e) { /* best effort */ }
-}
-async function cdpForceRender(on) {
-  if (on && !_screencastOn) {
-    // Kill-switch, same shape as forceTrustedInput / forceWorkerTimersOff: a contended machine can
-    // opt out and take the slow-but-proven path instead.
-    try {
-      const { forceRenderOff } = await new Promise((r) => chrome.storage.local.get("forceRenderOff", r));
-      if (forceRenderOff) return false;
-    } catch (e) { /* default to ON */ }
-    try {
-      chrome.debugger.onEvent.addListener(cdpScreencastFrameHandler);
-      // ⚠ everyNthFrame MATTERS. At 1 Chrome captures and JPEG-encodes EVERY frame, and the encoding
-      // starves the renderer it was meant to free: live 2026-08-05 a `gender` select that fills in ~1s
-      // took 33.4s and listed no options at all. We do not want the pictures — we want the compositor
-      // awake — so ask for roughly one frame a second and let the rest of the pipeline breathe.
-      await cdpSend("Page.startScreencast", { format: "jpeg", quality: 1, maxWidth: 32, maxHeight: 24, everyNthFrame: 60 });
-      _screencastOn = true;
-      cdpInvalidatePaint();   // the paint answer just changed — re-measure rather than trust the cache
-      return true;
-    } catch (e) {
-      try { chrome.debugger.onEvent.removeListener(cdpScreencastFrameHandler); } catch (e2) { /* ignore */ }
-      return false;
-    }
-  }
-  if (!on && _screencastOn) {
-    _screencastOn = false;
-    try { chrome.debugger.onEvent.removeListener(cdpScreencastFrameHandler); } catch (e) { /* ignore */ }
-    try { await cdpSend("Page.stopScreencast", {}); } catch (e) { /* ignore */ }
-    cdpInvalidatePaint();
-  }
-  return _screencastOn;
-}
-function cdpRenderForced() { return _screencastOn; }
+// If a future tenant genuinely needs frames, this is the lever and it does work — bring it back
+// deliberately, with a measurement, rather than as a hedge. It is not free: capture makes the renderer
+// paint, and at everyNthFrame:1 the JPEG encoding starved the very renderer it was meant to free.
 
 // ── Hidden-tab SPA-transition unblock (2026-07-03) ───────────────────────────
 // A HIDDEN/minimized tab has requestAnimationFrame FULLY PAUSED (and timers

@@ -109,7 +109,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-install-before-navigate";
+const AP_BUILD = "2026-08-07-no-screencast";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -544,9 +544,9 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // the line text (e.g. "CDP-TIME|HALT"), `limit` caps the reply (newest kept, `truncated` says so), and
   // `clear` empties the buffer after replying. Allowed DURING a run — watching a live walk is the point.
   if (type === "AP_DEV_FLAG") {
-    // dev-only: flip a chrome.storage.local debug flag (atsSkipOverrides, forceWorkerTimersOff, …)
+    // dev-only: flip a chrome.storage.local debug flag (forceWorkerTimersOff, forceTrustedInput)
     const key = String(message.key || "");
-    if (!/^(atsSkipOverrides|forceWorkerTimersOff|forceTrustedInput|forceRenderOff)$/.test(key)) { sendResponse({ ok: false, error: "unknown flag" }); return true; }
+    if (!/^(forceWorkerTimersOff|forceTrustedInput)$/.test(key)) { sendResponse({ ok: false, error: "unknown flag" }); return true; }
     chrome.storage.local.set({ [key]: !!message.value }, () => sendResponse({ ok: true, key, value: !!message.value }));
     return true;
   }
@@ -3927,19 +3927,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // the registration (Page.addScriptToEvaluateOnNewDocument) is in place before the posting is ever
     // fetched and every document the run touches starts with it. That costs NOTHING — it is the same
     // single navigation the run always made, just moved to after the install. A reload here would have
-    // worked too and was rejected for being a second page load. chrome.storage.local.atsSkipOverrides
-    // remains as a debug switch for comparing against no overrides at all.
-    {
-      const { atsSkipOverrides } = await new Promise((r) => chrome.storage.local.get("atsSkipOverrides", r));
-      if (atsSkipOverrides) console.log("[ApplyPilot][CDP] page overrides SKIPPED for this ATS run (atsSkipOverrides)");
-      else await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
-    }
+    // worked too and was rejected for being a second page load.
+    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
     await cdpSetFocusEmulation(true).catch(() => {});
-    // …and actually MAKE it render: focus emulation only changes what the page believes, while a
-    // screencast puts the tab under capture, which is what keeps Chrome's compositor producing the
-    // frames rAF (and therefore every menu paint) waits on. Proven by the paint probe below.
-    const forced = await cdpForceRender(true).catch(() => false);
-    try { console.log(`[ApplyPilot][CDP] render forcing ${forced ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ }
 
     // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
     // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below
@@ -4104,31 +4094,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const prepared = prepareProfile(store.profile);
     let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
 
-    // RELOAD ONCE IF THIS PAGE'S ASYNC WIDGETS NEVER ANSWERED. Greenhouse forms sometimes load in a
-    // state where their server-backed comboboxes (school / degree / discipline / location) return
-    // nothing at all — the operator's own remedy is to refresh, and the same widget then answers in
-    // ~1s by hand (2026-08-06). Every other explanation was tested and ruled out first: the tab was
-    // VISIBLE and painting, the click was trusted, the keystrokes were trusted, and google.maps is not
-    // involved. Bounded to ONE retry, gated on the signal (a healthy page never pays it), and these
-    // forms are stateless — a refill from a blank form is exactly what a second visit does anyway.
-    if ((out.deadAsync || []).length && !opts0.__reloaded) {
-      LOG(`this form's async widgets never answered (${out.deadAsync.join(", ")}) — reloading once and refilling, the way a human would`);
-      emitRunProgress("Refreshing the form", "its dropdowns never loaded — reloading once");
-      try {
-        // A TRUE REFRESH (Page.reload), not a re-navigation: the operator's remedy is F5, and a
-        // navigate to the same URL can be served from a state that is already broken.
-        await cdpReload();
-        await cdpDelay(1200);                 // let the document start over before we look for fields
-        const ready = await waitAtsFormReady(ats, LOG);   // ⚠ it returns {ready}, not {ok}
-        if (ready && ready.ready) {
-          const retry = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
-          const before = (out.deadAsync || []).length, after = (retry.deadAsync || []).length;
-          LOG(`refill after reload: ${after} async widget(s) still silent (was ${before})`);
-          if (after < before) out = retry;   // keep whichever visit actually got answers
-        } else {
-          LOG("reload did not bring the form back — keeping the first pass");
-        }
-      } catch (e) { LOG("reload attempt failed:", String((e && e.message) || e)); }
+    // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
+    // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
+    // nothing at all; that state was our own page overrides landing on an already-running document, and
+    // it is fixed at the cause now (see the install above). What is left is the honest kind: a form whose
+    // places/search service genuinely does not respond — live, Ashby's location combobox, which fails
+    // identically on a reload, under screen capture, and by hand. Retrying that costs a second full fill
+    // and changes nothing, so the field reaches review self-explaining and we name it here.
+    if ((out.deadAsync || []).length) {
+      LOG(`the form's own async widget(s) never answered: ${out.deadAsync.join(", ")} — left for review rather than retried`);
     }
 
     // ONE page ⇒ one bundle write (the walk's clear-once + accumulate collapses to a set).
@@ -4189,16 +4163,6 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides();
     await cdpSetFocusEmulation(true).catch(() => {});
-    // THE REPLAY NEEDS THE FRAMES JUST AS MUCH AS THE FILL DID — arguably more, because here a widget
-    // whose menu never paints means an APPROVED value cannot be committed and the gate refuses. This
-    // was missing while the fill had it, and the asymmetry showed up exactly as you would expect
-    // (live 2026-08-06, Reddit: every dropdown filled on the fill, then two of them reported "listed
-    // no options" on the rehearsal — 25.4s and 17.9s — with no render-forcing line in that run's log).
-    {
-      const forcedR = await cdpForceRender(true).catch(() => false);
-      try { LOG(`render forcing ${forcedR ? "ON (screencast)" : "unavailable"} — paint: ${await cdpPaintLabel()}`); } catch (e) { /* log only */ }
-    }
-
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
     // form from an embedded frame, and the fill followed it there. Starting from the caller's
