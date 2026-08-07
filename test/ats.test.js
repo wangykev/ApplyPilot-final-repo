@@ -1708,3 +1708,57 @@ test("commit read-back: polls until the value appears, instead of sampling once"
   assert.ok(/^filled/.test(String(rec.status)), "status was " + rec.status);
   assert.ok(reads >= 3, "it actually polled (reads=" + reads + ")");
 });
+
+// ── SELECT-ALL-THAT-APPLY identity checkboxes (Ashby/Sierra, live 2026-08-07) ──────────────
+// The diversity survey renders each identity as its OWN checkbox, so the LABEL is an option
+// rather than a question. The profile answers those dimensions in whole sentences, which used
+// to match neither /^(yes|true)$/ nor /^(no|false)$/ — so two questions the profile ALREADY
+// ANSWERS were reported as "your profile answer isn't one of this form's options". Leaving the
+// box unchecked IS that answer, so it must be silent, and it must not actuate anything.
+test("checkbox: a stated NEGATIVE leaves an identity box unchecked, silently and untouched", async () => {
+  for (const stated of ["No, I don't have a disability", "I am not a protected veteran", "No"]) {
+    let touched = false;
+    const act = fakeAct({ atsInjSetChecked: () => { touched = true; return { ok: true, checked: true }; } });
+    const f = { fieldName: "cb", widgetType: "checkbox", label: "Person with disability", isRequired: false, options: [] };
+    const rec = {};
+    const produced = await ats.atsActuateField(act, "ashby", f, { inputSel: "#cb" }, rec, [stated], null, {}, {}, {});
+    assert.ok(produced, stated + ": the driver must OWN this field, not fall through to needs_review");
+    assert.strictEqual(rec.status, "skipped", stated + " → status was " + rec.status);
+    assert.ok(!rec.flag, stated + " must not be flagged for review, it is answered");
+    assert.strictEqual(touched, false, stated + " must not click the box");
+  }
+});
+
+test("checkbox: an answer that NAMES the identity ticks it; a different identity does not", async () => {
+  const mk = (label) => ({ fieldName: "cb", widgetType: "checkbox", label, isRequired: false, options: [] });
+  // exact-normalized name → the affirmative
+  let checked = false;
+  const act = fakeAct({ atsInjSetChecked: () => { checked = true; return { ok: true, checked: true }; } });
+  const rec = {};
+  await ats.atsActuateField(act, "ashby", mk("Asian"), { inputSel: "#cb" }, rec, ["Asian"], null, {}, {}, {});
+  assert.strictEqual(checked, true, "an answer naming this identity should tick it");
+  assert.strictEqual(rec.status, "filled_review", "an EEO box we ticked is always shown to the human");
+
+  // NOT a near-miss: "East Asian" must not decide a box labelled "Asian" (an "East Asian" box may exist)
+  let checked2 = false;
+  const act2 = fakeAct({ atsInjSetChecked: () => { checked2 = true; return { ok: true, checked: true }; } });
+  const rec2 = {};
+  const produced2 = await ats.atsActuateField(act2, "ashby", mk("Asian"), { inputSel: "#cb" }, rec2, ["East Asian"], null, {}, {}, {});
+  assert.strictEqual(checked2, false, "a containment near-miss must never tick a demographic box");
+  assert.strictEqual(produced2, false, "it should fall through so the human picks it");
+});
+
+test("checkbox: an ordinary consent is unchanged — required auto-checks, refused required flags", async () => {
+  let checked = false;
+  const act = fakeAct({ atsInjSetChecked: () => { checked = true; return { ok: true, checked: true }; } });
+  const rec = {};
+  const f = { fieldName: "consent", widgetType: "checkbox", label: "I agree to the terms", isRequired: true, options: [] };
+  await ats.atsActuateField(act, "ashby", f, { inputSel: "#c" }, rec, null, null, {}, {}, {});
+  assert.strictEqual(checked, true);
+  assert.strictEqual(rec.status, "filled");
+
+  const rec2 = {};
+  const act2 = fakeAct({ atsInjSetChecked: () => ({ ok: true, checked: true }) });
+  await ats.atsActuateField(act2, "ashby", f, { inputSel: "#c" }, rec2, ["No"], null, {}, {}, {});
+  assert.strictEqual(rec2.status, "needs_review", "a required box the profile refuses is never auto-consented");
+});

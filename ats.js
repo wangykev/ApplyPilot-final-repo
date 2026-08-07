@@ -2450,9 +2450,33 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   if (wt === "checkbox") {
     // Consent semantics — the Workday rule: REQUIRED → auto-check (silent); optional with a
     // mapped true → check; otherwise leave (blank optional is the correct resting state).
-    const explicitTrue = candidates && candidates.length && /^(yes|true)$/i.test(String(candidates[0]));
-    const explicitFalse = candidates && candidates.length && /^(no|false)$/i.test(String(candidates[0]));
-    if (!f.isRequired && !explicitTrue) { if (!explicitFalse) return false; rec.status = "skipped"; rec.detail = "profile refuses this optional checkbox — left unchecked"; return true; }
+    //
+    // A STATED ANSWER CARRIES ITS POLARITY IN ITS LEADING WORDS, not as a bare token (2026-08-07).
+    // Ashby/Sierra renders its diversity survey as SELECT ALL THAT APPLY: each identity is its own
+    // checkbox — "Person with disability", "Veteran", "Neurodiverse", "Parent" — so the LABEL is an
+    // option, not a question. The profile answers those dimensions in whole sentences ("No, I do not
+    // have a disability", "I am not a protected veteran"), which matched neither /^(yes|true)$/ nor
+    // /^(no|false)$/, so two questions the profile ALREADY ANSWERS fell through to "your profile
+    // answer isn't one of this form's options — pick the right one here". Nothing was unmatched:
+    // leaving the box unchecked IS that answer, completely. Negative is tested FIRST, because "I am
+    // not a protected veteran" satisfies the positive lead too.
+    const c0 = candidates && candidates.length ? String(candidates[0]) : "";
+    const explicitFalse = !!c0 && (/^(no|false)\b/i.test(c0) || ATS_NEG_LEAD_RE.test(c0));
+    // …and on such a list, an answer that NAMES this box is the affirmative. EXACT-normalized only,
+    // and deliberately NOT gated on atsIsEeoLabel: that detector knows DIMENSION names ("veteran",
+    // "disability"), while these labels are the VALUES ("Asian", "White") — which is the whole point
+    // of a select-all list. Exact equality stands on its own anyway: the profile literally says this
+    // label, on any checkbox. Containment must stay out — "East Asian" must not decide a box labelled
+    // "Asian" while an "East Asian" box may be sitting right below it.
+    const namesIt = !!c0 &&
+      candidates.some((c) => atsLib.normalize(String(c)) === atsLib.normalize(String(f.label)));
+    const explicitTrue = !!c0 && !explicitFalse && (/^(yes|true)\b/i.test(c0) || ATS_POS_LEAD_RE.test(c0) || namesIt);
+    if (!f.isRequired && !explicitTrue) {
+      if (!explicitFalse) return false;
+      rec.status = "skipped";
+      rec.detail = "your profile answers this (" + JSON.stringify(c0) + "), so the box stays unchecked";
+      return true;
+    }
     if (f.isRequired && explicitFalse) { rec.status = "needs_review"; rec.detail = "required checkbox the profile refuses — not auto-consenting"; return true; }
     rec.resolved = true;
     const r = await act.eval(atsInjSetChecked, ref.inputSel, true);
