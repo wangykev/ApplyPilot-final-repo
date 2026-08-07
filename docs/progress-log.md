@@ -3555,3 +3555,59 @@ disagrees.
 Extension **1117/1117**. One test-writing note worth keeping: the first draft of the reconcile tests
 passed for the WRONG reason — every row landed in `missing_on_review` because the fixture used the wrong
 argument shape — so they now assert `tier === "keyed"` to prove they exercise the real compare.
+
+## 2026-08-07 (d) — SKILLS: the multi-value typeahead, built from a hand trace
+
+`Type to Add Skills` has been `skipped: no mapping` since 2026-06-04 — the last always-empty field on
+page 2. The plan on the books was "a repeat-commit loop around `fillTypeaheadCdp`". The trace says that
+would have been wrong in a way unit tests could never have caught, so the trace came first: page 2 of a
+real Solar Turbines draft (`cat.wd5`), driven by hand in the operator's own session, reading the DOM
+after every keystroke. Full observation record: dom-patterns 2026-08-07.
+
+**What the widget actually does.** It does not live-filter (ENTER is the filter trigger, banner "Search
+Results"); the input only GAINS `data-automation-id="searchBox"` once opened; the open list is
+"No Items." so there is nothing to start-scrape; a commit ADDS a chip and leaves the list open with the
+query intact, so N skills go in on one open; Tab-blur exits clean. A synthetic pointer-sequence click
+commits fine here — no trusted input needed.
+
+**Three findings changed the design.**
+
+**1. The taxonomy renames, so exact-only would have filled almost nothing.** "Python" is offered ONLY as
+`Python (Programming Language)`; "Docker" is offered as BOTH `Docker` and `Docker (Software)`. That
+trailing parenthetical is Workday's own qualifier — the same shape `normalize()` already strips off a
+dial code `(+1)` — hence `skillBaseName` and a "qualified" match tier, with a bare exact winning so
+"Docker" never resolves to "Docker (Software)".
+
+**2. The search is server-side FUZZY, so its results are NOT candidates.** `Yosys` → **Yodiz**;
+`ODrive` → **Top Drive**; even `zzqqxwvj` → `z/VM`. All under the same "Search Results" banner as a real
+hit. Containment and Levenshtein would each have committed one of those onto an application, which is the
+precise failure this project's match ladder exists to prevent — so this field allows exact/qualified only,
+ambiguity-guarded, and a skill Workday doesn't know stays OFF the form and is NAMED for the human. No AI:
+it is optional, and guessing a demonstrated-bad row is worse than a blank.
+
+**3. A dirty search box FABRICATES a skill.** A zero-result query + Enter makes Workday add the typed text
+as a brand-new skill. Mid-trace a `ctrl+a` that didn't land meant the next skill appended to the old
+query, and Enter created the chip **"DockerCubeMars motor drivers"** — a skill nobody claimed. On every
+other typeahead a dirty box merely wastes a candidate; here it writes a wrong answer. So the clear is a
+HARD GATE: unverified-empty ⇒ the field stops rather than press Enter. (That same behaviour is also the
+only way an off-taxonomy skill lands verbatim, and it is accepted when the new chip IS what we typed —
+Workday completed it, we didn't guess it.)
+
+**And one that makes a re-fill safe.** An already-selected skill DISAPPEARS from its own later results:
+with `Docker` committed, re-searching it offered only `Docker (Software)` and `Dockerfile`. So a re-fill
+that didn't dedup would commit a near-duplicate — `missingSkills` compares BASE names in both directions
+(a `Python (Programming Language)` chip covers the profile's "Python"), all-present is zero actuation, and
+the replay is idempotent by construction.
+
+**Shipped.** `skillBaseName`/`matchSkillOption`/`missingSkills` (lib.js, mirrored into the SW `apMatch`
+literal — the lockstep guard caught this one immediately, for a comment containing `field:` that its
+literal parser read as a key), `isSkillsField` + `fillSkillsCdp` (fill-driver.js), routed in
+`drivePageFill`'s flat loop and in `replayField` (splitting the approved `"A; B; C"` back apart, ABOVE
+skip-if-correct so chip order can't read as a mismatch). Each commit is verified as chip-set GROWTH plus
+identity of the new chip; `skillsMaxAdds`/`skillsBudgetMs` bound a cost that scales with the profile
+(~2–4s/skill), and whatever they drop is named rather than silently trimmed.
+
+Extension **1131/1132** (`test/skills.test.js`, 20 new pins; the one failure is `db.test.js` —
+`fake-indexeddb` is missing from this worktree's `node_modules`, unrelated). **Live-verify pending**, plus
+two operator calls left open: whether a qualified commit should stay silent `filled` or be flagged, and
+whether a partial fill should nag review or just name the absent skills in the detail (current behaviour).

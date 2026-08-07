@@ -521,6 +521,72 @@ function splitGroupValue(v) {
   const s = String(v == null ? "" : v);
   return s.trim() === "" ? [] : s.split(GROUP_JOIN).map((x) => x.trim()).filter(Boolean);
 }
+// ── Workday SKILLS ("Type to Add Skills") ────────────────────────────────────
+// A MULTI-VALUE typeahead over Workday's OWN skill taxonomy. Traced live on cat.wd5 2026-08-07
+// (docs/dom-patterns.md). Two OBSERVED facts drive every helper here:
+//
+//  1. The taxonomy RENAMES. "Python" is offered only as "Python (Programming Language)" — there is
+//     no bare "Python" row — while "Docker" is offered as BOTH "Docker" and "Docker (Software)".
+//     So a plain exact match finds nothing for most skills, and that trailing parenthetical is a
+//     QUALIFIER Workday added, the same shape normalize() already strips off a dial code "(+1)".
+//
+//  2. The search is SERVER-SIDE FUZZY and answers almost anything. "Yosys" → "Yodiz" + "GoSystem
+//     Tax RS"; "ODrive" → "Top Drive" + "Optical Disk Drives"; even "zzqqxwvj" returns rows. The
+//     server has ALREADY fuzzed, badly — so containment, Levenshtein and "take the first row" are
+//     not weak tiers here, they are wrong answers waiting to be committed. Only an exact name
+//     (bare or qualified) may be committed; anything else is left for the human to add by hand.
+const SKILL_QUALIFIER_RE = /\s*\([^()]*\)\s*$/; // ONE trailing "(...)" — never a mid-string paren
+
+// "Python (Programming Language)" → "python". A name that is NOTHING but a parenthetical is kept
+// whole, so a degenerate option can't collapse to "" and match everything.
+function skillBaseName(s) {
+  const full = normalize(String(s == null ? "" : s));
+  const bare = full.replace(SKILL_QUALIFIER_RE, "").trim();
+  return bare || full;
+}
+
+// Match ONE profile skill against the live search results → { index, tier } (index -1 = commit
+// NOTHING). Two tiers, and deliberately no containment and no fuzzy tier (fact 2 above):
+//   • "exact"     — the option IS the skill               ("Docker" → "Docker")
+//   • "qualified" — the skill plus Workday's parenthetical ("Python" → "Python (Programming Language)")
+// A bare exact WINS, so "Docker" never resolves to "Docker (Software)" while the plain row is on
+// offer. Both tiers are AMBIGUITY-GUARDED: if two rows match, we cannot tell which the human meant
+// (e.g. "Python (Programming Language)" vs a hypothetical "Python (Snake)"), so we commit nothing.
+function matchSkillOption(skill, optionTexts) {
+  const opts = Array.isArray(optionTexts) ? optionTexts.map((t) => String(t == null ? "" : t)) : [];
+  const want = normalize(String(skill == null ? "" : skill));
+  if (!want || !opts.length) return { index: -1, tier: null };
+  const hits = (fn) => { const out = []; opts.forEach((t, i) => { if (fn(t)) out.push(i); }); return out; };
+  const exact = hits((t) => normalize(t) === want);
+  if (exact.length === 1) return { index: exact[0], tier: "exact" };
+  if (exact.length > 1) return { index: -1, tier: null, ambiguous: "exact" };
+  const wantBase = skillBaseName(want);
+  const qualified = hits((t) => skillBaseName(t) === wantBase);
+  if (qualified.length === 1) return { index: qualified[0], tier: "qualified" };
+  if (qualified.length > 1) return { index: -1, tier: null, ambiguous: "qualified" };
+  return { index: -1, tier: null };
+}
+
+// Which of `wanted` are not already on the widget, in profile order. Compared on the BASE name in
+// both directions, because a chip Workday created reads back QUALIFIED: a "Python (Programming
+// Language)" chip already covers the profile's "Python". Without that, a second pass would search
+// "Python" again, find the bare row GONE (Workday drops an already-selected skill from its own
+// results — observed), and commit "Python IDLE" as a near-duplicate. Also dedupes `wanted` against
+// itself, so a profile listing a skill twice can't add it twice.
+function missingSkills(wanted, chips) {
+  const have = new Set((Array.isArray(chips) ? chips : []).map(skillBaseName).filter(Boolean));
+  const out = [];
+  for (const raw of (Array.isArray(wanted) ? wanted : [])) {
+    const s = String(raw == null ? "" : raw).trim();
+    if (!s) continue;
+    const base = skillBaseName(s);
+    if (!base || have.has(base)) continue;
+    have.add(base);
+    out.push(s);
+  }
+  return out;
+}
+
 // A checkbox GROUP's recorded value is a JOINED set ("Asian; White"), and Workday's review page
 // prints the options separately — so looking for the joined string finds nothing and a correct
 // two-answer field reads as MISSING. Expand a group entry into its individual values before matching.
@@ -1947,6 +2013,7 @@ function devLogSelect(ring, opts) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
+  skillBaseName, matchSkillOption, missingSkills,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

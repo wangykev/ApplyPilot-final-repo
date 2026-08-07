@@ -3408,3 +3408,92 @@ before the rehearsal, so stale server state is plausible — but the fill walk S
 successfully minutes earlier, and the failure is specific to re-entering a SAVED application, which is
 what a replay always does. It is consistent with the already-recorded finding that Workday drops some
 self-ID answers on re-entry while sibling dropdowns persist.
+
+## 2026-08-07 — SKILLS ("Type to Add Skills") on cat.wd5: the multi-value typeahead, traced end to end
+
+First full trace of the Skills widget, done by hand in the operator's own signed-in session on the Solar
+Turbines draft (`cat.wd5/solarturbines`, page 2 "My Experience", `formField-skills`, label
+**"Type to Add Skills"**, OPTIONAL). It had been `skipped: no mapping` since 2026-06-04. Everything below
+was observed, and several points refute what the single-value typeahead path would have assumed.
+
+**Structure.** Closed, the wrapper holds `multiSelectContainer[data-uxi-widget-type=multiselect]` →
+`multiselectInputContainer` → `div[data-automation-hiddensearch=false]` → `input#skills--skills`
+(placeholder "Search") + `promptAriaInstruction` reading **"0 items selected"**.
+
+- **The input GAINS `data-automation-id="searchBox"` only once opened** (and `hiddensearch` flips to
+  `true`). So `cdpReadHierState` reports `searchBox.present:false` on a closed widget — the open click is
+  a precondition for reading it at all, not just for typing.
+- **On open with an empty query the list is "No Items."** There is no browsable catalog, so a start-scrape
+  (`makeStartCapture`) and `captureChoiceOptions` both come back empty here — no pre-scrape
+  short-circuit, and no option list for the review editor. That is a property of the widget, not a bug.
+- The open list is also where the **chip-contamination rule** proves itself again: a page-wide
+  `promptOption` read returned "Carnegie Mellon University" and "Electrical and Computer Engineering" —
+  the *school* and *field-of-study* chips from the Education section above. `cdpReadHierState`'s
+  `selectedItemList` exclusion already removes them.
+
+**It does NOT live-filter — ENTER is the filter trigger** (the US Bank `source` family). Typing "Python"
+and waiting 2s left the list on "No Items."; Enter produced the `promptTitle` banner **"Search Results"**.
+
+**Chip anatomy** (the delete affordance, and why a chip embeds an option):
+```
+li[data-automation-id=menuItem][role=presentation]
+  div[data-automation-id=selectedItem][role=option][aria-label="Docker, press delete to clear value."]
+    div[data-automation-id=DELETE_charm][role=presentation]      ← the X
+    p[data-automation-id=promptOption]  "Docker"                 ← why a chip reads as an option
+```
+After a commit `promptAriaInstruction` reads **"1 item selected, Docker"** — a clean read-back signal.
+
+### The findings that decide the design
+
+**1. The taxonomy RENAMES, so a plain exact match fills almost nothing.** "Python" is offered ONLY as
+`Python (Programming Language)` (plus `Python IDLE`) — there is no bare "Python" row. "Docker" is offered
+as BOTH `Docker` and `Docker (Software)`. The trailing parenthetical is a QUALIFIER Workday added, the
+same shape `normalize()` already strips off a dial code `(+1)`. Hence `skillBaseName` + a "qualified"
+match tier, with a **bare exact winning** so "Docker" never resolves to "Docker (Software)".
+
+**2. The search is SERVER-SIDE FUZZY and answers almost anything — its results are NOT candidates.**
+Measured:
+
+| typed | Workday returned |
+|---|---|
+| `Yosys` | **Yodiz**, GoSystem Tax RS |
+| `ODrive` | **Top Drive**, Optical Disk Drives |
+| `CubeMars motor drivers` | Motor Drives, Motor Controllers |
+| `zzqqxwvj` (gibberish) | z/VM, Xilinx Zynq |
+
+Every one of those came back under a "Search Results" banner, indistinguishable in shape from a real hit.
+So containment, Levenshtein and "take the first row" are not weak tiers on this field — they are wrong
+answers waiting to be committed onto an application. **Exact/qualified only**, ambiguity-guarded; a skill
+Workday does not know stays OFF the form and is named for the human.
+
+**3. Committing ADDS and the list STAYS OPEN.** A synthetic pointer sequence
+(`pointerdown→mousedown→pointerup→mouseup→click`) on the leaf committed fine — chip added, **query still
+in the box, list still rendered** — so N skills go in on ONE open, with no re-open or re-focus between
+them. Note this widget does NOT need trusted input for the commit (unlike the Self Identify page).
+
+**4. ⚠ A ZERO-RESULT query + Enter makes Workday ADD THE TYPED TEXT as a brand-new skill.** This is how a
+dirty box becomes a fabricated answer, and it happened during the trace: with "Docker" left in the box a
+`ctrl+a` that did not take effect meant the next skill APPENDED, and Enter created the chip
+**"DockerCubeMars motor drivers"** — a skill nobody claimed. (Deleted via `DELETE_charm`.) On every other
+typeahead a dirty box merely wastes a candidate; here it writes a wrong value. So the clear is a **HARD
+GATE** on this field: unverified-empty ⇒ do not press Enter.
+It is also the ONLY path by which an off-taxonomy skill can land verbatim — but it is not reachable on
+demand, because the fuzzy search nearly always returns *something* (see the gibberish row above).
+
+**5. An already-selected skill DISAPPEARS from its own future results.** With "Docker" committed,
+re-searching `Docker` offered only `Docker (Software)` and `Dockerfile`. Two consequences: re-clicking
+cannot toggle a chip off (the row is not there), and **a re-fill that does not dedup against the existing
+chips will commit a near-duplicate** — the exact reason `missingSkills` compares BASE names in both
+directions, so a `Python (Programming Language)` chip covers a profile "Python".
+
+**Tab-blur is the clean exit** (as everywhere else): the query cleared, the list closed, the `searchBox`
+automation-id disappeared, and NO stray chip was created.
+
+**Résumé auto-parse did NOT pre-populate anything here.** The widget was empty on arrival, because this
+pipeline reaches the form via **Apply Manually**, which skips Workday's résumé-parse step — so the
+operator's "check what the parse already populated first" is still the right rule (a human who clicks
+Autofill with Resume WILL see chips), but on our path the field starts blank and the dedup guard is what
+makes the rule safe rather than an optimisation.
+
+**Left on the page:** one legitimate chip, `Docker` (a real skill of the operator's) — deliberately kept
+as a pre-existing-chip fixture for verifying the never-touch rule on the next run.
