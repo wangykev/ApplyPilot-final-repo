@@ -72,8 +72,14 @@ export const isEeoGuess = (e: ReviewEntry): boolean => e.flag === "ai-eeo-guess"
 export const isAiFlag = (e: ReviewEntry): boolean => !!e.flag && e.flag.indexOf("ai-") === 0;
 // SUPER-HARD: an AI typeahead pick the applicant didn't claim (ai-closest-forced), OR any AI
 // guess the model itself flagged LOW confidence — the riskiest committed AI answers.
+// `ai-canon-approximate` and `required-forced-pick` belong here for the same reason (2026-08-07): a
+// CLOSED list must be answered, so when nothing in it means what the applicant said we commit the
+// nearest option (AI) or a last-resort option (deterministic, when no model could answer). Both are
+// values the applicant never claimed, which is exactly what this tier is for — without them they fell
+// through to the generic "AI filled this" line and lost the one fact that matters.
 export const isSuperHard = (e: ReviewEntry): boolean =>
-  e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
+  e.flag === "ai-closest-forced" || e.flag === "ai-canon-approximate" || e.flag === "required-forced-pick"
+  || (isAiFlag(e) && e.confidence === "low");
 export const mustReplace = (e: ReviewEntry): boolean =>
   isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
 // Pre-populated: the value was ALREADY on the form (account pre-fill / operator / prior run).
@@ -206,6 +212,12 @@ export function explainFill(e: ReviewEntry): string | null {
   if (flag === "ai-choice" && e.match_tier === "ai-source-tree")
     return `AI matched your profile to “${chose}” in this form’s list. Check it’s right.`;
   // Forced: required field, nothing matched — the riskiest AI answer.
+  // Nothing in the list MEANT what you said — the nearest option was taken so the form would accept it.
+  if (flag === "ai-canon-approximate")
+    return `No option on this form means ${stated ? `“${stated}”` : "your profile value"}, so the closest one — “${chose}” — was selected to get past this page. This is NOT your answer: correct it.`;
+  // No model could answer it at all; a placeholder was committed purely so the page would advance.
+  if (flag === "required-forced-pick")
+    return `Nothing could answer this required question, so “${chose}” was selected only so the application could reach review. This is a PLACEHOLDER — set it yourself.`;
   if (flag === "ai-closest-forced")
     return `This field is required, but none of the options matched your profile. AI picked the nearest one — “${chose}”${stated ? ` (closest to “${stated}”)` : ""}. Double-check this one.`;
   if (flag === "ai-choice-sensitive")
