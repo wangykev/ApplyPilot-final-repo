@@ -607,6 +607,34 @@ function normalizeLabel(s) {
   return String(s == null ? "" : s).toLowerCase().replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
 }
 
+// ── ERROR-TEXT ↔ FIELD-LABEL matching key (2026-08-07) ──────────────────────────────────────────────
+// `parseErrorFieldName` strips a trailing colon off the name it extracts (its own trailing-char class
+// includes ":"), but `normalizeLabel` strips only "*" and whitespace. So for any field whose visible
+// label ENDS IN A COLON the two sides can never be equal, and every strict-equality error→field matcher
+// silently finds nothing:
+//
+//   error  "…The field Please check one of the boxes below is required" → "please check one of the boxes below"
+//   label  "Please check one of the boxes below:*"                      → "please check one of the boxes below:"
+//
+// That one character is the whole self-ID disability blocker. Reproduced deterministically on
+// analogdevices.wd1 (passed rehearsal #1, failed #2) and seen on radiancetech.wd12, itron.wd5 and
+// waystar.wd1: Workday drops the disability answer when you RE-ENTER a saved application (its siblings
+// on the same page keep theirs), so the replay lands on `disabilityStatus ""*` — present, required,
+// empty, WITH an approved value in the bundle — and then the force-re-fill and the phantom-required
+// guard both report "match no field on this page" and the run halts having done nothing.
+//
+// Deliberately NOT folded into normalizeLabel: that one is LOCKSTEP with the website's
+// `normalizeQuestion` for answer-bucket matching, and widening it would change which taught wordings
+// match on both sides. This key is only for matching Workday's own error text to a field on the page,
+// where a slightly loose match is already documented as safe (re-filling an already-correct field is a
+// no-op). Strips any trailing run of "*", ":", ";", ".", ",", and dashes, in any order.
+function errorLabelKey(s) {
+  return String(s == null ? "" : s).toLowerCase()
+    .replace(/\s+/g, " ").trim()
+    .replace(/[*:;.,–—-\s]+$/, "")
+    .trim();
+}
+
 // AI-4 Tier-1 (DETERMINISTIC, no AI): the MAPPED fields an error set names. For each error →
 // parseErrorFieldName → match a scan field by label (equal OR bidirectional-containment after
 // normalizeLabel) → keep only fields with `fieldMap[fieldName]` truthy (deterministically
@@ -1426,10 +1454,10 @@ function phantomRequiredTargets(errorTitles, liveFields) {
   const holds = (v) => v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
   const matched = [], unmatched = [];
   for (const title of titles) {
-    const want = normalizeLabel(title);
+    const want = errorLabelKey(title);   // colon-tolerant — see errorLabelKey
     // Visible label first, then the automation-id — some tenants word the error after the id.
-    const hit = fields.find((f) => normalizeLabel((f && f.label) || "") === want)
-      || fields.find((f) => normalizeLabel((f && f.fieldName) || "") === want);
+    const hit = fields.find((f) => errorLabelKey((f && f.label) || "") === want)
+      || fields.find((f) => errorLabelKey((f && f.fieldName) || "") === want);
     if (hit) matched.push({ title, fieldName: hit.fieldName, wrapperSel: hit.wrapperSel, value: hit.value });
     else unmatched.push(title);
   }
@@ -1752,7 +1780,7 @@ function requiredBlankByLabel(liveFields, bundleEntries) {
   // basecamp field read "Select One", so a plain empty-string test saw it as filled and this whole
   // recovery silently did nothing while Workday refused the page for that exact field being required.
   const blank = (v) => v == null || String(v).trim() === "" || isPlaceholderOption(String(v));
-  const key = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
+  const key = (x) => errorLabelKey(x);   // colon-tolerant, same reason as phantomRequiredTargets
   const live = new Set((liveFields || []).map((f) => f && f.fieldName));
   const byLabel = new Map();
   for (const e of bundleEntries || []) {
@@ -1907,5 +1935,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

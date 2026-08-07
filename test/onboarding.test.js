@@ -5,7 +5,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
-  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow } = require("../lib.js");
+  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -424,4 +424,65 @@ test("applyChainStuckMixed: never fires once auth or the form has rendered — t
 test("applyChainStuckMixed: tolerates a missing/blank state", () => {
   assert.strictEqual(applyChainStuckMixed(null), false);
   assert.strictEqual(applyChainStuckMixed({}), false);
+});
+
+// ── The self-ID disability blocker: error text vs a label ending in a COLON (2026-08-07) ────────────
+// Workday drops the disability answer when you RE-ENTER a saved application (siblings on the same page
+// keep theirs), so the replay lands on `disabilityStatus ""*` -- present, required, empty, with an
+// approved value in the bundle. It then halted having done nothing, because parseErrorFieldName strips
+// a trailing ":" off the extracted name while normalizeLabel strips only "*" -- so the two sides could
+// never be equal for a label that ends in a colon. Reproduced deterministically on analogdevices.wd1
+// (rehearsal #1 passed, #2 failed) and seen on radiancetech.wd12, itron.wd5 and waystar.wd1.
+const SELFID_ERR = "Error-Please check one of the boxes below:The field Please check one of the boxes below is required and must have a value.";
+const SELFID_LABEL = "Please check one of the boxes below:*";   // verbatim, as the live scan reports it
+
+test("errorLabelKey: the live self-ID error name and the live colon label agree", () => {
+  const title = parseErrorFieldName(SELFID_ERR);
+  assert.strictEqual(title, "Please check one of the boxes below");
+  assert.strictEqual(errorLabelKey(title), errorLabelKey(SELFID_LABEL));
+});
+test("errorLabelKey: strips a trailing *, :, and both in either order", () => {
+  const want = "please check one of the boxes below";
+  for (const v of ["Please check one of the boxes below",
+                   "Please check one of the boxes below:",
+                   "Please check one of the boxes below*",
+                   "Please check one of the boxes below:*",
+                   "Please check one of the boxes below*:",
+                   "Please check one of the boxes below : * "]) {
+    assert.strictEqual(errorLabelKey(v), want, `failed for ${JSON.stringify(v)}`);
+  }
+});
+test("errorLabelKey: does NOT merge two genuinely different labels", () => {
+  assert.notStrictEqual(errorLabelKey("Country:"), errorLabelKey("Country Phone Code:"));
+  assert.notStrictEqual(errorLabelKey("Name:"), errorLabelKey("Legal Name:"));
+});
+test("errorLabelKey: tolerates blank/missing input", () => {
+  assert.strictEqual(errorLabelKey(null), "");
+  assert.strictEqual(errorLabelKey("  "), "");
+  assert.strictEqual(errorLabelKey("***"), "");
+});
+
+// phantomRequiredTargets is one of the strict-equality matchers the colon defeated. The live page:
+// disabilityStatus is on the page, REQUIRED and EMPTY -> a REAL validation block, not the blur-race
+// phantom. Before the fix it returned "match no field on this page", which is a different (and wrong)
+// reason and sent the walk down the wrong branch.
+const SELFID_LIVE = [
+  { fieldName: "disabilityForm", label: "Language*", value: "English", isRequired: true },
+  { fieldName: "name", label: "Name*", value: "Kevin Wang", isRequired: true },
+  { fieldName: "employeeId", label: "Employee ID", value: "", isRequired: false },
+  { fieldName: "dateSignedOn", label: "Date*", value: "08/07/2026", isRequired: true },
+  { fieldName: "disabilityStatus", label: SELFID_LABEL, value: "", isRequired: true },
+];
+test("phantomRequiredTargets: the self-ID error now MATCHES its field and is reported as genuinely empty", () => {
+  const r = phantomRequiredTargets([parseErrorFieldName(SELFID_ERR)], SELFID_LIVE);
+  assert.strictEqual(r.phantom, false, "an empty required field is a real block, not the phantom");
+  assert.match(r.reason, /genuinely empty on the page/);
+  assert.match(r.reason, /disabilityStatus/, "it must name the field it matched");
+  assert.doesNotMatch(r.reason, /match no field/, "the colon must no longer defeat the match");
+});
+test("phantomRequiredTargets: the same field HOLDING a value is the phantom (blur race)", () => {
+  const held = SELFID_LIVE.map((f) => (f.fieldName === "disabilityStatus" ? { ...f, value: "No, I do not have a disability and have not had one in the past" } : f));
+  const r = phantomRequiredTargets([parseErrorFieldName(SELFID_ERR)], held);
+  assert.strictEqual(r.phantom, true);
+  assert.strictEqual(r.targets[0].fieldName, "disabilityStatus");
 });

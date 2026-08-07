@@ -5240,9 +5240,9 @@ async function runCdpReplayWalk(tabId, opts) {
           try {
             const fscan = await cdpEval(cdpPageScan);
             for (const title of titles) {
-              const want = normalizeLabel(title);
-              const hit = ((fscan && fscan.fields) || []).find((f) => normalizeLabel((f && f.label) || "") === want)
-                || ((fscan && fscan.fields) || []).find((f) => normalizeLabel((f && f.fieldName) || "") === want);
+              const want = errorLabelKey(title);   // colon-tolerant — see errorLabelKey (lib.js)
+              const hit = ((fscan && fscan.fields) || []).find((f) => errorLabelKey((f && f.label) || "") === want)
+                || ((fscan && fscan.fields) || []).find((f) => errorLabelKey((f && f.fieldName) || "") === want);
               if (hit) named.add(hit.fieldName);
             }
           } catch (e) { /* no scan → nothing to force */ }
