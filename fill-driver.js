@@ -1637,6 +1637,38 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
     detail: "AI canonicalized stated \"" + statedStr + "\" → \"" + target + "\" (vocab map, not inferred)", options: enabledTexts, auditLoc: loc.wrapperSel };
 };
 
+// Commit the LAST-RESORT option on a REQUIRED dropdown nothing else could answer (see
+// pickLastResortOption for the operator rule and the preference order). Deterministic — no LLM, so it
+// works with AI off or an exhausted provider. Everything else is unchanged: the pick still goes through
+// the same open → text-keyed click → commit-verify → close-confirm sequence every other dropdown commit
+// uses, so it can never report a value the page did not take.
+const forceRequiredDropdownPick = async (act, loc, f, budgets, why) => {
+  const norm = apMatch.normalize;
+  const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+  if (!expanded || !state || state.optionCount === 0) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "required-blank-no-options",
+      detail: "a REQUIRED field could not be answered and its options did not render" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
+  }
+  const enabledTexts = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
+  const target = pickLastResortOption(enabledTexts);
+  if (!target) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "required-blank-no-options",
+      detail: "a REQUIRED field could not be answered and the list held no selectable option" + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  await act.clickDropdownOptionByText(loc, target);
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets, (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  if (!cr.ok) {
+    return { status: "needs_review", after: cr.after, flag: "required-forced-commit-failed",
+      detail: `last-resort pick "${target}" did not commit — the page still blocks on this required field`, options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above stands */ }
+  return { status: "filled_review", after: target, verified: true, flag: "required-forced-pick", confidence: "low",
+    detail: `PLACEHOLDER — nothing could answer this required field (${why}), so "${target}" was selected only so the application can reach review. VERIFY AND CORRECT IT.`,
+    options: enabledTexts, auditLoc: loc.wrapperSel };
+};
+
 // AI-3 MANDATORY-EEO inference (dropdown) — operator-decided (REVERSES "never AI-guess a demographic").
 // A REQUIRED EEO field with NO profile value (a blank would HALT the walk). The LLM may INFER the
 // demographic ONLY as a CONFIDENT guess (e.g. from the name); otherwise it MUST decline (the neutral
@@ -2967,6 +2999,33 @@ const parseAiTypeaheadReply = (text) => {
 // "Other" detection (normalize lowercases + strips trailing (+digits) + collapses whitespace).
 const isOtherOption = (o) => apMatch.normalize(o) === "other";
 
+// ── LAST-RESORT PICK for a REQUIRED choice field (operator rule, 2026-08-07) ─────────────────────────
+// "Every dropdown will commit a value even if AI can't accurately determine the correct one. Getting to
+// the review page is 1st priority with everything reconned correctly."
+//
+// A required dropdown left blank BLOCKS Save & Continue, so the walk halts and the operator gets NOTHING
+// — no review page, no bundle, nothing to correct. A flagged wrong answer is strictly better: the
+// application reaches review with every other field intact and this one shouting for attention.
+//
+// Runs only after every ladder above it has failed (deterministic match, buckets, canonicalize, the AI
+// always-guess), and only for REQUIRED fields — an optional blank harms nothing and is still left alone.
+// It is DETERMINISTIC and needs no LLM, so it also covers AI OFF and an exhausted/erroring provider.
+//
+// Preference order is "least-wrong first", not "first in the list":
+//   1. a DECLINE option ("Prefer not to say" / "Decline to answer") — on any question, refusing to
+//      answer is the least-wrong thing to put in a box you cannot answer, and on a demographic it is
+//      the only defensible pick.
+//   2. "Other" — the next most neutral.
+//   3. the first real option — genuinely arbitrary, and flagged as such.
+// Always `filled_review` with a loud flag, and the detail SAYS it is a placeholder, so the review editor
+// (and submitPrecondition, via the unapproved-flagged gate) treats it as a question, never as an answer.
+const LAST_RESORT_DECLINE_RE = /prefer not|decline|do not wish|don'?t wish|not.*(disclose|answer)|choose not|rather not|undeclared|no response/i;
+const pickLastResortOption = (enabledTexts) => {
+  const opts = (enabledTexts || []).filter((t) => t != null && String(t).trim() !== "");
+  if (!opts.length) return null;
+  return opts.find((t) => LAST_RESORT_DECLINE_RE.test(t)) || opts.find(isOtherOption) || opts[0];
+};
+
 // Parse the AI's TREE-CATEGORY reply: {choice, confidence} (no `represented` — the category is a
 // navigation step, not the answer). Tolerant like parseAiTypeaheadReply (```-fences / embedded / non-JSON).
 const parseAiTreeReply = (text) => {
@@ -3963,7 +4022,33 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         const batched = willUseAi ? await aiBatchAnswer(f, wantKind) : null;
         const preInfer = !canonicalize ? batched : null;
         const preCanon = canonicalize ? batched : null;
-        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
+        if (canonicalize) {
+          aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
+          // ── A DECLINED canonicalize must not leave a REQUIRED field BLANK (2026-08-07) ──────────────
+          // Canonicalize is deliberately strict: "if NO option means the same, reply UNKNOWN", so it
+          // never bends a stated value into a different meaning. Right — but on a REQUIRED field the
+          // result is a blank, and a blank required field BLOCKS Save & Continue, so the walk halts
+          // having filled nothing. The typeahead path already refuses to end that way (`ai-closest-
+          // forced` — "NEVER declines, a blank required halts the walk"); dropdowns had no equivalent.
+          //
+          // Live on nvidia.wd5 page 1: Phone Device Type offers ONLY ["Home", "Home Cellular"] — there
+          // is no "Mobile" — so the stated value legitimately maps to nothing, canonicalize replied
+          // UNKNOWN, and Workday then refused page 1 with "The field Phone Device Type is required".
+          // The whole application was blocked on a field whose answer is obvious to a human.
+          //
+          // So fall through to the ALWAYS-GUESS required path, which is the same machinery AI-1 uses for
+          // an unmapped required dropdown: it re-opens the field, picks from the LIVE options, and the
+          // pick still has to clear the match ladder. The answer is `filled_review` and flagged, so it
+          // reaches the human exactly like any other guess — the difference is the operator gets a form
+          // they can correct instead of a run that stopped. Costs one extra LLM call, only on decline.
+          if (aiRes && aiRes.flag === "ai-canon-nomatch" && f.isRequired && f.widgetType === "dropdown") {
+            const forced = await aiFillField(act, loc, f, profile, jobContext, budgets, null);
+            if (forced && forced.status === "filled_review") {
+              forced.detail = `stated "${Array.isArray(record.resolved) ? record.resolved.join(" / ") : record.resolved}" matches no option here — ${forced.detail || "AI picked the closest"}`;
+              aiRes = forced;
+            }
+          }
+        }
         else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
             ? await aiFillField(act, loc, f, profile, jobContext, budgets, preInfer)
@@ -4028,6 +4113,34 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess"; // a demographic radio → loud demographic badge
         if (aiRes) Object.assign(record, aiRes);
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI radio fallback error: " + String((e && e.message) || e); }
+    }
+
+    // ── FINAL BACKSTOP: a REQUIRED DROPDOWN never ends this page BLANK (operator, 2026-08-07) ─────────
+    // "Every dropdown will commit a value even if AI can't accurately determine the correct one. Getting
+    // to the review page is 1st priority with everything reconned correctly."
+    //
+    // Everything above can legitimately end with nothing: the deterministic match misses, buckets miss,
+    // canonicalize declines, the AI declines / errors / has no key / is switched OFF entirely. Each of
+    // those is individually correct — and the SUM of them is a halted walk that hands the operator no
+    // review page at all. This turns that into a flagged placeholder they can fix in one click.
+    //
+    // Placed DEAD LAST on purpose — after canonicalize, after the AI infer, after the confidence-gated
+    // EEO path and the required-radio rescue. An earlier position pre-empted the EEO path, which has a
+    // genuinely better answer for a demographic (it declines to "Undeclared" rather than picking one).
+    // Deterministic, so it still works when the AI is the thing that failed, or is switched off.
+    //
+    // ONLY when the field is genuinely EMPTY. A dropdown that already HOLDS something — a tenant pre-fill
+    // we deliberately kept, or a value that strayed and was surfaced for review — is not blocking
+    // anything, and overwriting it would destroy a real answer to solve a problem that does not exist.
+    // `hasLiveValue` treats the "Select One" placeholder as empty, which is exactly the blocking case.
+    if (record.widgetType === "dropdown" && f.isRequired
+        && record.status !== "filled" && record.status !== "filled_review"
+        && !hasLiveValue(record.after)) {
+      try {
+        const why = record.flag ? `${record.flag}: ${record.detail || "no answer"}` : (record.detail || "no answer available");
+        const forced = await forceRequiredDropdownPick(act, loc, f, budgets, why);
+        if (forced && forced.status === "filled_review") Object.assign(record, forced);
+      } catch (e) { /* leave the honest blank record — the walk's own halt explains it */ }
     }
 
     // ── Required CHECKBOX-GROUP AI fallback ── same reasoning as the radio pass above, for the
@@ -7347,5 +7460,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { planAiBatchCandidates, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { planAiBatchCandidates, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, pickLastResortOption, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1456,9 +1456,15 @@ test("AI batch: a batched answer STILL clears the match ladder — an off-list c
       { id: "q2", choice: "No", confidence: "High" }] }) });
   const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
   const q1 = out.results.find((r) => r.fieldName === "q1");
-  assert.strictEqual(q1.status, "needs_review", "an off-list batched answer is refused exactly like a per-field one");
-  assert.strictEqual(q1.flag, "ai-nomatch");
-  assert.notStrictEqual(q1.after, "Maybe", "and nothing was committed");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(q1.after, "Maybe", "THE INVARIANT: the model's off-list text is never committed");
+  assert.strictEqual(q1.status, "filled_review", "but a required field must not be left blank");
+  assert.strictEqual(q1.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(q1.after), "the committed value is a REAL option from the live list");
+  assert.match(q1.detail, /PLACEHOLDER/, "and it says plainly that it is a placeholder");
   assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No", "its sibling still commits");
 });
 
@@ -1920,20 +1926,27 @@ test("Buckets M4 piggyback: maps_to 'none' normalizes to \"\" (the teach card st
 test("AI fallback: a literal UNKNOWN reply is just a non-option → needs_review (ai-nomatch), blank, no commit (the gate is dropped — guess, don't refuse)", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.after, null, "blank — UNKNOWN matched no option");
-  assert.strictEqual(rec.flag, "ai-nomatch");
-  assert.strictEqual(rec.confidence, "low", "carries the AI's confidence even on a non-match");
-  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "never committed");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(rec.after, "UNKNOWN", "THE INVARIANT: 'UNKNOWN' is not an option and is never committed");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(rec.after), "a REAL option was selected so the page can advance");
 });
 
 test("AI fallback: LLM choice not among the options → needs_review (ai-nomatch), never blind-commit", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"Maybe","justification":"unsure","confidence":"Medium"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-nomatch");
-  assert.strictEqual(rec.after, null);
-  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "a non-option reply is never committed");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(rec.after, "Maybe", "THE INVARIANT: a non-option reply is never committed");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(rec.after), "the value is a REAL option");
 });
 
 test("AI fallback HOLD 2: a non-option choice + a value STRAYS on close → ai-nomatch-stray surfaces the STRAYED value (never a false blank)", async () => {
@@ -1969,10 +1982,15 @@ test("AI fallback on a PREFILLED dropdown: a FAILED LLM call reports the live ke
 test("AI fallback on a BLANK dropdown: a FAILED LLM call stays after:null ('Select One' is the placeholder, not a value — regression pin)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: { ok: false, error: "HTTP 503: high demand" } });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-call-failed");
-  assert.strictEqual(rec.after, null, "genuinely blank — the placeholder never masquerades as a kept value");
-  assert.ok(!/prefilled/.test(rec.detail), "no kept-prefill note on a blank field");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  // The provider FAILING is exactly when the deterministic backstop has to carry the page.
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(rec.after), "a real option, chosen without any LLM");
+  assert.match(rec.detail, /ai-call-failed/, "the record still records WHY it fell back");
 });
 
 test("AI fallback on a PREFILLED dropdown: a no-match reply ALSO reports the kept prefilled value", async () => {
@@ -2231,8 +2249,11 @@ test("AI-3 EEO inference (mapped-but-empty required → the confidence-gated pat
 test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays deterministic)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: false, ai: "No" });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
-  assert.ok(!act.log.some(([m]) => m === "llm"), "AI OFF → the LLM is never consulted");
-  assert.strictEqual(out.results[0].status, "skipped", "stays the deterministic skipped (no mapping)");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "THE INVARIANT: AI OFF → the LLM is never consulted (no spend)");
+  // The required-dropdown backstop is DETERMINISTIC, so it still runs with AI off — that is the point:
+  // the page must reach review whether or not a model was available.
+  assert.strictEqual(out.results[0].status, "filled_review", "a required dropdown still commits with AI off");
+  assert.strictEqual(out.results[0].flag, "required-forced-pick");
 });
 
 test("optional gate: an UNMAPPED OPTIONAL EEO dropdown gets NO AI — left blank, no LLM ('blank optional EEO too')", async () => {
@@ -2338,9 +2359,13 @@ test("closeAndVerifyBlank REGRESSION (the live false-stray): list slow / won't c
 test("AI fallback REGRESSION: a non-option choice with a slow-to-close list (value stays placeholder) → ai-nomatch BLANK, not a false ai-nomatch-stray", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?", escapeWontClose: true })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-nomatch", "a blank field whose list was slow to close is reported clean, not STRAYED");
-  assert.strictEqual(rec.after, null);
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick", "a slow-to-close list is still not a STRAY");
+  assert.ok(["Yes", "No"].includes(rec.after));
 });
 
 test("dropdown: commit shows the target then REVERTS (pick before render-complete) → needs_review, never a false verified:true", async () => {
@@ -9079,8 +9104,13 @@ test("AI dropdown: the AI cannot COMMIT the placeholder even if it names it", as
   // the field lands in review instead of committing a value the form counts as empty.
   const act = makeFakeAct([phDd()], { aiEnabled: true, ai: '{"choice":"Select One","justification":"j","confidence":"High"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.notStrictEqual(rec.after, "Select One", "the placeholder is never committed as the answer");
-  assert.strictEqual(rec.status, "needs_review", "no valid choice → review, not a bogus fill");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(rec.after, "Select One", "THE INVARIANT: the placeholder is never committed as the answer");
+  assert.strictEqual(rec.status, "filled_review", "a required field still gets a real option so the page advances");
+  assert.strictEqual(rec.flag, "required-forced-pick");
 });
 
 test("submit gate: a REQUIRED choice field still holding the placeholder BLOCKS submit", async () => {
@@ -9679,4 +9709,82 @@ test("replayField: a date naming a DIFFERENT event still replays the APPROVED va
     await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
     assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay what the human approved, not today`);
   }
+});
+
+// ── A DECLINED canonicalize must not leave a REQUIRED dropdown BLANK (2026-08-07) ───────────────────
+// Canonicalize is deliberately strict ("if NO option means the same, reply UNKNOWN") so it never bends a
+// stated value into a different meaning. On a REQUIRED field that leaves a blank, and a blank required
+// field blocks Save & Continue — so the walk halts having filled nothing. The typeahead path already
+// refuses to end that way (`ai-closest-forced`); dropdowns had no equivalent.
+//
+// Live on nvidia.wd5 page 1, with this exact option list: Phone Device Type offers ONLY "Home" and
+// "Home Cellular" — there is no "Mobile" — so the stated value legitimately maps to nothing, and Workday
+// refused the page: "The field Phone Device Type is required and must have a value."
+const nvidiaPhoneType = (flags) => Object.assign({
+  wrapperSel: "[w-phonetype]", fieldName: "phoneType", widgetType: "dropdown", isRequired: true,
+  label: "Phone Device Type*", triggerText: "Select One",
+  options: [{ text: "Select One", disabled: true }, { text: "Home" }, { text: "Home Cellular" }],
+}, flags || {});
+const PHONE_PROFILE = { personal_info: { phone_device_type: "Mobile" } };
+
+test("canonicalize decline: a REQUIRED dropdown falls through to the always-guess pick instead of staying blank", async () => {
+  // Reply 1 = the canonicalize declining; reply 2 = the always-guess pick from the LIVE options.
+  const act = makeFakeAct([nvidiaPhoneType()], { aiEnabled: true,
+    ai: ['{"choice":"UNKNOWN"}', '{"choice":"Home Cellular","confidence":"Medium"}'] });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.status, "filled_review", "a required field must not be left blank — it blocks Save & Continue");
+  assert.strictEqual(rec.after, "Home Cellular");
+  assert.notStrictEqual(rec.flag, "ai-canon-nomatch", "the decline must no longer be the final answer");
+  assert.match(rec.detail, /matches no option here/, "the record should say WHY it had to guess");
+});
+
+test("canonicalize decline: an OPTIONAL dropdown still stays blank — never a forced guess", async () => {
+  const act = makeFakeAct([nvidiaPhoneType({ isRequired: false })], { aiEnabled: true,
+    ai: ['{"choice":"UNKNOWN"}', '{"choice":"Home Cellular","confidence":"Medium"}'] });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.status, "needs_review", "an optional blank does not block the page — never guess it");
+  assert.strictEqual(rec.flag, "ai-canon-nomatch");
+  assert.strictEqual(rec.after, null);
+});
+
+test("canonicalize SUCCESS is untouched — exactly one LLM call when the stated value does map", async () => {
+  const act = makeFakeAct([nvidiaPhoneType()], { aiEnabled: true, ai: '{"choice":"Home Cellular","confidence":"High"}' });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "a clean vocab map keeps its own flag");
+  assert.strictEqual(rec.after, "Home Cellular");
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1, "no second call on the success path");
+});
+
+// ── The required-dropdown backstop must be LAST, and must never overwrite a real value ─────────────
+// Both of these are bugs the backstop HAD when first written, caught by the existing suite:
+//   • placed before the EEO path, it pre-empted a genuinely better answer (EEO declines to the neutral
+//     option rather than picking a demographic at random);
+//   • without an emptiness guard it overwrote a kept tenant PRE-FILL with a placeholder.
+test("required-dropdown backstop: the EEO decline path WINS — the backstop never pre-empts a better answer", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Female" }, { text: "Male" }, { text: "Undeclared" }];
+  // A MAPPED-but-empty required EEO dropdown; the model answers with LOW confidence → the EEO path
+  // overrides to the neutral decline. The backstop must not touch it afterwards.
+  const act = makeFakeAct([genderField({ isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.flag, "eeo_declined", "the EEO path owns this field, not the backstop");
+  assert.strictEqual(rec.after, "Undeclared");
+  assert.notStrictEqual(rec.flag, "required-forced-pick");
+});
+
+test("required-dropdown backstop: a KEPT PRE-FILL is never overwritten by a placeholder", async () => {
+  // The field already holds a real tenant value and the LLM call fails. Nothing is blocking, so the
+  // backstop must stay out of it — overwriting would destroy a real answer.
+  const act = makeFakeAct([aiDd({ triggerText: "Yes" })], { aiEnabled: true, ai: { ok: false, error: "HTTP 503" } });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "Yes", "the pre-filled value survives");
+  assert.notStrictEqual(rec.flag, "required-forced-pick", "the backstop must not fire on a field that holds a value");
+});
+
+test("pickLastResortOption: prefers a DECLINE option, then Other, then the first real option", () => {
+  assert.strictEqual(pickLastResortOption(["Yes", "No", "Prefer not to say"]), "Prefer not to say");
+  assert.strictEqual(pickLastResortOption(["Yes", "No", "Other"]), "Other");
+  assert.strictEqual(pickLastResortOption(["Home", "Home Cellular"]), "Home", "no decline/Other → the first real option");
+  assert.strictEqual(pickLastResortOption(["Decline to answer", "Other"]), "Decline to answer", "decline beats Other");
+  assert.strictEqual(pickLastResortOption([]), null);
+  assert.strictEqual(pickLastResortOption(null), null);
 });
