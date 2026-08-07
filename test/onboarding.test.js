@@ -5,7 +5,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
-  classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow } = require("../lib.js");
+  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -393,4 +393,35 @@ test("classifyWorkdayPage: a REAL auth screen is still auth, even with an apply 
   assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, passwordInput: true, hasAuthEl: true, markers: { continueButton: true } }), "auth");
   assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, emailInput: true, hasAuthEl: true, markers: { applyManually: true } }), "auth");
   assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, signInWithEmail: true, hasAuthEl: true, markers: {} }), "auth");
+});
+
+// ── The half-torn-down apply chain (2026-08-07, live: radiancetech.wd12 + magna.wd3) ────────────────
+// A healthy JD page has adventureButton and NO applyManually; a healthy /apply chooser has
+// applyManually + useMyLastApplication and NO adventureButton (verified against a cleanly-loaded
+// chooser). Both at once means the SPA swapped views without tearing the old one down, so the
+// coordinate click hits a dead layer, reports success, and the page never moves. Onboarding used to
+// burn the full 45s budget and re-issue the identical click three rounds over, then halt backToApply.
+const STUCK = {
+  // the exact marker set the live run logged on every read for 45s
+  markers: { adventureButton: true, applyManually: true, useMyLastApplication: true },
+  formFieldCount: 0, hasAuthEl: false, emailInput: false, passwordInput: false,
+  title: "Senior FPGA Engineer",
+};
+test("applyChainStuckMixed: Apply + Apply Manually mounted together is the stuck state", () => {
+  assert.strictEqual(applyChainStuckMixed(STUCK), true);
+});
+test("applyChainStuckMixed: a healthy JD page is NOT stuck (no applyManually)", () => {
+  assert.strictEqual(applyChainStuckMixed({ markers: { adventureButton: true }, formFieldCount: 0, hasAuthEl: false }), false);
+});
+test("applyChainStuckMixed: a healthy chooser is NOT stuck (no adventureButton)", () => {
+  assert.strictEqual(applyChainStuckMixed({ markers: { applyManually: true, useMyLastApplication: true }, formFieldCount: 0, hasAuthEl: false }), false);
+});
+test("applyChainStuckMixed: never fires once auth or the form has rendered — that is 'not landed yet', not stuck", () => {
+  assert.strictEqual(applyChainStuckMixed({ ...STUCK, hasAuthEl: true }), false, "auth element present");
+  assert.strictEqual(applyChainStuckMixed({ ...STUCK, passwordInput: true }), false, "credential field present");
+  assert.strictEqual(applyChainStuckMixed({ ...STUCK, formFieldCount: 4 }), false, "the form is up");
+});
+test("applyChainStuckMixed: tolerates a missing/blank state", () => {
+  assert.strictEqual(applyChainStuckMixed(null), false);
+  assert.strictEqual(applyChainStuckMixed({}), false);
 });

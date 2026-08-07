@@ -1470,6 +1470,29 @@ function classifyWorkdayPage(state) {
   return "unknown";
 }
 
+// ── THE STUCK, HALF-TORN-DOWN APPLY CHAIN (2026-08-07) ───────────────────────────────────────────────
+// The JD page offers `adventureButton` (Apply). The /apply CHOOSER offers `applyManually` +
+// `useMyLastApplication` — and, verified live on a cleanly-loaded radiancetech.wd12 chooser, it does NOT
+// carry `adventureButton`. So the two markers are MUTUALLY EXCLUSIVE on any healthy page, and seeing them
+// TOGETHER means the SPA swapped views without tearing the old one down: a coordinate click then lands on
+// a layer that is no longer live, reports success, and nothing moves.
+//
+// This is not theoretical — it is what two tenants actually did on a fresh account (radiancetech.wd12 and
+// magna.wd3, hidden AND foreground). Every read for the full 45s budget showed
+// `markers [adventureButton, applyManually, useMyLastApplication]`, the click "succeeded" each time, and
+// onboarding halted `backToApply` after re-issuing the identical click three rounds over (~135s).
+//
+// Deliberately NARROW: it requires the contradiction AND no auth element AND no form fields, so a page
+// mid-render toward the auth screen (which is simply "not landed yet") can never match. It is a signal to
+// change the ACTIVATION MECHANISM, never to give up — the caller still escalates and still waits.
+function applyChainStuckMixed(state) {
+  const s = state || {};
+  const m = s.markers || {};
+  if (s.hasAuthEl || s.emailInput || s.passwordInput) return false; // already at/near auth — just not landed
+  if ((s.formFieldCount || 0) > 0) return false;                    // a form is up; nothing is stuck
+  return !!(m.adventureButton && m.applyManually);
+}
+
 // Workday's candidate-home "My Applications" list — the page behind the already-applied page's "View My
 // Applications" link, and the ONLY place that says whether an application was really submitted.
 // Text-anchored on purpose: the automation-ids here are unconfirmed across tenants (no recon dump yet),
@@ -1884,5 +1907,5 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

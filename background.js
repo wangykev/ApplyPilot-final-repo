@@ -7047,10 +7047,59 @@ async function runCdpOnboard(tabId, opts) {
     st = await scan() || st;
     if (st.markers.applyManually) {
       LOG('Stage 2 — clicking "Apply Manually".');
-      const c = await clickTarget(['[data-automation-id="applyManually"]'], "Apply Manually");
+      const AM_SEL = '[data-automation-id="applyManually"]';
+      const c = await clickTarget([AM_SEL], "Apply Manually");
       if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "apply-manually-blocked", detail: c.blockedBy || "Apply Manually not clickable" };
-      const w = await waitFor((s) => s.hasAuthEl || s.formFieldCount > 0, await renderBudget(20000, 45000), "post-apply-manually");
+      // ESCALATE THE MECHANISM, exactly as Stage 1 does (2026-08-07). Stage 1 got this ladder on
+      // 2026-08-06 because "the coordinate click can report success and still not register"; Stage 2
+      // never did, and that gap is the ENTIRE difference on the tenants where onboarding dead-ends.
+      // Live on radiancetech.wd12 AND magna.wd3 (fresh account, both hidden and "visible"): the click
+      // reported success, the chooser never moved for the FULL 45s budget, and the applyStage loop then
+      // re-issued the IDENTICAL click twice more before halting `backToApply` — ~135s to fail, on a
+      // page whose Apply Manually is a plain <a href> that navigates fine when activated in-page.
+      // The stuck state is diagnostic: the scan showed adventureButton AND applyManually AND
+      // useMyLastApplication mounted together, which a cleanly-loaded chooser never shows — a
+      // half-torn-down SPA transition in which the coordinate click lands on nothing live.
+      // Wait SHORT first, so the happy path (waystar/cat, which land in well under 4s) is unchanged.
+      const manuallyLanded = (s) => s.hasAuthEl || s.formFieldCount > 0;
+      let w = await waitFor(manuallyLanded, 4000, "post-apply-manually(fast)");
       st = w.scan || st;
+      // A half-torn-down chain (Apply and Apply Manually mounted together) says the coordinate click
+      // landed on a dead layer, so waiting longer and re-pressing Enter cannot help — go straight to
+      // activating the anchor from inside the page.
+      if (!manuallyLanded(st) && applyChainStuckMixed(st)) {
+        LOG("  the apply chain is in a half-torn-down state (Apply and Apply Manually are mounted together, which a healthy chooser never shows) — the click landed on a dead layer; activating in-page.");
+        const d0 = await cdpEval(cdpActivateBySelector, AM_SEL, "click");
+        if (d0 && d0.ok) {
+          LOG(`  apply-manually recovery: activated "${d0.label}" in-page via ${d0.via}.`);
+          w = await waitFor(manuallyLanded, 10000, "post-apply-manually(stuck-recovery)");
+          st = w.scan || st;
+        } else LOG(`  apply-manually recovery unavailable — ${(d0 && d0.reason) || "eval failed"}.`);
+      }
+      if (!manuallyLanded(st)) {
+        const f = await cdpEval(cdpActivateBySelector, AM_SEL, "focus");
+        if (f && f.ok) {
+          LOG(`  apply-manually fallback 1: the click did not register — focused "${f.label}" and pressing Enter.`);
+          try { await cdpKeyTap(CDP_KEYS.enter); } catch (e) { /* best-effort */ }
+          w = await waitFor(manuallyLanded, 6000, "post-apply-manually(Enter)");
+          st = w.scan || st;
+        } else LOG(`  apply-manually fallback 1 unavailable — ${(f && f.reason) || "focus failed"}.`);
+      }
+      if (!manuallyLanded(st)) {
+        const d = await cdpEval(cdpActivateBySelector, AM_SEL, "click");
+        if (d && d.ok) {
+          LOG(`  apply-manually fallback 2: activating "${d.label}" in-page via ${d.via}.`);
+          w = await waitFor(manuallyLanded, 10000, "post-apply-manually(in-page click)");
+          st = w.scan || st;
+        } else LOG(`  apply-manually fallback 2 unavailable — ${(d && d.reason) || "eval failed"}.`);
+      }
+      // Nothing has landed yet — give the RENDER the budget it always had. A slow hidden-tab
+      // create-account page is a different failure from a click that never registered, and only this
+      // wait covers it; the ladder above just stops us spending it on a dead click three times over.
+      if (!manuallyLanded(st)) {
+        w = await waitFor(manuallyLanded, await renderBudget(20000, 45000), "post-apply-manually");
+        st = w.scan || st;
+      }
     }
 
     // ── STAGE 3: Auth (+ create-account + verify) ──
