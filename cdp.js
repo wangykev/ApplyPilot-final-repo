@@ -4235,6 +4235,18 @@ function makeCdpActuation(llmConfig) {
     // needs no coordinates and no paint — the skills opener alternates the two routes. Returns a
     // diagnostic (not a bool); the caller polls readHier, since the searchBox id appears a tick later.
     openHierInput: (loc) => cdpEval(cdpOpenMultiselectInput, loc.wrapperSel),
+    // A TRUSTED coordinate click aimed at the widget's own INPUT rect. openHier's ladder resolves
+    // `multiselectInputContainer` first and clicks its CENTRE, which is fine for a single-value picker but
+    // wrong for a multi-value one: that container GROWS with each chip, so its centre drifts onto a CHIP,
+    // whose DELETE_charm is part of it (live: a skill present after one run was GONE after the next, in a
+    // run that logged our own "chip set changed" signal). The input is a distinct element from the chips,
+    // so a click at ITS centre opens the widget and cannot delete anything.
+    clickHierInputRect: async (loc) => {
+      const r = await cdpEvalRectReady(cdpRectOf, loc.wrapperSel + " input", true);
+      if (!r || r.w <= 0) return false;
+      await cdpClickAt(r.cx, r.cy);
+      return true;
+    },
     // React-safe, focus-independent clear of the widget's search input (see cdpClearInputNative).
     clearHierInput: (loc) => cdpEval(cdpClearInputNative, loc.wrapperSel + " input"),
     typeInHier: (text) => cdpTypeChars(text, 40),

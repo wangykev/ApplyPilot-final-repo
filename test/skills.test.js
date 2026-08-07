@@ -255,13 +255,17 @@ test("fillSkillsCdp: the opener RETRIES an open that lost the race, alternating 
   // So the first opens are allowed to miss, and the routes alternate.
   const { act, st, log } = makeSkillsAct({ catalog: CATALOG });
   let opens = 0;
-  act.openHierInput = async () => { opens++; if (opens >= 2) st.open = true;   // route A lands on the retry
+  act.openHierInput = async () => { opens++; if (opens >= 2) st.open = true;   // lands on the retry
     return { ok: true, focused: true, openedNow: st.open }; };
-  act.openHier = async () => { log.push(["coords"]); return true; };            // route B never opens it here
+  act.openHier = async () => { log.push(["container-coords"]); return true; };
+  act.clickHierInputRect = async () => { log.push(["input-coords"]); return true; };
   const r = await fd.fillSkillsCdp(act, LOC, ["Linux"], B);
   assert.deepEqual(st.chips, ["Linux"], "a first-attempt miss no longer costs the whole field");
   assert.equal(r.status, "filled");
   assert.ok(opens >= 2, "it retried the coordinate-free route");
+  // `openHier` clicks the CONTAINER's centre, which drifts onto a CHIP (and its delete X) as chips
+  // accumulate — live, a skill vanished between runs. The coordinate route must aim at the INPUT.
+  assert.ok(!log.some((l) => l[0] === "container-coords"), "never coordinate-clicks the chip-bearing container");
 });
 
 test("fillSkillsCdp: nothing matched and the field is BLANK → needs_review", async () => {

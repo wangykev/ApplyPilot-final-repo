@@ -3644,6 +3644,19 @@ on one run, not the previous). And strictness costs coverage: a skill whose only
 differently-named relative (`Vivado` against `Xilinx Vivado`) is left OFF rather than guessed — named in
 the record for the human. That is the intended trade, not a gap.
 
+**4. The opener was DELETING skills, and our own diagnostic caught it.** `Git` was on the form after one run
+and gone after the next — in the run that logged `cand "C++" → autocommit, 0 options`, i.e. the chip-set
+change test firing on a REMOVAL. `openHier` clicks the centre of `multiselectInputContainer`, which on a
+multi-value widget grows with every chip until its centre sits on a CHIP, whose delete X is a child. The
+coordinate route now aims at the INPUT's own rect. Both routes are still required: a run with only the
+page-side focus+click opened nothing (1 candidate, `needs_review`), so the trusted coordinate click is the
+reliable opener — it just has to be aimed at something that isn't a chip.
+
+**Converged**, hidden and synthetic: 11 remaining candidates attempted, `ROS 2` and `Git` added, nothing
+lost, `[filled]` — **15 of the profile's 24 skills on the form**. The nine that stay off (`C++`, `HTML/CSS`,
+`CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`) have no exact-or-
+qualified row on this tenant and are named in the record for the human.
+
 Extension **1139/1140** (`test/skills.test.js`, 28 pins; the one failure is `db.test.js` — `fake-indexeddb`
 is missing from this worktree's `node_modules`, unrelated and pre-existing). Two operator calls still open:
 whether a qualified commit should stay silent `filled` or be flagged, and whether a partial fill should nag

@@ -3550,3 +3550,24 @@ named in the record so the human can add them by hand.
 C++ chip afterwards). `awaitListTerminal` reports autocommit whenever the chip SET differs from the
 snapshot, which a re-order/re-render also produces. Nothing added, nothing strayed — so it is bucketed as
 a failure rather than disappearing from the report.
+
+### ⚠ The coordinate opener can DELETE a chip — aim at the INPUT, never the container
+
+The signal above is what exposed it. `Git` was on the form after one run and **GONE** after the next, in the
+very run that logged `cand "C++" → autocommit, 0 options` — our own "the chip set changed" test firing on a
+REMOVAL, not an addition.
+
+Cause: the shared `openHier` ladder resolves `[data-automation-id="multiselectInputContainer"]` first and
+clicks its **centre**. That is safe on a single-value picker, but this container **grows with every chip**,
+so its centre drifts onto a CHIP — and `DELETE_charm` (the X) is a child of the chip. The opener was
+deleting skills it had just added.
+
+Fix: the coordinate route now targets the **input's own rect** (`clickHierInputRect`); the input is a
+distinct element from the chip list, so the click opens the widget and cannot delete anything. Both routes
+are still needed — a run using ONLY the page-side focus+click opened nothing (1 candidate, `needs_review`),
+so the reliable open is the trusted coordinate click; it just has to be aimed correctly.
+
+**Converged result (hidden, synthetic):** 11 remaining candidates attempted, `ROS 2` and `Git` added,
+**nothing lost**, status `filled` — 15 of the profile's 24 skills on the form. The nine that stay off
+(`C++`, `HTML/CSS`, `CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`)
+have no exact-or-qualified row in Workday's taxonomy on this tenant, and are named in the record.

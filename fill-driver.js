@@ -3042,8 +3042,18 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
         // click opened the widget, the immediate coordinate click landed before the searchBox had
         // mounted, and a second click on a multiselect TOGGLES IT SHUT — so the poll always found it
         // closed. This is the same toggle-shut invariant the unified typeahead filler documents.
-        const useInputRoute = (attempt % 2 === 1) && act.openHierInput;
-        if (useInputRoute) openDiags.push(await act.openHierInput(loc)); // NOT `step` — that is per-skill, out of scope
+        // Route A = page-side focus+click (no coordinates); route B = a TRUSTED coordinate click on the
+        // INPUT's own rect. Alternating them is what makes the open survive the re-render race, and a
+        // page-side click alone was NOT enough live (a run using only route A opened nothing).
+        //
+        // ⚠ Route B must target the INPUT, never the shared `openHier`, which clicks the CENTRE of
+        // `multiselectInputContainer`. On a multi-value widget that container GROWS with each chip, so its
+        // centre drifts onto a CHIP — and a chip's `DELETE_charm` is part of it. Live: `Git` was on the
+        // form after one run and GONE after the next, in a run that logged our own "the chip set changed"
+        // signal. Deleting a skill the operator listed is worse than any fill failure.
+        const routeA = (attempt % 2 === 1) && act.openHierInput;
+        if (routeA) openDiags.push(await act.openHierInput(loc)); // NOT `step` — that is per-skill, out of scope
+        else if (act.clickHierInputRect) { if (!(await act.clickHierInputRect(loc))) { await act.delay(budgets.reopenSettleMs); continue; } }
         else if (!(await act.openHier(loc))) { await act.delay(budgets.reopenSettleMs); continue; }
         const t0 = Date.now();
         while (Date.now() - t0 < budgets.taOpenCeilingMs) {
