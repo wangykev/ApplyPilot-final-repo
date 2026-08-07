@@ -1984,8 +1984,30 @@ function cdpOnboardScan() {
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
   const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
+  // ── WHY the auth form refused (2026-08-07) ───────────────────────────────────────────────────────
+  // A Sign In / Create Account that submits to nothing looked identical in the log to one that never
+  // registered the click: both printed "no outcome after 20s and the form is still up". Live on
+  // itron.wd5 the consent tick was FIXED and Create Account still would not go, and the log could not
+  // say why — so the next move was a guess. Workday states the reason on the page; read it.
+  // Distinct from bodyText (12k of everything) because the point is a SHORT, quotable cause.
+  const errNodes = Array.from(document.querySelectorAll(
+    '[data-automation-id="errorMessage"],[data-automation-id="formFieldErrorMessage"],[data-automation-id="validationErrorMessage"],[role="alert"],.css-error,[class*="error" i]'
+  ));
+  const seen = Object.create(null);
+  const authErrors = [];
+  for (const n of errNodes) {
+    if (!n || (n.children && n.children.length > 2)) continue;   // leaf-ish nodes only — never a container
+    const r = n.getBoundingClientRect && n.getBoundingClientRect();
+    if (r && (r.width <= 0 || r.height <= 0)) continue;          // not rendered
+    const t = ((n.textContent || "").replace(/\s+/g, " ").trim());
+    if (!t || t.length > 220 || seen[t]) continue;
+    seen[t] = 1;
+    authErrors.push(t);
+    if (authErrors.length >= 6) break;
+  }
   return {
     url: location.href, host: location.host, title: document.title,
+    authErrors,
     // Was the document still parsing when we read it? The auth widget can be MID-RENDER (auth chrome
     // present, email/password not in the DOM yet) — indistinguishable from "this page has no fields"
     // without this. A hidden tab makes it common; the waitFor timeout logs it (2026-07-27).

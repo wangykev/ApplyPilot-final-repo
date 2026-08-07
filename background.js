@@ -6093,6 +6093,9 @@ async function runCdpOnboard(tabId, opts) {
       `signInButtonText=${!!s.signInButtonPresent}`,
       `hasAuthEl=${!!s.hasAuthEl}`,
       `markers=[${on.join(",") || "none"}]`,
+      // The page's OWN stated reason, when it has one — turns "the form is still up" from a dead end
+      // into something actionable (2026-08-07).
+      ...((s.authErrors && s.authErrors.length) ? [`pageErrors=${JSON.stringify(s.authErrors)}`] : []),
     ].join(" · ");
   };
 
