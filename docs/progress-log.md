@@ -3657,6 +3657,59 @@ lost, `[filled]` — **15 of the profile's 24 skills on the form**. The nine tha
 `CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`) have no exact-or-
 qualified row on this tenant and are named in the record for the human.
 
+## 2026-08-08 — Autofill-with-Resume end to end, and the two writes that were never approved
+
+Two operator bug reports, both traced to US writing values the human never approved, and both fixed and
+live-verified on cat.wd5 in one sitting.
+
+**1. The phantom "required" errors were a missing BLUR.** Workday refused Save & Continue with
+`Error-To / Error-From / The field is required` and `Invalid LinkedIn URL` on a page that visibly HELD
+all of those values. Operator: *"all I did to manually fix it is to click into and then click out of the
+box."* Clicking out is a blur, and neither `fillDateCompositeCdp` nor `fillTextCdp` ever issued one —
+they typed, read back, and moved on. Several Workday inputs hand their value to the form model (and run
+validation) on blur, so a field we typed and never LEFT reads correct in the DOM and is unset as far as
+Workday is concerned. Both fillers now blur after the read-back verify.
+
+*Why it surfaced with Autofill-with-Resume and never with Apply Manually:* on a blank form we fill
+several fields per entry, so the next field's click incidentally blurs the previous one. On an autofilled
+form Workday has already populated most of an entry, so we often touch a single field — and nothing ever
+blurs it. Same code, different exposure. Verified: the page that halted the previous run advanced with
+only the blur added.
+
+**2. The replay INVENTED a signature date, and that write cascaded.** Operator: *"reherse filled out the
+date when it was not approved in the review summary. and then when date gets filled, name and disability
+checkbox becomes required so it failed."* Exactly right. `replayField` re-derived any signature date to
+TODAY on every replay (a 2026-08-07 fix for Workday's "Enter today's date" on a day-old bundle), but it
+overrode `current_value` unconditionally — including onto a date the human had left BLANK. On the Self
+Identify page that write CASCADES: Name and the disability group become required, neither has an approved
+answer, and the rehearse halts on two questions the human never saw.
+
+New rule, the operator's: **the replay always follows the review page.** Today's date is written only
+REACTIVELY — when Save & Continue actually returns "Enter today's date", the walk stamps that page's
+signature-date field and re-clicks once (bounded per run, refuses to guess if no signature-date field is
+on the page). The old tests were updated to the new rule rather than deleted, plus a new pin for the
+exact live failure: an UNAPPROVED (blank) signature date must be left alone.
+
+**Verified end to end** on a clean bundle: fill reached REVIEW after 5 pages via `/apply/autofillWithResume`
+→ approved `3 / 3 flagged` → rehearse replayed every page and reached the submit gate, with page 5 reading
+
+    page 5: 4 approved entries NOT actuated (left as-is): name (cleared), employeeId (cleared),
+            dateSignedOn (cleared), disabilityStatus (cleared)
+    ✓ page 5 → advanced.
+    review page vs approved: AGREE 47 · DISAGREE 0 · MISSING 3 · EXTRA 1 · AMBIGUOUS 0
+
+The date was left alone, the self-ID fields stayed blank, nothing cascaded, and the reconcile is clean.
+
+**The gate then blocked for an HONEST reason, not a regression:** the website rows deleted to clear
+Workday's phantom-duplicate error did not come back on the review page, so submitting would file the
+application without them (`phantomLost`). That is the retention premise being CHECKED rather than assumed
+— the same URL-loss issue already recorded for clearwater, now reproduced on cat.wd5.
+
+**Still open from the autofill flow:** the parse leaves repeating entries we do not own (an education
+entry that was entirely EMPTY blocked a page), and it writes `linkedInAccount`, which we skip as unmapped
+and therefore never validate — Workday rejected its own value. Both need the section reconcile to clean
+up after the parse, not just fill what is empty.
+
 ### The CONTAINMENT tier (operator decision, same day)
 
 "Accept the containment match for skills so Vivado lands too." Added as the LAST tier in
