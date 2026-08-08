@@ -4315,6 +4315,17 @@ function makeCdpActuation(llmConfig) {
     },
     // React-safe, focus-independent clear of the widget's search input (see cdpClearInputNative).
     clearHierInput: (loc) => cdpEval(cdpClearInputNative, loc.wrapperSel + " input"),
+    // Blur whatever holds focus — the "click out of the box" half of a commit. Workday's date composite
+    // keeps a typed value in the DOM but does not hand it to its own model until the field is left, which
+    // surfaced as a phantom "The field From is required" on a page visibly showing the date.
+    blurActive: () => cdpEval(() => {
+      const el = document.activeElement;
+      if (!el || !el.blur || el === document.body) return { ok: false, reason: "nothing focused" };
+      const aid = (el.getAttribute && el.getAttribute("data-automation-id")) || el.id || el.tagName;
+      el.blur();
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) { /* blur alone may suffice */ }
+      return { ok: true, blurred: aid };
+    }),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
     probeHierLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),

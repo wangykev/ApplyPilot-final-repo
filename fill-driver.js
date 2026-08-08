@@ -792,6 +792,13 @@ const fillTextCdp = async (act, loc, value, budgets, tag, opts) => {
       await act.delay(budgets.textReadIntervalMs);
     } while (Date.now() < deadline);
     if (textValuesMatch(after, value)) {
+      // COMMIT BY BLURRING, same as the date composite (operator, 2026-08-08). Workday rejected a page
+      // with "Invalid LinkedIn URL" on a field that visibly held a valid URL, and the operator's manual
+      // fix was to click into the box and back out. Several Workday inputs VALIDATE and hand their value
+      // to the form model on blur, so a field we typed and never left can read correct in the DOM and
+      // still be wrong (or unset) as far as Workday is concerned. Blurring is what a human does on the
+      // way to the next field; the read-back above already decided the value, so this only commits it.
+      if (act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort */ } }
       let detail = before ? `overwrote "${before}"` : null;
       if (attempt > 1) detail = (detail ? detail + " | " : "") + `self-healed on attempt ${attempt}`;
       return { status: "filled", after, verified: true, detail };
@@ -6415,6 +6422,17 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
     trace[seg] = (r && r.focusRung ? r.focusRung : "focus-failed") + "/" + (r && r.ok ? r.inputMethod : ((r && r.inputMethod) || "?") + "-FAILED");
     if (!r || !r.ok) allVerified = false;
   }
+
+  // ── COMMIT THE COMPOSITE BY BLURRING IT (operator, 2026-08-08) ─────────────────────────────────
+  // Workday rejected Save & Continue with "The field From is required and must have a value" on a page
+  // whose date segments visibly HELD those values — a phantom error. The operator's manual fix says what
+  // is missing: "all I did was click into and then click out of the box". Clicking out is a BLUR, and
+  // this filler never issued one: it typed each segment, read it back, and moved on. The DOM had the
+  // value; Workday's own model never received the commit.
+  //
+  // Same family as every other React-state lesson here (a native-setter write that no event follows).
+  // The read-back above is unchanged, so this can only ADD a commit — it never decides the value.
+  if (act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort — the value is already typed */ } }
 
   const afterStr = ["Month", "Day", "Year"].filter((s) => after[s] != null).map((s) => after[s]).join("/");
   const detail = "segments " + JSON.stringify(trace);
