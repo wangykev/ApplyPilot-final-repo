@@ -3033,7 +3033,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (!Array.isArray(r.settle_trace) || !r.settle_trace.length) continue;
     LOG(`settle trace — ${r.fieldName} (${r.widgetType}):`);
     for (const s of r.settle_trace) {
-      LOG(`    cand "${s.candidate}" → ${s.outcome || "?"} (${s.settleMs != null ? s.settleMs + "ms" : "?"}, ${s.count != null ? s.count + " options" : "? options"}, banner:${!!s.banner}, open:${!!s.open}, chip:${s.chips ? `"${s.chips}"` : "none"})${s.note ? " — " + s.note : ""}`);
+      // scrape/type are broken out because "this field was slow" is useless without WHICH PHASE was slow
+      // — the field-of-study lag was attributed to the option scrape until the phases were split.
+      const phases = [s.scrapeMs != null ? `scrape ${s.scrapeMs}ms` : null, s.typeMs != null ? `type ${s.typeMs}ms` : null].filter(Boolean).join(", ");
+      LOG(`    cand "${s.candidate}" → ${s.outcome || "?"} (${s.settleMs != null ? "settle " + s.settleMs + "ms" : "?"}${phases ? ", " + phases : ""}, ${s.count != null ? s.count + " options" : "? options"}, banner:${!!s.banner}, open:${!!s.open}, chip:${s.chips ? `"${s.chips}"` : "none"})${s.note ? " — " + s.note : ""}`);
     }
     LOG(`    → final ${r.fieldName} value: ${r.after ? `"${r.after}"` : "(none)"} [${r.status}] — cross-check vs the settle-end chip (labeling vs wrong-value)`);
   }

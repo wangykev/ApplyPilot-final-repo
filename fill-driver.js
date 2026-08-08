@@ -2591,10 +2591,13 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // the type → the async blur landed in that gap → the then-live keptLowerTier re-commit strayed.
   // This puts the scrape entirely BEFORE the loop's single re-assert. (The re-commit itself was later
   // retired — keptLowerTier now Tab-closes in overwriteNoMatchResting, 2026-07-02.)
+  let scrapeMs = 0; // instrumentation (2026-08-08): scrape vs type vs settle, so a slow field names its own phase
   if (opts.onCapture) {
+    const _scT0 = Date.now();
     await act.openHier(loc);
     await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
     capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
+    scrapeMs = Date.now() - _scT0;
     // PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25). The start-scrape already enumerated the widget's
     // WHOLE option list, so typing a candidate just to learn it isn't offered is pure waste — live, FoS
     // burned ~540ms proving "Electrical and Computer Engineering" was absent before typing the one that
@@ -2688,6 +2691,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // a partial/unfocused box. (The settle above makes a mid-type drop rare; this makes the loop closed, not
     // just probabilistically safe.)
     let snap = null, snapSig = null, landed = false;
+    const _tyT0 = Date.now(); // clear + type + echo-verify — the phase the operator watched lag
     for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
       if (attempt > 1 && !(await ensureSearchFocused())) break; // re-assert focus on retry (blur after a prior clear/type)
       await act.clearHierSearch();
@@ -2704,6 +2708,8 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
       await act.pressTab(); // BLUR before leaving: an armed row from a prior/partial filter must not survive to the next field
       return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
     }
+    step.typeMs = Date.now() - _tyT0; // BEFORE the Enter, so it isolates clear+type+echo from the settle
+    if (scrapeMs) { step.scrapeMs = scrapeMs; scrapeMs = 0; } // charged once, to the first candidate
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
 
     // RENDER GATE (the core fix): block until the list reaches a CONFIRMED terminal render state — banner or
