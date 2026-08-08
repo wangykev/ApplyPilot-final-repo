@@ -4770,6 +4770,7 @@ async function runCdpReplayWalk(tabId, opts) {
     let dupFixes = 0; // per-RUN budget — a duplicate error that survives the fix is a real problem, not a retry loop
     let phantomNudges = 0; // per-RUN budget for the blur-race fix (nudgePhantomRequired) — same reasoning: if a focus→blur commit doesn't clear it, it isn't the blur race
     let forcedRefills = 0; // per-RUN budget for the mechanism-agnostic force-re-actuate remedy (skip-if-correct OFF) — if re-WRITING the approved value doesn't clear it, re-writing it again won't either
+    let dateStamps = 0;    // per-RUN budget for the REACTIVE signature-date stamp — the only value the replay may write that the review page did not approve, and only because Workday asked for it by name
 
     let findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
     let submitFired = false; // single-fire sentinel
@@ -5218,6 +5219,51 @@ async function runCdpReplayWalk(tabId, opts) {
         //    are visibly unique. Clear the visible rows and re-advance; Workday's own retained copy
         //    keeps the values, and the review page is checked for them before any submit. Bounded per
         //    RUN — a duplicate error that survives the fix is a real problem, not something to retry. ──
+        // ── SIGNATURE DATE: stamp TODAY only because Workday ASKED (operator, 2026-08-08) ────────────
+        // The replay follows the review page, so it never writes a date the human did not approve. The
+        // one exception is this error, and it is REACTIVE by design:
+        //
+        //   Error-Date  "Enter today's date"
+        //
+        // The proactive version of this (re-deriving a signature date to today on every replay) is what
+        // this replaces: it wrote onto a date the human had left BLANK, and on the Self Identify page
+        // that write CASCADES — Name and the disability group become required — so the rehearse halted
+        // on two questions the human never saw, entirely because of our own unapproved write.
+        // Here the value is only ever written after Workday demands it, it can only ever be today, and
+        // the page is re-Saved once. Bounded per RUN.
+        if (dateStamps < 2 && samples.some((t) => /enter\s+today'?s\s+date/i.test(String(t)))) {
+          const today = (() => { const t = new Date(); return { month: String(t.getMonth() + 1), day: String(t.getDate()), year: String(t.getFullYear()) }; })();
+          let stamped = null;
+          try {
+            const fscan = await cdpEval(cdpPageScan);
+            const df = ((fscan && fscan.fields) || []).find((f) => (f.widgetType === "date" || f.widgetType === "text")
+              && apMatch.isSignatureDateQuestion(f.label));
+            if (df) {
+              const loc = { wrapperSel: df.wrapperSel };
+              const r = df.widgetType === "date"
+                ? await fillDateCompositeCdp(act, loc, today, DEFAULT_BUDGETS)
+                : await fillTextCdp(act, loc, `${today.month}/${today.day}/${today.year}`, DEFAULT_BUDGETS, "input");
+              if (r && (r.status === "filled")) stamped = { field: df.fieldName, label: df.label, value: r.after };
+            }
+          } catch (e) { LOG(`  (signature-date stamp failed to run: ${String((e && e.message) || e).slice(0, 90)})`); }
+          if (stamped) {
+            dateStamps++;
+            LOG(`page ${page}: Workday asked for TODAY'S DATE — stamped "${stamped.label}" = ${stamped.value} (the ONLY value the replay may write that the review page did not approve) and re-saving.`);
+            const sigD = cdpPageSig(await cdpEval(cdpPageScan));
+            await cdpWakePage();
+            const clickD = await act.clickPageNext();
+            LOG(`page ${page} Save & Continue (after stamping today's date):`, JSON.stringify(clickD));
+            if (clickD.clicked) {
+              const resD = await cdpWaitNextPage(sigD);
+              if (resD.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after the date stamp on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (resD.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after the date stamp on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (!resD.timeout) { LOG(`✓ page ${page} → advanced after stamping today's date.`); continue; }
+            }
+            LOG(`⚠ page ${page}: still blocked after stamping today's date — the date was not the only problem.`);
+          } else {
+            LOG(`  (Workday asked for today's date but no signature-date field was found on this page — not guessing which field it meant.)`);
+          }
+        }
         if (dupFixes < 2 && duplicateErrorSection(samples)) {
           const fix = await clearPhantomDuplicates(act, pageResults, samples, LOG);
           if (fix.ran && fix.deleted > 0) {

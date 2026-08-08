@@ -6602,32 +6602,19 @@ async function replayField(act, entry, budgets) {
   const sel = deriveFlatWrapperSel(entry);
   if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
   const loc = { wrapperSel: sel };
-  // ── A SIGNATURE DATE IS "NOW", NOT A STORED ANSWER (2026-08-07) ──────────────────────────────────
-  // The self-ID attestation date is the day the form is COMPLETED, and the fill path already stamps it
-  // deterministically (aiFillDate → isSignatureDateQuestion) rather than treating it as a fact to look
-  // up. The replay, though, wrote back whatever the bundle held — so an approved bundle SIGNED
-  // YESTERDAY replays yesterday's date, and Workday rejects the page outright:
+  // ── THE REPLAY FOLLOWS THE REVIEW PAGE, INCLUDING FOR A SIGNATURE DATE (operator, 2026-08-08) ─────
+  // This used to re-derive a signature date to TODAY on every replay, to dodge Workday's
+  // "Error-Date / Enter today's date" on a bundle approved yesterday. That fixed a stale date and
+  // introduced a worse bug: it wrote a value the human had NOT approved — including onto a date they
+  // had left BLANK — and on the Self Identify page that write CASCADES, making Name and the disability
+  // group required. The rehearse then halted on two questions the human never saw, caused entirely by
+  // our own unapproved write.
   //
-  //   Error-Date  "Enter today's date"          (live, waystar.wd1: bundle approved 08/06,
-  //                                              replayed 08/07 — and it names no field, so
-  //                                              parseErrorFieldName can't route it either)
-  //
-  // That is also why the same page passed on analogdevices: its bundle was filled the SAME day, so the
-  // stored value happened to be today. A one-day-old approval is enough to break it.
-  //
-  // Re-deriving TODAY here does not weaken the approval contract: for this one question the human
-  // approved "the date I am signing", not a specific literal, and the only value this can ever produce
-  // is today's date — never an arbitrary one. Narrow by construction: isSignatureDateQuestion rejects
-  // any label naming a DIFFERENT event (start/birth/graduation/expiry/from/to), so a real date question
-  // still replays exactly what was approved.
-  let value = entry.current_value;
-  if ((widget === "date" || widget === "text") && apMatch.isSignatureDateQuestion(entry.question_label)) {
-    const t = new Date();
-    const fresh = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
-    if (!apMatch.sameCalendarDate(String(value == null ? "" : value), fresh)) {
-      value = fresh;
-    }
-  }
+  // The rule is now the operator's: the replay always follows the review page. Today's date may only be
+  // written REACTIVELY — when Save & Continue actually comes back with "Enter today's date", the walk
+  // stamps it and re-clicks (see the signature-date remediation in runCdpReplayWalk). That keeps the
+  // approval contract intact and still clears the one error the proactive rewrite existed for.
+  const value = entry.current_value;
   // A checkbox GROUP's answer is a SET. `groupSelection` prefers the authoritative array the review
   // editor writes and falls back to splitting the joined string for a bundle written before it
   // existed — so the replay never has to re-derive the human's choice from a display string when the
