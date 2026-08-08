@@ -417,12 +417,16 @@ test("fillSkillsCdp: fill-all OFF keeps Workday's suggested skills and adds NOTH
   assert.ok(!log.length, "and it never even opened the widget");
 });
 
-test("fillSkillsCdp: fill-all OFF with an EMPTY field says how to turn it on", async () => {
+test("fillSkillsCdp: fill-all OFF and NO suggestions → a review item, not a silent skip", async () => {
+  // Live, the same résumé produced 15 suggestions on one posting, 1 on another and 0 on a third. When it
+  // suggests nothing, "keep the suggestions" would ship an application with no skills at all — so the
+  // empty case is surfaced for review rather than hidden.
   const { act } = makeSkillsAct({ catalog: CATALOG });
   const r = await fd.fillSkillsCdp(act, LOC, ["Git"], B);
-  assert.equal(r.status, "skipped");
-  assert.match(r.detail, /try to fill all skills.*is off/i);
-  assert.match(r.detail, /1\.5–3s per skill/, "the warning names the real cost");
+  assert.equal(r.status, "needs_review");
+  assert.equal(r.flag, "skills-none-suggested");
+  assert.match(r.detail, /suggested no skills/i);
+  assert.match(r.detail, /1\.5–3s per skill/, "and it names the real cost of turning it on");
 });
 
 test("fillSkillsCdp: fill-all ON adds on TOP of the suggestions, never replacing them", async () => {

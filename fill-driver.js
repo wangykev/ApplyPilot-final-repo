@@ -3010,8 +3010,12 @@ const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
         flag: "skills-suggested-kept", confidence: "high", skills_added: [], skills_not_offered: [],
         detail: `kept the ${priorChips.length} skill(s) Workday suggested from the résumé — "try to fill all skills" is off, so none of the profile's ${wanted.length} were added. Edit the list on the review page.` };
     }
-    return { status: "skipped", after: null,
-      detail: `no skills on the form and "try to fill all skills" is off — turn it on in the profile to add the ${wanted.length} from your profile (it is slow: roughly 1.5–3s per skill).` };
+    // The parse suggested NOTHING, so "keep the suggestions" would ship an application with no skills at
+    // all. Observed live: the same résumé produced 15 suggestions on one posting, 1 on another and 0 here.
+    // The operator's rule is "leave it be, but record it so users can add or delete" — recording it as a
+    // silent skip would hide it, so an EMPTY field is a review item that names the profile skills waiting.
+    return { status: "needs_review", after: null, flag: "skills-none-suggested", confidence: "none",
+      detail: `Workday's résumé parse suggested no skills, and "try to fill all skills" is off — the field is EMPTY. Add some here, or turn the checkbox on to fill your ${wanted.length} profile skills automatically (slow: roughly 1.5–3s per skill).` };
   }
 
   const todo = apMatch.missingSkills(wanted, priorChips);

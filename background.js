@@ -376,6 +376,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // seeds the Skills section with its suggestions; the fill then refills the form as if blank. The
         // SUBMIT/rehearse run below deliberately does NOT, so saved skills survive un-reparsed.
         const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null, preferResumeAutofill: true });
+        await removeInputLock(); // onboarding locked the page across the login flow; the walk re-installs per page. NEVER leave it on a halt.
         // The page turned out to host a non-Workday ATS in an iframe — drive it with that
         // pipeline instead of reporting a page we could not read.
         if (onb && onb.embeddedAts && onb.embeddedUrl) {
@@ -824,6 +825,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
         emitRunProgress("Signing in", "reaching the application form");
         const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        await removeInputLock(); // onboarding locked the page across the login flow; the walk re-installs per page. NEVER leave it on a halt.
         if (!onb.ok || !onb.reached_form) {
           sendResponse({ ...onb, submitted: false, replayed: false, job_key: jobKey, tabId, startUrl });
           return;
@@ -1121,6 +1123,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r));
       const cfg = store.onboardConfig || {};
       const onb = await runCdpOnboard(tab.id, { credentials: store.credentials || null, gmailEnabled: !!cfg.gmailEnabled, startUrl: cfg.startUrl || null });
+        await removeInputLock(); // onboarding locked the page across the login flow; the walk re-installs per page. NEVER leave it on a halt.
       // Same login record as the website Run — a popup-driven onboarding gets its account tracked too.
       if (onb.ok && onb.reached_form) {
         let liveUrl = cfg.startUrl || null;
@@ -6066,6 +6069,15 @@ async function runCdpOnboard(tabId, opts) {
   // re-parsing the résumé over them (operator, 2026-08-07).
   const preferResumeAutofill = !!o.preferResumeAutofill;
   let resumeAutofilled = false;
+  // OPERATOR INPUT-LOCK ACROSS THE WHOLE LOGIN FLOW (operator, 2026-08-08). The fill walk has installed
+  // the lock per page since M-input-lock, but onboarding — Apply → chooser → sign-in / create-account →
+  // email verify → the résumé page — ran UNPROTECTED, which is the stretch where a stray keystroke does
+  // the most damage: it lands in an email or password box, or dismisses the chooser. Every navigation
+  // tears the overlay down, so it is re-installed after each settled transition (see relock). Removal is
+  // guaranteed by the CALLERS, immediately after runCdpOnboard returns — the walk then re-installs per
+  // page, and a stranded lock is the worst possible operator failure.
+  const relock = async () => { try { await installInputLock(); } catch (e) { /* best-effort */ } };
+  await relock();
   let accountCreated = false, verified = false, softReloads = 0;
   // Workday sometimes returns an EMPTY shell after the sign-in submit — recoverable by a reload
   // (see isBlankAuthPage). RUN-level budget: if refreshing twice doesn't restore a real page, it's
@@ -6220,7 +6232,7 @@ async function runCdpOnboard(tabId, opts) {
       await cdpWakePage();
       let ready = null;
       try { ready = await cdpEval(() => document.readyState); } catch (e) { continue; }
-      if (ready === "complete") { await pace(700); return true; }
+      if (ready === "complete") { await pace(700); await relock(); return true; } // a fresh document has no overlay
     }
     return false;
   };
@@ -6254,7 +6266,7 @@ async function runCdpOnboard(tabId, opts) {
       if (st) last = st;
       if (!st) continue;
       if (await maybeRefresh(st)) { st = await scan(); if (st) last = st; if (!st) continue; }
-      if (pred(st)) return { matched: true, scan: st };
+      if (pred(st)) { await relock(); return { matched: true, scan: st }; } // a matched wait = the page moved → the overlay was torn down with it
       // ── TERMINAL STATES: stop waiting for something that can NEVER arrive (audit, 2026-07-27). ──
       // Every predicate here waits for a page to BECOME something. On an already-applied page or a
       // maintenance page it never will, so each wait used to burn its full budget in turn — an
