@@ -521,6 +521,157 @@ function splitGroupValue(v) {
   const s = String(v == null ? "" : v);
   return s.trim() === "" ? [] : s.split(GROUP_JOIN).map((x) => x.trim()).filter(Boolean);
 }
+// ── Workday SKILLS ("Type to Add Skills") ────────────────────────────────────
+// A MULTI-VALUE typeahead over Workday's OWN skill taxonomy. Traced live on cat.wd5 2026-08-07
+// (docs/dom-patterns.md). Two OBSERVED facts drive every helper here:
+//
+//  1. The taxonomy RENAMES. "Python" is offered only as "Python (Programming Language)" — there is
+//     no bare "Python" row — while "Docker" is offered as BOTH "Docker" and "Docker (Software)".
+//     So a plain exact match finds nothing for most skills, and that trailing parenthetical is a
+//     QUALIFIER Workday added, the same shape normalize() already strips off a dial code "(+1)".
+//
+//  2. The search is SERVER-SIDE FUZZY and answers almost anything. "Yosys" → "Yodiz" + "GoSystem
+//     Tax RS"; "ODrive" → "Top Drive" + "Optical Disk Drives"; even "zzqqxwvj" returns rows. The
+//     server has ALREADY fuzzed, badly — so containment, Levenshtein and "take the first row" are
+//     not weak tiers here, they are wrong answers waiting to be committed. Only an exact name
+//     (bare or qualified) may be committed; anything else is left for the human to add by hand.
+const SKILL_QUALIFIER_RE = /\s*\([^()]*\)\s*$/; // ONE trailing "(...)" — never a mid-string paren
+
+// Workday annotates a chip the RÉSUMÉ PARSE contributed as "Digital Systems (Suggested)" (traced live
+// 2026-08-07 on the Autofill-with-Resume flow). That suffix is UI provenance, not part of the skill's
+// name — Workday's own review page prints the bare name — so it is stripped before a chip is recorded,
+// deduped or replayed. Without this the bundle stores a value the review page never shows, and the
+// reconcile reports a correctly-filled skill as missing. Only this exact marker is removed; a real
+// qualifier like "(Programming Language)" is part of the name and stays.
+function skillChipName(s) {
+  return String(s == null ? "" : s).replace(/\s*\((?:suggested|recommended)\)\s*$/i, "").trim();
+}
+
+// "Python (Programming Language)" → "python". A name that is NOTHING but a parenthetical is kept
+// whole, so a degenerate option can't collapse to "" and match everything.
+function skillBaseName(s) {
+  const full = normalize(String(s == null ? "" : s));
+  const bare = full.replace(SKILL_QUALIFIER_RE, "").trim();
+  return bare || full;
+}
+
+// Match ONE profile skill against the live search results → { index, tier } (index -1 = commit
+// NOTHING). Two tiers, and deliberately no containment and no fuzzy tier (fact 2 above):
+//   • "exact"     — the option IS the skill               ("Docker" → "Docker")
+//   • "qualified" — the skill plus Workday's parenthetical ("Python" → "Python (Programming Language)")
+// A bare exact WINS, so "Docker" never resolves to "Docker (Software)" while the plain row is on
+// offer. Both tiers are AMBIGUITY-GUARDED: if two rows match, we cannot tell which the human meant
+// (e.g. "Python (Programming Language)" vs a hypothetical "Python (Snake)"), so we commit nothing.
+function matchSkillOption(skill, optionTexts) {
+  const opts = Array.isArray(optionTexts) ? optionTexts.map((t) => String(t == null ? "" : t)) : [];
+  const want = normalize(String(skill == null ? "" : skill));
+  if (!want || !opts.length) return { index: -1, tier: null };
+  const hits = (fn) => { const out = []; opts.forEach((t, i) => { if (fn(t)) out.push(i); }); return out; };
+  const exact = hits((t) => normalize(t) === want);
+  if (exact.length === 1) return { index: exact[0], tier: "exact" };
+  if (exact.length > 1) return { index: -1, tier: null, ambiguous: "exact" };
+  const wantBase = skillBaseName(want);
+  const qualified = hits((t) => skillBaseName(t) === wantBase);
+  if (qualified.length === 1) return { index: qualified[0], tier: "qualified" };
+  if (qualified.length > 1) return { index: -1, tier: null, ambiguous: "qualified" };
+  // TIER 3 — CONTAINMENT, an OPERATOR-AUTHORIZED exception to the standing "containment is a guess"
+  // rule (2026-08-07), so a skill Workday only lists under a broader name still lands: "Vivado" →
+  // "Xilinx Vivado". It is the LAST tier, it is ambiguity-guarded, and every commit through it is
+  // flagged for review — the operator sees exactly what was widened.
+  //
+  // WHOLE-WORD, not raw substring, and that is the load-bearing part. Plain `includes` on this
+  // vocabulary is actively wrong: "Git" is inside "Di**git**al" and "CAN" is inside "**Can**adian",
+  // so a raw substring tier would put a marketing skill on an embedded engineer's application.
+  if (!skillContainmentEligible(want)) return { index: -1, tier: null };
+  const contained = hits((t) => skillWholeWordIn(normalize(t), want));
+  if (contained.length === 1) return { index: contained[0], tier: "containment" };
+  if (contained.length > 1) {
+    // SEVERAL broader rows contain the skill. Refusing here is what kept "Vivado" off the form — live,
+    // Workday offered more than one row containing it. The tie is broken on WORKDAY'S OWN RANKING (its
+    // first result for that query), the same "pick the first" rule the exact tier and clickHierLeaf
+    // already use, rather than on a preference of ours about which product name is the "real" one. The
+    // alternatives ride along so the review names what else was on offer and the human can switch.
+    return { index: contained[0], tier: "containment",
+             alternatives: contained.slice(1).map((i) => opts[i]) };
+  }
+  return { index: -1, tier: null };
+}
+
+// Split a normalized skill into tokens, keeping the characters real skill names carry (+ # .) so
+// "c++", "c#" and "node.js" stay single tokens instead of dissolving.
+function skillTokens(s) {
+  return String(s == null ? "" : s).split(/[^a-z0-9+#.]+/).filter(Boolean);
+}
+
+// May this skill be matched by CONTAINMENT at all? A DISTINCTIVENESS gate, modelled on the
+// employer-match scan's rule (multi-word, or a lone word long enough to be unambiguous). A short lone
+// token is exactly where containment goes wrong — "CAN" (the bus) against "Canadian Payroll", "rqt",
+// "C++" — so those stay exact/qualified-only. "Vivado" (6) and "PCB design" (2 words) pass.
+const SKILL_CONTAINMENT_MIN_LONE = 5;
+function skillContainmentEligible(skill) {
+  const t = skillTokens(normalize(String(skill == null ? "" : skill)));
+  if (!t.length) return false;
+  return t.length >= 2 || t[0].length >= SKILL_CONTAINMENT_MIN_LONE;
+}
+
+// Does `needle` appear in `haystack` as a whole word / contiguous word sequence? Both are expected
+// normalized. Boundaries are non-alphanumeric (or the string ends), which is what separates
+// "vivado" ⊂ "xilinx vivado" (a real match) from "git" ⊂ "digital" (not one).
+function skillWholeWordIn(haystack, needle) {
+  const h = String(haystack == null ? "" : haystack), n = String(needle == null ? "" : needle);
+  if (!h || !n) return false;
+  const esc = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("(^|[^a-z0-9])" + esc + "([^a-z0-9]|$)").test(h);
+}
+
+// The SHARED core of the skills detector. The fill path recognises a live SCAN field and the
+// reconcile recognises a bundle ENTRY; routing both through this one predicate is what stops them
+// drifting into disagreeing about which field this even is. Deliberately anchored, never a bare
+// /skill/ test — a language-proficiency field and a prose "Skills" box must not match.
+function isSkillsFieldName(name, label) {
+  if (/(^|[-_])skills$/i.test(String(name == null ? "" : name))) return true;
+  const l = String(label == null ? "" : label).replace(/\*+\s*$/, "").trim();
+  return /^(type to add\s+)?skills$/i.test(l);
+}
+
+// A review-bundle entry for the skills field. `field_id` is "<page>::formField-<name>".
+function isSkillsEntry(entry) {
+  if (!entry) return false;
+  const wt = String(entry.widget_type || "");
+  if (wt !== "typeahead" && wt !== "hierarchical") return false;
+  let s = String(entry.field_id == null ? "" : entry.field_id);
+  const i = s.lastIndexOf("formField-");
+  if (i !== -1) s = s.slice(i + "formField-".length);
+  return isSkillsFieldName(s, entry.question_label);
+}
+
+// Which of `wanted` are not already on the widget, in profile order. Compared on the BASE name in
+// both directions, because a chip Workday created reads back QUALIFIED: a "Python (Programming
+// Language)" chip already covers the profile's "Python". Without that, a second pass would search
+// "Python" again, find the bare row GONE (Workday drops an already-selected skill from its own
+// results — observed), and commit "Python IDLE" as a near-duplicate. Also dedupes `wanted` against
+// itself, so a profile listing a skill twice can't add it twice.
+function missingSkills(wanted, chips) {
+  const chipList = (Array.isArray(chips) ? chips : []).map((c) => normalize(String(c == null ? "" : c))).filter(Boolean);
+  const have = new Set(chipList.map(skillBaseName).filter(Boolean));
+  const out = [];
+  for (const raw of (Array.isArray(wanted) ? wanted : [])) {
+    const s = String(raw == null ? "" : raw).trim();
+    if (!s) continue;
+    const base = skillBaseName(s);
+    if (!base || have.has(base)) continue;
+    // A chip committed through the CONTAINMENT tier reads back BROADER than the profile name
+    // ("Vivado" landed as "Xilinx Vivado"), so a base-name comparison alone would call it missing and
+    // search again — and Workday drops the selected row from its own results, so the next containment
+    // hit would be a DIFFERENT variant ("Vivado HLS") added alongside. Same whole-word + eligibility
+    // rule as the matcher, so a "Digital Marketing" chip never counts as covering "Git".
+    if (skillContainmentEligible(base) && chipList.some((c) => skillWholeWordIn(c, base))) continue;
+    have.add(base);
+    out.push(s);
+  }
+  return out;
+}
+
 // A checkbox GROUP's recorded value is a JOINED set ("Asian; White"), and Workday's review page
 // prints the options separately — so looking for the joined string finds nothing and a correct
 // two-answer field reads as MISSING. Expand a group entry into its individual values before matching.
@@ -1138,19 +1289,25 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     const cv = e.current_value;
     if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
     if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
-    // A SIGNATURE date is compared against TODAY, because that is what the replay WRITES (2026-08-07).
-    // replayField re-derives it rather than replaying the stored literal — Workday rejects the page
-    // outright with "Enter today's date" otherwise — so an approved bundle signed yesterday would then
-    // reconcile its own correct behaviour as a contradiction and BLOCK the submit:
-    //   ≠ "Date*": approved "8/6/2026" but the page shows "08/07/2026"     (live, waystar.wd1)
-    // Comparing to today keeps the check strict: a page showing any date OTHER than today still
-    // disagrees. Narrow by construction (isSignatureDateQuestion rejects start/birth/graduation/
-    // expiry/from/to), so a real date question is still held to the approved value.
+    // ── A SIGNATURE date may legitimately read as EITHER the approved value OR today (2026-08-08) ──
+    // This compared against today UNCONDITIONALLY, because the replay used to re-derive a signature
+    // date on every run. That is no longer true: the replay now follows the review page, and today is
+    // stamped only REACTIVELY, when Workday itself comes back with "Enter today's date" (see the
+    // signature-date remediation in runCdpReplayWalk). Both outcomes are therefore correct:
+    //   • Workday never asked  → the page holds the APPROVED value
+    //   • Workday asked        → the walk stamped TODAY and re-saved
+    // Comparing to today alone would now report a FALSE DISAGREE on the first case and block a clean
+    // submit — the mirror of the bug the unconditional substitution was added to fix.
+    //
+    // So accept either, and nothing else: a page showing some THIRD date still disagrees, which is the
+    // property that matters. Narrow by construction — isSignatureDateQuestion rejects any label naming
+    // a different event (start / birth / graduation / expiry / from / to).
     const wt = e.widget_type;
     let cvs = String(cv);
+    let altCvs = null;
     if ((wt === "date" || wt === "text") && isSignatureDateQuestion(e.question_label)) {
       const t = new Date();
-      cvs = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
+      altCvs = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
     }
     const nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
     const base = { label: e.question_label != null ? e.question_label : null, value_bundle: cvs,
@@ -1173,15 +1330,19 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     //    string would find nothing and call a correct two-answer field MISSING, so each selected
     //    option is checked on its own and the row AGREES only when every one of them is present.
     //    A group with a single selection falls through to the normal path unchanged. ──
+    //    SKILLS is the other multi-value field and prints the same way (one value per skill), so it
+    //    takes this path too — matching the joined "A; B; C" as one string would report a correctly
+    //    filled 20-skill field as MISSING on every rehearsal.
     const groupVals = wt === "checkbox_group" ? groupSelection(e) : [];
-    if (groupVals.length > 1) {
-      claimed++; claimedValues.push(...groupVals.map((g) => normalize(g)));
-      const absent = groupVals.filter((g) => {
+    const setVals = groupVals.length ? groupVals : (isSkillsEntry(e) ? splitGroupValue(cvs) : []);
+    if (setVals.length > 1) {
+      claimed++; claimedValues.push(...setVals.map((g) => normalize(g)));
+      const absent = setVals.filter((g) => {
         const n = normalize(g);
         if (n.length >= 4 || (n.length >= 3 && !AMBIGUOUS_SHORT.test(n))) return !presentTier(g);
         return !items.some((it) => it.nlabel && labelMatches(it.nlabel, nlabel) && valueTier(n, it.nval));
       });
-      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: "checkbox-group-set" });
+      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: groupVals.length ? "checkbox-group-set" : "skills-set" });
       else missing_on_review.push({ ...base, detail: "not shown on the review page: " + absent.join("; ") });
       continue;
     }
@@ -1209,7 +1370,10 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
         else disagree.push({ ...base, value_review: cand.value });
       } else {
         claimed++; claimedValues.push(nval);
-        if (valuesAgree(cvs, cand.value)) agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
+        // altCvs is set ONLY for a signature date: today is an equally-correct page value there, because
+        // the walk stamps it reactively when Workday demands it. Any other date still disagrees.
+        if (valuesAgree(cvs, cand.value) || (altCvs && valuesAgree(altCvs, cand.value)))
+          agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
         else verdictFor(base, cvs, cand, rep && rep.section); // a shuffled row is not a contradiction
       }
       continue;
@@ -1987,6 +2151,8 @@ function devLogSelect(ring, opts) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
+  skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
+  skillTokens, skillContainmentEligible, skillWholeWordIn,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

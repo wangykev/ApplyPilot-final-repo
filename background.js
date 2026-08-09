@@ -376,7 +376,11 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
         // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
         // startUrl:null — runCdpOnboard scans the current page and proceeds to Apply, no re-nav.
-        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        // preferResumeAutofill: a FILL run takes "Autofill with Resume" so Workday parses the résumé and
+        // seeds the Skills section with its suggestions; the fill then refills the form as if blank. The
+        // SUBMIT/rehearse run below deliberately does NOT, so saved skills survive un-reparsed.
+        const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null, preferResumeAutofill: true });
+        await removeInputLock(); // onboarding locked the page across the login flow; the walk re-installs per page. NEVER leave it on a halt.
         // The page turned out to host a non-Workday ATS in an iframe — drive it with that
         // pipeline instead of reporting a page we could not read.
         if (onb && onb.embeddedAts && onb.embeddedUrl) {
@@ -825,6 +829,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
         emitRunProgress("Signing in", "reaching the application form");
         const onb = await runCdpOnboard(tabId, { credentials: store.credentials || null, gmailEnabled, startUrl: null });
+        await removeInputLock(); // onboarding locked the page across the login flow; the walk re-installs per page. NEVER leave it on a halt.
         if (!onb.ok || !onb.reached_form) {
           sendResponse({ ...onb, submitted: false, replayed: false, job_key: jobKey, tabId, startUrl });
           return;
@@ -1122,6 +1127,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig"], r));
       const cfg = store.onboardConfig || {};
       const onb = await runCdpOnboard(tab.id, { credentials: store.credentials || null, gmailEnabled: !!cfg.gmailEnabled, startUrl: cfg.startUrl || null });
+        await removeInputLock(); // onboarding locked the page across the login flow; the walk re-installs per page. NEVER leave it on a halt.
       // Same login record as the website Run — a popup-driven onboarding gets its account tracked too.
       if (onb.ok && onb.reached_form) {
         let liveUrl = cfg.startUrl || null;
@@ -3031,7 +3037,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (!Array.isArray(r.settle_trace) || !r.settle_trace.length) continue;
     LOG(`settle trace — ${r.fieldName} (${r.widgetType}):`);
     for (const s of r.settle_trace) {
-      LOG(`    cand "${s.candidate}" → ${s.outcome || "?"} (${s.settleMs != null ? s.settleMs + "ms" : "?"}, ${s.count != null ? s.count + " options" : "? options"}, banner:${!!s.banner}, open:${!!s.open}, chip:${s.chips ? `"${s.chips}"` : "none"})${s.note ? " — " + s.note : ""}`);
+      // scrape/type are broken out because "this field was slow" is useless without WHICH PHASE was slow
+      // — the field-of-study lag was attributed to the option scrape until the phases were split.
+      const phases = [s.scrapeMs != null ? `scrape ${s.scrapeMs}ms` : null, s.typeMs != null ? `type ${s.typeMs}ms` : null].filter(Boolean).join(", ");
+      LOG(`    cand "${s.candidate}" → ${s.outcome || "?"} (${s.settleMs != null ? "settle " + s.settleMs + "ms" : "?"}${phases ? ", " + phases : ""}, ${s.count != null ? s.count + " options" : "? options"}, banner:${!!s.banner}, open:${!!s.open}, chip:${s.chips ? `"${s.chips}"` : "none"})${s.note ? " — " + s.note : ""}`);
     }
     LOG(`    → final ${r.fieldName} value: ${r.after ? `"${r.after}"` : "(none)"} [${r.status}] — cross-check vs the settle-end chip (labeling vs wrong-value)`);
   }
@@ -4765,6 +4774,7 @@ async function runCdpReplayWalk(tabId, opts) {
     let dupFixes = 0; // per-RUN budget — a duplicate error that survives the fix is a real problem, not a retry loop
     let phantomNudges = 0; // per-RUN budget for the blur-race fix (nudgePhantomRequired) — same reasoning: if a focus→blur commit doesn't clear it, it isn't the blur race
     let forcedRefills = 0; // per-RUN budget for the mechanism-agnostic force-re-actuate remedy (skip-if-correct OFF) — if re-WRITING the approved value doesn't clear it, re-writing it again won't either
+    let dateStamps = 0;    // per-RUN budget for the REACTIVE signature-date stamp — the only value the replay may write that the review page did not approve, and only because Workday asked for it by name
 
     let findings = { mismatches: [], cascadeRevealed: [] }; // fed to the submit gate; the walk HALTS on any mismatch/cascade before review, so these stay empty on a clean run (the gate re-checks defensively)
     let submitFired = false; // single-fire sentinel
@@ -5186,6 +5196,15 @@ async function runCdpReplayWalk(tabId, opts) {
       if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.timeout) {
+        // Workday's soft error after the Save click, same as the fill walk. cdpWaitNextPage surfaces it
+        // now, so it costs one branch — and without it the replay spends a re-click on a page that has
+        // no footer button before halting for a reason that has nothing to do with the bundle.
+        if (res.softError && softReloads < MAX_REPLAY_SOFT_RELOADS) {
+          softReloads++;
+          LOG(`⚠ Workday soft-error AFTER Save & Continue on page ${page} ("Something went wrong / please refresh") — reloading + restarting the replay (soft-reload ${softReloads}/${MAX_REPLAY_SOFT_RELOADS}).`);
+          await reloadAndSettle(LOG);
+          continue restartWalk;
+        }
         // CLEAN no-advance fallback first (operator ask): a swallowed Save & Continue re-clicks (up to 2x).
         // Self-guards on error/session-death, so a real validation block still HALTS (never masked).
         const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
@@ -5213,6 +5232,51 @@ async function runCdpReplayWalk(tabId, opts) {
         //    are visibly unique. Clear the visible rows and re-advance; Workday's own retained copy
         //    keeps the values, and the review page is checked for them before any submit. Bounded per
         //    RUN — a duplicate error that survives the fix is a real problem, not something to retry. ──
+        // ── SIGNATURE DATE: stamp TODAY only because Workday ASKED (operator, 2026-08-08) ────────────
+        // The replay follows the review page, so it never writes a date the human did not approve. The
+        // one exception is this error, and it is REACTIVE by design:
+        //
+        //   Error-Date  "Enter today's date"
+        //
+        // The proactive version of this (re-deriving a signature date to today on every replay) is what
+        // this replaces: it wrote onto a date the human had left BLANK, and on the Self Identify page
+        // that write CASCADES — Name and the disability group become required — so the rehearse halted
+        // on two questions the human never saw, entirely because of our own unapproved write.
+        // Here the value is only ever written after Workday demands it, it can only ever be today, and
+        // the page is re-Saved once. Bounded per RUN.
+        if (dateStamps < 2 && samples.some((t) => /enter\s+today'?s\s+date/i.test(String(t)))) {
+          const today = (() => { const t = new Date(); return { month: String(t.getMonth() + 1), day: String(t.getDate()), year: String(t.getFullYear()) }; })();
+          let stamped = null;
+          try {
+            const fscan = await cdpEval(cdpPageScan);
+            const df = ((fscan && fscan.fields) || []).find((f) => (f.widgetType === "date" || f.widgetType === "text")
+              && apMatch.isSignatureDateQuestion(f.label));
+            if (df) {
+              const loc = { wrapperSel: df.wrapperSel };
+              const r = df.widgetType === "date"
+                ? await fillDateCompositeCdp(act, loc, today, DEFAULT_BUDGETS)
+                : await fillTextCdp(act, loc, `${today.month}/${today.day}/${today.year}`, DEFAULT_BUDGETS, "input");
+              if (r && (r.status === "filled")) stamped = { field: df.fieldName, label: df.label, value: r.after };
+            }
+          } catch (e) { LOG(`  (signature-date stamp failed to run: ${String((e && e.message) || e).slice(0, 90)})`); }
+          if (stamped) {
+            dateStamps++;
+            LOG(`page ${page}: Workday asked for TODAY'S DATE — stamped "${stamped.label}" = ${stamped.value} (the ONLY value the replay may write that the review page did not approve) and re-saving.`);
+            const sigD = cdpPageSig(await cdpEval(cdpPageScan));
+            await cdpWakePage();
+            const clickD = await act.clickPageNext();
+            LOG(`page ${page} Save & Continue (after stamping today's date):`, JSON.stringify(clickD));
+            if (clickD.clicked) {
+              const resD = await cdpWaitNextPage(sigD);
+              if (resD.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after the date stamp on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (resD.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after the date stamp on page ${page}.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
+              if (!resD.timeout) { LOG(`✓ page ${page} → advanced after stamping today's date.`); continue; }
+            }
+            LOG(`⚠ page ${page}: still blocked after stamping today's date — the date was not the only problem.`);
+          } else {
+            LOG(`  (Workday asked for today's date but no signature-date field was found on this page — not guessing which field it meant.)`);
+          }
+        }
         if (dupFixes < 2 && duplicateErrorSection(samples)) {
           const fix = await clearPhantomDuplicates(act, pageResults, samples, LOG);
           if (fix.ran && fix.deleted > 0) {
@@ -5580,6 +5644,13 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
     try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
     if (state && isWorkdayMaintenance(state)) return { advanced: false, maintenance: true, state }; // transient, retry-later — NOT dead (checked first)
     if (state && sessionLooksDead(state)) return { advanced: false, sessionDead: true, state };
+    // Workday's soft error ("Something went wrong / please refresh") is a TERMINAL answer to the click,
+    // exactly like the two above — the page we were waiting for is gone and no amount of waiting brings
+    // it back. Without this it fell through to the 15s ceiling, and only THEN did the caller start
+    // polling ~4s for error text that a soft-error page never has, plus a re-click that finds no footer
+    // button (operator: "it seems to take a long time in order for this to happen"). The flag is already
+    // in the state read on every poll, so detecting it costs nothing and lands within ~500ms.
+    if (state && state.softErrorPresent) return { advanced: false, softError: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
     if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSteady = 0; continue; } // not hydrated
@@ -5923,6 +5994,28 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // error (sessionLooksDead already excluded above). Attempt BOUNDED remediation before the
         // dirty halt: Tier-0 dup-language / Tier-1 deterministic re-fill → Tier-2 AI, capped + halt-on-no-progress.
         if (res.errorDetected) LOG(`page ${page} Save & Continue blocked — error markers detected fast (~1s).`);
+        // ── WORKDAY'S SOFT ERROR, AFTER the Save click (operator, 2026-08-08) ────────────────────────
+        // The walk already reloads on "Something went wrong / please refresh" at the TOP of a page and
+        // again BEFORE Save — but not here, and here is where it actually appeared: the click lands,
+        // Workday swaps the page for its error screen, the nav wait times out, and we fall into AI-4
+        // instead of reloading. The operator's report is precisely this asymmetry — "the apply manually
+        // run reloads no issues" (its soft errors surface at a point the existing checks cover) while
+        // the autofill run "does not refresh". Diagnosing it from the log is misleading too: the error
+        // screen has no form and no footer button, so the trace reads `0 error(s)`, `no error text` and
+        // `re-click refused (no-button)` — three symptoms of a page that is simply GONE.
+        // Same bounded budget as the other two checks; a reload restarts the walk from page 1, and
+        // skip-if-correct makes the already-filled pages cheap on the way back.
+        // res.softError is the CHEAP path: cdpWaitNextPage now exits the moment it sees the error page,
+        // so this normally fires ~500ms after the click instead of after the 15s ceiling. The re-read is
+        // the fallback for a soft error that renders just after the wait returned.
+        let softAfterSave = res.softError ? res.state : null;
+        if (!softAfterSave) { try { softAfterSave = await cdpEval(cdpReadSessionState); } catch (e) { /* fall through to remediation */ } }
+        if (softAfterSave && softAfterSave.softErrorPresent && softReloads < MAX_SOFT_RELOADS) {
+          softReloads++;
+          LOG(`⚠ Workday soft-error AFTER Save & Continue on page ${page} ("Something went wrong / please refresh") — reloading + restarting the walk (soft-reload ${softReloads}/${MAX_SOFT_RELOADS}).`);
+          await reloadAndSettle(LOG);
+          continue restartWalk;
+        }
         // OPERATOR RULE: with AI fill OFF, do NOT auto-remediate — the deterministic Tier-1/1.6 re-fill
         // is the unwanted "refill on error" (and, pre-M-overwrite, a duplicate-page vector). Skip
         // remediation entirely and HALT on any error the deterministic pass couldn't clear; only a
@@ -6062,6 +6155,20 @@ async function runCdpOnboard(tabId, opts) {
   const creds = o.credentials || null;
   const gmailEnabled = !!o.gmailEnabled;
   const startUrl = o.startUrl || null;
+  // Prefer "Autofill with Resume" on the apply chooser (a FILL run). A REHEARSE/SUBMIT run leaves this
+  // OFF so it applies manually / continues — that keeps the already-saved skills and stops Workday
+  // re-parsing the résumé over them (operator, 2026-08-07).
+  const preferResumeAutofill = !!o.preferResumeAutofill;
+  let resumeAutofilled = false;
+  // OPERATOR INPUT-LOCK ACROSS THE WHOLE LOGIN FLOW (operator, 2026-08-08). The fill walk has installed
+  // the lock per page since M-input-lock, but onboarding — Apply → chooser → sign-in / create-account →
+  // email verify → the résumé page — ran UNPROTECTED, which is the stretch where a stray keystroke does
+  // the most damage: it lands in an email or password box, or dismisses the chooser. Every navigation
+  // tears the overlay down, so it is re-installed after each settled transition (see relock). Removal is
+  // guaranteed by the CALLERS, immediately after runCdpOnboard returns — the walk then re-installs per
+  // page, and a stranded lock is the worst possible operator failure.
+  const relock = async () => { try { await installInputLock(); } catch (e) { /* best-effort */ } };
+  await relock();
   let accountCreated = false, verified = false, softReloads = 0;
   // Workday sometimes returns an EMPTY shell after the sign-in submit — recoverable by a reload
   // (see isBlankAuthPage). RUN-level budget: if refreshing twice doesn't restore a real page, it's
@@ -6145,7 +6252,72 @@ async function runCdpOnboard(tabId, opts) {
   // made the flow conclude the fields would never arrive and halt on a WRONG reason. Visible keeps the
   // tuned, live-verified fast values; hidden gets room to actually finish rendering.
   const renderBudget = async (visibleMs, hiddenMs) => ((await cdpVisible()) ? visibleMs : hiddenMs);
-  const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl;
+  const isPastAuth = (s) => !!s && (s.formFieldCount || 0) > 0 && !s.hasAuthEl && !onResumeUploadPage(s);
+
+  // ── The résumé-upload page (Autofill with Resume) ────────────────────────────────────────────────
+  // Traced 2026-08-07 on cat.wd5: "Autofill with Resume" lands on `/apply/autofillWithResume`, which
+  // carries the upload input and only reaches My Information after the upload — so Workday parses the
+  // résumé and pre-populates the application, INCLUDING the Skills section with its own suggestions.
+  // It reports ONE bare `formField-` wrapper, which is why isPastAuth excludes it above: otherwise
+  // onboarding would announce "reached the form" and hand the walk a page with no real fields.
+  // The automation-ids are the ones attachResume already drives, so the upload itself is reused as-is.
+  // The upload input is the POSITIVE signal, but it mounts a beat after the page does — and keying the
+  // decision on one read of it is how the résumé page got mistaken for the form (live 2026-08-08: the
+  // walk was handed a page whose only field was a file_upload, re-attached the résumé onto it, clicked
+  // Continue, and Workday answered with "Something went wrong"; by then the footer button was gone, so
+  // neither the re-click nor the reload could fire and it died as a bare nav-timeout on "page 1").
+  //
+  // So the URL carries the decision when the marker is late. `/apply/autofillWithResume` is the whole
+  // flow's path (My Information sits on it too), which is exactly why the field COUNT is the other half:
+  // the résumé page has one bare wrapper, the real form has fourteen. Neither signal alone is safe —
+  // together they are, and this is the check `isPastAuth` defers to.
+  function onResumeUploadPage(s) {
+    if (!s || (s.formFieldCount || 0) > 1) return false;
+    if (s.markers && s.markers.resumeUploadInput) return true;
+    return /\/apply\/autofillWithResume\b/i.test(String(s.url || "")) && !s.hasAuthEl;
+  }
+  // Upload the stored résumé (if it isn't already up) and click Continue. Returns {scan} on success or
+  // {halt} with a self-explaining stop — never a bare false, since every failure here is operator-actionable.
+  const consumeResumeUploadPage = async (s) => {
+    let rec = null;
+    try { rec = await getResume(); } catch (e) { /* treated as none */ }
+    if (!rec || !rec.base64) {
+      LOG("⛔ on Workday's résumé-upload page but NO résumé is stored — upload one on the website first.");
+      return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-missing-for-autofill",
+        detail: "Autofill with Resume needs the stored résumé and none is saved in the extension." } };
+    }
+    // The page can be recognised from the URL before its upload input has mounted, so WAIT for the input
+    // rather than attaching into a page that isn't ready — that races Workday's own parse setup, and the
+    // clear-then-attach inside attachResume is exactly the wrong thing to do mid-flight.
+    if (!(s.markers && s.markers.resumeUploadInput)) {
+      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1,
+        await renderBudget(12000, 25000), "resume-upload-input");
+      s = w.scan || s;
+      if ((s.formFieldCount || 0) > 1) { LOG("the résumé page moved on by itself — already past it."); return { scan: s }; }
+      if (!(s.markers && s.markers.resumeUploadInput)) {
+        return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-input-missing",
+          detail: "the Autofill-with-Resume page never rendered its upload control." } };
+      }
+    }
+    if (s.markers && s.markers.resumeUploadSuccess) LOG("the résumé is already uploaded on this page — continuing.");
+    else {
+      LOG(`uploading the résumé for Workday's autofill parse (${rec.filename || "resume.pdf"})…`);
+      const ar = await cdpAttachResumeConfirmed(rec, LOG);
+      if (!ar || !ar.attached) {
+        return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-failed",
+          detail: "the résumé upload never confirmed on the Autofill page — " + ((ar && ar.detail) || "no detail") } };
+      }
+    }
+    const c = await clickTarget(['[data-automation-id="pageFooterNextButton"]'], "Continue (after the résumé upload)");
+    if (!c.clicked) {
+      return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-continue-blocked",
+        detail: c.blockedBy || "Continue was not clickable on the résumé-upload page" } };
+    }
+    // Workday PARSES the résumé on this transition, so it is slower than an ordinary page advance.
+    const w = await waitFor((sc) => (sc.formFieldCount || 0) > 1 || sc.hasAuthEl, await renderBudget(25000, 50000), "post-resume-upload(parse)");
+    LOG(`résumé page done — Workday parsed it; the next page has ${(w.scan && w.scan.formFieldCount) || 0} field(s).`);
+    return { scan: w.scan || s };
+  };
   // "We are on the JOB-DESCRIPTION page, not an auth screen" (2026-07-29). `signInButtonPresent` is a TEXT
   // match over every clickable, and a Workday posting carries "Sign In" in its own HEADER — so a JD page
   // satisfied the Stage-3 auth condition, and doAuth then waited its full budget for credential fields that
@@ -6179,7 +6351,7 @@ async function runCdpOnboard(tabId, opts) {
       await cdpWakePage();
       let ready = null;
       try { ready = await cdpEval(() => document.readyState); } catch (e) { continue; }
-      if (ready === "complete") { await pace(700); return true; }
+      if (ready === "complete") { await pace(700); await relock(); return true; } // a fresh document has no overlay
     }
     return false;
   };
@@ -6231,6 +6403,7 @@ async function runCdpOnboard(tabId, opts) {
       if (pred(st)) {
         const took = Date.now() - start;
         if (took >= PROGRESS_AFTER_MS) LOG(`waitFor(${label}) satisfied after ${(took / 1000).toFixed(1)}s.`);
+        await relock(); // a matched wait = the page moved → the overlay was torn down with it
         return { matched: true, scan: st };
       }
       // ── TERMINAL STATES: stop waiting for something that can NEVER arrive (audit, 2026-07-27). ──
@@ -6792,7 +6965,19 @@ async function runCdpOnboard(tabId, opts) {
       if (await maybeRefresh(st)) st = await scan() || st;
 
       const oc = classifyAuthOutcome(st);
-      if (oc === "success" || isPastAuth(st)) { LOG("reached the application form."); return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified }; }
+      if (oc === "success" || isPastAuth(st) || onResumeUploadPage(st)) {
+        // Signing in can land on the RÉSUMÉ page rather than the form, when Autofill with Resume was
+        // chosen before the auth screen appeared. Consume it here too, or onboarding would report
+        // "reached the form" while sitting on a page that has no fields to fill.
+        if (onResumeUploadPage(st)) {
+          const r = await consumeResumeUploadPage(st);
+          if (r.halt) return r.halt;
+          st = r.scan || st;
+          resumeAutofilled = true;
+        }
+        LOG("reached the application form.");
+        return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified, resume_autofilled: resumeAutofilled };
+      }
       // ALREADY APPLIED inside the auth loop (audit, 2026-07-27). It was checked at the initial scan, at
       // the start of Stage 3, and after a successful sign-in — but NOT here, so an already-applied page
       // reached during the loop fell through to the race-guard and halted `auth-form-not-rendered`: a
@@ -7160,9 +7345,46 @@ async function runCdpOnboard(tabId, opts) {
       LOG('only "Use My Last Application" is offered on this page — refusing to reuse a prior application; waiting for a manual-apply/auth path…');
     }
 
-    // ── STAGE 2: Apply Manually ──
+    // ── STAGE 2: the chooser — Autofill with Resume (a FILL run) or Apply Manually ──
     st = await scan() || st;
-    if (st.markers.applyManually) {
+    // AUTOFILL WITH RESUME is preferred for a FILL run (operator, 2026-08-07): Workday parses the résumé
+    // and pre-populates the application, which is what puts its own SUGGESTED skills in the Skills
+    // section. The fill still treats the result as a blank form and refills it (the parse is unreliable —
+    // live it left the whole address blank and answered nothing for the previously-worked question), so
+    // this only ADDS Workday's parse on top; it never replaces our own fill.
+    // A REHEARSE/SUBMIT run deliberately does NOT come here — it applies manually / continues, so the
+    // saved skills survive and the résumé is not re-parsed.
+    if (preferResumeAutofill && st.markers.autofillWithResume) {
+      LOG('Stage 2 — clicking "Autofill with Resume" (first application: let Workday parse the résumé).');
+      emitRunProgress("Starting the application", "Autofill with Resume");
+      const AR_SEL = '[data-automation-id="autofillWithResume"]';
+      const c = await clickTarget([AR_SEL], "Autofill with Resume");
+      if (!c.clicked) return { ok: true, reached_form: false, needs_operator: true, stopped: "autofill-resume-blocked", detail: c.blockedBy || "Autofill with Resume not clickable" };
+      // Either the résumé page appears (already signed in) or the auth screen does (Stage 3 then runs and
+      // consumes the résumé page after signing in) — the same escalation shape Stage 1 and 2 both use.
+      const autofillLanded = (s) => onResumeUploadPage(s) || s.hasAuthEl || (s.formFieldCount || 0) > 1;
+      // A GENEROUS first wait, unlike Stage 1/2's 4s fast-first. Live (cat.wd5, hidden): the résumé page
+      // had not mounted its upload input by 6s, so this timed out, the in-page fallback then reported
+      // "selector not found" (the chooser was already gone — we HAD navigated), and onboarding handed the
+      // page to the WALK, which attached the résumé itself and wrote a junk 1-field bundle page. Nothing
+      // failed, but the résumé page belongs to onboarding: it is pre-form.
+      let w = await waitFor(autofillLanded, await renderBudget(15000, 30000), "post-autofill-with-resume");
+      st = w.scan || st;
+      if (!autofillLanded(st)) {
+        const d = await cdpEval(cdpActivateBySelector, AR_SEL, "click");
+        if (d && d.ok) {
+          LOG(`  autofill fallback: activating "${d.label}" in-page via ${d.via}.`);
+          w = await waitFor(autofillLanded, 12000, "post-autofill-with-resume(in-page)");
+          st = w.scan || st;
+        } else LOG(`  autofill fallback unavailable — ${(d && d.reason) || "eval failed"}.`);
+      }
+      if (onResumeUploadPage(st)) {
+        const r = await consumeResumeUploadPage(st);
+        if (r.halt) return r.halt;
+        st = r.scan || st;
+        resumeAutofilled = true;
+      }
+    } else if (st.markers.applyManually) {
       LOG('Stage 2 — clicking "Apply Manually".');
       const AM_SEL = '[data-automation-id="applyManually"]';
       const c = await clickTarget([AM_SEL], "Apply Manually");

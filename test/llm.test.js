@@ -5,7 +5,7 @@
 // adapter would crash a fill).
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { callLLM, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_MS, LLM_REQUEST_TIMEOUT_MS,
+const { callLLM, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_MS ,
   resetLlmRetryState,
   llmRetryAfterMs,
   LLM_BREAKER_TRIP_AFTER,
@@ -263,46 +263,45 @@ test("breaker: a SUCCESS clears it, so a recovered quota resumes full retrying",
   resetLlmRetryState();
 });
 
-// ── PER-REQUEST TIMEOUT (2026-08-07) ────────────────────────────────────────────────────────────────
-// There was none. A hanging request is worse than a dead provider: a dead one fails instantly and the
-// caller's deterministic fallback fills the field, while a hanging one holds the whole walk. Live on
-// nvidia.wd5 one call took 91,182ms and dragged a page fill from ~10s to 100.1s — retries were disabled
-// for that attempt and nothing on the path sleeps, so all 91s was spent inside a single fetch.
-test("callLLM: a hanging request TIMES OUT into a normalized {ok:false} — never hangs, never throws", async () => {
-  let aborted = false;
-  const hangingFetch = (url, opts) => new Promise((resolve, reject) => {
-    // A realistic fetch: it only settles when the signal aborts.
-    if (opts && opts.signal) {
-      opts.signal.addEventListener("abort", () => { aborted = true; reject(new Error("The operation was aborted.")); });
+// ── PER-ATTEMPT REQUEST TIMEOUT ─────────────────────────────────────────────
+// Live (cat.wd5, 2026-08-08): AI-4 remediation took ~182s to clear ONE field, and 148s of that was a
+// SINGLE hung call — `[LLM] ok in 148262ms` — while the identical retry right after it returned in
+// 2005ms and every other call in the run took 0.5-2s. fetch() has no timeout of its own, so one stuck
+// socket blocked the whole walk. Each attempt is now bounded; the abort throws, which callLLMOnce
+// already treats as a retryable transient.
+test("a request that never answers is ABORTED and retried, not waited on forever", async () => {
+  resetLlmRetryState();
+  let attempts = 0;
+  const fetchImpl = async (url, opts) => {
+    attempts++;
+    if (attempts === 1) {
+      return await new Promise((_resolve, reject) => {
+        if (opts && opts.signal) opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      }); // never resolves on its own — the live hang
     }
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "hi" }] } }] }) };
+  };
+  const r = await callLLM(
+    { provider: "gemini", model: LLM_DEFAULT_MODELS.gemini, apiKey: "k", user: "q", timeoutMs: 40 },
+    fetchImpl,
+    async () => {} // don't actually sleep the retry ladder
+  );
+  assert.equal(attempts, 2, "the hung attempt was abandoned and re-issued");
+  assert.equal(r.ok, true);
+  assert.equal(r.text, "hi");
+});
+
+test("a hang on EVERY attempt still returns a normalized error — callLLM never throws", async () => {
+  resetLlmRetryState();
+  const fetchImpl = async (url, opts) => new Promise((_res, rej) => {
+    if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted")));
   });
-  const t0 = Date.now();
-  const res = await callLLM({ provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "k",
-    user: "hi", timeoutMs: 120, noRetry: true }, hangingFetch);
-  assert.strictEqual(res.ok, false, "a stall must be a normalized failure, not a hang");
-  assert.match(String(res.error), /timed out after 120ms/);
-  assert.ok(Date.now() - t0 < 5000, "it returned promptly rather than waiting on the provider");
-  assert.strictEqual(aborted, true, "the in-flight request is actually aborted, not left running");
-});
-
-test("callLLM: the timeout does NOT fire on a normal fast reply", async () => {
-  const okFetch = async () => ({ ok: true, status: 200,
-    json: async () => ({ candidates: [{ content: { parts: [{ text: "Yes" }] } }] }) });
-  const res = await callLLM({ provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "k",
-    user: "hi", timeoutMs: 5000 }, okFetch);
-  assert.strictEqual(res.ok, true);
-  assert.strictEqual(res.text, "Yes");
-});
-
-test("callLLM: a fake fetch that IGNORES the signal still times out (the race, not the abort, is the guarantee)", async () => {
-  const deafFetch = () => new Promise(() => {});   // never settles, never listens for abort
-  const res = await callLLM({ provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "k",
-    user: "hi", timeoutMs: 100, noRetry: true }, deafFetch);
-  assert.strictEqual(res.ok, false);
-  assert.match(String(res.error), /timed out after 100ms/);
-});
-
-test("LLM_REQUEST_TIMEOUT_MS: well above a healthy call, well below the observed 91s stall", () => {
-  assert.ok(LLM_REQUEST_TIMEOUT_MS >= 10000, "must not cut off a genuinely slow-but-working provider");
-  assert.ok(LLM_REQUEST_TIMEOUT_MS <= 45000, "must be far below the 91s hang it exists to stop");
+  const r = await callLLM(
+    { provider: "gemini", model: LLM_DEFAULT_MODELS.gemini, apiKey: "k", user: "q", timeoutMs: 20 },
+    fetchImpl,
+    async () => {}
+  );
+  assert.equal(r.ok, false);
+  assert.match(String(r.error), /timed out after 20ms/, "the reason names the timeout, not a bare network error");
+  resetLlmRetryState();
 });

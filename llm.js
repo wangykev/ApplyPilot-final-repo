@@ -181,15 +181,38 @@ const LLM_RETRY_STATUS = { 429: true, 500: true, 502: true, 503: true, 504: true
 // Wait-then-retry, in order; length = max retries. Reaches ~75s because a 429 is usually a
 // per-MINUTE quota and the old 2s+8s ladder could not outlast one (live 2026-08-02: a 65-field
 // form burned its quota and fields fell to needs_review the model could have answered).
-// Per-request ceiling for ONE provider call. Above any healthy call by a wide margin (observed
-// 0.6-2.0s typical, 10.0s on a slow day) so it only ever cuts off a genuine stall — see the 91,182ms
-// hang in callLLMOnce's timeout note. A timeout is a normal {ok:false}; the caller's deterministic
-// fallbacks take it from there.
-const LLM_REQUEST_TIMEOUT_MS = 20000;
 const LLM_RETRY_DELAYS_MS = [2000, 8000, 20000, 45000];
 // A 429 usually carries Retry-After (seconds, or an HTTP date). Obeying the server beats
 // guessing — but cap it, so a header asking for an hour can't hang a run.
 const LLM_RETRY_AFTER_CAP_MS = 60000;
+// ── PER-ATTEMPT REQUEST TIMEOUT (operator, 2026-08-08) ──────────────────────────────────────────
+// A request that never answers used to block the whole walk, because fetch() has no timeout of its
+// own. Live on cat.wd5: AI-4 remediation took ~182s to clear ONE field, and 148s of that was a single
+// hung call — `[LLM] ok in 148262ms` — while the IDENTICAL retry right after it returned in 2005ms and
+// every other call in the run took 0.5-2s. So the model was not slow; that one socket was stuck.
+//
+// Bounding each ATTEMPT turns a hang into the transient it actually is: an aborted fetch throws, which
+// this function already treats as retryable, so the existing ladder re-issues it (and key rotation can
+// move on). Generous against real latency — the LLM budget for a fill answer is small and the observed
+// spread is 0.5-2s — and tight against a hang. Overridable per call via cfg.timeoutMs.
+const LLM_REQUEST_TIMEOUT_MS = 30000;
+
+// fetch with a hard deadline. Falls back to a plain fetch where AbortController is unavailable (or the
+// timeout is disabled), so an injected test fetch keeps working untouched.
+async function fetchWithTimeout(fetchFn, url, opts, ms) {
+  if (!ms || typeof AbortController === "undefined") return fetchFn(url, opts);
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; try { ac.abort(); } catch (e) { /* already gone */ } }, ms);
+  try {
+    return await fetchFn(url, Object.assign({}, opts, { signal: ac.signal }));
+  } catch (e) {
+    if (timedOut) throw new Error("request timed out after " + ms + "ms");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 // CIRCUIT BREAKER. Retrying is right for a momentary spike and wrong for an EXHAUSTED quota:
 // with a full ladder per field, one dead quota would turn a 65-field form into a ~45-minute
 // stall. After this many calls exhaust their whole ladder back-to-back, stop retrying for a
@@ -241,49 +264,10 @@ async function callLLMOnce(req, fetchImpl, sleepImpl) {
   // remedy than waiting, so the ladder is saved for when every key has been tried.
   const cooling = Date.now() < llmRetryState.coolingUntil;
   const maxRetries = cfg.noRetry || cooling ? 0 : LLM_RETRY_DELAYS_MS.length;
-  // ── PER-REQUEST TIMEOUT (2026-08-07) ─────────────────────────────────────────────────────────────
-  // There was none, and a hanging request is worse than a dead provider: a dead one fails instantly and
-  // the deterministic last-resort fill takes over, while a hanging one holds the whole walk. Live on
-  // nvidia.wd5 a single call took **91,182ms** and dragged page 1 from ~10s to 100.1s — with retries
-  // disabled for that attempt and no sleeps on the path, so all 91s was spent inside one fetch.
-  //
-  // A timeout is a normalized `{ok:false}` like any other failure, so every existing fallback already
-  // handles it — including the required-dropdown backstop, which needs no model at all. Bounded well
-  // above a healthy call (observed 0.6–2.0s across this session, 10.0s worst case on a slow day) so it
-  // only ever cuts off a genuine stall.
-  const timeoutMs = Number(cfg.timeoutMs) > 0 ? Number(cfg.timeoutMs) : LLM_REQUEST_TIMEOUT_MS;
-  const withTimeout = async () => {
-    // AbortController is present in the SW, the popup and Node 18+. The `timedOut` FLAG — not the race
-    // result — is what decides, because aborting makes a real fetch REJECT, and that rejection settles
-    // the race before the timeout's own resolve does. Keying off the flag reports the true cause either
-    // way, and also covers an injected fetch that ignores `signal` and never settles at all.
-    const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
-    let timedOut = false, timer = null;
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        try { if (ac) ac.abort(); } catch (e) { /* best-effort */ }
-        resolve("__ap_timeout__");
-      }, timeoutMs);
-    });
-    try {
-      const r = await Promise.race([fetchFn(url, ac ? Object.assign({}, opts, { signal: ac.signal }) : opts), timeout]);
-      if (timedOut || r === "__ap_timeout__") return { timedOut: true };
-      return { response: r };
-    } catch (e) {
-      if (timedOut) return { timedOut: true };     // the abort we caused — not a network fault
-      throw e;                                     // a genuine network throw keeps its own message + ladder
-    } finally { if (timer) clearTimeout(timer); }
-  };
-
   let res, attempt = 0, netErr = null;
   for (;;) {
     netErr = null;
-    try {
-      const out = await withTimeout();
-      if (out.timedOut) { netErr = "timed out after " + timeoutMs + "ms"; res = null; }
-      else res = out.response;
-    }
+    try { res = await fetchWithTimeout(fetchFn, url, opts, cfg.timeoutMs === undefined ? LLM_REQUEST_TIMEOUT_MS : cfg.timeoutMs); }
     catch (e) { netErr = String((e && e.message) || e); res = null; }
     // A network throw is transient too (DNS blip, dropped socket) — it earns the same ladder.
     const retryable = netErr !== null || (res && !res.ok && LLM_RETRY_STATUS[res.status]);
@@ -546,7 +530,8 @@ const LLM_PRICING_URLS = {
 // the functions stay globals (from <script> / importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS, LLM_REQUEST_TIMEOUT_MS,
+    LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
+    LLM_REQUEST_TIMEOUT_MS, fetchWithTimeout,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
     llmCostUsd, GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
     ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor, ANTHROPIC_EFFORT_LEVELS,

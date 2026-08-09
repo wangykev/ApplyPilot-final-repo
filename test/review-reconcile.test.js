@@ -515,3 +515,32 @@ test("reconcile: a NON-signature date is still held to the APPROVED value", () =
   );
   assert.strictEqual(bad.counts.disagree, 1, "a start date silently changed to today IS a contradiction");
 });
+
+// ── After the 2026-08-08 policy change, EITHER value is correct for a signature date ────────────────
+// The replay no longer re-derives a signature date; it follows the review page, and today is stamped
+// only REACTIVELY when Workday returns "Enter today's date". So both outcomes are legitimate:
+//   Workday never asked → the page holds the APPROVED value
+//   Workday asked       → the walk stamped TODAY and re-saved
+// Comparing against today alone (which is what the previous commit did, correctly, for the OLD replay
+// behaviour) would now report a false DISAGREE on the first case and block a clean submit.
+test("reconcile: a signature date matching its APPROVED value agrees (Workday never asked)", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: _pad(SIG_YESTERDAY) })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "the page shows exactly what was approved — never a contradiction");
+});
+test("reconcile: a signature date stamped TODAY also agrees (Workday asked, the walk re-saved)", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: _pad(SIG_TODAY) })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "the reactive stamp is a legitimate page value too");
+});
+test("reconcile: a THIRD date is still a real DISAGREE — accepting two values is not accepting any", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: "01/02/2020" })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 1);
+});
